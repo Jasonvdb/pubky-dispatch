@@ -1007,6 +1007,56 @@ mod tests {
         }
     }
 
+    /// An answer to `request` that `service` signs over the empty body field, as one given
+    /// before the body is read.
+    fn unread_answer(request: &Request, service: &IdentityKey, status: u16, body: &Value) -> Response {
+        let body = serde_json::to_vec(body).unwrap();
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status,
+                request: SentRequest::of(request).received(false),
+                server_time: TIME,
+                head: None,
+                body: &body,
+            },
+        );
+        Response {
+            status,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, TIME),
+            ],
+            body,
+        }
+    }
+
+    #[test]
+    fn test_signature_takes_the_empty_body_field_only_before_the_body() {
+        // As the client's check (Switch wire 7.1): only a `413 too_large`, a `429
+        // rate_limited` and a `404 not_found` may verify over the empty body field, each with
+        // the status its code fixes; any other answer so signed fails.
+        let service = key(2);
+        let checker = checker(&service);
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        let put = request("POST", "ops", &json!({ "ops": [] }));
+        let error = |code: &str| json!({ "code": code, "message": "m" });
+        for (status, code) in [(413, "too_large"), (429, "rate_limited"), (404, "not_found")] {
+            let answer = unread_answer(&put, &service, status, &error(code));
+            assert!(checker.signature(&put, &answer).is_ok(), "{code}");
+        }
+        for (status, body) in [
+            (200, json!({})),
+            (400, error("bad_request")),
+            (503, error("unavailable")),
+            (409, error("too_large")),
+            (404, error("rate_limited")),
+        ] {
+            let answer = unread_answer(&put, &service, status, &body);
+            assert!(checker.signature(&put, &answer).is_err(), "{status} {body}");
+        }
+    }
+
     #[test]
     fn test_chain_stubs_link_both_ways_from_the_zero_hash() {
         let service = key(2);

@@ -285,6 +285,7 @@ impl Inner {
     pub(super) fn step_two(&mut self, request: &Request) -> Option<Response> {
         let class = class_of(request);
         let verdict = self.judge();
+        let unknown = matches!(verdict, Verdict::Unknown);
         if let Verdict::NotHosted { delete_mark: true } = verdict {
             self.marks.slot = MarkSlot::Missing;
         }
@@ -319,8 +320,15 @@ impl Inner {
             let other = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
             return Some(self.respond_signed(&other, request, status, &body, self.now(), None));
         }
-        // Signed with the one key, with no head, and with the time base (Switch wire 7.1).
-        Some(self.respond_signed(&self.service, request, status, &body, self.now(), None))
+        // Signed with the one key, with no head: the notice and the not-hosted `404` at the
+        // time base; the `503`, which commits nothing, at the last time stamped where the
+        // switch holds the account, else the time base (Switch wire 7.1 Timestamp).
+        let at = if unknown && self.enrolled.is_some() {
+            self.stamped_ms
+        } else {
+            self.now()
+        };
+        Some(self.respond_signed(&self.service, request, status, &body, at, None))
     }
 
     /// `POST /erase` at a lost identity (Switch wire 7.4.16, 7.3 Tables 2 and 3): it goes

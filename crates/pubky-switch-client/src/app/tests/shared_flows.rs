@@ -6684,9 +6684,9 @@ async fn test_scripted_first_call_without_a_record_is_refused_alike_at_every_rou
     phone.receive(None).await.unwrap();
     let committed = s.w.switch.lock().stamped_ms;
     s.w.clock.advance_ms(61_000);
-    // At the identity's service time, the clock's time here, later than the last stamped
-    // one, which the refusal doesn't move (Switch wire 7.1 Timestamp, 7.3 step 3).
-    let service_time = pubky_switch_core::time::rfc3339(s.w.clock.now_ms().max(committed));
+    // At the last time stamped, since the refusal commits nothing (Switch wire 7.1
+    // Timestamp).
+    let service_time = pubky_switch_core::time::rfc3339(committed);
     let unknown = app_keys("unknown").app_id_bytes();
     let claim = pubky_switch_core::enc::b64(&[7; 32]);
     for (method, rest) in [

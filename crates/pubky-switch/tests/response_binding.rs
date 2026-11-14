@@ -205,6 +205,52 @@ async fn test_response_binding_repeated_signed_header_is_refused() {
 }
 
 #[tokio::test]
+async fn test_response_binding_empty_or_unreadable_signed_header_is_refused() {
+    // A signed request header present with an empty value, or with one that isn't printable
+    // ASCII, is `400 bad_request` before any signature work, as a repeated one is: the
+    // service never reads a value otherwise than its answer binds it (Switch wire 7.1).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let honest = honest_apps();
+    let sent = Sent::of(&honest);
+    let before = head_now(&replay).await;
+    for (name, value) in [
+        (header::INVITE_CODE, HeaderValue::from_static("")),
+        (header::APP, HeaderValue::from_static("")),
+        (header::CERT, HeaderValue::from_static("")),
+        (header::TRANSFER, HeaderValue::from_static("")),
+        (
+            header::APP,
+            HeaderValue::from_bytes(b"\xff\xfe").expect("value"),
+        ),
+        (header::INVITE_CODE, HeaderValue::from_static("a\tb")),
+    ] {
+        let mut odd = copy_of(&honest);
+        odd.headers.insert(HeaderName::from_static(name), value);
+        let odd_sent = Sent::of(&odd);
+        let answer = replay.service.handle(odd).await;
+        assert_eq!(code_of(&answer), (400, json!("bad_request")), "{name}");
+        assert!(header_text(&answer, header::HEAD).is_none(), "{name}");
+        assert!(
+            signed_with(&answer, &service_public(&replay), &odd_sent),
+            "{name}"
+        );
+        assert!(
+            !signed_with(&answer, &service_public(&replay), &sent),
+            "{name}"
+        );
+        assert_eq!(head_now(&replay).await, before, "{name}");
+    }
+    // A header no received request covers is no signed header.
+    let mut other = copy_of(&honest);
+    other
+        .headers
+        .insert(HeaderName::from_static("x-other"), HeaderValue::from_static(""));
+    assert_eq!(replay.service.handle(other).await.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_response_binding_lower_case_method_is_an_unknown_route() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
@@ -337,7 +383,21 @@ async fn test_response_binding_public_read_binds_no_header() {
                 Vec::new(),
             ))
             .await;
-        for answer in [&signed, &junk] {
+        // Nor is it refused by the header rule every other call has: a header sent twice,
+        // empty or not printable ASCII (Switch wire 7.1 "Each header once, as text").
+        let mut twice = signer_request("GET", &path, Vec::new(), at);
+        let timestamp = twice.headers.get(header::TIMESTAMP).expect("ts").clone();
+        twice
+            .headers
+            .append(HeaderName::from_static(header::TIMESTAMP), timestamp);
+        let twice = replay.service.handle(twice).await;
+        let mut unreadable = support::request("GET", &path, &[], Vec::new());
+        unreadable.headers.insert(
+            HeaderName::from_static(header::APP),
+            HeaderValue::from_bytes(b"\xff").expect("value"),
+        );
+        let unreadable = replay.service.handle(unreadable).await;
+        for answer in [&signed, &junk, &twice, &unreadable] {
             assert_eq!(answer.status, unsigned.status, "{id}");
             assert_eq!(answer.headers, unsigned.headers, "{id}");
             assert_eq!(answer.body, unsigned.body, "{id}");

@@ -61,7 +61,8 @@ fn signed_by(response: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
     signed_with(response, key, sent)
 }
 
-fn signature_of(request: &pubky_switch::http::SwitchRequest) -> Sent {
+/// `request` as sent, which an answer to it binds (Switch wire 7.1); it carries a signature.
+fn signed_sent(request: &pubky_switch::http::SwitchRequest) -> Sent {
     let sent = Sent::of(request);
     assert!(sent.signed(), "signature");
     sent
@@ -233,7 +234,7 @@ async fn deliver(
         .to_json(),
         at_ms,
     );
-    let signature = signature_of(&request);
+    let signature = signed_sent(&request);
     (replay.service.handle(request).await, signature)
 }
 
@@ -438,7 +439,7 @@ async fn test_recovery_in_place_starts_afresh_under_the_service_key() {
         2
     );
     let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    let read_signature = signature_of(&request);
+    let read_signature = signed_sent(&request);
     let apps = replay.service.handle(request).await;
     assert_eq!(apps.status, 200);
     assert!(signed_by(&apps, &key, &read_signature));
@@ -648,7 +649,7 @@ async fn test_recovery_in_place_answers_a_held_feed_read_from_the_new_generation
     let keys = vectors("keys.json");
     let path = format!("/v1/{}/feed?after=1:{tip}&wait=10", alice_id());
     let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), at);
-    let request_signature = signature_of(&request);
+    let sent = signed_sent(&request);
     let started = std::time::Instant::now();
     let waiting = replay.service.handle(request);
     let (answer, delivered) = tokio::join!(waiting, async {
@@ -686,7 +687,7 @@ async fn test_recovery_in_place_answers_a_held_feed_read_from_the_new_generation
     assert_eq!(names, ["switch-server-time", "switch-service-signature"]);
     // Woken by the recovery, not by the end of its wait.
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert!(signed_by(&answer, &key, &request_signature));
+    assert!(signed_by(&answer, &key, &sent));
     let _ = stop.send(());
     task.await.expect("listener");
     replay.db.drop_database().await.expect("drop");
@@ -1103,7 +1104,7 @@ async fn only_the_start_gets_past_the_mark(fork: bool) {
     let reason = if fork { "fork" } else { "behind" };
     let key = service_public(&replay);
     let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let apps = replay.service.handle(request).await;
     assert!(
         is_notice(&apps, 1, reason),
@@ -1179,7 +1180,7 @@ async fn only_the_start_gets_past_the_mark(fork: bool) {
         (2, 2, head.chain_hash, mark_before.created_at_ms)
     );
     let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    let read_signature = signature_of(&request);
+    let read_signature = signed_sent(&request);
     let apps = replay.service.handle(request).await;
     assert_eq!(apps.status, 200);
     assert!(signed_by(&apps, &key, &read_signature));
@@ -1919,7 +1920,7 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
         Vec::new(),
         at,
     );
-    let signature = signature_of(&request);
+    let signature = signed_sent(&request);
     let answer = replay.service.handle(request).await;
     assert_eq!(answer.status, 200);
     assert!(signed_by(&answer, &key, &signature));

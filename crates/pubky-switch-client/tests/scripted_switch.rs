@@ -1048,8 +1048,8 @@ async fn test_testing_held_read_given_up_is_held_no_more() {
 #[tokio::test]
 async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
     // As at the service: a body over its call's cap is `413 too_large` over the empty body
-    // field, and a signed request header sent twice is `400 bad_request`, both signed with
-    // the service key, without a head (Switch wire 7.1).
+    // field, and a signed request header sent twice, or with an empty or non-ASCII value, is
+    // `400 bad_request`, both signed with the service key, without a head (Switch wire 7.1).
     use pubky_switch_client::client::SentRequest;
     let s = Setup::new();
     let switch = s.alice.switch();
@@ -1106,6 +1106,36 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         (400, "bad_request")
     );
     assert!(verifies(&repeated, &answer, true));
+    // A signed header present with an empty value, or one that isn't printable ASCII, is
+    // refused the same way; a header no received request covers isn't looked at.
+    for (name, value) in [
+        ("switch-invite-code", ""),
+        ("switch-app", "\u{e9}"),
+        ("x-other", ""),
+    ] {
+        let odd = Request {
+            headers: vec![Header::new(name, value)],
+            ..repeated.clone()
+        };
+        let answer = switch.transport().send(odd.clone()).await.unwrap();
+        if name == "x-other" {
+            assert_ne!(answer.status, 400, "{name}");
+            continue;
+        }
+        assert_eq!(
+            (answer.status, code_of(&answer).as_str()),
+            (400, "bad_request"),
+            "{name}"
+        );
+        assert!(verifies(&odd, &answer, true), "{name}");
+        // The public read uses no header, so it is answered as any public read.
+        let read = Request {
+            path_and_query: format!("/v1/{id}/identity"),
+            ..odd
+        };
+        let answer = switch.transport().send(read).await.unwrap();
+        assert_ne!(answer.status, 400, "{name}");
+    }
     // The public read uses no header, so it is answered as any public read.
     let read = Request {
         path_and_query: format!("/v1/{id}/identity"),

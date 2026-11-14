@@ -343,21 +343,22 @@ impl Service {
     /// The answer of step 2 or of the judgement under the lock that replaces every other:
     /// the not-hosted `404`, the `503` of an unknown verdict, or the notice, each signed with
     /// the verdict's key, without a head (Switch wire 7.1, 7.3); `None` for a request that
-    /// goes on. The notice and the `404` are signed at the time base `base_ms`, the `503` at
-    /// the identity's service time `service_ms` (Switch wire 7.1 Timestamp, 7.3 step 3).
+    /// goes on. The notice and the `404`, which count in no comparison of service times, are
+    /// signed at the time base `base_ms`; the `503`, which commits nothing, at the last time
+    /// the service committed for the identity, `committed_ms` (Switch wire 7.1 Timestamp).
     pub(super) fn verdict_answer(
         &self,
         identity: &str,
         answer: &verdict::Answer,
         asked: Asked<'_>,
         base_ms: u64,
-        service_ms: u64,
+        committed_ms: u64,
     ) -> Option<SwitchResponse> {
         let (error, at_ms) = match answer.route {
             Route::NotHosted => (not_hosted(), base_ms),
             Route::Unavailable => (
                 ApiError::unavailable("7.3: the mark store can't be read"),
-                service_ms,
+                committed_ms,
             ),
             Route::Notice(notice) => (self.notice(identity, notice), base_ms),
             Route::CreateAccount
@@ -369,7 +370,7 @@ impl Service {
             | Route::Erase { .. }
             | Route::EraseLost => return None,
         };
-        Some(self.keyed_error(&answer.key, asked, at_ms, base_ms, &error))
+        Some(self.keyed_error(&answer.key, asked, at_ms, &error))
     }
 
     /// The notice `503 recovery_required` (Switch wire 7.6), counted and logged at its one

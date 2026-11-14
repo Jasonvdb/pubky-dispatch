@@ -230,14 +230,15 @@ impl HttpTransport {
         }
         let mut response = call.send().await.map_err(map_error)?;
         let status = response.status().as_u16();
+        // Every header is kept, one whose value isn't text included, with its bytes read
+        // lossily: a signed response header that doesn't read then fails the response, and a
+        // second copy of one is seen as a repeat, never dropped (Switch wire 7.1).
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(name, value)| {
-                Some(Header {
-                    name: name.as_str().to_owned(),
-                    value: value.to_str().ok()?.to_owned(),
-                })
+            .map(|(name, value)| Header {
+                name: name.as_str().to_owned(),
+                value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
             })
             .collect();
         if response
@@ -542,6 +543,35 @@ mod tests {
         let poll = timed(TimeoutClass::LongPoll { wait_s: 1 }).await;
         assert!(poll >= Duration::from_millis(1_700), "{poll:?}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_keeps_a_response_header_that_isnt_text() {
+        // A server that answers every request once with a `Switch-Head` that isn't text,
+        // beside one that is.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut read = [0u8; 4096];
+            let _ = socket.read(&mut read).await.unwrap();
+            let mut answer = b"HTTP/1.1 200 OK\r\nswitch-head: aGVhZA\r\nswitch-head: \xff\xfe\r\n".to_vec();
+            answer.extend_from_slice(b"content-length: 2\r\nconnection: close\r\n\r\n{}");
+            socket.write_all(&answer).await.unwrap();
+        });
+        let transport =
+            HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default())
+                .unwrap();
+        let response = transport.send(request(&origin)).await.unwrap();
+        let heads: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|header| header.name == "switch-head")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(heads, ["aGVhZA", "\u{fffd}\u{fffd}"]);
+        server.await.unwrap();
     }
 
     #[tokio::test]

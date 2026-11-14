@@ -1513,18 +1513,10 @@ impl Signer {
                 }
                 Err(error.into())
             }
-            Err(
-                error @ (ClientError::Switch {
-                    status: 400 | 413, ..
-                }
-                | ClientError::BodyOverCap { .. }),
-            ) => {
-                // A definite refusal, a `400` or a `413 too_large` that binds the delivery as
-                // sent, its body included, or a body over the call's cap, which the client
-                // refuses before sending it (Switch wire 7.1): the same bytes would be refused
-                // again. A `413` given before the body was read binds no body and is final
-                // for nothing. The version stays spent (`signed_through`). A
-                // renewal it carried didn't happen, and the user is told in the same commit.
+            Err(error) if delivery_refused_for_good(&error) => {
+                // A definite refusal: the same bytes would be refused again. The version stays
+                // spent (`signed_through`). A renewal it carried didn't happen, and the user is
+                // told in the same commit.
                 let mut state = self.state.clone();
                 self.note_refused_renewals(&mut state, &doc)?;
                 self.commit(state, None).await?;
@@ -2159,9 +2151,54 @@ pub(crate) struct SwitchRead {
     pub(crate) device_ms: u64,
 }
 
+/// Whether a delivery's refusal is for good, so the same bytes would be refused again: a
+/// `400`, or a `413 too_large` that binds the delivery as sent, its body included, or a body
+/// over the call's cap, which the client refuses before sending it (Switch wire 7.1). A `413`
+/// given before the body was read binds no body and is final for nothing.
+fn delivery_refused_for_good(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Switch {
+            status: 400 | 413,
+            ..
+        } | ClientError::BodyOverCap { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_delivery_refused_for_good_takes_only_what_binds_the_bytes() {
+        let switch = |status: u16, code: ErrorCode| ClientError::Switch {
+            status,
+            code,
+            message: String::new(),
+            current: serde_json::Value::Null,
+            known_version: None,
+            retry_after: None,
+        };
+        for error in [
+            switch(400, ErrorCode::BadRequest),
+            switch(413, ErrorCode::TooLarge),
+            ClientError::BodyOverCap { cap: 1 },
+        ] {
+            assert!(delivery_refused_for_good(&error), "{error:?}");
+        }
+        for error in [
+            ClientError::BodyUnread {
+                status: 413,
+                code: ErrorCode::TooLarge,
+                retry_after: None,
+            },
+            switch(409, ErrorCode::Conflict),
+            switch(503, ErrorCode::Unavailable),
+            ClientError::BadServiceSignature { status: 400 },
+        ] {
+            assert!(!delivery_refused_for_good(&error), "{error:?}");
+        }
+    }
 
     #[test]
     fn test_identity_cap_keeps_its_headroom() {

@@ -106,8 +106,8 @@ impl Service {
                     Err(_) => refuse(&ApiError::unavailable("7.6: a temporary failure")),
                 }
             }
-            // At the identity's service time, which no answer shows going back (Switch wire
-            // 7.1 Timestamp, 7.3 step 3).
+            // At the last time the service committed for the identity, since the refusal
+            // commits nothing (Switch wire 7.1 Timestamp).
             Err((error, time_ms)) => Self::signed_error(&current, signature, time_ms, &error),
         }
     }
@@ -152,7 +152,9 @@ impl Service {
 
     /// What the enrollment's answer names, under the verdict of the identity's account and
     /// mark (Switch wire 3.7, 7.3 Tables 2 and 3): a new account's, or an existing one's. A
-    /// refusal comes with the identity's service time it is answered at.
+    /// refusal comes with the time it is answered at: the last time the service committed
+    /// for the identity, or the time base for an identity without an account (Switch wire
+    /// 7.1 Timestamp).
     async fn answer_enrollment(
         &self,
         enrollment: &Enrollment,
@@ -166,11 +168,12 @@ impl Service {
             .judge_at_step_two(identity_text)
             .await
             .map_err(|error| (error, base_ms))?;
-        // The identity's service time (Switch wire 7.1 Timestamp, 7.3 step 3).
-        let service_ms = found
+        // The last time the service committed for the identity, or the time base where it
+        // holds no account (Switch wire 7.1 Timestamp).
+        let committed_ms = found
             .as_ref()
-            .map_or(base_ms, |found| base_ms.max(found.stamped_time_ms));
-        let at = |error: ApiError| (error, service_ms);
+            .map_or(base_ms, |found| found.stamped_time_ms);
+        let at = |error: ApiError| (error, committed_ms);
         let enrollment_hash = enrollment
             .signed()
             .doc_hash()
@@ -199,7 +202,7 @@ impl Service {
         }
         self.enroll_at_account(enrollment, identity_text, enrollment_hash, base_ms)
             .await
-            .map_err(at)
+            .map_err(|(error, under_lock)| (error, under_lock.unwrap_or(committed_ms)))
     }
 
     /// Create the identity's account (Switch wire 7.3, Table 3), all under the identity's
@@ -310,21 +313,43 @@ impl Service {
     /// identity's lock and the account's: it changes nothing by itself, but at a serving
     /// account its `revoked_apps` are held for the next generation, and at a staged account
     /// that no document names yet the mark's key becomes the key the answer names, durably
-    /// before the commit.
+    /// before the commit. A refusal comes with the time the account last committed, read
+    /// under its lock, or `None` where it came before the lock.
     async fn enroll_at_account(
         &self,
         enrollment: &Enrollment,
         identity_text: &str,
         enrollment_hash: [u8; 32],
         base_ms: u64,
-    ) -> Result<Enrolled, ApiError> {
+    ) -> Result<Enrolled, (ApiError, Option<u64>)> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let mut txn = self
             .store
             .begin(identity_text)
             .await
-            .map_err(|e| store_error(&e))?
-            .ok_or_else(unavailable)?;
+            .map_err(|e| (store_error(&e), None))?
+            .ok_or_else(|| (unavailable(), None))?;
+        let committed_ms = txn.head().stamped_time_ms;
+        let refused = |error: ApiError| (error, Some(committed_ms));
+        let enrolled = self
+            .enroll_under_lock(&mut txn, enrollment, identity_text, enrollment_hash, base_ms)
+            .await
+            .map_err(refused)?;
+        txn.commit().await.map_err(|e| refused(store_error(&e)))?;
+        Ok(enrolled)
+    }
+
+    /// [`Service::enroll_at_account`] under the account's lock, `txn`, which the caller
+    /// commits.
+    async fn enroll_under_lock(
+        &self,
+        txn: &mut crate::store::AccountTxn,
+        enrollment: &Enrollment,
+        identity_text: &str,
+        enrollment_hash: [u8; 32],
+        base_ms: u64,
+    ) -> Result<Enrolled, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let time_ms = txn.stamp(base_ms);
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The account's creation time, read under the lock: the mark's, or the account's
@@ -361,7 +386,6 @@ impl Service {
             tracing::error!(%failure, "a staged account's mark taking the current key");
             return Err(unavailable());
         }
-        txn.commit().await.map_err(|e| store_error(&e))?;
         Ok(Enrolled {
             time_ms,
             limits,

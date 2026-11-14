@@ -226,13 +226,12 @@ pub(crate) enum Body {
     Octets,
 }
 
-/// A signed request, with its signature.
+/// A request this client built, signed in its `Switch-Signature` header but for the
+/// unauthenticated public read, to send with [`SwitchClient::send`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedRequest {
     /// The request.
     pub request: Request,
-    /// The 64 bytes of its `Switch-Signature`; `None` for the unauthenticated public read.
-    pub signature: Option<[u8; 64]>,
 }
 
 /// The request the client sent, as the service receives it, which a response signature
@@ -483,6 +482,7 @@ pub struct SwitchClient {
     pinned: Mutex<Option<[u8; 32]>>,
     last_server_time: Mutex<Option<u64>>,
     latest_server_time: Mutex<Option<u64>>,
+    latest_compared_time: Mutex<Option<u64>>,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
 }
@@ -537,6 +537,7 @@ impl SwitchClient {
             pinned: Mutex::new(pinned_key),
             last_server_time: Mutex::new(None),
             latest_server_time: Mutex::new(None),
+            latest_compared_time: Mutex::new(None),
             transport,
             clock,
         })
@@ -600,6 +601,22 @@ impl SwitchClient {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The `Switch-Server-Time` of this client's latest call, where it counts in the
+    /// comparison of service times that never go back (Switch spec 10.1, wire 7.1
+    /// Timestamp): every answer checked with the pinned key, refusals included, but those
+    /// that carry the time base, `None` for them and for a call without a checked answer.
+    /// Those are the notice, `503 recovery_required` (7.6); the `404` with `current: {
+    /// "hosted": false }` of an identity the service doesn't host (7.3 step 2); and an answer
+    /// that verifies only with the empty body field, given before the body was read (7.1).
+    /// Every other answer carries a time the service stamped, or the last time it committed
+    /// for the identity, which no later answer goes behind.
+    pub(crate) fn latest_compared_time(&self) -> Option<u64> {
+        *self
+            .latest_compared_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn set_latest(&self, time: Option<u64>) {
         *self
             .latest_server_time
@@ -612,16 +629,33 @@ impl SwitchClient {
         checked: &Result<CheckedResponse, ClientError>,
         response: &Response,
     ) {
+        let shown = || {
+            response
+                .header(header::SERVER_TIME)
+                .and_then(|text| parse_rfc3339(text).ok())
+        };
         let time = match checked {
             Ok(answer) => Some(answer.server_time_ms),
             // An error answer verified with the pinned key carries the stamped time only once
             // the request verified, which its head shows; a head it carries verified as the
             // account's, or the answer would have failed (Switch wire 7.1).
-            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => response
-                .header(header::SERVER_TIME)
-                .and_then(|text| parse_rfc3339(text).ok()),
+            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => shown(),
             Err(_) => None,
         };
+        // Every checked answer but those at the time base (Switch wire 7.1 Timestamp).
+        let compared = match checked {
+            Ok(answer) => Some(answer.server_time_ms),
+            Err(error @ ClientError::Switch { code, .. })
+                if *code != ErrorCode::RecoveryRequired && !error.is_not_hosted() =>
+            {
+                shown()
+            }
+            Err(_) => None,
+        };
+        *self
+            .latest_compared_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = compared;
         self.set_latest(time);
         if let Some(time) = time {
             *self
@@ -667,7 +701,8 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Usage`] for an invite code that isn't a token.
+    /// [`ClientError::Usage`] for an invite code that isn't a token, or a request header
+    /// the service would refuse at routing (Switch wire 7.1 "Each header once, as text").
     pub fn sign_request(
         &self,
         method: &str,
@@ -725,7 +760,6 @@ impl SwitchClient {
                     body,
                     timeout: auth.timeout,
                 },
-                signature: None,
             });
         }
         if let Some(code) = auth.invite_code
@@ -790,6 +824,16 @@ impl SwitchClient {
         };
         headers.push(Header::new(header::TIMESTAMP, &timestamp));
         headers.push(Header::new(header::SIGNATURE, &b64(&signature)));
+        // Nothing the service refuses at routing is sent: each signed header once, with a
+        // printable value, never empty (Switch wire 7.1 "Each header once, as text").
+        let received = http::ReceivedHeaders::of(
+            headers
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_bytes())),
+        );
+        if let Some(reason) = received.broken_rule() {
+            return Err(ClientError::Usage(format!("Switch wire {reason}")));
+        }
         Ok(SignedRequest {
             request: Request {
                 method,
@@ -799,7 +843,6 @@ impl SwitchClient {
                 body,
                 timeout: auth.timeout,
             },
-            signature: Some(signature),
         })
     }
 

@@ -873,11 +873,31 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     let cert = request.request.header(header::CERT).unwrap();
     assert_eq!(cert, cert_of(&identity(), &app_keys()).signed().compact());
     assert_eq!(request.request.header(header::INVITE_CODE), Some(code));
-    // An invite code that isn't a token isn't sent.
-    assert!(matches!(
-        foreign.sign_request("GET", "/v1/x/directory", Vec::new(), Some("a b")),
-        Err(ClientError::Usage(_))
-    ));
+    // An invite code that isn't a token isn't sent, an empty one included, which the service
+    // would refuse at routing (Switch wire 7.1 "Each header once, as text").
+    for code in ["a b", ""] {
+        assert!(
+            matches!(
+                foreign.sign_request("GET", "/v1/x/directory", Vec::new(), Some(code)),
+                Err(ClientError::Usage(_))
+            ),
+            "{code:?}"
+        );
+    }
+    // Every request it builds keeps the header rule the service checks at routing.
+    for (client, code) in [(&own, None), (&foreign, Some(code))] {
+        let request = client
+            .sign_request("POST", "/v1/x/ops", b"{}".to_vec(), code)
+            .unwrap()
+            .request;
+        let received = http::ReceivedHeaders::of(
+            request
+                .headers
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_bytes())),
+        );
+        assert_eq!(received.broken_rule(), None);
+    }
     // Operations are written only at the caller's own account.
     assert!(foreign.sign_batch(1, two_lists(), None).is_err());
 }
@@ -928,7 +948,8 @@ fn test_signer_requests_credential_signs_a_request_that_verifies() {
     let signed = requests
         .sign_request("GET", "/v1/x/apps", Vec::new(), None)
         .unwrap();
-    let signature = signed.signature.unwrap();
+    let signature =
+        http::decode_signature(signed.request.header(header::SIGNATURE).unwrap()).unwrap();
     let target = http::RequestTarget {
         method: "GET",
         path_and_query: "/v1/x/apps",
@@ -1308,6 +1329,72 @@ async fn test_write_answer_proof_must_be_the_transition_written() {
         client.leave().await.unwrap_err(),
         ClientError::Chain(_)
     ));
+}
+
+#[tokio::test]
+async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
+    // Every answer checked with the pinned key counts in the comparison of service times,
+    // refusals without the head included, but the notice, the not-hosted `404` and an answer
+    // that verifies only with the empty body field (Switch wire 7.1 Timestamp, spec 10.1).
+    let error = |code: &str, current: Value| {
+        let mut body = json!({ "code": code, "message": "m" });
+        if !current.is_null() {
+            body["current"] = current;
+        }
+        body
+    };
+    let notice = json!({ "generation": 1, "reason": "behind", "permanent": false });
+    for (status, body, compared) in [
+        (200, json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                      "invite_codes": [] }), true),
+        (401, error("bad_signature", Value::Null), true),
+        (401, error("stale_timestamp", json!({ "server_time": rfc3339(NOW) })), true),
+        (403, error("not_current", Value::Null), true),
+        (429, error("rate_limited", Value::Null), true),
+        (503, error("unavailable", Value::Null), true),
+        (404, error("not_found", Value::Null), true),
+        (404, error("not_found", json!({ "hosted": true })), true),
+        (404, error("not_found", http::not_hosted_current()), false),
+        (503, error("recovery_required", notice.clone()), false),
+    ] {
+        let client = client_with(app(), Some(service_public()), fixed(service_key(), status, body.clone()));
+        let _ = client.allow().await;
+        assert_eq!(
+            client.latest_compared_time(),
+            compared.then_some(NOW),
+            "{status} {body}"
+        );
+    }
+    // Given before the body was read: a `413`, which verifies only with the empty body field.
+    let key = service_key();
+    let unread = Arc::new(MockTransport::with_handler(move |request| {
+        let body = error("too_large", Value::Null).to_string().into_bytes();
+        let server_time = rfc3339(NOW);
+        let signature = sign_response(
+            &key,
+            &http::ResponseParts {
+                status: 413,
+                request: SentRequest::of(request).received(false),
+                server_time: &server_time,
+                head: None,
+                body: &body,
+            },
+        );
+        Ok(Response {
+            status: 413,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, &server_time),
+            ],
+            body,
+        })
+    }));
+    let client = client_with(app(), Some(service_public()), unread);
+    assert!(matches!(
+        client.allow().await,
+        Err(ClientError::BodyUnread { status: 413, .. })
+    ));
+    assert_eq!(client.latest_compared_time(), None);
 }
 
 #[tokio::test]

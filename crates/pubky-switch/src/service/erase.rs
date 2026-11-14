@@ -169,7 +169,7 @@ impl Service {
         asked: Asked<'_>,
     ) -> SwitchResponse {
         let refuse =
-            |error: ApiError| self.keyed_error(&routed.key, asked, base_ms, base_ms, &error);
+            |error: ApiError| self.keyed_error(&routed.key, asked, base_ms, &error);
         if request.route.call != Call::Erase {
             return self.service_error(asked, base_ms, &marking::not_hosted());
         }

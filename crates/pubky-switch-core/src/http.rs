@@ -273,6 +273,26 @@ impl ReceivedHeaders {
             .and_then(|at| self.values.get(at))
             .map_or(&[], Vec::as_slice)
     }
+
+    /// The header rule these headers break, as the reason of its `400 bad_request`, or
+    /// `None` (Switch wire 7.1 "Each header once, as text"): a signed request header sent more
+    /// than once, or present with a value that is empty or isn't printable ASCII (bytes 0x20
+    /// to 0x7E). The service never acts on signed values it would have to choose between, or
+    /// on one it would read otherwise than its answer binds it. The public read, which uses
+    /// none of these headers, is exempt; the caller decides that by the call.
+    pub fn broken_rule(&self) -> Option<&'static str> {
+        if self.values.iter().any(|values| values.len() > 1) {
+            return Some("7.1: a signed request header sent more than once");
+        }
+        let mut values = self.values.iter().flatten();
+        if values.clone().any(Vec::is_empty) {
+            return Some("7.1: a signed request header with an empty value");
+        }
+        if values.any(|value| !value.iter().all(|byte| (0x20..=0x7e).contains(byte))) {
+            return Some("7.1: a signed request header whose value isn't printable ASCII");
+        }
+        None
+    }
 }
 
 /// The request a response answers, exactly as the service received it (Switch wire 7.1).
@@ -1271,6 +1291,52 @@ mod tests {
         .unwrap();
         assert!(fields[2].is_empty());
         assert_eq!(BodyField::read(b"").as_bytes(), hash(b""));
+    }
+
+    #[test]
+    fn test_received_headers_broken_rule() {
+        let of = |pairs: &[(&str, &[u8])]| ReceivedHeaders::of(pairs.iter().copied());
+        // Absent, once, and headers a received request doesn't cover break nothing.
+        assert_eq!(ReceivedHeaders::default().broken_rule(), None);
+        assert_eq!(honest_headers().broken_rule(), None);
+        assert_eq!(
+            of(&[(header::APP, b"a b~"), ("content-type", b""), ("x-other", b"\xff")])
+                .broken_rule(),
+            None
+        );
+        // Repeated, empty, or not printable ASCII: refused, each with its own reason.
+        for (pairs, reason) in [
+            (
+                &[(header::TIMESTAMP, b"t".as_slice()), (header::TIMESTAMP, b"t")][..],
+                "7.1: a signed request header sent more than once",
+            ),
+            (
+                &[(header::APP, b"a".as_slice()), ("Switch-App", b"b")][..],
+                "7.1: a signed request header sent more than once",
+            ),
+            (
+                &[(header::INVITE_CODE, b"".as_slice())][..],
+                "7.1: a signed request header with an empty value",
+            ),
+            (
+                &[(header::TRANSFER, b"".as_slice())][..],
+                "7.1: a signed request header with an empty value",
+            ),
+            (
+                &[(header::APP, b"\xff\xfe".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+            (
+                &[(header::CERT, b"a\tb".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+            (
+                &[(header::SIGNATURE, b"a\x7f".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+        ] {
+            assert_eq!(of(pairs).broken_rule(), Some(reason), "{pairs:?}");
+        }
     }
 
     #[test]

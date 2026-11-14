@@ -289,7 +289,8 @@ fn set_read_only(dir: &std::path::Path, read_only: bool) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-fn signature_of(request: &SwitchRequest) -> Sent {
+/// `request` as sent, which an answer to it binds (Switch wire 7.1); it carries a signature.
+fn signed_sent(request: &SwitchRequest) -> Sent {
     let sent = Sent::of(request);
     assert!(sent.signed(), "signature");
     sent
@@ -936,7 +937,7 @@ async fn test_erase_wakes_the_reads_waiting_on_the_account() {
         Vec::new(),
         ms(&at),
     );
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let started = std::time::Instant::now();
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1130,7 +1131,7 @@ async fn test_erase_conflict_at_a_failing_account_carries_the_held_copy() {
         }
         assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
         let request = erasure(&replay, Some(&held_hash()), ms(&at)).await;
-        let sent = signature_of(&request);
+        let sent = signed_sent(&request);
         let answer = service.handle(request).await;
         assert_eq!(answer.status, 200, "{reason}: {}", text(&answer));
         assert!(no_head(&answer));
@@ -1196,7 +1197,7 @@ async fn test_erase_at_a_lost_identity_writes_the_record_and_deletes_the_mark() 
     assert_eq!(code_of(&apps), (503, json!("recovery_required")));
     assert_eq!(body(&apps)["current"]["reason"], json!("behind"));
     let request = erasure(&replay, Some(&[9; 32]), ms(now)).await;
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let answer = replay.service.handle(request).await;
     assert_eq!(answer.status, 200, "{}", text(&answer));
     assert_eq!(answer.body.as_slice(), br#"{"erased":true}"#);
@@ -1331,7 +1332,7 @@ async fn test_erase_deletion_that_doesnt_commit_withdraws_the_record() {
     let mark = held_mark(&replay, &alice_id()).await;
     let at = revoke_time();
     let request = erasure(&replay, Some(&held_hash()), ms(&at)).await;
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let answer = replay.service.handle(request).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
@@ -1369,7 +1370,7 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     let ledger = replay.key_dir().join("accounts").join("erasures");
     set_read_only(&ledger, true);
     let request = erasure(&replay, Some(&held_hash()), ms(&at)).await;
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let answer = replay.service.handle(request).await;
     set_read_only(&ledger, false);
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
@@ -1918,7 +1919,7 @@ async fn test_erase_restored_account_is_never_served_while_the_mark_store_cant_b
         )
     };
     let request = feed();
-    let sent = signature_of(&request);
+    let sent = signed_sent(&request);
     let answer = service.handle(request).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
@@ -2350,7 +2351,7 @@ async fn test_erase_lost_identity_requires_created() {
     let mark = held_mark(&replay, &alice_id()).await;
     for named in [None, Some(ms(created) + 1), Some(ms(created) - 250)] {
         let request = erasure_naming(named, None, ms(now));
-        let sent = signature_of(&request);
+        let sent = signed_sent(&request);
         let answer = replay.service.handle(request).await;
         assert_eq!(
             conflict_current(&answer),

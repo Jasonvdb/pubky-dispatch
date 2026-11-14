@@ -3430,6 +3430,66 @@ async fn test_app_service_time_going_back_is_an_alarm() {
 }
 
 #[tokio::test]
+async fn test_app_service_time_leaves_out_only_the_time_base_answers() {
+    // Each answer verified with the pinned key counts in the comparison of service times,
+    // a refusal without the head included, but the answers at the time base: the notice,
+    // the not-hosted `404` and an answer given before the body was read. A service that
+    // shows an earlier time on any other is misbehaviour (Switch spec 10.1, wire 7.1
+    // Timestamp).
+    let earlier = START + HOUR / 2;
+    let after_a_read = || async {
+        let w = World::new();
+        let mut app = w.join("wallet").await;
+        w.clock.advance_ms(HOUR);
+        app.receive(None).await.unwrap();
+        // The time base goes back.
+        w.clock.set_ms(earlier);
+        (w, app)
+    };
+    let not_an_alarm = |what: &str, result: Result<crate::app::ReceiveReport, AppError>| {
+        assert!(
+            !matches!(result, Err(AppError::Alarm(_))),
+            "{what}: {result:?}"
+        );
+    };
+    // The notice.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lose_mark();
+    not_an_alarm("the notice", app.receive(None).await);
+    // The `404` of an identity the switch doesn't host.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lose_account();
+    w.switch.lose_mark();
+    not_an_alarm("not hosted", app.receive(None).await);
+    // An answer given before the body was read.
+    let (w, mut app) = after_a_read().await;
+    w.switch.fail_next(Fault::BeforeTheBody {
+        path: "/feed".into(),
+        code: ErrorCode::TooLarge,
+    });
+    not_an_alarm("before the body", app.receive(None).await);
+    // The `503` of a mark store that can't be read commits nothing: it carries the last
+    // time committed, no earlier than the one the app verified.
+    let (w, mut app) = after_a_read().await;
+    w.switch.set_mark_store_unreadable(true);
+    not_an_alarm("the store can't be read", app.receive(None).await);
+    // A `401`, answered before the request verified and without the head, at a time earlier
+    // than the app verified: the service went back.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lock().stamped_ms = earlier;
+    w.switch.fail_next(Fault::Error {
+        path: "/feed".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::ServiceTimeBackwards { .. })),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
     let w = World::new();
     let mut app = w.join("wallet").await;

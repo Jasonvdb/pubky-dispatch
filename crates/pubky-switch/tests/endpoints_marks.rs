@@ -1004,3 +1004,91 @@ async fn test_marks_unknown_verdict_carries_the_identitys_service_time() {
     assert!(signed_with(&answer, &service_public(&replay), &sent));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The `Switch-Server-Time` of `answer`, in Unix milliseconds.
+fn time_shown(answer: &SwitchResponse) -> u64 {
+    ms(header_text(answer, header::SERVER_TIME).expect("Switch-Server-Time"))
+}
+
+#[tokio::test]
+async fn test_marks_answers_that_commit_nothing_never_run_ahead_of_the_next_commit() {
+    // An answer that commits nothing carries the last time the service committed for the
+    // identity, never the identity's service time of the moment: so once the wall clock goes
+    // back, within the 5 minutes the time base follows it, the next commit stamps no time
+    // earlier than one an answer already showed (Switch wire 7.1 Timestamp, spec 10.1).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (_, base) = served(&replay).await;
+    let committed = replay.service.handle(apps_read(base)).await;
+    assert_eq!(committed.status, 200);
+    let last_committed = time_shown(&committed);
+    let ahead = base + 240_000;
+    replay.clock.set_wall_ms(ahead);
+    assert_eq!(replay.time.peek().base_ms, ahead, "the time base");
+    let mut shown = Vec::new();
+    // Refused before the lock: a request signature that doesn't verify, a stale timestamp.
+    for (request, code_of) in [
+        (bad_signature(apps_read(ahead)), "bad_signature"),
+        (apps_read(ahead - 301_000), "stale_timestamp"),
+    ] {
+        let answer = replay.service.handle(request).await;
+        assert_eq!(code(&answer), code_of);
+        shown.push((code_of, time_shown(&answer)));
+    }
+    // A `429` before authentication, at a hosted account.
+    let (limited, _) = restarted(
+        &replay,
+        Limits {
+            auth_failures_per_source_per_min: 1,
+            ..Limits::default()
+        },
+    );
+    let source = "203.0.113.9";
+    let failed = limited
+        .handle(from_source(bad_signature(apps_read(ahead)), source))
+        .await;
+    assert_eq!(code(&failed), "bad_signature");
+    let answer = limited.handle(from_source(apps_read(ahead), source)).await;
+    assert_eq!(code(&answer), "rate_limited");
+    shown.push(("rate_limited", time_shown(&answer)));
+    // The `503` of a mark store that can't be read, to a call and to an enrollment.
+    let store_id = accounts_dir(&replay).join("store-id");
+    let id = std::fs::read(&store_id).expect("store-id");
+    std::fs::remove_file(&store_id).expect("remove store-id");
+    let (unread, _) = restarted(&replay, Limits::default());
+    let http = vectors("http.json");
+    let enrollment = named(&http["requests"], "signer: enrollment");
+    let enrollment_body =
+        pubky_switch_core::enc::unb64(enrollment["body_b64"].as_str().expect("body")).expect("b64");
+    for (request, what) in [
+        (apps_read(ahead), "a call"),
+        (
+            signer_request("POST", "/v1/enroll", enrollment_body, ahead),
+            "an enrollment",
+        ),
+    ] {
+        let answer = unread.handle(request).await;
+        assert_eq!(code(&answer), "unavailable", "{what}");
+        shown.push((what, time_shown(&answer)));
+    }
+    std::fs::write(&store_id, id).expect("restore store-id");
+    for (what, at) in &shown {
+        assert_eq!(*at, last_committed, "{what}: the last committed time");
+    }
+    assert_eq!(account_row(&replay).await.1, i64::try_from(last_committed).expect("ms"));
+    // The wall clock back by two minutes: the next commit stamps the time base, earlier than
+    // the time those answers would have shown had they carried the time of the moment, and
+    // no earlier than any they showed.
+    let back = ahead - 120_000;
+    replay.clock.set_wall_ms(back);
+    assert_eq!(replay.time.peek().base_ms, back, "the time base went back");
+    let next = replay.service.handle(apps_read(back)).await;
+    assert_eq!(next.status, 200);
+    let stamped = time_shown(&next);
+    assert_eq!(stamped, back);
+    for (what, at) in &shown {
+        assert!(*at <= stamped, "{what}: {at} shown, {stamped} stamped next");
+    }
+    replay.db.drop_database().await.expect("drop");
+}

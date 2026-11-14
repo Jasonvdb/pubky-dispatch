@@ -541,12 +541,15 @@ impl Service {
         // The request as received, which every answer to it signs (Switch wire 7.1).
         let received = Received::read(&request, &self.origin);
         let asked = received.asked();
-        // A signed request header sent more than once is refused before the account is looked
-        // up and before any signature work: the service never chooses between two signed
-        // values. The public read uses none of them (Switch wire 7.1).
-        if received.repeats_a_signed_header() && request.route.call != Call::GetIdentity {
-            let error = ApiError::bad_request("7.1: a signed request header sent more than once");
-            return self.service_error(asked, base_ms, &error);
+        // A signed request header sent more than once, or present with a value empty or not
+        // printable ASCII, is refused before the account is looked up and before any
+        // signature work: the service never chooses between two signed values, nor reads one
+        // otherwise than its answer binds it. The public read uses none of them (Switch wire
+        // 7.1 "Each header once, as text").
+        if let Some(reason) = received.broken_header_rule()
+            && request.route.call != Call::GetIdentity
+        {
+            return self.service_error(asked, base_ms, &ApiError::bad_request(reason));
         }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
@@ -565,25 +568,31 @@ impl Service {
         };
         let class = marking::class_of(&request);
         let routed = verdict::answer(&judged.judgement, &class, self.current_key());
-        // The identity's service time (step 3): the time base, or the last time it stamped
-        // where the time base is earlier (Switch wire 7.1 Timestamp).
-        let service_ms = found
+        // The last time the service committed for the identity: the time an answer that
+        // commits nothing carries, so none shows a time later than the next commit stamps,
+        // even after the time base went back. An identity without an account has none, and
+        // such an answer carries the time base (Switch wire 7.1 Timestamp, spec 10.1).
+        let committed_ms = found
             .as_ref()
-            .map_or(base_ms, |found| base_ms.max(found.stamped_time_ms));
+            .map_or(base_ms, |found| found.stamped_time_ms);
+        // The identity's service time (step 3), which the checks before the lock that depend
+        // on time take: the time base, or the last time it stamped where the time base is
+        // earlier.
+        let service_ms = base_ms.max(committed_ms);
         if matches!(routed.route, Route::Notice(_)) {
             // The notice replaces every later answer, a `401` and a `403` before
-            // authentication included, but a `413` or a `429` answered before it, which
-            // carries the identity's service time as such an answer does; a request that
-            // would have been a `401` still counts against its source (Switch wire 7.1
-            // Timestamp, 7.3 under Table 2, 9.4).
+            // authentication included, but a `429` answered before it, which commits nothing
+            // and carries the last committed time; a request that would have been a `401`
+            // still counts against its source (Switch wire 7.1 Timestamp, 7.3 under Table 2,
+            // 9.4).
             if let Some(limited) = self.limited_before_authentication(&account, &request, base_ms) {
-                return self.keyed_error(&routed.key, asked, service_ms, base_ms, &limited);
+                return self.keyed_error(&routed.key, asked, committed_ms, &limited);
             }
             if *call != Call::GetIdentity {
                 let _ = self.pre_lock(&account, &request, base_ms, service_ms).await;
             }
         }
-        if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms, service_ms) {
+        if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms, committed_ms) {
             return answer;
         }
         if found.is_none() {
@@ -593,11 +602,11 @@ impl Service {
                 .erase_without_account(&account, &request, &routed, base_ms, asked)
                 .await;
         }
-        // An answer before the account's lock: signed with the verdict's key, at the
-        // identity's service time, which it doesn't move (Switch wire 7.1 Timestamp, 7.3 step
-        // 3).
+        // An answer before the account's lock commits nothing: signed with the verdict's key,
+        // at the last time the service committed for the identity (Switch wire 7.1
+        // Timestamp).
         let refused_early =
-            |error: ApiError| self.keyed_error(&routed.key, asked, service_ms, base_ms, &error);
+            |error: ApiError| self.keyed_error(&routed.key, asked, committed_ms, &error);
         // Everything that needs no account state comes before the lock: the limits that
         // apply before authentication, the headers and the signature (Switch wire 7.2).
         let PreLock {
@@ -932,16 +941,19 @@ impl Service {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let identity = txn.head().id.clone();
         let identity_key = txn.head().identity_key;
+        // The time the account last committed: what an answer that commits nothing carries
+        // (Switch wire 7.1 Timestamp).
+        let committed_ms = txn.head().stamped_time_ms;
         let held = match txn.held_identity().await {
             Ok(Some(held)) => match IdentityDoc::verify(&held.doc, &identity_key) {
                 Ok(doc) => Some(doc),
                 Err(_) => {
                     tracing::error!("a held identity.json doesn't verify");
-                    return self.service_error(asked, base_ms, &unavailable());
+                    return self.service_error(asked, committed_ms, &unavailable());
                 }
             },
             Ok(None) => None,
-            Err(error) => return self.service_error(asked, base_ms, &store_error(&error)),
+            Err(error) => return self.service_error(asked, committed_ms, &store_error(&error)),
         };
         // The verdict again, under the lock (Switch wire 7.3 step 2).
         let head = txn.head().clone();
@@ -956,27 +968,23 @@ impl Service {
             && let Some(erased_at_ms) = judged.erasure_at_ms
         {
             drop(txn);
-            let error = match self.erase_again(&identity, erased_at_ms).await {
-                Ok(()) => marking::not_hosted(),
-                Err(error) => error,
+            return match self.erase_again(&identity, erased_at_ms).await {
+                Ok(()) => self.service_error(asked, base_ms, &marking::not_hosted()),
+                Err(error) => self.service_error(asked, committed_ms, &error),
             };
-            return self.service_error(asked, base_ms, &error);
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
-        // The identity's service time (step 3), not yet stamped.
-        let service_ms = base_ms.max(txn.head().stamped_time_ms);
-        if let Some(answer) = self.verdict_answer(&identity, &routed, asked, base_ms, service_ms) {
+        if let Some(answer) = self.verdict_answer(&identity, &routed, asked, base_ms, committed_ms)
+        {
             return answer;
         }
         let Some(signer) = self.signer_of(&routed.key) else {
-            return self.service_error(asked, base_ms, &unavailable());
+            return self.service_error(asked, committed_ms, &unavailable());
         };
         // Only an answer the verdict lets carry a head carries one (Switch wire 7.3 under
         // Table 2): the start of a generation carries its own.
         let carries_head = matches!(routed.route, Route::Proceed { head: true });
         let healthy = matches!(judged.judgement.verdict, verdict::Verdict::Healthy);
-        // The time the account last committed, for an answer whose commit fails.
-        let committed_ms = txn.head().stamped_time_ms;
         // Step 3: the identity's service time, which never goes back.
         let time_ms = txn.stamp(base_ms);
         // A failure under the lock: the transaction is dropped, nothing of it stays, and the
@@ -1155,16 +1163,15 @@ impl Service {
                         sign_answer(page.signer(), asked, time_ms, answer)
                     }
                     // Signed when it answers, after the wait: the notice and the not-hosted
-                    // `404` at the time base then, an unknown verdict's `503` at the identity's
-                    // service time (Switch wire 7.1 Timestamp).
+                    // `404` at the time base then, an unknown verdict's `503` at the last time
+                    // the read saw committed (Switch wire 7.1 Timestamp).
                     Err(feed::FeedStop::Verdict {
                         key,
                         error,
-                        service_ms,
+                        committed_ms,
                     }) => {
-                        let now_ms = self.time.read().base_ms;
-                        let at_ms = service_ms.map_or(now_ms, |at| at.max(now_ms));
-                        self.keyed_error(&key, asked, at_ms, now_ms, &error)
+                        let at_ms = committed_ms.unwrap_or_else(|| self.time.read().base_ms);
+                        self.keyed_error(&key, asked, at_ms, &error)
                     }
                     Err(feed::FeedStop::Refused(refusal)) => {
                         // Every 401 counts against the network source (9.4).

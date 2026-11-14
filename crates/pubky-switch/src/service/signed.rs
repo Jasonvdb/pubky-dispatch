@@ -83,12 +83,11 @@ impl<'a> Received<'a> {
         }
     }
 
-    /// Whether it carries one of the signed request headers more than once (Switch wire
-    /// 7.1).
-    pub(super) fn repeats_a_signed_header(&self) -> bool {
-        wire_http::RECEIVED_HEADERS
-            .iter()
-            .any(|name| self.headers.values(name).len() > 1)
+    /// The header rule it breaks, as its refusal's reason: a signed request header sent more
+    /// than once, or present with a value empty or not printable ASCII (Switch wire 7.1
+    /// "Each header once, as text").
+    pub(super) fn broken_header_rule(&self) -> Option<&'static str> {
+        self.headers.broken_rule()
     }
 
     /// The request every answer to it signs.
@@ -170,16 +169,16 @@ impl Service {
         sign_answer(signer, asked, time_ms, Answer::error(error))
     }
 
-    /// `error` signed with the service key at the time base `base_ms`, without a head: an
-    /// answer the service can't tie to an account, or one whose verdict's key it doesn't
-    /// hold (Switch wire 7.1).
+    /// `error` signed with the service key at `time_ms`, without a head: an answer the
+    /// service can't tie to an account, at the time base, or one whose verdict's key it
+    /// doesn't hold (Switch wire 7.1).
     pub(super) fn service_error(
         &self,
         asked: Asked<'_>,
-        base_ms: u64,
+        time_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
-        Self::signed_error(&self.keys.current(), asked, base_ms, error)
+        Self::signed_error(&self.keys.current(), asked, time_ms, error)
     }
 
     /// The signer of `key`, the key the verdict answers with; `None` when the key store
@@ -192,21 +191,20 @@ impl Service {
         signer
     }
 
-    /// `error` signed with `key` at `time_ms`, without a head, or with the service key at
-    /// the time base when the key store doesn't hold `key`.
+    /// `error` signed with `key` at `time_ms`, without a head, or a `503` with the service
+    /// key at the same time when the key store doesn't hold `key`.
     pub(super) fn keyed_error(
         &self,
         key: &[u8; 32],
         asked: Asked<'_>,
         time_ms: u64,
-        base_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
         match self.signer_of(key) {
             Some(signer) => Self::signed_error(&signer, asked, time_ms, error),
             None => self.service_error(
                 asked,
-                base_ms,
+                time_ms,
                 &ApiError::unavailable("7.6: a temporary failure"),
             ),
         }

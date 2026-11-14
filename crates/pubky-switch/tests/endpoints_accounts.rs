@@ -977,10 +977,13 @@ async fn test_stale_timestamp_gives_a_time_to_retry_with() {
         (refused.status, code(&refused).as_str()),
         (401, "stale_timestamp")
     );
-    // The signed time is the identity's service time, here the time base, later than the
-    // last time it stamped, which the refusal doesn't move; the body gives the time base
-    // too (Switch wire 7.1 Timestamp, 7.3 step 3).
-    assert_eq!(header_of(&refused, header::SERVER_TIME), Some(T));
+    // The refusal commits nothing: its signed time is the last time the service committed
+    // for the identity, which it doesn't move; the body gives the time base (Switch wire
+    // 7.1 Timestamp).
+    assert_eq!(
+        header_of(&refused, header::SERVER_TIME),
+        Some(last_committed)
+    );
     assert_eq!(
         replay
             .db

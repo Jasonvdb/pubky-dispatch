@@ -2867,38 +2867,43 @@ impl App {
     }
 
     /// The service time of the latest checked answer (Switch spec 10.1): the highest is
-    /// kept with its key, and its offset from the device clock; an earlier one from the
-    /// same key is misbehaviour, returned as the alarm.
+    /// kept with its key, and the offset of the latest stamped one from the device clock; an
+    /// earlier one from the same key is misbehaviour, returned as the alarm.
     fn note_service_time(&mut self) -> Option<Alarm> {
-        // Only the latest call's own stamped time: a refusal answered before the request
-        // verified stamps nothing, and measures nothing (Switch wire 7.1).
-        let time = self.client.latest_server_time()?;
+        // Every checked answer counts in the comparison but those at the time base: a
+        // refusal that committed nothing carries the last time the service committed, which
+        // no later answer goes behind (Switch wire 7.1 Timestamp).
+        let compared = self.client.latest_compared_time()?;
+        let key = self.state.meta.service_key;
+        let held = self.state.service_time.filter(|held| held.key == key);
+        let alarm = held
+            .filter(|held| compared < held.highest_ms)
+            .map(|held| Alarm::ServiceTimeBackwards {
+                highest: held.highest_ms,
+                signed: compared,
+            });
+        let highest_ms = held.map_or(compared, |held| held.highest_ms.max(compared));
+        // Only a time the latest call stamped measures the clock: the last committed time a
+        // refusal carries may be days old on an idle account (Switch wire 7.1). Such a time
+        // raises the highest one held, and starts none: the first stamped one does.
+        let Some(time) = self.client.latest_server_time() else {
+            if let Some(held) = held
+                && held.highest_ms < highest_ms
+            {
+                self.state.service_time = Some(ServiceTime { highest_ms, ..held });
+                self.service_time_dirty = true;
+            }
+            return alarm;
+        };
         let now = self.now();
         self.time_fresh_at = Some(now);
-        let key = self.state.meta.service_key;
         let offset = i64::try_from(time)
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX));
-        let mut alarm = None;
-        let record = match self.state.service_time {
-            Some(held) if held.key == key => {
-                if time < held.highest_ms {
-                    alarm = Some(Alarm::ServiceTimeBackwards {
-                        highest: held.highest_ms,
-                        signed: time,
-                    });
-                }
-                ServiceTime {
-                    key,
-                    highest_ms: held.highest_ms.max(time),
-                    offset_ms: offset,
-                }
-            }
-            _ => ServiceTime {
-                key,
-                highest_ms: time,
-                offset_ms: offset,
-            },
+        let record = ServiceTime {
+            key,
+            highest_ms,
+            offset_ms: offset,
         };
         if time > now.saturating_add(SERVICE_TIME_AHEAD_MS)
             || offset.unsigned_abs() > CLOCK_TOLERANCE_MS

@@ -8,8 +8,9 @@
 //!    answer, and asks the user to revoke the Pubky grant of each app, listed or removed,
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
-//! 2. sends `POST /v1/{id}/erase` naming, once this install delivered a version there, the
-//!    hash of its mark as `identity_hash`, the same body again until it is answered or, after
+//! 2. sends `POST /v1/{id}/erase` naming the account's creation time, as its enrollment
+//!    answer gave it, and, once this install delivered a version there, the hash of its mark
+//!    as `identity_hash`, the same body again until it is answered or, after
 //!    a request in doubt, the check's read meets the switch's `404`, marking before each
 //!    request that it may land. A `200` confirms the erasure. After a request that may have
 //!    landed, as a lost `200` leaves it, so does the `404` the pinned key signed for an
@@ -36,8 +37,12 @@
 //! meanwhile. Revocations are refused during an erasure, and none pending is
 //! sent: it signs nothing else (spec 12.7 step 5).
 //!
-//! A `409 conflict`, signed, is the switch refusing it: another key, another `identity.json`
-//! than the mark, or a move in progress. The request didn't land, so it is no longer in doubt,
+//! A `409 conflict`, signed, is the switch refusing it: another creation time, another
+//! `identity.json` than the mark, or a move in progress. Every one names the creation time it
+//! was checked against: one other than the request named is kept as the account's and the
+//! erasure sent again naming it, once, as a signer that holds none, after a restore or a
+//! hand-over, learns it; a `409` without a readable one stops the erasure there, in progress,
+//! and tells the user (Switch wire 7.4.16). The request didn't land, so it is no longer in doubt,
 //! and the switch's copy is judged first, as every copy: another install's newer copy ends
 //! the erasure as any other install found signing does, this install's own keeps it as
 //! records behind, and a copy that went back raises the alarm. With the mark still held, the
@@ -159,16 +164,31 @@ impl Signer {
             };
             self.commit(self.state.clone(), Some(flow)).await?;
         }
+        self.send_erasure(unpublished, reminded, unanswered, true)
+            .await
+    }
+
+    /// The erasure's request, and what its answer makes of the flow. With `relearn`, a signed
+    /// `409` naming another creation time than the request did has it kept as the account's
+    /// and the request sent once more, naming it (Switch wire 7.4.16).
+    async fn send_erasure(
+        &mut self,
+        unpublished: bool,
+        reminded: Vec<[u8; 16]>,
+        unanswered: bool,
+        relearn: bool,
+    ) -> Result<()> {
         // Through the signing gate, as every signing step: the erasure is the identity's
-        // to ask for only while this install signs. It names the mark it follows, so a
-        // delivery since the last check, such as another install's take-over, makes the switch
-        // refuse it; a retry names the same one (Switch wire 7.4.16).
-        let following = self.erasure_follows()?;
+        // to ask for only while this install signs. It names the account's creation time and
+        // the mark it follows, so a delivery since the last check, such as another install's
+        // take-over, makes the switch refuse it, and so does a later account of the identity
+        // there; a retry names the same (Switch wire 7.4.16).
+        let (created, following) = self.erasure_names()?;
         let answer = {
             let key = self.signing_key()?;
             let client = self.signing_client(&key)?;
             drop(key);
-            client.erase(following).await
+            client.erase(created, following).await
         };
         match answer {
             Ok(()) => self.erased().await,
@@ -201,6 +221,46 @@ impl Signer {
             // landed, and the mark stays.
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
                 Err(error.into())
+            }
+            // Every `409` to an erasure names the creation time it was checked against; without
+            // one, the erasure stops here, in progress, and the user is told (Switch wire
+            // 7.4.16).
+            Err(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            }) if checked_against(&current).is_none() => {
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded,
+                    unanswered: false,
+                    first_404_ms: None,
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
+                Err(ClientError::InvalidResponse(
+                    "Switch wire 7.4.16: a 409 to the erasure without the creation time".into(),
+                )
+                .into())
+            }
+            // One other than the request named is the account's: it is kept, and the erasure
+            // is sent again naming it, whatever time was held, once (Switch wire 7.4.16).
+            Err(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            }) if relearn && checked_against(&current) != created => {
+                let mut state = self.state.clone();
+                if let Some(service) = state.service.as_mut() {
+                    service.created = checked_against(&current);
+                }
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded: reminded.clone(),
+                    unanswered: false,
+                    first_404_ms: None,
+                };
+                self.commit(state, Some(flow)).await?;
+                Box::pin(self.send_erasure(unpublished, reminded, false, false)).await
             }
             // Signed with the service key, so the request didn't land: another
             // `identity.json`, or a move in progress. The switch's copy is judged first, as
@@ -239,19 +299,23 @@ impl Signer {
         }
     }
 
-    /// The erasure's body, `identity_hash`, the document hash of the newest `identity.json`
-    /// the account holds as this install knows it (Switch wire 7.4.16 Request): the mark's,
-    /// once it names this account's service, that is, once this install delivered a version
-    /// here; `None` before, as at a staged account it delivered nothing to, which holds none.
-    fn erasure_follows(&self) -> Result<Option<[u8; 32]>> {
+    /// What the erasure's body names (Switch wire 7.4.16 Request), in one place: `created`,
+    /// the account's creation time its enrollment answer gave, or a `409` since, `None` where
+    /// this install holds none, after a restore or a hand-over; and `identity_hash`, the
+    /// document hash of the newest `identity.json` the account holds as this install knows
+    /// it: the mark's, once it names this account's service, that is, once this install
+    /// delivered a version here; `None` before, as at a staged account it delivered nothing
+    /// to, which holds none.
+    fn erasure_names(&self) -> Result<(Option<u64>, Option<[u8; 32]>)> {
         let Some(service) = self.state.service.as_ref() else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        Ok(self
+        let following = self
             .state
             .newest_doc()?
             .filter(|mark| mark.inbox().service_key == service.service_key)
-            .map(|mark| mark.hash()))
+            .map(|mark| mark.hash());
+        Ok((service.created, following))
     }
 
     /// Before each step of an erasure that deletes or asks to erase, a fresh check that this
@@ -531,4 +595,13 @@ enum Checked {
     /// didn't sign, with no other install anywhere; taken as erased once it has held for 24
     /// hours.
     ErasedAlready,
+}
+
+/// The creation time a `409` to an erasure was checked against, its `current.created`
+/// (Switch wire 7.4.16); `None` where it is missing or isn't a time.
+fn checked_against(current: &serde_json::Value) -> Option<u64> {
+    current
+        .get("created")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())
 }

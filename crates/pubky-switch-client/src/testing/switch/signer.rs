@@ -188,13 +188,15 @@ impl Inner {
             }
         }
         let limits = self.enroll_limits;
+        // The one key it names, at every account (Switch wire 7.4.1).
+        let service_key = self.service.verifying_key().to_bytes();
+        // The account's creation time, fixed for the account (Switch wire 3.7).
+        let created = self.creation_time();
         let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
             limits,
             answers: HashMap::new(),
         });
-        // The one key it names, at every account (Switch wire 7.4.1).
-        let service_key = self.service.verifying_key().to_bytes();
-        let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits, 0);
+        let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits, created);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
         enrolled.answers.insert(enrollment.hash(), value.clone());
         // The enrollment that makes the account names the App IDs it keeps for good; another
@@ -682,46 +684,34 @@ impl Inner {
         }
     }
 
-    /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): a timestamp earlier than
-    /// the account's creation is `401 stale_timestamp`; `identity_hash` names the newest
-    /// `identity.json` the account holds, left out only where it holds none (`409 conflict`
-    /// otherwise, whose `current.identity` is the copy held at an account that answers the
-    /// notice); and a move in progress refuses it (`409 conflict`): a frozen account that
-    /// doesn't fail stop, whose export this switch doesn't track, and a staged one holding an
-    /// import, but not one staged for a key change in place. Then the erasure's record is
-    /// written, the account goes, and its mark with it: every later call, a retry included,
-    /// gets the `404` of an identity the switch doesn't host. The answer is signed with the
-    /// one key, without a head; an app's call is `403 permission_missing`.
+    /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): a move in progress refuses
+    /// it (`409 conflict`): a frozen account that doesn't fail stop, whose export this switch
+    /// doesn't track, and a staged one holding an import. Then its binding to the account
+    /// ([`Inner::erasure_binding`]): the creation time, then the `identity.json` it follows.
+    /// Every `409` carries `current.created`. Then the erasure's record is written, dated no
+    /// earlier than the creation time it named, the account goes, and its mark with it: every
+    /// later call, a retry included, gets the `404` of an identity the switch doesn't host.
+    /// The answer is signed with the one key, without a head; an app's call is `403
+    /// permission_missing`.
     pub(super) fn erase_answer(&mut self, request: &crate::transport::Request) -> Answer {
         if let Some(refusal) = self.erasure_timestamp_refusal(request) {
             return refusal;
         }
-        let named = match pubky_switch_core::http::parse_erase_body(&request.body) {
-            Ok(named) => named.identity_hash,
-            Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
-        };
         let fails_stop = self.notice().is_some();
-        let held = self.doc.as_ref().map(IdentityDoc::hash);
-        if named != held {
-            // At an account that answers the notice, the copy it holds, which the signer
-            // reads nowhere else (Switch wire 7.4.16).
-            let current = if fails_stop {
-                json!({ "identity": self.doc.as_ref().map(|doc| doc.signed().clone()) })
-            } else {
-                json!(null)
-            };
+        if (self.frozen.is_some() && !fails_stop) || (self.staged && self.holds_import) {
             return bad(
                 ErrorCode::Conflict,
-                "Switch wire 7.4.16: the account holds another identity.json",
-                current,
+                "a move is in progress",
+                json!({ "created": pubky_switch_core::time::rfc3339(self.creation_time()) }),
             );
         }
-        if (self.frozen.is_some() && !fails_stop) || (self.staged && self.holds_import) {
-            return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
-        }
+        let created = match self.erasure_binding(request) {
+            Ok(created) => created,
+            Err(refusal) => return refusal,
+        };
         // The record first, then the deletion, then the mark (Switch wire 7.3, Table 3); all
         // at once here.
-        self.marks.erasure_at_ms = Some(self.now());
+        self.marks.erasure_at_ms = Some(self.now().max(created));
         self.drop_account();
         self.marks.slot = super::marks::MarkSlot::Missing;
         (200, json!({ "erased": true }))
@@ -951,7 +941,7 @@ mod tests {
                 origin: SWITCH_ORIGIN.into(),
                 path_and_query: "/v1/x/erase".into(),
                 headers: Vec::new(),
-                body: pubky_switch_core::http::erase_body(None, Some(&hash)),
+                body: pubky_switch_core::http::erase_body(Some(inner.creation_time()), Some(&hash)),
                 timeout: crate::transport::TimeoutClass::default(),
             };
             assert_eq!(inner.erase_answer(&erasure).0, 200);
@@ -1184,15 +1174,16 @@ mod tests {
             [2; 32],
             Arc::new(crate::clock::TestClock::new(0)),
         );
+        let mut inner = switch.lock();
+        let created = Some(inner.creation_time());
         let erasure = |hash: Option<&[u8; 32]>| crate::transport::Request {
             method: "POST".into(),
             origin: SWITCH_ORIGIN.into(),
             path_and_query: "/v1/x/erase".into(),
             headers: Vec::new(),
-            body: erase_body(None, hash),
+            body: erase_body(created, hash),
             timeout: crate::transport::TimeoutClass::default(),
         };
-        let mut inner = switch.lock();
         assert!(inner.doc.is_none());
         let (status, body) = inner.erase_answer(&erasure(Some(&[9; 32])));
         assert_eq!((status, body["code"].clone()), (409, json!("conflict")));

@@ -2160,7 +2160,7 @@ async fn signer_erases(w: &World) {
     )
     .unwrap();
     let held = w.switch.identity_doc().map(|doc| doc.hash());
-    signer.erase(held).await.unwrap();
+    signer.erase(Some(w.switch.created()), held).await.unwrap();
     assert!(w.switch.erased());
 }
 

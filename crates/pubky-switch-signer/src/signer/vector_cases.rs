@@ -54,6 +54,19 @@ fn text<'a>(value: &'a Value, member: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{member} isn't a string"))
 }
 
+/// The account's creation time `http.json`'s enrollment answer names (Switch wire 3.7).
+fn vector_created() -> u64 {
+    let http = load("http.json");
+    let answer = http["responses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| text(r, "name").starts_with("signer: enrollment answer"))
+        .unwrap();
+    let body: Value = serde_json::from_str(text(answer, "body")).unwrap();
+    pubky_switch_core::time::parse_rfc3339(text(&body, "created")).unwrap()
+}
+
 fn hex32(text: &str) -> [u8; 32] {
     hex::decode(text).unwrap().try_into().unwrap()
 }
@@ -273,6 +286,7 @@ async fn old_signer_answering(erasure: Option<Response>) -> OldSigner {
         origin: v3.inbox().url.clone(),
         service_key: v3.inbox().service_key,
         limits: serde_json::from_value::<Limits>(records["limits"].clone()).unwrap(),
+        created: Some(vector_created()),
     });
     state.newest = Some(Newest {
         doc: v3.signed().clone(),
@@ -539,9 +553,10 @@ async fn test_vectors_old_signer_renews_the_wallet_as_the_vectors_do() {
 
 /// `http.json`'s account erasure naming the `identity.json` it follows, and its answer (Switch
 /// wire 7.4.16): at the vector's time, the erasure alice's signer sends is the vector's
-/// request, its body naming her account's service key and the hash of her version 3, its
-/// mark, its headers and signature byte for byte; the vector's answer, signed with that
-/// key and carrying no head, confirms it, and the signer then signs nothing more.
+/// request, its body naming her account's creation time, from her enrollment answer, and the
+/// hash of her version 3, its mark, its headers and signature byte for byte; the vector's
+/// answer, signed with the service key and carrying no head, confirms it, and the signer then
+/// signs nothing more.
 #[tokio::test]
 async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
     let http = load("http.json");
@@ -551,7 +566,7 @@ async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
         .iter()
         .find(|r| {
             text(r, "name")
-                == "signer: account erasure, naming the account's service key and the identity.json it follows"
+                == "signer: account erasure, naming the account's creation time and the identity.json it follows"
         })
         .unwrap();
     let answer = http["responses"]

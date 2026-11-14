@@ -39,6 +39,27 @@ async fn confirm_erasure(signer: &mut Signer) {
     assert_eq!(signer.status(), SignerStatus::Erased);
 }
 
+/// The `current` of a `409` to an erasure: the creation time it was checked against (Switch
+/// wire 7.4.16).
+fn checked_against(created: u64) -> serde_json::Value {
+    serde_json::json!({ "created": pubky_switch_core::time::rfc3339(created) })
+}
+
+/// The creation times the erasure requests sent named, in order.
+fn named_created(world: &World) -> Vec<Option<u64>> {
+    world
+        .transport
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/erase"))
+        .map(|r| {
+            pubky_switch_core::http::parse_erase_body(&r.body)
+                .unwrap()
+                .created
+        })
+        .collect()
+}
+
 fn erase_requests(world: &World) -> usize {
     world
         .transport
@@ -188,7 +209,7 @@ async fn test_erasure_refused_publishes_the_identity_again() {
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
         code: ErrorCode::Conflict,
-        current: serde_json::Value::Null,
+        current: checked_against(world.switch.created()),
     });
     assert_eq!(
         signer.close_account(confirmed()).await.unwrap_err(),
@@ -2311,14 +2332,14 @@ async fn test_erasure_after_a_take_over_between_check_and_request_erases_nothing
 #[tokio::test]
 async fn test_erasure_refused_while_the_switch_holds_the_mark_ends_it() {
     // A `409` to the request while the switch still holds this install's mark: a refusal
-    // signed with the account's key, so nothing landed. The copy checks out, the erasure ends
+    // signed with the service key, so nothing landed. The copy checks out, the erasure ends
     // refused, and the user may ask again (Switch wire 7.4.16).
     let world = World::new();
     let (mut signer, _, _) = with_an_app(&world).await;
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
         code: ErrorCode::Conflict,
-        current: serde_json::Value::Null,
+        current: checked_against(world.switch.created()),
     });
     assert_eq!(
         signer.close_account(confirmed()).await.unwrap_err(),
@@ -2454,4 +2475,95 @@ async fn test_erasure_signed_409_from_a_clone_delivery_keeps_the_erasure_abortab
         "{aborted:?}"
     );
     assert_ne!(signer.status(), SignerStatus::Erasing);
+}
+
+#[tokio::test]
+async fn test_signer_erase_names_the_created_of_its_enrollment_answer() {
+    // The erasure names the account's creation time, as the enrollment answer gave it
+    // (Switch wire 3.7, 7.4.16): one request erases.
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    signer.close_account(confirmed()).await.unwrap();
+    assert!(world.switch.erased());
+    assert_eq!(named_created(&world), [Some(world.switch.created())]);
+}
+
+#[tokio::test]
+async fn test_signer_erase_without_a_held_created_learns_it_from_the_409() {
+    // A restored signer holds no creation time, since the backup doesn't carry it: its
+    // erasure names none, the signed `409 conflict` carries it, and the erasure sent again
+    // naming it goes through (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let created = world.switch.created();
+    signer.restore(confirmed()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap();
+    assert!(world.switch.erased());
+    assert_eq!(named_created(&world), [None, Some(created)]);
+    assert_eq!(signer.status(), SignerStatus::Erased);
+}
+
+#[tokio::test]
+async fn test_signer_erase_adopts_conflict_created() {
+    // A signed `409` naming another creation time than the request did, such as a later
+    // account's after a request in doubt: the signer names that one in the erasure it sends
+    // again, whatever time it held (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let created = world.switch.created();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/erase".into(),
+        code: ErrorCode::Conflict,
+        current: checked_against(created + 7),
+    });
+    // The switch's next answer checks the time it named, which isn't the account's: the
+    // signer, having relearned once, takes that `409` as a refusal.
+    assert_eq!(
+        signer.close_account(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureRefused)
+    );
+    assert_eq!(named_created(&world), [Some(created), Some(created + 7)]);
+    assert!(!world.switch.erased());
+    // The time it learned is the one it holds and names next: the switch's `409` to it named
+    // the account's, which the signer adopts in turn, and the erasure goes through.
+    signer.close_account(confirmed()).await.unwrap();
+    assert!(world.switch.erased());
+    assert_eq!(
+        named_created(&world),
+        [
+            Some(created),
+            Some(created + 7),
+            Some(created + 7),
+            Some(created)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_signer_erase_malformed_created_stops() {
+    // A signed `409` whose `current.created` is missing or isn't a time: the signer stops
+    // and tells the user, sending nothing more, and nothing is erased (Switch wire 7.4.16).
+    for current in [
+        serde_json::Value::Null,
+        serde_json::json!({ "created": "yesterday" }),
+    ] {
+        let world = World::new();
+        let (mut signer, _, _) = with_an_app(&world).await;
+        world.switch.fail_next(SwitchFault::Error {
+            path: "/erase".into(),
+            code: ErrorCode::Conflict,
+            current,
+        });
+        let error = signer.close_account(confirmed()).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SignerError::Switch(pubky_switch_client::ClientError::InvalidResponse(_))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(erase_requests(&world), 1);
+        assert!(!world.switch.erased());
+        assert_eq!(signer.status(), SignerStatus::Erasing);
+    }
 }

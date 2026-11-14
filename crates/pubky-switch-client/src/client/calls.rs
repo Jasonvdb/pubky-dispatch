@@ -821,9 +821,12 @@ impl SwitchClient {
         PublicIdentity::read(Obj::of(&value, what)?, &self.account())
     }
 
-    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming `identity_hash`, the
-    /// document hash of the newest `identity.json` the account holds, or none for an account
-    /// that holds none: a switch holding another answers `409 conflict` and erases nothing.
+    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming `created`, the account's
+    /// creation time its enrollment answer gave, or none for a signer that holds none, and
+    /// `identity_hash`, the document hash of the newest `identity.json` the account holds, or
+    /// none for an account that holds none: a switch that created the account at another time
+    /// or holds another document answers `409 conflict`, carrying `current.created`, and
+    /// erases nothing.
     ///
     /// A signer whose `200` was lost gets, on a retry, the operator-signed `404` of an
     /// account the service doesn't host, as
@@ -833,9 +836,13 @@ impl SwitchClient {
     /// # Errors
     ///
     /// As every call.
-    pub async fn erase(&self, identity_hash: Option<[u8; 32]>) -> Result<(), ClientError> {
+    pub async fn erase(
+        &self,
+        created: Option<u64>,
+        identity_hash: Option<[u8; 32]>,
+    ) -> Result<(), ClientError> {
         self.signer_only()?;
-        let body = erase_body(None, identity_hash.as_ref());
+        let body = erase_body(created, identity_hash.as_ref());
         let checked = self
             .send_json("POST", "erase", body, TimeoutClass::Ordinary)
             .await?;

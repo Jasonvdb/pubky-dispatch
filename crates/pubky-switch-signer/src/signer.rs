@@ -1086,6 +1086,7 @@ impl Signer {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
+            created: Some(answer.created),
         });
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {

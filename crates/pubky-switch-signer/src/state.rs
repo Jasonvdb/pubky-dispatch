@@ -181,6 +181,10 @@ pub(crate) struct Service {
     pub(crate) service_key: [u8; 32],
     /// The limits the enrollment answer announced, which the switch gives only then.
     pub(crate) limits: Limits,
+    /// The account's creation time, as the enrollment answer or a `409` to an erasure since
+    /// named it, which an erasure names (Switch wire 3.7, 7.4.16); `None` where this install
+    /// holds none: after a restore or a hand-over, whose formats don't carry it.
+    pub(crate) created: Option<u64>,
 }
 
 /// The newest `identity.json` a service accepted from this signer, or that it adopted: its

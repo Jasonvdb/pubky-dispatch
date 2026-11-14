@@ -295,9 +295,10 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
             outcome(client.export_chunk(chunk).await)
         }
         ("POST", "erase") => {
-            // The `identity.json` the erasure follows, when it names one (Switch wire 7.4.16).
+            // The account's creation time, and the `identity.json` the erasure follows, when
+            // it names one (Switch wire 7.4.16).
             let named = pubky_switch_core::http::parse_erase_body(&body).unwrap();
-            outcome(client.erase(named.identity_hash).await)
+            outcome(client.erase(named.created, named.identity_hash).await)
         }
         ("PUT", "peers") => {
             let doc: SignedDoc = serde_json::from_slice(&body).unwrap();

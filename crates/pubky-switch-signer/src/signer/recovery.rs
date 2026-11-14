@@ -426,6 +426,7 @@ impl Signer {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
+            created: Some(answer.created),
         };
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
@@ -457,6 +458,7 @@ impl Signer {
                         origin: origin.to_owned(),
                         service_key,
                         limits: answer.limits,
+                        created: Some(answer.created),
                     })
             }
         };

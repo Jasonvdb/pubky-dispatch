@@ -12,10 +12,6 @@ use super::recovery::{expect_staged, expect_upload, follow_recovery};
 use super::{ORIGIN, STEP_MS};
 use crate::{FlowResult, World};
 
-/// How long the operator's `404` must hold, after an erasure in doubt, before the signer
-/// takes the erasure as done (Switch wire 7.4.16, Switch spec 12.7 step 5).
-const CONFIRMATION_MS: u64 = 24 * 3_600_000;
-
 /// Where the signer stands in an erasure in doubt, for the trace: how its run ended, its
 /// state, since when it holds the account as erased but unconfirmed, as far into the flow
 /// as the world's clock was then, and whether its `identity.json` is on the Homeserver.
@@ -63,14 +59,6 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
         }
     }
 }
-
-/// How long an app must meet the operator's `404` and a missing `identity.json`, at reads
-/// spread over that time, before it takes its account as erased: the same 24 hours (Switch
-/// spec 12.7 step 5).
-const APP_WAIT_MS: u64 = CONFIRMATION_MS;
-
-/// The least time between two reads the app's wait counts: it takes five, so four of these.
-const APP_SPACING_MS: u64 = APP_WAIT_MS / 4;
 
 /// One read of an app whose account was erased, for the trace: how it ended, the events it
 /// raised, where the app stands with its service, and whether the identity's
@@ -133,16 +121,15 @@ fn gone(raised: bool, expected: bool, step: &str) -> FlowResult {
 
 /// What the world shows of the identity once its signer closed the account: the signer's
 /// own state, whether its `identity.json` is still on the Homeserver, what anyone reading
-/// the public `identity.json` from the switch gets, an app's wait, and the signer's next
-/// run.
+/// the public `identity.json` from the switch gets, an app's next reads, and the signer's
+/// next run.
 ///
-/// The app's wait (Switch spec 12.7 step 5): nothing authenticates an erasure, so the app
-/// takes its account as gone only once the operator's `404` and a missing `identity.json`
-/// have both held at five reads at least 6 hours apart, over 24 hours. The flow deletes
+/// The app's next read meets the service's `404` saying that it doesn't host the identity,
+/// signed with the service key the app pinned and bound to its own request, and a missing
+/// `identity.json`: "Both together are an erasure, at once" (Switch spec 12.7 step 5,
+/// Switch wire 7.4.16 Afterwards), so that read raises `AccountGone`. The flow deletes
 /// nothing itself: the file is missing because the signer's erasure took it off the
-/// Homeserver. Four reads 6 hours apart raise nothing, nor does one a step short of 24
-/// hours; the read 24 hours after the first raises `AccountGone`, and a read after that
-/// asks the switch nothing.
+/// Homeserver. A read after that asks the switch nothing.
 async fn afterwards(
     world: &World,
     name: &str,
@@ -164,28 +151,7 @@ async fn afterwards(
         &json!({ "status": public.status }),
     );
 
-    let step = format!("{name}: an app's next read, the first of its wait");
-    let raised = read_once_erased(world, &step, app, identity).await?;
-    gone(raised, false, &step)?;
-    // A check for a move in between asks the public `identity.json` of the switch: it meets
-    // the `404` too.
-    let check = app.check_for_move().await;
-    world.outcome(
-        &format!("{name}: the app's check for a move"),
-        &json!({ "ended": ended(&check), "events": events(&app.take_events()) }),
-    );
-    for hours in [6, 12, 18] {
-        world.advance_ms(APP_SPACING_MS);
-        let step = format!("{name}: the app's read {hours} hours on");
-        let raised = read_once_erased(world, &step, app, identity).await?;
-        gone(raised, false, &step)?;
-    }
-    world.advance_ms(APP_SPACING_MS - STEP_MS);
-    let step = format!("{name}: the app's read short of 24 hours on");
-    let raised = read_once_erased(world, &step, app, identity).await?;
-    gone(raised, false, &step)?;
-    world.advance_ms(STEP_MS);
-    let step = format!("{name}: the app's read 24 hours on, the account is gone");
+    let step = format!("{name}: an app's next read, the account is gone");
     let raised = read_once_erased(world, &step, app, identity).await?;
     gone(raised, true, &step)?;
     world.advance_ms(STEP_MS);
@@ -202,14 +168,16 @@ async fn afterwards(
 }
 
 /// The signer closes the identity's account: `identity.json` leaves the Homeserver, the
-/// switch erases the account, and every later call is answered by the operator's `404`.
+/// switch erases the account, and every later call is answered by the not-hosted `404`,
+/// signed with the service key.
 ///
-/// An app of the identity then waits its own 24 hours before it takes the account as gone.
+/// An app of the identity takes the account as gone at its next read (Switch spec 12.7
+/// step 5).
 ///
 /// Calls: `POST /v1/{id}/erase` (`200`), then the public `GET /v1/{id}/identity` and an
-/// own app's `GET /v1/{id}/feed` at each read of its wait, each answered `404` with the
-/// operator key. The signer, holding the account as erased, sends nothing at its next run,
-/// nor does the app once it took the account as gone.
+/// own app's `GET /v1/{id}/feed`, each answered `404` with the service key. The signer,
+/// holding the account as erased, sends nothing at its next run, nor does the app once it
+/// took the account as gone.
 ///
 /// # Errors
 ///
@@ -238,15 +206,14 @@ pub async fn erasure(world: &World) -> FlowResult {
 }
 
 /// The erasure's answer is lost: the signer's call fails with the erasure in doubt. Its
-/// next run meets the operator's `404`, which nobody can authenticate, and holds the account
-/// as erased but unconfirmed; a run short of 24 hours later still does; the first run 24
-/// hours after that first `404` concludes the account is erased (Switch wire 7.4.16, Switch
-/// spec 12.7 step 5). The erasure is never sent again. An app of the identity then waits
-/// its own 24 hours, as in [`erasure`].
+/// next run meets the not-hosted `404` its pinned key signed, which "confirms the erasure at
+/// once" (Switch wire 7.4.16 "The signer's `404`", Switch spec 12.7 step 5): the account is
+/// erased, and the erasure is never sent again. An app of the identity then takes the
+/// account as gone, as in [`erasure`].
 ///
-/// Calls: `POST /v1/{id}/erase` with its answer lost; then the signer's read at each of
-/// its three runs, answered `404` with the operator key; then the calls of [`erasure`]
-/// after its `200`.
+/// Calls: `POST /v1/{id}/erase` with its answer lost; then the signer's read at its next
+/// run, answered `404` with the service key; then the calls of [`erasure`] after its
+/// `200`.
 ///
 /// # Errors
 ///
@@ -275,32 +242,8 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     let first = signer.resume().await;
     world.outcome(
-        "the signer's next run meets the operator's 404: erased, unconfirmed",
+        "the signer's next run meets the signed 404: erased",
         &in_doubt(world, started_ms, &signer, &first, &alice.public())?,
-    );
-    standing(
-        &signer,
-        "erased, unconfirmed",
-        matches!(signer.status(), SignerStatus::ErasedUnconfirmed { .. }),
-    )?;
-    // One step short of 24 hours after that first `404`.
-    world.advance_ms(CONFIRMATION_MS - STEP_MS);
-    let early = signer.resume().await;
-    world.outcome(
-        "a run short of 24 hours later: still unconfirmed",
-        &in_doubt(world, started_ms, &signer, &early, &alice.public())?,
-    );
-    standing(
-        &signer,
-        "erased, unconfirmed",
-        matches!(signer.status(), SignerStatus::ErasedUnconfirmed { .. }),
-    )?;
-    // 24 hours after it.
-    world.advance_ms(STEP_MS);
-    let done = signer.resume().await;
-    world.outcome(
-        "the run 24 hours after the first 404: erased",
-        &in_doubt(world, started_ms, &signer, &done, &alice.public())?,
     );
     standing(
         &signer,

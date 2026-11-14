@@ -344,6 +344,16 @@ async fn test_marks_lost_account_is_taken_over_by_an_enrollment() {
     client.apps().await.unwrap();
 }
 
+/// The `current` of a `409` to an erasure: the creation time it was checked against, and
+/// `identity` where the answer carries it (Switch wire 7.4.16).
+fn checked(created: u64, identity: Option<Value>) -> Value {
+    let mut current = json!({ "created": pubky_switch_core::time::rfc3339(created) });
+    if let Some(identity) = identity {
+        current["identity"] = identity;
+    }
+    current
+}
+
 #[tokio::test]
 async fn test_marks_erasure_goes_through_at_a_failing_account() {
     let alice = alice();
@@ -352,13 +362,28 @@ async fn test_marks_erasure_goes_through_at_a_failing_account() {
     let client = client(&alice);
     client.apps().await.unwrap();
     switch.restore_to(1);
-    // Another document: `409 conflict`, carrying the copy the account holds.
-    let error = client.erase(Some([9; 32])).await.unwrap_err();
-    let (status, refusal, current) = code(&error);
-    assert_eq!((status, refusal), (409, ErrorCode::Conflict));
+    let created = switch.created();
     let held = switch.identity_doc().unwrap();
-    assert_eq!(current, json!({ "identity": held.signed() }));
-    client.erase(Some(held.hash())).await.unwrap();
+    // Another document, or another creation time: `409 conflict`, carrying the creation time
+    // and the copy the account holds (Switch wire 7.4.16).
+    for (named_created, named) in [(created, [9; 32]), (created + 1, held.hash())] {
+        let error = client
+            .erase(Some(named_created), Some(named))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            (
+                409,
+                ErrorCode::Conflict,
+                checked(created, Some(json!(held.signed())))
+            )
+        );
+    }
+    client
+        .erase(Some(created), Some(held.hash()))
+        .await
+        .unwrap();
     assert!(switch.erased());
     assert_eq!(switch.mark(), None);
     // Afterwards the identity isn't hosted: the `404`, signed with the one key.
@@ -373,51 +398,100 @@ async fn test_marks_erasure_goes_through_at_a_failing_account() {
 async fn test_marks_erasure_names_the_held_document() {
     let alice = alice();
     let client = client(&alice);
+    let created = alice.switch().created();
     let held = alice.switch().identity_doc().unwrap();
     // Without a hash at an account that holds a document, and with another one: `409`,
-    // with no copy at an account that doesn't answer the notice.
+    // carrying only the creation time at an account that doesn't answer the notice.
     for named in [None, Some([9; 32])] {
-        let error = client.erase(named).await.unwrap_err();
-        assert_eq!(code(&error), (409, ErrorCode::Conflict, Value::Null));
+        let error = client.erase(Some(created), named).await.unwrap_err();
+        assert_eq!(
+            code(&error),
+            (409, ErrorCode::Conflict, checked(created, None))
+        );
     }
     assert!(!alice.switch().erased());
-    client.erase(Some(held.hash())).await.unwrap();
+    client
+        .erase(Some(created), Some(held.hash()))
+        .await
+        .unwrap();
     assert!(alice.switch().erased());
 }
 
 #[tokio::test]
-async fn test_marks_erasure_signed_before_the_account_existed_is_stale() {
-    // An erasure whose timestamp is earlier than the creation time in the account's mark
-    // is `401 stale_timestamp`, even within 5 minutes of the switch's time (Switch wire
-    // 7.4.16); the client sends it once more at the time the refusal gives, and that one
-    // goes through.
-    struct Statuses {
-        switch: Arc<ScriptedSwitch>,
-        seen: Mutex<Vec<u16>>,
-    }
-    impl Transport for Statuses {
-        fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-            Box::pin(async move {
-                let answer = self.switch.handle(&request)?;
-                self.seen.lock().unwrap().push(answer.status);
-                Ok(answer)
-            })
-        }
-    }
+async fn test_marks_erasure_without_the_creation_time_learns_it() {
+    // A signer that holds no creation time, after a lost enrollment answer, sends none: the
+    // `409 conflict`, not a `400`, carries it, and the erasure naming it goes through
+    // (Switch wire 7.4.16).
     let alice = alice();
+    let client = client(&alice);
     let held = alice.switch().identity_doc().unwrap();
-    let statuses = Arc::new(Statuses {
-        switch: Arc::clone(alice.switch()),
-        seen: Mutex::new(Vec::new()),
-    });
-    let early = client_at(
-        &alice,
-        Arc::clone(&statuses) as Arc<dyn Transport>,
-        START_MS - 60_000,
-    );
-    early.erase(Some(held.hash())).await.unwrap();
-    assert_eq!(*statuses.seen.lock().unwrap(), [401, 200]);
+    let error = client.erase(None, Some(held.hash())).await.unwrap_err();
+    let (status, refusal, current) = code(&error);
+    assert_eq!((status, refusal), (409, ErrorCode::Conflict));
+    assert_eq!(current, checked(alice.switch().created(), None));
+    let learned =
+        pubky_switch_core::time::parse_rfc3339(current["created"].as_str().unwrap()).unwrap();
+    client
+        .erase(Some(learned), Some(held.hash()))
+        .await
+        .unwrap();
     assert!(alice.switch().erased());
+}
+
+#[tokio::test]
+async fn test_marks_erasure_replayed_at_a_later_account_is_conflict() {
+    // An erasure, then an enrollment within the same millisecond: the new account's creation
+    // time is after the erasure's record, which is no earlier than the creation it erased, so
+    // an erasure naming the first account's time, the first request again, is `409
+    // conflict` carrying the new account's, and the new account and its mark stay; one
+    // naming the new time erases it. Before the enrollment the same request is the
+    // not-hosted `404` (Switch wire 7.3, The mark; 7.4.16).
+    let alice = alice();
+    let switch = alice.switch();
+    let client = client(&alice);
+    let first = switch.created();
+    let held = switch.identity_doc().unwrap();
+    client.erase(Some(first), Some(held.hash())).await.unwrap();
+    assert_eq!(
+        switch.erasure_record(),
+        Some(alice.clock().now_ms().max(first))
+    );
+    let error = client.erase(Some(first), None).await.unwrap_err();
+    assert_eq!(
+        code(&error),
+        (404, ErrorCode::NotFound, json!({ "hosted": false }))
+    );
+    let answer = client.enroll(&enrollment(&alice, 3)).await.unwrap();
+    let later = switch.created();
+    assert_eq!(answer.created, later);
+    assert_eq!(later, switch.erasure_record().unwrap() + 1, "no wait");
+    let error = client.erase(Some(first), None).await.unwrap_err();
+    assert_eq!(
+        code(&error),
+        (409, ErrorCode::Conflict, checked(later, None))
+    );
+    assert_eq!(switch.mark(), Some((0, 0, ZERO_HASH)));
+    assert!(!switch.erased());
+    client.erase(Some(later), None).await.unwrap();
+    assert!(switch.erased());
+}
+
+#[tokio::test]
+async fn test_marks_enrollment_taking_a_mark_over_is_created_later() {
+    // An enrollment that takes a lost account's mark over, within the same millisecond as
+    // the account's creation, gets a creation time after it, and so does the next one: no
+    // two accounts of the identity have the same (Switch wire 7.3, The mark; Table 3).
+    let alice = alice();
+    let switch = alice.switch();
+    let client = client(&alice);
+    let mut earlier = switch.created();
+    for nonce in [3, 4] {
+        switch.lose_account();
+        let answer = client.enroll(&enrollment(&alice, nonce)).await.unwrap();
+        assert_eq!(answer.created, earlier + 1);
+        assert_eq!(switch.created(), answer.created);
+        earlier = answer.created;
+    }
 }
 
 #[tokio::test]
@@ -426,9 +500,23 @@ async fn test_marks_erasure_at_a_lost_identity_writes_the_record() {
     let switch = alice.switch();
     let client = client(&alice);
     client.apps().await.unwrap();
+    let created = switch.created();
     switch.lose_account();
-    // Whatever hash it names: no document is held to compare.
-    client.erase(Some([9; 32])).await.unwrap();
+    // Another creation time: `409 conflict`, carrying the mark's and `identity` `null`,
+    // nothing written (Switch wire 7.4.16).
+    let error = client.erase(Some(created + 1), None).await.unwrap_err();
+    assert_eq!(
+        code(&error),
+        (
+            409,
+            ErrorCode::Conflict,
+            checked(created, Some(Value::Null))
+        )
+    );
+    assert_eq!(switch.erasure_record(), None);
+    assert!(switch.mark().is_some());
+    // The mark's creation time, whatever hash it names: no document is held to compare.
+    client.erase(Some(created), Some([9; 32])).await.unwrap();
     assert!(switch.erasure_record().is_some());
     assert_eq!(switch.mark(), None);
     let error = client.apps().await.unwrap_err();
@@ -441,7 +529,10 @@ async fn test_marks_enrollment_after_an_erasure_makes_a_new_account() {
     let switch = alice.switch();
     let client = client(&alice);
     client
-        .erase(Some(switch.identity_doc().unwrap().hash()))
+        .erase(
+            Some(switch.created()),
+            Some(switch.identity_doc().unwrap().hash()),
+        )
         .await
         .unwrap();
     let answer = client.enroll(&enrollment(&alice, 3)).await.unwrap();

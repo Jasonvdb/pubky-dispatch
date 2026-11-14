@@ -323,41 +323,83 @@ impl Inner {
     }
 
     /// `POST /erase` at a lost identity (Switch wire 7.4.16, 7.3 Tables 2 and 3): it goes
-    /// through whatever `identity_hash` it names, unless its timestamp is earlier than the
-    /// mark's creation time; the record is written, then the mark deleted.
+    /// through whatever `identity_hash` it names when it names the mark's creation time
+    /// ([`Inner::erasure_binding`]); the record is written, then the mark deleted.
     fn erase_lost(&mut self, request: &Request) -> Answer {
         if let Some(refusal) = self.erasure_timestamp_refusal(request) {
             return refusal;
         }
-        if let Err(error) = pubky_switch_core::http::parse_erase_body(&request.body) {
-            return bad(ErrorCode::BadRequest, &error.to_string(), json!(null));
-        }
-        self.marks.erasure_at_ms = Some(self.now());
+        let created = match self.erasure_binding(request) {
+            Ok(created) => created,
+            Err(refusal) => return refusal,
+        };
+        self.marks.erasure_at_ms = Some(self.now().max(created));
         self.marks.slot = MarkSlot::Missing;
         (200, json!({ "erased": true }))
     }
 
     /// An erasure's `401 stale_timestamp`: a `Switch-Timestamp` more than 5 minutes from the
-    /// switch's time, or earlier than the creation time in the account's mark, or the
-    /// account's own where the mark is lost (Switch wire 7.4.16).
+    /// switch's time (Switch wire 7.4.16, 7.1).
     pub(super) fn erasure_timestamp_refusal(&self, request: &Request) -> Option<Answer> {
         let now = self.now();
         let at = request
             .header(header::TIMESTAMP)
             .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())?;
-        let created = self
-            .marks
-            .mark()
-            .map_or(self.created_at_ms, |mark| mark.created_at_ms);
-        let stale = at.abs_diff(now) > pubky_switch_core::records::CLOCK_TOLERANCE_MS;
-        (stale || at < created).then(|| {
+        (at.abs_diff(now) > pubky_switch_core::records::CLOCK_TOLERANCE_MS).then(|| {
             bad(
                 ErrorCode::StaleTimestamp,
-                "Switch wire 7.4.16: signed before this account existed, or too far from the \
-                 service's time",
+                "Switch wire 7.1: too far from the service's time",
                 json!({ "server_time": rfc3339(now) }),
             )
         })
+    }
+
+    /// The account's creation time (Switch wire 3.7, 7.3): the one in its mark, or the
+    /// account's own where the mark is lost.
+    pub(super) fn creation_time(&self) -> u64 {
+        self.marks
+            .mark()
+            .map_or(self.created_at_ms, |mark| mark.created_at_ms)
+    }
+
+    /// What binds an erasure to the account it erases (Switch wire 7.4.16), in one place, as
+    /// the service checks it: its body `{ "created", "identity_hash" }` names the account's
+    /// creation time ([`Inner::creation_time`]), then the hash of the newest `identity.json`
+    /// the account holds, left out only where it holds none; at a lost identity no document
+    /// is held to compare, and the mark's creation time binds it. The creation time it names.
+    ///
+    /// `400` for a body of another shape; `409 conflict` for another creation time or none,
+    /// another document, a hash where none is held or none where one is: each carries
+    /// `current.created`, and, at an account that answers the notice, the copy it holds, at a
+    /// lost identity `identity: null`.
+    pub(super) fn erasure_binding(&self, request: &Request) -> Result<u64, Answer> {
+        let named = pubky_switch_core::http::parse_erase_body(&request.body)
+            .map_err(|error| bad(ErrorCode::BadRequest, &error.to_string(), json!(null)))?;
+        let created = self.creation_time();
+        let lost = !self.hosts();
+        let conflict = |why: &str| {
+            let mut current = json!({ "created": rfc3339(created) });
+            if lost {
+                current["identity"] = serde_json::Value::Null;
+            } else if self.notice().is_some() {
+                current["identity"] = json!(self.doc.as_ref().map(|doc| doc.signed().clone()));
+            }
+            bad(ErrorCode::Conflict, why, current)
+        };
+        if named.created != Some(created) {
+            return Err(conflict("7.4.16: the account was created at another time"));
+        }
+        if lost {
+            return Ok(created);
+        }
+        let held = self
+            .doc
+            .as_ref()
+            .map(pubky_switch_core::records::IdentityDoc::hash);
+        if named.identity_hash != held {
+            return Err(conflict("7.4.16: the account holds another identity.json"));
+        }
+        Ok(created)
     }
 
     /// An enrollment that creates an account (Switch wire 7.3, Table 3): at an identity
@@ -368,12 +410,15 @@ impl Inner {
     pub(super) fn mark_new_account(&mut self) {
         let key = self.service.verifying_key().to_bytes();
         // A creation time after any erasure's record, so the record never covers the new
-        // account (Table 1's first row).
-        let created = self.now().max(
-            self.marks
-                .erasure_at_ms
-                .map_or(0, |at| at.saturating_add(1)),
-        );
+        // account (Table 1's first row), and after that of the mark it takes over, so no two
+        // accounts of the identity have the same one (Switch wire 7.3, The mark).
+        let created = [
+            self.marks.erasure_at_ms,
+            self.marks.mark().map(|mark| mark.created_at_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(self.now(), |at, earlier| at.max(earlier.saturating_add(1)));
         self.created_at_ms = created;
         self.marks.slot = MarkSlot::At(match self.marks.slot {
             MarkSlot::At(mark) => Mark {
@@ -466,6 +511,12 @@ impl ScriptedSwitch {
             MarkSlot::At(mark) => Some((mark.generation, mark.seq, mark.chain_hash)),
             MarkSlot::Missing | MarkSlot::Corrupt => None,
         }
+    }
+
+    /// The account's creation time, as its enrollment answer names it (Switch wire 3.7): the
+    /// one in its mark, or the account's own where the mark is lost.
+    pub fn created(&self) -> u64 {
+        self.lock().creation_time()
     }
 
     /// The time of the erasure's record for the identity, if there is one.

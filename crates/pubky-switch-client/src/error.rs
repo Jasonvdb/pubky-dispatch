@@ -161,6 +161,13 @@ pub enum ClientError {
         /// `retry_after` in seconds, on `429 rate_limited` (Switch wire 7.6).
         retry_after: Option<u64>,
     },
+    /// The request's body is over its call's cap (Switch wire 7.1 Body caps), so it wasn't
+    /// sent: a refusal for good, since the same bytes are over the cap every time.
+    #[error("the body is over its call's cap of {cap} bytes")]
+    BodyOverCap {
+        /// The call's cap, in bytes.
+        cap: usize,
+    },
     /// The client holds no pinned service key, so the call wasn't sent: only an enrollment
     /// is sent without one (Switch wire 7.1, Switch spec 6.1).
     #[error("no pinned service key; only an enrollment is sent without one")]

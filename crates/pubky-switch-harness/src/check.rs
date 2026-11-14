@@ -282,6 +282,40 @@ impl Checker {
     ///
     /// What is wrong with it.
     pub fn signature(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
+        // As a client checks it (Switch wire 7.1): each header the signature decides on at
+        // most once, and a head that is there verifies as the account's with the key that
+        // signed the answer.
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD] {
+            let count = answer
+                .headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case(name))
+                .count();
+            if count > 1 {
+                return Err(format!("the answer carries {name} {count} times"));
+            }
+        }
+        let with = self.signed_with(request, answer)?;
+        if let Some(text) = answer.header(header::HEAD) {
+            let account = account_id(request).and_then(|id| {
+                lock(&self.accounts)
+                    .get(id)
+                    .map(|account| (account.identity, account.key_of(with)))
+            });
+            let verifies = SignedHead::from_header(text).ok().zip(account).is_some_and(
+                |(head, (identity, key))| {
+                    key.is_some_and(|key| head.verify(&key, &identity).is_ok())
+                },
+            );
+            if !verifies {
+                return Err("its Switch-Head doesn't verify as the account's head".into());
+            }
+        }
+        Ok(with)
+    }
+
+    /// The key [`Checker::signature`] finds `answer`'s signature verifies with.
+    fn signed_with(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
         let signature = answer
             .header(header::SERVICE_SIGNATURE)
             .and_then(|text| unb64_array::<64>(text).ok())
@@ -908,6 +942,65 @@ mod tests {
                 .any(|v| v.contains("the operator key signed")),
             "{operators:?}"
         );
+    }
+
+    /// An answer to `request` that `service` signs carrying `head` as its `Switch-Head`.
+    fn answer_with_head(request: &Request, service: &IdentityKey, head: &str) -> Response {
+        let body = b"{}".to_vec();
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: Some(head),
+                body: &body,
+            },
+        );
+        Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, TIME),
+                Header::new(header::HEAD, head),
+            ],
+            body,
+        }
+    }
+
+    #[test]
+    fn test_signature_refuses_what_a_client_refuses() {
+        // As the client's check (Switch wire 7.1): a signed response header sent twice, and a
+        // head that doesn't verify as the account's, fail the answer.
+        let service = key(2);
+        let checker = checker(&service);
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        let get = request("GET", "feed", &json!(null));
+        let plain = answer(&get, &service, 200, &json!({}));
+        assert!(checker.signature(&get, &plain).is_ok());
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME] {
+            let mut repeated = plain.clone();
+            let copy = repeated.header(name).unwrap().to_owned();
+            repeated.headers.push(Header::new(name, &copy));
+            assert!(checker.signature(&get, &repeated).is_err(), "{name}");
+        }
+        let tip = ChainTip {
+            generation: 1,
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        };
+        let good = SignedHead::sign(&service, &alice().public(), &tip).to_header();
+        let headed = answer_with_head(&get, &service, &good);
+        assert!(checker.signature(&get, &headed).is_ok());
+        let mut doubled = headed.clone();
+        doubled.headers.push(Header::new(header::HEAD, &good));
+        assert!(checker.signature(&get, &doubled).is_err());
+        // Signed by another key, or not a head at all.
+        let forged = SignedHead::sign(&key(9), &alice().public(), &tip).to_header();
+        for head in [forged.as_str(), "not a head"] {
+            let answer = answer_with_head(&get, &service, head);
+            assert!(checker.signature(&get, &answer).is_err(), "{head}");
+        }
     }
 
     #[test]

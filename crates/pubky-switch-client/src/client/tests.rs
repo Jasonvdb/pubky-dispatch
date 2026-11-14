@@ -1620,3 +1620,16 @@ async fn test_response_replayed_as_the_answer_to_another_call_fails() {
     );
     assert!(recorded.lock().unwrap().is_some());
 }
+
+#[tokio::test]
+async fn test_body_over_its_cap_is_never_sent() {
+    // A body over its call's cap is refused before it is sent, for good: the service would
+    // answer it before reading it, an answer final for nothing (Switch wire 7.1 Body caps).
+    let transport = Arc::new(MockTransport::new());
+    let client = client_with(app(), Some(service_public()), transport.clone());
+    assert_eq!(
+        client.append(vec![0; 65_537], 1, None).await.unwrap_err(),
+        ClientError::BodyOverCap { cap: 65_536 }
+    );
+    assert!(transport.last_request().is_none(), "nothing was sent");
+}

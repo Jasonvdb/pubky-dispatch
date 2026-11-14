@@ -701,6 +701,14 @@ impl SwitchClient {
         auth: Auth<'_>,
     ) -> Result<SignedRequest, ClientError> {
         let method = method.to_ascii_uppercase();
+        // A body over its call's cap is never sent: the service answers it before reading the
+        // body, an answer final for nothing, while the same bytes are over the cap every time
+        // (Switch wire 7.1 Body caps).
+        if let Some(cap) = http::body_cap(&method, path_and_query)
+            && body.len() > cap
+        {
+            return Err(ClientError::BodyOverCap { cap });
+        }
         let mut headers = Vec::new();
         match content {
             Body::Empty => {}

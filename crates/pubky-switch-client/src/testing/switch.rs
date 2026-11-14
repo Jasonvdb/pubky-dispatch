@@ -281,6 +281,16 @@ pub enum Fault {
         /// The secret of the key that signs the answer.
         secret: [u8; 32],
     },
+    /// The answer `code`, given before the switch read the body: signed with the account's
+    /// key over the empty body field, with no head, as a service whose one key signs every
+    /// answer gives a `413 too_large`, a `429 rate_limited` or a `404 not_found` (Switch wire
+    /// 7.1).
+    BeforeTheBody {
+        /// A part of the request's path and query.
+        path: String,
+        /// The error code answered.
+        code: ErrorCode,
+    },
 }
 
 pub(crate) struct Inner {
@@ -1204,6 +1214,9 @@ impl ScriptedSwitch {
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
         inner.minute_sweep();
+        if let Some(refused) = inner.refused_as_received(request) {
+            return Ok(refused);
+        }
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
@@ -1218,7 +1231,8 @@ impl ScriptedSwitch {
             | Fault::LeaveOut { path: p, .. }
             | Fault::Replace { path: p, .. }
             | Fault::SignWith { path: p, .. }
-            | Fault::ErrorSignedWith { path: p, .. } => path.contains(p.as_str()),
+            | Fault::ErrorSignedWith { path: p, .. }
+            | Fault::BeforeTheBody { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(
@@ -1264,6 +1278,19 @@ impl ScriptedSwitch {
                     }
                     let key = SigningKey::from_bytes(&secret);
                     return Ok(inner.respond_with(&key, request, status, &body));
+                }
+                Some(Fault::BeforeTheBody { code, .. }) => {
+                    let (status, body) = bad(code, "scripted", Value::Null);
+                    let at = inner.now();
+                    return Ok(inner.respond_bound(
+                        &inner.service,
+                        request,
+                        status,
+                        &body,
+                        at,
+                        None,
+                        false,
+                    ));
                 }
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
@@ -2144,6 +2171,64 @@ impl Inner {
         at: u64,
         head: Option<&str>,
     ) -> Response {
+        self.respond_bound(key, request, status, body, at, head, true)
+    }
+
+    /// The refusals the service gives a request as it arrives, before anything else, signed
+    /// with the operator key and without a head, as the service signs them: a body over its
+    /// call's cap, `413 too_large` over the empty body field, since the body isn't read; a
+    /// signed request header sent more than once, `400 bad_request`, but at the public read,
+    /// which uses none (Switch wire 7.1).
+    fn refused_as_received(&self, request: &Request) -> Option<Response> {
+        let operator = SigningKey::from_bytes(&[42; 32]);
+        let at = self.now();
+        if let Some(cap) =
+            pubky_switch_core::http::body_cap(&request.method, &request.path_and_query)
+            && request.body.len() > cap
+        {
+            let (status, body) = bad(
+                ErrorCode::TooLarge,
+                "Switch wire 7.1: the body is over its call's cap",
+                Value::Null,
+            );
+            return Some(self.respond_bound(&operator, request, status, &body, at, None, false));
+        }
+        let repeated = pubky_switch_core::http::RECEIVED_HEADERS
+            .iter()
+            .any(|name| {
+                request
+                    .headers
+                    .iter()
+                    .filter(|header| header.name.eq_ignore_ascii_case(name))
+                    .count()
+                    > 1
+            });
+        if repeated
+            && !pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
+        {
+            let (status, body) = bad(
+                ErrorCode::BadRequest,
+                "Switch wire 7.1: a signed request header sent more than once",
+                Value::Null,
+            );
+            return Some(self.respond_bound(&operator, request, status, &body, at, None, true));
+        }
+        None
+    }
+
+    /// [`Inner::respond_signed`], the body field the body's hash where `body_read`, else
+    /// empty, for an answer given before the body is read (Switch wire 7.1).
+    #[allow(clippy::too_many_arguments)]
+    fn respond_bound(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+        head: Option<&str>,
+        body_read: bool,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
         let server_time = rfc3339(at);
         let sent = SentRequest::of(request);
@@ -2151,7 +2236,7 @@ impl Inner {
             key,
             &ResponseParts {
                 status,
-                request: sent.received(true),
+                request: sent.received(body_read),
                 server_time: &server_time,
                 head,
                 body: &bytes,

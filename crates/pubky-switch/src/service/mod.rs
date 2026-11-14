@@ -2056,6 +2056,11 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
     ) -> Option<bool> {
+        // The public read decides nothing by its headers, on any path: its answer is the same
+        // for every reader (Switch wire 7.1, 7.4.15).
+        if request.route.call == Call::GetIdentity {
+            return None;
+        }
         let identity_key = pubky_switch_core::enc::pubky_key(account).ok()?;
         let text = request.headers.get(header::TIMESTAMP)?.to_str().ok()?;
         let signed_at = pubky_switch_core::time::parse_rfc3339(text).ok()?;

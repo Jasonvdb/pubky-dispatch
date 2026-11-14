@@ -1844,6 +1844,31 @@ async fn test_erase_owed_keys_hold_back_only_the_signers_404() {
 }
 
 #[tokio::test]
+async fn test_erase_owed_keys_public_read_answers_signed_and_unsigned_alike() {
+    // The public read decides nothing by its headers: signed by the identity's signer or
+    // not, the read of an erased account whose key is owed gets the same `404`, which binds
+    // no header (Switch wire 7.1, 7.4.15, 7.4.16).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let _gate = erased_owing_its_key(&mut replay).await;
+    let path = format!("/v1/{}/identity", alice_id());
+    let unsigned = replay
+        .service
+        .handle(request("GET", &path, &[], Vec::new()))
+        .await;
+    let signed_request = signer_request("GET", &path, Vec::new(), ms(&revoke_time()));
+    let sent = Sent::of(&signed_request);
+    let signed = replay.service.handle(signed_request).await;
+    assert_eq!(code_of(&unsigned), (404, json!("not_found")));
+    assert_eq!(signed.status, unsigned.status);
+    assert_eq!(signed.headers, unsigned.headers);
+    assert_eq!(signed.body, unsigned.body);
+    assert!(operator_signed(&signed, &sent));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_erase_retry_that_doesnt_verify_sweeps_nothing() {
     // A retried erasure sweeps the owed keys only when its signature verifies with the
     // identity key: one that doesn't verify gets the `404` and the key stays owed; the

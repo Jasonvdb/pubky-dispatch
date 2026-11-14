@@ -253,12 +253,12 @@ fn request_case(
     })
 }
 
-/// The requests of the three responses the prototype wrote without theirs, which
+/// The requests of the three responses the reference prototype wrote without theirs, which
 /// `pubky-switch-core` generates (README "How the files were generated") with the fixed keys
 /// of `keys.json`, each at the second of its answer's time: bob's shop reading alice's
 /// directory with its certificate, alice's wallet reading her feed after `1:4`, and the
 /// wallet sending the batch of `chain.json` `seq` 7 and 8, the operations in the order the
-/// chain holds them. Each request signature is the one the prototype's answer named.
+/// chain holds them. Each request signature is the one that answer named.
 fn answered_requests(keys: &Keys) {
     let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
     let bob_id = pubky_switch_core::enc::pubky_id(&keys.identity("bob"));

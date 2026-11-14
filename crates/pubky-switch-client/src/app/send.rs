@@ -1072,11 +1072,13 @@ impl App {
             .collect())
     }
 
-    /// Whether `kind` is a kind of the protocol `protocol`.
+    /// Whether `kind` is a kind of the protocol `protocol`, or of no registered protocol,
+    /// as a message a restore with another set of protocols brings back: any protocol may
+    /// then act on it, so its hold can still be released.
     fn owns_kind(&self, protocol: &str, kind: &str) -> bool {
         self.protocols
             .of_kind(kind)
-            .is_some_and(|owner| owner.name == protocol)
+            .is_none_or(|owner| owner.name == protocol)
     }
 
     /// The kind of the message `msg_id` when the app owes its delivery, checked to be a

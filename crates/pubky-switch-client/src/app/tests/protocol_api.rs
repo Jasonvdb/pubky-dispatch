@@ -5080,9 +5080,15 @@ async fn hold_marks_of(app: &App) -> usize {
 }
 
 /// A message held while a kept batch would queue it stays held when the protocol queues it
-/// again itself: queuing ends no hold.
+/// again itself, with either call: queuing ends no hold.
 #[tokio::test]
 async fn test_hold_message_of_a_kept_batch_message_holds_its_copy_queued_again() {
+    for signed_again in [false, true] {
+        kept_batch_message_queued_again(signed_again).await;
+    }
+}
+
+async fn kept_batch_message_queued_again(signed_again: bool) {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
@@ -5097,7 +5103,11 @@ async fn test_hold_message_of_a_kept_batch_message_holds_its_copy_queued_again()
             .await
             .unwrap()
     );
-    wallet.queue_stored(signed.plaintext()).await.unwrap();
+    if signed_again {
+        wallet.queue_signed(signed.clone()).await.unwrap();
+    } else {
+        wallet.queue_stored(signed.plaintext()).await.unwrap();
+    }
     assert_eq!(
         wallet.held_messages("sample").await.unwrap(),
         vec![signed.msg_id().to_owned()]
@@ -5156,6 +5166,40 @@ async fn test_hold_message_of_a_dropped_kept_batch_ends_with_it() {
     assert!(wallet.held_messages("sample").await.unwrap().is_empty());
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered unheld");
+}
+
+/// A kept batch dropped while the outbox holds the message it would queue leaves the hold:
+/// the outbox's delivery goes on, held.
+#[tokio::test]
+async fn test_hold_message_outlives_a_dropped_kept_batch_while_the_outbox_holds_it() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    kept_with(&p, &mut wallet, &signed).await;
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    assert!(
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap()
+    );
+    p.alice.switch().fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({}),
+    });
+    wallet.receive(None).await.unwrap_or_default();
+    assert!(wallet.kept_batches().await.unwrap().is_empty(), "dropped");
+    assert_eq!(
+        wallet.held_messages("sample").await.unwrap(),
+        vec![signed.msg_id().to_owned()]
+    );
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 0, "still held");
 }
 
 /// A restore in place from a backup taken before a message was queued ends that message's

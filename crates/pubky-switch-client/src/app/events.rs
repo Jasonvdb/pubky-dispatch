@@ -812,7 +812,8 @@ pub enum AppEvent {
     /// on the service's word only, a missing date or the certificate the service chose: it
     /// names nobody, the record keeps what the app trusts and reads as
     /// [`super::SharedRecord::not_taken`], and the app's next write builds on that write's
-    /// version (Switch spec 8.2). Told once for each newer such write the app follows.
+    /// version (Switch spec 8.2). Told when the app follows a newer such write; a read
+    /// whose commit fails tells it again at its retry.
     WriteNotTaken {
         /// The record key.
         key: [u8; 32],

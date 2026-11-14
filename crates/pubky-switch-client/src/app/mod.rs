@@ -1438,10 +1438,13 @@ impl App {
         // Each held message is one of the outbox the backup carries, its delivery owed: no
         // writer carries the hold of another.
         for msg_id in &backup.held_messages {
+            // The item the restore puts back for `msg_id` is the last the backup lists.
             if !backup
                 .outbox
                 .iter()
-                .any(|item| item.msg_id() == msg_id && item.delivery_pending())
+                .rev()
+                .find(|item| item.msg_id() == msg_id)
+                .is_some_and(send::OutboxItem::delivery_pending)
             {
                 return Err(AppError::InvalidData(
                     "a backup's held message isn't one of its outbox owed a delivery".into(),
@@ -2036,7 +2039,9 @@ impl App {
                     backup
                         .outbox
                         .iter()
-                        .any(|item| item.msg_id() == msg_id && item.delivery_pending())
+                        .rev()
+                        .find(|item| item.msg_id() == msg_id)
+                        .is_some_and(send::OutboxItem::delivery_pending)
                 })
                 .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
@@ -2109,8 +2114,8 @@ impl App {
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
-                // The store's message holds before the backup's outbox: a message the backup
-                // left out past its budget is given up there, which ends its hold.
+                // The store's message holds before the backup's outbox, which ends the hold of
+                // any message it gives up.
                 for msg_id in &old_message_holds {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }

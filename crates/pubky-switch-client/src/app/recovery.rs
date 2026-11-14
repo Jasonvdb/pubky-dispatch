@@ -712,7 +712,6 @@ impl App {
                                     uncertain_until_ms: view.uncertain_until_ms,
                                 },
                             },
-                            super::order::Place::Outside,
                         )?;
                     } else {
                         tx.local(&super::protocols::qualify(name, actions.local))?;

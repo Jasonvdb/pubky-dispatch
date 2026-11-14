@@ -188,6 +188,25 @@ impl ProtocolSet {
             .find(|r| r.protocol.collections().iter().any(|c| c.name == name))
     }
 
+    /// The registered protocol other than `name` that a record belongs to, if one does: the
+    /// one giving a collection named `collection`, or owning the root of `read_scope`,
+    /// under whose key the record's value is sealed (Switch spec 3.3). A protocol writes
+    /// only its own records, so its step never changes what another protocol sees or uses
+    /// another's key.
+    pub(crate) fn foreign_owner(
+        &self,
+        name: &str,
+        collection: Option<&str>,
+        read_scope: &str,
+    ) -> Option<&str> {
+        collection
+            .and_then(|collection| self.of_collection(collection))
+            .into_iter()
+            .chain(self.of_scope(read_scope))
+            .map(|registered| registered.name.as_str())
+            .find(|owner| *owner != name)
+    }
+
     /// The root of a scope of `cert` that no registered protocol owns, if one is. Key bundle
     /// parts hold exactly the keys of the certificate's scopes that have keys, and only a
     /// scope's own protocol knows whether it has any (Switch spec 3.5, wire 3.5): with such a

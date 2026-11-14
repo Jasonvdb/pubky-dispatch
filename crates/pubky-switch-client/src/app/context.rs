@@ -640,9 +640,11 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, the record is
-    /// written already in this batch (Switch wire 6.2), the batch is full, or the
-    /// protocol's mark of the value is over [`super::MAX_SEEN_MARK_BYTES`];
+    /// [`Refusal::Usage`] when the target is another registered protocol's, in a collection
+    /// it gives or under a scope whose root it owns (Switch spec 3.3), the certificate holds
+    /// none of the write scopes, the record is written already in this batch (Switch wire
+    /// 6.2), the batch is full, or the protocol's mark of the value is over
+    /// [`super::MAX_SEEN_MARK_BYTES`];
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
     /// epoch ([`ReceiveContext::holds_scope_key`]): an effect the step applies anyway isn't
     /// sent; the entry waits for the key as for [`super::Outcome::AwaitKey`] at the current
@@ -685,6 +687,9 @@ impl<'a> ReceiveContext<'a> {
         conditions: Vec<Condition>,
     ) -> Result<[u8; 32], AppError> {
         self.room()?;
+        // A step writes only its own protocol's records (Switch spec 3.3): a target of
+        // another registered protocol is refused before anything is built.
+        super::records::refuse_foreign_target(self.protocols, self.name, target)?;
         // A value that isn't JSON is refused before the protocol marks it, as `record_op`
         // does: nothing is handed on first.
         super::records::refuse_non_json(value)?;

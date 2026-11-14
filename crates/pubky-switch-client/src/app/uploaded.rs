@@ -37,8 +37,7 @@ use pubky_switch_core::scopes::Permission;
 
 use super::claims::{claim_key_of, reread_key};
 use super::events::Duty;
-use super::order::Place;
-use super::records::{owe_listing, record_key_of};
+use super::records::record_key_of;
 use super::state::Tx;
 use super::{App, AppError};
 use crate::error::{ClientError, StoreError};
@@ -75,15 +74,6 @@ const MARK_BYTES: u64 = 128;
 // The marks of one upload fit the room a feed item has in its read's commit.
 const _: () = assert!(2 * (MAX_MARKED_KEYS as u64) * MARK_BYTES <= super::feed::ITEM_ROOM_BYTES);
 
-/// A record mark (`rcread/<key>`): the device time it was marked at, and the position,
-/// (generation, `seq`), of the `upload` transition that marked it.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-struct RecordMark {
-    at_ms: u64,
-    generation: u64,
-    seq: u64,
-}
-
 fn record_reread_key(key: &[u8; 32]) -> String {
     format!("{RECORD_REREAD_PREFIX}{}", b64(key))
 }
@@ -99,22 +89,16 @@ impl App {
     /// transition's read. An app without `claims.read` can't read claims, and marks none; a
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
-    /// listing instead, but for records the app holds outside the protocol's collections.
-    /// `at` is the transition's position, (generation, `seq`), where that listing is owed.
+    /// listing instead, but for records the app holds outside the protocol's collections:
+    /// returns whether it does, and the caller owes the listing at the transition's item.
     pub(crate) async fn mark_uploaded(
         &self,
         mut records: Vec<[u8; 32]>,
         mut claims: Vec<[u8; 32]>,
-        at: (u64, u64),
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        let owed_at = at;
-        let mark = RecordMark {
-            at_ms: self.now(),
-            generation: at.0,
-            seq: at.1,
-        };
-        let at = mark.at_ms;
+    ) -> Result<bool, AppError> {
+        let at = self.now();
+        let mut lists = false;
         records.truncate(MAX_MARKED_KEYS);
         claims.truncate(MAX_MARKED_KEYS);
         if !records.is_empty() {
@@ -150,17 +134,17 @@ impl App {
                     .map(|collection| collection.name)
                     .collect();
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                owe_listing(tx, Some(owed_at))?;
+                lists = true;
                 for key in keys {
                     if let Some(held) = self.held_collection(&key).await?
                         && !listed.contains(&held.name)
                     {
-                        tx.put(&record_reread_key(&key), &mark)?;
+                        tx.put(&record_reread_key(&key), &at)?;
                     }
                 }
             } else {
                 for key in &records {
-                    tx.put(&record_reread_key(key), &mark)?;
+                    tx.put(&record_reread_key(key), &at)?;
                 }
             }
         }
@@ -176,7 +160,7 @@ impl App {
                 }
             }
         }
-        Ok(())
+        Ok(lists)
     }
 
     /// At the end of a read: read again the records an upload listed (Switch wire 7.4.14),
@@ -189,43 +173,38 @@ impl App {
     /// and the rest still marked, and the feed's read still succeeds; an alarm or a store
     /// failure fails it.
     ///
-    /// A record is read again at the end of a read, after everything it handed, as it
-    /// stands then: its protocol is told it only once it owes nothing at or before the
-    /// cursor or before the transition, and was handed every item held for it before
-    /// ([`App::may_reread`], Switch spec 8.3). The mark of one it may not be told yet, or
-    /// that the app can't place while any protocol owes, stays, untouched and unread, until
-    /// then; the others' marks are read meanwhile, the window taken from them alone.
+    /// A record is read again as it stands then, not in feed order: only for a protocol
+    /// that is with the read, told through everything it covered ([`App::may_tell`], Switch
+    /// spec 8.3). The mark of a record whose protocol is behind, or that the app can't
+    /// place while any protocol is behind, stays, untouched and unread, until then; the
+    /// others' marks are read meanwhile, the read's window taken from them alone.
     ///
     /// Returns whether marks are left that this read could read and didn't reach, past its
     /// budget of [`RECORD_REREADS_PER_READ`] or its time
     /// ([`super::AppConfig::call_budget_ms`]): the next read goes on with them
-    /// ([`super::ReceiveReport::more`]). Marks waiting for a protocol's call aren't that:
-    /// the read that follows its call reaches them.
+    /// ([`super::ReceiveReport::more`]). Marks waiting for a protocol that is behind aren't
+    /// that: the read that brings it level reaches them.
     pub(crate) async fn reread_records(
         &mut self,
         budget: Option<&super::CallBudget>,
     ) -> Result<bool, AppError> {
-        let mut marks = self
-            .reader()
-            .scan::<RecordMark>(RECORD_REREAD_PREFIX)
-            .await?;
-        marks.sort_by(|(a_key, a), (b_key, b)| a.at_ms.cmp(&b.at_ms).then(a_key.cmp(b_key)));
+        let mut marks = self.reader().scan::<u64>(RECORD_REREAD_PREFIX).await?;
+        marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
         let mut due = Vec::new();
         let mut left = false;
-        for (rest, mark) in marks {
+        for (rest, _) in marks {
             let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
             let protocol = self.record_protocol(&key).await?;
-            let at = self.feed_order(mark.generation, mark.seq);
-            if !self.may_reread(protocol.as_deref(), at).await? {
+            if !self.may_tell_of(protocol.as_deref()) {
                 continue;
             }
             if due.len() == RECORD_REREADS_PER_READ {
                 left = true;
                 break;
             }
-            due.push((key, at));
+            due.push(key);
         }
-        for (index, (key, at)) in due.into_iter().enumerate() {
+        for (index, key) in due.into_iter().enumerate() {
             if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
                 return Ok(true);
             }
@@ -243,13 +222,8 @@ impl App {
             let collection = self.held_collection(&key).await?;
             let mut tx = self.tx()?;
             if let Some(view) = view {
-                self.take_view(
-                    &view,
-                    collection.as_ref().map(|c| (&key, c)),
-                    Place::Item(at),
-                    &mut tx,
-                )
-                .await?;
+                self.take_view(&view, collection.as_ref().map(|c| (&key, c)), &mut tx)
+                    .await?;
             }
             tx.delete(&record_reread_key(&key))?;
             self.commit(tx).await?;
@@ -264,7 +238,6 @@ impl App {
         &mut self,
         key: &[u8; 32],
         divergent: bool,
-        place: Place,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let record = record_key_of(key);
@@ -272,19 +245,17 @@ impl App {
             Some(held) => held,
             None => self.reader().exists(&record).await?,
         };
-        self.note_divergent(key, divergent && held, place, tx).await
+        self.note_divergent(key, divergent && held, tx).await
     }
 
     /// Hold the divergent uploads of record `key`, `tx`'s writes included:
     /// [`super::AppEvent::RecordDivergent`] once the record becomes divergent, not again while it
     /// stays so, a duty event kept in `tx` beside the mark, so no crash separates the two
-    /// and a mark cleared later in the same read doesn't take the event with it. `place` is
-    /// the judged view's ([`App::keep_duty_for`]).
+    /// and a mark cleared later in the same read doesn't take the event with it.
     pub(crate) async fn note_divergent(
         &mut self,
         key: &[u8; 32],
         divergent: bool,
-        place: Place,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let mark = divergent_key(key);
@@ -295,12 +266,12 @@ impl App {
         if divergent && !held {
             tx.put(&mark, &())?;
             // For the protocol of the record's collection, as far as the app knows it, `tx`'s
-            // writes included: the protocol its judging was placed under.
+            // writes included: the protocol its judging was admitted for.
             let to = match self.record_protocol_in(key, tx).await? {
                 Some(name) => vec![name],
                 None => self.protocols.names(),
             };
-            self.keep_duty_for(tx, to, Duty::RecordDivergent { key: *key }, place)?;
+            self.keep_duty_for(tx, to, Duty::RecordDivergent { key: *key })?;
         } else if !divergent && held {
             tx.delete(&mark)?;
         }

@@ -630,18 +630,12 @@ async fn test_upload_divergent_flag_follows_the_last_note_in_one_commit() {
         .next()
         .expect("the record");
     let mut tx = app.tx().unwrap();
-    app.note_view_divergence(&key, true, crate::app::order::Place::Outside, &mut tx)
-        .await
-        .unwrap();
+    app.note_view_divergence(&key, true, &mut tx).await.unwrap();
     app.commit(tx).await.unwrap();
     assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
     let mut tx = app.tx().unwrap();
-    app.note_divergent(&key, false, crate::app::order::Place::Outside, &mut tx)
-        .await
-        .unwrap();
-    app.note_view_divergence(&key, true, crate::app::order::Place::Outside, &mut tx)
-        .await
-        .unwrap();
+    app.note_divergent(&key, false, &mut tx).await.unwrap();
+    app.note_view_divergence(&key, true, &mut tx).await.unwrap();
     app.commit(tx).await.unwrap();
     assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
     let report = app.receive(None).await.unwrap();
@@ -1019,12 +1013,8 @@ async fn test_upload_divergence_marked_and_cleared_in_one_commit_is_told_after_a
     let (mut app, key) = holding_a_record(&w, &router, &store, &protocol).await;
     let id = app.app_id();
     let mut tx = app.tx().unwrap();
-    app.note_divergent(&key, true, crate::app::order::Place::Outside, &mut tx)
-        .await
-        .unwrap();
-    app.note_divergent(&key, false, crate::app::order::Place::Outside, &mut tx)
-        .await
-        .unwrap();
+    app.note_divergent(&key, true, &mut tx).await.unwrap();
+    app.note_divergent(&key, false, &mut tx).await.unwrap();
     app.commit(tx).await.unwrap();
     assert_eq!(marks(&store, "rcdiv/"), 0);
     assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);

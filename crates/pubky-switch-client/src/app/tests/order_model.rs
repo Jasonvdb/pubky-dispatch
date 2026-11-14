@@ -1,0 +1,1144 @@
+//! The order each protocol is told things in (Switch spec 8.3), checked against a model.
+//!
+//! A seeded generator shows two or three protocols every kind of feed item, in any order,
+//! with pages of any size, reads that stop on their pages, each protocol failing and
+//! taking again each kind of call at any point, and the app dropped and loaded again from
+//! its store at any point. The check is the rule itself: what a protocol took is, at every
+//! moment, the first items the feed holds for it, in feed order, each once; a call it
+//! fails is the next of them; and once every protocol takes its calls and the reads are
+//! quiet, it is all of them.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use pubky_switch_core::envelope::Recipient;
+use pubky_switch_core::ident::Policy;
+use pubky_switch_core::keys::ReceiveKey;
+use pubky_switch_core::message::{Message, Sender};
+use pubky_switch_core::ops::OpKind;
+use pubky_switch_core::records::AppCert;
+use pubky_switch_core::scopes::Permission;
+use serde_json::{Map, json};
+
+use super::*;
+use crate::app::{
+    AppError, AppEvent, Collection, DenyListChange, DenyListGap, ProtocolSet, ReceiveContext,
+    RecordTarget, Refusal, StoreFailure,
+};
+use crate::error::StoreError;
+
+/// A kind of call a protocol may fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    Missed,
+    Resend,
+    Deny,
+    Gap,
+}
+
+const CALLS: [Call; 4] = [Call::Missed, Call::Resend, Call::Deny, Call::Gap];
+
+/// What a protocol was told, as it saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Told {
+    /// It took the feed item at this `seq`: a message, or a call about the item.
+    Took(u64),
+    /// It failed the call about the feed item at this `seq`.
+    Failed(u64),
+    /// It took, or failed, a deny list gap at this position.
+    Gap(u64),
+}
+
+/// A protocol named `name` with one collection, `<name>.list`: it takes `<name>.item`,
+/// `<name>.write`, whose step writes a record of its own, and `<name>.poach`, whose step
+/// tries to write a record of another protocol; it notes everything it is told.
+struct Model {
+    name: String,
+    list: Collection,
+    /// A collection of another protocol, which a `.poach` step tries to write.
+    other: Collection,
+    told: Mutex<Vec<Told>>,
+    /// The kinds of call it fails now.
+    failing: Mutex<Vec<Call>>,
+    /// The `seq` of the unopenable entry accepted at each time: a re-send call names only
+    /// the time.
+    resends: Arc<Mutex<BTreeMap<u64, u64>>>,
+    /// How many writes of another protocol's record its steps had refused.
+    refused_poaches: Mutex<u32>,
+    /// Whether it notes what it is told: off for the apps beside the one under test.
+    notes: bool,
+}
+
+/// The scope of protocol `name`, which has keys: its name, or one under its root.
+fn scope_of(name: &str) -> String {
+    if name == "sample" {
+        "sample-a".into()
+    } else {
+        name.into()
+    }
+}
+
+fn list_of(name: &str) -> Collection {
+    let scope = scope_of(name);
+    Collection::new(&format!("{name}.list"), Policy::new(&scope, &[&scope]))
+}
+
+impl Model {
+    fn fails(&self, call: Call) -> bool {
+        self.failing.lock().unwrap().contains(&call)
+    }
+
+    fn note(&self, told: Told) {
+        if self.notes {
+            self.told.lock().unwrap().push(told);
+        }
+    }
+
+    fn call(&self, call: Call, seq: u64) -> Result<Vec<LocalWrite>, StoreFailure> {
+        if self.fails(call) {
+            self.note(Told::Failed(seq));
+            return Err(StoreError::Unavailable.into());
+        }
+        self.note(Told::Took(seq));
+        Ok(vec![LocalWrite::Put {
+            key: format!("took/{seq}").into_bytes(),
+            value: b"1".to_vec(),
+        }])
+    }
+}
+
+impl Protocol for Model {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        // The first protocol has a second collection, whose read scope a renewal adds.
+        let mut collections = vec![self.list.clone()];
+        if self.name == NAMES[0] {
+            collections.push(Collection::new(
+                "tasks.wide",
+                Policy::new("tasks_wide", &["tasks"]),
+            ));
+        }
+        collections
+    }
+
+    fn has_keys(&self, scope: &str) -> bool {
+        scope == scope_of(&self.name)
+    }
+
+    fn sent_between_own_apps(&self, _kind: &str) -> bool {
+        false
+    }
+
+    fn check_scopes(&self, _: &Message, _: &AppCert, _: &AppCert) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn accepts(&self, _cert: &AppCert) -> Vec<String> {
+        ["item", "write", "poach"]
+            .iter()
+            .map(|kind| format!("{}.{kind}", self.name))
+            .collect()
+    }
+
+    fn check_body(&self, _message: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let kind = message.message.kind.as_str();
+        if kind.ends_with(".write") {
+            let target = RecordTarget::new(self.list.clone(), b"own");
+            let value = json!({ "seq": message.seq }).to_string();
+            if cx.put_record(&target, value.as_bytes(), vec![]).is_err() {
+                return Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable));
+            }
+        }
+        if kind.ends_with(".poach") {
+            let target = RecordTarget::new(self.other.clone(), b"poached");
+            match cx.put_record(&target, b"{}", vec![]) {
+                Err(AppError::Refused(Refusal::Usage(_))) => {
+                    *self.refused_poaches.lock().unwrap() += 1;
+                }
+                other => panic!("a write of another protocol's record: {other:?}"),
+            }
+        }
+        // A step run again for one entry, as after a conflict, tells it the same entry.
+        if self.told.lock().unwrap().last() != Some(&Told::Took(message.seq)) {
+            self.note(Told::Took(message.seq));
+        }
+        Outcome::Apply(Effect {
+            ops: Vec::new(),
+            local: vec![LocalWrite::Put {
+                key: format!("took/{}", message.seq).into_bytes(),
+                value: b"1".to_vec(),
+            }],
+        })
+    }
+
+    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let seq = self
+            .resends
+            .lock()
+            .unwrap()
+            .get(&needed.accepted_from_ms)
+            .copied()
+            .unwrap_or(0);
+        self.call(Call::Resend, seq)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.call(Call::Missed, missed.seq)
+    }
+
+    fn deny_list_changed(&self, change: &DenyListChange) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.call(Call::Deny, change.seq)
+    }
+
+    fn deny_list_gap(&self, gap: &DenyListGap) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.note(Told::Gap(gap.seq));
+        if self.fails(Call::Gap) {
+            return Err(StoreError::Unavailable.into());
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// A small generator of numbers from a seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn chance(&mut self, of: u64) -> bool {
+        self.below(of) == 0
+    }
+}
+
+/// An app under test with its protocols, another own app that writes records, and one that
+/// manages the deny list; and what the feed holds for each protocol.
+struct Bench {
+    w: World,
+    names: Vec<String>,
+    models: Vec<Arc<Model>>,
+    store: Arc<MemoryStore>,
+    config: AppConfig,
+    app: App,
+    phone: App,
+    manager: App,
+    resends: Arc<Mutex<BTreeMap<u64, u64>>>,
+    /// The `seq` of each item the feed holds for each protocol, in feed order.
+    feed: BTreeMap<String, Vec<u64>>,
+    /// The record of each protocol the app wrote itself, for uploads to make divergent.
+    own: BTreeMap<String, [u8; 32]>,
+    /// The `seq` of the last deny list change, and the position of the last gap asked for.
+    last_barrier: u64,
+    /// The `seq` of each `missed` item shown.
+    missed_at: Vec<u64>,
+    /// What each item the feed holds for a protocol is, for a failure's message.
+    shown: BTreeMap<u64, String>,
+    written: u64,
+    denied: u8,
+    /// A record each protocol's collection held when it began to fail a call another
+    /// protocol went past: the `seq` of the call, and the records as held then.
+    frozen: BTreeMap<String, (u64, String)>,
+    /// Whether a renewal was shown: its listing is owed outside the feed when the app
+    /// takes it from its own record, so the records of a protocol behind may change.
+    renewed: bool,
+}
+
+const NAMES: [&str; 3] = ["tasks", "chat", "sample"];
+
+fn spec(names: &[String], permissions: &[Permission], extra: &[&str]) -> AppSpec {
+    let own: Vec<String> = names.iter().map(|name| scope_of(name)).collect();
+    let mut scopes: Vec<&str> = own.iter().map(String::as_str).collect();
+    scopes.extend_from_slice(extra);
+    // In the fixed order (Switch wire 3.1).
+    let all: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| *p == Permission::ConversationAdd || permissions.contains(p))
+        .collect();
+    AppSpec::new(&scopes).with_permissions(&all)
+}
+
+fn models(
+    names: &[String],
+    resends: &Arc<Mutex<BTreeMap<u64, u64>>>,
+    notes: bool,
+) -> Vec<Arc<Model>> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let other = &names[(index + 1) % names.len()];
+            Arc::new(Model {
+                name: name.clone(),
+                list: list_of(name),
+                other: list_of(other),
+                told: Mutex::new(Vec::new()),
+                failing: Mutex::new(Vec::new()),
+                resends: Arc::clone(resends),
+                refused_poaches: Mutex::new(0),
+                notes,
+            })
+        })
+        .collect()
+}
+
+fn set_of(models: &[Arc<Model>]) -> ProtocolSet {
+    ProtocolSet::new(
+        models
+            .iter()
+            .map(|model| Arc::clone(model) as Arc<dyn Protocol>)
+            .collect(),
+    )
+    .unwrap()
+}
+
+impl Bench {
+    async fn new(protocols: usize, page_size: u32) -> Self {
+        let w = World::new();
+        let names: Vec<String> = NAMES[..protocols].iter().map(|n| (*n).to_owned()).collect();
+        let resends = Arc::new(Mutex::new(BTreeMap::new()));
+        let own_models = models(&names, &resends, true);
+        let store = Arc::new(MemoryStore::new());
+        let mut config = World::config();
+        config.page_size = page_size;
+        let join = |name: &str, permissions: &[Permission]| {
+            w.signer
+                .approve(&app_keys(name), &spec(&names, permissions, &[]))
+                .unwrap()
+        };
+        let mut app = App::join(
+            w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+            set_of(&own_models),
+            config.clone(),
+            join("wallet", &[Permission::ListsRead]),
+        )
+        .await
+        .unwrap();
+        let mut phone = App::join(
+            w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            set_of(&models(&names, &resends, false)),
+            World::config(),
+            join("phone", &[]),
+        )
+        .await
+        .unwrap();
+        let mut manager = App::join(
+            w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            set_of(&models(&names, &resends, false)),
+            World::config(),
+            join("manager", &[Permission::ListsManage]),
+        )
+        .await
+        .unwrap();
+        for other in [&mut phone, &mut manager] {
+            for _ in 0..3 {
+                other.receive(None).await.unwrap();
+            }
+        }
+        let mut own = BTreeMap::new();
+        for name in &names {
+            let target = RecordTarget::new(list_of(name), b"held");
+            app.put_record(&target, b"{}", vec![]).await.unwrap();
+            own.insert(name.clone(), app.record_key(&target).unwrap());
+        }
+        let feed = names
+            .iter()
+            .map(|name| (name.clone(), Vec::new()))
+            .collect();
+        let mut bench = Self {
+            w,
+            names,
+            models: own_models,
+            store,
+            config,
+            app,
+            phone,
+            manager,
+            resends,
+            feed,
+            own,
+            last_barrier: 0,
+            missed_at: Vec::new(),
+            shown: BTreeMap::new(),
+            written: 0,
+            denied: 0,
+            frozen: BTreeMap::new(),
+            renewed: false,
+        };
+        bench.settle().await;
+        for model in &bench.models {
+            model.told.lock().unwrap().clear();
+        }
+        bench
+    }
+
+    fn model(&self, name: &str) -> &Arc<Model> {
+        self.models.iter().find(|model| model.name == name).unwrap()
+    }
+
+    /// Each item is accepted at a time of its own.
+    fn tick(&self) -> u64 {
+        let now = self.w.clock.now_ms() + 1;
+        self.w.clock.set_ms(now);
+        now
+    }
+
+    fn holds(&mut self, names: &[String], seq: u64, what: &str) {
+        self.shown.insert(seq, what.to_owned());
+        for name in names {
+            self.feed.get_mut(name).unwrap().push(seq);
+        }
+    }
+
+    /// A message of `kind` of protocol `name`.
+    fn entry(&mut self, name: &str, kind: &str) -> u64 {
+        self.tick();
+        let me = self.app.app_id();
+        let kind = format!("{name}.{kind}");
+        let seq = self
+            .w
+            .switch
+            .send(
+                &self.w.bob,
+                &self.w.bob_keys,
+                &self.w.bob_cert,
+                &kind,
+                json!({ "text": kind }),
+                &[me],
+            )
+            .unwrap()
+            .0;
+        self.holds(&[name.to_owned()], seq, &kind);
+        seq
+    }
+
+    /// An entry sealed to a key the app doesn't hold: a re-send call to every protocol.
+    fn unopenable(&mut self) -> u64 {
+        let now = self.tick();
+        let me = self.app.app_id();
+        let stranger = ReceiveKey::from_secret(9, [45; 32]);
+        let message = Message::new(
+            "tasks.item",
+            Sender::of_app(self.w.bob.public(), &self.w.bob_keys),
+            self.w.alice.public(),
+            now,
+            vec![],
+            Map::new(),
+        )
+        .unwrap();
+        let sealed = message
+            .sign(&self.w.bob_keys)
+            .unwrap()
+            .seal(
+                &self.w.alice.public(),
+                &[Recipient::new(stranger.public)],
+                false,
+            )
+            .unwrap();
+        let seq = self
+            .w
+            .switch
+            .send_envelope(self.w.bob.public(), &self.w.bob_cert, sealed, &[me]);
+        self.resends.lock().unwrap().insert(now, seq);
+        let names = self.names.clone();
+        self.holds(&names, seq, "unopenable");
+        seq
+    }
+
+    /// A `missed` item: a call to every protocol, and a listing.
+    fn missed(&mut self) -> u64 {
+        let now = self.tick();
+        let seq = self.w.switch.push_missed(1, now, now);
+        let names = self.names.clone();
+        self.holds(&names, seq, "missed");
+        self.missed_at.push(seq);
+        seq
+    }
+
+    /// A deny list change by the manager: a call to every protocol.
+    async fn deny(&mut self) -> u64 {
+        self.tick();
+        self.denied = self.denied.wrapping_add(1);
+        self.manager.deny(&[self.denied; 32]).await.unwrap();
+        let seq = self.w.switch.seq();
+        let names = self.names.clone();
+        self.holds(&names, seq, "deny list change");
+        self.last_barrier = seq;
+        seq
+    }
+
+    /// Another own app's write of a record of protocol `name`.
+    async fn phone_writes(&mut self, name: &str) {
+        self.tick();
+        self.written += 1;
+        let natural = format!("w{}", self.written % 3);
+        let target = RecordTarget::new(list_of(name), natural.as_bytes());
+        let value = json!({ "n": self.written }).to_string();
+        // The phone builds on what it holds: it reads its own writes first.
+        self.phone.receive(None).await.unwrap();
+        self.phone
+            .put_record(&target, value.as_bytes(), vec![])
+            .await
+            .unwrap();
+    }
+
+    /// An upload making the record of protocol `name` the app holds divergent.
+    fn upload(&mut self, name: &str) {
+        self.tick();
+        self.written += 1;
+        let by = app_keys("phone").app_id_bytes();
+        let hash = [u8::try_from(self.written % 250).unwrap(); 32];
+        self.w
+            .switch
+            .make_divergent(by, self.own[name], hash)
+            .unwrap();
+    }
+
+    /// An upload of more records than the app keeps marks for: a listing.
+    fn upload_past_the_marks(&mut self) {
+        self.tick();
+        let records = (0..=crate::app::MAX_RECORD_MARKS)
+            .map(|i| {
+                let mut key = [0xee; 32];
+                key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+                key
+            })
+            .collect();
+        let changes = pubky_switch_core::recovery::UploadChanges {
+            records,
+            ..Default::default()
+        };
+        self.w
+            .switch
+            .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+            .unwrap();
+    }
+
+    /// A renewal of the app's certificate that adds the read scope of a collection: the
+    /// certificate is taken, the app's record changes, and a listing is owed.
+    fn renew(&mut self) {
+        let now = self.tick();
+        self.renewed = true;
+        let me = self.app.app_id();
+        let renewed = issue_cert(
+            &self.w.alice,
+            &app_keys("wallet"),
+            &spec(&self.names, &[Permission::ListsRead], &["tasks_wide"]),
+            now + 1000,
+        )
+        .unwrap();
+        let old = self.app.cert().clone();
+        self.w
+            .switch
+            .signer_op(OpKind::CertPut {
+                target_app_id: me,
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+        self.w.next_doc(|body| {
+            body.apps.retain(|a| a.app_id != me);
+            body.apps.push(pubky_switch_core::records::ListedApp {
+                app_id: me,
+                cert: renewed.hash(),
+            });
+            body.renewed.retain(|r| r.app_id != me);
+            body.renewed.push(pubky_switch_core::records::RenewedCert {
+                app_id: me,
+                cert: old.hash(),
+                until: None,
+            });
+        });
+    }
+
+    /// Drop the app and load it again from its store.
+    async fn reopen(&mut self) {
+        let me = self.app.app_id();
+        self.app = App::load(
+            self.w
+                .env_on(Arc::clone(&self.store) as Arc<dyn StateStore>),
+            set_of(&self.models),
+            self.config.clone(),
+            me,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn read(&mut self) -> crate::app::ReceiveReport {
+        let report = self.app.receive(None).await.unwrap();
+        self.check().await;
+        report
+    }
+
+    /// Read until the reads tell no protocol anything new: twice in a row from a read
+    /// that has more to do now to the one that has not, with nothing taken between (a
+    /// read behind a held item starts at the cursor again once it reached the feed's end),
+    /// `reopening` the app before each read when asked.
+    async fn quiet(&mut self, reopening: bool) {
+        let mut still = 0;
+        let mut before = self.told_count();
+        for _ in 0..600 {
+            if reopening {
+                self.reopen().await;
+            }
+            let report = self.read().await;
+            if report.more {
+                continue;
+            }
+            if self.told_count() == before {
+                still += 1;
+                if still == 2 {
+                    return;
+                }
+            } else {
+                still = 0;
+                before = self.told_count();
+            }
+        }
+        panic!(
+            "the reads never come to rest: {:?}",
+            self.models
+                .iter()
+                .map(|model| (model.name.clone(), model.told.lock().unwrap().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    async fn settle(&mut self) {
+        self.quiet(false).await;
+    }
+
+    /// How many things the protocols took so far, the calls they failed aside.
+    fn told_count(&self) -> usize {
+        self.models
+            .iter()
+            .map(|model| {
+                let told = model.told.lock().unwrap();
+                told.iter()
+                    .filter(|told| matches!(told, Told::Took(_)))
+                    .count()
+            })
+            .sum()
+    }
+
+    /// What protocol `name` took so far, and the call it fails now, if it fails one.
+    fn taken(&self, name: &str) -> (Vec<u64>, Option<u64>) {
+        let mut took = Vec::new();
+        let mut failing = None;
+        let all = self.model(name).told.lock().unwrap().clone();
+        for told in &all {
+            match told {
+                Told::Took(seq) => {
+                    took.push(*seq);
+                    failing = None;
+                }
+                Told::Failed(seq) => failing = Some(*seq),
+                Told::Gap(_) => {}
+            }
+        }
+        (took, failing)
+    }
+
+    /// The rule: what each protocol took is the first items the feed holds for it, in
+    /// order, each once; a call it failed was the next of them then; and a gap came after
+    /// everything at or before its position.
+    async fn check(&mut self) {
+        for name in self.names.clone() {
+            let feed = &self.feed[&name];
+            let mut next = 0;
+            let all = self.model(&name).told.lock().unwrap().clone();
+            for told in &all {
+                match *told {
+                    Told::Took(seq) => {
+                        assert_eq!(
+                            feed.get(next),
+                            Some(&seq),
+                            "`{name}` took {seq}, not the next the feed holds for it: {all:?} of {feed:?}; {:?}",
+                            self.shown
+                        );
+                        next += 1;
+                    }
+                    Told::Failed(seq) => assert_eq!(
+                        feed.get(next),
+                        Some(&seq),
+                        "`{name}` was handed {seq} before what comes before it"
+                    ),
+                    // A gap carries the list as it stands when it is told: it comes after
+                    // everything at or before its position.
+                    Told::Gap(at) => assert!(
+                        feed.get(next).is_none_or(|seq| *seq > at),
+                        "`{name}` was told a gap at {at} before what comes before it: {next} of {feed:?}"
+                    ),
+                }
+            }
+        }
+        self.check_records().await;
+    }
+
+    /// While a protocol fails a re-send or deny list call another protocol went past, the
+    /// app's copy of its records stays as it was: nothing of them is judged, marked or
+    /// read for it.
+    async fn check_records(&mut self) {
+        if self.renewed {
+            return;
+        }
+        let missed = self.missed_at.clone();
+        for name in self.names.clone() {
+            let (_, failing) = self.taken(&name);
+            let passed = failing.filter(|seq| {
+                !missed.contains(seq)
+                    && self
+                        .names
+                        .iter()
+                        .any(|other| *other != name && self.taken(other).0.last() > Some(seq))
+            });
+            let Some(seq) = passed else {
+                self.frozen.remove(&name);
+                continue;
+            };
+            let held = format!(
+                "{:?}",
+                self.app.records_of(&format!("{name}.list")).await.unwrap()
+            );
+            match self.frozen.get(&name) {
+                Some((at, before)) if *at == seq => assert_eq!(
+                    *before, held,
+                    "the records of `{name}` changed while it fails the call at {seq}"
+                ),
+                _ => {
+                    self.frozen.insert(name, (seq, held));
+                }
+            }
+        }
+    }
+
+    /// Every protocol takes its calls again; then, the reads quiet, each took everything
+    /// the feed holds for it, the app owes nothing, and its records are the switch's.
+    async fn finish(&mut self) {
+        for model in &self.models {
+            model.failing.lock().unwrap().clear();
+        }
+        self.quiet(false).await;
+        for name in &self.names {
+            assert_eq!(
+                self.taken(name).0,
+                self.feed[name],
+                "`{name}` took everything the feed holds for it"
+            );
+        }
+        assert_eq!(self.app.owed_protocol_calls().await.unwrap(), 0);
+        assert!(!self.app.listing_owed().await.unwrap());
+        self.phone.receive(None).await.unwrap();
+        for name in &self.names {
+            let collection = format!("{name}.list");
+            for theirs in self.phone.records_of(&collection).await.unwrap() {
+                let ours = self.app.shared_record(&theirs.key).await.unwrap();
+                assert_eq!(
+                    ours.map(|record| record.version),
+                    Some(theirs.version),
+                    "the app holds the newest write of each record of `{name}`"
+                );
+            }
+        }
+    }
+}
+
+/// One step of a generated run.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    Entry,
+    WritingEntry,
+    PoachingEntry,
+    Unopenable,
+    Missed,
+    MissedUnparsable,
+    Deny,
+    Gap,
+    PhoneWrite,
+    Upload,
+    UploadPastTheMarks,
+    Renew,
+    Read,
+    Fail,
+    Recover,
+    Reopen,
+    Settle,
+}
+
+/// The steps, each as often as its weight.
+const STEPS: [(Step, u64); 17] = [
+    (Step::Entry, 26),
+    (Step::WritingEntry, 5),
+    (Step::PoachingEntry, 3),
+    (Step::Unopenable, 8),
+    (Step::Missed, 8),
+    (Step::MissedUnparsable, 2),
+    (Step::Deny, 4),
+    (Step::Gap, 2),
+    (Step::PhoneWrite, 8),
+    (Step::Upload, 5),
+    (Step::UploadPastTheMarks, 1),
+    (Step::Renew, 1),
+    (Step::Read, 30),
+    (Step::Fail, 8),
+    (Step::Recover, 8),
+    (Step::Reopen, 6),
+    (Step::Settle, 3),
+];
+
+fn pick(rng: &mut Rng) -> Step {
+    let total: u64 = STEPS.iter().map(|(_, weight)| weight).sum();
+    let mut at = rng.below(total);
+    for (step, weight) in STEPS {
+        if at < weight {
+            return step;
+        }
+        at -= weight;
+    }
+    Step::Read
+}
+
+impl Bench {
+    async fn step(&mut self, step: Step, rng: &mut Rng) {
+        let name = self.names[usize::try_from(rng.below(self.names.len() as u64)).unwrap()].clone();
+        match step {
+            Step::Entry => {
+                self.entry(&name, "item");
+            }
+            Step::WritingEntry => {
+                self.entry(&name, "write");
+            }
+            Step::PoachingEntry => {
+                self.entry(&name, "poach");
+            }
+            Step::Unopenable => {
+                self.unopenable();
+            }
+            Step::Missed => {
+                self.missed();
+            }
+            Step::MissedUnparsable => {
+                self.tick();
+                self.w.switch.push_missed_unparsable(1);
+            }
+            Step::Deny => {
+                self.deny().await;
+            }
+            Step::Gap => {
+                self.app.allow_list().await.unwrap();
+                self.last_barrier = self.last_barrier.max(self.app.cursor().seq);
+            }
+            Step::PhoneWrite => self.phone_writes(&name).await,
+            Step::Upload => self.upload(&name),
+            Step::UploadPastTheMarks => self.upload_past_the_marks(),
+            Step::Renew => {
+                if !self.renewed {
+                    self.renew();
+                }
+            }
+            Step::Read => {
+                self.read().await;
+            }
+            Step::Fail => {
+                let call = CALLS[usize::try_from(rng.below(4)).unwrap()];
+                let mut failing = self.model(&name).failing.lock().unwrap();
+                if !failing.contains(&call) {
+                    failing.push(call);
+                }
+            }
+            Step::Recover => self.model(&name).failing.lock().unwrap().clear(),
+            Step::Reopen => self.reopen().await,
+            Step::Settle => {
+                let reopening = rng.chance(2);
+                self.quiet(reopening).await;
+                self.check_progress();
+            }
+        }
+    }
+
+    /// Once the reads are quiet, a protocol that fails no call took everything the feed
+    /// holds for it, whatever another protocol fails: unless a deny list change or gap,
+    /// which every protocol takes before any is handed anything later, came after the
+    /// first call a protocol fails.
+    fn check_progress(&self) {
+        let stuck: Vec<u64> = self
+            .names
+            .iter()
+            .filter_map(|name| self.taken(name).1)
+            .collect();
+        let barrier = stuck.iter().any(|seq| self.last_barrier >= *seq);
+        let gap_fails = self
+            .models
+            .iter()
+            .any(|model| model.fails(Call::Gap) || model.fails(Call::Deny));
+        if barrier || gap_fails {
+            return;
+        }
+        for name in &self.names {
+            if self.taken(name).1.is_none() && self.model(name).failing.lock().unwrap().is_empty() {
+                assert_eq!(
+                    self.taken(name).0,
+                    self.feed[name],
+                    "`{name}` fails nothing, and took everything the feed holds for it"
+                );
+            }
+        }
+    }
+}
+
+/// One generated run: `steps` steps from `seed`, then every protocol takes its calls.
+async fn run(seed: u64, protocols: usize, page_size: u32, steps: usize) {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut bench = Bench::new(protocols, page_size).await;
+    for _ in 0..steps {
+        let step = pick(&mut rng);
+        bench.step(step, &mut rng).await;
+    }
+    bench.finish().await;
+}
+
+/// The seeds of one test, each run on a thread of its own stack, and named when it fails.
+fn run_seeds(seeds: impl IntoIterator<Item = u64>, protocols: usize, steps: usize) {
+    for seed in seeds {
+        // Pages of one item for a third of the seeds, of a few for another, of many else.
+        let page_size = match seed % 3 {
+            0 => 1,
+            1 => 2 + u32::try_from(seed % 4).unwrap(),
+            _ => 100,
+        };
+        let outcome = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run(seed, protocols, page_size, steps));
+            })
+            .unwrap()
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "seed {seed} with {protocols} protocols and pages of {page_size} failed"
+        );
+    }
+}
+
+#[test]
+fn test_order_model_two_protocols_take_the_feed_in_order_in_any_run() {
+    run_seeds(1..41, 2, 70);
+}
+
+#[test]
+fn test_order_model_three_protocols_take_the_feed_in_order_in_any_run() {
+    run_seeds(100..130, 3, 70);
+}
+
+#[test]
+fn test_order_model_runs_that_once_broke_the_order_keep_it() {
+    // A deny list change kept for one protocol while the read went on for the others; a
+    // listing owed again by an item the read met a second time; a call kept past the
+    // cursor reached on a page that ended for a listing.
+    run_seeds([6, 18, 148, 263, 411], 2, 90);
+    run_seeds([104, 1104, 1337], 3, 90);
+}
+
+/// Run `test` on a thread with room for the read's deepest futures.
+fn on_a_thread(test: impl std::future::Future<Output = ()> + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn test_order_model_protocol_behind_a_read_that_stopped_on_its_pages_catches_up_in_order() {
+    // `tasks` fails a missed call; an entry of its own follows, then enough of `chat`'s
+    // for a read of one-item pages to stop on its pages past the held entry, then another
+    // of `tasks`. Once `tasks` takes the call, it gets the held entry before the later
+    // one, though the read before went on past both.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 1).await;
+        b.model("tasks").failing.lock().unwrap().push(Call::Missed);
+        let missed = b.missed();
+        b.quiet(false).await;
+        assert_eq!(b.taken("tasks"), (vec![], Some(missed)));
+        let held = b.entry("tasks", "item");
+        for _ in 0..6 {
+            b.entry("chat", "item");
+        }
+        let later = b.entry("tasks", "item");
+        let report = b.read().await;
+        assert!(report.more, "the read stopped on its pages: {report:?}");
+        b.model("tasks").failing.lock().unwrap().clear();
+        b.quiet(false).await;
+        assert_eq!(b.taken("tasks").0, [missed, held, later]);
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_step_writing_another_protocols_record_is_refused() {
+    // A step of `chat` that writes a record of `tasks` is refused where it names the
+    // target; a batch of `chat` carrying such a write is refused too. Nothing of `tasks`
+    // changes, also while `tasks` fails a call.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 100).await;
+        b.model("tasks").failing.lock().unwrap().push(Call::Missed);
+        b.missed();
+        b.quiet(false).await;
+        let before = format!("{:?}", b.app.records_of("tasks.list").await.unwrap());
+        // `tasks` is the collection after `chat`'s in the bench: `chat`'s step tries it.
+        b.entry("chat", "poach");
+        b.quiet(false).await;
+        assert_eq!(*b.model("chat").refused_poaches.lock().unwrap(), 1);
+        assert_eq!(
+            format!("{:?}", b.app.records_of("tasks.list").await.unwrap()),
+            before
+        );
+        let target = RecordTarget::new(list_of("tasks"), b"batched");
+        let (_, write) = b.app.record_op(&target, Some(b"{}"), vec![]).await.unwrap();
+        let batch = crate::app::OpBatch::for_protocol("chat").op(write);
+        match b.app.submit_batch(batch).await {
+            Err(AppError::Refused(Refusal::Usage(why))) => {
+                assert!(why.contains("`tasks`"), "{why}");
+            }
+            other => panic!("a batch of `chat` writing a record of `tasks`: {other:?}"),
+        }
+        assert_eq!(
+            format!("{:?}", b.app.records_of("tasks.list").await.unwrap()),
+            before
+        );
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_app_loaded_before_every_read_goes_on_past_a_protocol_that_is_behind() {
+    // `tasks` fails a missed call and has an entry held behind it, so the cursor stays;
+    // `chat` has more entries than one read of one-item pages takes. With the app loaded
+    // again from its store before every read, `chat` still gets them all in a few reads:
+    // the positions are in the store, and no read starts over at the cursor.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 1).await;
+        b.model("tasks").failing.lock().unwrap().push(Call::Missed);
+        b.missed();
+        b.quiet(false).await;
+        b.entry("tasks", "item");
+        let chat: Vec<u64> = (0..12).map(|_| b.entry("chat", "item")).collect();
+        for _ in 0..6 {
+            b.reopen().await;
+            b.read().await;
+        }
+        let took = b.taken("chat").0;
+        assert!(
+            took.ends_with(&chat),
+            "`chat` took its twelve entries: {took:?}"
+        );
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_listing_an_item_owes_is_not_held_by_that_items_own_call() {
+    // `tasks` fails the call of a `missed` item: the listing the item owes is made for
+    // `tasks` too, before it takes the call, as with one protocol; `chat` goes on.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 100).await;
+        b.phone_writes("tasks").await;
+        b.model("tasks").failing.lock().unwrap().push(Call::Missed);
+        let missed = b.missed();
+        let after = b.entry("chat", "item");
+        b.quiet(false).await;
+        assert_eq!(b.taken("tasks"), (vec![], Some(missed)));
+        assert!(b.taken("chat").0.ends_with(&[missed, after]));
+        assert!(
+            !b.app.listing_owed().await.unwrap(),
+            "the listing was made for both protocols"
+        );
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_listing_waiting_for_one_protocols_key_lets_the_other_go_on() {
+    // The app lacks the key of `tasks`'s scope when a `missed` item owes a listing: the
+    // listing of `tasks` waits for it, the full key bundle is asked for again, and the
+    // read says so; `chat` is listed and goes on. Once the key is back, `tasks` is listed
+    // and gets its later entry.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 100).await;
+        let held = b.app.state.scope_keys.keys.clone();
+        b.app
+            .state
+            .scope_keys
+            .keys
+            .retain(|key| key.scope != "tasks");
+        let mut tx = b.app.tx().unwrap();
+        for key in held.iter().filter(|key| key.scope == "tasks") {
+            tx.delete(&crate::app::state::key::scope(key.data_epoch, &key.scope))
+                .unwrap();
+        }
+        b.app.commit(tx).await.unwrap();
+        let missed = b.missed();
+        let tasks_later = b.entry("tasks", "item");
+        let chat_later = b.entry("chat", "item");
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            events.extend(b.read().await.events);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AppEvent::ListingWaitsForKey)),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AppEvent::FullBundleRequested)),
+            "{events:?}"
+        );
+        assert!(b.app.listing_owed().await.unwrap());
+        assert_eq!(b.taken("tasks").0, [missed]);
+        assert!(b.taken("chat").0.ends_with(&[missed, chat_later]));
+        // The key comes back.
+        let mut tx = b.app.tx().unwrap();
+        for key in &held {
+            tx.put(
+                &crate::app::state::key::scope(key.data_epoch, &key.scope),
+                key,
+            )
+            .unwrap();
+        }
+        b.app.commit(tx).await.unwrap();
+        b.app.state.scope_keys.keys = held;
+        b.quiet(false).await;
+        assert!(!b.app.listing_owed().await.unwrap());
+        assert_eq!(b.taken("tasks").0, [missed, tasks_later]);
+        b.finish().await;
+    });
+}

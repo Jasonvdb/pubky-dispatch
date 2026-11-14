@@ -585,6 +585,19 @@ impl App {
         // registered protocol.
         let local = match &batch.protocol {
             Some(name) if self.protocols.contains(name) => {
+                // A protocol's batch writes only that protocol's own records (Switch spec
+                // 3.3): one of another registered protocol is refused before anything is
+                // signed or kept.
+                for (_, kind) in &batch.ops {
+                    if let OpKind::RecordPut(put) = kind
+                        && let Some(owner) = self.foreign_put(name, put)
+                    {
+                        return Err(Refusal::Usage(format!(
+                            "Switch spec 3.3: a batch of `{name}` writes a record of protocol `{owner}`"
+                        ))
+                        .into());
+                    }
+                }
                 super::protocols::qualify(name, batch.local)
             }
             Some(name) => {
@@ -1068,7 +1081,6 @@ impl App {
                 batch_id: *id,
                 code: code.as_str().to_owned(),
             },
-            super::order::Place::Outside,
         )?;
         self.commit(tx).await
     }

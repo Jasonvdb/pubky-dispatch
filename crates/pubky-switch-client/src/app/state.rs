@@ -93,8 +93,6 @@ pub(crate) mod key {
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";
-    /// The position, (generation, `seq`), of the `cert.put` that brought `cert/renewal`.
-    pub(crate) const CERT_RENEWAL_AT: &str = "cert/renewal_at";
     /// The hash of the newest renewed certificate the app's protocols refused
     /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
     /// never refused with a second event.

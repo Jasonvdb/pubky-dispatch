@@ -1483,13 +1483,12 @@ async fn test_protocol_set_owed_call_never_lets_the_cursor_pass_what_its_protoco
     let second_gap = p.w.switch.push_missed(2, now, now);
     let chat_second = p.send(me, "chat.item");
     read(&mut app, 4).await;
-    // `chat` took what comes before the second call, in feed order; `tasks` owes the first
-    // call, its entry is held, and the second call is owed to it behind the first. The
-    // second call is past the cursor, which stays before the held entry, so the feed
-    // stops at it: `chat`'s later entry waits until the cursor gets there.
+    // `chat` took everything, in feed order; `tasks` owes the first call, its entry is
+    // held, and the second call is kept for it behind the first. The second call is past
+    // the cursor, which stays before the held entry: the read goes on past it for `chat`.
     assert_eq!(
         *p.chat.taken.lock().unwrap(),
-        [first_gap, chat_first, second_gap]
+        [first_gap, chat_first, second_gap, chat_second]
     );
     assert!(p.tasks.taken.lock().unwrap().is_empty());
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
@@ -1500,7 +1499,7 @@ async fn test_protocol_set_owed_call_never_lets_the_cursor_pass_what_its_protoco
         app.cursor()
     );
     // Once `tasks` takes the calls, it gets the rest in feed order, each once; `chat`
-    // gets its later entry, and nothing again, and the cursor goes on.
+    // gets nothing again, and the cursor goes on.
     *p.tasks.failing_missed.lock().unwrap() = 0;
     read(&mut app, 4).await;
     assert_eq!(
@@ -2595,7 +2594,7 @@ async fn while_tasks_owes(order: &[Shown], tail: bool) {
     assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
     assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
     assert!(!w.app.listing_owed().await.unwrap());
-    // A listing owed while it owed left its collections out: its own came after its call.
+    // A listing a later item owed waited for it: made once it took its call.
     let owes_a_listing = order.iter().any(|shown| {
         matches!(
             shown,
@@ -2678,8 +2677,8 @@ async fn test_protocol_set_owing_protocol_is_told_nothing_later_in_any_order() {
 #[tokio::test]
 async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_listing() {
     // A second missed item, after an upload makes a `tasks` record divergent: the listing
-    // it owes leaves `tasks.list` out, so `tasks` isn't told the divergence until it takes
-    // its call, when its own listing comes after it.
+    // it owes waits for `tasks`, so `tasks` isn't told the divergence until it takes its
+    // call, when the listing is made for it.
     while_tasks_owes(
         &[Shown::TasksUpload, Shown::Missed, Shown::ChatEntry],
         false,
@@ -2697,8 +2696,8 @@ async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_upload() {
 #[tokio::test]
 async fn test_protocol_set_call_after_one_its_protocol_failed_is_owed_behind_it() {
     // `tasks` fails the first of two missed items in one page, once: the second isn't
-    // handed to it past the first, but owed behind it, while `chat` takes both; the next
-    // read hands `tasks` both, in feed order.
+    // handed to it past the first, but kept for it behind it, while `chat` takes both; the
+    // next read hands `tasks` both, in feed order.
     let p = Pair::with(
         Named {
             failing_missed: Mutex::new(1),
@@ -2720,32 +2719,6 @@ async fn test_protocol_set_call_after_one_its_protocol_failed_is_owed_behind_it(
         *p.chat.missed.lock().unwrap(),
         [first, second],
         "handed once"
-    );
-}
-
-#[tokio::test]
-async fn test_protocol_set_duty_event_past_a_call_its_protocol_owes_is_refused() {
-    // A duty event raised past a call its protocol owes is never kept: the commit fails.
-    // One for another protocol, or at the owed call's own item, is kept.
-    let p = Pair::new();
-    let mut app = p.join().await;
-    read(&mut app, 1).await;
-    app.owed_from.insert("tasks".into(), (1, 0, 3));
-    let duty = || crate::app::events::Duty::RecordDivergent { key: [5; 32] };
-    let place = crate::app::order::Place::Item((1, 0, 4));
-    let mut tx = app.tx().unwrap();
-    assert!(
-        app.keep_duty_for(&mut tx, vec!["tasks".into()], duty(), place)
-            .is_err()
-    );
-    assert!(
-        app.keep_duty_for(&mut tx, vec!["chat".into()], duty(), place)
-            .is_ok()
-    );
-    let at_the_call = crate::app::order::Place::Item((1, 0, 3));
-    assert!(
-        app.keep_duty_for(&mut tx, vec!["tasks".into()], duty(), at_the_call)
-            .is_ok()
     );
 }
 
@@ -2785,9 +2758,9 @@ async fn test_protocol_set_listing_takes_a_new_divergent_record_while_another_pr
 #[tokio::test]
 async fn test_protocol_set_marks_wait_for_what_was_held_before_them() {
     // `tasks` owes a call; its entry is held, then `chat` entries, then an upload makes the
-    // `tasks` record divergent. With pages of one item, the first read after `tasks` takes
-    // its call goes on from where the last read got, past the held entry: the record is
-    // read again for `tasks` only once that entry was handed.
+    // `tasks` record divergent. With pages of one item, the read before `tasks` takes its
+    // call got past the held entry: the record is read again for `tasks` only once that
+    // entry was handed.
     let p = Pair::with(
         Named {
             collections: vec![tasks_list()],

@@ -983,7 +983,10 @@ async fn test_app_restore_in_place_leaves_behind_an_owed_call_that_isnt_whole() 
     let mut tx = app.tx().unwrap();
     tx.put(
         &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),
-        &missed,
+        &(crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call: missed,
+        }),
     )
     .unwrap();
     tx.put(
@@ -3707,6 +3710,7 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let current = value["v"].clone();
     // Another version doesn't read, with or without a layer.
     value["v"] = json!(9);
     let other = serde_json::to_vec(&value).unwrap();
@@ -3714,13 +3718,16 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
         AppBackup::from_bytes(&other),
         Err(AppError::InvalidData(_))
     ));
-    value["protocol"] =
-        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
+    value["layers"] = json!([{ "name": "sample", "data": "" }]);
+    value["beyond_cursor"] = json!({ "seen": [], "parked": [], "processed": [] });
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),
         Err(AppError::InvalidData(_))
     ));
+    // The same layered bytes at the current version read: only the version refuses them.
+    value["v"] = current;
+    assert!(AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).is_ok());
     assert!(AppBackup::from_bytes(b"{}").is_err());
     // Its Debug names the app only.
     let text = format!("{:?}", app.backup().await.unwrap());
@@ -5174,13 +5181,19 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
 async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let batch = conversation(w.bob.public()).local(LocalWrite::Put {
-        key: b"big".to_vec(),
-        value: vec![0; MAX_STEP_LOCAL_BYTES],
-    });
+    // The protocol's own batch, so only the bound refuses it.
+    let batch = crate::app::OpBatch::for_protocol("sample")
+        .op(OpKind::AllowPut {
+            pubky: w.bob.public(),
+            kind: pubky_switch_core::ops::AllowKind::Conversation,
+        })
+        .local(LocalWrite::Put {
+            key: b"big".to_vec(),
+            value: vec![0; MAX_STEP_LOCAL_BYTES],
+        });
     let error = app.submit_batch(batch).await.unwrap_err();
     assert!(
-        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        matches!(&error, AppError::Refused(Refusal::Usage(why)) if why.contains("local writes are at most")),
         "{error:?}"
     );
     assert!(app.kept_batches().await.unwrap().is_empty());
@@ -6739,7 +6752,10 @@ async fn test_app_owed_call_whose_key_names_no_position_fails_closed() {
     let mut tx = app.tx().unwrap();
     tx.put(
         &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),
-        &call,
+        &crate::app::feed::Owed {
+            to: vec!["sample".into()],
+            call,
+        },
     )
     .unwrap();
     app.commit(tx).await.unwrap();

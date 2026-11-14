@@ -1422,11 +1422,8 @@ async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
     .unwrap();
     let backup = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
     // The bytes of a backup without a layer carry no member for it.
-    assert!(
-        !String::from_utf8(backup.to_bytes().unwrap())
-            .unwrap()
-            .contains("\"protocol\"")
-    );
+    let text = String::from_utf8(backup.to_bytes().unwrap()).unwrap();
+    assert!(!text.contains("\"layers\"") && !text.contains("\"beyond_cursor\""));
     let store = Arc::new(MemoryStore::new());
     let restored = restore_on(
         &w,

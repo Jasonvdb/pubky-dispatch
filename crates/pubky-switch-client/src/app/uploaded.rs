@@ -186,6 +186,17 @@ impl App {
                 return Ok(true);
             }
             let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            // Not judged or told past a call its protocol owes, nor one whose protocol the
+            // app can't tell while any protocol owes: it stays marked for a later read
+            // (Switch spec 8.3).
+            if !self.owing.is_empty()
+                && self
+                    .record_protocol(&key)
+                    .await?
+                    .is_none_or(|name| self.owing.contains(&name))
+            {
+                continue;
+            }
             let view = match self.record_view(&key).await {
                 Ok(view) => view.filter(|view| view.key == key),
                 Err(AppError::Switch(ClientError::Switch {

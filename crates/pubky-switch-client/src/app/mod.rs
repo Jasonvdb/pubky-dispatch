@@ -1438,13 +1438,18 @@ impl App {
         // Each held message is one of the outbox the backup carries, its delivery owed: no
         // writer carries the hold of another.
         for msg_id in &backup.held_messages {
-            // The item the restore puts back for `msg_id` is the last the backup lists.
+            // The item the restore puts back for `msg_id` is the last the backup lists, and a
+            // message the backup left out past its budget isn't one it carries.
             if !backup
                 .outbox
                 .iter()
                 .rev()
                 .find(|item| item.msg_id() == msg_id)
                 .is_some_and(send::OutboxItem::delivery_pending)
+                || backup
+                    .outbox_left_out
+                    .iter()
+                    .any(|(left, _)| left == msg_id)
             {
                 return Err(AppError::InvalidData(
                     "a backup's held message isn't one of its outbox owed a delivery".into(),

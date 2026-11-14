@@ -5252,6 +5252,76 @@ async fn test_hold_message_restore_in_place_ends_the_hold_of_a_message_it_drops(
     assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered unheld");
 }
 
+/// A backup listing a held message twice is checked against the copy the restore puts
+/// back, the last: one delivered there carries no hold. So is one listing a held message as
+/// left out past its budget.
+#[tokio::test]
+async fn test_hold_message_backup_whose_held_message_is_not_carried_owed_is_refused() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    assert!(
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap()
+    );
+    let bytes = wallet.backup().await.unwrap().to_bytes().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let restore = |value: &serde_json::Value| {
+        let backup = AppBackup::from_bytes(&serde_json::to_vec(value).unwrap()).unwrap();
+        let env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+        let protocol = protocol.clone();
+        async move { App::restore(env, protocol, config(), &backup).await }
+    };
+    assert!(restore(&value).await.is_ok(), "as taken, it restores");
+    // Twice, the last copy accepted already.
+    let mut twice = value.clone();
+    let mut accepted = twice["outbox"][0].clone();
+    accepted["accepted_at_ms"] = json!(START);
+    twice["outbox"].as_array_mut().unwrap().push(accepted);
+    let error = restore(&twice).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // Carried and named as left out.
+    let mut left = value.clone();
+    left["outbox_left_out"] = json!([[signed.msg_id(), false]]);
+    let error = restore(&left).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+}
+
+/// A held message of a kind no registered protocol owns, as a restore with another set of
+/// protocols brings back, is any protocol's to list and release.
+#[tokio::test]
+async fn test_hold_message_of_a_kind_no_protocol_owns_is_any_protocols() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    assert!(
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap()
+    );
+    let bytes = wallet.backup().await.unwrap().to_bytes().unwrap();
+    drop(wallet);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["outbox"][0]["kind"] = json!("nobody.note");
+    let backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.held_messages("sample").await.unwrap(),
+        vec![signed.msg_id().to_owned()]
+    );
+    restored
+        .release_message("sample", signed.msg_id())
+        .await
+        .unwrap();
+    assert!(restored.held_messages("sample").await.unwrap().is_empty());
+}
+
 /// The per-message calls name a registered protocol.
 #[tokio::test]
 async fn test_hold_message_of_an_unregistered_protocol_is_refused() {

@@ -9924,3 +9924,56 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     assert!(!shared.flagged);
     assert!(shared.not_taken);
 }
+
+/// The wallet's write served with its earlier certificate, which a renewal closed, and no
+/// proof: nothing dates it, so the phone doesn't take it, names nobody, is told so, and
+/// builds on its version. A later write the phone takes ends that.
+#[tokio::test]
+async fn test_records_undated_write_under_a_closed_renewal_is_not_taken_until_one_is() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let (mut wallet, target, key, earlier) = own_write_under_a_closed_renewal(&s).await;
+    phone.refresh_identity().await.unwrap();
+    phone.read_record(&target).await.unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let (cert, proof) = {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        let kept = (held.cert.clone(), held.proof.clone());
+        held.cert = Some(earlier.signed().clone());
+        held.proof = None;
+        kept
+    };
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    phone.take_events();
+    phone.read_record(&target).await.unwrap();
+    let told = phone
+        .take_events()
+        .iter()
+        .filter(|e| matches!(e, AppEvent::WriteNotTaken { key: k } if *k == key))
+        .count();
+    assert_eq!(told, 1);
+    let shared = phone.shared_record(&key).await.unwrap().unwrap();
+    assert!(shared.not_taken && !shared.flagged, "{shared:?}");
+    assert_eq!(ids(shared.content.value()), vec!["a"]);
+    {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        held.cert = cert;
+        held.proof = proof;
+    }
+    wallet
+        .put_record(&target, &value(&["a", "b", "c"]), vec![])
+        .await
+        .unwrap();
+    phone.read_record(&target).await.unwrap();
+    let shared = phone.shared_record(&key).await.unwrap().unwrap();
+    assert!(!shared.not_taken, "{shared:?}");
+    assert_eq!(ids(shared.content.value()), vec!["a", "b", "c"]);
+}

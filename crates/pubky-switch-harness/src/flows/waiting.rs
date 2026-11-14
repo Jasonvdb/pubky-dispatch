@@ -270,7 +270,8 @@ async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
 /// watch, her only app, has read its feed to the end and reads again with `wait`: nothing
 /// is pending, and the switch holds the read. The erasure, the account's first change since
 /// the read arrived, wakes it, and it is answered as for an account the switch doesn't
-/// host: the operator's `404`, never a page under the erased account's key.
+/// host: the not-hosted `404`, signed with the service key, never a page of the erased
+/// account.
 ///
 /// The flow notes that the read was held when the signer acted. How the read ended for
 /// the app isn't noted; the trace holds what the switch answered it.

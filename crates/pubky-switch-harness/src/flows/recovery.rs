@@ -751,19 +751,21 @@ pub async fn provider_loss_refused(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// An enrollment that takes three sends, the first two refused in transit. The first is
-/// answered `400` and the second `409 conflict`, each in the service's place by something
-/// that holds none of its keys, so neither refusal is a switch's: the flow shows what the
-/// signer does with them, and the one enrollment that arrives. The signer takes neither for
-/// the service's word. After the `400` it sends the same
-/// enrollment again; after the `409` it signs a new one, which the service answers, and the
-/// recovery completes.
+/// An enrollment that takes four sends, the first three refused in transit (Switch wire
+/// 7.4.1 Errors). Each is answered in the service's place by something that holds none of
+/// its keys: a `400`, a `503 unavailable` and a `200` no key signs. The signer hasn't
+/// pinned the new service's key, so it can check none of them and takes none for the
+/// service's word; an enrollment error changes nothing, and the signer sends the same
+/// enrollment again. After the `400` it does so in the same run; the `503` and the answer
+/// that doesn't verify end the run, and the next run sends the same bytes. The fourth send
+/// reaches the service, and the recovery completes.
 ///
-/// Calls: `POST /v1/enroll` three times, the first two never reaching the service.
+/// Calls: `POST /v1/enroll` four times, the first three never reaching the service.
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, or a fault met no request.
+/// When a step that should succeed against any switch fails, the signer signs another
+/// enrollment or sends it other than four times, or a fault met no request.
 pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -772,22 +774,49 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
 
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
-    world.refuse("POST", "/v1/enroll", 400, "bad_request");
-    world.refuse("POST", "/v1/enroll", 409, "conflict");
     let (sent, enrollments) = (world.requests_sent(), world.enrollments_sent());
-    let doc = signer
+    world.refuse("POST", "/v1/enroll", 400, "bad_request");
+    world.refuse("POST", "/v1/enroll", 503, "unavailable");
+    let declared = signer
         .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
-        .await?;
+        .await;
     world.outcome(
-        "the signer recovered at its third enrollment",
-        &recovered(&doc, &signer)?,
+        "the signer declared the loss, its enrollment refused twice",
+        &json!({ "ended": ended(&declared), "signer": status(&signer)? }),
     );
-    // Three sends: the same enrollment twice, around the `400`, and a new one after the
-    // `409` (Switch wire 7.4.1). The recovery's other calls are the delivery and the reads
-    // after it.
+    if declared.is_ok() {
+        return Err("the declaration completed after a 503".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    world.refuse("POST", "/v1/enroll", 200, "ok");
+    let unverified = signer.resume().await;
+    world.outcome(
+        "the signer's next run, its enrollment answered unsigned",
+        &json!({ "ended": ended(&unverified), "signer": status(&signer)? }),
+    );
+    if unverified.is_ok() {
+        return Err("the recovery completed on an answer no key signs".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let resumed = signer.resume().await;
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds no identity document")?;
+    world.outcome(
+        "the signer recovered at its fourth send",
+        &json!({ "ended": ended(&resumed), "recovered": recovered(&doc, &signer)? }),
+    );
+    resumed?;
+    if doc.inbox().url != RECOVERY_ORIGIN {
+        return Err(format!("the newest version names {}", doc.inbox().url).into());
+    }
+    // One enrollment, sent four times: an error changes nothing (Switch wire 7.4.1). The
+    // recovery's other calls are the delivery and the reads after it.
     let new_enrollments = world.enrollments_sent() - enrollments;
-    if new_enrollments != 2 {
-        return Err(format!("{new_enrollments} different enrollments were sent, not 2").into());
+    if new_enrollments != 1 {
+        return Err(format!("{new_enrollments} different enrollments were sent, not 1").into());
     }
     let trace = world.trace();
     let sends = trace
@@ -797,8 +826,8 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
         .skip(sent)
         .filter(|line| line.label == "{alice} POST /v1/enroll")
         .count();
-    if sends != 3 {
-        return Err(format!("the enrollment took {sends} sends, not 3").into());
+    if sends != 4 {
+        return Err(format!("the enrollment took {sends} sends, not 4").into());
     }
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
@@ -1146,9 +1175,9 @@ pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, the refusal isn't the
-/// service's under the new account's key, or the signer doesn't end as refused there, or
-/// sends something after it.
+/// When a step that should succeed against any switch fails, the refusal isn't signed with
+/// the service's one key, or the signer doesn't end as refused there, or sends something
+/// after it.
 pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;

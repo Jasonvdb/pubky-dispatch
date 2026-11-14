@@ -13,10 +13,11 @@
 //!   key of a generation is the one its `identity.json` names (`inbox.service_key`, Switch
 //!   wire 3.3), taken from the delivery the switch accepted, which must itself be answered
 //!   under that key; the key of the generation before is held no longer from then on.
-//!   Before its document is taken, a key is one the run brought: the service key a world
-//!   gives an account, or the one an enrollment's answer names and is signed with (Switch
-//!   wire 7.4.1). The trace says which signed, a generation's key or a key not delivered
-//!   yet by its number in the order the run brought them, so the two runs must agree on it;
+//!   Before its document is taken, a key is one the run brought: the one key of the switch
+//!   a world adds the account at, or the one an enrollment's answer names and is signed
+//!   with (Switch wire 7.4.1). The trace says which signed, a generation's key or a key
+//!   not delivered yet by its number in the order the run brought them, so the two runs
+//!   must agree on it;
 //! - every signed head, in `Switch-Head` and in a body's `head` (Switch wire 6.7): its
 //!   signature, with the key that signed the answer carrying it, its generation, and its
 //!   chain hash against the stub of its `seq` where the run showed one;
@@ -191,7 +192,7 @@ pub enum SignedWith {
     /// `identity.json` names, which a switch took.
     Generation(u64),
     /// A service key the run brought whose document no switch took yet: its number, from
-    /// 1, in the order the run brought the account's keys.
+    /// 1, in the order the run brought them for the account.
     Brought(usize),
     /// A switch's one key, for an answer about no account the run knows.
     SwitchKey,
@@ -407,7 +408,7 @@ impl Found<'_> {
     }
 
     /// The service key to verify `what` at `at` with: the one that signed the answer. An
-    /// answer about no account the run knows carries nothing an account's key signs; one
+    /// answer about no account the run knows carries no head or proof of an account; one
     /// whose own signature failed is reported for that already.
     fn key_for(&mut self, what: &str, at: &str) -> Option<[u8; 32]> {
         if self.key.is_none() && self.signed == Some(SignedWith::SwitchKey) {
@@ -799,7 +800,7 @@ mod tests {
         let refused = answer(
             &enroll,
             &key(4),
-            409,
+            400,
             &json!({ "service_key": b64(&key(4).public()) }),
         );
         assert!(checker.signature(&enroll, &refused).is_err());

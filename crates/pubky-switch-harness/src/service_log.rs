@@ -282,7 +282,7 @@ mod tests {
         tracing::info!(target: "pubky_switch::service", "served");
         tracing::warn!(target: "pubky_switch_other::service", "another crate's");
         tracing::warn!(target: "sqlx::query", "a slow statement");
-        tracing::error!(target: "pubky_switch::keys", failure = %"no such file", "the operator key");
+        tracing::error!(target: "pubky_switch::keys", failure = %"no such file", "the service key");
         drop(keeping);
         tracing::error!(target: "pubky_switch::service", "after it");
 
@@ -291,7 +291,7 @@ mod tests {
             [
                 "WARN pubky_switch::service: storage error=database: pool timed out while \
                  waiting for an open connection",
-                "ERROR pubky_switch::keys: the operator key failure=no such file",
+                "ERROR pubky_switch::keys: the service key failure=no such file",
             ]
         );
     }

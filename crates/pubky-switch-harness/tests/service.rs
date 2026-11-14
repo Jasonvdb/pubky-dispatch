@@ -101,8 +101,8 @@ async fn test_service_transport_takes_the_services_own_path() {
     assert!(!database_exists(&name).await, "{name} was left behind");
 }
 
-/// A request the service's storage fails: the service answers `503 unavailable` under the
-/// operator key, and its log, which a run keeps, says that it was the database.
+/// A request the service's storage fails: the service answers `503 unavailable` under its
+/// service key, and its log, which a run keeps, says that it was the database.
 #[tokio::test]
 async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
     let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {

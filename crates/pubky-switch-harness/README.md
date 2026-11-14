@@ -64,16 +64,13 @@ A revocation whose answer was lost isn't sent again while the signer can read th
 reads the account's apps and finds it done.
 
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
-next read of the account's apps gets the operator's `404`, which nobody can authenticate, so
-it holds the account as erased but unconfirmed. It concludes the account is erased at its
-first run 24 hours after that `404`, every read in between having met it too. The flow moves
-the world's clock, which is the signer's device clock, by those 24 hours.
+next read of the account's apps gets the not-hosted `404`, signed with the service key it
+pinned and bound to its own request, which confirms the erasure at once.
 
-An app of an erased account waits too (Switch spec 12.7 step 5): its reads meet the
-operator's `404` and no `identity.json` on the Homeserver, which the signer's erasure took
-off, and it takes the account as gone at the fifth read, each at least 6 hours after the one
-before, 24 hours after the first. Both erasure flows run that wait, and a read short of the
-24 hours that raises nothing.
+An app of an erased account takes it as gone at its next read (Switch spec 12.7 step 5): the
+read meets the not-hosted `404`, signed with the service key the app pinned, and the
+Homeserver holds no `identity.json`, which the signer's erasure took off. Neither alone is
+enough; both together are an erasure, at once.
 
 ## The recovery notice
 

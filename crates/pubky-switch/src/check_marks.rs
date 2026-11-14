@@ -19,12 +19,7 @@ use std::{
     str::FromStr,
 };
 
-use pubky_switch_core::{
-    chain::{ChainTip, ZERO_HASH},
-    http::RecoveryNotice,
-    records::IdentityBody,
-    sig::SignedDoc,
-};
+use pubky_switch_core::{http::RecoveryNotice, records::IdentityBody, sig::SignedDoc};
 use serde::Serialize;
 use sqlx::{PgConnection, postgres::PgConnectOptions};
 
@@ -311,41 +306,25 @@ pub fn state_of(verdict: &Verdict, erased_again: bool) -> Option<MarkState> {
     }
 }
 
-/// The account the verdict judges: serving at its chain head once its newest
-/// `identity.json` names `origin` and `service_key`, else staged, holding no chain.
+/// The account the verdict judges, as the service judges it ([`Account::judged`]): its
+/// newest `identity.json` naming `origin` and a key the key store holds, `service_key`, its
+/// one key. Returns it and whether it serves.
 fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Account, bool) {
     let body = head
         .identity_doc
         .as_deref()
         .and_then(|bytes| serde_json::from_slice::<SignedDoc>(bytes).ok())
         .and_then(|doc| doc.peek::<IdentityBody>().ok());
-    let named = body
-        .as_ref()
-        .filter(|body| body.inbox.url == origin && body.inbox.service_key == *service_key)
-        .map(|body| body.inbox.service_key);
-    let (seq, chain_hash) = head.chain.unwrap_or((0, ZERO_HASH));
-    let tip = ChainTip {
-        generation: head.generation,
-        seq,
-        chain_hash,
-    };
-    let state = if named.is_some() {
-        AccountState::Serving(tip)
-    } else if head.chain.is_some() {
-        AccountState::StagedImport(tip)
-    } else {
-        AccountState::StagedNoChain
-    };
-    (
-        Account {
-            state,
-            created_at_ms: head.created_at_ms,
-            document_generation: body.map(|body| body.generation),
-            named_key: named,
-            enrolled_generation: head.generation,
-        },
-        named.is_some(),
-    )
+    let account = Account::judged(
+        origin,
+        |key| key == service_key,
+        head.generation,
+        head.chain,
+        head.created_at_ms,
+        body.as_ref(),
+    );
+    let serving = matches!(account.state, AccountState::Serving(_));
+    (account, serving)
 }
 
 /// One identity as the check judges it.
@@ -591,6 +570,7 @@ fn mark_input(marks: &MarkView, identity: &str) -> Result<MarkInput, CheckError>
 mod tests {
     use super::*;
     use crate::marks::AccountMark;
+    use pubky_switch_core::chain::ChainTip;
 
     const KEY: [u8; 32] = [7; 32];
 

@@ -10,7 +10,7 @@
 //! compares a state with its mark.
 
 use pubky_switch_core::{
-    chain::{ChainTip, ZERO_HASH},
+    chain::ChainTip,
     http::{IdentityDelivery, NoticeReason, RecoveryNotice, not_hosted_current},
     records::IdentityBody,
     sig::SignedDoc,
@@ -19,9 +19,7 @@ use pubky_switch_core::{
 use super::{
     Service,
     signed::Asked,
-    verdict::{
-        self, Account, AccountState, Inputs, Judgement, MarkInput, MoveStep, RequestClass, Route,
-    },
+    verdict::{self, Account, Inputs, Judgement, MarkInput, MoveStep, RequestClass, Route},
 };
 use crate::{
     http::{
@@ -108,8 +106,9 @@ pub(super) fn class_of(request: &SwitchRequest) -> RequestClass {
         Call::RecoveryUpload | Call::Import | Call::ImportChunk(_) => {
             RequestClass::Move(MoveStep::ImportOrUpload)
         }
-        // The activation isn't served yet: it goes on to the endpoint's answer.
-        Call::ImportActivate => RequestClass::Move(MoveStep::Activate { clears_mark: true }),
+        // Whether the import clears the mark is the endpoint's to compute from the import,
+        // which isn't read here: the activation is classed as unjudged (Table 2).
+        Call::ImportActivate => RequestClass::Move(MoveStep::ActivateUnjudged),
         Call::Unfreeze => RequestClass::Move(MoveStep::Abort),
         Call::Export | Call::ExportChunk(_) => RequestClass::Move(MoveStep::Export),
         _ => RequestClass::Ordinary,
@@ -117,18 +116,8 @@ pub(super) fn class_of(request: &SwitchRequest) -> RequestClass {
 }
 
 impl Service {
-    /// What an `identity.json` says of this service: its generation, and the service key it
-    /// names where it names this origin and a key the key store holds.
-    fn doc_facts(&self, body: &IdentityBody) -> (u64, Option<[u8; 32]>) {
-        let names = (body.inbox.url == self.origin
-            && self.keys.signer_for(&body.inbox.service_key).is_some())
-        .then_some(body.inbox.service_key);
-        (body.generation, names)
-    }
-
-    /// An account as the verdict judges it (Switch wire 7.3, "The state"): serving at its
-    /// chain head once its newest `identity.json` names this service, else staged, holding
-    /// no chain (no import is activated here yet).
+    /// An account as the verdict judges it ([`Account::judged`]), naming this origin and a
+    /// key the key store holds.
     pub(super) fn account_input(
         &self,
         generation: u64,
@@ -136,30 +125,14 @@ impl Service {
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
     ) -> Account {
-        let facts = doc.map(|body| self.doc_facts(body));
-        let named_key = facts.and_then(|(_, named)| named);
-        let (seq, chain_hash) = chain.unwrap_or((0, ZERO_HASH));
-        let tip = ChainTip {
+        Account::judged(
+            &self.origin,
+            |key| self.keys.signer_for(key).is_some(),
             generation,
-            seq,
-            chain_hash,
-        };
-        // A staged account holding a chain, one whose newest document names another service,
-        // is judged as one holding an activated import: by its chain.
-        let state = if named_key.is_some() {
-            AccountState::Serving(tip)
-        } else if chain.is_some() {
-            AccountState::StagedImport(tip)
-        } else {
-            AccountState::StagedNoChain
-        };
-        Account {
-            state,
+            chain,
             created_at_ms,
-            document_generation: facts.map(|(generation, _)| generation),
-            named_key,
-            enrolled_generation: generation,
-        }
+            doc,
+        )
     }
 
     /// The account a lookup found, as the verdict judges it. Its document was verified when
@@ -372,6 +345,7 @@ impl Service {
             | Route::Proceed { .. }
             | Route::StartAfresh
             | Route::Conflict
+            | Route::JudgeActivation
             | Route::Erase { .. }
             | Route::EraseLost => return None,
         };

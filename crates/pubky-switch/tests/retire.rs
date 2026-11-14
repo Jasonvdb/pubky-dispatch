@@ -388,3 +388,59 @@ async fn test_retire_service_answers_permanent_notice() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_clears_nothing() {
+    // alice's account is staged at her (0, 0) mark, and generation 1 is retired for her, as
+    // a lost identity's retirement that her new enrollment kept. An activation there isn't
+    // judged as one that clears the mark: it reaches only the answer of a call the service
+    // doesn't serve, and the mark stays where it was (Switch wire 7.3, Tables 2 and 3).
+    let Some(replay) = replay().await else { return };
+    let alice = alice_id();
+    let keys = vectors("keys.json");
+    let identity = IdentityKey::from_secret(hex32(&support::alice(&keys)["secret_hex"]));
+    let account = NewAccount {
+        id: alice.clone(),
+        identity_key: identity.public(),
+        generation: 1,
+        created_at_ms: T0,
+        limits: pubky_switch_core::records::Limits::default(),
+        identity_doc: None,
+        revoked_apps: Vec::new(),
+        enrollment_hash: [0; 32],
+    };
+    assert!(
+        replay
+            .db
+            .store()
+            .create_account(&account)
+            .await
+            .expect("create")
+    );
+    replay
+        .marks
+        .create_zero(&alice, service_public(&replay), T0)
+        .await
+        .expect("mark");
+    replay.marks.retire(&alice, 1).await.expect("retire");
+    let before = replay.marks.read(&alice).await.expect("read");
+    let at = T0 + 1_000;
+    replay.clock.set_wall_ms(at);
+    let path = format!("/v1/{alice}/import/activate");
+    let answer = replay
+        .service
+        .handle(signer_request("POST", &path, b"{}".to_vec(), at))
+        .await;
+    assert_eq!(answer.status, 503);
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(body["code"], "unavailable", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("isn't served yet")),
+        "{body}"
+    );
+    assert!(header_text(&answer, "switch-head").is_none());
+    assert_eq!(replay.marks.read(&alice).await.expect("read"), before);
+    replay.db.drop_database().await.expect("drop");
+}

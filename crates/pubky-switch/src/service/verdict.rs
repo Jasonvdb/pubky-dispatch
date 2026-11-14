@@ -6,8 +6,9 @@
 //! "Signed with" column; [`answer`] gives the route of Table 2 for the request's class.
 
 use pubky_switch_core::{
-    chain::ChainTip,
+    chain::{ChainTip, ZERO_HASH},
     http::{NoticeReason, RecoveryNotice},
+    records::IdentityBody,
 };
 
 use crate::marks::{AccountMark, MarkRead, MarkStoreError};
@@ -61,6 +62,44 @@ pub struct Account {
 }
 
 impl Account {
+    /// The account as the verdict judges it (Switch wire 7.3, "The state"), in one place
+    /// for the service and its offline check: serving at its chain head once its newest
+    /// `identity.json`, `doc`, names `origin` and a key the service's key store holds, as
+    /// `holds` says; else staged, judged by its chain where it holds one (an activated
+    /// import), else holding none. `generation` is the one it was enrolled at.
+    pub fn judged(
+        origin: &str,
+        holds: impl Fn(&[u8; 32]) -> bool,
+        generation: u64,
+        chain: Option<(u64, [u8; 32])>,
+        created_at_ms: u64,
+        doc: Option<&IdentityBody>,
+    ) -> Self {
+        let named_key = doc
+            .filter(|body| body.inbox.url == origin && holds(&body.inbox.service_key))
+            .map(|body| body.inbox.service_key);
+        let (seq, chain_hash) = chain.unwrap_or((0, ZERO_HASH));
+        let tip = ChainTip {
+            generation,
+            seq,
+            chain_hash,
+        };
+        let state = if named_key.is_some() {
+            AccountState::Serving(tip)
+        } else if chain.is_some() {
+            AccountState::StagedImport(tip)
+        } else {
+            AccountState::StagedNoChain
+        };
+        Self {
+            state,
+            created_at_ms,
+            document_generation: doc.map(|body| body.generation),
+            named_key,
+            enrolled_generation: generation,
+        }
+    }
+
     /// Its generation here (Switch wire 7.6): that of the state it holds, its chain's where
     /// it holds one (an activated import included), else its document's, 0 only while it
     /// holds neither.
@@ -396,11 +435,20 @@ pub enum MoveStep {
     /// The import and the uploads: `POST /import`, `PUT /import/chunks/{chunk_id}`,
     /// `POST /recovery/upload`.
     ImportOrUpload,
-    /// `POST /import/activate`.
+    /// `POST /import/activate`, once its import is judged.
+    // The activation isn't served yet: its endpoint will route it so.
+    #[cfg_attr(not(test), allow(dead_code))]
     Activate {
         /// Whether the import clears the mark ([`activation_clears_mark`]).
         clears_mark: bool,
     },
+    /// `POST /import/activate` as the request arrives, before its import is judged: no
+    /// verdict lets it activate anything, and wherever the import could clear the mark it is
+    /// routed to [`Route::JudgeActivation`], so an activation is only ever answered as
+    /// [`MoveStep::Activate`] with `clears_mark` computed from its import. This keeps the
+    /// refusal of an import of a retired generation, at any staged account, from being
+    /// passed over (Switch wire 7.3, Table 2).
+    ActivateUnjudged,
     /// The abort, `POST /unfreeze` (Switch wire 10.6).
     Abort,
     /// The export, `GET /export` and `GET /export/chunks/{chunk_id}`.
@@ -427,6 +475,10 @@ pub enum Route {
     StartAfresh,
     /// `409 conflict`: an activation that doesn't clear the mark.
     Conflict,
+    /// An activation whose import isn't judged yet ([`MoveStep::ActivateUnjudged`]): the
+    /// endpoint computes [`activation_clears_mark`] from the import and routes it again as
+    /// [`MoveStep::Activate`]; nothing is activated and no head is signed on this route.
+    JudgeActivation,
     /// The erasure as Switch wire 7.4.16 gives.
     Erase {
         /// The account fails stop: a frozen account's unfinished export doesn't bar it.
@@ -484,6 +536,7 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
             // At any staged account, an import of a retired generation isn't activated: the
             // same `409 conflict` as at a bounded one (Switch wire 7.3, Table 2).
             RequestClass::Move(MoveStep::Activate { clears_mark: false }) => Route::Conflict,
+            RequestClass::Move(MoveStep::ActivateUnjudged) => Route::JudgeActivation,
             RequestClass::Ordinary | RequestClass::PutIdentity { .. } | RequestClass::Move(_) => {
                 Route::Proceed { head: true }
             }
@@ -506,6 +559,7 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
                 MoveStep::ImportOrUpload => Route::Proceed { head: false },
                 MoveStep::Activate { clears_mark: true } => Route::Proceed { head: true },
                 MoveStep::Activate { clears_mark: false } => Route::Conflict,
+                MoveStep::ActivateUnjudged => Route::JudgeActivation,
                 MoveStep::Abort if abort_allowed => Route::Proceed { head: false },
                 MoveStep::Abort | MoveStep::Export => Route::Notice(notice),
             },
@@ -562,7 +616,8 @@ fn start_or_notice(notice: RecoveryNotice, generation: u64, recovery_from: Optio
 /// there. `hash_at_mark` is the import's chain hash at the mark's generation and `seq`,
 /// `None` where its chain doesn't reach it. With the mark lost only the retirement bounds
 /// it.
-// The activation isn't served yet: its endpoint will compute `MoveStep::Activate` with it.
+// The activation isn't served yet: its endpoint will compute `MoveStep::Activate` with it,
+// from the request routed to `Route::JudgeActivation`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn activation_clears_mark(
     import_head: ChainTip,
@@ -1465,10 +1520,11 @@ mod tests {
     }
 
     const ERASE: RequestClass = RequestClass::Erase;
-    const STEPS: [MoveStep; 5] = [
+    const STEPS: [MoveStep; 6] = [
         MoveStep::ImportOrUpload,
         MoveStep::Activate { clears_mark: true },
         MoveStep::Activate { clears_mark: false },
+        MoveStep::ActivateUnjudged,
         MoveStep::Abort,
         MoveStep::Export,
     ];
@@ -1552,13 +1608,81 @@ mod tests {
         assert_eq!(route_of(verdict, RequestClass::Ordinary), on);
         assert_eq!(route_of(verdict, put(5, Some(4))), on);
         for step in STEPS {
-            let expected = if step == (MoveStep::Activate { clears_mark: false }) {
-                Route::Conflict
-            } else {
-                on
+            let expected = match step {
+                MoveStep::Activate { clears_mark: false } => Route::Conflict,
+                MoveStep::ActivateUnjudged => Route::JudgeActivation,
+                _ => on,
             };
             assert_eq!(route_of(verdict, RequestClass::Move(step)), expected);
         }
+    }
+
+    #[test]
+    fn test_account_judged_serves_on_a_held_key_at_this_origin() {
+        // Serving once the newest document names this origin and a key the store holds;
+        // another origin, or a key it doesn't hold, leaves it staged, judged by its chain
+        // where it holds one (Switch wire 7.3, "The state").
+        let body = |origin: &str, key: [u8; 32]| IdentityBody {
+            generation: 2,
+            ..IdentityBody::first(
+                [9; 32],
+                [4; 16],
+                pubky_switch_core::records::Inbox::new(origin, key),
+                pubky_switch_core::records::IdentityPolicy::default(),
+            )
+        };
+        let holds = |key: &[u8; 32]| *key == DOC_KEY || *key == CURRENT;
+        let judged = |doc: Option<&IdentityBody>, chain| {
+            Account::judged("https://switch.example", holds, 2, chain, 5, doc)
+        };
+        let here = body("https://switch.example", DOC_KEY);
+        let served = judged(Some(&here), Some((10, [1; 32])));
+        assert_eq!(served.state, AccountState::Serving(tip(2, 10, 1)));
+        assert_eq!(served.named_key, Some(DOC_KEY));
+        assert_eq!(served.document_generation, Some(2));
+        let unheld = body("https://switch.example", [7; 32]);
+        let elsewhere = body("https://other.example", DOC_KEY);
+        for doc in [&unheld, &elsewhere] {
+            let staged = judged(Some(doc), Some((10, [1; 32])));
+            assert_eq!(staged.state, AccountState::StagedImport(tip(2, 10, 1)));
+            assert_eq!(staged.named_key, None);
+            assert_eq!(judged(Some(doc), None).state, AccountState::StagedNoChain);
+        }
+        assert_eq!(judged(None, None).document_generation, None);
+    }
+
+    #[test]
+    fn test_answer_unjudged_activation_never_clears_a_mark() {
+        // An activation whose import isn't judged is never routed as one that activates or
+        // signs a head: where the import could clear the mark, it goes to be judged; at an
+        // account that fails stop or a lost identity it gets the notice, as every move step
+        // that isn't an abort (Switch wire 7.3, Table 2).
+        let unjudged = RequestClass::Move(MoveStep::ActivateUnjudged);
+        for verdict in [
+            Verdict::Staged,
+            Verdict::Healthy,
+            Verdict::Bounded {
+                notice: BEHIND,
+                abort_allowed: true,
+            },
+            Verdict::Bounded {
+                notice: BEHIND,
+                abort_allowed: false,
+            },
+        ] {
+            assert_eq!(route_of(verdict, unjudged), Route::JudgeActivation);
+        }
+        for verdict in [
+            Verdict::Failing {
+                notice: BEHIND,
+                abort_allowed: true,
+            },
+            Verdict::Lost { notice: BEHIND },
+        ] {
+            assert_eq!(route_of(verdict, unjudged), Route::Notice(BEHIND));
+        }
+        assert_eq!(route_of(NOT_HOSTED, unjudged), Route::NotHosted);
+        assert_eq!(route_of(Verdict::Unknown, unjudged), Route::Unavailable);
     }
 
     #[test]

@@ -879,6 +879,7 @@ impl Service {
             | Route::Proceed { head: false }
             | Route::StartAfresh
             | Route::Conflict
+            | Route::JudgeActivation
             | Route::Erase { .. }
             | Route::EraseLost => {
                 return Err(FeedStop::Verdict {

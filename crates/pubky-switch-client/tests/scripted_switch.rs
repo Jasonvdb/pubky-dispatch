@@ -759,7 +759,7 @@ async fn test_testing_held_read_of_a_departed_app_is_refused() {
 }
 
 #[tokio::test]
-async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
+async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
     let s = Setup::new();
     let switch = s.alice.switch();
     let (_app, request) = held_read(&s).await;
@@ -772,18 +772,24 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
-        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        body: pubky_switch_core::http::erase_body(
+            &switch.service_key(),
+            switch.identity_doc().map(|doc| doc.hash()).as_ref(),
+        ),
     };
     let erased = switch.transport().send(erase).await.unwrap();
     assert_eq!(erased.status, 200);
     assert_eq!(switch.held_reads(), 0, "the erasure woke the read");
-    // The held read is answered as for an account the switch doesn't host: the operator's
-    // `404`, never a page under the erased account's key.
+    // The held read is answered as for an account the switch doesn't host: the `404` with
+    // `current: { "hosted": false }`, never a page of the erased account (Switch wire 7.3
+    // step 2).
     let answer = poll_once(&mut read).expect("answered");
     assert_eq!(
         (answer.status, code_of(&answer).as_str()),
         (404, "not_found")
     );
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(body["current"], json!({ "hosted": false }));
     assert!(
         answer.header("switch-head").is_none(),
         "no head of the erased account"
@@ -811,15 +817,9 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         )
         .is_ok()
     };
-    assert!(
-        !verifies(&switch.service_key()),
-        "signed with the erased account's key"
-    );
-    // The scripted switch's operator key.
-    let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
-        .verifying_key()
-        .to_bytes();
-    assert!(verifies(&operator), "signed with the operator key");
+    // Signed with the switch's one key, bound to the read's method and path (Switch wire
+    // 7.1).
+    assert!(verifies(&switch.service_key()), "signed with the one key");
 }
 
 /// A feed read by `app` after `seq`, with `wait`.
@@ -924,13 +924,16 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         (answer.status, code_of(&answer).as_str()),
         (403, "not_current")
     );
-    // An account erased before the read: the operator's `404` at once.
+    // An account erased before the read: the not-hosted `404` at once.
     let erase = Request {
         method: "POST".into(),
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
-        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        body: pubky_switch_core::http::erase_body(
+            &switch.service_key(),
+            switch.identity_doc().map(|doc| doc.hash()).as_ref(),
+        ),
     };
     assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
     let mut read = transport.send(request);

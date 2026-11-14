@@ -18,8 +18,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
   the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
   one isn't refused. An enrollment's timestamp is checked the same way, before the
-  enrollment is looked at, and its `401` is the operator's, with the clock's time in both
-  places. Every other request stamps the clock's time. Answers to own apps and
+  enrollment is looked at, and its `401` carries the clock's time in both places. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
   time and no head; other injected faults with the clock's time and the head. A request an
@@ -56,10 +55,39 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
 ## State and retention
 
-- **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
-  key's mark isn't kept, so there is no state behind it: the service's `503` "a new
-  generation is needed" (Switch wire 7.3 step 10), and the recovery delivery exempt from it,
-  aren't modelled. Per-account order is a mutex.
+- **Durability** (Switch spec 6.5): everything is in memory, answered at once, so a commit
+  and the mark's move never fail apart: the `503 unavailable` of a mark that didn't move,
+  and its retry, aren't modelled. Per-account order is a mutex.
+- **One service key** (Switch wire 7.1): every answer, the account's and those it can't tie
+  to an account (the `404` of an identity it doesn't host, an enrollment's errors), is
+  signed with the switch's one key, the key made from `service_secret`; there is no
+  operator key. A key change in place (`change_key_into`) is a switch of its own under the
+  new key, where the service keeps each mark's key until a start names the new one.
+- **Accounts and marks** (Switch wire 7.3, Tables 1 to 3), in `switch/marks.rs`: the
+  account's mark (generation, `seq`, chain hash, key, creation time), its retired
+  generations and its erasure's record lie apart from its state and survive an erasure, a
+  lost account and a start afresh. An enrollment that creates the account writes (0, 0)
+  first, or takes over a (0, 0) mark or a lost account's mark; a switch made with `new`,
+  `with_generation`, `recovering` or `import_into` starts with its mark at its state. The
+  mark moves to the state after each request whose account is healthy, and to an injected
+  batch's, and a delivery that starts a generation writes it at the new first head. Step 2
+  judges the two before anything else, a stale timestamp and an own app's first-call `403`
+  included: the notice, `503 recovery_required` with `current { generation, reason,
+  permanent }`; the `404 not_found` with `current: { "hosted": false }`; and `503
+  unavailable` while the store can't be read; each with no head and the clock's time. The
+  test controls: `restore_to` (the state behind the mark), `fork_mark`, `lose_mark`,
+  `corrupt_mark`, `set_mark_store_unreadable`, `lose_account` (the mark without the account)
+  and `retire`; `mark` and `erasure_record` read them. `roll_back_to` moves the mark back
+  with the chain, a faulty service that signs behind its heads. Left out:
+  - Table 1's first row: nothing brings an erased account back;
+  - the moves of Table 2 but `POST /recovery/upload`, which goes through only where the
+    account is bounded: this switch has no import, activation, abort or export calls, so an
+    activation's `409 conflict` and an abort that goes through at a failing account aren't
+    shown;
+  - a failed mark move (above), the instance lock's freshness, and the leftover sweep at
+    start: a leftover mark goes at the next request for the identity;
+  - the creation time of an account enrolled right after an erasure is a millisecond past
+    the erasure's record where the clock hasn't moved, so the record never covers it.
 - **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
   feed read with `wait` that has nothing to show its app, until the account's sequence
   grows or the wait has passed. The wait passes by the switch's clock, a test clock that
@@ -74,15 +102,14 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   lagging mark ends then. The switch's
   lock isn't held across the wait, and every request to the switch lets the held reads look
   again. A read held while its app is revoked or leaves is woken and refused `403
-  not_current`, and one held while its account is erased gets the operator's `404`, never a
-  page under the erased account's key (Switch wire 7.4.16). One held while its account
-  recovers in place is woken by the recovery and answered `503 unavailable` with the operator
-  key and no head, as at the service: the key it was read under signs nothing more (Switch
-  wire 7.4.4); `recover_in_place` recovers the account through its own `PUT /identity`, for
-  tests. Unlike the service, a held read looks again only for something to show, the
-  erasure, the account's service key and its time: if a recovery in place and then an
-  erasure both land before a woken read looks again, it gets the `503` where the service
-  answers `404` (no flow of one task reaches it). An app whose
+  not_current`, and one held while its account is erased gets the `404` of an identity the
+  switch doesn't host, never a page of the erased account (Switch wire 7.4.16). One held
+  while its account recovers in place is woken by the recovery and answered from the account
+  as it then is, at the new generation: `403 not_current` with no head, the fresh account
+  holding no record of the app (Switch wire 7.4.4); `recover_in_place` recovers the account
+  through its own `PUT /identity`, for tests. Unlike the service, a held read looks again
+  only for something to show, the erasure, the account's generation and its time; a held
+  read whose account starts failing meanwhile gets the notice once it looks again. An app whose
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and
   the stale-timestamp check apply when the read is answered, not when it arrives.
@@ -279,36 +306,33 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   origin, [`SWITCH_ORIGIN`] unless it was made with `unenrolled_at`, with the default limits
   unless a test sets others (`set_enroll_limits`), and without checking the request
   signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
-  with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
-  every later one gets the same key and changes nothing. As at the service, the same
-  enrollment again gets its kept answer first, with no other effect, signed with the key it
-  names. At a serving account, as at the service, a new enrollment is answered with a
-  pending key for the next generation, the same
-  for every such enrollment, signed with that key, and the App IDs it names are held with
-  it. Once a delivery starts a generation under the pending key, an enrollment the outgoing
-  key answered is `409 conflict` again, and one the pending key answered gets its answer
-  again. Unlike the service:
-  - an enrollment's `identity_doc` isn't held, so the account starts with no document and
-    at the switch's own generation, whatever the enrollment names;
-  - the pending key is derived from the account's, not random.
-
-  Its errors, injected ones and the `409 conflict` included, are signed with the operator
-  key, as at the service.
+  with the `404` of an identity it doesn't host until then. As at the service, the
+  enrollment that makes the account writes its mark first (above) and sets its kept App
+  IDs, every enrollment's answer names the one key, and every later one changes nothing.
+  As at the service, the same enrollment again gets its kept answer first, with no other
+  effect. At a serving account, as at the service, the App IDs a new enrollment names are
+  held for the next generation, whose start refuses a document listing one and then keeps
+  them. Unlike the service, an enrollment's `identity_doc` isn't held, so the account starts
+  with no document and at the switch's own generation, whatever the enrollment names. Its
+  errors, injected ones included, are signed with the one key, as at the service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each
   names, with the key of that generation (its own, or the earlier service's that
   `import_into` carried). A first document carrying `recovery_from` starts the recovery as
   at the service: the account takes its generation, and its chain starts with the `recovery`
-  transition, unless the switch was made `recovering`, which chained it already. A document
-  naming the pending key with `recovery_from` is a provider loss in place, refused with
-  `400` when it lists an App ID held with that key: the account starts afresh under that
-  key, keeping its service time, its enrollments and the App IDs
-  to refuse, those held with the pending key among them, and, as the service does, its upload
+  transition, unless the switch was made `recovering`, which chained it already. The next
+  generation naming this switch's key with `recovery_from` is a provider loss in place,
+  refused with `400` when it lists an App ID held for that generation, and so is the start
+  above both the held document's and the mark's generation that a failing or bounded
+  account takes, exempt from the compare-and-swap: the account starts afresh, keeping its
+  creation time, its mark store, its service time, its enrollments and the App IDs
+  to refuse, those held for the generation among them, and, as the service does, its upload
   limits, its hourly upload counts, the directory's `apps_version` and
   `directory_version`, which go on counting, and what a test set of its configuration (the
-  feed's page limits, kept passed entries, open admission). Unlike the service: a key change
-  in place, without `recovery_from`, is answered `400`; and a staged account's generation
+  feed's page limits, kept passed entries, open admission). A key change in place, without
+  `recovery_from`, is answered `400`, as at the service, whose one key it can't change to.
+  Unlike the service: and a staged account's generation
   change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
@@ -401,27 +425,27 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
   copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
-  its answer with another key, such as a third key, or the key a recovery in place leaves,
-  signing the delivery that starts the new generation; **`Fault::ErrorSignedWith`** an
+  its answer with another key, such as a third key; **`Fault::ErrorSignedWith`** an
   error answer under another key, applying nothing.
-- **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
-  the account's service key (`409 conflict` for another) and, when it names one, the hash of
-  the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
-  refuses during a move (`409 conflict`): at any frozen account, since this switch keeps no
-  export to tell whether it was fetched, and at a staged one holding an import (not one
-  staged for a key change in place).
-  An app's call is `403 permission_missing`. Then every call, the retry included, gets the
-  `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
-  flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
-  a move. After an erasure both take `POST /v1/enroll` again and make a new account under
-  another service key, which signs that answer and every answer after it; nothing of the
-  erased account stays, its kept App IDs included, which the new enrollment names again.
-  That account serves from its first `identity.json`, at the next generation with
-  `recovery_from` (Switch wire 7.4.16), which starts its recovery.
-  This switch deletes everything at once and owes no key: its `404` comes right after the
-  erasure. The service can owe the erased account's key when its key store fails, and until
-  the key is gone it answers a request signed with the identity key, whatever its timestamp,
-  with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
+- **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` is `401
+  stale_timestamp` for a timestamp earlier than the creation time in the account's mark, or
+  the account's own where the mark is lost; then it checks the body's `identity_hash` names
+  the newest `identity.json` this switch holds, left out only where it holds none (`409
+  conflict` otherwise, whose `current.identity` is the copy held at an account that answers
+  the notice); the body's `service_key`, which the core's body still carries, isn't judged.
+  It refuses during a move (`409 conflict`): at a frozen account that doesn't fail stop,
+  since this switch keeps no export to tell whether it was fetched, and at a staged one
+  holding an import (not one staged for a key change in place). It goes through at an
+  account that fails stop or is bounded, and at a lost identity whatever hash it names. An
+  app's call is `403 permission_missing`. The erasure's record is written, the account and
+  its mark go, all at once, and every call, the retry included, gets the `404` of an
+  identity the switch doesn't host, signed with the one key. `erased` tells a test it
+  happened. App tests set `not_hosted_unpinned` to answer every call with that `404` under
+  another key, the `404` an app can't check. After an erasure `POST /v1/enroll` makes a new
+  account under the same key with a new (0, 0) mark; nothing of the erased account stays,
+  its kept App IDs included, which the new enrollment names again. That account serves from
+  its first `identity.json`, at the next generation with `recovery_from` (Switch wire
+  7.4.16), which starts its recovery.
 - **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
   handle for every `notify` entry and sends it to the relay (8.2); the scripted switch
   neither sends nor records one, since a webhook goes to the relay, never to an app, so no

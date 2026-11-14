@@ -7477,7 +7477,7 @@ async fn reader_owing_a_deny_change_at_a_loss(
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
     kinds.log.lock().unwrap().clear();
     let next = super::moves::third_recovering(w, &router, 2, 1);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     (reader, kinds, router, next)
 }
 
@@ -8391,7 +8391,7 @@ async fn test_deny_list_loss_at_a_told_gaps_position_tells_the_new_list() {
     let z = [0x5a; 32];
     restored.deny(&z).await.unwrap();
     let _next = super::moves::third_recovering(&w, &router, 2, 1);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     restored.refresh_identity().await.unwrap();
     for _ in 0..5 {
         let _ = restored.receive(None).await;

@@ -6726,7 +6726,7 @@ async fn test_scripted_first_call_without_a_record_is_refused_alike_at_every_rou
     let (status, code, head, _) = scripted_call(&s, phone.app_id(), "GET", "feed");
     assert_eq!((status, code, head), (503, json!("staged"), true));
     // An account the switch doesn't hold is found missing first (Switch wire 7.3 step 2).
-    s.w.switch.lock().erased = true;
+    s.w.switch.lock().not_hosted_unpinned = true;
     let (status, code, head, _) = scripted_call(&s, unknown, "GET", "feed");
     assert_eq!((status, code, head), (404, json!("not_found"), false));
 }

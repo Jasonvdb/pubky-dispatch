@@ -285,7 +285,7 @@ async fn test_held_cursor_clean_restore_followed_by_a_loss_reads_unknown() {
     assert_eq!(restored.restore_held_cursor(), Some(HeldCursor::Clean));
     restored.end_reconcile(UserConfirmed::new()).await.unwrap();
     declare_loss(&w, &router);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     restored.refresh_identity().await.unwrap();
     for _ in 0..3 {
         let _ = restored.receive(None).await;

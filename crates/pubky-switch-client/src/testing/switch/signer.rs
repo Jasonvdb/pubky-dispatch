@@ -5,16 +5,14 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
-
 use pubky_switch_core::chain::{ItemType, ProofState, ServiceTransition, item_hash};
 use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
-    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc, KeptProofs,
-    Limits, check_delivery, needed_generations,
+    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, GenerationChange,
+    IdentityDoc, KeptProofs, Limits, check_delivery, needed_generations,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
@@ -34,15 +32,13 @@ pub(crate) struct Enrolled {
     /// The answer to each enrollment taken, by enrollment hash, so the same enrollment again
     /// gets the same answer.
     pub(crate) answers: HashMap<[u8; 32], Value>,
-    /// The enrollments answered with a key a generation change has since retired: each is
-    /// `409 conflict` again (Switch wire 3.7).
-    pub(crate) retired: BTreeSet<[u8; 32]>,
 }
 
 impl ScriptedSwitch {
     /// A switch at [`SWITCH_ORIGIN`] where `identity` has no account yet: every call is the
-    /// operator's `404` until the signer enrolls (Switch wire 3.7, 7.4.1). The enrollment makes
-    /// the account, staged, with the service key from `service_secret`.
+    /// `404` of an identity it doesn't host until the signer enrolls (Switch wire 3.7, 7.3
+    /// step 2, 7.4.1). The enrollment makes the account, staged; the switch's one key is the
+    /// one from `service_secret`.
     pub fn unenrolled(
         identity: &pubky_switch_core::keys::IdentityKey,
         service_secret: [u8; 32],
@@ -126,9 +122,11 @@ impl ScriptedSwitch {
         self.lock().enroll_limits = limits;
     }
 
-    /// Whether the account is erased (Switch wire 7.4.16).
+    /// Whether the account is erased (Switch wire 7.4.16): no account, and the erasure's
+    /// record.
     pub fn erased(&self) -> bool {
-        self.lock().erased
+        let inner = self.lock();
+        !inner.hosts() && inner.marks.erasure_at_ms.is_some()
     }
 
     /// The App IDs the account keeps for good from the enrollment that made it.
@@ -158,76 +156,41 @@ impl Inner {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
-        // An erased account is gone, so its enrollment makes a new one, as for an identity
-        // the service never hosted (Switch wire 7.4.16, Switch spec 12.7 step 4).
-        if self.erased {
-            self.start_new_account();
-        }
-        // An enrollment the service answered with a key a generation change has retired: its
-        // signer enrolls anew (Switch wire 3.7).
-        if self
-            .enrolled
-            .as_ref()
-            .is_some_and(|e| e.retired.contains(&enrollment.hash()))
-        {
-            return Ok(bad(
-                ErrorCode::Conflict,
-                "the key this enrollment's answer named is retired",
-                json!(null),
-            ));
-        }
-        // The same enrollment again gets its kept answer, with no other effect, signed with the
-        // key it names: the account's, or the pending key (Switch wire 3.7, 7.4.1).
+        // The same enrollment again gets its kept answer, with no other effect (Switch wire
+        // 3.7, 7.4.1).
         if let Some(answer) = self
             .enrolled
             .as_ref()
             .and_then(|e| e.answers.get(&enrollment.hash()))
             .cloned()
         {
-            let named = answer["service_key"].as_str().map(str::to_owned);
-            let pending = self.pending.as_ref().map(|(key, _)| key.clone());
-            self.answer_key = pending.filter(|key| {
-                named.as_deref() == Some(b64(&key.verifying_key().to_bytes()).as_str())
-            });
             return Ok((200, answer));
         }
-        // A serving account answers a pending key for the next generation, the same for every
-        // such enrollment, signed with that key, and holds the App IDs they name with it
+        // A switch a test made answer as for an identity it doesn't host makes a new account.
+        if self.not_hosted_unpinned {
+            self.drop_account();
+        }
+        let creating = !self.hosts();
+        // An enrollment that creates the account writes its mark first (Switch wire 7.3,
+        // Table 3): (0, 0), or the mark a crash or a lost account left, taken over.
+        if creating {
+            self.mark_new_account();
+        }
+        // At a serving account the App IDs it names are held for the next generation
         // (Switch wire 3.7).
-        if self.enrolled.is_some() && self.doc.is_some() && !self.staged {
-            let generation = self.tip.generation;
-            let (pending, named) = self.pending.get_or_insert_with(|| {
-                let mut seed = self.service.to_bytes();
-                seed[0] ^= 0xa5;
-                seed[31] = seed[31].wrapping_add(u8::try_from(generation % 251).unwrap_or(0));
-                (SigningKey::from_bytes(&seed), Vec::new())
-            });
+        if !creating && self.doc.is_some() && !self.staged {
             for app in enrollment.revoked_apps() {
-                if !named.contains(app) {
-                    named.push(*app);
+                if !self.held_app_ids.contains(app) {
+                    self.held_app_ids.push(*app);
                 }
             }
-            let key = pending.clone();
-            let limits = self.enroll_limits;
-            let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
-                limits,
-                answers: HashMap::new(),
-                retired: BTreeSet::new(),
-            });
-            let answer =
-                EnrollmentAnswer::new(&enrollment, key.verifying_key().to_bytes(), enrolled.limits);
-            let value: Value = serde_json::from_slice(&answer.to_json()?)?;
-            enrolled.answers.insert(enrollment.hash(), value.clone());
-            self.answer_key = Some(key);
-            return Ok((200, value));
         }
-        let creating = self.enrolled.is_none();
         let limits = self.enroll_limits;
         let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
             limits,
             answers: HashMap::new(),
-            retired: BTreeSet::new(),
         });
+        // The one key it names, at every account (Switch wire 7.4.1).
         let service_key = self.service.verifying_key().to_bytes();
         let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
@@ -242,19 +205,15 @@ impl Inner {
         Ok((200, value))
     }
 
-    /// A new account in the place of an erased one, as the enrollment after an erasure
-    /// makes it (Switch wire 7.4.16, Switch spec 12.7 step 4): another service key, and
-    /// nothing of what the erased account held, its enrollments, its kept App IDs and its
-    /// counts included. The account then starts as at a service that never hosted the
-    /// identity: its first `identity.json` is the next generation's, naming the erased one
-    /// in `recovery_from`. What a test set of the switch's configuration stays set.
-    fn start_new_account(&mut self) {
-        // A read still held is answered for an account under another key.
+    /// The account is gone, its mark store staying: after an erasure, or for a lost account
+    /// (Switch wire 7.3, 7.4.16). Nothing of what it held stays, its enrollments, its kept
+    /// App IDs and its counts included; the service key is the switch's, not the account's,
+    /// and what a test set of the switch's configuration stays set. An enrollment then makes
+    /// a new, staged account, whose first `identity.json` is the next generation's, as at a
+    /// service that never hosted the identity.
+    pub(super) fn drop_account(&mut self) {
+        // A read still held is answered for an account the switch doesn't host.
         self.wake_held();
-        // The erased account's key is gone for good: another one, the same in every run.
-        let mut seed = self.service.to_bytes();
-        seed[0] ^= 0x3c;
-        seed[31] = seed[31].wrapping_add(1);
         let tip = pubky_switch_core::chain::ChainTip {
             generation: 1,
             seq: 0,
@@ -262,13 +221,15 @@ impl Inner {
         };
         let mut fresh = Inner::fresh(
             super::clone_key(&self.identity),
-            SigningKey::from_bytes(&seed),
+            self.service.clone(),
             Arc::clone(&self.clock),
             tip,
         );
         // Nothing enrolled at it yet, and it serves only once it takes its first document.
         fresh.enrolled = None;
         fresh.staged = true;
+        fresh.marks = std::mem::take(&mut self.marks);
+        fresh.stamped_ms = self.stamped_ms;
         fresh.origin = self.origin.clone();
         fresh.enroll_limits = self.enroll_limits;
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
@@ -280,17 +241,18 @@ impl Inner {
         fresh.keep_passed = self.keep_passed;
         fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);
-        // A read held before the erasure drops its number when it ends.
+        // A read held before drops its number when it ends.
         fresh.held_ids = self.held_ids;
         *self = fresh;
     }
 
-    /// Start the account afresh under `key` at `generation`, as a recovery in place does:
-    /// its service time, its enrollments and the App IDs to refuse stay, `named` among them,
-    /// and everything else goes (Switch spec 12.6 step 1, wire 3.3).
-    fn start_afresh(&mut self, key: SigningKey, named: &[[u8; 16]], generation: u64) {
-        // The held reads look again, and find the key changed (Switch wire 7.4.4); their
-        // numbers go on, so none is taken for another's.
+    /// Start the account afresh at `generation`, as a recovery in place does, and the start
+    /// a failing or bounded account takes: its creation time, its mark store, its service
+    /// time, its enrollments and the App IDs to refuse stay, those held for this generation
+    /// among them, and everything else goes (Switch spec 12.6 step 1, wire 3.3, 3.7).
+    fn start_afresh(&mut self, generation: u64) {
+        // The held reads look again, and find the generation changed (Switch wire 7.4.4);
+        // their numbers go on, so none is taken for another's.
         self.wake_held();
         let tip = pubky_switch_core::chain::ChainTip {
             generation,
@@ -299,27 +261,14 @@ impl Inner {
         };
         let mut fresh = Inner::fresh(
             super::clone_key(&self.identity),
-            key,
+            self.service.clone(),
             Arc::clone(&self.clock),
             tip,
         );
         fresh.stamped_ms = self.stamped_ms;
         fresh.origin = self.origin.clone();
-        // The answers the outgoing key named are retired; the pending key's stay, the
-        // account's key from now on (Switch wire 3.7).
-        let new_key = b64(&fresh.service.verifying_key().to_bytes());
-        if let Some(enrolled) = self.enrolled.as_mut() {
-            let outgoing: Vec<[u8; 32]> = enrolled
-                .answers
-                .iter()
-                .filter(|(_, answer)| answer["service_key"].as_str() != Some(new_key.as_str()))
-                .map(|(hash, _)| *hash)
-                .collect();
-            for hash in outgoing {
-                enrolled.answers.remove(&hash);
-                enrolled.retired.insert(hash);
-            }
-        }
+        fresh.marks = std::mem::take(&mut self.marks);
+        fresh.created_at_ms = self.created_at_ms;
         fresh.enrolled = self.enrolled.take();
         fresh.enroll_limits = self.enroll_limits;
         // The upload limits are the service's configuration, and its upload counts are kept
@@ -351,9 +300,9 @@ impl Inner {
                 fresh.kept_app_ids.push(*id);
             }
         }
-        for id in named {
-            if !fresh.kept_app_ids.contains(id) {
-                fresh.kept_app_ids.push(*id);
+        for id in std::mem::take(&mut self.held_app_ids) {
+            if !fresh.kept_app_ids.contains(&id) {
+                fresh.kept_app_ids.push(id);
             }
         }
         *self = fresh;
@@ -468,53 +417,90 @@ impl Inner {
                 kept.push(*id);
             }
         }
+        let generation_before = self.tip.generation;
+        // At a failing or bounded account step 2 let through only the start of a generation
+        // above both the held document's and the mark's, with `recovery_from` (Switch wire
+        // 7.3, Table 2): it starts the account afresh, so it is judged as the first document
+        // of the account it starts.
+        let mut started_afresh = false;
+        if self.notice().is_some() {
+            let mut refused = kept.clone();
+            refused.extend(self.held_app_ids.iter().copied());
+            let fresh = AccountView {
+                held: None,
+                app_limit,
+                staged: false,
+                origin: &self.origin,
+                pending_key: None,
+                kept_app_ids: &refused,
+                kept_proofs: KeptProofs::default(),
+            };
+            if let Err(refusal) = check_delivery(&fresh, &doc, None) {
+                return Ok(self.refusal(refusal));
+            }
+            // It names this switch: its origin and its key (Switch wire 7.4.2).
+            if doc.inbox().url != self.origin
+                || doc.inbox().service_key != self.service.verifying_key().to_bytes()
+            {
+                return Ok(bad(
+                    ErrorCode::BadRequest,
+                    "a recovery's first document names this service",
+                    json!(null),
+                ));
+            }
+            self.start_afresh(doc.generation());
+            kept = self.kept_app_ids.clone();
+            started_afresh = true;
+        }
         let (records, claim_entries) = self.kept_proof_keys();
         let view = AccountView {
             held: self.doc.as_ref(),
             app_limit,
             staged: self.staged,
             origin: &self.origin,
-            pending_key: self
-                .pending
-                .as_ref()
-                .map(|(key, _)| key.verifying_key().to_bytes()),
+            // The next generation in place names the key the enrollments answer: the one
+            // key (Switch wire 3.3, 3.7).
+            pending_key: (!self.staged).then(|| self.service.verifying_key().to_bytes()),
             kept_app_ids: &kept,
             kept_proofs: KeptProofs {
                 records: &records,
                 claim_entries: &claim_entries,
             },
         };
-        match check_delivery(&view, &doc, delivery.prev.as_ref()) {
-            Ok(Delivery::New(_)) => {
-                // A document naming the pending key starts the next generation in place: a
-                // recovery there starts the account afresh, keeping only its service time and
-                // the App IDs to refuse (Switch spec 12.6 step 1, wire 3.3). A key change in
-                // place isn't scripted.
-                if let Some((pending, named)) = self.pending.clone()
-                    && doc.inbox().service_key == pending.verifying_key().to_bytes()
-                {
-                    if doc.body().recovery_from.is_none() {
+        // The start a failing or bounded account takes is exempt from the compare-and-swap
+        // (Switch wire 3.3).
+        let prev = delivery.prev.filter(|_| !started_afresh);
+        match check_delivery(&view, &doc, prev.as_ref()) {
+            Ok(Delivery::New(change)) => {
+                match change {
+                    // A service key change names another key than the ending generation's;
+                    // this switch has one (Switch wire 3.3).
+                    Some(GenerationChange::KeyRotation) => {
                         return Ok(bad(
                             ErrorCode::BadRequest,
-                            "scripted: no key change in place",
+                            "Switch wire 3.3: a key change names another key",
                             json!(null),
                         ));
                     }
-                    // As at the service: the App IDs held with the pending key are refused
-                    // from the start, so a document listing one is refused (Switch wire 3.3).
-                    if doc
-                        .body()
-                        .apps
-                        .iter()
-                        .any(|app| named.contains(&app.app_id))
-                    {
-                        return Ok(bad(
-                            ErrorCode::BadRequest,
-                            "the document lists an App ID its enrollment revoked",
-                            json!(null),
-                        ));
+                    // A provider loss in place starts the account afresh, keeping only its
+                    // service time and the App IDs to refuse (Switch spec 12.6 step 1, wire
+                    // 3.3); the App IDs held for this generation are refused from the start.
+                    Some(GenerationChange::ProviderLoss) => {
+                        if doc
+                            .body()
+                            .apps
+                            .iter()
+                            .any(|app| self.held_app_ids.contains(&app.app_id))
+                        {
+                            return Ok(bad(
+                                ErrorCode::BadRequest,
+                                "the document lists an App ID its enrollment revoked",
+                                json!(null),
+                            ));
+                        }
+                        self.start_afresh(doc.generation());
                     }
-                    self.start_afresh(pending, &named, doc.generation());
+                    Some(GenerationChange::Staged) | None => {}
                 }
                 // A first document that starts a recovery, as at the service: the account
                 // takes its generation, and its chain starts with the `recovery` transition
@@ -545,6 +531,11 @@ impl Inner {
                     self.service_transition(ServiceTransition::Recovery { recovery_from, at })?;
                 }
                 let proof = self.chain_identity(&doc)?;
+                // A delivery that starts a generation moves the mark to its first head
+                // (Switch wire 7.3, Table 3).
+                if self.tip.generation != generation_before {
+                    self.mark_generation_start();
+                }
                 Ok((
                     200,
                     json!({ "proofs": [proof], "head": self.head().to_value() }),
@@ -557,21 +548,26 @@ impl Inner {
                     json!({ "proofs": proofs, "head": self.head().to_value() }),
                 ))
             }
-            Err(DeliveryRefusal::BadRequest(why)) => {
-                Ok(bad(ErrorCode::BadRequest, why, json!(null)))
-            }
-            Err(DeliveryRefusal::StaleIdentity(why)) => {
+            Err(refusal) => Ok(self.refusal(refusal)),
+        }
+    }
+
+    /// The answer to a delivery the core's rules refuse (Switch wire 7.4.2).
+    fn refusal(&self, refusal: DeliveryRefusal) -> Answer {
+        match refusal {
+            DeliveryRefusal::BadRequest(why) => bad(ErrorCode::BadRequest, why, json!(null)),
+            DeliveryRefusal::StaleIdentity(why) => {
                 let current = self.doc.as_ref().map_or(json!(null), |held| {
                     json!({ "version": held.version(), "generation": held.generation(),
                             "hash": b64(&held.hash()), "identity": held.signed() })
                 });
-                Ok(bad(ErrorCode::StaleIdentity, why, current))
+                bad(ErrorCode::StaleIdentity, why, current)
             }
-            Err(DeliveryRefusal::Conflict { proof_generations }) => Ok(bad(
+            DeliveryRefusal::Conflict { proof_generations } => bad(
                 ErrorCode::Conflict,
                 "a needed service key is left out",
                 json!({ "proof_generations": proof_generations }),
-            )),
+            ),
         }
     }
 
@@ -684,42 +680,48 @@ impl Inner {
         }
     }
 
-    /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): the body names the
-    /// account's service key (`409 conflict` for another) and, when it names one, the hash of
-    /// the `identity.json` this switch holds (`409 conflict` for another, or for none held),
-    /// and a move in progress refuses it
-    /// (`409 conflict`): a frozen account, whose export this switch doesn't track, and a staged
-    /// one holding an import, but not one staged for a key change in place. Then the account is
-    /// erased, and every later call, a retry included, gets the operator's `404`. The answer
-    /// is signed with the service key, without a head; an app's call is `403
-    /// permission_missing`.
-    pub(super) fn erase_answer(&mut self, body: &[u8]) -> Answer {
-        let named = match pubky_switch_core::http::parse_erase_body(body) {
-            Ok(named) => named,
+    /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): a timestamp earlier than
+    /// the account's creation is `401 stale_timestamp`; `identity_hash` names the newest
+    /// `identity.json` the account holds, left out only where it holds none (`409 conflict`
+    /// otherwise, whose `current.identity` is the copy held at an account that answers the
+    /// notice); and a move in progress refuses it (`409 conflict`): a frozen account that
+    /// doesn't fail stop, whose export this switch doesn't track, and a staged one holding an
+    /// import, but not one staged for a key change in place. Then the erasure's record is
+    /// written, the account goes, and its mark with it: every later call, a retry included,
+    /// gets the `404` of an identity the switch doesn't host. The answer is signed with the
+    /// one key, without a head; an app's call is `403 permission_missing`.
+    pub(super) fn erase_answer(&mut self, request: &crate::transport::Request) -> Answer {
+        if let Some(refusal) = self.erasure_timestamp_refusal(request) {
+            return refusal;
+        }
+        let named = match pubky_switch_core::http::parse_erase_body(&request.body) {
+            Ok(named) => named.identity_hash,
             Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
         };
-        if named.service_key != self.service.verifying_key().to_bytes() {
-            return bad(
-                ErrorCode::Conflict,
-                "not the account's service key",
-                json!(null),
-            );
-        }
+        let fails_stop = self.notice().is_some();
         let held = self.doc.as_ref().map(IdentityDoc::hash);
-        if named.identity_hash.is_some_and(|hash| Some(hash) != held) {
+        if named != held {
+            // At an account that answers the notice, the copy it holds, which the signer
+            // reads nowhere else (Switch wire 7.4.16).
+            let current = if fails_stop {
+                json!({ "identity": self.doc.as_ref().map(|doc| doc.signed().clone()) })
+            } else {
+                json!(null)
+            };
             return bad(
                 ErrorCode::Conflict,
-                "the account holds another identity.json",
-                json!(null),
+                "Switch wire 7.4.16: the account holds another identity.json",
+                current,
             );
         }
-        if self.frozen.is_some() || (self.staged && self.holds_import) {
+        if (self.frozen.is_some() && !fails_stop) || (self.staged && self.holds_import) {
             return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
         }
-        self.erased = true;
-        // A feed read held for the account is answered now, as for an account the switch
-        // doesn't host (Switch wire 7.4.16).
-        self.wake_held();
+        // The record first, then the deletion, then the mark (Switch wire 7.3, Table 3); all
+        // at once here.
+        self.marks.erasure_at_ms = Some(self.now());
+        self.drop_account();
+        self.marks.slot = super::marks::MarkSlot::Missing;
         (200, json!({ "erased": true }))
     }
 
@@ -909,63 +911,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scripted_lost_enrollment_answer_leaves_no_signing_key() {
-        // An enrollment answered with the pending key whose answer is lost leaves no key
-        // behind to sign a later answer with (Switch wire 7.4.1).
-        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
-        let switch = ScriptedSwitch::unenrolled_at(
-            &identity,
-            [2; 32],
-            Arc::new(crate::clock::TestClock::new(0)),
-            SWITCH_ORIGIN,
-        );
-        assert_eq!(enroll_at(&switch, &identity, 1, None).0, 200);
-        let service = switch.lock().service.verifying_key().to_bytes();
-        let doc = IdentityDoc::sign(
-            &identity,
-            pubky_switch_core::records::IdentityBody::first(
-                identity.public(),
-                [3; 16],
-                pubky_switch_core::records::Inbox::new(SWITCH_ORIGIN, service),
-                pubky_switch_core::records::IdentityPolicy::default(),
-            ),
-        )
-        .unwrap();
-        let delivery = json!({ "identity": doc.signed(), "prev": null }).to_string();
-        assert_eq!(
-            switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
-            200
-        );
-        switch.fail_next(crate::testing::Fault::LoseAnswer {
-            path: "/enroll".into(),
-        });
-        let body = pubky_switch_core::records::EnrollmentBody {
-            identity: identity.public(),
-            origin: SWITCH_ORIGIN.to_owned(),
-            nonce: [2; 16],
-            policy: pubky_switch_core::records::IdentityPolicy::default(),
-            identity_doc: None,
-            revoked_apps: None,
-        };
-        let enrollment = Enrollment::sign(&identity, body).unwrap();
-        let request = crate::transport::Request {
-            method: "POST".into(),
-            origin: SWITCH_ORIGIN.into(),
-            path_and_query: "/v1/enroll".into(),
-            headers: Vec::new(),
-            body: json!({ "enrollment": enrollment.signed() })
-                .to_string()
-                .into_bytes(),
-        };
-        assert!(switch.handle(&request).is_err(), "the answer is lost");
-        assert!(switch.lock().answer_key.is_none());
-    }
-
-    #[test]
     fn test_scripted_enrollment_after_an_erasure_makes_a_new_account() {
         // As at the service, where the erased account doesn't exist any more (Switch wire
-        // 7.4.16, Switch spec 12.7 step 4): another key, and nothing of what the erased
-        // account kept.
+        // 7.4.16, Switch spec 12.7 step 4): the same one key, a new (0, 0) mark, and nothing
+        // of what the erased account kept.
         use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let clock = Arc::new(crate::clock::TestClock::new(1_700_000_000_000));
@@ -992,19 +941,35 @@ mod tests {
             inner.directory_version = 3;
             inner.shared.contacts.insert([5; 32]);
             inner.shared.connect.push(([6; 32], 1));
-            inner.erased = true;
             inner.uploads_per_app_per_hour = 7;
+            let hash = inner.doc.as_ref().unwrap().hash();
+            let erasure = crate::transport::Request {
+                method: "POST".into(),
+                origin: SWITCH_ORIGIN.into(),
+                path_and_query: "/v1/x/erase".into(),
+                headers: Vec::new(),
+                body: pubky_switch_core::http::erase_body(&[0; 32], Some(&hash)),
+            };
+            assert_eq!(inner.erase_answer(&erasure).0, 200);
         }
+        assert!(switch.erased());
+        assert_eq!(switch.mark(), None, "the mark went with the account");
 
         let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
         assert_eq!(status, 200);
-        assert_ne!(second["service_key"], first["service_key"]);
+        assert_eq!(second["service_key"], first["service_key"], "the one key");
         assert!(!switch.erased());
+        assert_eq!(
+            switch.mark(),
+            Some((0, 0, pubky_switch_core::chain::ZERO_HASH))
+        );
+        {
+            // Created after the erasure's record, so the record doesn't cover it.
+            let inner = switch.lock();
+            assert!(inner.created_at_ms > inner.marks.erasure_at_ms.unwrap());
+        }
         // The erased account's kept App ID went with it; the new enrollment names its own.
         assert_eq!(switch.kept_app_ids(), vec![[9; 16]]);
-        // The new account's key is the one that signs from now on.
-        let named = b64(&switch.lock().service.verifying_key().to_bytes());
-        assert_eq!(second["service_key"].as_str(), Some(named.as_str()));
         {
             // Nothing of the erased account is left, and the new one serves only once it
             // takes its first document.
@@ -1026,7 +991,7 @@ mod tests {
     #[test]
     fn test_scripted_stale_enrollment_is_refused_before_it_is_looked_at() {
         // As at the service: an enrollment whose timestamp is more than 5 minutes from the
-        // switch's time is `401 stale_timestamp`, signed with the operator key, whether it
+        // switch's time is `401 stale_timestamp`, signed with the one key, whether it
         // is new or the switch holds its answer (Switch wire 7.1, 7.4.1).
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let now = 1_700_000_000_000;
@@ -1062,9 +1027,9 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
-            let by_operator = pubky_switch_core::http::verify_response(
-                &operator.verifying_key().to_bytes(),
+            let key = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+            let by_switch = pubky_switch_core::http::verify_response(
+                &key.verifying_key().to_bytes(),
                 &pubky_switch_core::http::ResponseParts {
                     status: answer.status,
                     method: "POST",
@@ -1082,7 +1047,7 @@ mod tests {
             (
                 answer.status,
                 body["code"].as_str().map(str::to_owned),
-                by_operator,
+                by_switch,
             )
         };
         let tolerance = pubky_switch_core::records::CLOCK_TOLERANCE_MS;
@@ -1101,10 +1066,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scripted_recovery_in_place_retires_the_outgoing_keys_enrollments() {
-        // As at the service: after a recovery in place under the pending key, the enrollment
-        // the outgoing key answered is `409 conflict`, and the one the pending key answered
-        // gets its answer again, the account's key now (Switch wire 3.7).
+    fn test_scripted_recovery_in_place_keeps_the_one_key_and_the_held_app_ids() {
+        // As at the service: an enrollment at a serving account names the one key and holds
+        // the App IDs it names for the next generation, whose start refuses a document
+        // listing one and then keeps them; every enrollment's kept answer stays (Switch
+        // wire 3.3, 3.7).
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let switch = ScriptedSwitch::unenrolled_at(
             &identity,
@@ -1134,32 +1100,16 @@ mod tests {
         );
         let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
         assert_eq!(status, 200);
-        let pending = key(&second);
-        assert_ne!(pending, outgoing, "a pending key at a serving account");
-        let signing = |switch: &ScriptedSwitch| {
-            switch
-                .lock()
-                .answer_key
-                .take()
-                .map(|key| b64(&key.verifying_key().to_bytes()))
-        };
-        assert_eq!(signing(&switch), Some(pending.clone()));
-        // The same enrollment again: its kept answer, signed with the pending key it names.
+        assert_eq!(key(&second), outgoing, "the one key at a serving account");
+        assert_eq!(switch.lock().held_app_ids, vec![[7; 16]]);
+        // The same enrollment again: its kept answer.
         let (status, replayed) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
-        assert_eq!((status, key(&replayed)), (200, pending.clone()));
-        assert_eq!(signing(&switch), Some(pending.clone()));
+        assert_eq!((status, replayed), (200, second.clone()));
         let mut body = doc.body().clone();
         body.version = 2;
         body.generation = 2;
         body.recovery_from = Some(1);
-        body.inbox = pubky_switch_core::records::Inbox::new(
-            SWITCH_ORIGIN,
-            pubky_switch_core::enc::unb64(&pending)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-        // One listing an App ID held with the pending key is refused, as at the service.
+        // One listing an App ID held for the next generation is refused, as at the service.
         let mut listing = body.clone();
         listing.apps.push(pubky_switch_core::records::ListedApp {
             app_id: [7; 16],
@@ -1191,7 +1141,12 @@ mod tests {
         );
         assert!(
             switch.kept_app_ids().contains(&[7; 16]),
-            "the App ID held with the pending key is kept"
+            "the App ID held for the generation is kept"
+        );
+        assert_eq!(
+            switch.mark().map(|(g, _, _)| g),
+            Some(2),
+            "the mark at its start"
         );
         // The upload limits and counts stay, as the service's do (Switch wire 9.4).
         {
@@ -1208,17 +1163,15 @@ mod tests {
             // Pending connect requests don't outlive it (Switch spec 12.6 step 1, wire 7.4.7).
             assert!(inner.shared.connect.is_empty());
         }
-        let (status, retired) = enroll_at(&switch, &identity, 1, None);
-        assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
-        let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
-        assert_eq!(status, 200);
-        assert_eq!(key(&again), pending);
+        let (status, again) = enroll_at(&switch, &identity, 1, None);
+        assert_eq!((status, again), (200, first));
     }
 
     #[test]
     fn test_scripted_erasure_naming_a_hash_with_no_identity_json_held_is_conflict() {
         // A fresh account holds no `identity.json`: a hash can't match, so the erasure is
-        // `409 conflict` and erases nothing; the key alone erases it (Switch wire 7.4.16).
+        // `409 conflict` and erases nothing; a body without one erases it, writing the
+        // erasure's record and deleting the mark (Switch wire 7.4.16, 7.3 Table 3).
         use pubky_switch_core::http::erase_body;
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let switch = ScriptedSwitch::new(
@@ -1226,15 +1179,23 @@ mod tests {
             [2; 32],
             Arc::new(crate::clock::TestClock::new(0)),
         );
+        let erasure = |hash: Option<&[u8; 32]>| crate::transport::Request {
+            method: "POST".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: "/v1/x/erase".into(),
+            headers: Vec::new(),
+            body: erase_body(&[0; 32], hash),
+        };
         let mut inner = switch.lock();
         assert!(inner.doc.is_none());
-        let key = inner.service.verifying_key().to_bytes();
-        let (status, body) = inner.erase_answer(&erase_body(&key, Some(&[9; 32])));
+        let (status, body) = inner.erase_answer(&erasure(Some(&[9; 32])));
         assert_eq!((status, body["code"].clone()), (409, json!("conflict")));
-        assert!(!inner.erased);
-        let (status, _) = inner.erase_answer(&erase_body(&key, None));
+        assert!(inner.hosts());
+        let (status, _) = inner.erase_answer(&erasure(None));
         assert_eq!(status, 200);
-        assert!(inner.erased);
+        assert!(!inner.hosts());
+        assert!(inner.marks.erasure_at_ms.is_some());
+        assert_eq!(inner.marks.slot, super::super::marks::MarkSlot::Missing);
     }
 
     #[test]

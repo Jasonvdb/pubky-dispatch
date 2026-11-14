@@ -1108,7 +1108,7 @@
       "status": 200
     },
     {
-      "body": "{\"code\":\"not_found\",\"message\":\"no such account\",\"current\":{\"hosted\":false}}",
+      "body": "{\"code\":\"not_found\",\"message\":\"no such account\"}",
       "fields": [
         {
           "hex": "0000000000000194",
@@ -1135,22 +1135,22 @@
           "name": "BLAKE3(Switch-Head)"
         },
         {
-          "hex": "7ac94dc726c8f2f61c9bd21a2898727abe5c95411ab3b38322ab37bb7a4eec60",
+          "hex": "40322f43b80572957220b69e02507cf5e925bd2b287c97a50fde3e8fdbf40fd6",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:00:00.000Z",
-        "switch-service-signature": "jMM_X19v08sIc5iu4Hw3JzZswFxzaMG9mpp7xcpUxGa4PLE75nQRcyBOD14EpZu9rp6REUTdc43GfGPOvo6PDw"
+        "switch-service-signature": "hb0CD4gnO1bOFuGSdJf50eyKzrQm5ppd70nov-E2sA1bAbjtaEhAKfWZFzc-vi0nzsXovjVfhg_9Hnh3rooAAg"
       },
       "label": "pubky-switch/v1/http-response",
       "method": "GET",
-      "name": "anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head",
+      "name": "no signature on the request, unknown account: operator key, BLAKE3 of the empty string",
       "path": "/v1/43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o/identity",
-      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "public_key": "G4ccdZHE8gurcEdy9PAO3nn7T3pjObgU38PXavxaPEI",
       "request_signature": null,
-      "signature": "jMM_X19v08sIc5iu4Hw3JzZswFxzaMG9mpp7xcpUxGa4PLE75nQRcyBOD14EpZu9rp6REUTdc43GfGPOvo6PDw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019400000003474554000000412f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f6964656e7469747900000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30303a30302e3030305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262000000207ac94dc726c8f2f61c9bd21a2898727abe5c95411ab3b38322ab37bb7a4eec60",
+      "signature": "hb0CD4gnO1bOFuGSdJf50eyKzrQm5ppd70nov-E2sA1bAbjtaEhAKfWZFzc-vi0nzsXovjVfhg_9Hnh3rooAAg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019400000003474554000000412f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f6964656e7469747900000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30303a30302e3030305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000002040322f43b80572957220b69e02507cf5e925bd2b287c97a50fde3e8fdbf40fd6",
       "signer": "service key",
       "status": 404
     },

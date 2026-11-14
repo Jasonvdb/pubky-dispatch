@@ -104,11 +104,15 @@ pub struct AppKeys {
     pub permissions: Vec<String>,
 }
 
-/// The fixed keys of `keys.json`.
+/// The fixed keys of `keys.json`, and the operator key.
 pub struct Keys {
     pub apps: Vec<AppKeys>,
-    /// Ed25519 public key to its secret, for every identity, app and service key.
+    /// Ed25519 public key to its secret, for every identity, app and service key and the
+    /// operator key.
     pub secrets: HashMap<[u8; 32], [u8; 32]>,
+    /// The operator key's public key, of the seed `service/operator` (README "Seeds"): it
+    /// signs a service's answers it can't tie to an account, and no account's key is it.
+    pub operator: [u8; 32],
     /// Account (Pubky ID) to its service key at the service its `identity.json` names.
     pub service: HashMap<String, [u8; 32]>,
     /// Identity name (`alice`, `bob`) to its public key.
@@ -153,6 +157,9 @@ impl Keys {
     }
 }
 
+/// The seed label of the operator key.
+const OPERATOR_SEED_LABEL: &str = "service/operator";
+
 pub fn keys() -> Keys {
     let k = load("keys.json");
     let mut secrets = HashMap::new();
@@ -165,6 +172,9 @@ pub fn keys() -> Keys {
         identity_secrets.insert(public, secret);
         identities.insert(st(i, "name").to_owned(), public);
     }
+    let operator_secret = seed(OPERATOR_SEED_LABEL);
+    let operator = sig::public_of(&operator_secret);
+    secrets.insert(operator, operator_secret);
     let next = &k["next_service_key"];
     secrets.insert(b64n::<32>(st(next, "public")), hx32(st(next, "secret_hex")));
     let mut service = HashMap::new();
@@ -198,6 +208,7 @@ pub fn keys() -> Keys {
     Keys {
         apps,
         secrets,
+        operator,
         service,
         identities,
         identity_secrets,

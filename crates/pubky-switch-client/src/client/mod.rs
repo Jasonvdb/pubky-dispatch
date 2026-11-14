@@ -240,7 +240,8 @@ pub struct SignedRequest {
 /// answer against the method and path it sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentRequest {
-    /// The method, in upper case.
+    /// The method, as the request holds it; the response signature covers it upper-cased
+    /// ([`response_fields`](pubky_switch_core::http::response_fields)).
     pub method: String,
     /// The path as sent, without the query.
     pub path: String,

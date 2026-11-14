@@ -1688,7 +1688,7 @@ So the largest answer the limits bound is under 135 MiB at the default limits, a
 - Error bodies are `{ "code": string, "message": string, "current": object (where 8.6 says), "known_version": ... (only in `409 identity_needed`), "retry_after": int (on `429 rate_limited`) }`.
 - Writes by own apps and the signer return `{ "proofs": [...], "head": signed head }`, the transition proofs of the chain items they wrote, in order.
 
-Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Switch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and the `404 not_found` with `current` `{ "hosted": false }` to an unsigned read of an identity the service doesn't host (7.3 step 2), signed with the service key. Each response names the method and path its signature covers. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2).
+Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Switch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and an operator-signed `404` to a request without a signature. Each response names the method and path its signature covers. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2).
 
 Example request headers (an append from bob's `shop` to alice's inbox):
 

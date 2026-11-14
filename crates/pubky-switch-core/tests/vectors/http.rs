@@ -54,7 +54,7 @@ const RESPONSE_FIELDS: [&str; 7] = [
 
 /// The responses whose request isn't in the file, with the method and route the wire format
 /// fixes for the call each answers, at the account whose service key signs it, or, for the
-/// not-hosted `404`, at bob, whom that service doesn't host (Switch wire 7.3 step 2).
+/// operator-signed `404` ([`OPERATOR_404`]), at bob, whom that service doesn't host.
 const ROUTES: [(&str, &str, &str, bool); 6] = [
     (
         "app of another identity: directory",
@@ -81,12 +81,13 @@ const ROUTES: [(&str, &str, &str, bool); 6] = [
         "identity",
         false,
     ),
-    (NOT_HOSTED, "GET", "identity", true),
+    (OPERATOR_404, "GET", "identity", true),
 ];
 
-/// The `404 not_found` to a read of an identity the service doesn't host (Switch wire 7.3
-/// step 2, 7.6), the one response without a request signature but the public reads.
-const NOT_HOSTED: &str = "anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head";
+/// The `404 not_found` to an unsigned request for an account the service doesn't host, which
+/// the operator key signs: the one response without a request signature but the public reads.
+const OPERATOR_404: &str =
+    "no signature on the request, unknown account: operator key, BLAKE3 of the empty string";
 
 /// The method and path a response case's signature covers (Switch wire 7.1): those of the
 /// request in `file` whose signature it signs, else the route [`ROUTES`] gives its call.
@@ -160,39 +161,34 @@ fn signed_case(keys: &Keys, file: &Value, mut case: Value) -> Value {
 /// Every response's signature over the method and path of the request it answers, the
 /// request signature, the server time, the `Switch-Head` text and the body (Switch wire
 /// 7.1), which `pubky-switch-core` writes (README "How the files were generated"), with the
-/// fixed keys of `keys.json`; and the not-hosted `404` ([`NOT_HOSTED`]), its `current`
-/// `{ "hosted": false }`, signed with alice's service's key.
+/// fixed keys of `keys.json` and the operator key; among them the operator-signed `404`
+/// ([`OPERATOR_404`]), to an unsigned `GET` of bob's `identity.json`.
 fn response_signatures(keys: &Keys) {
     let file = load("http.json");
-    let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
-    let not_hosted_at = arr(&file, "responses")
+    let unknown_at = arr(&file, "responses")
         .iter()
         .position(|c| c["status"] == 404 && c["request_signature"].is_null())
         .unwrap();
-    let held = &arr(&file, "responses")[not_hosted_at];
-    let body = format!(
-        r#"{{"code":"not_found","message":"no such account","current":{}}}"#,
-        http::not_hosted_current()
-    );
-    let not_hosted = serde_json::json!({
-        "body": body,
+    let held = &arr(&file, "responses")[unknown_at];
+    let unknown = serde_json::json!({
+        "body": r#"{"code":"not_found","message":"no such account"}"#,
         "headers": {
             "switch-server-time": header(held, http::header::SERVER_TIME).unwrap(),
         },
         "label": labels::sig::HTTP_RESPONSE,
-        "name": NOT_HOSTED,
-        "public_key": pubky_switch_core::enc::b64(&keys.service_key(&alice_id)),
+        "name": OPERATOR_404,
+        "public_key": pubky_switch_core::enc::b64(&keys.operator),
         "request_signature": null,
         "signer": "service key",
         "status": 404,
     });
-    let pointer = format!("/responses/{not_hosted_at}");
-    let not_hosted = signed_case(keys, &file, not_hosted);
+    let pointer = format!("/responses/{unknown_at}");
+    let unknown = signed_case(keys, &file, unknown);
     let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent; the timestamp is RFC 3339 UTC to the second. Response signatures cover u64(status), the method and path of the request answered, which each response names (the path as sent, without the query), BLAKE3 of the decoded Switch-Signature (or of the empty string), the exact Switch-Server-Time text, BLAKE3 of the exact Switch-Head text (or of the empty string when there is none) and BLAKE3(body).";
     generated(
         "http.json",
         &[
-            (Place::Element(&pointer), not_hosted),
+            (Place::Element(&pointer), unknown),
             (
                 Place::Member("/description"),
                 Value::String(description.into()),
@@ -664,7 +660,17 @@ fn test_vectors_http() {
                 "{name}"
             );
         }
-        // Signed by the service key, for an account it hosts and for one it doesn't.
+        // Signed by the account's service key, except the answer to a request the service
+        // can't tie to an account, which the operator key signs, no account's key.
+        if request_signature.is_none() && status == 404 {
+            assert_eq!(name, OPERATOR_404);
+            assert_eq!(public, keys.operator, "{name}: the operator key");
+            assert!(
+                !keys.service.values().any(|k| *k == public),
+                "{name}: no account's key"
+            );
+            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
+        }
         assert!(
             reproduce(
                 &keys,
@@ -675,11 +681,6 @@ fn test_vectors_http() {
             ),
             "{name}: no fixed key for the service"
         );
-        if name == NOT_HOSTED {
-            let parsed: Value = serde_json::from_slice(body).unwrap();
-            assert_eq!(parsed["current"], http::not_hosted_current(), "{name}");
-            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
-        }
         if name.starts_with("signer: enrollment answer") {
             let answer = EnrollmentAnswer::from_json(body).unwrap();
             answer

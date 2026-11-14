@@ -425,13 +425,30 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             let bytes: [u8; 64] = b64(s).try_into().unwrap();
             bytes
         });
-        let account = account_of_key(&keys, &public)
-            .unwrap_or_else(|| panic!("{name}: a service key of keys.json"));
         // The method and path the request sent, which the signature covers (wire 7.1).
         let sent = SentRequest {
             method: st(r, "method").to_owned(),
             path: st(r, "path").to_owned(),
             signature: request_signature,
+        };
+        let Some(account) = account_of_key(&keys, &public) else {
+            // The operator's key, which no client knows: unauthenticated with any account
+            // key a client pins.
+            assert_eq!(response.status, 404, "{name}");
+            for (account, key) in &keys.services {
+                assert_eq!(
+                    check_response(
+                        &key.verifying_key().to_bytes(),
+                        &pubky_key(account).unwrap(),
+                        &sent,
+                        &response,
+                    )
+                    .unwrap_err(),
+                    ClientError::BadServiceSignature { status: 404 },
+                    "{name}"
+                );
+            }
+            continue;
         };
         let checked = check_response(&public, &account, &sent, &response);
         if response.status < 300 {

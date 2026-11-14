@@ -5,8 +5,8 @@
 //! The vectors' switch is at `seq` 41, past what `chain.json` replays here, so their answers
 //! are compared byte for byte but for `Switch-Head`, that switch's head, and the response
 //! signature, which covers it: the signature is checked with the vector's service key over
-//! the head this switch sends (Switch wire 7.1). Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see
-//! `store::testing`.
+//! the head this switch sends (Switch wire 7.1). Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run
+//! them; see `store::testing`.
 
 // Test helpers fail the test on any error.
 #![allow(clippy::expect_used, clippy::panic)]

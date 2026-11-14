@@ -53,9 +53,13 @@ impl Protocol for BackedUp {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         self.released.lock().unwrap().push(message.released);
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -109,7 +113,7 @@ impl StateStore for Counting {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         let parked = batch
-            .writes
+            .writes()
             .iter()
             .filter(
                 |write| matches!(write, Write::Delete { key, .. } if key.starts_with(b"parked/")),
@@ -195,8 +199,8 @@ fn dropped(events: &[AppEvent]) -> Vec<(u64, DropReason)> {
         .collect()
 }
 
-/// An entry stored as `reason` by a build before the bounds, written to the store as it
-/// is: a note signed by `peer`, accepted at `accepted_at_ms`.
+/// An entry stored as `reason`, to be written to the store as it is, whatever the bounds:
+/// a note signed by `peer`, accepted at `accepted_at_ms`.
 fn entry_of(
     w: &World,
     peer: &Peer,
@@ -230,7 +234,7 @@ fn entry_of(
     }
 }
 
-/// Write `entries` to `app`'s store, as an earlier build left them, under the next IDs.
+/// Write `entries` to `app`'s store as they are, past any bound, under the next IDs.
 async fn write_stored(app: &mut App, entries: Vec<ParkedEntry>) -> Vec<u64> {
     let mut ids = Vec::new();
     for chunk in entries.chunks(64) {
@@ -441,7 +445,8 @@ async fn test_unverified_bound_applies_at_a_read_to_entries_stored_before_in_ste
     let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
     w.homeserver.set_down(true);
     let h = peer(&w, "honest");
-    // 200 of one sender, as a build before the bounds left them: 136 over.
+    // 200 of one sender, as one read stores them before the next read's bounds apply: 136
+    // over.
     let now = w.clock.now_ms();
     let entries: Vec<ParkedEntry> = (0..200u64)
         .map(|n| entry_of(&w, &h, 1_000 + n, now + n, ParkReason::Unverifiable))

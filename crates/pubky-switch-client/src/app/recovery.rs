@@ -202,10 +202,8 @@ pub(crate) struct LossRecord {
     pub(crate) conversations: Vec<String>,
     /// How many counterparties the protocol named past [`MAX_LOSS_CONVERSATIONS`], not
     /// added back.
-    #[serde(default)]
     pub(crate) conversations_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
-    #[serde(default)]
     pub(crate) claim_entries_left_out: u64,
 }
 
@@ -498,6 +496,9 @@ impl App {
             None,
         )?;
         let time_ms = self.state.cursor.time_ms;
+        // The lists come back at the next service by the uploads, not as list changes: the
+        // deny list's history has a gap after the lost sequence's position (Switch spec 12.6).
+        let lost_at = (self.state.cursor.generation, self.state.cursor.seq);
         self.state.cursor = Cursor {
             generation,
             seq: 0,
@@ -540,6 +541,7 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
+        self.note_deny_gap(lost_at.0, lost_at.1, &mut tx).await?;
         // The lost service's divergent uploads aren't the new one's.
         tx.delete_prefix(super::uploaded::DIVERGENT_PREFIX)?;
         // Entries stored locally stay as they are: their local IDs, not the `seq`s they
@@ -642,7 +644,7 @@ impl App {
                         store.as_ref(),
                         &self.ns,
                     );
-                    self.protocol.provider_lost_with(&loss.view(), &view)
+                    self.protocol.provider_lost(&loss.view(), &view)
                 }
                 // The step stays `Resend` in the record: the next call asks again.
                 .map_err(AppError::Protocol)?;
@@ -1007,16 +1009,10 @@ mod tests {
             Some("00000000")
         );
         assert!(record.conversations.windows(2).all(|w| w[0] < w[1]));
-        // Kept with the loss: the count reads back, and a record without it reads as none.
+        // Kept with the loss: the count reads back.
         let bytes = serde_json::to_vec(&record).unwrap();
         let read: LossRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(read.conversations_left_out, 3);
-        let mut old: Value = serde_json::from_slice(&bytes).unwrap();
-        old.as_object_mut()
-            .unwrap()
-            .remove("conversations_left_out");
-        let old: LossRecord = serde_json::from_value(old).unwrap();
-        assert_eq!(old.conversations_left_out, 0);
         // Within the cap, none is left out.
         record.keep_conversations(vec!["b".into(), "a".into(), "a".into()]);
         assert_eq!(record.conversations, ["a", "b"]);

@@ -143,11 +143,7 @@ impl Protocol for ApiProtocol {
         }
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        self.items.receive(message)
-    }
-
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let mode = *self.mode.lock().unwrap();
         let msg_id = message.message.msg_id.clone();
         let mut seen = Seen {
@@ -171,7 +167,7 @@ impl Protocol for ApiProtocol {
             }
         }
         let outcome = match mode {
-            Mode::Plain => self.receive(message),
+            Mode::Plain => self.items.receive(message, cx),
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
                 let held = cx.record(&inbox()).unwrap();
                 seen.held = held.as_ref().map(|r| r.version);
@@ -259,8 +255,14 @@ impl Protocol for ApiProtocol {
         self.items.record_seen(c, seen, value)
     }
 
-    fn record_regression(&self, c: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
-        self.items.record_regression(c, seen, value)
+    fn record_regression(
+        &self,
+        c: &str,
+        seen: &[u8],
+        value: Option<&[u8]>,
+        base: crate::app::WriteBase,
+    ) -> Option<String> {
+        self.items.record_regression(c, seen, value, base)
     }
 
     fn sent_record(
@@ -1460,8 +1462,9 @@ async fn test_outbox_record_job_given_up_names_the_batch_it_left_kept() {
         tag: b"sent".to_vec(),
     });
     let msg_id = wallet.queue_signed(signed).await.unwrap();
-    // Accepted; the record job's batch, after the conversation entry's, is kept unsent.
-    p.alice.switch().fail_next(Fault::Unreachable {
+    // Accepted; the record job's batch, after the conversation entry's, is sent and never
+    // answered: kept, stamped, unapplied.
+    p.alice.switch().fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 1,
     });
@@ -3081,6 +3084,8 @@ async fn test_sender_disposition_answer_without_flagged_replaces_nothing() {
     let alice = p.alice.identity().public();
     p.bob.switch().lock().shared.flagged.insert(alice, 3);
     shop.allow_list().await.unwrap();
+    // The read tells the gap `allow_list` owes, the copy taken again from its answer.
+    shop.receive(None).await.unwrap();
     let as_of = shop.highest_service_time();
     // A faulty answer leaves `flagged` out: malformed, so the copy stays as it was.
     p.clock.advance_ms(MINUTE);
@@ -3188,7 +3193,10 @@ async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown()
 }
 
 #[tokio::test]
-async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknown() {
+async fn test_sender_disposition_failed_refresh_after_a_restore_holds_the_read() {
+    // A restore with `lists.read` owes the protocol a deny list gap, told with the lists
+    // read for it: while that read fails, the read holds and hands nothing, so no entry is
+    // handed with the copy unknown. The next read tells the gap and takes the copy.
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let (mut shop, store) = shop_restored_after_a_deny(&p, &protocol, &Permission::ALL).await;
@@ -3197,13 +3205,13 @@ async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknow
         code: ErrorCode::Unavailable,
         current: json!(null),
     });
-    // The read goes on without the refresh, and the copy stays unknown.
-    let seen = restored_disposition(&mut shop, &protocol).await;
-    assert_eq!(seen.lists_as_of_ms, None);
-    assert!(!seen.blocked, "{seen:?}");
+    let held = shop.receive(None).await.unwrap();
+    assert!(held.stopped);
+    assert!(protocol.seen().is_empty());
     assert!(!refreshed(&store, &shop));
-    // It is still owed: the next read refreshes.
-    shop.receive(None).await.unwrap();
+    let seen = restored_disposition(&mut shop, &protocol).await;
+    assert!(seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
     assert!(refreshed(&store, &shop));
 }
 

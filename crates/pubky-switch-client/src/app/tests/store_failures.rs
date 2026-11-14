@@ -102,7 +102,7 @@ impl Protocol for FlakyProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         *self.calls.lock().unwrap() += 1;
         let flaky = message.message.body.get("text").and_then(Value::as_str) == Some(FLAKY);
         if flaky && self.mode == Mode::AfterNeed {
@@ -142,7 +142,7 @@ impl Protocol for FlakyProtocol {
             };
         }
         drop(fails);
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     /// Backs up its whole local state, as the default hooks write and read it.
@@ -1334,7 +1334,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
 }
 
 #[tokio::test]
-async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refuses() {
+async fn test_backup_with_a_layer_is_told_by_its_protocol_member() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
     let (mut app, _) = journaled(
@@ -1345,31 +1345,21 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
     )
     .await;
     let version = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).unwrap()["v"].clone();
-    let with = |bytes: &[u8], v: u32| {
-        let mut value: Value = serde_json::from_slice(bytes).unwrap();
-        value["v"] = json!(v);
-        serde_json::to_vec(&value).unwrap()
-    };
     let bare = app.backup().await.unwrap().to_bytes().unwrap();
     let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
-    // Without a layer, the schema's version, as before; with one, another, which a reader
-    // that takes only the schema's version refuses.
+    // Both carry the schema's version; only the layered one holds a layer.
     assert_eq!(version(&bare), json!(crate::app::SCHEMA_VERSION));
-    assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
-    assert!(AppBackup::from_bytes(&bare).is_ok());
-    assert!(AppBackup::from_bytes(&layered).is_ok());
-    // A layer under the schema's version, as an earlier schema wrote layered backups, is
-    // an old schema; the layered version without a layer doesn't read.
-    let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
-    assert!(matches!(
-        AppBackup::from_bytes(&layer_as_bare),
-        Err(AppError::Store(StoreError::OldSchema { .. }))
-    ));
-    let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
-    assert!(matches!(
-        AppBackup::from_bytes(&bare_as_layered),
-        Err(AppError::InvalidData(_))
-    ));
+    assert_eq!(version(&layered), json!(crate::app::SCHEMA_VERSION));
+    let bare = AppBackup::from_bytes(&bare).unwrap();
+    let layered = AppBackup::from_bytes(&layered).unwrap();
+    assert!(bare.protocol_layer().unwrap().is_none());
+    assert_eq!(
+        layered
+            .protocol_layer()
+            .unwrap()
+            .map(|layer| layer.protocol),
+        Some(JOURNAL.to_owned())
+    );
 }
 
 #[tokio::test]
@@ -1482,7 +1472,7 @@ impl Protocol for CounterProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let count = match cx.local_get(COUNT) {
             Ok(value) => count_of(value),
             Err(error) => {
@@ -1980,7 +1970,7 @@ impl StateStore for DutyCounting {
 
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
         let kept = batch
-            .writes
+            .writes()
             .iter()
             .filter(|write| {
                 matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"duty/"))

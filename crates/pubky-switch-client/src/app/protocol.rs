@@ -8,10 +8,9 @@
 //! The trait is object-safe and takes and returns plain owned types, so a binding can
 //! implement it across a language boundary.
 //!
-//! - **Receiving** ([`Protocol::check_body`], then [`Protocol::receive_with`], or
-//!   [`Protocol::receive`] for a protocol that needs nothing of the app's state): the app
-//!   hands over each message that passed checks 1 to 9. The protocol checks the body (check
-//!   10) on its own, without effects, which is also what a push extension's peek runs; for a
+//! - **Receiving** ([`Protocol::check_body`], then [`Protocol::receive`]): the app hands
+//!   over each message that passed checks 1 to 9. The protocol checks the body (check 10)
+//!   on its own, without effects, which is also what a push extension's peek runs; for a
 //!   body that passes, it adds, through the [`ReceiveContext`], the shared record writes and
 //!   claim entries the app builds and signs for it, all committed in the same batch as the
 //!   cursor move, and the writes of its own local state to commit with the outcome (Switch
@@ -23,6 +22,9 @@
 //!   A protocol that can't read its own state for it says so with a [`StoreFailure`]: the app
 //!   keeps what it handed over and hands it over again later, so nothing is lost to a
 //!   default.
+//! - **Deny list changes** ([`Protocol::deny_list_changed`]): each one the feed shows, in
+//!   feed order, with the local writes the protocol returns to keep it, held back and
+//!   handed over again as re-sends are, and in the same order (Switch spec 8.3).
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
@@ -43,7 +45,7 @@ use crate::error::StoreError;
 use crate::store::KeyValue;
 
 /// What a newer write of a record builds on, as the reading app sees it
-/// ([`Protocol::record_regression_on`], Switch spec 8.2, 10.3).
+/// ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
@@ -80,11 +82,17 @@ pub struct OpaqueRule {
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
-    /// The `seq` the entry was read at: in the current generation for an entry of the
-    /// feed, and for one stored locally (`parked`) in the generation it was read at, which
-    /// a provider change since may have left behind. A stored entry's handle is its local
-    /// ID ([`super::AppEvent::Parked`]), not this `seq`.
+    /// The `seq` the entry was read at, in [`ReceivedMessage::generation`]. A stored
+    /// entry's handle is its local ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
+    /// The generation the entry was read at: the current one for an entry of the feed, and
+    /// for one stored locally (`parked`) the one it was first read at, which a provider
+    /// change since may have left behind; a retry reports the same pair every time. With
+    /// `seq` it is the entry's position in the inbox, by which a protocol orders what it
+    /// keeps: a move or a key change continues the sequence under the next generation, and
+    /// a provider loss starts a new one, so two entries can share a `seq` in different
+    /// generations.
+    pub generation: u64,
     /// The sender identity.
     pub sender: [u8; 32],
     /// When the inbox accepted it, service time in Unix milliseconds.
@@ -119,7 +127,8 @@ pub struct ReceivedMessage {
 }
 
 /// The most bytes of local writes a protocol or host hands over at once: one receive step,
-/// one [`Protocol::resend_needed`] or [`Protocol::missed`] answer, or one
+/// one [`Protocol::resend_needed`], [`Protocol::missed`] or [`Protocol::deny_list_changed`]
+/// answer, or one
 /// [`super::OpBatch`]'s local writes ([`Protocol`], "Limits a receive step plans for").
 /// 4 MiB, counted by [`local_writes_bytes`].
 ///
@@ -418,7 +427,7 @@ pub enum Outcome {
     },
     /// The step needs these read from the switch first, such as the claim a message gives
     /// evidence for when the app keeps no view of it (Switch spec 10.2). What the context
-    /// added is discarded; the app reads them, then calls [`Protocol::receive_with`] again
+    /// added is discarded; the app reads them, then calls [`Protocol::receive`] again
     /// with them in the context. Reads are bounded: every call for one entry together reads
     /// at most [`MAX_CLAIM_READS`] claims, and a `Need` that names nothing new or goes past
     /// the bound stores the entry locally and passes it
@@ -537,9 +546,55 @@ pub struct MissedEntries {
     pub accepted_from_ms: u64,
     /// The item's last acceptance time, `accepted_until` (Switch wire 7.5), raised to
     /// `accepted_from_ms` when it is earlier. The service writes it, and the app can't
-    /// check it. A call kept owed by a build that didn't keep this time is made with
-    /// `u64::MAX`: no end is known.
+    /// check it. For a gap the service's cursor shows ahead of the app's position
+    /// (Switch spec 8.3), no end is known: it is `u64::MAX`.
     pub accepted_until_ms: u64,
+}
+
+/// A change to the identity's deny list, as the feed shows it to an app holding `lists.read`
+/// (Switch spec 8.3): a `deny.put` or a `deny.delete` whose signature the app verified, made
+/// by an app of the identity whose certificate holds `lists.manage`, this one included. One
+/// the app can't verify so, such as one whose writer's certificate it can't find, is neither
+/// handed nor applied to the app's copy of the lists, and names nobody. The protocol gets each in feed order ([`Protocol::deny_list_changed`]),
+/// so one restored from a backup rebuilds who was denied since the backup's cursor; where
+/// that history has a gap, it is told so instead ([`Protocol::deny_list_gap`]).
+///
+/// A genuine change the service shows again reads as a new one (Switch spec 13.5): a
+/// protocol takes a change as setting a state, `pubky` denied or not, rather than as a
+/// count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DenyListChange {
+    /// The generation of the feed item.
+    pub generation: u64,
+    /// The item's `seq` in that generation.
+    pub seq: u64,
+    /// The pubky the change is about.
+    pub pubky: [u8; 32],
+    /// `true` when the pubky was added to the deny list, `false` when it was removed.
+    pub added: bool,
+    /// The item's service time, in Unix milliseconds.
+    pub at_ms: u64,
+}
+
+/// A gap in the deny list's history (Switch spec 8.3, 12.4, 12.6): changes after
+/// `generation` and `seq` may never reach the protocol, as after a restore from a backup
+/// older than the retained history, or after a provider loss. `denied` is the deny list as
+/// the service holds it now, read with `GET /allow` (Switch wire 7.4.11), so the protocol
+/// can start again from it, or hold what the gap covers ([`Protocol::deny_list_gap`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DenyListGap {
+    /// The generation of the last position the history is known complete through.
+    pub generation: u64,
+    /// That position's `seq`.
+    pub seq: u64,
+    /// The deny list now, empty when `list_read` is false.
+    pub denied: Vec<[u8; 32]>,
+    /// Whether the lists were read for the gap. `false` when the service's answer couldn't
+    /// be read: the protocol then knows only that the history has a gap, and fails closed
+    /// for it.
+    pub list_read: bool,
 }
 
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
@@ -549,7 +604,7 @@ pub struct MissedEntries {
 ///
 /// Every callback is synchronous and runs on the app's task, in the middle of one of its
 /// calls. A callback may read the host's store synchronously: the receive step through its
-/// [`ReceiveContext`], [`Protocol::sends_to_with`] and [`Protocol::provider_lost_with`]
+/// [`ReceiveContext`], [`Protocol::sends_to`] and [`Protocol::provider_lost`]
 /// through a [`LocalView`], any callback through a handle of its own on the host's store.
 /// No callback writes the store: the app commits the protocol's local state only as the
 /// [`LocalWrite`]s a callback returns, or a batch or [`super::App::protocol_commit`]
@@ -569,7 +624,8 @@ pub struct MissedEntries {
 ///     there, and an effect over it is stored and passed as
 ///     [`super::ParkReason::EffectTooLarge`], with [`super::AppEvent::EffectRefused`],
 ///     never applied (Switch spec 8.2);
-///   - **[`Protocol::resend_needed`] and [`Protocol::missed`]**, made at once or again
+///   - **[`Protocol::resend_needed`], [`Protocol::missed`] and
+///     [`Protocol::deny_list_changed`]**, made at once or again
 ///     later: the writes aren't committed and the call isn't made again, since the same
 ///     answer would come; the item is passed, and the protocol told with
 ///     [`super::AppEvent::LocalWritesRefused`], a duty event;
@@ -618,7 +674,7 @@ pub trait Protocol: Send + Sync {
 
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
     /// the body parses as its kind's body, the members read have their types, and the
-    /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive_with`],
+    /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive`],
     /// and a push extension's peek runs it alone (Switch spec 9 step 5), so it must refuse
     /// every body that the receive step would drop for its shape, and change nothing.
     ///
@@ -628,33 +684,26 @@ pub trait Protocol: Send + Sync {
     /// generic notification for it.
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String>;
 
-    /// The effect of a message whose body passed [`Protocol::check_body`], for a protocol
-    /// that needs nothing of the app's state: [`Protocol::receive_with`] calls it by default.
-    /// A protocol that implements [`Protocol::receive_with`] need not implement this one; by
-    /// default it drops every message. A step that can't finish because the protocol's
-    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`].
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
-        let _ = message;
-        Outcome::Drop {
-            reason: "the protocol takes no messages".into(),
-        }
-    }
-
     /// The effect of a message whose body passed [`Protocol::check_body`], with the app's
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
-    /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
-    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an
-    /// [`Outcome::Retry`], an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an [`Outcome::Need`] the app reads what it
-    /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
+    /// entries to the effect's batch, which carries the cursor move. A protocol that needs
+    /// nothing of the app's state ignores `cx`. What `cx` added goes only with
+    /// [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an [`Outcome::Retry`],
+    /// an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an
+    /// [`Outcome::Need`] the app reads what it names and calls this again, the answers in
+    /// [`ReceiveContext::switch_claim`]. A step that can't finish because the protocol's
+    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`]: a read
     /// of the context, or of the protocol's own store, that fails with a store error is an
-    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
-    /// or stored locally and tried again at a later read. After `409 conflict` on the batch the
-    /// app reads the records and claims `cx` wrote again and calls this once more, with
-    /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
-    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
-        let _ = cx;
-        self.receive(message)
+    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]), and the entry is held for a later
+    /// read, or stored locally and tried again at a later read. After `409 conflict` on the
+    /// batch the app reads the records and claims `cx` wrote again and calls this once more,
+    /// with [`ReceivedMessage::conflict`] set. By default it drops every message.
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let _ = (message, cx);
+        Outcome::Drop {
+            reason: "the protocol takes no messages".into(),
+        }
     }
 
     /// Entries the app can't read: the protocol queues its re-send request and returns the
@@ -665,7 +714,8 @@ pub trait Protocol: Send + Sync {
     /// A [`StoreFailure`] when the protocol can't build its writes now, such as when its own
     /// state can't be read, of either kind. The cursor still passes the entries, and the app
     /// keeps `needed` in that same commit and calls this again with it at the start of each
-    /// later read, across loads, until it returns writes
+    /// later read, across loads, before anything else is handed, until it returns writes;
+    /// while it fails, the read hands nothing after it, of any kind (Switch spec 8.3)
     /// ([`super::App::owed_protocol_calls`]).
     fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure>;
 
@@ -676,6 +726,76 @@ pub trait Protocol: Send + Sync {
     /// As [`Protocol::resend_needed`].
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure>;
 
+    /// A change to the deny list the feed shows (Switch spec 8.3): the protocol keeps what
+    /// it needs of it and returns the local writes that keep it, committed with the cursor
+    /// passing the item. Nothing by default.
+    ///
+    /// - **Who gets them:** an app holding `lists.read`, its own changes included, which
+    ///   come back by its feed. An app without it gets none.
+    /// - **Order:** feed order, across everything the app hands over. While a change is
+    ///   owed, the read hands nothing after it: no later item, owed call or entry stored
+    ///   locally. So an undeny is seen before the message after it. Calls owed from a
+    ///   sequence a provider loss ended come before those of the current sequence, and
+    ///   among themselves in the order (generation, seq): two of one lost sequence owed at
+    ///   different generations, as across a key change in place, may come out of feed
+    ///   order. The gap the loss leaves follows them, with the full list
+    ///   ([`Protocol::deny_list_gap`]). A change owed that the app's position is already
+    ///   past, as after a restore in place from a newer backup, or one of a lost sequence
+    ///   once the app reads the next, isn't made: it would come after later changes, so
+    ///   the protocol is told a gap at that position instead.
+    /// - **After a restore:** a backup holds the protocol's layer as committed when it was
+    ///   taken, and none of the changes or gaps owed then. So every restore tells the
+    ///   protocol a gap at the backup's position, with the full list, whatever the backup
+    ///   held, after the owed calls the restore carries up to that position; the
+    ///   changes after it come as the feed hands them.
+    /// - **Again:** a change may come twice, after a crash before its commit and after a
+    ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
+    ///   keeps by the change's place, or takes it as setting a state.
+    /// - **Before and after:** an entry held, accepted before a change, may come again at a
+    ///   later read, after the change.
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::resend_needed`]. A failed change is owed and made again at the start
+    /// of each later read, before anything else is handed; the read stops there while it
+    /// fails, and after [`RETRY_EVENT_READS`] such reads the app tells the host
+    /// ([`super::AppEvent::OwedCallHeld`]). Writes over [`MAX_STEP_LOCAL_BYTES`] aren't
+    /// committed and the change isn't made again, with
+    /// [`super::AppEvent::LocalWritesRefused`].
+    fn deny_list_changed(&self, change: &DenyListChange) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = change;
+        Ok(Vec::new())
+    }
+
+    /// A gap in the deny list's history, with the list as it stands now ([`DenyListGap`]):
+    /// the protocol starts again from it, or fails closed for what the gap covers
+    /// (Switch spec 8.3). Made by a read, after the owed calls and before any later change
+    /// or item is handed, once the app has read the list for the gap (`GET /allow`).
+    ///
+    /// A gap comes after a restore, a provider loss, a checkpoint past the cursor, a change
+    /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
+    /// and every [`super::App::allow_list`]: whenever the app's copy of
+    /// the lists is taken whole from a list read, the protocol is given that list as a gap.
+    /// The writes are committed on their own, with the owed gap deleted; the copy of the
+    /// lists is then replaced from the same answer in a commit of its own, best effort,
+    /// which lists too large for one commit leave as it was, not known complete.
+    ///
+    /// A gap may be told again at the same position, each time with the full list, which
+    /// sets the same state. One told with `list_read` false, the answer not readable, is
+    /// owed again at the next read, as long as the answer can't be read. Writes over
+    /// [`MAX_STEP_LOCAL_BYTES`] aren't committed: the gap is refused with
+    /// [`super::AppEvent::LocalWritesRefused`] and counts as told, and no further gap
+    /// follows for it. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`]: the copy isn't taken, and the call is made again at the next
+    /// read, which hands nothing else meanwhile, as for [`Protocol::deny_list_changed`].
+    fn deny_list_gap(&self, gap: &DenyListGap) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = gap;
+        Ok(Vec::new())
+    }
+
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
     /// inboxes accepted from [`ProviderLoss::accepted_from_ms`] on, and names the
@@ -684,7 +804,9 @@ pub trait Protocol: Send + Sync {
     /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
     /// once, with that step; a crash before that commit calls it again. Writes over
     /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
-    /// [`super::AppEvent::LocalWritesRefused`]. Nothing by default.
+    /// [`super::AppEvent::LocalWritesRefused`]. `view` reads the protocol's local state,
+    /// read-only, such as to find the counterparties of its unfinished activity; a protocol
+    /// that needs none of it ignores it. Nothing by default.
     ///
     /// # Errors
     ///
@@ -692,25 +814,13 @@ pub trait Protocol: Send + Sync {
     /// state can't be read. The recovery stays at this step, which its record keeps, and the
     /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
     /// failing; the next call asks again.
-    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreFailure> {
-        let _ = loss;
-        Ok(LossActions::default())
-    }
-
-    /// [`Protocol::provider_lost`], with the protocol's local state at hand, read-only
-    /// (`view`), such as to find the counterparties of its unfinished activity. The app
-    /// calls this one; by default it calls [`Protocol::provider_lost`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Protocol::provider_lost`].
-    fn provider_lost_with(
+    fn provider_lost(
         &self,
         loss: &ProviderLoss,
         view: &LocalView<'_>,
     ) -> Result<LossActions, StoreFailure> {
-        let _ = view;
-        self.provider_lost(loss)
+        let _ = (loss, view);
+        Ok(LossActions::default())
     }
 
     /// Whether a certificate's scopes allow its app to receive `kind`, which a sender checks
@@ -722,23 +832,12 @@ pub trait Protocol: Send + Sync {
     }
 
     /// The protocol's narrower rule for senders (Switch spec 3.4): whether `message` goes to
-    /// the app whose record is `recipient`, beyond its certificate and `accepts`. Every app
-    /// by default.
-    fn sends_to(&self, message: &Message, recipient: &AppRecord) -> bool {
-        let _ = (message, recipient);
+    /// the app whose record is `recipient`, beyond its certificate and `accepts`, with the
+    /// protocol's local state at hand, read-only (`view`); a protocol that needs none of it
+    /// ignores it. Every app by default.
+    fn sends_to(&self, message: &Message, recipient: &AppRecord, view: &LocalView<'_>) -> bool {
+        let _ = (message, recipient, view);
         true
-    }
-
-    /// [`Protocol::sends_to`], with the protocol's local state at hand, read-only (`view`).
-    /// The app calls this one; by default it calls [`Protocol::sends_to`].
-    fn sends_to_with(
-        &self,
-        message: &Message,
-        recipient: &AppRecord,
-        view: &LocalView<'_>,
-    ) -> bool {
-        let _ = view;
-        self.sends_to(message, recipient)
     }
 
     /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
@@ -793,6 +892,14 @@ pub trait Protocol: Send + Sync {
     /// breaks, without content, and the write is flagged and not acted on. `value` is
     /// `None` for a delete or an unreadable value. Never by default.
     ///
+    /// `base` tells what the newer write builds on ([`WriteBase`]): its `expected_version`,
+    /// whether the app holds that version, and the conditions its operation signed. A
+    /// protocol whose rules hold only for a writer that built on the value the app holds,
+    /// such as one that may drop only what it held itself, applies them when `base.held`;
+    /// one whose rule fences a change on a condition, such as a `claim_step` on the claim of
+    /// what the write drops, finds it in `base.conditions`. A protocol whose rules don't
+    /// depend on the base ignores it.
+    ///
     /// The rule is at most [`MAX_REGRESSION_REASON_BYTES`], 256 bytes; a longer one is cut
     /// there, at a character boundary.
     fn record_regression(
@@ -800,30 +907,10 @@ pub trait Protocol: Send + Sync {
         collection: &str,
         seen: &[u8],
         value: Option<&[u8]>,
-    ) -> Option<String> {
-        let _ = (collection, seen, value);
-        None
-    }
-
-    /// [`Protocol::record_regression`], told what the newer write builds on
-    /// ([`WriteBase`]): its `expected_version`, whether the app holds that version, and the
-    /// conditions its operation signed. A protocol whose rules hold only for a writer that
-    /// built on the value the app holds, such as one that may drop only what it held itself,
-    /// applies them when `base.held`; one whose rule fences a change on a condition, such as
-    /// a `claim_step` on the claim of what the write drops, finds it in `base.conditions`.
-    /// The app calls this one; by default it calls [`Protocol::record_regression`], so a
-    /// protocol that implements only that keeps its rules as they are.
-    ///
-    /// The same bound on the rule applies, [`MAX_REGRESSION_REASON_BYTES`].
-    fn record_regression_on(
-        &self,
-        collection: &str,
-        seen: &[u8],
-        value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {
-        let _ = base;
-        self.record_regression(collection, seen, value)
+        let _ = (collection, seen, value, base);
+        None
     }
 
     /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):

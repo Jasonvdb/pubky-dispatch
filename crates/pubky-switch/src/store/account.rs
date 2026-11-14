@@ -6,7 +6,7 @@
 //! commits. Dropping it without committing, or a process that dies before the commit,
 //! rolls everything back.
 
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use super::{StoreError, from_db, to_db};
 use pubky_switch_core::sig::SignedDoc;
@@ -146,9 +146,10 @@ impl std::fmt::Debug for AccountTxn {
     }
 }
 
-/// An account inserted and not committed yet: its creation time is raised past every erasure
-/// of its identity before it commits ([`Creation::commit`]), so a new account is never taken
-/// for one a restored database brought back (Switch spec 6.5).
+/// An account inserted under its identity's lock and not committed yet
+/// ([`super::IdentityLock::create`]): it commits at the creation time asked for, which the
+/// caller read under the same lock past every erasure's record and every mark it takes over
+/// (Switch wire 7.3, "The mark").
 pub struct Creation {
     tx: Transaction<'static, Postgres>,
     account: NewAccount,
@@ -162,35 +163,17 @@ impl std::fmt::Debug for Creation {
     }
 }
 
-/// Insert an account unless one exists: `None` if one does. The insert waits for an erasure
-/// of the identity still committing, at most `lock_timeout_ms` ([`StoreError::LockTimeout`],
-/// writing nothing). The key store's ledger is read after it, by the caller: an erasure's
-/// record is durable before its deletion commits (Switch wire 7.3, Table 3), so the ledger
-/// holds every erasure committed before the insert.
-pub(super) async fn begin_create(
-    pool: &PgPool,
+/// Insert an account in `tx`, which holds its identity's lock, unless one exists: `None` if
+/// one does.
+pub(super) async fn create(
+    mut tx: Transaction<'static, Postgres>,
     account: &NewAccount,
-    lock_timeout_ms: u64,
 ) -> Result<Option<Creation>, StoreError> {
     let identity_doc = account
         .identity_doc
         .as_ref()
         .map(super::identity::encode_doc)
         .transpose()?;
-    let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
-    // READ COMMITTED whatever the pool's default: the read after the insert takes a snapshot
-    // of its own, so it sees an erasure the insert waited for. The number is formatted, as
-    // `SET` takes no bind parameters.
-    sqlx::Executor::execute(
-        &mut *tx,
-        format!(
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-             SET LOCAL lock_timeout = {lock_timeout_ms}"
-        )
-        .as_str(),
-    )
-    .await
-    .map_err(StoreError::from_db)?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, created_at_ms, \
          stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $4, $5, $6) \
@@ -219,24 +202,10 @@ pub(super) async fn begin_create(
 }
 
 impl Creation {
-    /// Commit the account, created after `ledger_ms`, the time of its identity's latest
-    /// erasure's record in the key store's ledger: at the time asked for, or 1 ms after that
-    /// record. The time it was created at.
-    pub async fn commit(mut self, ledger_ms: Option<u64>) -> Result<u64, StoreError> {
+    /// Commit the account, at the creation time asked for, and let its identity's lock go.
+    pub async fn commit(mut self) -> Result<(), StoreError> {
         let account = &self.account;
-        let created_at_ms = ledger_ms.map_or(account.created_at_ms, |at| {
-            account.created_at_ms.max(at.saturating_add(1))
-        });
-        if created_at_ms != account.created_at_ms {
-            sqlx::query(
-                "UPDATE accounts SET created_at_ms = $2, stamped_time_ms = $2 WHERE id = $1",
-            )
-            .bind(&account.id)
-            .bind(to_db(created_at_ms, "created_at_ms")?)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-        }
+        let created_at_ms = account.created_at_ms;
         for app_id in &account.revoked_apps {
             sqlx::query(
                 "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
@@ -269,7 +238,7 @@ impl Creation {
         )
         .await?;
         self.tx.commit().await.map_err(StoreError::from_db)?;
-        Ok(created_at_ms)
+        Ok(())
     }
 }
 

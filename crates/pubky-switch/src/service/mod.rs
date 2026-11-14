@@ -144,7 +144,7 @@ pub struct Service {
     resolver: Resolver,
     /// How many webhooks delivery sends at once (`push.concurrency`).
     push_concurrency: usize,
-    /// How long the erasure ledger keeps an erasure: the age of the oldest database backup
+    /// How long the mark store keeps an erasure's record: the age of the oldest database backup
     /// kept (`keys.backup_retention_days`); `None` keeps it for good (Switch spec 6.5).
     backup_retention_ms: Option<u64>,
     /// Turns to hold a registration while its webhook is signed, each on a connection of the
@@ -309,8 +309,8 @@ impl Service {
     /// The passes a service runs once, before it takes requests, after its settings: the
     /// push keys left owed go (Switch wire 8.1), then the accounts a restored database
     /// brought back after their erasure, and the erasures' leftover marks (Switch wire 7.3,
-    /// Table 1; the check at each request covers a failure here), then the ledger's
-    /// erasures past `keys.backup_retention_days`.
+    /// Table 1; the check at each request covers a failure here), then the erasures' records
+    /// past `keys.backup_retention_days`.
     pub async fn started(self) -> Self {
         let _ = self.sweep_erased_keys().await;
         let _ = self.erase_restored_accounts().await;
@@ -324,11 +324,13 @@ impl Service {
     /// older than two checks (Switch spec 6.5).
     #[must_use]
     pub fn with_lock_freshness(mut self, freshness: LockFreshness) -> Self {
+        // Every mark write waits for no stale check, whatever path makes it.
+        self.marks = self.marks.gated(freshness.clone());
         self.lock_freshness = Some(freshness);
         self
     }
 
-    /// Keep the erasure ledger's entries for `days` after their erasure, the age of the
+    /// Keep the erasures' records for `days` after their erasure, the age of the
     /// oldest database backup the operator keeps (`keys.backup_retention_days`, Switch spec
     /// 6.5); `None` keeps them for good.
     #[must_use]
@@ -544,31 +546,32 @@ impl Service {
         };
         let class = marking::class_of(&request);
         let routed = verdict::answer(&judged.judgement, &class, self.current_key());
+        // The identity's service time (step 3): the time base, or the last time it stamped
+        // where the time base is earlier (Switch wire 7.1 Timestamp).
+        let service_ms = found
+            .as_ref()
+            .map_or(base_ms, |found| base_ms.max(found.stamped_time_ms));
         if matches!(routed.route, Route::Notice(_)) {
             // The notice replaces every later answer, a `401` and a `403` before
-            // authentication included, but a `413` or a `429` answered before it; a request
-            // that would have been a `401` still counts against its source (Switch wire 7.3
-            // under Table 2, 9.4).
+            // authentication included, but a `413` or a `429` answered before it, which
+            // carries the identity's service time as such an answer does; a request that
+            // would have been a `401` still counts against its source (Switch wire 7.1
+            // Timestamp, 7.3 under Table 2, 9.4).
             if let Some(limited) = self.limited_before_authentication(&account, &request, base_ms) {
-                return self.keyed_error(&routed.key, asked, base_ms, base_ms, &limited);
+                return self.keyed_error(&routed.key, asked, service_ms, base_ms, &limited);
             }
             if *call != Call::GetIdentity {
-                let stamped = found
-                    .as_ref()
-                    .map_or(base_ms, |found| found.stamped_time_ms);
-                let _ = self
-                    .pre_lock(&account, &request, base_ms, base_ms.max(stamped))
-                    .await;
+                let _ = self.pre_lock(&account, &request, base_ms, service_ms).await;
             }
         }
-        if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms) {
+        if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms, service_ms) {
             return answer;
         }
         let Some(found) = found else {
             // An identity without an account that the verdict lets through: the erasure at
             // a lost identity (Switch wire 7.4.16, 7.3 Table 2).
             return self
-                .erase_without_account(&account, &request, &judged, &routed, base_ms, asked)
+                .erase_without_account(&account, &request, &routed, base_ms, asked)
                 .await;
         };
         let stamped_ms = found.stamped_time_ms;
@@ -950,7 +953,9 @@ impl Service {
             return self.service_error(asked, base_ms, &error);
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
-        if let Some(answer) = self.verdict_answer(&identity, &routed, asked, base_ms) {
+        // The identity's service time (step 3), not yet stamped.
+        let service_ms = base_ms.max(txn.head().stamped_time_ms);
+        if let Some(answer) = self.verdict_answer(&identity, &routed, asked, base_ms, service_ms) {
             return answer;
         }
         let Some(signer) = self.signer_of(&routed.key) else {
@@ -1137,8 +1142,17 @@ impl Service {
                         let (answer, time_ms) = page.answer();
                         sign_answer(page.signer(), asked, time_ms, answer)
                     }
-                    Err(feed::FeedStop::Verdict { key, error }) => {
-                        self.keyed_error(&key, asked, base_ms, base_ms, &error)
+                    // Signed when it answers, after the wait: the notice and the not-hosted
+                    // `404` at the time base then, an unknown verdict's `503` at the identity's
+                    // service time (Switch wire 7.1 Timestamp).
+                    Err(feed::FeedStop::Verdict {
+                        key,
+                        error,
+                        service_ms,
+                    }) => {
+                        let now_ms = self.time.read().base_ms;
+                        let at_ms = service_ms.map_or(now_ms, |at| at.max(now_ms));
+                        self.keyed_error(&key, asked, at_ms, now_ms, &error)
                     }
                     Err(feed::FeedStop::Refused(refusal)) => {
                         // Every 401 counts against the network source (9.4).
@@ -1146,13 +1160,15 @@ impl Service {
                             self.record_failure(request, identity.clone());
                         }
                         let refusal = *refusal;
-                        let head = match (&refusal.snapshot, refusal.head) {
-                            (Some(snapshot), _) => snapshot.sign(&answer_signer),
-                            (None, true) => fallback_head,
-                            (None, false) => None,
+                        // A refusal decided from a snapshot is signed, head and answer, with
+                        // the key that snapshot's verdict gives.
+                        let (head, signer) = match (&refusal.snapshot, refusal.head) {
+                            (Some(snapshot), _) => (snapshot.sign(), snapshot.signer().clone()),
+                            (None, true) => (fallback_head, answer_signer),
+                            (None, false) => (None, answer_signer),
                         };
                         let answer = Answer::error(&refusal.error).with_head(head);
-                        sign_answer(&answer_signer, asked, refusal.time_ms, answer)
+                        sign_answer(&signer, asked, refusal.time_ms, answer)
                     }
                 };
             }

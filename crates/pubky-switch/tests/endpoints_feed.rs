@@ -826,12 +826,22 @@ async fn test_feed_long_poll_behind_the_mark_answers_the_notice() {
             .advance(&alice_id(), ahead, service_public(&replay))
             .await
             .expect("mark");
+        // Time passes during the wait.
+        replay.clock.set_wall_ms(ms(&at) + 30_000);
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (503, json!("recovery_required"))
     );
     assert_eq!(body(&answer)["current"]["reason"], json!("behind"));
+    // Signed when it answers, at the time base then, not at the request's start (Switch
+    // wire 7.1 Timestamp, 7.6).
+    let time = header_text(&answer, header::SERVER_TIME).expect("server time");
+    assert_eq!(
+        pubky_switch_core::time::parse_rfc3339(time).expect("time"),
+        replay.time.peek().base_ms
+    );
+    assert_eq!(replay.time.peek().base_ms, ms(&at) + 30_000);
     assert!(header_text(&answer, header::HEAD).is_none());
     assert!(signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(replay.service.mark_refusals(), 1);

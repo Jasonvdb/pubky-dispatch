@@ -719,7 +719,7 @@ async fn test_push_delivery_of_a_restored_erased_account_is_never_sent() {
     db.close().await.expect("close");
     // The key store as the erasure left it: the erasure recorded (Switch wire 7.3, Table 3).
     replay
-        .keys
+        .marks
         .record_erasure(&alice_id(), u64::try_from(created).expect("time") + 60_000)
         .await
         .expect("ledger");
@@ -1106,33 +1106,6 @@ impl KeyStore for Gate {
     }
     fn delete<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ()> {
         self.inner.delete(id)
-    }
-    fn record_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-    ) -> KeyFuture<'a, Option<u64>> {
-        self.inner.record_erasure(identity, erased_at_ms)
-    }
-    fn withdraw_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-        previous: Option<u64>,
-    ) -> KeyFuture<'a, ()> {
-        self.inner
-            .withdraw_erasure(identity, erased_at_ms, previous)
-    }
-    fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
-        self.inner.erasure(identity)
-    }
-
-    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
-        self.inner.erasures()
-    }
-
-    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
-        self.inner.forget_erasures_before(before_ms)
     }
 }
 
@@ -2069,7 +2042,7 @@ async fn test_push_delivery_of_an_account_enrolled_after_an_erasure_is_sent() {
         .expect("account");
     db.close().await.expect("close");
     replay
-        .keys
+        .marks
         .record_erasure(&alice_id(), u64::try_from(created).expect("time") - 1)
         .await
         .expect("ledger");

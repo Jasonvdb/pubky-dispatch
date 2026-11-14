@@ -894,3 +894,86 @@ async fn test_marks_refusals_count_each_notice() {
     assert_eq!(service.mark_refusals(), 3);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_marks_later_generation_over_a_forked_earlier_chain_is_a_fork() {
+    // The fork rule under Table 1 looks at the stub of the mark's generation at the mark's
+    // `seq` whenever the service holds it, whatever the state's generation: a state at a
+    // later generation over a chain whose stub there has another hash is a fork (Switch
+    // wire 7.3).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, _) = served(&replay).await;
+    let batch = replay.service.handle(wallet_batch(&replay, &[3, 4])).await;
+    assert_eq!(
+        batch.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&batch.body)
+    );
+    // The state at generation 2, its chain's stubs those of generation 1, and a mark at
+    // generation 1's seq 2 whose chain hash isn't the stub's there.
+    sql(
+        &replay,
+        &[&format!(
+            "UPDATE accounts SET generation = 2 WHERE id = '{}'",
+            alice_id()
+        )],
+    )
+    .await;
+    replay.marks.delete(&alice_id()).await.expect("delete");
+    let other = ChainTip {
+        chain_hash: [9; 32],
+        ..mark_at(&mark, 2).head()
+    };
+    replay
+        .marks
+        .write_anew(&alice_id(), other, mark.key, mark.created_at_ms)
+        .await
+        .expect("write");
+    let at = time_of(3) + 60_000;
+    replay.clock.set_wall_ms(at);
+    let request = apps_read(at);
+    let sent = Sent::of(&request);
+    let answer = replay.service.handle(request).await;
+    assert_notice(&replay, &answer, &sent, "fork", 2);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_unknown_verdict_carries_the_identitys_service_time() {
+    // The `503` of an unknown verdict carries the identity's service time, which never goes
+    // back, also while the time base is behind the time it last stamped; only the notice
+    // and the not-hosted `404` carry the time base (Switch wire 7.1 Timestamp, 7.3 step 2).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (_, _) = served(&replay).await;
+    let stamped = u64::try_from(account_row(&replay).await.1).expect("time");
+    let base = stamped - 60_000;
+    replay.clock.set_wall_ms(base);
+    assert_eq!(
+        replay.time.peek().base_ms,
+        base,
+        "the time base behind the stamp"
+    );
+    std::fs::remove_file(accounts_dir(&replay).join("store-id")).expect("remove store-id");
+    let (service, _) = restarted(&replay, Limits::default());
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = service.handle(request).await;
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert!(header_text(&answer, header::HEAD).is_none(), "no head");
+    let time = header_text(&answer, header::SERVER_TIME).expect("server time");
+    assert_eq!(
+        parse_rfc3339(time).expect("time"),
+        stamped,
+        "the service time"
+    );
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    replay.db.drop_database().await.expect("drop");
+}

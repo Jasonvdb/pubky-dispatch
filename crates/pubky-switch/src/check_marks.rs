@@ -347,7 +347,7 @@ pub(crate) fn judge_identity(
     head: Option<&StoredHead>,
     mark: &MarkInput,
     stub_at_mark: Option<[u8; 32]>,
-    keys: &KeyStoreView,
+    marks: &MarkView,
     retired: &[u64],
     origin: &str,
     service_key: &[u8; 32],
@@ -357,7 +357,7 @@ pub(crate) fn judge_identity(
         account: judged.as_ref().map(|(account, _)| account),
         mark,
         stub_at_mark,
-        erasure_at_ms: keys.erasure(identity),
+        erasure_at_ms: marks.erasure(identity),
         retired,
         current_key: *service_key,
     });
@@ -385,7 +385,6 @@ fn judge_line(
     head: Option<&StoredHead>,
     mark: &MarkInput,
     stub_at_mark: Option<[u8; 32]>,
-    keys: &KeyStoreView,
     marks: &MarkView,
     origin: &str,
     service_key: &[u8; 32],
@@ -396,7 +395,7 @@ fn judge_line(
         head,
         mark,
         stub_at_mark,
-        keys,
+        marks,
         &retired,
         origin,
         service_key,
@@ -463,22 +462,13 @@ pub async fn run(options: &CheckOptions) -> Result<Report, CheckError> {
     let marks = MarkView::open(&options.key_dir)?;
     let service_key = keys.service_key()?.ok_or(CheckError::NoServiceKey)?;
     let mut conn = heads::open_read_only_with(&options.database).await?;
-    let report = check(
-        &mut conn,
-        &keys,
-        &marks,
-        &options.origin,
-        &service_key,
-        options,
-    )
-    .await;
+    let report = check(&mut conn, &marks, &options.origin, &service_key, options).await;
     let _ = sqlx::Connection::close(conn).await;
     report
 }
 
 async fn check(
     conn: &mut PgConnection,
-    keys: &KeyStoreView,
     marks: &MarkView,
     origin: &str,
     service_key: &[u8; 32],
@@ -506,9 +496,7 @@ async fn check(
                 continue;
             };
             let stub = stub_at(conn, head, mark).await?;
-            if let Some(line) =
-                judge_line(id, Some(head), mark, stub, keys, marks, origin, service_key)
-            {
+            if let Some(line) = judge_line(id, Some(head), mark, stub, marks, origin, service_key) {
                 report.add(line, options.all);
             }
         }
@@ -526,7 +514,6 @@ async fn check(
             read.head.as_ref(),
             &read.mark,
             read.stub_at_mark,
-            keys,
             marks,
             origin,
             service_key,
@@ -537,8 +524,9 @@ async fn check(
     Ok(report)
 }
 
-/// The stub `head`'s account holds at the mark's `seq`, where its state is past the mark in
-/// the mark's generation, as the service reads it.
+/// The stub `head`'s account holds at the mark's generation and `seq`, where its state is
+/// past the mark, whatever the state's generation, as the service reads it
+/// ([`verdict::stub_for_fork_rule`]).
 async fn stub_at(
     conn: &mut PgConnection,
     head: &StoredHead,
@@ -547,13 +535,11 @@ async fn stub_at(
     let MarkInput::Mark(held) = mark else {
         return Ok(None);
     };
-    let past = head.chain.is_some_and(|(seq, _)| {
-        held.records_head() && head.generation == held.generation && seq > held.seq
-    });
-    if !past {
+    let state = head.chain.map(|(seq, _)| (head.generation, seq));
+    let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held) else {
         return Ok(None);
-    }
-    Ok(heads::stub_hash_at(conn, &head.id, held.generation, held.seq).await?)
+    };
+    Ok(heads::stub_hash_at(conn, &head.id, generation, seq).await?)
 }
 
 /// The identity's mark as the verdict takes it.

@@ -12,7 +12,6 @@
 mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
-use pubky_switch::keys::KeyStore;
 use pubky_switch::marks::{AccountMark, MarkRead};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
@@ -389,7 +388,7 @@ async fn test_recovery_in_place_starts_afresh_under_the_service_key() {
         "the service key's answer"
     );
     assert_eq!(
-        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        replay.marks.erasure(&alice_id()).await.expect("ledger"),
         None,
         "no erasure recorded"
     );

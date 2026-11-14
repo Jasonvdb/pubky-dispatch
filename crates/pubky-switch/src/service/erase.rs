@@ -6,8 +6,8 @@
 //! and the account's newest `identity.json`, left out only where the account holds none
 //! (`409 conflict` otherwise, carrying the creation time). Then the order is fixed (Switch
 //! wire 7.3, Table 3):
-//! 1. the erasure's record is written to the key store's ledger, durably, dated no earlier
-//!    than the creation it erases;
+//! 1. the erasure's record is written to the mark store, durably, dated no earlier than the
+//!    creation it erases;
 //! 2. the account's row is deleted, and with it every row of its state, its apps' push keys
 //!    owed deleting in the same transaction (`erased_keys`), and committed; where the
 //!    deletion doesn't commit, the record is taken back and the answer is `503`;
@@ -15,20 +15,24 @@
 //! 4. only then is the answer released, signed with the key the verdict gives, without a
 //!    head.
 //!
-//! A mark the deletion of step 3 leaves is an erasure's leftover: the record covers it, and a
-//! later request for the identity or the next start deletes it. Afterwards every request for
-//! the account finds no account: the not-hosted `404`, signed with the service key.
+//! Steps 1 and 2 run under the identity's lock (`store`, "One identity at a time"), which an
+//! enrollment holds from the mark's write through the account's insert, so no account is
+//! created between the record and the deletion, and every later account is created after the
+//! record. A mark the deletion of step 3 leaves is an erasure's leftover: the record covers
+//! it, and a later request for the identity or the next start deletes it. Afterwards every
+//! request for the account finds no account: the not-hosted `404`, signed with the service
+//! key.
 //!
-//! **A restored database** (spec 6.5). The key store, apart from the database's backups,
-//! keeps each erasure's record in its ledger. A database restored from a backup taken before
+//! **A restored database** (spec 6.5). The mark store, apart from the database's backups,
+//! keeps each erasure's record. A database restored from a backup taken before
 //! an erasure brings the account back. Such an account, one created at or before the time
-//! the ledger holds for its identity, is erased again before anything is served or signed
-//! for it (Switch wire 7.3, Table 1, first row): at start, for every identity the ledger
-//! holds, and at every request's judgement of the account. An account created after the
+//! the mark store holds for its identity, is erased again before anything is served or signed
+//! for it (Switch wire 7.3, Table 1, first row): at start, for every identity a record
+//! names, and at every request's judgement of the account. An account created after the
 //! erasure, by an enrollment since, is a new account: an enrollment creates it later than the
-//! time the ledger holds. The ledger keeps an erasure until every database backup that could
-//! hold its account has aged out (`keys.backup_retention_days`), and drops a record only once
-//! the leftover marks it covers are gone.
+//! time the store holds. The store keeps an erasure's record until every database backup that
+//! could hold its account has aged out (`keys.backup_retention_days`), and drops a record
+//! only once the leftover marks it covers are gone.
 
 use std::sync::Arc;
 
@@ -108,7 +112,7 @@ impl Service {
             return Self::signed_error(signer, asked, committed_ms, &unavailable());
         }
         // The record first, durably, once the checks have passed (Table 3).
-        let previous = match self.keys.record_erasure(&account, record_at).await {
+        let previous = match self.marks.record_erasure(&account, record_at).await {
             Ok(previous) => previous,
             Err(failure) => {
                 tracing::error!(%failure, "recording an erasure");
@@ -135,7 +139,7 @@ impl Service {
             if let Ok(Some(found)) = self.store.lookup(&account).await
                 && found.created_at_ms == created_at_ms
                 && let Err(failure) = self
-                    .keys
+                    .marks
                     .withdraw_erasure(&account, record_at, previous)
                     .await
             {
@@ -153,13 +157,13 @@ impl Service {
     }
 
     /// The erasure at an identity without an account that the verdict lets through: a lost
-    /// one (Switch wire 7.3 Table 2, 7.4.16). After the signer's checks, the record is
-    /// written, then the mark deleted; the answer is signed with the key in the mark.
+    /// one (Switch wire 7.3 Table 2, 7.4.16). After the signer's checks, under the identity's
+    /// lock, the identity is judged again, then the record is written and the mark deleted;
+    /// the answer is signed with the key in the mark.
     pub(super) async fn erase_without_account(
         &self,
         account: &str,
         request: &SwitchRequest,
-        judged: &Judged,
         routed: &verdict::Answer,
         base_ms: u64,
         asked: Asked<'_>,
@@ -182,28 +186,49 @@ impl Service {
         if routed.route != Route::EraseLost {
             return self.service_error(asked, base_ms, &marking::not_hosted());
         }
-        let created = match erasure_binding(request, None, judged) {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        // No enrollment creates or takes over the account while the erasure holds the
+        // identity's lock: what it judges is what it erases.
+        let mut lock = match self.store.lock_identity(account).await {
+            Ok(lock) => lock,
+            Err(error) => return refuse(store_error(&error)),
+        };
+        match lock.has_account().await {
+            Ok(false) => {}
+            // An account made meanwhile: the retry is judged at it.
+            Ok(true) => return refuse(unavailable()),
+            Err(error) => return refuse(store_error(&error)),
+        }
+        let inputs = self.mark_inputs(account).await;
+        let judged = self.judge_with(account, None, inputs).await;
+        let routed = verdict::answer(
+            &judged.judgement,
+            &verdict::RequestClass::Erase,
+            self.current_key(),
+        );
+        match routed.route {
+            Route::EraseLost => {}
+            Route::NotHosted => return self.service_error(asked, base_ms, &marking::not_hosted()),
+            _ => return refuse(unavailable()),
+        }
+        let created = match erasure_binding(request, None, &judged) {
             Ok(created) => created,
             Err(error) => return refuse(error),
         };
-        if !self.lock_is_fresh() {
-            return refuse(ApiError::unavailable("7.6: a temporary failure"));
-        }
         // Dated no earlier than the creation it erases (Switch wire 7.3, Table 3).
         let at_ms = base_ms.max(created);
-        if let Err(failure) = self.keys.record_erasure(account, at_ms).await {
+        if let Err(failure) = self.marks.record_erasure(account, at_ms).await {
             tracing::error!(%failure, "recording an erasure");
-            return refuse(ApiError::unavailable("7.6: a temporary failure"));
+            return refuse(unavailable());
         }
         // A mark left here is a leftover the record covers, deleted later.
-        self.delete_leftover(account, at_ms).await;
+        if let Err(failure) = self.marks.delete_created_by(account, at_ms).await {
+            tracing::warn!(%failure, "deleting an erased identity's mark");
+        }
+        drop(lock);
         self.forget_account(account);
         let Some(signer) = self.signer_of(&routed.key) else {
-            return self.service_error(
-                asked,
-                base_ms,
-                &ApiError::unavailable("7.6: a temporary failure"),
-            );
+            return self.service_error(asked, base_ms, &unavailable());
         };
         sign_answer(&signer, asked, base_ms, Answer::ok(ERASED_BODY.to_vec()))
     }
@@ -223,25 +248,43 @@ impl Service {
     }
 
     /// Erase again account `account`, which a restored database brought back after its
-    /// erasure at `erased_at_ms` (Switch wire 7.3, Table 1 first row): as an erasure does,
-    /// its state deleted and its push keys owed in one commit, then the owed keys deleted,
-    /// its ledger entry kept, with no answer to sign. Whether the identity holds no such
-    /// account any more: gone, erased here, or a new account made since; `false` when the
-    /// erasure didn't commit.
+    /// erasure at `erased_at_ms` (Switch wire 7.3, Table 1 first row), under the identity's
+    /// lock: the record again, durably, as a record held only in memory, as a write that
+    /// failed leaves it, would not survive a restart (Table 3); then, as an erasure does, its
+    /// state deleted and its push keys owed in one commit, then the owed keys deleted, with
+    /// no answer to sign. Whether the identity holds no such account any more: gone, erased
+    /// here, or a new account made since; `false` when the record or the erasure didn't
+    /// commit.
     pub(super) async fn erase_restored(&self, account: &str, erased_at_ms: u64) -> bool {
-        let (store, keys, id) = (self.store.clone(), self.keys.clone(), account.to_string());
+        let (store, keys, marks, id) = (
+            self.store.clone(),
+            self.keys.clone(),
+            self.marks.clone(),
+            account.to_string(),
+        );
         // Run to the end in a task of its own, as an erasure is: a request dropped meanwhile
         // can't stop it between the commit and the keys' deletion.
         let erased = to_the_end(async move {
-            let Some(txn) = store.begin(&id).await? else {
-                return Ok(false);
+            let lock = match store.lock_identity(&id).await {
+                Ok(lock) => lock,
+                Err(failure) => return Err(failure.to_string()),
+            };
+            if let Err(failure) = marks.record_erasure(&id, erased_at_ms).await {
+                return Err(failure.to_string());
+            }
+            let txn = match lock.account().await {
+                Ok(Some(txn)) => txn,
+                Ok(None) => return Ok(false),
+                Err(failure) => return Err(failure.to_string()),
             };
             if txn.head().created_at_ms > erased_at_ms {
                 return Ok(false);
             }
-            txn.erase(erased_at_ms).await?;
+            txn.erase(erased_at_ms)
+                .await
+                .map_err(|failure| failure.to_string())?;
             let _ = sweep_owed(store, keys).await;
-            Ok::<_, crate::store::StoreError>(true)
+            Ok(true)
         })
         .await;
         match erased {
@@ -263,15 +306,15 @@ impl Service {
     }
 
     /// Erase again every account a restored database brought back after its erasure, for
-    /// every identity the key store's ledger holds (Switch wire 7.3, Table 1), deleting the
+    /// every identity an erasure's record names (Switch wire 7.3, Table 1), deleting the
     /// marks the records cover with them. Run at start, before the service takes requests;
     /// the judgement at each request covers what this misses. The number erased, or `None`
-    /// when the ledger or the accounts can't be read.
+    /// when the records or the accounts can't be read.
     pub async fn erase_restored_accounts(&self) -> Option<usize> {
-        let ledger = match self.keys.erasures().await {
+        let ledger = match self.marks.erasures().await {
             Ok(ledger) => ledger,
             Err(failure) => {
-                tracing::error!(%failure, "reading the erasure ledger");
+                tracing::error!(%failure, "reading the erasures' records");
                 return None;
             }
         };
@@ -294,21 +337,19 @@ impl Service {
         Some(erased)
     }
 
-    /// Delete the erasures' leftover marks: for each identity the ledger holds without an
+    /// Delete the erasures' leftover marks: for each identity an erasure's record names without an
     /// account, a mark created at or before its record (Switch wire 7.3, Table 1). Run at
     /// start; a later request for the identity deletes one this misses.
     pub(super) async fn delete_leftover_marks(&self) {
-        let Ok(ledger) = self.keys.erasures().await else {
+        let Ok(ledger) = self.marks.erasures().await else {
             return;
         };
         for (identity, erased_at_ms) in ledger {
-            if matches!(self.store.lookup(&identity).await, Ok(None)) {
-                self.delete_leftover(&identity, erased_at_ms).await;
-            }
+            let _ = self.delete_leftover(&identity, erased_at_ms).await;
         }
     }
 
-    /// Forget the ledger's erasures older than `keys.backup_retention_days`, and at least a
+    /// Forget the erasures' records older than `keys.backup_retention_days`, and at least a
     /// day old, whose accounts no kept database backup can hold any more (Switch spec 6.5,
     /// wire 7.3 Table 3), by trusted time only: a
     /// clock ahead would forget an erasure too early. The leftover marks a record covers go
@@ -327,27 +368,19 @@ impl Service {
         let before_ms = reading
             .base_ms
             .saturating_sub(retention_ms.max(RECORD_KEPT_AT_LEAST_MS));
-        let Ok(ledger) = self.keys.erasures().await else {
+        // It deletes marks and records: not while another process may hold the database.
+        if !self.lock_is_fresh() {
+            return;
+        }
+        let Ok(ledger) = self.marks.erasures().await else {
             return;
         };
         for (identity, erased_at_ms) in ledger.iter().filter(|(_, at)| *at < before_ms) {
-            match self.store.lookup(identity).await {
-                Ok(None) => {
-                    if let Err(failure) =
-                        self.marks.delete_created_by(identity, *erased_at_ms).await
-                    {
-                        tracing::warn!(%failure, "deleting an erasure's leftover mark");
-                        return;
-                    }
-                }
-                Ok(Some(_)) => {}
-                Err(failure) => {
-                    let _ = store_error(&failure);
-                    return;
-                }
+            if !self.delete_leftover(identity, *erased_at_ms).await {
+                return;
             }
         }
-        if let Err(failure) = self.keys.forget_erasures_before(before_ms).await {
+        if let Err(failure) = self.marks.forget_erasures_before(before_ms).await {
             tracing::error!(%failure, "forgetting aged erasures");
         }
     }

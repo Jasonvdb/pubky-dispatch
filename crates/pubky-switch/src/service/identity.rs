@@ -221,8 +221,9 @@ impl Service {
     /// The start a failing or bounded account takes (Switch wire 3.3, 7.3 Table 2): `doc`,
     /// at a generation above both the held document's and the mark's with `recovery_from`
     /// its generation less one, which the verdict checked, naming this origin and a key the
-    /// service holds. The account starts afresh, without the compare-and-swap of `prev`: its
-    /// chain begins with the `recovery` transition, and `doc` is taken as its first document.
+    /// service holds, at a higher version than the one held. The account starts afresh,
+    /// without the compare-and-swap of `prev`: its chain begins with the `recovery`
+    /// transition, and `doc` is taken as its first document.
     /// Answered as the account stands after the commit, with the key `doc` names.
     async fn start_afresh(
         &self,
@@ -241,6 +242,17 @@ impl Service {
             .max(judged.mark().map_or(0, |mark| mark.generation));
         if doc.generation() <= floor || recovery_from.checked_add(1) != Some(doc.generation()) {
             return Err(temporary());
+        }
+        // Exempt from the compare-and-swap of `prev` only: it still needs a higher version
+        // than the one held, else `409 stale_identity` with that copy (Switch wire 3.3).
+        if let Some(held) = held
+            && doc.version() <= held.version()
+        {
+            return Err(ApiError::new(
+                ErrorCode::StaleIdentity,
+                "3.3: not a higher version than the one held",
+            )
+            .with_current(stale_identity_current(Some(held))));
         }
         if doc.inbox().url != self.origin {
             return Err(ApiError::bad_request(

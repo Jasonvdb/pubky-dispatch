@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use pubky_switch::{
-    keys::{FileKeyStore, KeyId, KeyStore},
+    keys::KeyId,
     store::{
         DatabaseConfig, ErasedKey, HeldIdentity, NewAccount, RECOVERY_KEEPS, Recovery, Store,
         StoreError, recovery_clears,
@@ -27,8 +27,6 @@ const T0: u64 = 1_767_225_600_000;
 
 struct Fixture {
     db: TestDatabase,
-    keys: FileKeyStore,
-    _key_dir: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -66,13 +64,7 @@ fn new_account(id: &str) -> NewAccount {
 
 async fn fixture() -> Option<Fixture> {
     let db = test_database().await?;
-    let key_dir = tempfile::tempdir().expect("key dir");
-    let keys = FileKeyStore::open(key_dir.path()).expect("key store");
-    Some(Fixture {
-        db,
-        keys,
-        _key_dir: key_dir,
-    })
+    Some(Fixture { db })
 }
 
 /// Append one chain item: a new seq, and the chain head moved to it.
@@ -429,12 +421,7 @@ async fn test_store_lock_timeout_is_reported() {
         eprintln!("skipped: no test database");
         return;
     };
-    let key_dir = tempfile::tempdir().expect("key dir");
-    let fx = Fixture {
-        keys: FileKeyStore::open(key_dir.path()).expect("keys"),
-        db,
-        _key_dir: key_dir,
-    };
+    let fx = Fixture { db };
     fx.account(ID_A).await;
     let held = fx
         .store()
@@ -1256,36 +1243,39 @@ async fn test_store_forget_compares_whole_positions() {
     fx.finish().await;
 }
 
-/// Wait until an account's insert waits for a lock another transaction holds.
-async fn insert_waits(db: &TestDatabase, context: &str) {
+/// Wait until one session waits for an advisory lock another transaction holds.
+async fn identity_lock_waits(db: &TestDatabase, context: &str) {
     let mut watcher = PgConnection::connect_with(db.options())
         .await
         .expect("conn");
     let mut waited = 0;
     loop {
-        let inserting: i64 = sqlx::query_scalar(
+        let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
-             AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO accounts%'",
+             AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
         )
         .fetch_one(&mut watcher)
         .await
         .expect("activity");
-        if inserting == 1 {
+        if waiting == 1 {
             break;
         }
         waited += 1;
-        assert!(waited < 500, "{context}: the insert never waited");
+        assert!(
+            waited < 500,
+            "{context}: the identity's lock was never waited for"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     watcher.close().await.expect("close");
 }
 
 #[tokio::test]
-async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
-    // An account inserted while an erasure of the same ID is still committing waits for the
-    // deletion, then is created after that erasure's record in the ledger, which is durable
-    // before the deletion commits, whatever isolation level the database gives new sessions
-    // (Switch spec 6.5; Switch wire 7.3, Table 3).
+async fn test_store_identity_lock_holds_a_creation_until_the_erasure_commits() {
+    // An erasure holds the identity's lock, then the account's, through its deletion's
+    // commit; a creation of the identity takes the identity's lock first, so it waits for the
+    // erasure and then finds the account gone, whatever isolation level the database gives
+    // new sessions (Switch wire 7.3, Table 3).
     for level in ["read committed", "repeatable read", "serializable"] {
         let Some(fx) = fixture().await else { return };
         let old = fx.account(ID_A).await;
@@ -1304,55 +1294,43 @@ async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
         let store = Store::connect_with(fx.db.options().clone(), &DatabaseConfig::default())
             .await
             .expect("store");
-        let erased_at = T0 + 60_000;
-        fx.keys
-            .record_erasure(ID_A, erased_at)
+        let erasing = store
+            .begin(ID_A)
             .await
-            .expect("record");
-        let mut erasing = PgConnection::connect_with(fx.db.options())
-            .await
-            .expect("conn");
-        erasing.execute("BEGIN").await.expect("begin");
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(ID_A)
-            .execute(&mut erasing)
-            .await
-            .expect("delete");
+            .expect("begin")
+            .expect("the account");
         let account = NewAccount {
             created_at_ms: T0 + 1_000,
             ..old.clone()
         };
         let (created, ()) = tokio::join!(
             async {
-                match store.begin_create(&account).await {
-                    Ok(Some(creation)) => {
-                        let ledger = fx.keys.erasure(ID_A).await.expect("ledger");
-                        creation.commit(ledger).await.ok()
-                    }
-                    _ => None,
+                let mut lock = store.lock_identity(ID_A).await.ok()?;
+                if lock.has_account().await.ok()? {
+                    return None;
                 }
+                lock.create(&account).await.ok()??.commit().await.ok()
             },
             async {
-                insert_waits(&fx.db, level).await;
-                erasing.execute("COMMIT").await.expect("commit");
+                identity_lock_waits(&fx.db, level).await;
+                erasing.erase(T0 + 500).await.expect("erase");
             }
         );
-        let created = created.unwrap_or_else(|| panic!("{level}: not created"));
-        assert!(created > erased_at, "{level}: created at {created}");
-        erasing.close().await.expect("close");
+        assert!(created.is_some(), "{level}: not created");
+        let found = store.lookup(ID_A).await.expect("lookup").expect("account");
+        assert_eq!(found.created_at_ms, T0 + 1_000, "{level}");
         store.close().await;
         fx.finish().await;
     }
 }
 
 #[tokio::test]
-async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout() {
-    // An account inserted while an erasure of the same ID holds its row waits at most the
-    // configured lock timeout, then is refused, writing nothing, so the enrollment answers
-    // `503`; a retry once the erasure committed creates the account after it (Switch spec
-    // 6.5).
+async fn test_store_identity_lock_gives_up_at_the_lock_timeout() {
+    // A request, an enrollment or an erasure waits for an identity's lock at most the
+    // configured lock timeout, then is refused having written nothing; another identity's
+    // lock is free meanwhile (Switch spec 6.5).
     let Some(fx) = fixture().await else { return };
-    let old = fx.account(ID_A).await;
+    fx.account(ID_A).await;
     let config = DatabaseConfig {
         lock_timeout_ms: 200,
         ..DatabaseConfig::default()
@@ -1360,70 +1338,49 @@ async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout(
     let store = Store::connect_with(fx.db.options().clone(), &config)
         .await
         .expect("store");
-    let erased_at = T0 + 60_000;
-    fx.keys
-        .record_erasure(ID_A, erased_at)
+    let held = store.lock_identity(ID_A).await.expect("lock");
+    let refused = tokio::time::timeout(Duration::from_secs(5), store.lock_identity(ID_A))
         .await
-        .expect("record");
-    let mut erasing = PgConnection::connect_with(fx.db.options())
-        .await
-        .expect("conn");
-    erasing.execute("BEGIN").await.expect("begin");
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(ID_A)
-        .execute(&mut erasing)
-        .await
-        .expect("delete");
-    let account = NewAccount {
-        created_at_ms: T0 + 1_000,
-        ..old.clone()
-    };
-    let refused = tokio::time::timeout(Duration::from_secs(5), store.begin_create(&account))
-        .await
-        .expect("the creation waited past the lock timeout");
-    let error = refused.expect_err("created while the erasure held the row");
+        .expect("waited past the lock timeout");
+    let error = refused.expect_err("taken twice");
     assert!(matches!(error, StoreError::LockTimeout), "{error:?}");
     assert!(error.is_refused(), "nothing written");
-    erasing.execute("COMMIT").await.expect("commit");
-    erasing.close().await.expect("close");
-    assert!(store.lookup(ID_A).await.expect("lookup").is_none());
-
-    let creation = store
-        .begin_create(&account)
+    let refused = tokio::time::timeout(Duration::from_secs(5), store.begin(ID_A))
         .await
-        .expect("retry")
-        .expect("no account");
-    let ledger = fx.keys.erasure(ID_A).await.expect("ledger");
-    let created = creation.commit(ledger).await.expect("commit");
-    assert!(created > erased_at, "created at {created}");
-    assert!(store.lookup(ID_A).await.expect("lookup").is_some());
+        .expect("waited past the lock timeout");
+    assert!(
+        matches!(refused, Err(StoreError::LockTimeout)),
+        "{refused:?}"
+    );
+    store.lock_identity(ID_B).await.expect("another identity's");
+    drop(held);
+    assert!(store.begin(ID_A).await.expect("free again").is_some());
     store.close().await;
     fx.finish().await;
 }
 
 #[tokio::test]
-async fn test_store_creation_is_raised_past_the_ledger_record() {
-    // An account whose identity's latest erasure is recorded at or after the time asked for
-    // is created 1 ms after the record, its stamped time with it; a record before that time,
-    // or none, leaves the time asked for (Switch spec 6.5; Switch wire 7.3, Table 1).
+async fn test_store_creation_commits_at_the_time_asked_for() {
+    // An account created under its identity's lock commits at the creation time the caller
+    // read under that lock, its stamped time with it; one that exists already is no
+    // creation, and keeps its time (Switch wire 7.3, "The mark").
     let Some(fx) = fixture().await else { return };
-    for (id, ledger, expected) in [
-        (ID_A, Some(T0 + 5_000), T0 + 5_001),
-        (ID_B, Some(T0), T0 + 1),
-        (ID_C, Some(T0 - 1), T0),
-        (ID_D, None, T0),
-    ] {
-        let creation = fx
-            .store()
-            .begin_create(&new_account(id))
+    for (id, at) in [(ID_A, T0), (ID_B, T0 + 5_001)] {
+        let account = NewAccount {
+            created_at_ms: at,
+            ..new_account(id)
+        };
+        fx.store()
+            .lock_identity(id)
             .await
-            .expect("begin")
-            .expect("no account");
-        assert_eq!(
-            creation.commit(ledger).await.expect("commit"),
-            expected,
-            "{id}"
-        );
+            .expect("lock")
+            .create(&account)
+            .await
+            .expect("insert")
+            .expect("no account")
+            .commit()
+            .await
+            .expect("commit");
         let found = fx
             .store()
             .lookup(id)
@@ -1432,17 +1389,29 @@ async fn test_store_creation_is_raised_past_the_ledger_record() {
             .expect("account");
         assert_eq!(
             (found.created_at_ms, found.stamped_time_ms),
-            (expected, expected),
+            (at, at),
             "{id}"
         );
     }
-    // An account that exists already is no creation, and keeps its time.
     assert!(
         fx.store()
-            .begin_create(&new_account(ID_A))
+            .lock_identity(ID_A)
             .await
-            .expect("begin")
+            .expect("lock")
+            .create(&new_account(ID_A))
+            .await
+            .expect("insert")
             .is_none()
+    );
+    // An account is created only under its own identity's lock.
+    assert!(
+        fx.store()
+            .lock_identity(ID_C)
+            .await
+            .expect("lock")
+            .create(&new_account(ID_D))
+            .await
+            .is_err()
     );
     fx.finish().await;
 }

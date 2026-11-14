@@ -329,7 +329,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   generation naming this switch's key with `recovery_from` is a provider loss in place,
   refused with `400` when it lists an App ID held for that generation, and so is the start
   above both the held document's and the mark's generation that a failing or bounded
-  account takes, exempt from the compare-and-swap: the account starts afresh, keeping its
+  account takes, exempt from the compare-and-swap but at a higher version than the one held
+  (`409 stale_identity` with that copy otherwise): the account starts afresh, keeping its
   creation time, its mark store, its service time, its enrollments and the App IDs
   to refuse, those held for the generation among them, and, as the service does, its upload
   limits, its hourly upload counts, the directory's `apps_version` and

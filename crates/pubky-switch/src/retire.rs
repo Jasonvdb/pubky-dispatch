@@ -258,7 +258,7 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
             read.head.as_ref(),
             &read.mark,
             read.stub_at_mark,
-            &keys,
+            &view,
             retired,
             &options.origin,
             &service_key,

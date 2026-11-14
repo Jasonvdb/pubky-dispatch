@@ -164,13 +164,71 @@ impl Service {
     /// Sign the head of the account's chain as it will be committed, for an answer to the
     /// signer or an own app, with `signer`, the key the verdict gives. Under the account's
     /// lock, before the commit, once the request has been judged there (Switch wire 7.3 step
-    /// 10); the mark moves to it once the commit is durable.
+    /// 10); the mark moves to it once the commit is durable. `None`, signing nothing, while
+    /// the instance lock isn't confirmed: another process may hold the database (Switch spec
+    /// 6.5). Every head signed under the lock is signed here.
     pub(super) async fn head(
         &self,
         txn: &AccountTxn,
         signer: &ServiceSigner,
     ) -> Option<SignedHead> {
+        if !self.lock_is_fresh() {
+            tracing::error!("the instance lock isn't confirmed: no head signed");
+            return None;
+        }
         let head = txn.head();
         Some(sign_head(signer, &head.identity_key, &head.chain_tip()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every place the service signs a head or a checkpoint, by file, with how many calls:
+    /// each checks the instance lock right before it signs (Switch spec 6.5). A new place is
+    /// added here only with that check.
+    const SIGNING: [(&str, &str, usize); 3] = [
+        ("signed.rs", "sign_head(", 1),
+        ("feed.rs", "sign_head(", 2),
+        ("retention.rs", "sign_checkpoint(", 1),
+    ];
+
+    #[test]
+    fn test_signed_every_head_is_signed_where_the_lock_is_checked() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service");
+        let mut files = vec![];
+        let mut stack = vec![dir];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).expect("service sources") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        for path in files {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let text = std::fs::read_to_string(&path).expect("source");
+            // The source before its tests, which sign nothing the service sends.
+            let code = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or_default();
+            for call in ["sign_head(", "sign_checkpoint("] {
+                let found = code.matches(call).count();
+                let expected = SIGNING
+                    .iter()
+                    .find(|(file, signing, _)| *file == name && *signing == call)
+                    .map_or(0, |(_, _, count)| *count);
+                assert_eq!(found, expected, "{name}: {call}");
+                if found > 0 {
+                    assert!(code.contains("lock_is_fresh()"), "{name}: no lock check");
+                }
+            }
+        }
     }
 }

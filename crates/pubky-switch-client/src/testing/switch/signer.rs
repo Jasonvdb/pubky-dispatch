@@ -428,6 +428,17 @@ impl Inner {
         // of the account it starts.
         let mut started_afresh = false;
         if self.notice().is_some() {
+            // Exempt from the compare-and-swap of `prev` only: it still needs a higher version
+            // than the one held (Switch wire 3.3).
+            if self
+                .doc
+                .as_ref()
+                .is_some_and(|held| doc.version() <= held.version())
+            {
+                return Ok(self.refusal(DeliveryRefusal::StaleIdentity(
+                    "Switch wire 3.3: not a higher version than the one held",
+                )));
+            }
             let mut refused = kept.clone();
             refused.extend(self.held_app_ids.iter().copied());
             let fresh = AccountView {

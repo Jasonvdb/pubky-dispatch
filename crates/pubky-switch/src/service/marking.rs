@@ -173,10 +173,10 @@ impl Service {
                 Vec::new()
             }
         };
-        let erasure_at_ms = match self.keys.erasure(identity).await {
+        let erasure_at_ms = match self.marks.erasure(identity).await {
             Ok(at) => at,
             Err(failure) => {
-                tracing::error!(%failure, "reading the erasure ledger");
+                tracing::error!(%failure, "reading the erasures' records");
                 mark = MarkInput::StoreUnreadable;
                 None
             }
@@ -210,19 +210,16 @@ impl Service {
             retired,
             erasure_at_ms,
         } = inputs;
-        // The stub at the mark's `seq`, where the state is past the mark in its generation.
+        // The stub at the mark's generation and `seq`, where the state is past the mark,
+        // whatever the state's generation (Switch wire 7.3 under Table 1).
         let mut stub_at_mark = None;
-        if let (MarkInput::Mark(held), Some(state)) =
-            (&mark, account.and_then(|account| account.state.state()))
-            && held.records_head()
-            && state.generation == held.generation
-            && state.seq > held.seq
+        let state = account
+            .and_then(|account| account.state.state())
+            .map(|state| (state.generation, state.seq));
+        if let MarkInput::Mark(held) = &mark
+            && let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held)
         {
-            match self
-                .store
-                .stub_hash_at(identity, held.generation, held.seq)
-                .await
-            {
+            match self.store.stub_hash_at(identity, generation, seq).await {
                 Ok(hash) => stub_at_mark = hash,
                 Err(failure) => {
                     tracing::error!(%failure, "reading the stub at the mark");
@@ -247,7 +244,8 @@ impl Service {
     }
 
     /// Erase again `identity`'s account, created at or before the erasure's record at
-    /// `erased_at_ms` (Switch wire 7.3, Table 1 first row): then only a mark created at or
+    /// `erased_at_ms` (Switch wire 7.3, Table 1 first row), under the identity's lock: the
+    /// record again, durably, then the account's deletion; then only a mark created at or
     /// before the record goes, and a later account's mark stays (Table 3).
     ///
     /// # Errors
@@ -259,12 +257,6 @@ impl Service {
         identity: &str,
         erased_at_ms: u64,
     ) -> Result<(), ApiError> {
-        // The record is durable before the account goes again: a record held only in memory,
-        // as a write that failed leaves it, would not survive a restart (Table 3).
-        if let Err(failure) = self.keys.record_erasure(identity, erased_at_ms).await {
-            tracing::error!(%failure, "recording an erasure again");
-            return Err(ApiError::unavailable("7.6: a temporary failure"));
-        }
         if !self.erase_restored(identity, erased_at_ms).await {
             return Err(ApiError::unavailable("7.6: a temporary failure"));
         }
@@ -276,10 +268,33 @@ impl Service {
     }
 
     /// Delete `identity`'s mark where it is an erasure's leftover: one created at or before
-    /// the erasure's record at `erased_at_ms`, with no account (Switch wire 7.3, Table 1).
-    pub(super) async fn delete_leftover(&self, identity: &str, erased_at_ms: u64) {
-        if let Err(failure) = self.marks.delete_created_by(identity, erased_at_ms).await {
-            tracing::warn!(%failure, "deleting an erasure's leftover mark");
+    /// the erasure's record at `erased_at_ms`, with no account (Switch wire 7.3, Table 1),
+    /// under the identity's lock, so no enrollment creates the account meanwhile. Whether no
+    /// leftover is left: `false` when the lock, the account or the mark store can't be read,
+    /// or the deletion failed.
+    pub(super) async fn delete_leftover(&self, identity: &str, erased_at_ms: u64) -> bool {
+        let mut lock = match self.store.lock_identity(identity).await {
+            Ok(lock) => lock,
+            Err(failure) => {
+                let _ = super::store_error(&failure);
+                return false;
+            }
+        };
+        match lock.has_account().await {
+            // A later account's: its mark stays.
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(failure) => {
+                let _ = super::store_error(&failure);
+                return false;
+            }
+        }
+        match self.marks.delete_created_by(identity, erased_at_ms).await {
+            Ok(_) => true,
+            Err(failure) => {
+                tracing::warn!(%failure, "deleting an erasure's leftover mark");
+                false
+            }
         }
     }
 
@@ -320,26 +335,31 @@ impl Service {
         if let (verdict::Verdict::NotHosted { delete_mark: true }, Some(erased_at_ms)) =
             (judged.judgement.verdict, judged.erasure_at_ms)
         {
-            self.delete_leftover(identity, erased_at_ms).await;
+            let _ = self.delete_leftover(identity, erased_at_ms).await;
         }
         Ok((found, judged))
     }
 
     /// The answer of step 2 or of the judgement under the lock that replaces every other:
     /// the not-hosted `404`, the `503` of an unknown verdict, or the notice, each signed with
-    /// the verdict's key at the time base, without a head (Switch wire 7.1, 7.3); `None` for
-    /// a request that goes on.
+    /// the verdict's key, without a head (Switch wire 7.1, 7.3); `None` for a request that
+    /// goes on. The notice and the `404` are signed at the time base `base_ms`, the `503` at
+    /// the identity's service time `service_ms` (Switch wire 7.1 Timestamp, 7.3 step 3).
     pub(super) fn verdict_answer(
         &self,
         identity: &str,
         answer: &verdict::Answer,
         asked: Asked<'_>,
         base_ms: u64,
+        service_ms: u64,
     ) -> Option<SwitchResponse> {
-        let error = match answer.route {
-            Route::NotHosted => not_hosted(),
-            Route::Unavailable => ApiError::unavailable("7.3: the mark store can't be read"),
-            Route::Notice(notice) => self.notice(identity, notice),
+        let (error, at_ms) = match answer.route {
+            Route::NotHosted => (not_hosted(), base_ms),
+            Route::Unavailable => (
+                ApiError::unavailable("7.3: the mark store can't be read"),
+                service_ms,
+            ),
+            Route::Notice(notice) => (self.notice(identity, notice), base_ms),
             Route::CreateAccount
             | Route::TakeOverMark
             | Route::Proceed { .. }
@@ -349,7 +369,7 @@ impl Service {
             | Route::Erase { .. }
             | Route::EraseLost => return None,
         };
-        Some(self.keyed_error(&answer.key, asked, base_ms, base_ms, &error))
+        Some(self.keyed_error(&answer.key, asked, at_ms, base_ms, &error))
     }
 
     /// The notice `503 recovery_required` (Switch wire 7.6), counted and logged at its one

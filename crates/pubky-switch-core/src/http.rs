@@ -418,7 +418,9 @@ pub struct EraseBody {
 }
 
 /// Read the body of `POST /v1/{id}/erase`: `{ "created": time, "identity_hash": b64(32) }`,
-/// both optional in shape (Switch wire 7.4.16).
+/// both optional in shape (Switch wire 7.4.16). A member that is `null` reads as missing
+/// (Switch wire 1.1 "Absent and null"), so the erasure's binding refuses it as it refuses a
+/// missing one.
 ///
 /// # Errors
 ///
@@ -428,12 +430,12 @@ pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
     let value: serde_json::Value = crate::json::parse_json(body)?;
     crate::json::reject_unknown_members(&value, &["created", "identity_hash"], "the erasure body")?;
     let created = match value.get("created") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(crate::time::parse_rfc3339(text)?),
         Some(_) => return invalid("Switch wire 7.4.16: `created` is a time"),
     };
     let identity_hash = match value.get("identity_hash") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
         Some(_) => return invalid("Switch wire 7.4.16: `identity_hash` is b64(32)"),
     };
@@ -1161,6 +1163,28 @@ mod tests {
         assert!(parse_erase_body(body.as_bytes()).is_err());
         assert!(parse_erase_body(br#"{"x":1}"#).is_err());
         assert!(parse_erase_body(b"[]").is_err());
+    }
+
+    #[test]
+    fn test_erase_body_null_member_reads_as_missing() {
+        // `null` is a missing member (Switch wire 1.1 "Absent and null"): the binding then
+        // answers the `409` a missing member gets, never a `400`.
+        assert_eq!(
+            parse_erase_body(br#"{"created":null,"identity_hash":null}"#).unwrap(),
+            EraseBody {
+                created: None,
+                identity_hash: None
+            }
+        );
+        let hash = crate::enc::b64(&[4; 32]);
+        let body = format!(r#"{{"created":null,"identity_hash":"{hash}"}}"#);
+        assert_eq!(
+            parse_erase_body(body.as_bytes()).unwrap(),
+            EraseBody {
+                created: None,
+                identity_hash: Some([4; 32])
+            }
+        );
     }
 
     #[test]

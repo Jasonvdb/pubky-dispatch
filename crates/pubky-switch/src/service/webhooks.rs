@@ -375,9 +375,9 @@ impl Service {
             .map_err(|_| Failure::Internal)?;
         // A webhook of an account a restored database brought back after its erasure is
         // never sent: the account is erased again first (Switch spec 6.5). Only an identity
-        // the ledger holds is looked up.
+        // an erasure's record names is looked up.
         if self
-            .keys
+            .marks
             .erasure(&push.account)
             .await
             .map_err(|_| Failure::Internal)?

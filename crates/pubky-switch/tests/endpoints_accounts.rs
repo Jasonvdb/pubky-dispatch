@@ -1431,3 +1431,338 @@ async fn test_enroll_while_the_mark_store_cant_be_read_is_503() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// alice served, then her mark deleted through the store: her account fails stop,
+/// `mark_lost` (Switch wire 7.3, Table 1).
+async fn serving_without_a_mark(replay: &Replay) {
+    serving(replay).await;
+    replay
+        .marks
+        .delete(&alice_keys().id)
+        .await
+        .expect("lose the mark");
+}
+
+/// The start of `generation` with `recovery_from` its generation less one, at `version`.
+fn start_at(version: u64, generation: u64) -> SignedDoc {
+    alice_version(|body| {
+        body.version = version;
+        body.generation = generation;
+        body.recovery_from = Some(generation - 1);
+    })
+}
+
+#[tokio::test]
+async fn test_identity_start_afresh_needs_a_higher_version_than_the_one_held() {
+    // The start a failing account takes is exempt from the compare-and-swap of `prev` only:
+    // it still needs a higher version than the one held, else `409 stale_identity` with
+    // that copy, and nothing changes (Switch wire 3.3).
+    let Some(replay) = replay().await else { return };
+    serving_without_a_mark(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    let held = version("alice identity.json, first delivery (version 1)");
+    // Another body at the version held: generation 2, `recovery_from` 1.
+    let again = start_at(1, 2);
+    let put = signer_request("PUT", &path, delivery(again, None), ms(T));
+    let refused = replay.service.handle(put).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (409, "stale_identity"),
+        "{}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(json(&refused)["current"]["version"], 1);
+    assert_eq!(
+        json(&refused)["current"]["identity"],
+        serde_json::to_value(&held).expect("held")
+    );
+    assert!(header_of(&refused, header::HEAD).is_none(), "no head");
+    assert!(
+        matches!(
+            replay.marks.read(&alice.id).await.expect("read"),
+            MarkRead::Missing
+        ),
+        "nothing started"
+    );
+    // A higher version starts the account afresh.
+    let put = signer_request("PUT", &path, delivery(start_at(2, 2), None), ms(T));
+    let started = replay.service.handle(put).await;
+    assert_eq!(
+        started.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&started.body)
+    );
+    assert_eq!(mark_of(&replay, &alice.id).await.generation, 2);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_identity_start_at_a_mark_lost_account_whose_mark_write_fails_is_not_rearmed() {
+    // A generation start where the mark is lost commits, then writes the mark anew; where
+    // that write fails the answer is `503 unavailable`. Its retry meets the account as it
+    // now stands, at the started generation with its mark still lost: the notice
+    // `mark_lost`, never the restored state armed again by a retry. The signer then signs
+    // above it (Switch wire 7.3, Table 3 and below it; 7.4.2).
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    serving_without_a_mark(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    let marks_dir = replay.key_dir().join("accounts").join("marks");
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only");
+    let start = delivery(start_at(2, 2), None);
+    let put = signer_request("PUT", &path, start.clone(), ms(T));
+    let failed = replay.service.handle(put).await;
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(
+        (failed.status, code(&failed).as_str()),
+        (503, "unavailable"),
+        "{}",
+        String::from_utf8_lossy(&failed.body)
+    );
+    assert!(header_of(&failed, header::HEAD).is_none(), "no head");
+    assert!(matches!(
+        replay.marks.read(&alice.id).await.expect("read"),
+        MarkRead::Missing
+    ));
+    let retry = signer_request("PUT", &path, start, ms(T));
+    assert_notice(&replay.service.handle(retry).await, 2, "mark_lost");
+    let above = signer_request("PUT", &path, delivery(start_at(3, 3), None), ms(T));
+    let started = replay.service.handle(above).await;
+    assert_eq!(
+        started.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&started.body)
+    );
+    let mark = mark_of(&replay, &alice.id).await;
+    assert_eq!(
+        mark.generation, 3,
+        "written anew at the generation signed above"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Wait until an account's insert is in progress, slowed by the `slow_insert` trigger.
+async fn insert_in_progress(replay: &Replay) {
+    let mut watcher = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for _ in 0..500 {
+        let inserting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND state = 'active' AND query LIKE 'INSERT INTO accounts%'",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("activity");
+        if inserting == 1 {
+            watcher.close().await.expect("close");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the insert never ran");
+}
+
+#[tokio::test]
+async fn test_enroll_concurrent_creations_answer_one_creation_time() {
+    // Two enrollments of one identity, the second while the first's account insert is not
+    // committed yet: the identity's lock holds the second until the first commits, so it
+    // never takes the first's fresh (0, 0) mark for a crash's leftover. Both answer the
+    // creation time the account and the mark hold, and an erasure naming it goes through
+    // (Switch wire 3.7, 7.3 Table 3, 7.4.16).
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    set_time(&replay.clock, T);
+    run_sql(
+        &replay,
+        "CREATE FUNCTION slow_insert() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END $$; \
+         CREATE TRIGGER slow_insert BEFORE INSERT ON accounts \
+         FOR EACH ROW EXECUTE FUNCTION slow_insert()",
+    )
+    .await;
+    let (first, second) = tokio::join!(enroll(&replay, 1), async {
+        insert_in_progress(&replay).await;
+        // Later by the clock too, so a take of the first's mark would move its time.
+        set_time(&replay.clock, "2026-01-01T00:00:00.007Z");
+        enroll(&replay, 2).await
+    });
+    run_sql(&replay, "DROP TRIGGER slow_insert ON accounts").await;
+    for answer in [&first, &second] {
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+    let created = created_at_of(&replay, &alice.id).await;
+    let created_text = json!(pubky_switch_core::time::rfc3339(created));
+    assert_eq!(json(&first)["created"], created_text);
+    assert_eq!(json(&second)["created"], created_text);
+    assert_eq!(mark_of(&replay, &alice.id).await.created_at_ms, created);
+    assert_eq!(accounts_of(&replay, &alice.id).await, 1);
+    let erase = signer_request(
+        "POST",
+        &format!("/v1/{}/erase", alice.id),
+        pubky_switch_core::http::erase_body(Some(created), None),
+        ms(T) + 10,
+    );
+    let erased = replay.service.handle(erase).await;
+    assert_eq!(
+        erased.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&erased.body)
+    );
+    assert_eq!(accounts_of(&replay, &alice.id).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A service on `replay` whose instance lock was last confirmed three checks ago.
+fn with_stale_lock(replay: &Replay) -> pubky_switch::service::Service {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let timing = LockTiming::checking_every(std::time::Duration::from_secs(5));
+    replay
+        .restarted_with(Limits::default())
+        .with_lock_freshness(LockFreshness::confirmed_ago(
+            std::time::Duration::from_secs(15),
+            timing,
+        ))
+}
+
+#[tokio::test]
+async fn test_enroll_under_a_stale_instance_lock_writes_nothing() {
+    // An enrollment creates or re-keys a mark: a service whose instance lock is stale
+    // answers `503 unavailable` and writes no mark and no account, at a new identity and at
+    // a staged account alike (Switch spec 6.5, wire 7.3 Table 3).
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    set_time(&replay.clock, T);
+    let stale = with_stale_lock(&replay);
+    let request = signer_request("POST", "/v1/enroll", enrollment_body(1, ORIGIN), ms(T));
+    let refused = stale.handle(request).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable")
+    );
+    assert_eq!(accounts_of(&replay, &alice.id).await, 0, "no account");
+    assert_eq!(
+        replay.marks.read(&alice.id).await.expect("read"),
+        MarkRead::Missing,
+        "no mark"
+    );
+    assert_eq!(enroll(&replay, 1).await.status, 200);
+    let mark = mark_of(&replay, &alice.id).await;
+    let request = signer_request("POST", "/v1/enroll", enrollment_body(2, ORIGIN), ms(T));
+    let refused = stale.handle(request).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable")
+    );
+    assert_eq!(
+        mark_of(&replay, &alice.id).await,
+        mark,
+        "the mark unchanged"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_lost_identity_under_a_stale_instance_lock_writes_nothing() {
+    // The erasure at a lost identity writes a record and deletes the mark: under a stale
+    // instance lock it is `503 unavailable` and does neither; under a fresh one it erases
+    // (Switch spec 6.5, wire 7.3 Table 3, 7.4.16).
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    let key = service_public(&replay);
+    let lost_at = ms(T) - 86_400_000;
+    replay
+        .marks
+        .create_zero(&alice.id, key, lost_at)
+        .await
+        .expect("a mark");
+    let head = ChainTip {
+        generation: 1,
+        seq: 5,
+        chain_hash: [9; 32],
+    };
+    replay
+        .marks
+        .advance(&alice.id, head, key)
+        .await
+        .expect("a head");
+    let mark = mark_of(&replay, &alice.id).await;
+    set_time(&replay.clock, T);
+    let erase = || {
+        signer_request(
+            "POST",
+            &format!("/v1/{}/erase", alice.id),
+            pubky_switch_core::http::erase_body(Some(lost_at), None),
+            ms(T),
+        )
+    };
+    let refused = with_stale_lock(&replay).handle(erase()).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable"),
+        "{}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(mark_of(&replay, &alice.id).await, mark, "the mark stays");
+    assert_eq!(
+        replay.marks.erasure(&alice.id).await.expect("records"),
+        None
+    );
+    let erased = replay.service.handle(erase()).await;
+    assert_eq!(
+        erased.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&erased.body)
+    );
+    assert_eq!(
+        replay.marks.read(&alice.id).await.expect("read"),
+        MarkRead::Missing
+    );
+    assert_eq!(
+        replay.marks.erasure(&alice.id).await.expect("records"),
+        Some(ms(T))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_null_members_read_as_missing() {
+    // `null` is a missing member (Switch wire 1.1 "Absent and null"): an erasure whose
+    // `created` is `null` gets the `409 conflict` a missing one gets, carrying the creation
+    // time, never a `400` (Switch wire 7.4.16).
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let erase = signer_request(
+        "POST",
+        &format!("/v1/{}/erase", alice.id),
+        br#"{"created":null,"identity_hash":null}"#.to_vec(),
+        ms(T),
+    );
+    let refused = replay.service.handle(erase).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (409, "conflict"),
+        "{}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    let created = mark_of(&replay, &alice.id).await.created_at_ms;
+    assert_eq!(
+        json(&refused)["current"]["created"],
+        json!(pubky_switch_core::time::rfc3339(created))
+    );
+    assert_eq!(accounts_of(&replay, &alice.id).await, 1, "nothing erased");
+    replay.db.drop_database().await.expect("drop");
+}

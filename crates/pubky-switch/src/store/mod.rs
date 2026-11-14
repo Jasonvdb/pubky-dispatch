@@ -1,10 +1,18 @@
 //! Durable storage in PostgreSQL.
 //!
 //! **One account at a time.** Every request to an account runs in one database transaction
-//! that first locks the account's row ([`Store::begin`]), so one account's operations are
-//! serialized while other accounts proceed in parallel (Switch spec 6.5). What a request
-//! changes commits all at once or not at all: a batch that fails, or a process that dies
-//! before the commit, leaves no trace.
+//! that first takes its identity's lock, then locks the account's row ([`Store::begin`]), so
+//! one account's operations are serialized while other accounts proceed in parallel (Switch
+//! spec 6.5). What a request changes commits all at once or not at all: a batch that fails,
+//! or a process that dies before the commit, leaves no trace.
+//!
+//! **One identity at a time.** Everything that creates, takes over, deletes or re-keys an
+//! identity's mark or account runs under the identity's lock ([`Store::lock_identity`]), a
+//! transaction-level advisory lock on the identity, held until its transaction ends: an
+//! enrollment from the mark's write through the account's insert, an erasure from its
+//! record through the deletion's commit, and the deletion of a leftover mark. The order is
+//! always the same: the identity's lock first, then the account's row, so two of them never
+//! wait for each other (Switch wire 7.3, Table 3).
 //!
 //! **Durable, then answered** (Switch wire 7.3 step 10). A request's answer carries a `seq`,
 //! a transition proof or a signed head only once [`AccountTxn::commit`] has returned, which
@@ -414,20 +422,44 @@ impl Store {
         Ok(())
     }
 
-    /// Insert an account, to commit with [`Creation::commit`] once its identity's
-    /// ledger entry is read: `None`, changing nothing, when one exists for the identity
-    /// already. Waits at most `lock_timeout_ms` for an erasure of the identity still
-    /// committing ([`StoreError::LockTimeout`], changing nothing).
-    pub async fn begin_create(&self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
-        account::begin_create(&self.pool, account, self.lock_timeout_ms).await
+    /// Take `id`'s identity lock (the module's "One identity at a time"): a transaction
+    /// holding a transaction-level advisory lock on the identity until it ends. Waits at most
+    /// `lock_timeout_ms` for a request, an enrollment or an erasure of the identity that
+    /// holds it ([`StoreError::LockTimeout`]).
+    pub async fn lock_identity(&self, id: &str) -> Result<IdentityLock, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
+        // READ COMMITTED whatever the pool's default, so what is read under the lock includes
+        // everything committed before it was taken. `SET` takes no bind parameters; the
+        // values are numbers we format.
+        tx.execute(
+            format!(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+                 SET LOCAL lock_timeout = {}; \
+                 SELECT pg_advisory_xact_lock({})",
+                self.lock_timeout_ms,
+                identity_lock_key(id)
+            )
+            .as_str(),
+        )
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(IdentityLock {
+            tx,
+            id: id.to_string(),
+        })
     }
 
-    /// For tests: create an account with no erasure ledger to read; `false`, changing
-    /// nothing, when one exists. The service creates through [`Store::begin_create`].
+    /// For tests: create an account; `false`, changing nothing, when one exists. The
+    /// service creates through [`IdentityLock::create`], once the mark is written.
     #[cfg(any(test, feature = "test-util"))]
     pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
-        match self.begin_create(account).await? {
-            Some(creation) => creation.commit(None).await.map(|_| true),
+        match self
+            .lock_identity(&account.id)
+            .await?
+            .create(account)
+            .await?
+        {
+            Some(creation) => creation.commit().await.map(|()| true),
             None => Ok(false),
         }
     }
@@ -517,7 +549,7 @@ impl Store {
         .transpose()
     }
 
-    /// Of `erased`, identities with the time of an erasure the key store's ledger holds,
+    /// Of `erased`, identities with the time of an erasure's record the mark store holds,
     /// those whose account here was created at or before that time: accounts a database
     /// restored from a backup brought back, to erase again before they serve (Switch spec
     /// 6.5). An account created after its identity's erasure is a new one and isn't listed.
@@ -609,16 +641,12 @@ impl Store {
         feed::read_feed(&self.pool, id, reader, after, positions, batch_tail, page).await
     }
 
-    /// Start a request to account `id`: a transaction holding the account's lock until it
-    /// commits or is dropped. `None` when there is no such account. Waits at most
-    /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
+    /// Start a request to account `id`: a transaction holding the identity's lock and the
+    /// account's, in that order, until it commits or is dropped. `None` when there is no
+    /// such account. Waits at most `lock_timeout_ms` for each lock
+    /// ([`StoreError::LockTimeout`]).
     pub async fn begin(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
-        // `SET LOCAL` takes no bind parameters; the value is a number we format.
-        tx.execute(format!("SET LOCAL lock_timeout = {}", self.lock_timeout_ms).as_str())
-            .await
-            .map_err(StoreError::from_db)?;
-        AccountTxn::lock(tx, id).await
+        self.lock_identity(id).await?.account().await
     }
 
     /// [`Store::begin`], with a transaction on the reader pool begun first, before the lock
@@ -730,6 +758,61 @@ pub struct FoundAccount {
 /// The readiness check of the database: a round trip on a pooled connection.
 #[derive(Clone, Debug)]
 pub struct StoreReadiness(pub Store);
+
+/// The advisory lock key of `id`'s identity lock: the hash of a label of its own and the
+/// identity, apart from every other advisory lock of the service.
+fn identity_lock_key(id: &str) -> i64 {
+    let mut input = b"pubky-switch/identity-lock/".to_vec();
+    input.extend_from_slice(id.as_bytes());
+    let digest = pubky_switch_core::enc::hash(&input);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
+}
+
+/// An identity's lock ([`Store::lock_identity`]): held until it is dropped, committed, or
+/// handed to the account's transaction or a creation, which hold it on.
+pub struct IdentityLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    id: String,
+}
+
+impl std::fmt::Debug for IdentityLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityLock")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IdentityLock {
+    /// Lock the identity's account's row too, the lock held on in the account's
+    /// transaction; `None`, letting the identity's lock go, when there is no account.
+    pub async fn account(self) -> Result<Option<AccountTxn>, StoreError> {
+        AccountTxn::lock(self.tx, &self.id).await
+    }
+
+    /// Whether the identity has an account, read under the lock.
+    pub async fn has_account(&mut self) -> Result<bool, StoreError> {
+        let found: Option<i32> = sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = $1")
+            .bind(&self.id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(found.is_some())
+    }
+
+    /// Insert `account`, the identity's, the lock held on until [`Creation::commit`]: `None`,
+    /// changing nothing and letting the lock go, when one exists.
+    pub async fn create(self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
+        if account.id != self.id {
+            return Err(StoreError::Corrupt(
+                "an account created under another identity's lock",
+            ));
+        }
+        account::create(self.tx, account).await
+    }
+}
 
 impl ReadinessCheck for StoreReadiness {
     fn name(&self) -> &str {

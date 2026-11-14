@@ -1,16 +1,21 @@
-//! The per-account mark store (Switch spec 6.5, Switch wire 7.3 "Accounts and marks").
+//! The per-account mark store (Switch spec 6.5, Switch wire 7.3 "Accounts and marks", "The
+//! store").
 //!
 //! For each identity it holds an account for, the service keeps one mark, apart from the
 //! state a backup restores: the newest head it signed for the identity (generation, `seq`,
 //! chain hash), the service key the account is answered with, and the time the account was
-//! created. Beside the marks lie the retirements of generations, one-way. The store lies in
+//! created. Beside the marks lie the retirements of generations, one-way, and the records of
+//! erasures (Switch wire 7.4.16). The three lie in one store, under one identity record, in
 //! `accounts/` under the key store's directory, which no backup of the state restores:
 //!
 //! - `accounts/store-id`: the store's identity, 16 random bytes in hex, written with the
 //!   directory. A directory without a readable one is a store that can't be read; a store
-//!   rebuilt after its loss has a new one, and every mark in it reads as missing.
+//!   rebuilt after its loss has a new one, and every mark, retirement and erasure's record in
+//!   it is gone together (Switch wire 7.3, Table 3).
 //! - `accounts/marks/<identity>`: the identity's mark, in JSON.
 //! - `accounts/retired/<identity>.<generation>`: an empty file per retired generation.
+//! - `accounts/erasures/<identity>`: the time of the identity's latest erasure's record, in
+//!   Unix milliseconds, as decimal text.
 //!
 //! Every write is a temporary file, synced, renamed into place, then its directory synced,
 //! and is durable before its call returns. A write that fails after its rename landed and
@@ -18,7 +23,13 @@
 //! durably, so a retry writes and syncs again before it reports success, and the store
 //! syncs its directories when it opens, before it reads them. Every read-check-write runs
 //! under one lock inside a blocking task, which runs to its end even if its caller stops
-//! waiting.
+//! waiting. A file no writer makes, in name or content, makes the store unreadable, apart
+//! from a mark file that doesn't read as a mark, which Table 1 judges (Switch wire 7.3).
+//!
+//! A store that serves under an instance lock refuses every write once the lock's last
+//! confirmed check is stale ([`MarkStore::gated`]): no mark is created, moved, taken, re-keyed
+//! or deleted, and no erasure's record written, while another process may hold the database
+//! (Switch spec 6.5).
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -38,9 +49,16 @@ use crate::keys::{
     KeyStoreError, create_private_dir, hex_bytes, is_ledger_name, is_temp_file, rename_into_place,
     sync_dir,
 };
+use crate::store::LockFreshness;
 
 /// The largest mark file the store reads, in bytes; a larger one doesn't read as a mark.
 const MAX_MARK_FILE: u64 = 4096;
+
+/// The largest erasure's record the store reads, in bytes: a `u64` in decimal.
+const MAX_ERASURE_FILE: u64 = 20;
+
+/// The store's directories under `accounts/`.
+const STORE_DIRS: [&str; 3] = ["marks", "retired", "erasures"];
 
 /// An identity's mark (Switch wire 7.3, "Accounts and marks").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,12 +168,19 @@ pub enum MarkStoreError {
     /// A head a mark can't move to: generation or `seq` 0.
     #[error("invalid head for a mark")]
     InvalidHead,
+    /// A retirement of generation 0, which no account serves (Switch wire 7.3, Table 3).
+    #[error("a retirement of generation 0")]
+    InvalidGeneration,
     /// The storage failed.
     #[error("mark store storage: {0}")]
     Io(#[from] std::io::Error),
     /// No randomness for the store's identity or a temporary file's name.
     #[error("no randomness")]
     Random,
+    /// A write refused: the instance lock's last confirmed check is stale, and another
+    /// process may hold the database (Switch spec 6.5).
+    #[error("the instance lock isn't confirmed")]
+    LockStale,
 }
 
 impl From<KeyStoreError> for MarkStoreError {
@@ -176,6 +201,9 @@ impl From<KeyStoreError> for MarkStoreError {
 #[derive(Clone)]
 pub struct MarkStore {
     inner: Arc<Inner>,
+    /// The instance lock every write waits for no stale check of, if the store serves under
+    /// one ([`MarkStore::gated`]).
+    gate: Option<LockFreshness>,
 }
 
 impl std::fmt::Debug for MarkStore {
@@ -200,8 +228,12 @@ struct Inner {
     /// Every retirement, read whole when the store is read, so a check needs no file read.
     /// It takes a retirement once its file is durable.
     retired: Mutex<HashMap<String, BTreeSet<u64>>>,
+    /// Every erasure's record, read whole when the store is read, so a request's check needs
+    /// no file read. It holds at least what the files hold: a record goes in before its file
+    /// is written, and leaves only once its file's removal is durable.
+    erasures: Mutex<HashMap<String, u64>>,
     /// Held around every read-check-write, inside the blocking task that does it, and
-    /// before `store_id`, `marks` and `retired`. A caller that stops waiting can't release
+    /// before `store_id`, `marks`, `retired` and `erasures`. A caller that stops waiting can't release
     /// it early: the task runs to its end, so writes land in the order they were checked.
     writes: Mutex<()>,
     /// Fails directory syncs and tracks what a crash would undo, for tests.
@@ -249,7 +281,28 @@ impl MarkStore {
         }
         Ok(Self {
             inner: Arc::new(inner),
+            gate: None,
         })
+    }
+
+    /// The same store, its every write refused with [`MarkStoreError::LockStale`] once
+    /// `freshness`'s last confirmed check is stale: what a service serving under the instance
+    /// lock writes through, so no path that creates, moves, takes, re-keys or deletes a mark,
+    /// or writes an erasure's record, can skip the check (Switch spec 6.5).
+    #[must_use]
+    pub fn gated(&self, freshness: LockFreshness) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            gate: Some(freshness),
+        }
+    }
+
+    /// Refuse a write while the instance lock isn't confirmed.
+    fn check_gate(&self) -> Result<(), MarkStoreError> {
+        match &self.gate {
+            Some(freshness) if !freshness.is_fresh() => Err(MarkStoreError::LockStale),
+            _ => Ok(()),
+        }
     }
 
     /// The identity's mark: [`MarkRead::Missing`], [`MarkRead::NotAMark`] or the mark.
@@ -276,6 +329,7 @@ impl MarkStore {
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
@@ -289,9 +343,10 @@ impl MarkStore {
         .await
     }
 
-    /// A new account takes the identity's mark: its generation, `seq` and chain hash stay,
-    /// as do the identity's retirements; its key and creation time become `key` and
-    /// `created_at_ms` (Switch wire 7.3, Table 3). Without a mark nothing changes.
+    /// A new account takes the identity's mark `read`, the one it was judged with: its
+    /// generation, `seq` and chain hash stay, as do the identity's retirements; its key and
+    /// creation time become `key` and `created_at_ms` (Switch wire 7.3, Table 3). Where the
+    /// store holds another mark than `read`, or none, nothing changes.
     ///
     /// # Errors
     ///
@@ -299,19 +354,21 @@ impl MarkStore {
     pub async fn take(
         &self,
         identity: &str,
+        read: AccountMark,
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
             inner.write_sync(&identity, |held| match held {
-                MarkRead::Mark(mark) => Some(AccountMark {
+                MarkRead::Mark(mark) if mark == read => Some(AccountMark {
                     key,
                     created_at_ms,
                     ..mark
                 }),
-                MarkRead::Missing | MarkRead::NotAMark => None,
+                MarkRead::Mark(_) | MarkRead::Missing | MarkRead::NotAMark => None,
             })
         })
         .await
@@ -329,6 +386,7 @@ impl MarkStore {
         identity: &str,
         key: [u8; 32],
     ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
@@ -355,6 +413,7 @@ impl MarkStore {
         head: ChainTip,
         key: [u8; 32],
     ) -> Result<Advance, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !is_head(&head) {
@@ -379,6 +438,7 @@ impl MarkStore {
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !is_head(&head) {
@@ -406,6 +466,7 @@ impl MarkStore {
     ///
     /// The store can't be read or the removal failed; [`MarkStoreError::InvalidIdentity`].
     pub async fn delete(&self, identity: &str) -> Result<(), MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || inner.delete_sync(&identity, None).map(|_| ())).await
@@ -424,6 +485,7 @@ impl MarkStore {
         identity: &str,
         at_ms: u64,
     ) -> Result<bool, MarkStoreError> {
+        self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || inner.delete_sync(&identity, Some(at_ms))).await
@@ -435,8 +497,13 @@ impl MarkStore {
     ///
     /// # Errors
     ///
-    /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`].
+    /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`];
+    /// [`MarkStoreError::InvalidGeneration`] for generation 0 (Switch wire 7.3, Table 3).
     pub async fn retire(&self, identity: &str, generation: u64) -> Result<(), MarkStoreError> {
+        self.check_gate()?;
+        if generation == 0 {
+            return Err(MarkStoreError::InvalidGeneration);
+        }
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || inner.retire_sync(&identity, generation)).await
@@ -474,6 +541,94 @@ impl MarkStore {
         let inner = self.inner.clone();
         blocking(move || inner.reading(|_| list_marks(&inner.marks_dir()))).await
     }
+
+    /// Record, durably, that `identity`'s account is erased at `erased_at_ms` (Switch wire
+    /// 7.4.16, 7.3 Table 3): the store keeps the latest time, so an older one never replaces
+    /// a newer one. Answers the time it held before, for [`MarkStore::withdraw_erasure`].
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`].
+    pub async fn record_erasure(
+        &self,
+        identity: &str,
+        erased_at_ms: u64,
+    ) -> Result<Option<u64>, MarkStoreError> {
+        self.check_gate()?;
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || inner.record_erasure_sync(&identity, erased_at_ms)).await
+    }
+
+    /// Take back the record of an erasure at `erased_at_ms` whose deletion didn't commit
+    /// (Switch wire 7.3, Table 3): the store holds `previous` for `identity` again, durably.
+    /// A later record left in its place meanwhile stays.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`].
+    pub async fn withdraw_erasure(
+        &self,
+        identity: &str,
+        erased_at_ms: u64,
+        previous: Option<u64>,
+    ) -> Result<(), MarkStoreError> {
+        self.check_gate()?;
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || inner.withdraw_erasure_sync(&identity, erased_at_ms, previous)).await
+    }
+
+    /// The time of the erasure's record for `identity`, if any; none for an identity no file
+    /// can name, which [`MarkStore::record_erasure`] refuses. Every request asks: it reads no
+    /// file once the store is read.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read.
+    pub async fn erasure(&self, identity: &str) -> Result<Option<u64>, MarkStoreError> {
+        let Ok(identity) = valid_identity(identity) else {
+            return Ok(None);
+        };
+        let inner = self.inner.clone();
+        blocking(move || inner.reading(|_| Ok(inner.erasures.lock().get(&identity).copied()))).await
+    }
+
+    /// Every erasure's record the store holds: each identity, with the time of its latest
+    /// record, ascending.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read.
+    pub async fn erasures(&self) -> Result<Vec<(String, u64)>, MarkStoreError> {
+        let inner = self.inner.clone();
+        blocking(move || {
+            inner.reading(|_| {
+                let mut all: Vec<(String, u64)> = inner
+                    .erasures
+                    .lock()
+                    .iter()
+                    .map(|(identity, at)| (identity.clone(), *at))
+                    .collect();
+                all.sort_unstable();
+                Ok(all)
+            })
+        })
+        .await
+    }
+
+    /// Forget the erasures recorded before `before_ms`, whose accounts no database backup
+    /// the operator keeps can hold any more (Switch spec 6.5); the number forgotten. The
+    /// caller deletes the leftover marks a record covers first (Switch wire 7.3, Table 3).
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read or a removal failed.
+    pub async fn forget_erasures_before(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
+        self.check_gate()?;
+        let inner = self.inner.clone();
+        blocking(move || inner.forget_erasures_sync(before_ms)).await
+    }
 }
 
 impl Inner {
@@ -483,6 +638,7 @@ impl Inner {
             store_id: Mutex::new(None),
             marks: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashMap::new()),
+            erasures: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
             #[cfg(test)]
             faults: Arc::default(),
@@ -499,6 +655,10 @@ impl Inner {
 
     fn retired_dir(&self) -> PathBuf {
         self.accounts().join("retired")
+    }
+
+    fn erasures_dir(&self) -> PathBuf {
+        self.accounts().join("erasures")
     }
 
     fn mark_path(&self, identity: &str) -> PathBuf {
@@ -586,7 +746,7 @@ impl Inner {
             .join(format!(".accounts.{}.tmp", hex::encode(suffix)));
         let result: Result<(), MarkStoreError> = (|| {
             create_private_dir(&temp)?;
-            for dir in ["marks", "retired"] {
+            for dir in STORE_DIRS {
                 create_private_dir(&temp.join(dir))?;
                 self.sync_dir(&temp.join(dir))?;
             }
@@ -612,7 +772,12 @@ impl Inner {
         // An earlier process, or an earlier call, may have landed a rename or a removal
         // and stopped before its directory sync: sync every directory before reading any.
         let accounts = self.accounts();
-        for dir in [self.marks_dir(), self.retired_dir(), accounts.clone()] {
+        for dir in [
+            self.marks_dir(),
+            self.retired_dir(),
+            self.erasures_dir(),
+            accounts.clone(),
+        ] {
             self.sync_dir(&dir).map_err(|error| {
                 MarkStoreError::StoreUnreadable(format!("{}: {error}", dir.display()))
             })?;
@@ -620,7 +785,9 @@ impl Inner {
         self.sync_dir(&self.root)?;
         let id = read_store_id(&accounts)?;
         let retired = read_retired(&self.retired_dir())?;
+        let erasures = read_erasures(&self.erasures_dir())?;
         *self.retired.lock() = retired;
+        *self.erasures.lock() = erasures;
         self.marks.lock().clear();
         *store_id = Some(id.clone());
         Ok(id)
@@ -792,16 +959,115 @@ impl Inner {
             Ok(())
         })
     }
+
+    /// Keep the latest erasure time: an account created before it is erased again after a
+    /// restore (Switch spec 6.5). Answers the time the store held before.
+    fn record_erasure_sync(
+        &self,
+        identity: &str,
+        erased_at_ms: u64,
+    ) -> Result<Option<u64>, MarkStoreError> {
+        self.writing(|_| {
+            let path = self.erasures_dir().join(identity);
+            let recorded = read_erasure_file(&path)?;
+            // Memory takes the record first, so it holds at least what the files hold, also
+            // when a write lands its file and then fails: on that side it only erases.
+            let latest = recorded.map_or(erased_at_ms, |recorded| recorded.max(erased_at_ms));
+            {
+                let mut erasures = self.erasures.lock();
+                let held = erasures.entry(identity.to_string()).or_insert(latest);
+                *held = (*held).max(latest);
+            }
+            if recorded.is_some_and(|recorded| recorded >= erased_at_ms) {
+                // The file may be one whose rename landed and whose directory sync then
+                // failed: the record isn't durable until a sync covers it.
+                self.sync_dir(&self.erasures_dir())?;
+                return Ok(recorded);
+            }
+            self.write_atomic(&path, erased_at_ms.to_string().as_bytes())?;
+            Ok(recorded)
+        })
+    }
+
+    /// Put `previous` back as `identity`'s record where the store holds `erased_at_ms`,
+    /// durably, then in memory.
+    fn withdraw_erasure_sync(
+        &self,
+        identity: &str,
+        erased_at_ms: u64,
+        previous: Option<u64>,
+    ) -> Result<(), MarkStoreError> {
+        self.writing(|_| {
+            let path = self.erasures_dir().join(identity);
+            // Memory holds what the files hold, and a record whose file's removal landed
+            // without its directory sync: the retry syncs it.
+            let held = self.erasures.lock().get(identity).copied();
+            if held != Some(erased_at_ms) || previous == Some(erased_at_ms) {
+                // A later record took its place, or the record was there before: it stays.
+                return Ok(());
+            }
+            match previous {
+                Some(at) => self.write_atomic(&path, at.to_string().as_bytes())?,
+                None => self.remove_durably(&path)?,
+            }
+            let mut erasures = self.erasures.lock();
+            match previous {
+                Some(at) => {
+                    erasures.insert(identity.to_string(), at);
+                }
+                None => {
+                    erasures.remove(identity);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove the records of erasures before `before_ms`, each removal durable before its
+    /// entry leaves memory.
+    fn forget_erasures_sync(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
+        self.writing(|_| {
+            let old: Vec<String> = self
+                .erasures
+                .lock()
+                .iter()
+                .filter(|(_, at)| **at < before_ms)
+                .map(|(identity, _)| identity.clone())
+                .collect();
+            let dir = self.erasures_dir();
+            for identity in &old {
+                #[cfg(test)]
+                let before = fs::read(dir.join(identity)).ok();
+                match fs::remove_file(dir.join(identity)) {
+                    Ok(()) => {
+                        #[cfg(test)]
+                        self.faults.lock().changed(&dir.join(identity), before);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !old.is_empty() {
+                self.sync_dir(&dir)?;
+                let mut erasures = self.erasures.lock();
+                for identity in &old {
+                    erasures.remove(identity);
+                }
+            }
+            Ok(old.len())
+        })
+    }
 }
 
 /// A read-only view of the mark store, for an operator's check beside a running service: it
 /// creates, writes, syncs and locks nothing, and reads each mark as its file is then. The
-/// retirements are read once, when it opens.
+/// retirements and the erasures' records are read once, when it opens.
 #[derive(Debug)]
 pub struct MarkView {
     accounts: PathBuf,
     store_id: String,
     retired: HashMap<String, BTreeSet<u64>>,
+    erasures: HashMap<String, u64>,
 }
 
 impl MarkView {
@@ -814,11 +1080,18 @@ impl MarkView {
         let accounts = root.as_ref().join("accounts");
         let store_id = read_store_id(&accounts)?;
         let retired = read_retired(&accounts.join("retired"))?;
+        let erasures = read_erasures(&accounts.join("erasures"))?;
         Ok(Self {
             accounts,
             store_id,
             retired,
+            erasures,
         })
+    }
+
+    /// The time of the erasure's record for `identity`, as the view read it.
+    pub fn erasure(&self, identity: &str) -> Option<u64> {
+        self.erasures.get(identity).copied()
     }
 
     /// The identity's mark as its file holds it now.
@@ -892,27 +1165,43 @@ fn read_store_id(accounts: &Path) -> Result<String, MarkStoreError> {
     }
 }
 
-/// Every retirement in `dir`. A write's temporary file isn't one; any other file that
-/// doesn't name an identity and a generation makes the store unreadable.
-fn read_retired(dir: &Path) -> Result<HashMap<String, BTreeSet<u64>>, MarkStoreError> {
-    let mut retired: HashMap<String, BTreeSet<u64>> = HashMap::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|error| MarkStoreError::StoreUnreadable(format!("retired: {error}")))?;
+/// The name of each entry in the store's directory `dir`, `what` naming it, but a write's
+/// temporary file: each a regular file whose name is UTF-8. Anything else, which no writer
+/// makes, makes the store unreadable.
+fn store_files(dir: &Path, what: &str) -> Result<Vec<(String, PathBuf)>, MarkStoreError> {
+    let unreadable = |why: String| MarkStoreError::StoreUnreadable(format!("{what}: {why}"));
+    let entries = fs::read_dir(dir).map_err(|error| unreadable(error.to_string()))?;
+    let mut files = Vec::new();
     for entry in entries {
-        let entry =
-            entry.map_err(|error| MarkStoreError::StoreUnreadable(format!("retired: {error}")))?;
+        let entry = entry.map_err(|error| unreadable(error.to_string()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            return Err(MarkStoreError::StoreUnreadable(
-                "retired: a file name isn't UTF-8".into(),
-            ));
+            return Err(unreadable("a file name isn't UTF-8".into()));
         };
         if is_temp_file(name) {
             continue;
         }
+        let kind = entry
+            .file_type()
+            .map_err(|error| unreadable(error.to_string()))?;
+        if !kind.is_file() {
+            return Err(unreadable(format!("{name} isn't a file")));
+        }
+        files.push((name.to_string(), entry.path()));
+    }
+    Ok(files)
+}
+
+/// Every retirement in `dir`. A write's temporary file isn't one; any other entry that isn't
+/// an empty file naming an identity and a generation above 0, as [`MarkStore::retire`]
+/// writes it, makes the store unreadable: a generation-0 retirement, which no writer makes,
+/// counts for nothing (Switch wire 7.3, Table 3).
+fn read_retired(dir: &Path) -> Result<HashMap<String, BTreeSet<u64>>, MarkStoreError> {
+    let mut retired: HashMap<String, BTreeSet<u64>> = HashMap::new();
+    for (name, path) in store_files(dir, "retired")? {
         let parsed = name.split_once('.').and_then(|(identity, generation)| {
             let value = generation.parse::<u64>().ok()?;
-            (is_ledger_name(identity) && value.to_string() == generation)
+            (is_ledger_name(identity) && value != 0 && value.to_string() == generation)
                 .then(|| (identity.to_string(), value))
         });
         let Some((identity, generation)) = parsed else {
@@ -920,34 +1209,75 @@ fn read_retired(dir: &Path) -> Result<HashMap<String, BTreeSet<u64>>, MarkStoreE
                 "retired: {name} names no retirement"
             )));
         };
+        let len = fs::metadata(&path)
+            .map_err(|error| MarkStoreError::StoreUnreadable(format!("retired: {error}")))?
+            .len();
+        if len != 0 {
+            return Err(MarkStoreError::StoreUnreadable(format!(
+                "retired: {name} isn't empty"
+            )));
+        }
         retired.entry(identity).or_default().insert(generation);
     }
     Ok(retired)
 }
 
+/// Every erasure's record in `dir`. A write's temporary file isn't one; any other entry that
+/// isn't a file naming an identity and holding a time as [`MarkStore::record_erasure`]
+/// writes it makes the store unreadable.
+fn read_erasures(dir: &Path) -> Result<HashMap<String, u64>, MarkStoreError> {
+    let mut erasures = HashMap::new();
+    for (name, path) in store_files(dir, "erasures")? {
+        if !is_ledger_name(&name) {
+            return Err(MarkStoreError::StoreUnreadable(format!(
+                "erasures: {name} names no identity"
+            )));
+        }
+        if let Some(at) = read_erasure_file(&path)? {
+            erasures.insert(name, at);
+        }
+    }
+    Ok(erasures)
+}
+
+/// The erasure's record at `path`: `None` where there is none. A record that isn't a time in
+/// decimal, without sign, leading zero or space, as the store writes it, makes the store
+/// unreadable.
+fn read_erasure_file(path: &Path) -> Result<Option<u64>, MarkStoreError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(MarkStoreError::StoreUnreadable(format!(
+                "erasures: {error}"
+            )));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_ERASURE_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| MarkStoreError::StoreUnreadable(format!("erasures: {error}")))?;
+    let at = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok().filter(|at| at.to_string() == text));
+    match at {
+        Some(at) => Ok(Some(at)),
+        None => Err(MarkStoreError::StoreUnreadable(
+            "erasures: a record isn't a time".into(),
+        )),
+    }
+}
+
 /// Every identity with a file in `dir`, ascending.
 fn list_marks(dir: &Path) -> Result<Vec<String>, MarkStoreError> {
-    let entries = fs::read_dir(dir)
-        .map_err(|error| MarkStoreError::StoreUnreadable(format!("marks: {error}")))?;
     let mut identities = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| MarkStoreError::StoreUnreadable(format!("marks: {error}")))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(MarkStoreError::StoreUnreadable(
-                "marks: a file name isn't UTF-8".into(),
-            ));
-        };
-        if is_temp_file(name) {
-            continue;
-        }
-        if !is_ledger_name(name) {
+    for (name, _) in store_files(dir, "marks")? {
+        if !is_ledger_name(&name) {
             return Err(MarkStoreError::StoreUnreadable(format!(
                 "marks: {name} names no identity"
             )));
         }
-        identities.push(name.to_string());
+        identities.push(name);
     }
     identities.sort();
     Ok(identities)
@@ -962,6 +1292,12 @@ fn read_mark_file(path: &Path) -> Result<MarkRead, MarkStoreError> {
         }
         Err(error) => return Err(error.into()),
     };
+    // A mark is a file: anything else there no writer makes.
+    if !file.metadata()?.is_file() {
+        return Err(MarkStoreError::StoreUnreadable(
+            "marks: an entry isn't a file".into(),
+        ));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_MARK_FILE + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_MARK_FILE {
@@ -1084,8 +1420,17 @@ mod tests {
             created_at_ms: 500,
             ..mark
         };
+        // Another mark than the one judged isn't taken.
+        let other = AccountMark { seq: 8, ..mark };
         assert_eq!(
-            store.take(ALICE, OTHER_KEY, 500).await.expect("take"),
+            store
+                .take(ALICE, other, OTHER_KEY, 500)
+                .await
+                .expect("take"),
+            MarkWrite::Unchanged(MarkRead::Mark(mark))
+        );
+        assert_eq!(
+            store.take(ALICE, mark, OTHER_KEY, 500).await.expect("take"),
             MarkWrite::Written(taken)
         );
         assert_eq!(
@@ -1099,12 +1444,18 @@ mod tests {
     async fn test_marks_take_without_a_mark_changes_nothing() {
         let (dir, store) = open();
         assert_eq!(
-            store.take(ALICE, KEY, 500).await.expect("take"),
+            store
+                .take(ALICE, AccountMark::zero(KEY, 1), KEY, 500)
+                .await
+                .expect("take"),
             MarkWrite::Unchanged(MarkRead::Missing)
         );
         fs::write(marks_dir(&dir).join(BOB), b"{}").expect("write");
         assert_eq!(
-            store.take(BOB, KEY, 500).await.expect("take"),
+            store
+                .take(BOB, AccountMark::zero(KEY, 1), KEY, 500)
+                .await
+                .expect("take"),
             MarkWrite::Unchanged(MarkRead::NotAMark)
         );
         assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Missing);
@@ -1312,12 +1663,15 @@ mod tests {
         with_mark(&store, ALICE, head(2, 2, 1)).await;
         store.retire(ALICE, 2).await.expect("retire");
         store.retire(ALICE, 2).await.expect("again");
-        store.retire(ALICE, 0).await.expect("zero");
+        assert!(matches!(
+            store.retire(ALICE, 0).await,
+            Err(MarkStoreError::InvalidGeneration)
+        ));
         store.retire(BOB, 5).await.expect("without a mark");
         store.delete(ALICE).await.expect("delete");
         drop(store);
         let store = MarkStore::open(dir.path()).expect("reopen");
-        assert_eq!(store.retired(ALICE).await.expect("retired"), vec![0, 2]);
+        assert_eq!(store.retired(ALICE).await.expect("retired"), vec![2]);
         assert_eq!(store.retired(BOB).await.expect("retired"), vec![5]);
         assert!(store.retired("carol").await.expect("none").is_empty());
     }
@@ -1626,5 +1980,282 @@ mod tests {
         }
         assert_eq!(held, MarkRead::Mark(AccountMark::zero(KEY, 1)));
         assert!(marks_dir(&dir).join(ALICE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasure_keeps_the_latest_time() {
+        let (dir, store) = open();
+        assert_eq!(store.erasure(ALICE).await.expect("read"), None);
+        assert_eq!(
+            store.record_erasure(ALICE, 2_000).await.expect("record"),
+            None
+        );
+        // An older time never replaces a newer one.
+        assert_eq!(
+            store.record_erasure(ALICE, 1_000).await.expect("record"),
+            Some(2_000)
+        );
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(2_000));
+        assert_eq!(
+            store.record_erasure(ALICE, 3_000).await.expect("record"),
+            Some(2_000)
+        );
+        drop(store);
+        let store = MarkStore::open(dir.path()).expect("reopen");
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(3_000));
+        assert_eq!(
+            fs::read(dir.path().join("accounts/erasures").join(ALICE)).expect("file"),
+            b"3000"
+        );
+        // A name no file can name was never recorded.
+        assert_eq!(store.erasure("../x").await.expect("read"), None);
+        assert!(matches!(
+            store.record_erasure("../x", 1).await,
+            Err(MarkStoreError::InvalidIdentity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_marks_withdrawn_erasure_puts_the_earlier_record_back() {
+        let (dir, store) = open();
+        let previous = store.record_erasure(ALICE, 1_000).await.expect("record");
+        assert_eq!(previous, None);
+        store
+            .withdraw_erasure(ALICE, 1_000, previous)
+            .await
+            .expect("withdraw");
+        assert_eq!(store.erasure(ALICE).await.expect("read"), None);
+        assert!(!dir.path().join("accounts/erasures").join(ALICE).exists());
+        store.record_erasure(ALICE, 1_000).await.expect("record");
+        let previous = store.record_erasure(ALICE, 2_000).await.expect("record");
+        store
+            .withdraw_erasure(ALICE, 2_000, previous)
+            .await
+            .expect("withdraw");
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(1_000));
+        // A later record in its place stays.
+        store.record_erasure(ALICE, 3_000).await.expect("record");
+        store
+            .withdraw_erasure(ALICE, 2_000, Some(1_000))
+            .await
+            .expect("withdraw");
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(3_000));
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasures_list_and_forget_before_a_time() {
+        let (dir, store) = open();
+        store.record_erasure(BOB, 1_000).await.expect("record");
+        store.record_erasure(ALICE, 5_000).await.expect("record");
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![(ALICE.to_string(), 5_000), (BOB.to_string(), 1_000)]
+        );
+        assert_eq!(
+            store.forget_erasures_before(5_000).await.expect("forget"),
+            1
+        );
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![(ALICE.to_string(), 5_000)]
+        );
+        drop(store);
+        let store = MarkStore::open(dir.path()).expect("reopen");
+        assert_eq!(store.erasure(BOB).await.expect("read"), None);
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(5_000));
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasure_retry_syncs_the_directory_before_it_is_recorded() {
+        let (dir, store, faults) = open_faulty();
+        let erasures = dir.path().join("accounts").join("erasures");
+        faults.lock().fail_sync(&erasures, 1);
+        assert!(store.record_erasure(ALICE, 1_000).await.is_err());
+        assert!(erasures.join(ALICE).exists(), "the rename landed");
+        // Memory holds it at once: on that side it only erases.
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(1_000));
+        // The retry finds the file and syncs before it reports the record.
+        store.record_erasure(ALICE, 1_000).await.expect("retry");
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure(ALICE).await.expect("read"), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasure_sync_failure_then_crash_loses_only_the_unanswered_record() {
+        let (dir, store, faults) = open_faulty();
+        let erasures = dir.path().join("accounts").join("erasures");
+        faults.lock().fail_sync(&erasures, 1);
+        assert!(store.record_erasure(ALICE, 1_000).await.is_err());
+        let store = crash_and_reopen(&dir, &faults);
+        assert_eq!(store.erasure(ALICE).await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn test_marks_bad_erasure_file_is_unreadable() {
+        let (dir, store) = open();
+        drop(store);
+        let erasures = dir.path().join("accounts").join("erasures");
+        fs::write(erasures.join(".alice.00.tmp"), b"x").expect("temp");
+        let store = MarkStore::open(dir.path()).expect("open");
+        assert_eq!(store.erasure(ALICE).await.expect("temp skipped"), None);
+        drop(store);
+        for (name, content) in [
+            ("alice", &b"01000"[..]),
+            ("alice", b" 1000"),
+            ("alice", b"1000\n"),
+            ("alice", b"+1000"),
+            ("alice", b""),
+            ("alice", b"99999999999999999999999"),
+            ("Alice", b"1000"),
+            ("alice.1", b"1000"),
+        ] {
+            fs::write(erasures.join(name), content).expect("write");
+            let store = MarkStore::open(dir.path()).expect("open");
+            assert!(
+                matches!(
+                    store.erasure(BOB).await,
+                    Err(MarkStoreError::StoreUnreadable(_))
+                ),
+                "{name} {content:?}"
+            );
+            assert!(MarkView::open(dir.path()).is_err(), "{name}");
+            fs::remove_file(erasures.join(name)).expect("remove");
+        }
+        fs::create_dir(erasures.join(ALICE)).expect("dir");
+        let store = MarkStore::open(dir.path()).expect("open");
+        assert!(matches!(
+            store.erasure(BOB).await,
+            Err(MarkStoreError::StoreUnreadable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_marks_generation_zero_or_nonempty_retirement_is_unreadable() {
+        let (dir, store) = open();
+        store.retire(ALICE, 1).await.expect("retire");
+        drop(store);
+        let retired = dir.path().join("accounts").join("retired");
+        // Only a corrupt or hostile file makes a generation-0 retirement: it fails the
+        // store closed, as does a retirement with content, or one that isn't a file.
+        for (name, content, dir_entry) in [
+            ("alice.0", &b""[..], false),
+            ("alice.2", b"x", false),
+            ("alice.3", b"", true),
+        ] {
+            if dir_entry {
+                fs::create_dir(retired.join(name)).expect("dir");
+            } else {
+                fs::write(retired.join(name), content).expect("write");
+            }
+            let store = MarkStore::open(dir.path()).expect("open");
+            assert!(
+                matches!(
+                    store.retired(ALICE).await,
+                    Err(MarkStoreError::StoreUnreadable(_))
+                ),
+                "{name}"
+            );
+            assert!(MarkView::open(dir.path()).is_err(), "{name}");
+            if dir_entry {
+                fs::remove_dir(retired.join(name)).expect("remove");
+            } else {
+                fs::remove_file(retired.join(name)).expect("remove");
+            }
+        }
+        let store = MarkStore::open(dir.path()).expect("open");
+        assert_eq!(store.retired(ALICE).await.expect("retired"), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_marks_entry_that_is_not_a_file_is_unreadable() {
+        let (dir, store) = open();
+        drop(store);
+        fs::create_dir(marks_dir(&dir).join(ALICE)).expect("dir");
+        let store = MarkStore::open(dir.path()).expect("open");
+        assert!(matches!(
+            store.read(ALICE).await,
+            Err(MarkStoreError::StoreUnreadable(_))
+        ));
+        assert!(matches!(
+            store.list().await,
+            Err(MarkStoreError::StoreUnreadable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_marks_rebuilt_store_drops_marks_retirements_and_erasures_together() {
+        let (dir, store) = open();
+        with_mark(&store, ALICE, head(1, 4, 1)).await;
+        store.retire(ALICE, 1).await.expect("retire");
+        store.record_erasure(BOB, 1_000).await.expect("record");
+        drop(store);
+        fs::remove_dir_all(dir.path().join("accounts")).expect("lose the store");
+        let store = MarkStore::open(dir.path()).expect("rebuild");
+        assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Missing);
+        assert!(store.retired(ALICE).await.expect("retired").is_empty());
+        assert_eq!(store.erasure(BOB).await.expect("erasure"), None);
+        assert!(store.erasures().await.expect("erasures").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_marks_view_reads_the_erasures() {
+        let (dir, store) = open();
+        store.record_erasure(ALICE, 1_000).await.expect("record");
+        let view = MarkView::open(dir.path()).expect("view");
+        assert_eq!(view.erasure(ALICE), Some(1_000));
+        assert_eq!(view.erasure(BOB), None);
+    }
+
+    #[tokio::test]
+    async fn test_marks_stale_gate_refuses_every_write() {
+        use crate::store::LockTiming;
+        let (dir, open_store) = open();
+        let mark = with_mark(&open_store, ALICE, head(1, 4, 1)).await;
+        open_store.record_erasure(BOB, 1_000).await.expect("record");
+        let timing = LockTiming::checking_every(std::time::Duration::from_secs(5));
+        let store = open_store.gated(LockFreshness::confirmed_ago(
+            std::time::Duration::from_secs(15),
+            timing,
+        ));
+        let stale = |result: Result<(), MarkStoreError>| {
+            assert!(
+                matches!(result, Err(MarkStoreError::LockStale)),
+                "{result:?}"
+            );
+        };
+        stale(store.create_zero(BOB, KEY, 1).await.map(|_| ()));
+        stale(store.take(ALICE, mark, OTHER_KEY, 9).await.map(|_| ()));
+        stale(store.set_key(ALICE, OTHER_KEY).await.map(|_| ()));
+        stale(store.advance(ALICE, head(1, 5, 2), KEY).await.map(|_| ()));
+        stale(
+            store
+                .write_anew(BOB, head(1, 5, 2), KEY, 9)
+                .await
+                .map(|_| ()),
+        );
+        stale(store.delete(ALICE).await);
+        stale(store.delete_created_by(ALICE, u64::MAX).await.map(|_| ()));
+        stale(store.retire(ALICE, 1).await);
+        stale(store.record_erasure(ALICE, 2_000).await.map(|_| ()));
+        stale(store.withdraw_erasure(BOB, 1_000, None).await);
+        stale(store.forget_erasures_before(u64::MAX).await.map(|_| ()));
+        // Reads go on, and nothing changed.
+        assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Mark(mark));
+        assert_eq!(store.read(BOB).await.expect("read"), MarkRead::Missing);
+        assert!(store.retired(ALICE).await.expect("retired").is_empty());
+        assert_eq!(store.erasure(BOB).await.expect("erasure"), Some(1_000));
+        assert_eq!(store.erasure(ALICE).await.expect("erasure"), None);
+        drop((store, open_store));
+        let reopened = MarkStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            reopened.read(ALICE).await.expect("read"),
+            MarkRead::Mark(mark)
+        );
+        // Confirmed just now: the writes go through.
+        let fresh = reopened.gated(LockFreshness::confirmed_ago(
+            std::time::Duration::ZERO,
+            timing,
+        ));
+        fresh.retire(ALICE, 1).await.expect("retire");
     }
 }

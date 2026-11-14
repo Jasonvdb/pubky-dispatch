@@ -108,33 +108,6 @@ impl KeyStore for Recording {
         }
         self.inner.delete(id)
     }
-    fn record_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-    ) -> KeyFuture<'a, Option<u64>> {
-        self.inner.record_erasure(identity, erased_at_ms)
-    }
-    fn withdraw_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-        previous: Option<u64>,
-    ) -> KeyFuture<'a, ()> {
-        self.inner
-            .withdraw_erasure(identity, erased_at_ms, previous)
-    }
-    fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
-        self.inner.erasure(identity)
-    }
-
-    fn erasures(&self) -> KeyFuture<'_, Vec<(String, u64)>> {
-        self.inner.erasures()
-    }
-
-    fn forget_erasures_before(&self, before_ms: u64) -> KeyFuture<'_, usize> {
-        self.inner.forget_erasures_before(before_ms)
-    }
 }
 
 impl Recording {
@@ -1065,7 +1038,10 @@ async fn test_push_replaced_key_whose_deletion_failed_is_swept_later() {
     replay.service.sweep_erased_keys().await;
     assert!(!exists(&keys, &old_id).await);
     // A push key's deletion records no erasure: the account lives on.
-    assert_eq!(keys.erasure(&alice_id()).await.expect("ledger"), None);
+    assert_eq!(
+        replay.marks.erasure(&alice_id()).await.expect("records"),
+        None
+    );
     assert_eq!(keys.public_key(&new_id).await.expect("current"), new);
     assert!(owed(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");

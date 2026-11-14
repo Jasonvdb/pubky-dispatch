@@ -131,7 +131,9 @@ impl Service {
         healthy: bool,
         base: u64,
     ) -> Result<(), StoreError> {
-        if !self.limits.chain_retention || !healthy {
+        // A checkpoint is a signed head: none while another process may hold the database
+        // (Switch spec 6.5).
+        if !self.limits.chain_retention || !healthy || !self.lock_is_fresh() {
             return Ok(());
         }
         let head = txn.head().clone();

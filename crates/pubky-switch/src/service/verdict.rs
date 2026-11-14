@@ -56,8 +56,10 @@ pub struct Account {
     /// The service key its newest `identity.json` names, where that document names this
     /// service.
     pub named_key: Option<[u8; 32]>,
-    /// The generation of the `identity.json` it was enrolled with, 0 for one enrolled
-    /// without a document.
+    /// The generation of the `identity.json` it was enrolled with (Switch wire 7.3, Table 2),
+    /// for an account enrolled without one 1, the generation its first document starts
+    /// (Switch wire 3.3). The account's row holds it while the account is staged, the only
+    /// time the abort it bounds counts.
     pub enrolled_generation: u64,
 }
 
@@ -66,7 +68,9 @@ impl Account {
     /// for the service and its offline check: serving at its chain head once its newest
     /// `identity.json`, `doc`, names `origin` and a key the service's key store holds, as
     /// `holds` says; else staged, judged by its chain where it holds one (an activated
-    /// import), else holding none. `generation` is the one it was enrolled at.
+    /// import), else holding none. `generation` is its row's: that of the `identity.json` it
+    /// was enrolled with, or 1 for one enrolled without a document, until a generation
+    /// starts there, which makes it serve.
     pub fn judged(
         origin: &str,
         holds: impl Fn(&[u8; 32]) -> bool,
@@ -372,6 +376,17 @@ fn judge_account(account: &Account, inputs: &Inputs<'_>) -> Verdict {
         (false, Some(reason)) => failing(reason, false),
         (false, None) => Verdict::Healthy,
     }
+}
+
+/// The stub whose chain hash the fork rule under Table 1 compares with the mark's (Switch
+/// wire 7.3): "Where the service still holds the chain stub at the mark's `seq`, a state past
+/// the mark with another chain hash there is a fork too". The mark's generation and `seq`,
+/// where the mark records a head and `state`, the account's (generation, `seq`), is past it,
+/// whatever the state's generation; `None` where the rule doesn't look. In one place for the
+/// service and its offline check.
+pub fn stub_for_fork_rule(state: Option<(u64, u64)>, mark: &AccountMark) -> Option<(u64, u64)> {
+    let marked = (mark.generation, mark.seq);
+    (mark.records_head() && state.is_some_and(|at| at > marked)).then_some(marked)
 }
 
 /// Which of Table 1's columns, other than the two read first, the state and the mark fall
@@ -799,6 +814,63 @@ mod tests {
     }
 
     // Table 1, row "Any, created at or before the time of an erasure's record".
+
+    #[test]
+    fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
+        let marked = AccountMark {
+            generation: 1,
+            seq: 5,
+            chain_hash: [1; 32],
+            key: CURRENT,
+            created_at_ms: 0,
+        };
+        // Past the mark in its generation, and at a later generation: the stub at the
+        // mark's generation and `seq` counts either way (Switch wire 7.3 under Table 1).
+        assert_eq!(stub_for_fork_rule(Some((1, 6)), &marked), Some((1, 5)));
+        assert_eq!(stub_for_fork_rule(Some((2, 3)), &marked), Some((1, 5)));
+        // At or behind the mark, without a state, or at a mark that records no head: none.
+        assert_eq!(stub_for_fork_rule(Some((1, 5)), &marked), None);
+        assert_eq!(stub_for_fork_rule(Some((1, 4)), &marked), None);
+        assert_eq!(stub_for_fork_rule(None, &marked), None);
+        assert_eq!(
+            stub_for_fork_rule(Some((2, 3)), &AccountMark::zero(CURRENT, 0)),
+            None
+        );
+        // A later generation's state over another hash there is a fork.
+        let serving = Account {
+            state: AccountState::Serving(ChainTip {
+                generation: 2,
+                seq: 3,
+                chain_hash: [2; 32],
+            }),
+            created_at_ms: 0,
+            document_generation: Some(2),
+            named_key: Some(CURRENT),
+            enrolled_generation: 2,
+        };
+        let judged = judge(&Inputs {
+            account: Some(&serving),
+            mark: &MarkInput::Mark(marked),
+            stub_at_mark: Some([9; 32]),
+            erasure_at_ms: None,
+            retired: &[],
+            current_key: CURRENT,
+        });
+        assert!(
+            matches!(
+                judged.verdict,
+                Verdict::Failing {
+                    notice: RecoveryNotice {
+                        reason: NoticeReason::Fork,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            judged.verdict
+        );
+    }
 
     #[test]
     fn test_verdict_erased_again_no_mark() {

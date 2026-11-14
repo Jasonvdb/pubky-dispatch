@@ -246,7 +246,7 @@ async fn held_mark(replay: &Replay, identity: &str) -> pubky_switch::marks::Acco
 
 /// The erasure's record the ledger holds for alice.
 async fn record_of(replay: &Replay) -> Option<u64> {
-    replay.keys.erasure(&alice_id()).await.expect("ledger")
+    replay.marks.erasure(&alice_id()).await.expect("ledger")
 }
 
 /// A service on `replay`'s database, keys and clock, its mark store opened again, as after
@@ -441,7 +441,7 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
 
 #[tokio::test]
 async fn test_erase_deletes_the_account_and_nothing_else() {
-    // Every row of alice's state goes, and her mark; the erasure is in the key store's ledger,
+    // Every row of alice's state goes, and her mark; the erasure's record is in the mark store,
     // and the service key stays; bob's account on the same service keeps every row and his
     // mark (Switch wire 7.4.16, 7.3 Table 3, spec 12.7).
     let Some(replay) = replay().await else { return };
@@ -529,7 +529,7 @@ async fn test_erase_deletes_the_account_and_nothing_else() {
     assert_eq!(held_mark(&replay, &bob).await, bob_mark, "bob's mark stays");
     assert_eq!(record_of(&replay).await, Some(ms(&at)));
     assert_eq!(
-        replay.keys.erasure(&bob).await.expect("ledger"),
+        replay.marks.erasure(&bob).await.expect("ledger"),
         None,
         "no record for bob"
     );
@@ -952,7 +952,6 @@ async fn test_erase_malformed_body_is_bad_request_not_conflict() {
     for body in [
         r#"{"identity_hash":"AA"}"#.to_string(),
         r#"{"identity_hash":7}"#.to_string(),
-        r#"{"identity_hash":null}"#.to_string(),
         format!(r#"{{"identity_hash":"{held}","x":1}}"#),
         r#"{"x":1}"#.to_string(),
         "[]".to_string(),
@@ -1307,8 +1306,7 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     set_time(&replay.clock, &at);
     let before = rows(&replay, &alice_id()).await;
     let mark = held_mark(&replay, &alice_id()).await;
-    let ledger = replay.key_dir().join("erasures");
-    std::fs::create_dir_all(&ledger).expect("ledger dir");
+    let ledger = replay.key_dir().join("accounts").join("erasures");
     set_read_only(&ledger, true);
     let request = erasure(&replay, Some(&held_hash()), ms(&at)).await;
     let sent = signature_of(&request);
@@ -1329,10 +1327,10 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// alice's erasure's record as the ledger's files hold it, read by a view opened now.
+/// alice's erasure's record as the mark store's files hold it, read by a view opened now.
 fn durable_record(replay: &Replay) -> Option<u64> {
-    pubky_switch::keys::KeyStoreView::open(replay.key_dir())
-        .expect("key store view")
+    pubky_switch::marks::MarkView::open(replay.key_dir())
+        .expect("mark store view")
         .erasure(&alice_id())
 }
 
@@ -1542,7 +1540,7 @@ async fn restored_after_erasure(replay: &Replay) -> u64 {
     let created = created_at(replay).await.expect("the account");
     let erased_at = created + 60_000;
     replay
-        .keys
+        .marks
         .record_erasure(&alice_id(), erased_at)
         .await
         .expect("ledger");
@@ -1687,7 +1685,7 @@ async fn test_erase_restored_account_is_erased_again_before_any_call_is_served()
         assert!(all_gone(&replay).await, "{name}: the state is erased again");
         // The ledger keeps the erasure, so a later restore is erased again too.
         assert_eq!(
-            replay.keys.erasure(&id).await.expect("ledger"),
+            replay.marks.erasure(&id).await.expect("ledger"),
             Some(erased_at),
             "{name}"
         );
@@ -1757,7 +1755,7 @@ async fn test_erase_restored_account_whose_mark_is_still_held_is_erased_with_it(
     replay_chain_through_revoke(&replay).await;
     let created = created_at(&replay).await.expect("the account");
     replay
-        .keys
+        .marks
         .record_erasure(&alice_id(), created + 60_000)
         .await
         .expect("ledger");
@@ -1885,7 +1883,7 @@ async fn test_erase_leftover_mark_is_deleted_at_a_request_and_at_start() {
             let name = format!("at start: {at_start}, leftover: {leftover}");
             let Some(replay) = replay().await else { return };
             replay
-                .keys
+                .marks
                 .record_erasure(&alice_id(), erased_at)
                 .await
                 .expect("record");
@@ -1949,14 +1947,14 @@ async fn test_erase_ledger_forgets_an_erasure_once_its_backups_aged_out() {
     set_time(&replay.clock, now);
     for (identity, age) in [("aaa", 3 * day), ("bbb", day / 2)] {
         replay
-            .keys
+            .marks
             .record_erasure(identity, ms(now) - age)
             .await
             .expect("record");
     }
     let held = || async {
         replay
-            .keys
+            .marks
             .erasures()
             .await
             .expect("ledger")
@@ -2009,7 +2007,7 @@ async fn test_erase_aged_record_goes_only_after_its_leftover_mark() {
         // bob's erasure three days ago, its mark left over from an account created before.
         let bob = bob_id();
         replay
-            .keys
+            .marks
             .record_erasure(&bob, ms(&at) - 3 * day)
             .await
             .expect("record");
@@ -2030,7 +2028,7 @@ async fn test_erase_aged_record_goes_only_after_its_leftover_mark() {
             .await;
         set_read_only(&marks_dir, false);
         assert_eq!(answer.status, 200, "{}", text(&answer));
-        let bob_record = replay.keys.erasure(&bob).await.expect("ledger");
+        let bob_record = replay.marks.erasure(&bob).await.expect("ledger");
         if deletable {
             assert_eq!(mark_of(&replay, &bob).await, MarkRead::Missing);
             assert_eq!(bob_record, None, "the aged record goes after its leftover");
@@ -2325,7 +2323,7 @@ async fn test_enroll_created_later_than_taken_over_mark() {
             }
             "record" => {
                 replay
-                    .keys
+                    .marks
                     .record_erasure(&alice_id(), ahead)
                     .await
                     .expect("record");
@@ -2435,14 +2433,14 @@ async fn test_erasure_record_drop_under_a_day_refused() {
     set_time(&replay.clock, now);
     for (identity, age) in [("aaa", 2 * day), ("bbb", day - 1000), ("ccc", 1000)] {
         replay
-            .keys
+            .marks
             .record_erasure(identity, ms(now) - age)
             .await
             .expect("record");
     }
     let _ = started(&replay, Some(0)).await;
     let held: Vec<_> = replay
-        .keys
+        .marks
         .erasures()
         .await
         .expect("ledger")
@@ -2471,7 +2469,6 @@ async fn test_erase_body_created_required_shape() {
         format!(r#"{{"created":"yesterday","identity_hash":"{hash}"}}"#),
         format!(r#"{{"created":"2026-13-01T00:00:00.000Z","identity_hash":"{hash}"}}"#),
         format!(r#"{{"created":{created},"identity_hash":"{hash}"}}"#),
-        format!(r#"{{"created":null,"identity_hash":"{hash}"}}"#),
     ] {
         let answer = replay
             .service
@@ -2490,6 +2487,17 @@ async fn test_erase_body_created_required_shape() {
         .handle(erasure_naming(None, Some(&held_hash()), ms(&at)))
         .await;
     assert_eq!(conflict_current(&missing), json!({ "created": time }));
+    // `null` is a missing member (Switch wire 1.1 "Absent and null"): the same `409`.
+    let null = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            format!(r#"{{"created":null,"identity_hash":"{hash}"}}"#).into_bytes(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(conflict_current(&null), json!({ "created": time }));
     assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
     assert_eq!(record_of(&replay).await, None);
     let answer = replay

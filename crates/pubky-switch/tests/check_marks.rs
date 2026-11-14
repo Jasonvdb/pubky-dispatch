@@ -17,7 +17,6 @@ use std::{
 use pubky_switch::{
     check_marks::{self, AccountReport, CheckOptions, DatabaseChoice, MarkState, Report},
     http::Handler,
-    keys::KeyStore,
     marks::{AccountMark, Advance, MarkRead},
     store::{NewAccount, heads::open_read_only_with, testing::TestDatabase},
 };
@@ -343,7 +342,7 @@ async fn test_check_marks_reports_marks_without_an_account() {
     let created = mark_of(&replay, &alice).await.created_at_ms;
     assert!(created > 0, "the mark's creation time");
     replay
-        .keys
+        .marks
         .record_erasure(&alice, created - 1)
         .await
         .expect("record");
@@ -352,7 +351,7 @@ async fn test_check_marks_reports_marks_without_an_account() {
 
     // Recorded at the mark's creation: the mark is the erasure's leftover.
     replay
-        .keys
+        .marks
         .record_erasure(&alice, created)
         .await
         .expect("record");
@@ -375,7 +374,7 @@ async fn test_check_marks_reports_an_account_created_by_an_erasure_record() {
     append(&replay.db, Some(&replay), "renewed", &[1]).await;
     // A record before the account's creation is an earlier account's.
     replay
-        .keys
+        .marks
         .record_erasure("renewed", T0 - 1)
         .await
         .expect("record");
@@ -383,7 +382,7 @@ async fn test_check_marks_reports_an_account_created_by_an_erasure_record() {
     assert_eq!(find(&report.accounts, "renewed").state, MarkState::Healthy);
     // A record at the account's creation: a restore brought it back.
     replay
-        .keys
+        .marks
         .record_erasure("renewed", T0)
         .await
         .expect("record");
@@ -521,7 +520,7 @@ async fn test_check_marks_reads_only() {
     mark_at(&replay, "behind", 1, 3, 3).await;
     create(&replay, "erased", true).await;
     replay
-        .keys
+        .marks
         .record_erasure("erased", T0)
         .await
         .expect("record");
@@ -531,7 +530,7 @@ async fn test_check_marks_reads_only() {
         .await
         .expect("mark");
     replay
-        .keys
+        .marks
         .record_erasure("leftover", T0)
         .await
         .expect("record");

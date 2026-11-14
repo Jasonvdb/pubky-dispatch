@@ -130,12 +130,17 @@ impl FeedRead {
 pub(super) enum FeedStop {
     /// The verdict of the account and its mark, judged from a page's snapshot, answers in
     /// place of the page: the not-hosted `404`, the notice or the `503` of an unknown
-    /// verdict, signed with `key` at the time base, without a head (Switch wire 7.3).
+    /// verdict, signed with `key`, without a head (Switch wire 7.3): the first two at the
+    /// time base when it answers, the last at the identity's service time (Switch wire 7.1
+    /// Timestamp).
     Verdict {
         /// The key the verdict answers with.
         key: [u8; 32],
         /// The answer.
         error: Box<ApiError>,
+        /// The latest service time the read saw for the identity, where the answer carries
+        /// the identity's service time; `None` for the time base.
+        service_ms: Option<u64>,
     },
     /// An error answer.
     Refused(Box<PageRefusal>),
@@ -158,17 +163,24 @@ pub(super) struct PageRefusal {
     pub(super) time_ms: u64,
 }
 
-/// The head of the snapshot a refusal was decided from, at or past the mark.
+/// The head of the snapshot a refusal was decided from, at or past the mark, with the key
+/// the verdict judged from that snapshot answers with.
 #[derive(Debug)]
 pub(super) struct SnapshotHead {
     tip: ChainTip,
     identity_key: [u8; 32],
+    signer: ServiceSigner,
 }
 
 impl SnapshotHead {
-    /// The head, signed with `signer`, the key the verdict answers with.
-    pub(super) fn sign(&self, signer: &ServiceSigner) -> Option<SignedHead> {
-        Some(sign_head(signer, &self.identity_key, &self.tip))
+    /// The head, signed with the key the verdict judged from the snapshot answers with.
+    pub(super) fn sign(&self) -> Option<SignedHead> {
+        Some(sign_head(&self.signer, &self.identity_key, &self.tip))
+    }
+
+    /// The key the verdict judged from the snapshot answers with.
+    pub(super) fn signer(&self) -> &ServiceSigner {
+        &self.signer
     }
 }
 
@@ -772,14 +784,22 @@ impl Service {
         .await;
         let answered = match polled {
             Ok(answered) => answered,
-            // A refusal from a snapshot moves the mark to its head first, as a page does; if
-            // it can't, the refusal carries the request's own head instead.
+            // A refusal from a snapshot moves the mark to its head first, as a page does,
+            // with the key the snapshot's verdict answers with; if it can't, or the instance
+            // lock isn't confirmed now, after the wait, the refusal carries the request's own
+            // head instead, which its commit covers (Switch spec 6.5).
             Err(FeedStop::Refused(mut refusal)) => {
                 if let Some(snapshot) = &refusal.snapshot
-                    && snapshot.tip.seq > 0
-                    && !self
-                        .move_mark(&read.account, snapshot.tip, read.key, None)
-                        .await
+                    && (!self.lock_is_fresh()
+                        || (snapshot.tip.seq > 0
+                            && !self
+                                .move_mark(
+                                    &read.account,
+                                    snapshot.tip,
+                                    super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
+                                    None,
+                                )
+                                .await))
                 {
                     refusal.snapshot = None;
                 }
@@ -787,12 +807,23 @@ impl Service {
             }
             Err(stop) => return Err(stop),
         };
-        // The mark moves to the page's head first, so no head goes out that the mark is
-        // behind, also when the page shows a commit whose own request hasn't moved it yet
-        // (Switch wire 7.3 step 10).
+        // A page signs a head: not while another process may hold the database, checked now,
+        // after the wait (Switch spec 6.5).
+        if !self.lock_is_fresh() {
+            tracing::error!("the instance lock isn't confirmed: no page signed");
+            return Err(FeedStop::refused(temporary(), false, answered.time_ms));
+        }
+        // The mark moves to the page's head first, with the key the page is signed with, so
+        // no head goes out that the mark is behind, also when the page shows a commit whose
+        // own request hasn't moved it yet (Switch wire 7.3 step 10).
         if answered.tip.seq > 0
             && !self
-                .move_mark(&read.account, answered.tip, read.key, None)
+                .move_mark(
+                    &read.account,
+                    answered.tip,
+                    super::PublicKeyBytes::public_key_bytes(&answered.signer),
+                    None,
+                )
                 .await
         {
             return Err(FeedStop::refused(temporary(), true, answered.time_ms));
@@ -855,6 +886,7 @@ impl Service {
             return Err(FeedStop::Verdict {
                 key: super::PublicKeyBytes::public_key_bytes(&current),
                 error: Box::new(super::marking::not_hosted()),
+                service_ms: None,
             });
         }
         let signer = match routed.route {
@@ -865,12 +897,14 @@ impl Service {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(super::marking::not_hosted()),
+                    service_ms: None,
                 });
             }
             Route::Notice(notice) => {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(self.notice(&read.account, notice)),
+                    service_ms: None,
                 });
             }
             Route::Unavailable
@@ -885,6 +919,7 @@ impl Service {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(temporary()),
+                    service_ms: Some(builder.time_ms.max(read.time_ms)),
                 });
             }
         };
@@ -907,6 +942,7 @@ impl Service {
                     snapshot: Some(SnapshotHead {
                         tip,
                         identity_key: read.identity_key,
+                        signer: signer.clone(),
                     }),
                     time_ms,
                 })));

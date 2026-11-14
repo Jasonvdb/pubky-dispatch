@@ -8,7 +8,8 @@
 //! rest of what the harness holds the means to check, on every answer of either switch:
 //!
 //! - the answer's signature (Switch wire 7.1), with the account's service key of its
-//!   generation, or the operator key for an answer the switch can't tie to an account. The
+//!   generation, or the switch's one key for an answer it can't tie to an account the run
+//!   knows. The
 //!   key of a generation is the one its `identity.json` names (`inbox.service_key`, Switch
 //!   wire 3.3), taken from the delivery the switch accepted, which must itself be answered
 //!   under that key; the key of the generation before is held no longer from then on.
@@ -131,7 +132,7 @@ impl Account {
                 .iter()
                 .find(|(named, _)| *named == number)
                 .map(|(_, key)| *key),
-            SignedWith::OperatorKey => None,
+            SignedWith::SwitchKey => None,
         }
     }
 
@@ -173,8 +174,8 @@ impl Account {
 pub struct Checker {
     /// The accounts, by Pubky ID.
     accounts: Mutex<HashMap<String, Account>>,
-    /// The operator key of the run's switches.
-    operator_key: Mutex<Option<[u8; 32]>>,
+    /// The one key of each of the run's switches.
+    switch_keys: Mutex<Vec<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for Checker {
@@ -192,8 +193,8 @@ pub enum SignedWith {
     /// A service key the run brought whose document no switch took yet: its number, from
     /// 1, in the order the run brought the account's keys.
     Brought(usize),
-    /// The operator key.
-    OperatorKey,
+    /// A switch's one key, for an answer about no account the run knows.
+    SwitchKey,
 }
 
 impl std::fmt::Display for SignedWith {
@@ -206,7 +207,7 @@ impl std::fmt::Display for SignedWith {
                 f,
                 "the account's service key number {number}, its document not taken yet"
             ),
-            SignedWith::OperatorKey => write!(f, "the operator key"),
+            SignedWith::SwitchKey => write!(f, "the switch's key"),
         }
     }
 }
@@ -271,9 +272,13 @@ impl Checker {
         Some(())
     }
 
-    /// Answers the switch can't tie to an account are signed with `operator_key`.
-    pub fn operator(&self, operator_key: [u8; 32]) {
-        *lock(&self.operator_key) = Some(operator_key);
+    /// A switch of the run signs with `key`, the answers it can't tie to an account too
+    /// (Switch wire 7.1).
+    pub fn switch_key(&self, key: [u8; 32]) {
+        let mut keys = lock(&self.switch_keys);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
 
     /// Verify `answer`'s signature as the switch sent it, and take what it settles: the key
@@ -333,14 +338,12 @@ impl Checker {
                 return Ok(SignedWith::Brought(*number));
             }
         }
-        if let Some(operator) = *lock(&self.operator_key)
-            && verifies(&operator)
-        {
-            return Ok(SignedWith::OperatorKey);
+        if lock(&self.switch_keys).iter().any(verifies) {
+            return Ok(SignedWith::SwitchKey);
         }
         Err(
-            "the answer's signature verifies with neither the account's service key nor the \
-             operator key"
+            "the answer's signature verifies with neither the account's service key nor a \
+             switch's key"
                 .into(),
         )
     }
@@ -404,11 +407,11 @@ impl Found<'_> {
     }
 
     /// The service key to verify `what` at `at` with: the one that signed the answer. An
-    /// answer the operator key signed carries nothing a service key signs; one whose own
-    /// signature failed is reported for that already.
+    /// answer about no account the run knows carries nothing an account's key signs; one
+    /// whose own signature failed is reported for that already.
     fn key_for(&mut self, what: &str, at: &str) -> Option<[u8; 32]> {
-        if self.key.is_none() && self.signed == Some(SignedWith::OperatorKey) {
-            self.violation(format!("{at}: {what} in an answer the operator key signed"));
+        if self.key.is_none() && self.signed == Some(SignedWith::SwitchKey) {
+            self.violation(format!("{at}: {what} in an answer about no account"));
         }
         self.key
     }
@@ -696,7 +699,7 @@ mod tests {
     fn checker(service: &IdentityKey) -> Checker {
         let checker = Checker::default();
         checker.account(&alice().id(), alice().public(), service.public());
-        checker.operator(key(42).public());
+        checker.switch_key(key(42).public());
         checker
     }
 
@@ -826,8 +829,8 @@ mod tests {
         assert_eq!(signs(&next), Ok(SignedWith::Generation(2)));
         // The outgoing key is held no longer.
         assert!(signs(&first).is_err(), "the outgoing generation's key");
-        // The operator's answers stay the operator's.
-        assert_eq!(signs(&key(42)), Ok(SignedWith::OperatorKey));
+        // A switch's key, for no account the run knows, stays so.
+        assert_eq!(signs(&key(42)), Ok(SignedWith::SwitchKey));
     }
 
     #[test]
@@ -889,13 +892,13 @@ mod tests {
             ahead.iter().any(|v| v.contains("a head of generation 2")),
             "{ahead:?}"
         );
-        // In an answer the operator key signed.
-        let operators = violations(&checker, &key(42), &head(&first, 1));
+        // In an answer about no account.
+        let unattached = violations(&checker, &key(42), &head(&first, 1));
         assert!(
-            operators
+            unattached
                 .iter()
-                .any(|v| v.contains("the operator key signed")),
-            "{operators:?}"
+                .any(|v| v.contains("in an answer about no account")),
+            "{unattached:?}"
         );
     }
 

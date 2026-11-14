@@ -13,8 +13,9 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request as HttpRequest, header};
 use pubky_switch::changes::{ChangeHub, ChangeListener};
 use pubky_switch::http::source::ProxyConfig;
-use pubky_switch::keys::{FileKeyStore, FixedKeys};
+use pubky_switch::keys::FileKeyStore;
 use pubky_switch::limits::Limits;
+use pubky_switch::marks::MarkStore;
 use pubky_switch::service::{Resolver, Service};
 use pubky_switch::store::Store;
 use pubky_switch::store::testing::{
@@ -179,18 +180,19 @@ impl RealSwitch {
     /// A service at `origin` on a fresh test database, or `None` when no test database is
     /// configured and the test is to be skipped (see [`pubky_switch::store::testing`]).
     ///
-    /// Its accounts take `service_secrets` as their service keys, in order, then random
-    /// ones; answers it can't tie to an account are signed with `operator_secret`. It
-    /// requires trusted time, as in production, and holds a sample taken from `clock`.
+    /// It signs with the service key `service_secret` makes, for every account it hosts and
+    /// every answer it can't tie to an account (Switch wire 7.1), and keeps its marks beside
+    /// that key (Switch wire 7.3). It requires trusted time, as in production, and holds a
+    /// sample taken from `clock`.
     ///
     /// # Errors
     ///
-    /// When the key store can't be made, or the change listener can't connect.
+    /// When the key store or the mark store can't be made, or the change listener can't
+    /// connect.
     pub async fn start(
         origin: &str,
         clock: Arc<TestClock>,
-        service_secrets: Vec<[u8; 32]>,
-        operator_secret: [u8; 32],
+        service_secret: [u8; 32],
         limits: Limits,
     ) -> Result<Option<Self>, HarnessError> {
         let Some(database) = test_database().await else {
@@ -198,13 +200,12 @@ impl RealSwitch {
         };
         let key_dir =
             tempfile::tempdir().map_err(|error| HarnessError::Setup(error.to_string()))?;
-        let store = FileKeyStore::open(key_dir.path())
+        let keys = Arc::new(
+            FileKeyStore::open_with_service_seed(key_dir.path(), service_secret)
+                .map_err(|error| HarnessError::Setup(error.to_string()))?,
+        );
+        let marks = MarkStore::open(key_dir.path())
             .map_err(|error| HarnessError::Setup(error.to_string()))?;
-        let keys = Arc::new(FixedKeys::new(
-            store,
-            service_secrets,
-            Some(operator_secret),
-        ));
         let start_ms = clock.now_ms();
         let clock = Arc::new(SharedClock { clock, start_ms });
         let time = Arc::new(TrustedTime::new(
@@ -215,6 +216,7 @@ impl RealSwitch {
             origin.to_owned(),
             database.store().clone(),
             keys,
+            marks,
             time.clone(),
             limits,
         )

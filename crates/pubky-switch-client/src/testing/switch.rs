@@ -524,7 +524,15 @@ impl Transport for Holding {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let Some(held) = self.0.waiting_read(&request) else {
-                return self.0.handle(&request);
+                // A request answered while reads are held lets the reads it woke answer
+                // first, as the service's woken reads go out while the request's own answer
+                // is still on its way (Switch wire 7.4.4).
+                let woke = self.0.held_reads() > 0;
+                let answer = self.0.handle(&request);
+                if woke {
+                    YieldOnce(false).await;
+                }
+                return answer;
             };
             held.await;
             // Answered as the account stands now: a reader revoked or departed while its
@@ -533,6 +541,22 @@ impl Transport for Holding {
             // generation, as at the service (Switch wire 7.4.4, 7.4.16).
             self.0.answer(&request, true)
         })
+    }
+}
+
+/// Pending once, waking itself, then ready: lets the tasks already woken run first.
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -1310,7 +1334,7 @@ impl ScriptedSwitch {
             }
             let (status, body) = bad(
                 ErrorCode::NotCurrent,
-                "Switch wire 7.2: an own app's first call carries its app.put",
+                "7.2: an own app's first call carries its app.put",
                 json!(null),
             );
             return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));

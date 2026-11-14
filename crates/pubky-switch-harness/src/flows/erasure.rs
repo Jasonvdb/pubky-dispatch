@@ -325,9 +325,9 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
 
 /// An erased account enrolled again at the same origin (Switch spec 12.7 step 4, Switch
 /// wire 7.4.16, 7.4.1). alice's signer closes her account, and the service deletes
-/// everything it held for her, its key for the account too. Her signer then declares the
-/// loss at the same origin. The service knows no account for her, so the enrollment makes
-/// a new one under a new key, which signs that answer and every answer after it. The
+/// everything it held for her, her account's mark too. Her signer then declares the loss at
+/// the same origin. The service knows no account for her, so the enrollment makes a new one
+/// with a new (0, 0) mark, under the service's one key, the erased account's too. The
 /// account starts as after a provider loss: its first document is the next generation's,
 /// at a higher version, naming the erased one as lost. Her wallet follows the recovery
 /// there, and the signer signs on.
@@ -338,8 +338,7 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the new account answers
-/// under the erased account's key or the operator's, or doesn't start at the next
-/// generation.
+/// under another key than the switch's one key, or doesn't start at the next generation.
 pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -375,8 +374,8 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
             "signer": status(&signer)?,
         }),
     );
-    // The new account's own key signs: the one its enrollment answer named, never the
-    // erased account's nor the operator's.
+    // The switch's one key signs for the new account, as it did for the erased one
+    // (Switch wire 7.1).
     // An answer the trace names no key for counts as none.
     let named =
         |answer: Option<[String; 3]>| answer.map(|[_, _, key]| key).filter(|key| !key.is_empty());
@@ -389,8 +388,7 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
         || doc.version() <= before.version()
         || delivered_under.as_deref() != Some("the account's service key of generation 2")
         || enrolled_under.is_none()
-        || enrolled_under.as_deref() == Some("the operator key")
-        || enrolled_under == erased_key
+        || enrolled_under != erased_key
     {
         return Err(format!(
             "the new account starts at generation {} from {:?}, its enrollment answered \

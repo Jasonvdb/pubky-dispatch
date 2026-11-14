@@ -421,15 +421,21 @@ impl Inner {
         });
     }
 
-    /// A mark at the account's state, for a switch made at it.
+    /// A mark at the account's state, for a switch made at it: (0, 0) before its first
+    /// item.
     pub(super) fn mark_at_state(&mut self) {
         self.created_at_ms = self.now();
-        self.marks.slot = MarkSlot::At(Mark {
-            generation: self.tip.generation,
-            seq: self.tip.seq,
-            chain_hash: self.tip.chain_hash,
-            key: self.service.verifying_key().to_bytes(),
-            created_at_ms: self.created_at_ms,
+        let key = self.service.verifying_key().to_bytes();
+        self.marks.slot = MarkSlot::At(if self.seq == 0 {
+            Mark::zero(key, self.created_at_ms)
+        } else {
+            Mark {
+                generation: self.tip.generation,
+                seq: self.tip.seq,
+                chain_hash: self.tip.chain_hash,
+                key,
+                created_at_ms: self.created_at_ms,
+            }
         });
     }
 }

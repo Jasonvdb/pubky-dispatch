@@ -773,7 +773,6 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
         body: pubky_switch_core::http::erase_body(
-            &switch.service_key(),
             switch.identity_doc().map(|doc| doc.hash()).as_ref(),
         ),
     };
@@ -931,7 +930,6 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
         body: pubky_switch_core::http::erase_body(
-            &switch.service_key(),
             switch.identity_doc().map(|doc| doc.hash()).as_ref(),
         ),
     };

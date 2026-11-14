@@ -21,7 +21,7 @@ const ORIGIN: &str = "https://switch.example";
 
 /// A service with no account, or `None` when no test database is configured.
 async fn switch(clock: Arc<TestClock>) -> Option<RealSwitch> {
-    RealSwitch::start(ORIGIN, clock, vec![[1; 32]], [2; 32], Limits::default())
+    RealSwitch::start(ORIGIN, clock, [1; 32], Limits::default())
         .await
         .expect("a service")
 }
@@ -53,7 +53,7 @@ async fn test_service_transport_takes_the_services_own_path() {
         transport.send(request(method, origin, path, body))
     };
 
-    // No such route: the operator's signed `404` (Switch wire 7.3 step 1).
+    // No such route: the `404` signed with the service key (Switch wire 7.3 step 1).
     let answer = ask("GET", ORIGIN, "/v1/someone/nowhere", Vec::new())
         .await
         .expect("an answer");

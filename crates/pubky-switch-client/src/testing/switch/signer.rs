@@ -61,6 +61,8 @@ impl ScriptedSwitch {
             inner.enrolled = None;
             inner.staged = true;
             inner.origin = origin.to_owned();
+            // No account, and no mark yet (Switch wire 7.3).
+            inner.marks = super::marks::MarkStore::default();
         }
         switch
     }
@@ -192,7 +194,7 @@ impl Inner {
         });
         // The one key it names, at every account (Switch wire 7.4.1).
         let service_key = self.service.verifying_key().to_bytes();
-        let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits);
+        let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits, 0);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
         enrolled.answers.insert(enrollment.hash(), value.clone());
         // The enrollment that makes the account names the App IDs it keeps for good; another
@@ -948,7 +950,7 @@ mod tests {
                 origin: SWITCH_ORIGIN.into(),
                 path_and_query: "/v1/x/erase".into(),
                 headers: Vec::new(),
-                body: pubky_switch_core::http::erase_body(&[0; 32], Some(&hash)),
+                body: pubky_switch_core::http::erase_body(Some(&hash)),
             };
             assert_eq!(inner.erase_answer(&erasure).0, 200);
         }
@@ -1184,7 +1186,7 @@ mod tests {
             origin: SWITCH_ORIGIN.into(),
             path_and_query: "/v1/x/erase".into(),
             headers: Vec::new(),
-            body: erase_body(&[0; 32], hash),
+            body: erase_body(hash),
         };
         let mut inner = switch.lock();
         assert!(inner.doc.is_none());

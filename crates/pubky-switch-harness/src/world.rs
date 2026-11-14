@@ -31,10 +31,6 @@ use crate::check::Checker;
 use crate::service::{RealSwitch, database_configured};
 use crate::trace::{Fault, Names, Recorder, Trace};
 
-/// The seed of the operator key every switch of a world signs with where it can't tie an
-/// answer to an account (Switch wire 7.1): the scripted switch's fixed one.
-const OPERATOR_SECRET: [u8; 32] = [42; 32];
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -60,8 +56,6 @@ pub struct World {
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
-    /// How many switches each identity was given an account's key at, by Pubky ID.
-    homes: Mutex<std::collections::HashMap<String, u8>>,
     /// The Homeserver writes and deletions to fail, each once.
     homeserver_faults: Arc<Mutex<Vec<HomeserverFault>>>,
 }
@@ -99,7 +93,6 @@ impl World {
         let names = Arc::new(Names::default());
         let router = Arc::new(Router::new());
         let checker = Arc::new(Checker::default());
-        checker.operator(IdentityKey::from_secret(OPERATOR_SECRET).public());
         let recorder = Arc::new(Recorder::new(
             router.clone() as Arc<dyn Transport>,
             names.clone(),
@@ -116,7 +109,6 @@ impl World {
             names,
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
-            homes: Mutex::new(std::collections::HashMap::new()),
             homeserver_faults: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -183,33 +175,29 @@ impl World {
         identities: &[&TestIdentity],
         limits: Limits,
     ) -> Result<(), HarnessError> {
-        // Each account's answers are verified with the service key its seed gives it here
-        // (an Ed25519 key, as an identity key is); a key an account takes later, as at a
-        // recovery in place, the checker learns from the enrollment that answers it.
-        let secrets: Vec<[u8; 32]> = identities
-            .iter()
-            .map(|identity| self.service_secret_at_next_switch(identity))
-            .collect();
-        for (identity, secret) in identities.iter().zip(&secrets) {
-            self.checker.account(
-                &identity.key().id(),
-                identity.public(),
-                IdentityKey::from_secret(*secret).public(),
-            );
+        // One service key for every account the switch hosts and every answer it can't tie
+        // to an account (Switch wire 7.1), its seed the origin's (an Ed25519 key, as an
+        // identity key is); a key an account takes later the checker learns from the
+        // enrollment that answers it.
+        let secret = self.seeds.seed(&format!("service/{origin}"));
+        let public = IdentityKey::from_secret(secret).public();
+        self.checker.switch_key(public);
+        for identity in identities {
+            self.checker
+                .account(&identity.key().id(), identity.public(), public);
         }
         match self.backend {
             Backend::Service => {
-                let switch =
-                    RealSwitch::start(origin, self.clock.clone(), secrets, OPERATOR_SECRET, limits)
-                        .await?
-                        .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
+                let switch = RealSwitch::start(origin, self.clock.clone(), secret, limits)
+                    .await?
+                    .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
                 self.router.add(origin, switch.transport());
                 lock(&self.services).push(switch);
             }
             Backend::Scripted => {
                 // A scripted switch holds one account: one per identity, behind one origin.
                 let mut accounts = Vec::with_capacity(identities.len());
-                for (identity, secret) in identities.iter().zip(secrets) {
+                for identity in identities {
                     let switch = ScriptedSwitch::unenrolled_at(
                         identity.key(),
                         secret,
@@ -241,18 +229,6 @@ impl World {
             }
         }
         Ok(())
-    }
-
-    /// The service key secret `identity`'s account takes at the next switch it is given
-    /// one at: its seed's at the first, and one derived from it at each later one, so an
-    /// identity that recovers at another service gets another key there.
-    fn service_secret_at_next_switch(&self, identity: &TestIdentity) -> [u8; 32] {
-        let mut homes = lock(&self.homes);
-        let nth = homes.entry(identity.key().id()).or_insert(0);
-        let mut secret = identity.service_secret();
-        secret[0] ^= *nth;
-        *nth = nth.saturating_add(1);
-        secret
     }
 
     /// The switch at `origin` is lost: every request to it fails to connect from now on, as

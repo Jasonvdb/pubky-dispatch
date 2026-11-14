@@ -109,7 +109,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   holding no record of the app (Switch wire 7.4.4); `recover_in_place` recovers the account
   through its own `PUT /identity`, for tests. Unlike the service, a held read looks again
   only for something to show, the erasure, the account's generation and its time; a held
-  read whose account starts failing meanwhile gets the notice once it looks again. An app whose
+  read whose account starts failing meanwhile gets the notice once it looks again. A
+  request answered through `holding_transport` while reads are held lets the reads it woke
+  answer before its own answer returns, as the service's woken reads go out while the
+  request's answer is still on its way. An app whose
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and
   the stale-timestamp check apply when the read is answered, not when it arrives.

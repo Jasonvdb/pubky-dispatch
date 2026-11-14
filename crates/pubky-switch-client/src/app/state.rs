@@ -93,6 +93,8 @@ pub(crate) mod key {
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";
+    /// The position, (generation, `seq`), of the `cert.put` that brought `cert/renewal`.
+    pub(crate) const CERT_RENEWAL_AT: &str = "cert/renewal_at";
     /// The hash of the newest renewed certificate the app's protocols refused
     /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
     /// never refused with a second event.
@@ -735,6 +737,32 @@ impl Tx {
     /// Every write in the batch, not yet committed, in order.
     pub(crate) fn pending_writes(&self) -> &[Write] {
         self.batch.writes()
+    }
+
+    /// The value the batch leaves at `key`, not yet committed: `Some(Some(value))` when its
+    /// last write there puts it, `Some(None)` when it deletes it, `None` when the batch
+    /// doesn't touch it (the store's value stands).
+    pub(crate) fn pending_get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<Option<T>>, AppError> {
+        let bytes = key.as_bytes();
+        let last = self
+            .batch
+            .writes()
+            .iter()
+            .rev()
+            .find_map(|write| match write {
+                Write::Put { key: k, value, .. } if k == bytes => Some(Some(value)),
+                Write::Delete { key: k, .. } if k == bytes => Some(None),
+                Write::DeletePrefix { prefix, .. } if bytes.starts_with(prefix) => Some(None),
+                _ => None,
+            });
+        match last {
+            Some(Some(value)) => Ok(Some(Some(decode(value)?))),
+            Some(None) => Ok(Some(None)),
+            None => Ok(None),
+        }
     }
 
     /// What the batch leaves at `key`, not yet committed: `Some(true)` when its last write

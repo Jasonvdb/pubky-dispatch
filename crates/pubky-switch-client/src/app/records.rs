@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
+use super::order::{OwedListing, Place, owed_listing_at_key, owed_listing_key};
 use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
 use super::state::Tx;
 use super::{App, AppError, IdentityRefresh};
@@ -80,12 +81,22 @@ fn listc_key(id: &[u8; 32]) -> String {
     format!("{LISTC_PREFIX}{}", b64(id))
 }
 
-/// Owe a listing of the collections from their beginning, in `tx`: `list_due` set and
-/// `list_at` deleted. Every new obligation starts the listing over, so a collection a
-/// listing under way already listed to its end is listed again: it may read members it
-/// didn't, such as after a renewal that widens the certificate (Switch spec 8.2, 8.3).
-pub(crate) fn owe_listing(tx: &mut Tx) -> Result<(), AppError> {
-    tx.put(LIST_DUE, &true)?;
+/// `list_due`: a listing of the collections is owed, owed by the feed item at `at`,
+/// (generation, `seq`), or, for `None`, outside the feed (a join, a restore, a certificate
+/// never shown on this app's feed). A protocol that owes a call before `at` has its
+/// collections left out, and is owed a listing of its own there (`order` module).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ListDue {
+    pub(crate) at: Option<(u64, u64)>,
+}
+
+/// Owe a listing of the collections from their beginning, in `tx`, owed by the feed item at
+/// `at` ([`ListDue`]): `list_due` set and `list_at` deleted. Every new obligation starts
+/// the listing over, so a collection a listing under way already listed to its end is
+/// listed again: it may read members it didn't, such as after a renewal that widens the
+/// certificate (Switch spec 8.2, 8.3).
+pub(crate) fn owe_listing(tx: &mut Tx, at: Option<(u64, u64)>) -> Result<(), AppError> {
+    tx.put(LIST_DUE, &ListDue { at })?;
     tx.delete(LIST_AT)?;
     Ok(())
 }
@@ -821,6 +832,9 @@ pub(crate) enum WriteRead {
     /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
     /// take.
     Refused,
+    /// Not judged: the protocol of its collection may not be told it yet, owing a call
+    /// before it ([`App::may_tell`]); nothing was written for it.
+    Waits,
 }
 
 /// What a read of one record came to ([`App::read_record_fresh`], Switch wire 7.4.9).
@@ -1033,7 +1047,7 @@ impl App {
         };
         let mut tx = self.tx()?;
         let read = self
-            .take_view(&view, Some((key, collection)), &mut tx)
+            .take_view(&view, Some((key, collection)), Place::Outside, &mut tx)
             .await?;
         self.commit(tx).await?;
         Ok(Some(read))
@@ -1067,7 +1081,7 @@ impl App {
                     KeptReason::Refused
                 }
                 Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
-                Ok(Some(WriteRead::Refused)) => KeptReason::Refused,
+                Ok(Some(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
                 Ok(None) => KeptReason::NotFound,
                 Err(AppError::Switch(ClientError::Switch { code, .. }))
                     if code.retry() == pubky_switch_core::http::Retry::No =>
@@ -1136,6 +1150,7 @@ impl App {
                     &mut pages,
                     Some((&mut progress, &key)),
                     Some(&budget),
+                    Place::Outside,
                 )
                 .await?;
             Ok(match listed {
@@ -1167,6 +1182,7 @@ impl App {
         pages: &mut u32,
         mut progress: Option<(&mut ListProgress, &str)>,
         budget: Option<&super::CallBudget>,
+        place: Place,
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
         let mut listed = 0u64;
@@ -1194,7 +1210,7 @@ impl App {
                     let full = std::mem::replace(&mut tx, self.tx()?);
                     self.commit(full).await?;
                 }
-                self.take_view(view, Some((&view.key, collection)), &mut tx)
+                self.take_view(view, Some((&view.key, collection)), place, &mut tx)
                     .await?;
                 listed = listed.saturating_add(1);
             }
@@ -1228,7 +1244,7 @@ impl App {
     ///
     /// A store failure.
     pub async fn listing_owed(&self) -> Result<bool, AppError> {
-        self.reader().exists(LIST_DUE).await
+        Ok(self.reader().exists(LIST_DUE).await? || !self.owed_listings().await?.is_empty())
     }
 
     /// List every collection of the protocol whose read scope the app's certificate holds
@@ -1289,7 +1305,8 @@ impl App {
         if !self.reader().exists(LIST_DUE).await? {
             return Ok(Listing::NotDue);
         }
-        if self.listing_lacks_keys() {
+        let (_, listed, _) = self.listing_now().await?;
+        if self.listing_lacks_keys(&listed) {
             return Ok(Listing::WaitsForKey);
         }
         Ok(if self.list_from_list_at(pages, budget).await? {
@@ -1308,12 +1325,7 @@ impl App {
         budget: Option<&super::CallBudget>,
     ) -> Result<bool, AppError> {
         let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
-        let collections: Vec<Collection> = self
-            .protocols
-            .collections()
-            .into_iter()
-            .filter(|c| c.readable_by(&self.state.cert))
-            .collect();
+        let (place, collections, left_out) = self.listing_now().await?;
         for collection in &collections {
             let id = collection.id(&self.state.meta.identity);
             if progress.done.contains(&b64(&id)) {
@@ -1327,6 +1339,7 @@ impl App {
                     pages,
                     Some((&mut progress, LIST_AT)),
                     budget,
+                    place,
                 )
                 .await?
             {
@@ -1336,15 +1349,113 @@ impl App {
         let mut tx = self.tx()?;
         tx.delete(LIST_DUE)?;
         tx.delete(LIST_AT)?;
+        // A protocol left out is owed its own listing at the item that owed this one, in the
+        // commit that settles it, so the obligation is never lost between the two.
+        if let Some((generation, seq)) = self.listing_at().await? {
+            for name in &left_out {
+                self.owe_listing_to(name, generation, seq, &mut tx).await?;
+            }
+        }
         self.commit(tx).await?;
         Ok(true)
     }
 
+    /// The feed item that owes the listing `list_due` holds, if one does.
+    async fn listing_at(&self) -> Result<Option<(u64, u64)>, AppError> {
+        Ok(self
+            .reader()
+            .get::<ListDue>(LIST_DUE)
+            .await?
+            .and_then(|due| due.at))
+    }
+
+    /// The owed listing's place, the readable collections it lists now, and the protocols
+    /// whose collections it leaves out: those that owe a call or a listing before the item
+    /// that owes it ([`App::may_tell`]). With none owed, an unfinished
+    /// [`App::list_collections`] goes on as asked.
+    async fn listing_now(&self) -> Result<(Place, Vec<Collection>, Vec<String>), AppError> {
+        let place = match self.listing_at().await? {
+            Some((generation, seq)) => Place::Item(self.feed_order(generation, seq)),
+            None => Place::Outside,
+        };
+        let mut listed = Vec::new();
+        let mut left_out: Vec<String> = Vec::new();
+        for registered in self.protocols.iter() {
+            let readable = registered
+                .protocol
+                .collections()
+                .into_iter()
+                .filter(|c| c.readable_by(&self.state.cert));
+            if self.may_tell(Some(&registered.name), place) {
+                listed.extend(readable);
+            } else {
+                left_out.push(registered.name.clone());
+            }
+        }
+        Ok((place, listed, left_out))
+    }
+
+    /// List the readable collections of protocol `name`, the listing owed to it alone
+    /// (`listo/<name>`, `order` module), at its turn in its feed order (`App::retry_owed`):
+    /// from where it got (`listop/<name>`), at most `pages` pages, each page's commit
+    /// recording how far it got. The commit of its last page deletes both. It waits, as an
+    /// owed listing does, while the certificate lacks a key of a scope reading one of them,
+    /// after one fetch of the key bundle.
+    pub(crate) async fn make_owed_listing(
+        &mut self,
+        name: &str,
+        listing: OwedListing,
+        pages: &mut u32,
+        budget: Option<&super::CallBudget>,
+    ) -> Result<Listing, AppError> {
+        let collections: Vec<Collection> = self
+            .protocols
+            .get(name)
+            .map(|protocol| protocol.collections())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.readable_by(&self.state.cert))
+            .collect();
+        if self.listing_lacks_keys(&collections) {
+            self.fetch_key_parts().await?;
+            if self.listing_lacks_keys(&collections) {
+                return Ok(Listing::WaitsForKey);
+            }
+        }
+        let place = Place::Item(self.feed_order(listing.generation, listing.seq));
+        let key = owed_listing_at_key(name);
+        let mut progress: ListProgress = self.reader().get(&key).await?.unwrap_or_default();
+        for collection in &collections {
+            let id = collection.id(&self.state.meta.identity);
+            if progress.done.contains(&b64(&id)) {
+                continue;
+            }
+            let after = progress.after(&id)?;
+            if let Listed::Paused(_) = self
+                .list_from(
+                    collection,
+                    after,
+                    pages,
+                    Some((&mut progress, &key)),
+                    budget,
+                    place,
+                )
+                .await?
+            {
+                return Ok(Listing::Unfinished);
+            }
+        }
+        let mut tx = self.tx()?;
+        tx.delete(&owed_listing_key(name))?;
+        tx.delete(&key)?;
+        self.commit(tx).await?;
+        Ok(Listing::Listed)
+    }
+
     /// Whether the certificate lacks, at the current data epoch, the key of a scope it
-    /// holds that reads a collection of the protocol (Switch spec 3.5).
-    fn listing_lacks_keys(&self) -> bool {
+    /// holds that reads one of `collections` (Switch spec 3.5).
+    fn listing_lacks_keys(&self, collections: &[Collection]) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        let collections = self.protocols.collections();
         self.state.cert.scopes().iter().any(|scope| {
             self.protocols.has_keys(scope)
                 && self.state.scope_keys.get(epoch, scope).is_none()
@@ -1399,8 +1510,15 @@ impl App {
                 stub: None,
                 view_version: Some(record.version),
             };
-            self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
-                .await?;
+            // A write taken already, at its place, opened now: no later write (`order`).
+            self.read_write(
+                &evidence,
+                Some((&put.key, &collection)),
+                put.key,
+                Place::Outside,
+                &mut tx,
+            )
+            .await?;
         }
         if self.reader().exists(REOPEN_DUE).await? {
             tx.delete(REOPEN_DUE)?;
@@ -1455,6 +1573,7 @@ impl App {
         &mut self,
         view: &SharedRecordView,
         expect: Option<(&[u8; 32], &Collection)>,
+        place: Place,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
         let evidence = Evidence {
@@ -1464,29 +1583,33 @@ impl App {
             stub: None,
             view_version: Some(RecordVersion::new(view.generation, view.version)),
         };
-        let read = self.read_write(&evidence, expect, view.key, tx).await?;
+        let read = self
+            .read_write(&evidence, expect, view.key, place, tx)
+            .await?;
         // Only a view of the key asked for says anything of that record's uploads.
-        if expect.is_none_or(|(asked, _)| *asked == view.key) {
-            self.note_view_divergence(&view.key, view.divergent, tx)
+        if read != WriteRead::Waits && expect.is_none_or(|(asked, _)| *asked == view.key) {
+            self.note_view_divergence(&view.key, view.divergent, place, tx)
                 .await?;
         }
         Ok(read)
     }
 
     /// A `record.put` chain item from the feed, its stub verified (Switch spec 8.3): taken
-    /// if newer than what the app holds.
+    /// if newer than what the app holds, at its place in feed order: one the protocol of
+    /// its collection may not be told yet is [`WriteRead::Waits`], and the read holds it.
     pub(crate) async fn feed_record_write(
         &mut self,
         item: &ChainItem,
         envelope: &ChainEnvelope,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<WriteRead, AppError> {
         let Ok(op) = SignedOp::peek(&item.item) else {
-            return Ok(());
+            return Ok(WriteRead::Refused);
         };
         let OpKind::RecordPut(put) = &op.body().kind else {
-            return Ok(());
+            return Ok(WriteRead::Refused);
         };
+        let place = Place::Item(self.feed_order(envelope.generation, item.seq));
         let evidence = Evidence {
             op: &item.item,
             cert: None,
@@ -1497,17 +1620,29 @@ impl App {
         let key = put.key;
         let mut viewed = None;
         let read = self
-            .judge_write(&evidence, None, key, tx, &mut viewed)
+            .judge_write(&evidence, None, key, place, tx, &mut viewed)
             .await?;
+        if read == WriteRead::Waits {
+            // Held for its protocol: the records an upload marked wait behind it.
+            let protocol = self.write_protocol(&evidence, None, &key, tx).await?;
+            self.note_gate_held(protocol.as_deref(), envelope.generation, item.seq, tx)
+                .await?;
+            return Ok(read);
+        }
         match viewed {
             // The record's view, read to judge the write, is the switch's latest word.
-            Some(divergent) => self.note_view_divergence(&key, divergent, tx).await?,
+            Some(divergent) => {
+                self.note_view_divergence(&key, divergent, place, tx)
+                    .await?;
+            }
             // A newer write clears the record's divergent uploads before it (Switch wire
             // 7.4.14); the write held doesn't: uploads after it may conflict with it.
-            None if read == WriteRead::Taken => self.note_divergent(&key, false, tx).await?,
+            None if read == WriteRead::Taken => {
+                self.note_divergent(&key, false, place, tx).await?;
+            }
             None => {}
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Check a write and take it, or flag it, or raise the rollback it proves; a view
@@ -1517,28 +1652,48 @@ impl App {
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
+        place: Place,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
         let mut viewed = None;
         let read = self
-            .judge_write(evidence, expect, shown_key, tx, &mut viewed)
+            .judge_write(evidence, expect, shown_key, place, tx, &mut viewed)
             .await?;
         if let Some(divergent) = viewed {
-            self.note_view_divergence(&shown_key, divergent, tx).await?;
+            self.note_view_divergence(&shown_key, divergent, place, tx)
+                .await?;
         }
         Ok(read)
     }
 
     /// [`App::read_write`], with `viewed` set to the `divergent` of a view of `shown_key`
     /// read to judge the write, if one was.
+    ///
+    /// Every write the app judges for a protocol goes through here, from the feed, a
+    /// listing, a read again or a reopening, at `place` in the order that protocol is told
+    /// things: one it may not be told yet ([`App::may_tell`]) is [`WriteRead::Waits`],
+    /// before anything is read or written for it, so no check, mark, flag, divergence or
+    /// event reaches it past a call it owes (Switch spec 8.3). The record's protocol is the
+    /// collection's asked for, else the record's as the app holds or names it, else that of
+    /// the collection the write names; one of none of them can't be placed, and waits
+    /// while any protocol owes.
     async fn judge_write(
         &mut self,
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
+        place: Place,
         tx: &mut Tx,
         viewed: &mut Option<bool>,
     ) -> Result<WriteRead, AppError> {
+        if place != Place::Outside {
+            let protocol = self
+                .write_protocol(evidence, expect, &shown_key, tx)
+                .await?;
+            if !self.may_tell(protocol.as_deref(), place) {
+                return Ok(WriteRead::Waits);
+            }
+        }
         let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
             .stub
@@ -1580,7 +1735,7 @@ impl App {
         }
         match outcome {
             Ok(accepted) => {
-                return Ok(match self.take_write(accepted, false, tx).await? {
+                return Ok(match self.take_write(accepted, false, place, tx).await? {
                     Taken::New => WriteRead::Taken,
                     Taken::Same | Taken::Reopened => WriteRead::Held,
                     Taken::NotNewer => WriteRead::NotNewer,
@@ -2275,6 +2430,7 @@ impl App {
         &mut self,
         mut accepted: Accepted,
         own: bool,
+        place: Place,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         let key = accepted.key;
@@ -2395,6 +2551,7 @@ impl App {
                         version: accepted.version.version.version,
                         mark_bytes: u64::try_from(mark.len()).unwrap_or(u64::MAX),
                     },
+                    place,
                 )?;
             }
             Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
@@ -2474,8 +2631,8 @@ impl App {
             Ok(accepted) => {
                 // The app's own write at this service clears the record's divergent
                 // uploads there (Switch wire 7.4.14).
-                if self.take_write(accepted, true, tx).await? == Taken::New {
-                    self.note_divergent(&key, false, tx).await?;
+                if self.take_write(accepted, true, Place::Outside, tx).await? == Taken::New {
+                    self.note_divergent(&key, false, Place::Outside, tx).await?;
                 }
             }
             Err(Refused::Misbehaviour(reason)) => {
@@ -2682,21 +2839,87 @@ impl App {
 
     /// A chain item of the shared state in the feed: a record write, a claim entry, a list
     /// change, or another own app's record, whose certificate is kept for its writes.
+    /// Returns whether the item waits: a record write whose protocol may not be told it yet
+    /// ([`WriteRead::Waits`]), which the read holds.
     pub(crate) async fn feed_shared_item(
         &mut self,
         item: &ChainItem,
         envelope: &ChainEnvelope,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let Ok(op) = SignedOp::peek(&item.item) else {
-            return Ok(());
+            return Ok(false);
         };
         match &op.body().kind {
-            OpKind::RecordPut(_) => self.feed_record_write(item, envelope, tx).await,
-            OpKind::Claim(_) => self.feed_claim_entry(item, envelope, tx).await,
-            OpKind::AppPut { record } => self.feed_app_record(record, tx),
-            _ => self.feed_list_change(item, tx),
+            OpKind::RecordPut(_) => {
+                Ok(self.feed_record_write(item, envelope, tx).await? == WriteRead::Waits)
+            }
+            OpKind::Claim(_) => self
+                .feed_claim_entry(item, envelope, tx)
+                .await
+                .map(|()| false),
+            OpKind::AppPut { record } => self.feed_app_record(record, tx).map(|()| false),
+            _ => self.feed_list_change(item, tx).map(|()| false),
         }
+    }
+
+    /// The protocol a write is judged for ([`App::judge_write`]): the collection's asked
+    /// for, else the record's as the app holds it or names it pending, else that of the
+    /// protocol's collection the write names; `None` when none of them is a registered
+    /// protocol's.
+    async fn write_protocol(
+        &self,
+        evidence: &Evidence<'_>,
+        expect: Option<(&[u8; 32], &Collection)>,
+        shown_key: &[u8; 32],
+        tx: &Tx,
+    ) -> Result<Option<String>, AppError> {
+        if let Some((_, collection)) = expect {
+            return Ok(self
+                .protocols
+                .of_collection(&collection.name)
+                .map(|registered| registered.name.clone()));
+        }
+        if let Some(name) = self.record_protocol_in(shown_key, tx).await? {
+            return Ok(Some(name));
+        }
+        let named = SignedOp::peek(evidence.op)
+            .ok()
+            .and_then(|op| match &op.body().kind {
+                OpKind::RecordPut(put) => self.collection_of(put),
+                _ => None,
+            });
+        Ok(named.and_then(|collection| {
+            self.protocols
+                .of_collection(&collection.name)
+                .map(|registered| registered.name.clone())
+        }))
+    }
+
+    /// [`App::record_protocol`], `tx`'s writes included: a record taken in `tx` is placed by
+    /// the collection it is taken in.
+    pub(crate) async fn record_protocol_in(
+        &self,
+        key: &[u8; 32],
+        tx: &Tx,
+    ) -> Result<Option<String>, AppError> {
+        let collection = match tx.pending_get::<HeldRecord>(&record_key_of(key))? {
+            Some(Some(held)) => Some(held.collection),
+            Some(None) => None,
+            None => self.held_record(key).await?.map(|held| held.collection),
+        };
+        let collection = match collection {
+            Some(name) => Some(name),
+            None => match tx.pending_get::<String>(&pending_name_key(key))? {
+                Some(name) => name,
+                None => self.reader().get::<String>(&pending_name_key(key)).await?,
+            },
+        };
+        Ok(collection.and_then(|name| {
+            self.protocols
+                .of_collection(&name)
+                .map(|registered| registered.name.clone())
+        }))
     }
 
     /// The protocol whose collection holds the record at `key`, as far as the app knows: the

@@ -143,9 +143,9 @@ impl App {
     /// expiry asked (this protocol's or another's) at or before now, naming the protocol
     /// that asked for it, a member the switch would refuse, or a record over the operation
     /// cap, before anything is signed. When another protocol's expiry has lapsed, this
-    /// protocol's `expires_at`, if later than now, is kept for the next signing, and its
-    /// `member` is not: the next record signed, at any protocol's change, carries the
-    /// expiry with the member the record held. [`Refusal::Stopped`], [`Refusal::Left`] or
+    /// protocol's `expires_at`, if later than now or `None`, is kept for the next signing,
+    /// and its `member` is not: the next record signed, at any protocol's change, carries
+    /// the expiry with the member the record held. [`Refusal::Stopped`], [`Refusal::Left`] or
     /// [`Refusal::Gone`]; a store failure;
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
@@ -203,10 +203,10 @@ impl App {
     /// The expiry each protocol asked of the record (`rexp`), with `protocol`'s now
     /// `expires_at`.
     ///
-    /// Each protocol's ask is its own: one that is later than now is kept, in a commit of
-    /// its own, even while another protocol's has lapsed and the record can't be signed, so
-    /// two protocols whose expiries lapsed each renew in turn, and the record is signed
-    /// once neither is lapsed. The host may renew for a protocol that doesn't.
+    /// Each protocol's ask is its own: one that is later than now, or `None`, is kept, in a
+    /// commit of its own, even while another protocol's has lapsed and the record can't be
+    /// signed, so two protocols whose expiries lapsed each renew in turn, and the record is
+    /// signed once neither is lapsed. The host may renew for a protocol that doesn't.
     ///
     /// # Errors
     ///

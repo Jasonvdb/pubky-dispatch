@@ -808,6 +808,15 @@ pub enum AppEvent {
         /// The record key.
         key: [u8; 32],
     },
+    /// The switch's current write of a shared record the app holds is one it didn't take
+    /// on the service's word only, a missing date or the certificate the service chose: it
+    /// names nobody, the record keeps what the app trusts and reads as
+    /// [`super::SharedRecord::not_taken`], and the app's next write builds on that write's
+    /// version (Switch spec 8.2). Told once for each newer such write the app follows.
+    WriteNotTaken {
+        /// The record key.
+        key: [u8; 32],
+    },
     /// A shared record write failed a check, or went back on what the app had seen: it is
     /// ignored and shown with the app that signed it (Switch spec 8.2, 10.3).
     WriteFlagged {

@@ -3328,24 +3328,26 @@ impl App {
     /// ([`ReceivedMessage::position`]), in feed order (Switch spec 8.3): the order in
     /// which the app reads the items and hands its protocols the calls it owes them. A
     /// protocol orders what it keeps by it, never by the `(generation, seq)` pair, which
-    /// puts an entry read before a move after one read since.
+    /// puts an entry read before a move after one read since. `None` where the app can't
+    /// tell: the protocol then holds whatever depends on the order.
     ///
     /// The order is the app's, as its newest own `identity.json` tells it:
+    /// - **One generation:** by `seq`.
     /// - **Within the current sequence** the positions compare by `seq` alone, whatever
     ///   generation names them: a cooperative move and a key change in place continue it.
-    /// - **A sequence a provider loss ended** comes before the current one, by generation,
-    ///   then `seq`. The newest `identity.json` names only the newest loss, so two positions
-    ///   of one lost sequence read at different generations, across a move before the loss,
-    ///   may compare out of feed order, and positions that compared by `seq` before a loss
-    ///   compare by generation after it.
-    /// - **A generation past the newest own `identity.json`** the app follows, as a restore
-    ///   in place may carry, is of a sequence it doesn't know yet: it comes after everything
-    ///   it knows, by generation, then `seq`, until the app follows it.
+    /// - **A sequence a provider loss ended** comes before the current one, and before a
+    ///   generation past the newest own `identity.json`.
+    /// - **Otherwise**, two generations of which the app doesn't know whether a loss
+    ///   separates them: of lost sequences (the newest `identity.json` names only the newest
+    ///   loss, and a lost sequence may have spanned a move), or past the newest own
+    ///   `identity.json` the app follows, as a restore in place may carry. Where their
+    ///   generations and their `seq`s order them the same way, that is the order, either way;
+    ///   where they disagree, `None`.
     ///
-    /// So the order of two positions is stable while the app follows one sequence; a
-    /// protocol that stores an order it took compares again after a provider loss
-    /// ([`super::Protocol::provider_lost`]) rather than keep it.
-    pub fn received_order(&self, a: FeedPosition, b: FeedPosition) -> std::cmp::Ordering {
+    /// An order given before a provider loss may be unknown after it, since positions of the
+    /// sequence it ended no longer compare by `seq` alone: a protocol that keeps an order it
+    /// took compares again after a loss ([`super::Protocol::provider_lost`]).
+    pub fn received_order(&self, a: FeedPosition, b: FeedPosition) -> Option<std::cmp::Ordering> {
         received_order(&self.state, a, b)
     }
 
@@ -4173,12 +4175,31 @@ pub(crate) fn feed_place(state: &AppState, generation: u64, seq: u64) -> (u8, u6
     }
 }
 
-/// Compare two feed positions in feed order, as the app `state` knows it
-/// ([`App::received_order`]).
+/// Compare two feed positions in feed order, as the app `state` knows it, `None` where it
+/// can't tell ([`App::received_order`]).
 pub(crate) fn received_order(
     state: &AppState,
     a: FeedPosition,
     b: FeedPosition,
-) -> std::cmp::Ordering {
-    feed_place(state, a.generation, a.seq).cmp(&feed_place(state, b.generation, b.seq))
+) -> Option<std::cmp::Ordering> {
+    let by_seq = a.seq.cmp(&b.seq);
+    if a.generation == b.generation {
+        return Some(by_seq);
+    }
+    let (class_a, class_b) = (
+        feed_place(state, a.generation, a.seq).0,
+        feed_place(state, b.generation, b.seq).0,
+    );
+    match (class_a, class_b) {
+        // Both of the current sequence.
+        (1, 1) => Some(by_seq),
+        // A lost sequence and a later one: the current, or one past it.
+        (0, 1) | (1, 0) | (0, 2) | (2, 0) => Some(class_a.cmp(&class_b)),
+        // Whether a loss separates them is unknown: one sequence orders them by `seq`,
+        // two by generation.
+        _ => {
+            let by_generation = a.generation.cmp(&b.generation);
+            (by_generation == by_seq).then_some(by_seq)
+        }
+    }
 }

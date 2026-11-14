@@ -852,7 +852,8 @@ impl App {
                     && self.may_attempt(false).is_err()
                 {
                     let mut tx = self.tx()?;
-                    self.kept_batch_dropped(&id, &pending, &batch, &mut tx)?;
+                    self.kept_batch_dropped(&id, &pending, &batch, &mut tx)
+                        .await?;
                     self.commit(tx).await?;
                     continue;
                 }
@@ -871,7 +872,8 @@ impl App {
             }
             if past {
                 let mut tx = self.tx()?;
-                self.kept_batch_dropped(&id, &pending, &batch, &mut tx)?;
+                self.kept_batch_dropped(&id, &pending, &batch, &mut tx)
+                    .await?;
                 self.commit(tx).await?;
                 continue;
             }
@@ -1059,6 +1061,7 @@ impl App {
         let reason = KeptBatchDrop::Refused {
             code: code.as_str().to_owned(),
         };
+        self.end_dropped_holds(id, pending, &mut tx).await?;
         self.end_kept_batch(id, pending, Ended::Dropped(reason), &mut tx)?;
         let to = self.batch_owners(pending);
         self.keep_duty_for(
@@ -1091,7 +1094,7 @@ impl App {
             return Err(error);
         }
         let mut tx = self.tx()?;
-        self.kept_batch_dropped(id, pending, batch, &mut tx)?;
+        self.kept_batch_dropped(id, pending, batch, &mut tx).await?;
         self.commit(tx).await
     }
 
@@ -1170,6 +1173,7 @@ impl App {
                         code: code.as_str().to_owned(),
                     };
                     let mut tx = self.tx()?;
+                    self.end_dropped_holds(id, pending, &mut tx).await?;
                     self.end_kept_batch(id, pending, Ended::Dropped(reason), &mut tx)?;
                     self.commit(tx).await?;
                 }
@@ -1319,6 +1323,39 @@ pub(crate) async fn kept_queued(
 }
 
 impl App {
+    /// End, in `tx`, the holds ([`App::hold_message`]) of the messages the kept batch
+    /// `batch_id` would queue, as the batch is dropped: the delivery of each ends with it,
+    /// unless the outbox holds the message or another kept batch this commit keeps would
+    /// queue it too.
+    pub(crate) async fn end_dropped_holds(
+        &self,
+        batch_id: &[u8; 16],
+        pending: &PendingBatch,
+        tx: &mut super::state::Tx,
+    ) -> Result<(), AppError> {
+        let others: Vec<PendingBatch> = self
+            .kept_batches()
+            .await?
+            .into_iter()
+            .filter(|(id, _)| id != batch_id && tx.pending_state(&pending_key(id)) != Some(false))
+            .map(|(_, other)| other)
+            .collect();
+        for item in &pending.queued {
+            let msg_id = item.msg_id();
+            let in_outbox = match tx.pending_state(&super::send::out_key(msg_id)) {
+                Some(put) => put,
+                None => self.reader().exists(&super::send::out_key(msg_id)).await?,
+            };
+            let elsewhere = others
+                .iter()
+                .any(|other| other.queued.iter().any(|queued| queued.msg_id() == msg_id));
+            if !in_outbox && !elsewhere {
+                super::send::end_message_hold(tx, msg_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The batches kept under `opq/`, by ID.
     pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
         self.reader()
@@ -1377,7 +1414,7 @@ impl App {
                 // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
                 // batches"), reported in the commit that drops it.
                 let mut tx = self.tx()?;
-                self.kept_batch_dropped(id, pending, batch, &mut tx)?;
+                self.kept_batch_dropped(id, pending, batch, &mut tx).await?;
                 return self.commit(tx).await;
             }
             Err(AppError::Switch(ClientError::Switch {

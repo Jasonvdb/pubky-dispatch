@@ -21,6 +21,15 @@ pub enum Alarm {
         /// The rule the chain broke.
         reason: String,
     },
+    /// A protocol on top found, in what the service signed about its own data, that the
+    /// service went back on its state or contradicts itself, and raised the alarm
+    /// ([`super::App::raise_rollback`], Switch spec 10.1). Resolved as [`Alarm::Rollback`].
+    ProtocolRollback {
+        /// The protocol that raised it.
+        protocol: String,
+        /// The rule the service broke, without content.
+        reason: String,
+    },
     /// Two `identity.json` bodies of the own identity at one version (Switch spec 4.3).
     Equivocation {
         /// The version.
@@ -59,6 +68,9 @@ impl std::fmt::Display for Alarm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Alarm::Rollback { reason } => write!(f, "rollback or fork: {reason}"),
+            Alarm::ProtocolRollback { protocol, reason } => {
+                write!(f, "rollback found by {protocol}: {reason}")
+            }
             Alarm::Equivocation { version } => {
                 write!(
                     f,

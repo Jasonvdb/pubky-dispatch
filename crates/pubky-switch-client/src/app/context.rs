@@ -417,12 +417,13 @@ impl<'a> ReceiveContext<'a> {
         self.state.service_time.map(|time| time.highest_ms)
     }
 
-    /// Compare two feed positions in feed order, as [`super::App::received_order`] does.
+    /// Compare two feed positions in feed order, `None` where the app can't tell, as
+    /// [`super::App::received_order`] does.
     pub fn received_order(
         &self,
         a: super::FeedPosition,
         b: super::FeedPosition,
-    ) -> std::cmp::Ordering {
+    ) -> Option<std::cmp::Ordering> {
         super::feed::received_order(self.state, a, b)
     }
 

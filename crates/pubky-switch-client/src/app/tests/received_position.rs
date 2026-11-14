@@ -212,12 +212,18 @@ async fn test_received_order_compares_by_seq_across_a_key_change() {
     app.receive(None).await.unwrap();
     assert_eq!(app.cursor().generation, 2);
     assert!(after > before);
-    assert_eq!(app.received_order(at(1, before), at(2, after)), Less);
-    assert_eq!(app.received_order(at(2, before), at(1, after)), Less);
+    assert_eq!(app.received_order(at(1, before), at(2, after)), Some(Less));
+    assert_eq!(app.received_order(at(2, before), at(1, after)), Some(Less));
     assert!((2, before) > (1, after), "the plain pair says otherwise");
-    assert_eq!(app.received_order(at(1, after), at(2, after)), Equal);
-    assert_eq!(app.received_order(at(3, 1), at(2, after)), Greater);
-    assert_eq!(app.received_order(at(3, 1), at(4, 1)), Less);
+    assert_eq!(app.received_order(at(1, after), at(2, after)), Some(Equal));
+    // Past the followed generation: whether a loss came between is unknown, so the order
+    // is known only where generation and `seq` agree.
+    assert_eq!(
+        app.received_order(at(3, after + 5), at(2, after)),
+        Some(Greater)
+    );
+    assert_eq!(app.received_order(at(3, 1), at(2, after)), None);
+    assert_eq!(app.received_order(at(3, 1), at(4, 1)), None);
 }
 
 /// After a provider loss the lost sequence comes first, whatever its `seq`, and the new one
@@ -231,7 +237,11 @@ async fn test_received_order_puts_a_lost_sequence_first() {
         .await
         .unwrap();
     assert_eq!(app.cursor().generation, 2);
-    assert_eq!(app.received_order(at(1, 100), at(2, 1)), Less);
-    assert_eq!(app.received_order(at(2, 3), at(2, 5)), Less);
-    assert_eq!(app.received_order(at(2, 1), at(1, 100)), Greater);
+    assert_eq!(app.received_order(at(1, 100), at(2, 1)), Some(Less));
+    assert_eq!(app.received_order(at(2, 3), at(2, 5)), Some(Less));
+    assert_eq!(app.received_order(at(2, 1), at(1, 100)), Some(Greater));
+    // The lost sequence comes before a generation past the followed one too; two such
+    // generations whose `seq`s disagree with them are unknown.
+    assert_eq!(app.received_order(at(1, 100), at(3, 1)), Some(Less));
+    assert_eq!(app.received_order(at(3, 5), at(4, 2)), None);
 }

@@ -9908,7 +9908,14 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
         path: "/directory".into(),
         after: 0,
     });
+    phone.take_events();
     phone.read_record(&target).await.unwrap();
+    let told = phone
+        .take_events()
+        .iter()
+        .filter(|e| matches!(e, AppEvent::WriteNotTaken { key: k } if *k == key))
+        .count();
+    assert_eq!(told, 1, "the protocol is told once");
     assert!(phone.flagged_writes().await.unwrap().is_empty());
     let held = phone.held_record(&key).await.unwrap().unwrap();
     assert_eq!(held.base_version(), proven);

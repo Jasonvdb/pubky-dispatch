@@ -1472,6 +1472,7 @@ impl App {
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
             .into_iter()
+            .map(|(msg_id, _)| msg_id)
             .filter(|msg_id| carried.items.iter().any(|item| item.msg_id() == msg_id))
             .collect();
         backup.outbox = carried.items;
@@ -2025,7 +2026,19 @@ impl App {
                 .into_iter()
                 .map(|(rest, _)| rest)
                 .collect();
-            let old_message_holds = send::held_messages_of(&old, env.clock.now_ms()).await?;
+            // The store's message holds of the messages the restored outbox owes: the
+            // restore replaces the outbox, which ends the delivery of every other one.
+            let old_message_holds: Vec<String> = send::held_messages_of(&old, env.clock.now_ms())
+                .await?
+                .into_iter()
+                .map(|(msg_id, _)| msg_id)
+                .filter(|msg_id| {
+                    backup
+                        .outbox
+                        .iter()
+                        .any(|item| item.msg_id() == msg_id && item.delivery_pending())
+                })
+                .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
@@ -3005,7 +3018,7 @@ impl App {
     }
 
     /// [`Refusal::Usage`] for a name no protocol of the app is registered under.
-    fn check_registered(&self, protocol: &str) -> Result<(), AppError> {
+    pub(crate) fn check_registered(&self, protocol: &str) -> Result<(), AppError> {
         if self.protocols.contains(protocol) {
             Ok(())
         } else {
@@ -3381,35 +3394,45 @@ impl App {
         Ok(())
     }
 
-    /// Raise the rollback alarm on a protocol's evidence ([`Alarm::Rollback`], Switch spec
-    /// 10.1): for a protocol that finds, in what the service signed for its own data, that
-    /// the service went back on it or contradicts itself, such as a shared record write
-    /// that breaks a rule only the service's state could break. The app keeps the alarm and
-    /// stops, as for one it found itself: every later call is refused until the user
-    /// resolves it, by moving to another provider or declaring a provider loss.
+    /// Raise the rollback alarm for the protocol `protocol` on its evidence
+    /// ([`Alarm::ProtocolRollback`], Switch spec 10.1): for a protocol that finds, in what
+    /// the service signed for its own data, that the service went back on it or contradicts
+    /// itself, such as a shared record write that breaks a rule only the service's state
+    /// could break. The app keeps the alarm and stops, as for one it found itself: every
+    /// later call is refused, for every protocol of the app, not only the one that raised
+    /// it, until the user resolves it, by moving to another provider or declaring a provider
+    /// loss. The store keeps it: only a restore or a fresh join, on a store without it,
+    /// starts again without it. So a protocol raises it only on evidence the service
+    /// signed, never on a doubt of its own.
     ///
     /// `reason` names the rule broken, without content: it is kept and shown, cut to
     /// [`MAX_REGRESSION_REASON_BYTES`], 256 bytes, at a character boundary. Returns the
-    /// alarm the app holds: this one, kept and told ([`AppEvent::Alarm`]) in the commit that
-    /// raises it, or the alarm it held already, which stays as it was. A protocol that finds
-    /// the evidence in a receive step answers it so the read doesn't pass the entry, and the
-    /// host raises it after the read returns.
+    /// alarm the app holds: this one, kept and told ([`AppEvent::Alarm`], naming
+    /// `protocol`) in the commit that raises it, or the alarm it held already, which stays
+    /// as it was. A protocol that finds the evidence in a receive step answers it so the
+    /// read doesn't pass the entry, and the host raises it after the read returns.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Left`] for an app that left; a store failure, after which the app isn't
-    /// stopped on this alarm: the host raises it again, and one the store kept after all is
-    /// the alarm then returned.
-    pub async fn raise_rollback(&mut self, reason: impl Into<String>) -> Result<Alarm, AppError> {
+    /// [`Refusal::Usage`] for a protocol not registered; [`Refusal::Left`] for an app that
+    /// left; a store failure, after which the app isn't stopped on this alarm: the host
+    /// raises it again, and one the store kept after all is the alarm then returned.
+    pub async fn raise_rollback(
+        &mut self,
+        protocol: &str,
+        reason: impl Into<String>,
+    ) -> Result<Alarm, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            self.check_registered(protocol)?;
             if self.state.leave.is_some() {
                 return Err(Refusal::Left.into());
             }
             if let Some(held) = &self.state.alarm {
                 return Ok(held.clone());
             }
-            let alarm = Alarm::Rollback {
+            let alarm = Alarm::ProtocolRollback {
+                protocol: protocol.to_owned(),
                 reason: records::cut_reason(reason.into()),
             };
             let mut tx = self.tx()?;

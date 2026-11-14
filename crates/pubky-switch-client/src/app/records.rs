@@ -1720,6 +1720,9 @@ impl App {
             held.follow_deleted = deleted;
             held.follow_named = named;
             tx.put(&record_key_of(key), &held)?;
+            if !named {
+                self.events.push(AppEvent::WriteNotTaken { key: *key });
+            }
         }
         Ok(())
     }

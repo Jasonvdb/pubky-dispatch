@@ -22,50 +22,95 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use pubky_switch_core::{
     chain::{ChainTip, SignedHead},
     enc::b64,
-    http::{self as wire_http, header},
+    http::{self as wire_http, BodyField, ReceivedHeaders, ReceivedRequest, header},
     time::rfc3339,
 };
 
 use super::{Answer, Service, unsigned};
 use crate::{
-    http::{SwitchResponse, error::ApiError},
+    http::{Refusal, SwitchRequest, SwitchResponse, error::ApiError},
     keys::{KeyId, Mark, ServiceSigner, sign_head},
     store::{AccountTxn, Keyed},
 };
 
-/// The request an answer answers, as the response signature covers it (Switch wire 7.1): its
-/// method, its path as sent without the query, and its signature bytes, `None` when it has
-/// none that decodes.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Asked<'a> {
+/// The request a response answers, exactly as the service received it (Switch wire 7.1),
+/// built once per request from what the transport received, before the service routes it.
+///
+/// The body field comes from what was received, never from a call site: a [`SwitchRequest`]
+/// holds a body the transport read whole, so it binds the body's hash; a [`Refusal`] binds
+/// it only where the transport read the body, so a body over its cap binds the empty field.
+/// The public read binds no header, by its call, in the core
+/// ([`received_request`](wire_http::received_request)).
+#[derive(Debug)]
+pub(super) struct Received<'a> {
     method: &'a str,
-    path: &'a str,
-    signature: Option<[u8; 64]>,
+    path_and_query: &'a str,
+    origin: &'a str,
+    body: BodyField,
+    headers: ReceivedHeaders,
 }
 
-impl<'a> Asked<'a> {
-    /// The request with `method`, `path_and_query` and `headers`.
-    pub(super) fn of(method: &'a str, path_and_query: &'a str, headers: &HeaderMap) -> Self {
-        Asked {
+/// The headers of `map` a received request covers, each value in the order received.
+fn received_headers(map: &HeaderMap) -> ReceivedHeaders {
+    ReceivedHeaders::of(
+        map.iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+}
+
+impl<'a> Received<'a> {
+    /// A request the transport read whole, at the switch origin `origin`.
+    pub(super) fn read(request: &'a SwitchRequest, origin: &'a str) -> Self {
+        Received {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            origin,
+            body: BodyField::read(&request.body),
+            headers: received_headers(&request.headers),
+        }
+    }
+
+    /// A request the transport refused, at the switch origin `origin`: an unknown route,
+    /// whose body it read, or a body over its call's cap, which it didn't (Switch wire 7.1).
+    pub(super) fn refused(refusal: &'a Refusal, origin: &'a str) -> Self {
+        let (method, path_and_query, headers, body) = match refusal {
+            Refusal::UnknownRoute {
+                method,
+                path_and_query,
+                headers,
+                body,
+            } => (method, path_and_query, headers, BodyField::read(body)),
+            Refusal::TooLarge {
+                method,
+                path_and_query,
+                headers,
+                ..
+            } => (method, path_and_query, headers, BodyField::NotRead),
+        };
+        Received {
             method,
-            path: wire_http::path_of(path_and_query),
-            signature: wire_http::request_signature_of(
-                headers
-                    .get(header::SIGNATURE)
-                    .and_then(|value| value.to_str().ok()),
-            ),
+            path_and_query,
+            origin,
+            body,
+            headers: received_headers(headers),
         }
     }
 
-    /// The same request with its signature left out of the answer's: the public read's
-    /// answer is the same for every reader (Switch wire 7.4.15).
-    pub(super) fn unsigned(self) -> Self {
-        Asked {
-            signature: None,
-            ..self
-        }
+    /// The request every answer to it signs.
+    pub(super) fn asked(&self) -> Asked<'_> {
+        Asked(ReceivedRequest {
+            method: self.method,
+            path_and_query: self.path_and_query,
+            body: self.body,
+            origin: self.origin,
+            headers: &self.headers,
+        })
     }
 }
+
+/// The request an answer answers, as the response signature covers it ([`Received`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Asked<'a>(ReceivedRequest<'a>);
 
 /// What shows the account still names the key an answer is signed with.
 pub(super) enum Proof<'a> {
@@ -122,8 +167,8 @@ impl Signing<'_> {
     }
 }
 
-/// Sign `answer` (Switch wire 7.1): the response signature over its status, the method and
-/// path of the request it answers, the request signature, `Switch-Server-Time`, the
+/// Sign `answer` (Switch wire 7.1): the response signature over its status, the request it
+/// answers as the service received it, `Switch-Server-Time`, the head field of the
 /// `Switch-Head` text as sent and the body.
 fn sign_answer(
     signer: &ServiceSigner,
@@ -141,9 +186,7 @@ fn sign_answer(
         signer,
         &wire_http::ResponseParts {
             status: answer.status,
-            method: asked.method,
-            path: asked.path,
-            request_signature: asked.signature.as_ref(),
+            request: asked.0,
             server_time: &server_time,
             head: head.as_ref().and_then(|value| value.to_str().ok()),
             body: &answer.body,
@@ -359,5 +402,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_received_request_built_only_from_what_was_received() {
+        // The body field, and the received request it is part of, come only from what the
+        // transport received (Switch wire 7.1): built here, once per request, never chosen
+        // by a call site.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        sources(&dir, &mut found);
+        let mut builds = 0;
+        for (path, text) in &found {
+            if path.ends_with("service/keyed.rs") {
+                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                assert_eq!(code.matches("BodyField::NotRead").count(), 1);
+                assert_eq!(code.matches("BodyField::read(").count(), 2);
+                continue;
+            }
+            for needle in [
+                "BodyField",
+                "ReceivedRequest",
+                "ReceivedHeaders",
+                "received_request(",
+            ] {
+                assert!(
+                    !text.contains(needle),
+                    "{} builds a received request outside keyed.rs: {needle}",
+                    path.display()
+                );
+            }
+            builds += text.matches("Received::read(").count();
+            builds += text.matches("Received::refused(").count();
+        }
+        // One for a request the handler serves, one for a refusal of the transport.
+        assert_eq!(builds, 2);
     }
 }

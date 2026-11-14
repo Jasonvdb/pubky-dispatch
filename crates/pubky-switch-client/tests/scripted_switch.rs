@@ -796,17 +796,13 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         .header("switch-service-signature")
         .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
         .expect("a signature");
+    let sent = pubky_switch_client::client::SentRequest::of(&request);
     let verifies = |key: &[u8; 32]| {
         pubky_switch_core::http::verify_response(
             key,
             &pubky_switch_core::http::ResponseParts {
                 status: answer.status,
-                method: &request.method,
-                path: pubky_switch_core::http::path_of(&request.path_and_query),
-                request_signature: pubky_switch_core::http::request_signature_of(
-                    request.header("switch-signature"),
-                )
-                .as_ref(),
+                request: sent.received(true),
                 server_time: answer.header("switch-server-time").expect("a time"),
                 head: answer.header("switch-head"),
                 body: &answer.body,

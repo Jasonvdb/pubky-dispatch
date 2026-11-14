@@ -61,7 +61,7 @@ fn signed_by(response: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
 
 fn signature_of(request: &pubky_switch::http::SwitchRequest) -> Sent {
     let sent = Sent::of(request);
-    assert!(sent.signature.is_some(), "signature");
+    assert!(sent.signed(), "signature");
     sent
 }
 

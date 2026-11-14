@@ -82,10 +82,10 @@ async fn test_vectors_accounts_replay() {
         .expect("32 bytes");
 
     // An unknown account, a request without a signature: the operator key's 404, to the
-    // method and path the vector names.
+    // method and path its received request names.
     let expected = named(
         &http["responses"],
-        "no signature on the request, unknown account: operator key, BLAKE3 of the empty string",
+        "no signature on the request, unknown account: operator key, the public read binding no header",
     );
     set_time(
         &replay.clock,
@@ -93,12 +93,13 @@ async fn test_vectors_accounts_replay() {
             .as_str()
             .expect("time"),
     );
-    let unknown = request(
-        expected["method"].as_str().expect("method"),
-        expected["path"].as_str().expect("path"),
-        &[],
-        Vec::new(),
-    );
+    let field = |at: usize| {
+        let hex = expected["received_request"]["fields"][at]["hex"]
+            .as_str()
+            .expect("field");
+        String::from_utf8(hex::decode(hex).expect("hex")).expect("text")
+    };
+    let unknown = request(&field(0), &field(1), &[], Vec::new());
     let answer = replay.service.handle(unknown).await;
     assert_matches(&answer, expected);
     assert!(header_text(&answer, header::HEAD).is_none());

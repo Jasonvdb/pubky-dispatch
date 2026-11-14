@@ -22,7 +22,7 @@ pub use batch::{Batch, Submitted};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_switch_core::chain::{ChainError, SignedHead};
-use pubky_switch_core::enc::{b64, pubky_id, zbase32_encode};
+use pubky_switch_core::enc::{b64, hash, pubky_id, zbase32_encode};
 use pubky_switch_core::http::{
     self, ErrorCode, RequestHeaders, RequestTarget, TransferHeaders, header,
 };
@@ -226,7 +226,7 @@ pub(crate) enum Body {
     Octets,
 }
 
-/// A signed request, with its signature as the response signature covers it.
+/// A signed request, with its signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedRequest {
     /// The request.
@@ -235,29 +235,48 @@ pub struct SignedRequest {
     pub signature: Option<[u8; 64]>,
 }
 
-/// What a response signature covers of the request the client sent (Switch wire 7.1): its
-/// method, its path as sent without the query, and its signature bytes. A client checks an
-/// answer against the method and path it sent.
+/// The request the client sent, as the service receives it, which a response signature
+/// covers (Switch wire 7.1): its method, path and query, body, origin and each request header
+/// it sent, a header it didn't send absent. A client checks an answer against what it sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentRequest {
-    /// The method, as the request holds it; the response signature covers it upper-cased
-    /// ([`response_fields`](pubky_switch_core::http::response_fields)).
-    pub method: String,
-    /// The path as sent, without the query.
-    pub path: String,
-    /// The 64 bytes of its `Switch-Signature`; `None` for a request without one that
-    /// decodes, such as the unauthenticated public read.
-    pub signature: Option<[u8; 64]>,
+    method: String,
+    path_and_query: String,
+    body_hash: [u8; 32],
+    origin: String,
+    headers: http::ReceivedHeaders,
 }
 
 impl SentRequest {
-    /// What the response signature covers of `request`, its signature read from its
-    /// `Switch-Signature` header.
+    /// What the client sends with `request`.
     pub fn of(request: &Request) -> Self {
         SentRequest {
             method: request.method.clone(),
-            path: http::path_of(&request.path_and_query).to_owned(),
-            signature: http::request_signature_of(request.header(header::SIGNATURE)),
+            path_and_query: request.path_and_query.clone(),
+            body_hash: hash(&request.body),
+            origin: request.origin.clone(),
+            headers: http::ReceivedHeaders::of(
+                request
+                    .headers
+                    .iter()
+                    .map(|header| (header.name.as_str(), header.value.as_bytes())),
+            ),
+        }
+    }
+
+    /// The received request: its body field the body's hash where `body_read`, as for an
+    /// answer the service gave once it read the body, else empty (Switch wire 7.1).
+    pub fn received(&self, body_read: bool) -> http::ReceivedRequest<'_> {
+        http::ReceivedRequest {
+            method: &self.method,
+            path_and_query: &self.path_and_query,
+            body: if body_read {
+                http::BodyField::Read(self.body_hash)
+            } else {
+                http::BodyField::NotRead
+            },
+            origin: &self.origin,
+            headers: &self.headers,
         }
     }
 }
@@ -278,19 +297,25 @@ pub struct CheckedResponse {
 }
 
 /// Check a response with the pinned service key before anything in it is used (Switch wire
-/// 7.1): its signature over the status, the method and path `sent`, the request signature,
-/// `Switch-Server-Time`, the `Switch-Head` text as received and the body; then
-/// `Switch-Server-Time`; then `Switch-Head`, where present, as a head the service key signed
-/// for `account` (Switch wire 6.7). An error status is read into [`ClientError::Switch`].
+/// 7.1): its signature over the status, the request `sent` as the service received it,
+/// `Switch-Server-Time`, the head field of the `Switch-Head` text as received and the body;
+/// then `Switch-Server-Time`; then `Switch-Head`, where present, as a head the service key
+/// signed for `account` (Switch wire 6.7). An error status is read into
+/// [`ClientError::Switch`].
 ///
-/// The response signature covers the `Switch-Head` text, so a head can't be moved onto
-/// another answer; a head that doesn't read or doesn't verify as a head for `account` is
-/// still ignored. The heads the chain view checks come from the signed bodies.
+/// A response that carries `Switch-Service-Signature`, `Switch-Server-Time` or `Switch-Head`
+/// more than once, or a `Switch-Head` that doesn't read or verify as a head for `account`,
+/// fails as a signature that doesn't verify. An answer that verifies only with the empty
+/// body field, one the service gave before it read the body, is
+/// [`ClientError::BodyUnread`], final for nothing, when it is a `413 too_large`, a `429
+/// rate_limited` or a `404 not_found` without a head; any other fails as a signature that
+/// doesn't verify. The heads the chain view checks come from the signed bodies.
 ///
 /// # Errors
 ///
 /// [`ClientError::BadServiceSignature`] for a signature that is missing or doesn't verify,
-/// [`ClientError::InvalidResponse`] for a server time that doesn't read, and
+/// [`ClientError::InvalidResponse`] for a server time that doesn't read,
+/// [`ClientError::BodyUnread`] for an answer given before the body was read, and
 /// [`ClientError::Switch`] for an error answer.
 pub fn check_response(
     service_key: &[u8; 32],
@@ -300,6 +325,20 @@ pub fn check_response(
 ) -> Result<CheckedResponse, ClientError> {
     let status = response.status;
     let unauthenticated = ClientError::BadServiceSignature { status };
+    // Each header the signature decides on comes once at most (Switch wire 7.1).
+    let repeated = [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD]
+        .iter()
+        .any(|name| {
+            response
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case(name))
+                .count()
+                > 1
+        });
+    if repeated {
+        return Err(unauthenticated);
+    }
     let signature = response
         .header(header::SERVICE_SIGNATURE)
         .and_then(|text| http::decode_signature(text).ok())
@@ -307,25 +346,57 @@ pub fn check_response(
     let server_time = response
         .header(header::SERVER_TIME)
         .ok_or_else(|| unauthenticated.clone())?;
-    http::verify_response(
-        service_key,
-        &http::ResponseParts {
-            status,
-            method: &sent.method,
-            path: &sent.path,
-            request_signature: sent.signature.as_ref(),
-            server_time,
-            head: response.header(header::HEAD),
-            body: &response.body,
-        },
-        &signature,
-    )
-    .map_err(|_| unauthenticated)?;
+    let head_text = response.header(header::HEAD);
+    let verifies = |read: bool| {
+        http::verify_response(
+            service_key,
+            &http::ResponseParts {
+                status,
+                request: sent.received(read),
+                server_time,
+                head: head_text,
+                body: &response.body,
+            },
+            &signature,
+        )
+        .is_ok()
+    };
+    let body_read = if verifies(true) {
+        true
+    } else if verifies(false) {
+        false
+    } else {
+        return Err(unauthenticated);
+    };
     // From here on the answer is the service's.
     let server_time_ms = parse_rfc3339(server_time).map_err(|_| {
         ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
     })?;
-    let head = verified_head(service_key, account, response);
+    // A head that is there must be the account's (Switch wire 7.1).
+    let head = match head_text {
+        None => None,
+        Some(text) => Some(
+            SignedHead::from_header(text)
+                .ok()
+                .filter(|head| verify_head(head, service_key, account).is_ok())
+                .ok_or_else(|| unauthenticated.clone())?,
+        ),
+    };
+    if !body_read {
+        // Only the answers a service may give before it reads the body (Switch wire 7.1).
+        return match parse_error(status, &response.body) {
+            ClientError::Switch {
+                code: code @ (ErrorCode::TooLarge | ErrorCode::RateLimited | ErrorCode::NotFound),
+                retry_after,
+                ..
+            } if head.is_none() => Err(ClientError::BodyUnread {
+                status,
+                code,
+                retry_after,
+            }),
+            _ => Err(unauthenticated),
+        };
+    }
     if !(200..300).contains(&status) {
         return Err(parse_error(status, &response.body));
     }
@@ -345,18 +416,6 @@ pub(crate) fn verify_head(
 ) -> Result<(), ClientError> {
     head.verify(service_key, account)
         .map_err(|error| ClientError::Chain(ChainError::Signature(error.to_string())))
-}
-
-/// `Switch-Head`, where present and verified with the service key for `account`.
-fn verified_head(
-    service_key: &[u8; 32],
-    account: &[u8; 32],
-    response: &Response,
-) -> Option<SignedHead> {
-    response
-        .header(header::HEAD)
-        .and_then(|text| SignedHead::from_header(text).ok())
-        .filter(|head| verify_head(head, service_key, account).is_ok())
 }
 
 /// Read a checked error body: `{ "code", "message", "current", "known_version",
@@ -550,21 +609,17 @@ impl SwitchClient {
 
     fn note_server_time(
         &self,
-        key: &[u8; 32],
         checked: &Result<CheckedResponse, ClientError>,
         response: &Response,
     ) {
         let time = match checked {
             Ok(answer) => Some(answer.server_time_ms),
             // An error answer verified with the pinned key carries the stamped time only once
-            // the request verified, which its head shows (Switch wire 7.1).
-            Err(ClientError::Switch { .. })
-                if verified_head(key, &self.account, response).is_some() =>
-            {
-                response
-                    .header(header::SERVER_TIME)
-                    .and_then(|text| parse_rfc3339(text).ok())
-            }
+            // the request verified, which its head shows; a head it carries verified as the
+            // account's, or the answer would have failed (Switch wire 7.1).
+            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => response
+                .header(header::SERVER_TIME)
+                .and_then(|text| parse_rfc3339(text).ok()),
             Err(_) => None,
         };
         self.set_latest(time);
@@ -789,7 +844,7 @@ impl SwitchClient {
             _ => key,
         };
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&key, &checked, &response);
+        self.note_server_time(&checked, &response);
         Ok(checked)
     }
 
@@ -819,7 +874,7 @@ impl SwitchClient {
                     status: response.status,
                 })?;
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&key, &checked, &response);
+        self.note_server_time(&checked, &response);
         if checked.is_ok() {
             self.pin(key);
         }

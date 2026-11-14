@@ -146,7 +146,7 @@ fn operator_signed(answer: &SwitchResponse, sent: &Sent) -> bool {
 
 fn signature_of(request: &pubky_switch::http::SwitchRequest) -> Sent {
     let sent = Sent::of(request);
-    assert!(sent.signature.is_some(), "signature");
+    assert!(sent.signed(), "signature");
     sent
 }
 
@@ -4177,22 +4177,17 @@ async fn test_erase_restored_account_whose_key_is_still_held_signs_nothing() {
         .await
         .expect("ledger");
     assert!(replay.keys.public_key(&key).await.is_ok(), "still held");
-    let answer = replay
-        .service
-        .handle(request(
-            "GET",
-            &format!("/v1/{}/identity", alice_id()),
-            &[],
-            Vec::new(),
-        ))
-        .await;
+    let read = request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    let sent = Sent::of(&read);
+    let answer = replay.service.handle(read).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    let read = Sent {
-        method: "GET".into(),
-        path: format!("/v1/{}/identity", alice_id()),
-        signature: None,
-    };
+    let read = sent;
     assert!(operator_signed(&answer, &read));
     assert!(all_gone(&replay).await, "erased again");
     assert!(

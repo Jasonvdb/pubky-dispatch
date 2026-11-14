@@ -356,30 +356,58 @@ pub fn header_text<'a>(response: &'a SwitchResponse, name: &str) -> Option<&'a s
         .and_then(|(_, value)| value.to_str().ok())
 }
 
-/// What a response signature covers of a request (Switch wire 7.1): its method, its path
-/// without the query, and its signature bytes, `None` when it has none that decodes.
+/// A request as the service received it, which a response signature covers (Switch wire
+/// 7.1).
 #[derive(Clone, Debug)]
 pub struct Sent {
-    /// The method.
-    pub method: String,
-    /// The path without the query.
-    pub path: String,
-    /// The request signature bytes.
-    pub signature: Option<[u8; 64]>,
+    method: String,
+    path_and_query: String,
+    body: wire_http::BodyField,
+    origin: String,
+    headers: wire_http::ReceivedHeaders,
 }
 
 impl Sent {
-    /// What the response signature covers of `request`.
+    /// `request` as a service at [`ORIGIN`] receives it, its body read whole.
     pub fn of(request: &SwitchRequest) -> Self {
+        Self::at(request, ORIGIN)
+    }
+
+    /// `request` as a service at `origin` receives it, its body read whole.
+    pub fn at(request: &SwitchRequest, origin: &str) -> Self {
         Sent {
             method: request.method.clone(),
-            path: wire_http::path_of(&request.path_and_query).to_owned(),
-            signature: wire_http::request_signature_of(
+            path_and_query: request.path_and_query.clone(),
+            body: wire_http::BodyField::read(&request.body),
+            origin: origin.to_owned(),
+            headers: wire_http::ReceivedHeaders::of(
                 request
                     .headers
-                    .get(header::SIGNATURE)
-                    .and_then(|value| value.to_str().ok()),
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
             ),
+        }
+    }
+
+    /// The same request with its body not read, as a refusal before the body binds it.
+    pub fn unread(mut self) -> Self {
+        self.body = wire_http::BodyField::NotRead;
+        self
+    }
+
+    /// Whether it carries `Switch-Signature`.
+    pub fn signed(&self) -> bool {
+        !self.headers.values(header::SIGNATURE).is_empty()
+    }
+
+    /// The core's view of it.
+    pub fn request(&self) -> wire_http::ReceivedRequest<'_> {
+        wire_http::ReceivedRequest {
+            method: &self.method,
+            path_and_query: &self.path_and_query,
+            body: self.body,
+            origin: &self.origin,
+            headers: &self.headers,
         }
     }
 }
@@ -395,9 +423,7 @@ pub fn signed_with(answer: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool
         key,
         &wire_http::ResponseParts {
             status: answer.status,
-            method: &sent.method,
-            path: &sent.path,
-            request_signature: sent.signature.as_ref(),
+            request: sent.request(),
             server_time: header_text(answer, header::SERVER_TIME).expect("time"),
             head: header_text(answer, header::HEAD),
             body: &answer.body,

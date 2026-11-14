@@ -128,13 +128,13 @@ pub fn check_origin(origin: &str, allow_insecure: bool) -> Result<(), &'static s
 pub struct SwitchRequest {
     /// The route.
     pub route: Route,
-    /// The method, upper case.
+    /// The method, exactly as sent; a routed one is in upper case, as the routes name it.
     pub method: String,
     /// The path and query exactly as sent.
     pub path_and_query: String,
-    /// The headers.
+    /// The headers, as received.
     pub headers: HeaderMap,
-    /// The body, within its call's cap.
+    /// The body, read whole, within its call's cap.
     pub body: Bytes,
     /// The network source; `None` when the service can't tell it.
     pub source: Option<NetworkSource>,
@@ -153,29 +153,31 @@ pub struct SwitchResponse {
 }
 
 /// A request the transport refuses before the handler runs it. The handler still answers
-/// it, so that the answer is signed like every other.
+/// it, so that the answer is signed like every other, over the request as received (Switch
+/// wire 7.1).
 #[derive(Debug)]
 pub enum Refusal {
     /// No such route: `404`, signed with the operator key (Switch wire 7.3 step 1).
     UnknownRoute {
-        /// The method, as the request holds it, which the answer's signature covers
-        /// upper-cased ([`response_fields`](pubky_switch_core::http::response_fields)).
+        /// The method, exactly as sent.
         method: String,
-        /// The path and query exactly as sent; the answer's signature covers the path.
+        /// The path and query exactly as sent.
         path_and_query: String,
-        /// The request's signature header, if any, which the answer's signature covers.
+        /// The request's headers.
         headers: HeaderMap,
+        /// The body, read whole within the cap of a request without a route.
+        body: Bytes,
     },
     /// A body over its call's cap: `413 too_large`, before the body is read (Switch wire 7.1).
     TooLarge {
         /// The route, if the request had one.
         route: Option<Route>,
-        /// The method, as the request holds it, which the answer's signature covers
-        /// upper-cased ([`response_fields`](pubky_switch_core::http::response_fields)).
+        /// The method, exactly as sent.
         method: String,
-        /// The path and query exactly as sent; the answer's signature covers the path.
+        /// The path and query exactly as sent.
         path_and_query: String,
-        /// The request's headers.
+        /// The request's headers. The body isn't read, so the answer binds none (Switch wire
+        /// 7.1).
         headers: HeaderMap,
         /// The cap.
         cap: u64,
@@ -266,6 +268,7 @@ async fn dispatch(
                             method,
                             path_and_query,
                             headers: parts.headers,
+                            body,
                         })
                         .await
                 }

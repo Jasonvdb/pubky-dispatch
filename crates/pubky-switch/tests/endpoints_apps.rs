@@ -507,9 +507,7 @@ async fn test_apps_signature_covers_the_body_and_time() {
             &key,
             &pubky_switch_core::http::ResponseParts {
                 status: 200,
-                method: &sent.method,
-                path: &sent.path,
-                request_signature: sent.signature.as_ref(),
+                request: sent.request(),
                 server_time: time,
                 head: header_text(&answer, header::HEAD),
                 body,

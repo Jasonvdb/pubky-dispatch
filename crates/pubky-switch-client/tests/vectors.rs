@@ -181,6 +181,43 @@ fn response_of(r: &Value) -> Response {
     }
 }
 
+/// The request a response case answers, as the client sent it: the request case its
+/// `request` names, else the unsigned read its received request states, with no header
+/// (Switch wire 7.1, 7.4.15).
+fn request_answered(v: &Value, r: &Value) -> Request {
+    if let Some(name) = r["request"].as_str() {
+        let case = arr(v, "requests")
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        return Request {
+            method: st(case, "method").to_owned(),
+            origin: st(case, "origin").to_owned(),
+            path_and_query: st(case, "path").to_owned(),
+            headers: case["headers"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(name, value)| Header::new(name, value.as_str().unwrap()))
+                .collect(),
+            body: b64(st(case, "body_b64")),
+            timeout: Default::default(),
+        };
+    }
+    let field = |at: usize| {
+        let hex = st(&r["received_request"]["fields"][at], "hex");
+        String::from_utf8(hex::decode(hex).unwrap()).unwrap()
+    };
+    Request {
+        method: field(0),
+        origin: field(3),
+        path_and_query: field(1),
+        headers: Vec::new(),
+        body: Vec::new(),
+        timeout: Default::default(),
+    }
+}
+
 /// The `Switch-*` headers of a request, by name.
 fn switch_headers(request: &Request) -> BTreeMap<String, String> {
     request
@@ -265,15 +302,31 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
     let method = st(r, "method");
     match (method, call.rsplit('/').next().unwrap()) {
         ("GET", "feed") => {
+            // `after=g:s`, `limit` and `wait`, as the request names them (Switch wire 7.4.4).
+            let query = path.split_once('?').map_or("", |(_, query)| query);
+            let param = |name: &str| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+            };
+            let after = param("after").map(|after| {
+                let (generation, seq) = after.split_once(':').unwrap();
+                Position {
+                    generation: generation.parse().unwrap(),
+                    seq: seq.parse().unwrap(),
+                }
+            });
             let query = FeedQuery {
-                after: Some(Position {
-                    generation: 1,
-                    seq: 41,
-                }),
-                limit: Some(100),
-                wait: Some(25),
+                after,
+                limit: param("limit").map(|limit| limit.parse().unwrap()),
+                wait: param("wait").map(|wait| wait.parse().unwrap()),
             };
             outcome(client.feed(query).await)
+        }
+        ("GET", "directory") => outcome(client.directory(None).await),
+        ("POST", "ops") => {
+            let batch = pubky_switch_client::client::Batch::from_body(body).unwrap();
+            outcome(client.submit(&batch).await)
         }
         ("POST", "inbox") => {
             let apps_version = path.split("apps_version=").nth(1).unwrap().parse().unwrap();
@@ -325,11 +378,10 @@ async fn test_vectors_http_requests_reproduced_by_the_typed_calls() {
     let responses = arr(&v, "responses");
     for r in arr(&v, "requests") {
         let name = st(r, "name");
-        let signature = st(r, "signature");
         // The answers to this request, in the file's order.
         let answers: Vec<&Value> = responses
             .iter()
-            .filter(|resp| resp["request_signature"].as_str() == Some(signature))
+            .filter(|resp| resp["request"] == r["name"])
             .collect();
         let path = st(r, "path");
         let account = if path == "/v1/enroll" {
@@ -421,16 +473,10 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
         let name = st(r, "name");
         let response = response_of(r);
         let public = b32(st(r, "public_key"));
-        let request_signature = r["request_signature"].as_str().map(|s| {
-            let bytes: [u8; 64] = b64(s).try_into().unwrap();
-            bytes
-        });
-        // The method and path the request sent, which the signature covers (wire 7.1).
-        let sent = SentRequest {
-            method: st(r, "method").to_owned(),
-            path: st(r, "path").to_owned(),
-            signature: request_signature,
-        };
+        // The request it answers, as the client sent it, which the signature covers (wire
+        // 7.1).
+        let request = request_answered(&v, r);
+        let sent = SentRequest::of(&request);
         let Some(account) = account_of_key(&keys, &public) else {
             // The operator's key, which no client knows: unauthenticated with any account
             // key a client pins.
@@ -495,20 +541,27 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             check_response(&public, &account, &sent, &tampered),
             Err(ClientError::BadServiceSignature { .. })
         ));
-        for other in [
-            SentRequest {
-                signature: Some([0; 64]),
-                ..sent.clone()
-            },
-            SentRequest {
-                method: "DELETE".into(),
-                ..sent.clone()
-            },
-            SentRequest {
-                path: format!("{}/x", sent.path),
-                ..sent.clone()
-            },
-        ] {
+        let changed = |change: &dyn Fn(&mut Request)| {
+            let mut other = request.clone();
+            change(&mut other);
+            SentRequest::of(&other)
+        };
+        let mut others = vec![
+            changed(&|r| r.method = "DELETE".into()),
+            changed(&|r| r.path_and_query = format!("{}/x", r.path_and_query)),
+            changed(&|r| r.path_and_query = format!("{}?x=1", r.path_and_query)),
+            changed(&|r| r.body.push(b' ')),
+            changed(&|r| r.origin = "https://other.example".into()),
+        ];
+        // A header added changes every answer's binding but the public read's, which binds
+        // none (wire 7.4.15).
+        let added = changed(&|r| r.headers.push(Header::new(header::TRANSFER, "")));
+        if pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query) {
+            assert!(check_response(&public, &account, &added, &response).is_ok());
+        } else {
+            others.push(added);
+        }
+        for other in others {
             assert!(
                 matches!(
                     check_response(&public, &account, &other, &response),
@@ -529,8 +582,8 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
                 "{name}"
             );
         }
-        // A head is checked for the account it names; one that doesn't verify for it is
-        // ignored (wire 6.7).
+        // A head is checked for the account it names; one that doesn't verify for it fails
+        // the answer (wire 6.7, 7.1).
         if header_of(r, header::HEAD).is_some() {
             let other = keys.identity("bob").public();
             let account = if other == account {
@@ -538,11 +591,12 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             } else {
                 other
             };
-            let checked = check_response(&public, &account, &sent, &response);
-            assert!(
-                matches!(&checked, Ok(c) if c.head.is_none())
-                    || matches!(&checked, Err(ClientError::Switch { .. })),
-                "{name}: {checked:?}"
+            assert_eq!(
+                check_response(&public, &account, &sent, &response).unwrap_err(),
+                ClientError::BadServiceSignature {
+                    status: response.status
+                },
+                "{name}"
             );
         }
     }
@@ -559,9 +613,7 @@ fn replaying(key: SigningKey, r: &Value) -> Arc<MockTransport> {
             &key,
             &pubky_switch_core::http::ResponseParts {
                 status: template.status,
-                method: &sent.method,
-                path: &sent.path,
-                request_signature: sent.signature.as_ref(),
+                request: sent.received(true),
                 server_time: &server_time,
                 head: template.header(header::HEAD),
                 body: &template.body,

@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use pubky_switch_client::client::SentRequest;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_client::transport::{Request, TimeoutClass};
 use pubky_switch_core::enc::unb64_array;
 use pubky_switch_core::http::{ResponseParts, header, verify_response};
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
@@ -56,6 +58,14 @@ pub async fn enrollment(world: &World) -> FlowResult {
     // writer may order as it likes (Switch wire 1.1): deliberately so, while both switches
     // write it this way, so that a change of either shows here.
     let path = format!("/v1/{}/identity", alice.key().id());
+    let sent = SentRequest::of(&Request {
+        method: "GET".into(),
+        origin: ORIGIN.into(),
+        path_and_query: path.clone(),
+        headers: Vec::new(),
+        body: Vec::new(),
+        timeout: TimeoutClass::default(),
+    });
     let answer = world.request("GET", ORIGIN, &path).await?;
     let mut expected = b"{\"identity\":".to_vec();
     expected.extend_from_slice(&serde_json::to_vec(delivered.signed())?);
@@ -74,9 +84,7 @@ pub async fn enrollment(world: &World) -> FlowResult {
         &delivered.inbox().service_key,
         &ResponseParts {
             status: answer.status,
-            method: "GET",
-            path: &path,
-            request_signature: None,
+            request: sent.received(true),
             server_time,
             head: answer.header(header::HEAD),
             body: &answer.body,

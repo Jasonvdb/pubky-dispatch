@@ -147,6 +147,20 @@ pub enum ClientError {
         /// The response's HTTP status, unauthenticated.
         status: u16,
     },
+    /// An error answer the service gave before it read the request's body: a `413
+    /// too_large`, a `429 rate_limited` or a `404 not_found`, its signature verified with the
+    /// pinned key and the empty body field. It binds the request without its body, so it may
+    /// answer a request whose length was changed on the way: it is final for nothing, and
+    /// the call failed as when no answer comes (Switch wire 7.1).
+    #[error("{code} before the body was read (status {status})")]
+    BodyUnread {
+        /// The HTTP status.
+        status: u16,
+        /// The error code, which fixes the status.
+        code: ErrorCode,
+        /// `retry_after` in seconds, on `429 rate_limited` (Switch wire 7.6).
+        retry_after: Option<u64>,
+    },
     /// The client holds no pinned service key, so the call wasn't sent: only an enrollment
     /// is sent without one (Switch wire 7.1, Switch spec 6.1).
     #[error("no pinned service key; only an enrollment is sent without one")]
@@ -179,7 +193,8 @@ impl ClientError {
         }
     }
 
-    /// The error code of an answer of the switch.
+    /// The error code of an answer of the switch; `None` for every other failure, an answer
+    /// given before the body was read ([`ClientError::BodyUnread`]) included.
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             ClientError::Switch { code, .. } => Some(*code),

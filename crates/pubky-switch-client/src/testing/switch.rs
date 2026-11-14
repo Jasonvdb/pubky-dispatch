@@ -15,9 +15,7 @@ use pubky_switch_core::chain::{
 };
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
-use pubky_switch_core::http::{
-    ErrorCode, ResponseParts, frozen_refuses, header, path_of, request_signature_of, sign_response,
-};
+use pubky_switch_core::http::{ErrorCode, ResponseParts, frozen_refuses, header, sign_response};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{
@@ -33,6 +31,7 @@ use pubky_switch_core::time::rfc3339;
 use serde_json::{Map, Value, json};
 
 use super::ScriptError;
+use crate::client::SentRequest;
 use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Transport};
@@ -2134,8 +2133,8 @@ impl Inner {
     }
 
     /// An answer whose `Switch-Server-Time` is `at`, carrying `head` as its `Switch-Head`;
-    /// the response signature covers the method and path of `request`, its signature, the
-    /// server time, the head's text and the body (Switch wire 7.1).
+    /// the response signature covers `request` as received, its body read whole, the server
+    /// time, the head field and the body (Switch wire 7.1).
     fn respond_signed(
         &self,
         key: &SigningKey,
@@ -2147,14 +2146,12 @@ impl Inner {
     ) -> Response {
         let bytes = body.to_string().into_bytes();
         let server_time = rfc3339(at);
-        let request_signature = request_signature_of(request.header(header::SIGNATURE));
+        let sent = SentRequest::of(request);
         let signature = sign_response(
             key,
             &ResponseParts {
                 status,
-                method: &request.method,
-                path: path_of(&request.path_and_query),
-                request_signature: request_signature.as_ref(),
+                request: sent.received(true),
                 server_time: &server_time,
                 head,
                 body: &bytes,

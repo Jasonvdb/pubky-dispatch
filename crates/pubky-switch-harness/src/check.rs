@@ -47,15 +47,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use pubky_switch_client::client::SentRequest;
 use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::chain::{
     ChainEnvelope, ItemType, ServiceTransition, SignedHead, Stub, TransitionProof, Verifier,
     ZERO_HASH,
 };
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{
-    ResponseParts, header, path_of, request_signature_of, verify_response,
-};
+use pubky_switch_core::http::{ErrorCode, ResponseParts, header, verify_response};
 use pubky_switch_core::records::IdentityDoc;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -290,22 +289,35 @@ impl Checker {
         let server_time = answer
             .header(header::SERVER_TIME)
             .ok_or("the answer carries no service time")?;
-        let request_signature = request_signature_of(request.header(header::SIGNATURE));
+        // The request as the switch received it; the empty body field only for the answers
+        // a switch may give before it reads the body, without a head (Switch wire 7.1).
+        let sent = SentRequest::of(request);
+        let before_the_body = answer.header(header::HEAD).is_none()
+            && serde_json::from_slice::<Value>(&answer.body)
+                .ok()
+                .and_then(|body| body["code"].as_str().and_then(ErrorCode::parse))
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        ErrorCode::TooLarge | ErrorCode::RateLimited | ErrorCode::NotFound
+                    ) && code.status() == answer.status
+                });
         let verifies = |key: &[u8; 32]| {
-            verify_response(
-                key,
-                &ResponseParts {
-                    status: answer.status,
-                    method: &request.method,
-                    path: path_of(&request.path_and_query),
-                    request_signature: request_signature.as_ref(),
-                    server_time,
-                    head: answer.header(header::HEAD),
-                    body: &answer.body,
-                },
-                &signature,
-            )
-            .is_ok()
+            let with = |body_read: bool| {
+                verify_response(
+                    key,
+                    &ResponseParts {
+                        status: answer.status,
+                        request: sent.received(body_read),
+                        server_time,
+                        head: answer.header(header::HEAD),
+                        body: &answer.body,
+                    },
+                    &signature,
+                )
+                .is_ok()
+            };
+            with(true) || (before_the_body && with(false))
         };
         // An enrollment's answer brings its key with it.
         let _ = self.enrolled_key(request, answer, &verifies);
@@ -675,9 +687,7 @@ mod tests {
             service,
             &ResponseParts {
                 status,
-                method: &request.method,
-                path: path_of(&request.path_and_query),
-                request_signature: None,
+                request: SentRequest::of(request).received(true),
                 server_time: TIME,
                 head: None,
                 body: &body,

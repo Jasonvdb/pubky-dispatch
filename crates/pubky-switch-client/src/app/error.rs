@@ -455,8 +455,11 @@ pub(crate) fn never_left(error: &AppError) -> bool {
 /// built again (after re-reading, with the key bundle, signed again or sealed again). Every
 /// other failure may pass with the same bytes later: `429`, `503`, `401 stale_timestamp`
 /// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
-/// transport failure, or an answer whose signature didn't verify or that didn't read, which
-/// may not be the service's (Switch wire 2.1, 7.1).
+/// transport failure, an answer whose signature didn't verify or that didn't read, which
+/// may not be the service's (Switch wire 2.1, 7.1), or one given before the body was read
+/// ([`ClientError::BodyUnread`]), which may answer other bytes. Only a
+/// [`ClientError::Switch`] is final: an answer that verified with the request as sent, its
+/// body included (Switch wire 7.1, 7.6).
 pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
     let AppError::Switch(ClientError::Switch { code, .. }) = error else {
         return None;
@@ -578,6 +581,21 @@ mod tests {
             AppError::Transport(TransportError::Timeout),
         ] {
             assert_eq!(refused_for_good(&error), None, "{error:?}");
+        }
+        // An answer given before the body was read binds the request without its body: it
+        // is final for nothing, whatever its code (Switch wire 7.1).
+        for (status, code) in [
+            (413, ErrorCode::TooLarge),
+            (404, ErrorCode::NotFound),
+            (429, ErrorCode::RateLimited),
+        ] {
+            let error = AppError::Switch(ClientError::BodyUnread {
+                status,
+                code,
+                retry_after: None,
+            });
+            assert_eq!(refused_for_good(&error), None, "{code}");
+            assert_eq!(refused_at(&error), None, "{code}");
         }
     }
 

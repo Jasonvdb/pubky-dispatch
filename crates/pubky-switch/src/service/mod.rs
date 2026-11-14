@@ -79,7 +79,7 @@ use crate::{
     time::TrustedTime,
 };
 
-use self::keyed::{Asked, NotKeyed, Proof};
+use self::keyed::{Asked, NotKeyed, Proof, Received};
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
 /// How many sweeps of owed keys a retried erasure of an account gone may run each minute, for
@@ -540,7 +540,9 @@ impl Service {
         let reading = self.time.read();
         let base_ms = reading.base_ms;
         let due = reading.trusted.then_some(base_ms);
-        let asked = Asked::of(&request.method, &request.path_and_query, &request.headers);
+        // The request as received, which every answer to it signs (Switch wire 7.1).
+        let received = Received::read(&request, &self.origin);
+        let asked = received.asked();
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
         }
@@ -604,11 +606,6 @@ impl Service {
         let looked_up_key = found.service_key.clone();
         let (account_ref, looked_up_ref, request_ref) = (&account, &looked_up_key, &request);
         let refused_early = |error: ApiError| {
-            let signature = if *call == Call::GetIdentity {
-                asked.unsigned()
-            } else {
-                asked
-            };
             async move {
                 // A read of the account's state that finds no account: erased since the
                 // lookup, its key maybe still in the store while owed. As for an account the
@@ -618,9 +615,9 @@ impl Service {
                         .no_longer_keyed(account_ref, looked_up_ref, false)
                         .await
                 {
-                    return self.operator_answer(signature, base_ms, &gone).await;
+                    return self.operator_answer(asked, base_ms, &gone).await;
                 }
-                self.early_answer(&found, request_ref, signature, base_ms, &error)
+                self.early_answer(&found, request_ref, asked, base_ms, &error)
                     .await
             }
         };
@@ -792,19 +789,12 @@ impl Service {
                     return refused_early(store_error(&error)).await;
                 }
             };
-            let signature = if caller.is_some() {
-                asked
-            } else {
-                // The public read's answer signs the hash of the empty string as the request
-                // signature, so it is the same for every reader (Switch wire 7.4.15).
-                asked.unsigned()
-            };
             self.at_account(
                 txn,
                 &request,
                 base_ms,
                 due,
-                signature,
+                asked,
                 caller.as_ref(),
                 verified.as_ref(),
                 other.as_ref(),
@@ -2099,20 +2089,9 @@ impl Handler for Service {
                 Refusal::UnknownRoute { .. } => ApiError::not_found("no such route"),
                 Refusal::TooLarge { cap, .. } => ApiError::body_too_large(*cap),
             };
-            let asked = match &refusal {
-                Refusal::UnknownRoute {
-                    method,
-                    path_and_query,
-                    headers,
-                }
-                | Refusal::TooLarge {
-                    method,
-                    path_and_query,
-                    headers,
-                    ..
-                } => Asked::of(method, path_and_query, headers),
-            };
-            self.operator_answer(asked, base_ms, &error).await
+            let received = Received::refused(&refusal, &self.origin);
+            self.operator_answer(received.asked(), base_ms, &error)
+                .await
         })
     }
 }

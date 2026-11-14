@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_key, zbase32_encode};
 use pubky_switch_core::envelope::parse_header;
-use pubky_switch_core::http::{ErrorCode, header, request_signature_of, sign_response};
+use pubky_switch_core::http::{
+    ErrorCode, ResponseParts, header, path_of, request_signature_of, sign_response,
+};
 use pubky_switch_core::keys::{AppKeys, ReceiveKey};
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::records::{
@@ -457,10 +459,15 @@ impl PeerInner {
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
             self.foreign.as_ref().unwrap_or(&self.service),
-            status,
-            request_signature.as_ref(),
-            &server_time,
-            &bytes,
+            &ResponseParts {
+                status,
+                method: &request.method,
+                path: path_of(&request.path_and_query),
+                request_signature: request_signature.as_ref(),
+                server_time: &server_time,
+                head: None,
+                body: &bytes,
+            },
         );
         Response {
             status,

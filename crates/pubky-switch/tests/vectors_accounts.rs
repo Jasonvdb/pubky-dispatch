@@ -81,19 +81,14 @@ async fn test_vectors_accounts_replay() {
         .try_into()
         .expect("32 bytes");
 
-    // An unknown account, a request without a signature: the operator key's 404.
-    let expected = named(
-        &http["responses"],
-        "no signature on the request, unknown account: operator key, BLAKE3 of the empty string",
-    );
-    set_time(
-        &replay.clock,
-        expected["headers"]["switch-server-time"]
-            .as_str()
-            .expect("time"),
-    );
+    // An account the service doesn't host, a request without a signature: `404 not_found`,
+    // without a head, signed with the operator key.
     let unknown = request("GET", &format!("/v1/{alice_id}/feed"), &[], Vec::new());
-    assert_matches(&replay.service.handle(unknown).await, expected);
+    let sent = Sent::of(&unknown);
+    let answer = replay.service.handle(unknown).await;
+    assert_eq!(answer.status, 404);
+    assert!(header_text(&answer, header::HEAD).is_none());
+    assert!(signed_with(&answer, &operator_public(), &sent));
 
     // The enrollment, answered with the new account's key.
     let expected = named(

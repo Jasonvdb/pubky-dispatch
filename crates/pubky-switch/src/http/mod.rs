@@ -158,6 +158,10 @@ pub struct SwitchResponse {
 pub enum Refusal {
     /// No such route: `404`, signed with the operator key (Switch wire 7.3 step 1).
     UnknownRoute {
+        /// The method, upper case, which the answer's signature covers.
+        method: String,
+        /// The path and query exactly as sent; the answer's signature covers the path.
+        path_and_query: String,
         /// The request's signature header, if any, which the answer's signature covers.
         headers: HeaderMap,
     },
@@ -165,6 +169,10 @@ pub enum Refusal {
     TooLarge {
         /// The route, if the request had one.
         route: Option<Route>,
+        /// The method, upper case, which the answer's signature covers.
+        method: String,
+        /// The path and query exactly as sent; the answer's signature covers the path.
+        path_and_query: String,
         /// The request's headers.
         headers: HeaderMap,
         /// The cap.
@@ -227,6 +235,8 @@ async fn dispatch(
             .handler
             .refuse(Refusal::TooLarge {
                 route: routed,
+                method,
+                path_and_query,
                 headers: parts.headers,
                 cap,
             })
@@ -239,6 +249,8 @@ async fn dispatch(
                     .handler
                     .refuse(Refusal::TooLarge {
                         route: routed,
+                        method,
+                        path_and_query,
                         headers: parts.headers,
                         cap,
                     })
@@ -249,6 +261,8 @@ async fn dispatch(
                     shared
                         .handler
                         .refuse(Refusal::UnknownRoute {
+                            method,
+                            path_and_query,
                             headers: parts.headers,
                         })
                         .await

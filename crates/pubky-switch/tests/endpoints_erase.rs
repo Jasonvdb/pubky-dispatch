@@ -140,35 +140,14 @@ async fn service_key_id(replay: &Replay, id: &str) -> KeyId {
 
 /// The answer is signed with the operator key, as for an account the service doesn't hold
 /// (Switch wire 7.3 step 2).
-fn operator_signed(answer: &SwitchResponse, request_signature: Option<&[u8; 64]>) -> bool {
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        header_text(answer, header::SERVICE_SIGNATURE).expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
-    pubky_switch_core::http::verify_response(
-        &operator_public(),
-        answer.status,
-        request_signature,
-        header_text(answer, header::SERVER_TIME).expect("time"),
-        &answer.body,
-        &signature,
-    )
-    .is_ok()
+fn operator_signed(answer: &SwitchResponse, sent: &Sent) -> bool {
+    signed_with(answer, &operator_public(), sent)
 }
 
-fn signature_of(request: &pubky_switch::http::SwitchRequest) -> [u8; 64] {
-    pubky_switch_core::enc::unb64(
-        request
-            .headers
-            .get(header::SIGNATURE)
-            .and_then(|value| value.to_str().ok())
-            .expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64")
+fn signature_of(request: &pubky_switch::http::SwitchRequest) -> Sent {
+    let sent = Sent::of(request);
+    assert!(sent.signature.is_some(), "signature");
+    sent
 }
 
 #[tokio::test]
@@ -339,14 +318,11 @@ async fn test_erase_then_every_call_is_the_operators_404() {
     ];
     for request in requests {
         let path = format!("{:?}", request.route.call);
-        let signature = request
-            .headers
-            .get(header::SIGNATURE)
-            .map(|_| signature_of(&request));
+        let signature = Sent::of(&request);
         let answer = replay.service.handle(request).await;
         assert_eq!(code_of(&answer), (404, json!("not_found")), "{path}");
         assert!(no_head(&answer), "{path}");
-        assert!(operator_signed(&answer, signature.as_ref()), "{path}");
+        assert!(operator_signed(&answer, &signature), "{path}");
     }
     replay.db.drop_database().await.expect("drop");
 }
@@ -709,22 +685,8 @@ async fn test_erase_commit_failure_deletes_nothing() {
     let answer = replay.service.handle(request).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        header_text(&answer, header::SERVICE_SIGNATURE).expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
     assert!(
-        pubky_switch_core::http::verify_response(
-            &alice_service_key(),
-            503,
-            Some(&request_signature),
-            header_text(&answer, header::SERVER_TIME).expect("time"),
-            &answer.body,
-            &signature,
-        )
-        .is_ok(),
+        alice_signed(&answer, &request_signature),
         "signed with the account's key"
     );
     assert_eq!(rows(&replay, &alice_id()).await, before);
@@ -879,7 +841,7 @@ async fn test_erase_waiting_feed_read_never_signs_with_the_erased_key() {
         String::from_utf8_lossy(&answer.body)
     );
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1129,7 +1091,7 @@ async fn test_erase_answer_withheld_until_its_key_is_gone() {
     let answer = replay.service.handle(request).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     assert!(
         replay.keys.public_key(&key).await.is_ok(),
         "the key is still owed"
@@ -1240,7 +1202,7 @@ async fn test_erase_feed_page_after_an_erasure_whose_key_stays_isnt_signed_with_
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1280,7 +1242,7 @@ async fn test_erase_write_answered_after_a_new_enrollment_isnt_signed_with_the_o
     });
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1335,7 +1297,7 @@ async fn test_erase_feed_page_whose_mark_moves_after_it_isnt_signed_with_its_key
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1359,7 +1321,7 @@ async fn test_erase_write_whose_mark_moves_after_it_isnt_signed_with_its_key() {
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1399,7 +1361,7 @@ async fn test_erase_deferred_claim_read_isnt_signed_with_its_key() {
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1460,7 +1422,7 @@ async fn test_erase_feed_refusal_after_an_erasure_whose_key_stays_isnt_signed_wi
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1517,7 +1479,7 @@ async fn test_erase_deferred_allow_read_isnt_signed_with_its_key() {
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1548,28 +1510,13 @@ async fn test_erase_deferred_records_page_isnt_signed_with_its_key() {
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
 /// The answer is signed with alice's service key.
-fn alice_signed(answer: &SwitchResponse, request_signature: Option<&[u8; 64]>) -> bool {
-    let Some(text) = header_text(answer, header::SERVICE_SIGNATURE) else {
-        return false;
-    };
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(text)
-        .expect("b64")
-        .try_into()
-        .expect("64");
-    pubky_switch_core::http::verify_response(
-        &alice_service_key(),
-        answer.status,
-        request_signature,
-        header_text(answer, header::SERVER_TIME).expect("time"),
-        &answer.body,
-        &signature,
-    )
-    .is_ok()
+fn alice_signed(answer: &SwitchResponse, sent: &Sent) -> bool {
+    signed_with(answer, &alice_service_key(), sent)
 }
 
 /// alice served, with the wallet's ops 3 and 4 and the phone's app record delivered, at
@@ -1689,10 +1636,10 @@ async fn test_erase_read_waiting_its_turn_across_an_erasure_isnt_signed_with_its
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
     assert_eq!(code_of(&second), (404, json!("not_found")));
     assert!(
-        !alice_signed(&second, Some(&second_signature)),
+        !alice_signed(&second, &second_signature),
         "signed with the erased account's key"
     );
-    assert!(operator_signed(&second, Some(&second_signature)));
+    assert!(operator_signed(&second, &second_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1741,10 +1688,10 @@ async fn test_erase_records_list_waiting_its_turn_across_an_erasure_isnt_signed_
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
     assert_eq!(code_of(&second), (404, json!("not_found")));
     assert!(
-        !alice_signed(&second, Some(&second_signature)),
+        !alice_signed(&second, &second_signature),
         "signed with the erased account's key"
     );
-    assert!(operator_signed(&second, Some(&second_signature)));
+    assert!(operator_signed(&second, &second_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1887,17 +1834,11 @@ async fn test_erase_owed_keys_hold_back_only_the_signers_404() {
     ];
     for request in others {
         let path = request.path_and_query.clone();
-        let request_signature = request
-            .headers
-            .contains_key(header::SIGNATURE)
-            .then(|| signature_of(&request));
+        let request_signature = Sent::of(&request);
         let answer = replay.service.handle(request).await;
         assert_eq!(code_of(&answer), (404, json!("not_found")), "{path}");
         assert!(no_head(&answer), "{path}");
-        assert!(
-            operator_signed(&answer, request_signature.as_ref()),
-            "{path}"
-        );
+        assert!(operator_signed(&answer, &request_signature), "{path}");
     }
     replay.db.drop_database().await.expect("drop");
 }
@@ -2008,7 +1949,7 @@ async fn test_erase_stale_signer_while_its_key_is_owed_isnt_a_404() {
     let answer = replay.service.handle(hosted).await;
     assert_eq!(code_of(&answer), (401, json!("stale_timestamp")));
     assert!(
-        alice_signed(&answer, Some(&hosted_signature)),
+        alice_signed(&answer, &hosted_signature),
         "the client retries this one"
     );
     gate.fail_ledger.store(true, Ordering::SeqCst);
@@ -2063,7 +2004,7 @@ async fn test_erase_signer_request_for_another_origin_is_the_404() {
     let signature = signature_of(&elsewhere);
     let answer = replay.service.handle(elsewhere).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
-    assert!(operator_signed(&answer, Some(&signature)));
+    assert!(operator_signed(&answer, &signature));
     assert_eq!(gate.recorded.load(Ordering::SeqCst), recorded, "no sweep");
     assert!(replay.keys.public_key(&key).await.is_ok(), "still owed");
     // The same request over this origin is the signer's: held back, then swept.
@@ -2112,7 +2053,7 @@ async fn test_erase_signer_mark_move_failing_after_an_erasure_owing_its_key_isnt
         erased
     });
     let got = (code_of(&erased), code_of(&answer), no_head(&answer));
-    let operator = operator_signed(&answer, Some(&request_signature));
+    let operator = operator_signed(&answer, &request_signature);
     replay.db.drop_database().await.expect("drop");
     assert_eq!(got.0, (503, json!("unavailable")));
     assert_eq!(
@@ -2170,7 +2111,7 @@ async fn test_erase_app_lock_waiter_after_an_erasure_owing_its_key_is_the_404() 
         })
     });
     let got = (code_of(&erased), code_of(&answer));
-    let operator = operator_signed(&answer, Some(&feed_signature));
+    let operator = operator_signed(&answer, &feed_signature);
     replay.db.drop_database().await.expect("drop");
     assert_eq!(got.0, (503, json!("unavailable")));
     assert_eq!(got.1, (404, json!("not_found")));
@@ -2269,8 +2210,8 @@ async fn test_erase_own_app_view_gone_after_the_lookup_isnt_signed_with_its_key(
             .expect("commit");
     });
     let got = code_of(&answer);
-    let erased_key = alice_signed(&answer, Some(&feed_signature));
-    let operator = operator_signed(&answer, Some(&feed_signature));
+    let erased_key = alice_signed(&answer, &feed_signature);
+    let operator = operator_signed(&answer, &feed_signature);
     replay.db.drop_database().await.expect("drop");
     assert_eq!(got, (404, json!("not_found")));
     assert!(!erased_key, "signed with the erased account's key");
@@ -2476,7 +2417,7 @@ async fn test_erase_retry_with_the_hash_after_it_landed_is_the_operators_404() {
     let signature = signature_of(&retry);
     let answer = replay.service.handle(retry).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
-    assert!(operator_signed(&answer, Some(&signature)));
+    assert!(operator_signed(&answer, &signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2536,7 +2477,7 @@ async fn test_erase_success_committed_before_it_isnt_signed_with_its_key() {
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2567,7 +2508,7 @@ async fn test_erase_tombstone_read_committed_before_it_isnt_signed_with_its_key(
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2765,7 +2706,7 @@ async fn assert_parked_across_an_erasure(request: pubky_switch::http::SwitchRequ
         String::from_utf8_lossy(&answer.body)
     );
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2800,7 +2741,7 @@ async fn test_erase_signer_parked_on_the_keying_lock_across_a_key_change_isnt_si
     .await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2821,7 +2762,7 @@ async fn test_erase_signer_parked_on_the_keying_lock_signs_once_it_is_free() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(alice_signed(&answer, Some(&request_signature)));
+    assert!(alice_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2878,7 +2819,7 @@ async fn test_erase_enrollment_parked_on_the_keying_lock_isnt_signed() {
     let request_signature = signature_of(&enrollment);
     let answer = parked_while(&replay, enrollment, erase_row).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2973,7 +2914,7 @@ async fn test_erase_keyed_section_reads_committed_whatever_the_pools_default() {
     let request_signature = signature_of(&request);
     let answer = parked_at(&replay, &service, request, erase_row).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -3015,7 +2956,7 @@ async fn test_erase_signer_refusal_parked_while_a_key_is_owed_isnt_a_404() {
     .await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
+    assert!(operator_signed(&answer, &request_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -3143,7 +3084,7 @@ async fn test_erase_failure_under_a_lost_lock_isnt_signed_with_the_erased_key() 
         String::from_utf8_lossy(&erased.body)
     );
     assert!(
-        !alice_signed(&answer, Some(&request_signature)),
+        !alice_signed(&answer, &request_signature),
         "signed with the erased key after the erasure's 200: {} {}",
         answer.status,
         String::from_utf8_lossy(&answer.body)
@@ -3399,14 +3340,14 @@ async fn test_erase_keyed_section_during_the_deletion_waits_for_its_commit() {
         String::from_utf8_lossy(&erased.body)
     );
     assert_eq!(code_of(&answer), (404, json!("not_found")));
-    assert!(operator_signed(&answer, Some(&refused_signature)));
+    assert!(operator_signed(&answer, &refused_signature));
     replay.db.drop_database().await.expect("drop");
 }
 
 /// A signer `GET /apps` paused under the lock after its signer is loaded, its transaction
 /// ended by the database, the account erased meanwhile (with `owed`, a key of it then left
 /// owed), then resumed: its answer, and its request's signature.
-async fn lost_lock_answer(owed: bool) -> (SwitchResponse, [u8; 64]) {
+async fn lost_lock_answer(owed: bool) -> (SwitchResponse, Sent) {
     let mut replay = replay().await.expect("database");
     replay_chain_through_revoke(&replay).await;
     let key = service_key_id(&replay, &alice_id()).await;
@@ -3474,7 +3415,7 @@ async fn test_erase_lost_lock_failure_is_the_operators_404() {
         String::from_utf8_lossy(&answer.body)
     );
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&signature)));
+    assert!(operator_signed(&answer, &signature));
 }
 
 #[tokio::test]
@@ -3489,7 +3430,7 @@ async fn test_erase_lost_lock_failure_to_the_signer_while_a_key_is_owed_is_the_5
         String::from_utf8_lossy(&answer.body)
     );
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&signature)));
+    assert!(operator_signed(&answer, &signature));
 }
 
 /// `first`, then `second`, queued in that order behind a hold on alice's account row, and
@@ -3867,14 +3808,11 @@ async fn test_erase_restored_account_is_erased_again_before_any_call_is_served()
         let erased_at = restored_after_erasure(&replay, replay.keys.as_ref()).await;
         let at = revoke_time();
         let request = call(&at);
-        let signature = request
-            .headers
-            .get(header::SIGNATURE)
-            .map(|_| signature_of(&request));
+        let signature = Sent::of(&request);
         let answer = replay.service.handle(request).await;
         assert_eq!(code_of(&answer), (404, json!("not_found")), "{name}");
         assert!(no_head(&answer), "{name}");
-        assert!(operator_signed(&answer, signature.as_ref()), "{name}");
+        assert!(operator_signed(&answer, &signature), "{name}");
         assert!(all_gone(&replay).await, "{name}: the state is erased again");
         // The ledger keeps the erasure, so a later restore is erased again too.
         assert_eq!(
@@ -4090,7 +4028,7 @@ async fn test_erase_restored_account_is_never_served_while_the_ledger_cant_be_re
     let answer = replay.service.handle(request).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&signature)));
+    assert!(operator_signed(&answer, &signature));
     assert!(!all_gone(&replay).await, "nothing erased yet");
     gate.fail_ledger_read
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4250,7 +4188,12 @@ async fn test_erase_restored_account_whose_key_is_still_held_signs_nothing() {
         .await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
-    assert!(operator_signed(&answer, None));
+    let read = Sent {
+        method: "GET".into(),
+        path: format!("/v1/{}/identity", alice_id()),
+        signature: None,
+    };
+    assert!(operator_signed(&answer, &read));
     assert!(all_gone(&replay).await, "erased again");
     assert!(
         replay.keys.public_key(&key).await.is_err(),

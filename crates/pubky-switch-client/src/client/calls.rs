@@ -20,7 +20,7 @@ use super::answers::{
     WriteAnswer,
 };
 use super::read::{self, Obj};
-use super::{Auth, Body, CheckedResponse, SwitchClient, check_response, verify_head};
+use super::{Auth, Body, CheckedResponse, SentRequest, SwitchClient, check_response, verify_head};
 use crate::error::ClientError;
 
 /// What the proofs of a write answer must show (Switch wire 6.5).
@@ -166,31 +166,24 @@ impl SwitchClient {
             .to_string()
             .into_bytes();
         let signed = self.build("POST", "/v1/enroll", body, Body::Json, Auth::default())?;
-        let signature = signed.signature;
+        let sent = SentRequest::of(&signed.request);
         let response = self.transport().send(signed.request).await?;
         let status = response.status;
         if !(200..300).contains(&status) {
             // A serving account signs its errors with its key; anything else is the
             // operator's, which no client knows (Switch wire 7.1, 7.4.1).
             return Err(match self.pinned_key() {
-                Some(key) => {
-                    match check_response(&key, &self.account(), signature.as_ref(), &response) {
-                        Err(error) => error,
-                        Ok(_) => ClientError::BadServiceSignature { status },
-                    }
-                }
+                Some(key) => match check_response(&key, &self.account(), &sent, &response) {
+                    Err(error) => error,
+                    Ok(_) => ClientError::BadServiceSignature { status },
+                },
                 None => ClientError::BadServiceSignature { status },
             });
         }
         // The key that verifies the answer is the one it names (Switch wire 3.7).
         let answer = EnrollmentAnswer::from_json(&response.body)
             .map_err(|_| ClientError::BadServiceSignature { status })?;
-        check_response(
-            &answer.service_key,
-            &self.account(),
-            signature.as_ref(),
-            &response,
-        )?;
+        check_response(&answer.service_key, &self.account(), &sent, &response)?;
         answer.check(enrollment)?;
         if self.pinned_key().is_none() {
             self.pin(answer.service_key);

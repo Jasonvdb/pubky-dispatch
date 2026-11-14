@@ -90,16 +90,43 @@ fn client_with(
 
 /// A response to `request`, signed with `key` as the switch signs it (Switch wire 7.1).
 fn respond(key: &SigningKey, request: &Request, status: u16, body: &[u8]) -> Response {
+    respond_with_head(key, request, status, body, None)
+}
+
+/// A response to `request` carrying `head` as its `Switch-Head`, signed with `key` as the
+/// switch signs it (Switch wire 7.1).
+fn respond_with_head(
+    key: &SigningKey,
+    request: &Request,
+    status: u16,
+    body: &[u8],
+    head: Option<&str>,
+) -> Response {
     let server_time = rfc3339(NOW);
-    let request_signature = http::request_signature_of(request.header(header::SIGNATURE));
-    let signature = sign_response(key, status, request_signature.as_ref(), &server_time, body);
+    let sent = SentRequest::of(request);
+    let signature = sign_response(
+        key,
+        &http::ResponseParts {
+            status,
+            method: &sent.method,
+            path: &sent.path,
+            request_signature: sent.signature.as_ref(),
+            server_time: &server_time,
+            head,
+            body,
+        },
+    );
+    let mut headers = vec![
+        Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+        Header::new(header::SERVER_TIME, &server_time),
+        Header::new("content-type", "application/json"),
+    ];
+    if let Some(head) = head {
+        headers.push(Header::new(header::HEAD, head));
+    }
     Response {
         status,
-        headers: vec![
-            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
-            Header::new(header::SERVER_TIME, &server_time),
-            Header::new("content-type", "application/json"),
-        ],
+        headers,
         body: body.to_vec(),
     }
 }
@@ -363,6 +390,43 @@ async fn test_answer_with_a_bad_or_missing_signature_is_refused() {
     );
 }
 
+/// The request the head tests' answers are checked against.
+fn head_request() -> SentRequest {
+    SentRequest {
+        method: "GET".into(),
+        path: format!("/v1/{}/apps", pubky_id(&identity().public())),
+        signature: Some([9; 64]),
+    }
+}
+
+/// A `200` to [`head_request`] carrying `head`, signed with the service key.
+fn head_response(head: &str) -> Response {
+    let bytes = br#"{"pending":true}"#;
+    let server_time = rfc3339(NOW);
+    let sent = head_request();
+    let signature = sign_response(
+        &service_key(),
+        &http::ResponseParts {
+            status: 200,
+            method: &sent.method,
+            path: &sent.path,
+            request_signature: sent.signature.as_ref(),
+            server_time: &server_time,
+            head: Some(head),
+            body: bytes,
+        },
+    );
+    Response {
+        status: 200,
+        headers: vec![
+            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            Header::new(header::SERVER_TIME, &server_time),
+            Header::new(header::HEAD, head),
+        ],
+        body: bytes.to_vec(),
+    }
+}
+
 #[tokio::test]
 async fn test_head_header_is_verified() {
     let account = identity().public();
@@ -373,44 +437,33 @@ async fn test_head_header_is_verified() {
     };
     let good = SignedHead::sign(&service_key(), &account, &tip);
     let key = service_key();
+    let header_value = good.to_header();
     let transport = Arc::new(MockTransport::with_handler(move |request| {
-        let mut response = respond(&key, request, 200, br#"{"pending":true}"#);
-        response
-            .headers
-            .push(Header::new(header::HEAD, &good.to_header()));
-        Ok(response)
+        Ok(respond_with_head(
+            &key,
+            request,
+            200,
+            br#"{"pending":true}"#,
+            Some(&header_value),
+        ))
     }));
     let client = client_with(app(), Some(service_public()), transport);
     client.connect().await.unwrap();
     // The head is kept only when it verifies with the service key.
-    let response = |head: &str| {
-        let bytes = br#"{"pending":true}"#;
-        let server_time = rfc3339(NOW);
-        let signature = sign_response(&service_key(), 200, None, &server_time, bytes);
-        Response {
-            status: 200,
-            headers: vec![
-                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
-                Header::new(header::SERVER_TIME, &server_time),
-                Header::new(header::HEAD, head),
-            ],
-            body: bytes.to_vec(),
-        }
-    };
     let checked = check_response(
         &service_public(),
         &account,
-        None,
-        &response(&good.to_header()),
+        &head_request(),
+        &head_response(&good.to_header()),
     );
     assert_eq!(checked.unwrap().head, Some(good));
 }
 
 #[tokio::test]
 async fn test_head_header_that_fails_is_ignored() {
-    // The response signature doesn't cover `Switch-Head` (Switch wire 7.1): a proxy may add
-    // or change one, so a head that doesn't verify or doesn't read is ignored, never an
-    // error the app could take as evidence against the service.
+    // A head the response signature covers but that doesn't verify as a head for the
+    // account, or doesn't read, is ignored, never an error the app could take as evidence
+    // against the service (Switch wire 6.7, 7.1).
     let account = identity().public();
     let tip = ChainTip {
         generation: 1,
@@ -422,29 +475,75 @@ async fn test_head_header_that_fails_is_ignored() {
         let key = service_key();
         let header_value = head.clone();
         let transport = Arc::new(MockTransport::with_handler(move |request| {
-            let mut response = respond(&key, request, 200, br#"{"pending":true}"#);
-            response
-                .headers
-                .push(Header::new(header::HEAD, &header_value));
-            Ok(response)
+            Ok(respond_with_head(
+                &key,
+                request,
+                200,
+                br#"{"pending":true}"#,
+                Some(&header_value),
+            ))
         }));
         let client = client_with(app(), Some(service_public()), transport);
         let result = client.connect().await;
         assert!(result.is_ok(), "{head}: {result:?}");
-        let bytes = br#"{"pending":true}"#;
-        let server_time = rfc3339(NOW);
-        let signature = sign_response(&service_key(), 200, None, &server_time, bytes);
-        let response = Response {
-            status: 200,
-            headers: vec![
-                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
-                Header::new(header::SERVER_TIME, &server_time),
-                Header::new(header::HEAD, &head),
-            ],
-            body: bytes.to_vec(),
-        };
-        let checked = check_response(&service_public(), &account, None, &response).unwrap();
+        let checked = check_response(
+            &service_public(),
+            &account,
+            &head_request(),
+            &head_response(&head),
+        )
+        .unwrap();
         assert_eq!(checked.head, None);
+    }
+}
+
+#[tokio::test]
+async fn test_head_header_moved_or_added_fails_the_signature() {
+    // The response signature covers the `Switch-Head` text, so a head added, dropped or
+    // changed on the way fails it (Switch wire 7.1).
+    let account = identity().public();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: [2; 32],
+    };
+    let good = SignedHead::sign(&service_key(), &account, &tip);
+    let key = service_key();
+    let header_value = good.to_header();
+    let added = Arc::new(MockTransport::with_handler(move |request| {
+        let mut response = respond(&key, request, 200, br#"{"pending":true}"#);
+        response
+            .headers
+            .push(Header::new(header::HEAD, &header_value));
+        Ok(response)
+    }));
+    let client = client_with(app(), Some(service_public()), added);
+    assert_eq!(
+        client.connect().await.unwrap_err(),
+        ClientError::BadServiceSignature { status: 200 }
+    );
+    let mut dropped = head_response(&good.to_header());
+    dropped.headers.retain(|h| h.name != header::HEAD);
+    assert_eq!(
+        check_response(&service_public(), &account, &head_request(), &dropped).unwrap_err(),
+        ClientError::BadServiceSignature { status: 200 }
+    );
+    // Another method or path than the one sent fails it too.
+    let response = head_response(&good.to_header());
+    for sent in [
+        SentRequest {
+            method: "POST".into(),
+            ..head_request()
+        },
+        SentRequest {
+            path: format!("/v1/{}/apps", pubky_id(&[7; 32])),
+            ..head_request()
+        },
+    ] {
+        assert_eq!(
+            check_response(&service_public(), &account, &sent, &response).unwrap_err(),
+            ClientError::BadServiceSignature { status: 200 }
+        );
     }
 }
 

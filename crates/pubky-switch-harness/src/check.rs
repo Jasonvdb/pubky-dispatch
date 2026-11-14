@@ -53,7 +53,9 @@ use pubky_switch_core::chain::{
     ZERO_HASH,
 };
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{header, request_signature_of, verify_response};
+use pubky_switch_core::http::{
+    ResponseParts, header, path_of, request_signature_of, verify_response,
+};
 use pubky_switch_core::records::IdentityDoc;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -292,10 +294,15 @@ impl Checker {
         let verifies = |key: &[u8; 32]| {
             verify_response(
                 key,
-                answer.status,
-                request_signature.as_ref(),
-                server_time,
-                &answer.body,
+                &ResponseParts {
+                    status: answer.status,
+                    method: &request.method,
+                    path: path_of(&request.path_and_query),
+                    request_signature: request_signature.as_ref(),
+                    server_time,
+                    head: answer.header(header::HEAD),
+                    body: &answer.body,
+                },
                 &signature,
             )
             .is_ok()
@@ -660,10 +667,21 @@ mod tests {
         }
     }
 
-    /// An answer `service` signs.
-    fn answer(service: &IdentityKey, status: u16, body: &Value) -> Response {
+    /// An answer to `request` that `service` signs.
+    fn answer(request: &Request, service: &IdentityKey, status: u16, body: &Value) -> Response {
         let body = serde_json::to_vec(body).unwrap();
-        let signature = sign_response(service, status, None, TIME, &body);
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status,
+                method: &request.method,
+                path: path_of(&request.path_and_query),
+                request_signature: None,
+                server_time: TIME,
+                head: None,
+                body: &body,
+            },
+        );
         Response {
             status,
             headers: vec![
@@ -710,13 +728,13 @@ mod tests {
             "identity",
             &document(generation, named, recovery_from),
         );
-        checker.signature(&put, &answer(by, 200, &json!({})))
+        checker.signature(&put, &answer(&put, by, 200, &json!({})))
     }
 
     /// What the checker finds wrong in an answer `service` signs with `body`.
     fn violations(checker: &Checker, service: &IdentityKey, body: &Value) -> Vec<String> {
         let get = request("GET", "feed", &json!(null));
-        let answer = answer(service, 200, body);
+        let answer = answer(&get, service, 200, body);
         let signed = checker.signature(&get, &answer).ok();
         checker.contents(&get, &answer, signed)
     }
@@ -751,7 +769,7 @@ mod tests {
         let enroll = request("POST", "enroll", &json!({}));
         let names_next = json!({ "service_key": b64(&next.public()) });
         // Signed with another key than the one it names: the named key isn't taken.
-        let forged = answer(&first, 200, &names_next);
+        let forged = answer(&enroll, &first, 200, &names_next);
         assert_eq!(
             checker.signature(&enroll, &forged),
             Ok(SignedWith::Brought(1))
@@ -759,22 +777,23 @@ mod tests {
         let get = request("GET", "apps", &json!(null));
         assert!(
             checker
-                .signature(&get, &answer(&next, 200, &json!({})))
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
                 .is_err(),
             "a key no verified enrollment answer named"
         );
         // Signed with the key it names: the run's second key.
-        let honest = answer(&next, 200, &names_next);
+        let honest = answer(&enroll, &next, 200, &names_next);
         assert_eq!(
             checker.signature(&enroll, &honest),
             Ok(SignedWith::Brought(2))
         );
         assert_eq!(
-            checker.signature(&get, &answer(&next, 200, &json!({}))),
+            checker.signature(&get, &answer(&get, &next, 200, &json!({}))),
             Ok(SignedWith::Brought(2))
         );
         // A refusal names no key.
         let refused = answer(
+            &enroll,
             &key(4),
             409,
             &json!({ "service_key": b64(&key(4).public()) }),
@@ -787,8 +806,9 @@ mod tests {
         let (first, next) = (key(2), key(3));
         let checker = checker(&first);
         let get = request("GET", "apps", &json!(null));
-        let signs =
-            |service: &IdentityKey| checker.signature(&get, &answer(service, 200, &json!({})));
+        let signs = |service: &IdentityKey| {
+            checker.signature(&get, &answer(&get, service, 200, &json!({})))
+        };
         assert_eq!(signs(&first), Ok(SignedWith::Brought(1)));
         assert_eq!(
             deliver(&checker, 1, &first, &first, None),
@@ -836,7 +856,7 @@ mod tests {
         // A refused delivery settles nothing.
         let put = request("PUT", "identity", &document(3, &third, Some(2)));
         assert_eq!(
-            checker.signature(&put, &answer(&next, 400, &json!({}))),
+            checker.signature(&put, &answer(&put, &next, 400, &json!({}))),
             Ok(SignedWith::Generation(2))
         );
     }

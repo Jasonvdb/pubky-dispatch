@@ -18,7 +18,7 @@
 //! changed, or when the keyed section fails. Nothing else in the service signs an answer or a
 //! head: `sign_answer` is this module's alone.
 
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use pubky_switch_core::{
     chain::{ChainTip, SignedHead},
     enc::b64,
@@ -32,6 +32,40 @@ use crate::{
     keys::{KeyId, Mark, ServiceSigner, sign_head},
     store::{AccountTxn, Keyed},
 };
+
+/// The request an answer answers, as the response signature covers it (Switch wire 7.1): its
+/// method, its path as sent without the query, and its signature bytes, `None` when it has
+/// none that decodes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Asked<'a> {
+    method: &'a str,
+    path: &'a str,
+    signature: Option<[u8; 64]>,
+}
+
+impl<'a> Asked<'a> {
+    /// The request with `method`, `path_and_query` and `headers`.
+    pub(super) fn of(method: &'a str, path_and_query: &'a str, headers: &HeaderMap) -> Self {
+        Asked {
+            method,
+            path: wire_http::path_of(path_and_query),
+            signature: wire_http::request_signature_of(
+                headers
+                    .get(header::SIGNATURE)
+                    .and_then(|value| value.to_str().ok()),
+            ),
+        }
+    }
+
+    /// The same request with its signature left out of the answer's: the public read's
+    /// answer is the same for every reader (Switch wire 7.4.15).
+    pub(super) fn unsigned(self) -> Self {
+        Asked {
+            signature: None,
+            ..self
+        }
+    }
+}
 
 /// What shows the account still names the key an answer is signed with.
 pub(super) enum Proof<'a> {
@@ -88,21 +122,32 @@ impl Signing<'_> {
     }
 }
 
-/// Sign `answer` (Switch wire 7.1): the response signature over its status, the request
-/// signature, `Switch-Server-Time` and the body.
+/// Sign `answer` (Switch wire 7.1): the response signature over its status, the method and
+/// path of the request it answers, the request signature, `Switch-Server-Time`, the
+/// `Switch-Head` text as sent and the body.
 fn sign_answer(
     signer: &ServiceSigner,
-    request_signature: Option<&[u8; 64]>,
+    asked: Asked<'_>,
     time_ms: u64,
     answer: Answer,
 ) -> SwitchResponse {
     let server_time = rfc3339(time_ms);
+    // The head's header text, signed exactly as it is sent.
+    let head = answer
+        .head
+        .as_ref()
+        .and_then(|head| HeaderValue::try_from(head.to_header()).ok());
     let signature = wire_http::sign_response(
         signer,
-        answer.status,
-        request_signature,
-        &server_time,
-        &answer.body,
+        &wire_http::ResponseParts {
+            status: answer.status,
+            method: asked.method,
+            path: asked.path,
+            request_signature: asked.signature.as_ref(),
+            server_time: &server_time,
+            head: head.as_ref().and_then(|value| value.to_str().ok()),
+            body: &answer.body,
+        },
     );
     let mut headers = Vec::new();
     let mut put = |name: &'static str, value: String| {
@@ -112,9 +157,6 @@ fn sign_answer(
     };
     put(header::SERVICE_SIGNATURE, b64(&signature));
     put(header::SERVER_TIME, server_time);
-    if let Some(head) = &answer.head {
-        put(header::HEAD, head.to_header());
-    }
     if let Some(seconds) = answer.retry_after {
         put(header::RETRY_AFTER, seconds.to_string());
     }
@@ -123,6 +165,9 @@ fn sign_answer(
     }
     if answer.no_store {
         put("cache-control", "no-store".into());
+    }
+    if let Some(head) = head {
+        headers.push((HeaderName::from_static(header::HEAD), head));
     }
     SwitchResponse {
         status: answer.status,
@@ -135,12 +180,12 @@ impl Service {
     /// An answer signed with the operator key, at the time base (Switch wire 7.1).
     pub(super) async fn operator_answer(
         &self,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         base_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
         match self.keys.operator().await {
-            Ok(signer) => sign_answer(&signer, request_signature, base_ms, Answer::error(error)),
+            Ok(signer) => sign_answer(&signer, asked, base_ms, Answer::error(error)),
             Err(failure) => {
                 tracing::error!(%failure, "the operator key");
                 unsigned(error)
@@ -155,12 +200,12 @@ impl Service {
         &self,
         proof: Proof<'_>,
         signer: &ServiceSigner,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         build: impl FnOnce(&Signing<'_>) -> (Answer, u64),
     ) -> Result<SwitchResponse, NotKeyed> {
         let sign = || {
             let (answer, time_ms) = build(&Signing { signer });
-            sign_answer(signer, request_signature, time_ms, answer)
+            sign_answer(signer, asked, time_ms, answer)
         };
         match proof {
             Proof::Locked(_) => Ok(sign()),
@@ -188,7 +233,7 @@ impl Service {
         &self,
         proof: Proof<'_>,
         signer: &ServiceSigner,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         time_ms: u64,
         answer: Answer,
         base_ms: u64,
@@ -199,19 +244,13 @@ impl Service {
             Proof::Locked(_) => None,
         };
         let signed = self
-            .try_sign_keyed(proof, signer, request_signature, |_| (answer, time_ms))
+            .try_sign_keyed(proof, signer, asked, |_| (answer, time_ms))
             .await;
         match signed {
             Ok(signed) => signed,
             Err(not_keyed) => {
-                self.not_keyed_answer(
-                    account.as_deref(),
-                    not_keyed,
-                    by_signer,
-                    request_signature,
-                    base_ms,
-                )
-                .await
+                self.not_keyed_answer(account.as_deref(), not_keyed, by_signer, asked, base_ms)
+                    .await
             }
         }
     }
@@ -229,7 +268,7 @@ impl Service {
         txn: AccountTxn,
         signer: &ServiceSigner,
         key: &KeyId,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         time_ms: u64,
         answer: Answer,
         base_ms: u64,
@@ -241,7 +280,7 @@ impl Service {
         self.sign_keyed(
             Proof::checked(&account, &key),
             signer,
-            request_signature,
+            asked,
             time_ms,
             answer,
             base_ms,
@@ -256,15 +295,14 @@ impl Service {
         account: Option<&str>,
         not_keyed: NotKeyed,
         by_signer: bool,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         base_ms: u64,
     ) -> SwitchResponse {
         let error = match (not_keyed, account) {
             (NotKeyed::Gone, Some(account)) => self.no_such_account(account, by_signer).await,
             _ => ApiError::unavailable("7.6: a temporary failure"),
         };
-        self.operator_answer(request_signature, base_ms, &error)
-            .await
+        self.operator_answer(asked, base_ms, &error).await
     }
 
     /// Sign the head of the account's chain as it will be committed, for an answer to the

@@ -42,12 +42,175 @@ const REQUEST_FIELDS: [&str; 9] = [
     "Switch-Cert",
     "Switch-Invite-Code",
 ];
-const RESPONSE_FIELDS: [&str; 4] = [
+const RESPONSE_FIELDS: [&str; 7] = [
     "u64(status)",
+    "method",
+    "path",
     "BLAKE3(request signature)",
     "server time",
+    "BLAKE3(Switch-Head)",
     "BLAKE3(body)",
 ];
+
+/// The responses whose request isn't in the file, with the method and route the wire format
+/// fixes for the call each answers, at the account whose service key signs it, or, for the
+/// not-hosted `404`, at bob, whom that service doesn't host (Switch wire 7.3 step 2).
+const ROUTES: [(&str, &str, &str, bool); 6] = [
+    (
+        "app of another identity: directory",
+        "GET",
+        "directory",
+        false,
+    ),
+    (
+        "own app: feed page with an entry and chain items",
+        "GET",
+        "feed",
+        false,
+    ),
+    ("own app: POST /ops answer", "POST", "ops", false),
+    (
+        "anyone: the public identity.json read",
+        "GET",
+        "identity",
+        false,
+    ),
+    (
+        "anyone: a frozen service's public identity.json read",
+        "GET",
+        "identity",
+        false,
+    ),
+    (NOT_HOSTED, "GET", "identity", true),
+];
+
+/// The `404 not_found` to a read of an identity the service doesn't host (Switch wire 7.3
+/// step 2, 7.6), the one response without a request signature but the public reads.
+const NOT_HOSTED: &str = "anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head";
+
+/// The method and path a response case's signature covers (Switch wire 7.1): those of the
+/// request in `file` whose signature it signs, else the route [`ROUTES`] gives its call.
+fn answered(keys: &Keys, file: &Value, case: &Value) -> (String, String) {
+    let name = st(case, "name");
+    if let Some(signature) = case["request_signature"].as_str()
+        && let Some(request) = arr(file, "requests")
+            .iter()
+            .find(|r| header(r, http::header::SIGNATURE) == Some(signature))
+    {
+        return (
+            st(request, "method").to_owned(),
+            http::path_of(st(request, "path")).to_owned(),
+        );
+    }
+    let (_, method, route, at_bob) = ROUTES
+        .iter()
+        .find(|(prefix, ..)| name.starts_with(prefix))
+        .unwrap_or_else(|| panic!("{name}: no request in the file and no route"));
+    let account = if *at_bob {
+        pubky_switch_core::enc::pubky_id(&keys.identity("bob"))
+    } else {
+        let public = b64n::<32>(st(case, "public_key"));
+        keys.service
+            .iter()
+            .find(|(_, key)| **key == public)
+            .map(|(account, _)| account.clone())
+            .unwrap_or_else(|| panic!("{name}: no account for its key"))
+    };
+    ((*method).to_owned(), format!("/v1/{account}/{route}"))
+}
+
+/// `case` with the members its response signature decides, written again: `method`,
+/// `path`, the signed fields and bytes, the signature and `Switch-Service-Signature`, signed
+/// with the fixed secret of its `public_key` over what it holds (Switch wire 7.1).
+fn signed_case(keys: &Keys, file: &Value, mut case: Value) -> Value {
+    let (method, path) = answered(keys, file, &case);
+    let public = b64n::<32>(st(&case, "public_key"));
+    let name = st(&case, "name").to_owned();
+    let secret = keys
+        .secret(&public)
+        .unwrap_or_else(|| panic!("{name}: no fixed key"));
+    let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    let request_signature = case["request_signature"].as_str().map(b64n::<64>);
+    let server_time = header(&case, http::header::SERVER_TIME).unwrap().to_owned();
+    let head = header(&case, http::header::HEAD).map(str::to_owned);
+    let body = st(&case, "body").to_owned();
+    let fields = http::response_fields(&http::ResponseParts {
+        status: u16::try_from(int(&case, "status")).unwrap(),
+        method: &method,
+        path: &path,
+        request_signature: request_signature.as_ref(),
+        server_time: &server_time,
+        head: head.as_deref(),
+        body: body.as_bytes(),
+    });
+    let signature = sig::sign(&key, labels::sig::HTTP_RESPONSE, &refs(&fields));
+    let b64 = pubky_switch_core::enc::b64;
+    case["method"] = Value::String(method);
+    case["path"] = Value::String(path);
+    case["fields"] = named_fields(&RESPONSE_FIELDS, &fields);
+    case["headers"][http::header::SERVICE_SIGNATURE] = Value::String(b64(&signature));
+    case["signature"] = Value::String(b64(&signature));
+    case["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(
+        labels::sig::HTTP_RESPONSE,
+        &refs(&fields),
+    )));
+    case
+}
+
+/// Every response's signature over the method and path of the request it answers, the
+/// request signature, the server time, the `Switch-Head` text and the body (Switch wire
+/// 7.1), which `pubky-switch-core` writes (README "How the files were generated"), with the
+/// fixed keys of `keys.json`; and the not-hosted `404` ([`NOT_HOSTED`]), its `current`
+/// `{ "hosted": false }`, signed with alice's service's key.
+fn response_signatures(keys: &Keys) {
+    let file = load("http.json");
+    let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
+    let not_hosted_at = arr(&file, "responses")
+        .iter()
+        .position(|c| c["status"] == 404 && c["request_signature"].is_null())
+        .unwrap();
+    let held = &arr(&file, "responses")[not_hosted_at];
+    let body = format!(
+        r#"{{"code":"not_found","message":"no such account","current":{}}}"#,
+        http::not_hosted_current()
+    );
+    let not_hosted = serde_json::json!({
+        "body": body,
+        "headers": {
+            "switch-server-time": header(held, http::header::SERVER_TIME).unwrap(),
+        },
+        "label": labels::sig::HTTP_RESPONSE,
+        "name": NOT_HOSTED,
+        "public_key": pubky_switch_core::enc::b64(&keys.service_key(&alice_id)),
+        "request_signature": null,
+        "signer": "service key",
+        "status": 404,
+    });
+    let pointer = format!("/responses/{not_hosted_at}");
+    let not_hosted = signed_case(keys, &file, not_hosted);
+    let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent; the timestamp is RFC 3339 UTC to the second. Response signatures cover u64(status), the method and path of the request answered, which each response names (the path as sent, without the query), BLAKE3 of the decoded Switch-Signature (or of the empty string), the exact Switch-Server-Time text, BLAKE3 of the exact Switch-Head text (or of the empty string when there is none) and BLAKE3(body).";
+    generated(
+        "http.json",
+        &[
+            (Place::Element(&pointer), not_hosted),
+            (
+                Place::Member("/description"),
+                Value::String(description.into()),
+            ),
+        ],
+    );
+    let file = load("http.json");
+    let cases: Vec<(Place<'_>, Value)> = arr(&file, "responses")
+        .iter()
+        .map(|case| {
+            (
+                Place::Case("/responses"),
+                signed_case(keys, &file, case.clone()),
+            )
+        })
+        .collect();
+    generated("http.json", &cases);
+}
 
 fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
     assert_eq!(names.len(), fields.len());
@@ -130,7 +293,15 @@ fn conditional_erasures(keys: &Keys) {
                 "signer": name,
             }),
         ));
-        let fields = http::response_fields(status, Some(&signature), server_time, answer);
+        let fields = http::response_fields(&http::ResponseParts {
+            status,
+            method: "POST",
+            path: &path,
+            request_signature: Some(&signature),
+            server_time,
+            head: None,
+            body: answer,
+        });
         let answer_signature = sig::sign(&service_key, labels::sig::HTTP_RESPONSE, &refs(&fields));
         generated_cases.push((
             Place::Case("/responses"),
@@ -142,7 +313,9 @@ fn conditional_erasures(keys: &Keys) {
                     "switch-service-signature": enc::b64(&answer_signature),
                 },
                 "label": labels::sig::HTTP_RESPONSE,
+                "method": "POST",
                 "name": answer_name,
+                "path": path,
                 "public_key": enc::b64(&service),
                 "request_signature": enc::b64(&signature),
                 "signature": enc::b64(&answer_signature),
@@ -200,12 +373,11 @@ fn superseded_as_stubs(body: &str) -> String {
 /// cursor is at the head. Each page holds the member before its `head`, and a record write
 /// that a later write in the page supersedes shows as its stub ([`superseded_as_stubs`]).
 /// Its answer is signed again with her account's fixed service key, at the page's own request
-/// signature and server time.
+/// signature, server time and head ([`signed_case`]).
 fn feed_page_cursors(keys: &Keys) {
     use pubky_switch_core::enc;
     let alice_id = enc::pubky_id(&keys.identity("alice"));
     let service = keys.service_key(&alice_id);
-    let service_key = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&service).unwrap());
     let file = load("http.json");
     let mut generated_cases = Vec::new();
     let mut signature_case = None;
@@ -232,25 +404,14 @@ fn feed_page_cursors(keys: &Keys) {
         let page = superseded_as_stubs(&page);
         let at = page.rfind("\"head\":{").unwrap();
         let body = format!("{}\"cursor\":{cursor},{}", &page[..at], &page[at..]);
-        let request_signature = b64n::<64>(st(&case, "request_signature"));
-        let server_time = header(&case, http::header::SERVER_TIME).unwrap().to_owned();
-        let fields =
-            http::response_fields(200, Some(&request_signature), &server_time, body.as_bytes());
-        let signature = sig::sign(&service_key, labels::sig::HTTP_RESPONSE, &refs(&fields));
         case["body"] = Value::String(body);
-        case["fields"] = named_fields(&RESPONSE_FIELDS, &fields);
-        case["headers"][http::header::SERVICE_SIGNATURE] = Value::String(enc::b64(&signature));
-        case["signature"] = Value::String(enc::b64(&signature));
-        case["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(
-            labels::sig::HTTP_RESPONSE,
-            &refs(&fields),
-        )));
+        let case = signed_case(keys, &file, case);
         if cursor == 41 {
             signature_case = Some(serde_json::json!({
-                "fields": named_fields(&RESPONSE_FIELDS, &fields),
+                "fields": case["fields"].clone(),
                 "label": labels::sig::HTTP_RESPONSE,
                 "public_key": enc::b64(&service),
-                "signature": enc::b64(&signature),
+                "signature": case["signature"].clone(),
                 "signed_bytes_hex": case["signed_bytes_hex"].clone(),
                 "signer": "service key",
             }));
@@ -276,6 +437,7 @@ fn test_vectors_http() {
     let keys = keys();
     conditional_erasures(&keys);
     feed_page_cursors(&keys);
+    response_signatures(&keys);
     let v = load("http.json");
     let mut transfer_requests = 0;
     for r in arr(&v, "requests") {
@@ -439,7 +601,23 @@ fn test_vectors_http() {
         assert_eq!(b64n::<64>(st(r, "signature")), signature, "{name}");
         let public = b64n::<32>(st(r, "public_key"));
         assert_eq!(st(r, "label"), labels::sig::HTTP_RESPONSE);
-        let fields = http::response_fields(status, request_signature.as_ref(), server_time, body);
+        // The method and path are those of the request it answers (Switch wire 7.1).
+        let (method, path) = answered(&keys, &v, r);
+        assert_eq!(
+            (st(r, "method"), st(r, "path")),
+            (&*method, &*path),
+            "{name}"
+        );
+        let parts = http::ResponseParts {
+            status,
+            method: &method,
+            path: &path,
+            request_signature: request_signature.as_ref(),
+            server_time,
+            head: header(r, http::header::HEAD),
+            body,
+        };
+        let fields = http::response_fields(&parts);
         assert_eq!(fields, fields_of(r), "{name}: fields");
         assert_eq!(
             hex::encode(sig::signed_bytes(
@@ -448,66 +626,59 @@ fn test_vectors_http() {
             )),
             st(r, "signed_bytes_hex")
         );
-        http::verify_response(
-            &public,
-            status,
-            request_signature.as_ref(),
-            server_time,
-            body,
-            &signature,
-        )
-        .unwrap_or_else(|e| panic!("{name}: {e}"));
-        // Another status, server time or request signature breaks it.
-        assert!(
-            http::verify_response(
-                &public,
-                status + 1,
-                request_signature.as_ref(),
-                server_time,
-                body,
-                &signature
-            )
-            .is_err()
-        );
-        assert!(
-            http::verify_response(
-                &public,
-                status,
-                Some(&[0; 64]),
-                server_time,
-                body,
-                &signature
-            )
-            .is_err()
-        );
-        assert!(
-            http::verify_response(
-                &public,
-                status,
-                request_signature.as_ref(),
-                "2000-01-01T00:00:00.000Z",
-                body,
-                &signature
-            )
-            .is_err()
-        );
-        // Signed by the account's service key, except the operator-signed answer to a
-        // request the service can't tie to an account, whose key no client knows.
-        let account_key =
-            keys.service.values().any(|k| *k == public) || keys.secret(&public).is_some();
-        if request_signature.is_none() && status == 404 {
-            assert!(!account_key, "{name}: an operator key");
-        } else {
+        http::verify_response(&public, &parts, &signature)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Another status, method, path, request signature, server time or head breaks it.
+        let other_head = match parts.head {
+            Some(_) => None,
+            None => Some("aGVhZA"),
+        };
+        for other in [
+            http::ResponseParts {
+                status: status + 1,
+                ..parts
+            },
+            http::ResponseParts {
+                method: "DELETE",
+                ..parts
+            },
+            http::ResponseParts {
+                path: "/v1/enroll/x",
+                ..parts
+            },
+            http::ResponseParts {
+                request_signature: Some(&[0; 64]),
+                ..parts
+            },
+            http::ResponseParts {
+                server_time: "2000-01-01T00:00:00.000Z",
+                ..parts
+            },
+            http::ResponseParts {
+                head: other_head,
+                ..parts
+            },
+        ] {
             assert!(
-                reproduce(
-                    &keys,
-                    &public,
-                    labels::sig::HTTP_RESPONSE,
-                    &refs(&fields),
-                    &signature
-                ),
-                "{name}: no fixed key for the service"
+                http::verify_response(&public, &other, &signature).is_err(),
+                "{name}"
             );
+        }
+        // Signed by the service key, for an account it hosts and for one it doesn't.
+        assert!(
+            reproduce(
+                &keys,
+                &public,
+                labels::sig::HTTP_RESPONSE,
+                &refs(&fields),
+                &signature
+            ),
+            "{name}: no fixed key for the service"
+        );
+        if name == NOT_HOSTED {
+            let parsed: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(parsed["current"], http::not_hosted_current(), "{name}");
+            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
         }
         if name.starts_with("signer: enrollment answer") {
             let answer = EnrollmentAnswer::from_json(body).unwrap();

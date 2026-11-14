@@ -10,6 +10,7 @@ use crate::error::{Error, Result, invalid};
 use crate::labels;
 use crate::sig;
 use crate::signing::Signs;
+use serde::{Deserialize, Serialize};
 
 /// Header names, as the switch sends them, in lower case; names are case-insensitive
 /// (Switch wire 7.1).
@@ -206,70 +207,78 @@ pub fn request_signature_of(header_value: Option<&str>) -> Option<[u8; 64]> {
     header_value.and_then(|text| unb64_array::<64>(text).ok())
 }
 
-/// The fields after the label of a response signature: `u64(status)`, `hash(request
-/// signature bytes)`, the `Switch-Server-Time` text and `hash(body)` (Switch wire 7.1).
-pub fn response_fields(
-    status: u16,
-    request_signature: Option<&[u8; 64]>,
-    server_time: &str,
-    body: &[u8],
-) -> Vec<Vec<u8>> {
-    let request_signature: &[u8] = match request_signature {
+/// The path a response signature covers: the request's path and query cut at the first `?`,
+/// as sent and not percent-decoded (Switch wire 7.1).
+pub fn path_of(path_and_query: &str) -> &str {
+    match path_and_query.split_once('?') {
+        Some((path, _)) => path,
+        None => path_and_query,
+    }
+}
+
+/// What a response signature covers besides its label (Switch wire 7.1, 2.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResponseParts<'a> {
+    /// The HTTP status.
+    pub status: u16,
+    /// The method of the request the response answers.
+    pub method: &'a str,
+    /// The path of the request the response answers, as sent and not percent-decoded,
+    /// without the query ([`path_of`]).
+    pub path: &'a str,
+    /// The request signature bytes ([`request_signature_of`]); `None` when the request has
+    /// none that decodes, and for the public read (Switch wire 7.4.15).
+    pub request_signature: Option<&'a [u8; 64]>,
+    /// The `Switch-Server-Time` text.
+    pub server_time: &'a str,
+    /// The `Switch-Head` text, exactly as sent; `None` when the response carries none.
+    pub head: Option<&'a str>,
+    /// The raw body bytes.
+    pub body: &'a [u8],
+}
+
+/// The fields after the label of a response signature: `u64(status)`, method, path,
+/// `hash(request signature bytes)`, the `Switch-Server-Time` text, `hash(Switch-Head text)`
+/// and `hash(body)` (Switch wire 7.1). An absent request signature or `Switch-Head` hashes
+/// as the empty string (Switch wire 2.3).
+pub fn response_fields(parts: &ResponseParts<'_>) -> Vec<Vec<u8>> {
+    let request_signature: &[u8] = match parts.request_signature {
         Some(signature) => signature,
         None => &[],
     };
     vec![
-        u64be(u64::from(status)).to_vec(),
+        u64be(u64::from(parts.status)).to_vec(),
+        parts.method.to_ascii_uppercase().into_bytes(),
+        parts.path.as_bytes().to_vec(),
         hash(request_signature).to_vec(),
-        server_time.as_bytes().to_vec(),
-        hash(body).to_vec(),
+        parts.server_time.as_bytes().to_vec(),
+        hash(parts.head.unwrap_or_default().as_bytes()).to_vec(),
+        hash(parts.body).to_vec(),
     ]
 }
 
-/// Sign a response with the account's service key, or the operator key for a response the
-/// service can't tie to an account (Switch wire 7.1).
-pub fn sign_response(
-    key: &impl Signs,
-    status: u16,
-    request_signature: Option<&[u8; 64]>,
-    server_time: &str,
-    body: &[u8],
-) -> [u8; 64] {
-    key.sign_fields(
-        labels::sig::HTTP_RESPONSE,
-        &refs(&response_fields(
-            status,
-            request_signature,
-            server_time,
-            body,
-        )),
-    )
+/// Sign a response with the service key (Switch wire 7.1).
+pub fn sign_response(key: &impl Signs, parts: &ResponseParts<'_>) -> [u8; 64] {
+    key.sign_fields(labels::sig::HTTP_RESPONSE, &refs(&response_fields(parts)))
 }
 
 /// Check a response signature with the service key the client pinned (Switch wire 7.1).
 ///
-/// A client checks this before it uses anything in the response.
+/// A client checks this before it uses anything in the response, with the method and path
+/// it sent.
 ///
 /// # Errors
 ///
 /// [`Error::Signature`] if it doesn't verify with `service_key`.
 pub fn verify_response(
     service_key: &[u8; 32],
-    status: u16,
-    request_signature: Option<&[u8; 64]>,
-    server_time: &str,
-    body: &[u8],
+    parts: &ResponseParts<'_>,
     signature: &[u8; 64],
 ) -> Result<()> {
     sig::verify(
         service_key,
         labels::sig::HTTP_RESPONSE,
-        &refs(&response_fields(
-            status,
-            request_signature,
-            server_time,
-            body,
-        )),
+        &refs(&response_fields(parts)),
         signature,
     )
 }
@@ -638,6 +647,9 @@ pub enum ErrorCode {
     Staged,
     /// `503`: a temporary failure.
     Unavailable,
+    /// `503`: the account awaits a recovery; its `current` is a [`RecoveryNotice`] (Switch
+    /// wire 7.3, 7.6).
+    RecoveryRequired,
 }
 
 /// Whether the same request may succeed later (the Retry column of Switch spec 6.4).
@@ -665,11 +677,14 @@ pub enum Retry {
     WhenLimitFrees,
     /// Yes, unchanged.
     Yes,
+    /// Held for the next generation: neither sent again to this generation nor final
+    /// (Switch wire 7.6, Switch spec 6.4).
+    HeldForNextGeneration,
 }
 
 impl ErrorCode {
     /// Every code, in the order of the table.
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         ErrorCode::BadRequest,
         ErrorCode::BadSignature,
         ErrorCode::StaleTimestamp,
@@ -690,6 +705,7 @@ impl ErrorCode {
         ErrorCode::QuotaExceeded,
         ErrorCode::Staged,
         ErrorCode::Unavailable,
+        ErrorCode::RecoveryRequired,
     ];
 
     /// The `code` text.
@@ -715,6 +731,7 @@ impl ErrorCode {
             ErrorCode::QuotaExceeded => "quota_exceeded",
             ErrorCode::Staged => "staged",
             ErrorCode::Unavailable => "unavailable",
+            ErrorCode::RecoveryRequired => "recovery_required",
         }
     }
 
@@ -744,7 +761,7 @@ impl ErrorCode {
             ErrorCode::Moved => 410,
             ErrorCode::TooLarge => 413,
             ErrorCode::RateLimited | ErrorCode::QuotaExceeded => 429,
-            ErrorCode::Staged | ErrorCode::Unavailable => 503,
+            ErrorCode::Staged | ErrorCode::Unavailable | ErrorCode::RecoveryRequired => 503,
         }
     }
 
@@ -770,6 +787,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => Retry::AfterRetryAfter,
             ErrorCode::QuotaExceeded => Retry::WhenLimitFrees,
             ErrorCode::Staged | ErrorCode::Unavailable => Retry::Yes,
+            ErrorCode::RecoveryRequired => Retry::HeldForNextGeneration,
         }
     }
 
@@ -778,6 +796,61 @@ impl ErrorCode {
     pub fn carries_known_version(self) -> bool {
         self == ErrorCode::IdentityNeeded
     }
+}
+
+/// Why an account awaits a recovery, the `reason` of a [`RecoveryNotice`] (Switch wire 7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeReason {
+    /// `behind`: the account's state is behind the newest head the service signed for it,
+    /// or of an earlier generation than its mark, or the account is gone while its mark is
+    /// there, or is staged and bounded by its mark.
+    Behind,
+    /// `fork`: the account is at that head's `seq` with another chain hash.
+    Fork,
+    /// `mark_lost`: the account's mark is missing or doesn't read as a mark.
+    MarkLost,
+}
+
+/// The `current` of a `503 recovery_required`, the recovery notice (Switch wire 7.6, Switch
+/// spec 6.5). All three members are required; unknown members are refused (Switch wire 1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryNotice {
+    /// The higher of the account's generation here, 0 while it holds no document, and its
+    /// mark's.
+    pub generation: u64,
+    /// Why the account awaits a recovery.
+    pub reason: NoticeReason,
+    /// `true` once the operator retired this generation for the account.
+    pub permanent: bool,
+}
+
+impl RecoveryNotice {
+    /// Read a notice from an error body's `current` (Switch wire 7.6).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if a member is missing, unknown or of another type, or `reason`
+    /// isn't one of the three.
+    pub fn from_current(current: &serde_json::Value) -> Result<Self> {
+        Ok(serde_json::from_value(current.clone())?)
+    }
+
+    /// The notice as an error body's `current`.
+    pub fn to_current(&self) -> serde_json::Value {
+        serde_json::json!({
+            "generation": self.generation,
+            "reason": self.reason,
+            "permanent": self.permanent,
+        })
+    }
+}
+
+/// The `current` of the `404 not_found` to an identity the service doesn't host,
+/// `{ "hosted": false }`, and of nothing else (Switch wire 7.3 step 2, 7.6).
+pub fn not_hosted_current() -> serde_json::Value {
+    serde_json::json!({ "hosted": false })
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -833,18 +906,112 @@ mod tests {
     fn test_response_signature_covers_the_request_signature() {
         let key = AppKeys::from_secrets([3; 32], [4; 32]);
         let request = [7u8; 64];
-        let time = "2026-01-01T00:00:00.000Z";
-        let signature = sign_response(&key, 200, Some(&request), time, b"{}");
+        let parts = ResponseParts {
+            status: 200,
+            method: "GET",
+            path: "/v1/accounts/x/feed",
+            request_signature: Some(&request),
+            server_time: "2026-01-01T00:00:00.000Z",
+            head: Some("aGVhZA"),
+            body: b"{}",
+        };
+        let signature = sign_response(&key, &parts);
         let public = key.signing_public();
-        assert!(verify_response(&public, 200, Some(&request), time, b"{}", &signature).is_ok());
-        assert!(verify_response(&public, 200, None, time, b"{}", &signature).is_err());
-        assert!(verify_response(&public, 201, Some(&request), time, b"{}", &signature).is_err());
-        // A request without a decodable signature signs the hash of the empty string.
-        assert_eq!(
-            response_fields(404, None, time, b"")[1],
-            crate::enc::hash(b"").to_vec()
-        );
+        assert!(verify_response(&public, &parts, &signature).is_ok());
+        let changed = [
+            ResponseParts {
+                request_signature: None,
+                ..parts
+            },
+            ResponseParts {
+                status: 201,
+                ..parts
+            },
+            ResponseParts {
+                method: "POST",
+                ..parts
+            },
+            ResponseParts {
+                path: "/v1/accounts/y/feed",
+                ..parts
+            },
+            ResponseParts {
+                head: None,
+                ..parts
+            },
+            ResponseParts {
+                head: Some("aGVhZB"),
+                ..parts
+            },
+        ];
+        for other in changed {
+            assert!(verify_response(&public, &other, &signature).is_err());
+        }
+        // The method is signed in upper case.
+        let lower = ResponseParts {
+            method: "get",
+            ..parts
+        };
+        assert!(verify_response(&public, &lower, &signature).is_ok());
+        // A request without a decodable signature, and a response without a head, sign the
+        // hash of the empty string.
+        let bare = ResponseParts {
+            request_signature: None,
+            head: None,
+            ..parts
+        };
+        let fields = response_fields(&bare);
+        assert_eq!(fields[3], crate::enc::hash(b"").to_vec());
+        assert_eq!(fields[5], crate::enc::hash(b"").to_vec());
         assert_eq!(request_signature_of(Some("not base64url")), None);
+    }
+
+    #[test]
+    fn test_response_path_drops_the_query() {
+        assert_eq!(
+            path_of("/v1/accounts/x/feed?after=3"),
+            "/v1/accounts/x/feed"
+        );
+        assert_eq!(path_of("/v1/accounts/x/feed"), "/v1/accounts/x/feed");
+        assert_eq!(path_of("/v1/a%20b?x=1?y"), "/v1/a%20b");
+    }
+
+    #[test]
+    fn test_recovery_notice_reads_strictly() {
+        let notice = RecoveryNotice::from_current(&serde_json::json!({
+            "generation": 3, "reason": "mark_lost", "permanent": false
+        }))
+        .unwrap();
+        assert_eq!(
+            notice,
+            RecoveryNotice {
+                generation: 3,
+                reason: NoticeReason::MarkLost,
+                permanent: false
+            }
+        );
+        assert_eq!(
+            RecoveryNotice::from_current(&notice.to_current()).unwrap(),
+            notice
+        );
+        for bad in [
+            serde_json::json!({ "generation": 3, "reason": "behind" }),
+            serde_json::json!({ "generation": 3, "reason": "lost", "permanent": false }),
+            serde_json::json!({ "generation": "3", "reason": "fork", "permanent": false }),
+            serde_json::json!({ "generation": 3, "reason": "fork", "permanent": false, "x": 1 }),
+        ] {
+            assert!(RecoveryNotice::from_current(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(ErrorCode::RecoveryRequired.status(), 503);
+        assert_eq!(
+            ErrorCode::parse("recovery_required"),
+            Some(ErrorCode::RecoveryRequired)
+        );
+        assert_eq!(
+            ErrorCode::RecoveryRequired.retry(),
+            Retry::HeldForNextGeneration
+        );
+        assert_eq!(not_hosted_current(), serde_json::json!({ "hosted": false }));
     }
 
     #[test]

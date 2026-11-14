@@ -208,7 +208,7 @@ Every signature of the Switch. Fields are encoded as in 1.4. The formats the Pub
 
 - **Identity** in a field list is always the account's identity: the identity whose inbox, records and chain these are. For a message it is the recipient's.
 - **Request signature bytes** are the 64 bytes decoded from `Switch-Signature`. When the request has no decodable signature (a `401 bad_signature`, or an unknown route), the field is `hash` of the empty string. The method and path in a response's input are those of the request it answers (7.1).
-- Vectors: `signatures.json` has one case per label, with each field, the exact signed bytes and the signature, and the rejections of 2.1; `http.json` adds requests and responses of every caller kind; `export.json` the export manifest, signed with the fixed service key of `keys.json`.
+- Vectors: `signatures.json` has one case per label, with each field, the exact signed bytes and the signature, and the rejections of 2.1; `http.json` adds requests and responses of every caller kind, each response with the method and path of the request it answers; `export.json` the export manifest, signed with the fixed service key of `keys.json`.
 
 ## 3. Records
 
@@ -1686,7 +1686,7 @@ So the largest answer the limits bound is under 135 MiB at the default limits, a
 - Error bodies are `{ "code": string, "message": string, "current": object (where 8.6 says), "known_version": ... (only in `409 identity_needed`), "retry_after": int (on `429 rate_limited`) }`.
 - Writes by own apps and the signer return `{ "proofs": [...], "head": signed head }`, the transition proofs of the chain items they wrote, in order.
 
-Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Switch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and an operator-signed `404` to a request without a signature. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2).
+Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Switch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and the `404 not_found` with `current` `{ "hosted": false }` to an unsigned read of an identity the service doesn't host (7.3 step 2), signed with the service key. Each response names the method and path its signature covers. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2).
 
 Example request headers (an append from bob's `shop` to alice's inbox):
 

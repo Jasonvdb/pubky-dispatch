@@ -54,10 +54,15 @@ impl Recording {
             .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
         let signature = pubky_switch_core::http::sign_response(
             &SigningKey::from_bytes(&[42; 32]),
-            503,
-            request_signature.as_ref(),
-            server_time,
-            &body,
+            &pubky_switch_core::http::ResponseParts {
+                status: 503,
+                method: &request.method,
+                path: pubky_switch_core::http::path_of(&request.path_and_query),
+                request_signature: request_signature.as_ref(),
+                server_time,
+                head: None,
+                body: &body,
+            },
         );
         Response {
             status: 503,
@@ -74,6 +79,8 @@ impl Transport for Recording {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let feed = request.path_and_query.contains("/feed");
+            let method = request.method.clone();
+            let path = pubky_switch_core::http::path_of(&request.path_and_query).to_owned();
             let request_signature = request
                 .header(header::SIGNATURE)
                 .and_then(|text| unb64(text).ok())
@@ -95,10 +102,15 @@ impl Transport for Recording {
                     .is_some_and(|(signature, time)| {
                         pubky_switch_core::http::verify_response(
                             &operator,
-                            response.status,
-                            request_signature.as_ref(),
-                            time,
-                            &response.body,
+                            &pubky_switch_core::http::ResponseParts {
+                                status: response.status,
+                                method: &method,
+                                path: &path,
+                                request_signature: request_signature.as_ref(),
+                                server_time: time,
+                                head: response.header(header::HEAD),
+                                body: &response.body,
+                            },
                             &signature,
                         )
                         .is_ok()

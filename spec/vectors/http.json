@@ -1,5 +1,5 @@
 {
-  "description": "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent; the timestamp is RFC 3339 UTC to the second. Response signatures cover u64(status), BLAKE3 of the decoded Switch-Signature (or of the empty string), the exact Switch-Server-Time text and BLAKE3(body).",
+  "description": "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent; the timestamp is RFC 3339 UTC to the second. Response signatures cover u64(status), the method and path of the request answered, which each response names (the path as sent, without the query), BLAKE3 of the decoded Switch-Signature (or of the empty string), the exact Switch-Server-Time text, BLAKE3 of the exact Switch-Head text (or of the empty string when there is none) and BLAKE3(body).",
   "requests": [
     {
       "body_b64": "",
@@ -783,6 +783,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6469726563746f7279",
+          "name": "path"
+        },
+        {
           "hex": "44a147eed786d82b138f0583be126644178476ba7ea5b5a3c3881f300c7644e3",
           "name": "BLAKE3(request signature)"
         },
@@ -791,20 +799,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "d203d0a77fbaafa6b1cf08ed5c3a592854695e2dc7dd789bc9e6275777e1f408",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:05:00.520Z",
-        "switch-service-signature": "wefUSkKzXb8PLX6w1g_Ituec7Z_tee9tL9nEJmuMSC44Bqtweuza0MXjYTxMuMQMD-ezDos-YGA2GDISL22-BA"
+        "switch-service-signature": "THmqkviAcXQZW2d4miCHbRmEwwGUOd2mCx7_75QR9lqn9YwFDCmQq_LD_yQ2YJTOD7ADBswN88KBOkKU8ACgBA"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "app of another identity: directory, known_version in the body",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/directory",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "sPW_nwESJD6GvnKpv_wqXZkSxq6YvguSiZWvYZyfxUE7z5c-wxFY8kj6fPi9dJoZPfQadBK147qSxbTrw2HkCw",
-      "signature": "wefUSkKzXb8PLX6w1g_Ituec7Z_tee9tL9nEJmuMSC44Bqtweuza0MXjYTxMuMQMD-ezDos-YGA2GDISL22-BA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c80000002044a147eed786d82b138f0583be126644178476ba7ea5b5a3c3881f300c7644e300000018323032362d30312d30315430303a30353a30302e3532305a00000020d203d0a77fbaafa6b1cf08ed5c3a592854695e2dc7dd789bc9e6275777e1f408",
+      "signature": "THmqkviAcXQZW2d4miCHbRmEwwGUOd2mCx7_75QR9lqn9YwFDCmQq_LD_yQ2YJTOD7ADBswN88KBOkKU8ACgBA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000003474554000000422f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6469726563746f72790000002044a147eed786d82b138f0583be126644178476ba7ea5b5a3c3881f300c7644e300000018323032362d30312d30315430303a30353a30302e3532305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020d203d0a77fbaafa6b1cf08ed5c3a592854695e2dc7dd789bc9e6275777e1f408",
       "signer": "service key",
       "status": 200
     },
@@ -816,12 +830,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f66656564",
+          "name": "path"
+        },
+        {
           "hex": "cae7b9e0fda344ca9f2b8e37ee24c3388e6e679aca621c01359001fbe22ca99d",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30353a30322e3031305a",
           "name": "server time"
+        },
+        {
+          "hex": "2c012a44e19ae76563acecb280761069e5392d540bd6dcc482c69c16f1f03993",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "42f929d26b69424c77da194d932d94ae3ed72daf260fcd1c790395cb4c116ae3",
@@ -831,14 +857,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjksImNoYWluX2hhc2giOiJtdVlqQmh1ejZVSTFSWDh1cElySUlNSUJwSV8zZ1J2Zmh3UXRyRGxkSW1BIiwic2lnIjoiYjIzeEhWUFpDUjdiT2dROTZISUlWQ28yU2JBVHpVUWZqMHJ4WXVCZGtPLWI3OWVidkR0OVlPT3dIVGYwdE5MbFMtNFlMeHUybEprbnNRQ1pJd08yQkEifQ",
         "switch-server-time": "2026-01-01T00:05:02.010Z",
-        "switch-service-signature": "tG4jIceKbuNFq746SBX-gaOs-O3J5h9znuTZzKyNNG-jr35ZaP8lTEqpeqZK6yHB8sVvBKNkKWrlMvpZOr9aBw"
+        "switch-service-signature": "faRI3zyy00DIQAMy6PlTHbFAQY2TkSu47-uYzH49ZW9IXRSlW2lqPdd-e1YnW6ytqPCmb5400Ky095cmAUp8DQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "own app: feed page with an entry and chain items",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/feed",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "IcopU_dGKgcb-CoR1r9YEmaDeWyi8kRnekAH6pM6G4AI6N2-36TiMH5oESs2-YThFXfTg4m2Q3VykIfAD5XvBw",
-      "signature": "tG4jIceKbuNFq746SBX-gaOs-O3J5h9znuTZzKyNNG-jr35ZaP8lTEqpeqZK6yHB8sVvBKNkKWrlMvpZOr9aBw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020cae7b9e0fda344ca9f2b8e37ee24c3388e6e679aca621c01359001fbe22ca99d00000018323032362d30312d30315430303a30353a30322e3031305a0000002042f929d26b69424c77da194d932d94ae3ed72daf260fcd1c790395cb4c116ae3",
+      "signature": "faRI3zyy00DIQAMy6PlTHbFAQY2TkSu47-uYzH49ZW9IXRSlW2lqPdd-e1YnW6ytqPCmb5400Ky095cmAUp8DQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000034745540000003d2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6665656400000020cae7b9e0fda344ca9f2b8e37ee24c3388e6e679aca621c01359001fbe22ca99d00000018323032362d30312d30315430303a30353a30322e3031305a000000202c012a44e19ae76563acecb280761069e5392d540bd6dcc482c69c16f1f039930000002042f929d26b69424c77da194d932d94ae3ed72daf260fcd1c790395cb4c116ae3",
       "signer": "service key",
       "status": 200
     },
@@ -850,12 +878,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6f7073",
+          "name": "path"
+        },
+        {
           "hex": "dd2bcfef9e21542e8e5bb900a32dc978fc9c81f8ec3b453900e93d0178468c35",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30303a30332e3030305a",
           "name": "server time"
+        },
+        {
+          "hex": "2c012a44e19ae76563acecb280761069e5392d540bd6dcc482c69c16f1f03993",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "4885b694f10bad8cb7fb66e35758c87a56ac948a63d427a76514d5563cd56c65",
@@ -865,14 +905,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjksImNoYWluX2hhc2giOiJtdVlqQmh1ejZVSTFSWDh1cElySUlNSUJwSV8zZ1J2Zmh3UXRyRGxkSW1BIiwic2lnIjoiYjIzeEhWUFpDUjdiT2dROTZISUlWQ28yU2JBVHpVUWZqMHJ4WXVCZGtPLWI3OWVidkR0OVlPT3dIVGYwdE5MbFMtNFlMeHUybEprbnNRQ1pJd08yQkEifQ",
         "switch-server-time": "2026-01-01T00:00:03.000Z",
-        "switch-service-signature": "qk0gTvdJWTPBNwmXncWF13WSHXz-62kakbFIHrFPGbreBrvYwYQ7BPd2MVt403Eaq3WGJ8gKrRrMOYB7hHS4Dw"
+        "switch-service-signature": "LgrDbWuCMvkhbb-RHWB2w1rSOMqjfUM24AE6VsHz_9V6CRhxsKEGupQEAro86TxXzGqI0CVmxKb21pLStREZCQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "own app: POST /ops answer with the batch's proofs",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/ops",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "cA19G_rRDE7fyJ8R3rej1y9aFqqcnzYNJjdGgUb-5If3rq6qXuzFmDXxc49QeJdvXVELVZ5YiNg5OtSOBHGwBQ",
-      "signature": "qk0gTvdJWTPBNwmXncWF13WSHXz-62kakbFIHrFPGbreBrvYwYQ7BPd2MVt403Eaq3WGJ8gKrRrMOYB7hHS4Dw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020dd2bcfef9e21542e8e5bb900a32dc978fc9c81f8ec3b453900e93d0178468c3500000018323032362d30312d30315430303a30303a30332e3030305a000000204885b694f10bad8cb7fb66e35758c87a56ac948a63d427a76514d5563cd56c65",
+      "signature": "LgrDbWuCMvkhbb-RHWB2w1rSOMqjfUM24AE6VsHz_9V6CRhxsKEGupQEAro86TxXzGqI0CVmxKb21pLStREZCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003c2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6f707300000020dd2bcfef9e21542e8e5bb900a32dc978fc9c81f8ec3b453900e93d0178468c3500000018323032362d30312d30315430303a30303a30332e3030305a000000202c012a44e19ae76563acecb280761069e5392d540bd6dcc482c69c16f1f03993000000204885b694f10bad8cb7fb66e35758c87a56ac948a63d427a76514d5563cd56c65",
       "signer": "service key",
       "status": 200
     },
@@ -884,12 +926,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f66656564",
+          "name": "path"
+        },
+        {
           "hex": "701b0d51655b16d43e1b4d62cda16ecec809e5f0c6271b1b2c93c327eb0cf006",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30353a30302e3235305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
@@ -899,14 +953,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
         "switch-server-time": "2026-01-01T00:05:00.250Z",
-        "switch-service-signature": "vZEvjUQYGWHCQt80Mo0-CRz9HY33Kke-hQyMD5VPhldwiOqbFPE0xes23ke0YV3kkfsMlldUAKeJdjmmX33MCA"
+        "switch-service-signature": "fr9pbEA0Szt8m5iaJfzRwU-FoMujCsg8ifs76OB4gAeTPNQ0IsZWnCrq0UUIQCjeV9o-F-zxTq0vS_7r3WTJAw"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "own app: feed page, with the head header",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/feed",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "TgEhN9juSp9-uwcSPfE32OTPKh7TqT1g67CbWKdo1vf34dp725pzIc5IljGX-FnJ-91dbK3QfVJeALTWBW4nDw",
-      "signature": "vZEvjUQYGWHCQt80Mo0-CRz9HY33Kke-hQyMD5VPhldwiOqbFPE0xes23ke0YV3kkfsMlldUAKeJdjmmX33MCA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020701b0d51655b16d43e1b4d62cda16ecec809e5f0c6271b1b2c93c327eb0cf00600000018323032362d30312d30315430303a30353a30302e3235305a00000020c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
+      "signature": "fr9pbEA0Szt8m5iaJfzRwU-FoMujCsg8ifs76OB4gAeTPNQ0IsZWnCrq0UUIQCjeV9o-F-zxTq0vS_7r3WTJAw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000034745540000003d2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6665656400000020701b0d51655b16d43e1b4d62cda16ecec809e5f0c6271b1b2c93c327eb0cf00600000018323032362d30312d30315430303a30353a30302e3235305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee34500000020c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
       "signer": "service key",
       "status": 200
     },
@@ -918,6 +974,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f696e626f78",
+          "name": "path"
+        },
+        {
           "hex": "779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe62324",
           "name": "BLAKE3(request signature)"
         },
@@ -926,20 +990,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "b49c918651eeb250ccff9a9d609d8097a890baace5da8082aa2f6571e5ece958",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:05:01.100Z",
-        "switch-service-signature": "6PXu8e0SO8_pYZn0xfuyG4KdgBd2nDpVjFV6CrkTLeaq9XiTcKCILR9W2SJFrE_nd_CqxlPw5-B-96hIJ2F7Bw"
+        "switch-service-signature": "8GNMyEMhVYbFAGP8xteJzdWuIBLvRtSIC-EWilctGUf0ufC8VUVN57nG_w1vDttIL44JTYfZe-pZtgww8Ru4BQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "app of another identity: 409 stale_key, no known_version in the body",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/inbox",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg",
-      "signature": "6PXu8e0SO8_pYZn0xfuyG4KdgBd2nDpVjFV6CrkTLeaq9XiTcKCILR9W2SJFrE_nd_CqxlPw5-B-96hIJ2F7Bw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000020779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe6232400000018323032362d30312d30315430303a30353a30312e3130305a00000020b49c918651eeb250ccff9a9d609d8097a890baace5da8082aa2f6571e5ece958",
+      "signature": "8GNMyEMhVYbFAGP8xteJzdWuIBLvRtSIC-EWilctGUf0ufC8VUVN57nG_w1vDttIL44JTYfZe-pZtgww8Ru4BQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f696e626f7800000020779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe6232400000018323032362d30312d30315430303a30353a30312e3130305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020b49c918651eeb250ccff9a9d609d8097a890baace5da8082aa2f6571e5ece958",
       "signer": "service key",
       "status": 409
     },
@@ -951,6 +1021,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f696e626f78",
+          "name": "path"
+        },
+        {
           "hex": "779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe62324",
           "name": "BLAKE3(request signature)"
         },
@@ -959,20 +1037,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "ea907ff3896f0ac446c651a3d9141b36e6cb319bf00b5239f166be9b63d45ff3",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:05:01.100Z",
-        "switch-service-signature": "LqFTovtTkSahDyRcIiOPja0J4YeEwjVedOYKWek_po0I7bdyg7WwLDAsf47udAbUCAjCtloGhBzxnnGTjnxlDw"
+        "switch-service-signature": "aC-ITyEGbA1FaatiTKqHh9j1iNO9nhM7hEIZ_Fwol4G56QBmjG2srODUz2JkyNj6g1_IxVqpWhoPk22xNBgwDg"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "app of another identity: 429 rate_limited, no known_version in the body",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/inbox",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg",
-      "signature": "LqFTovtTkSahDyRcIiOPja0J4YeEwjVedOYKWek_po0I7bdyg7WwLDAsf47udAbUCAjCtloGhBzxnnGTjnxlDw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000001ad00000020779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe6232400000018323032362d30312d30315430303a30353a30312e3130305a00000020ea907ff3896f0ac446c651a3d9141b36e6cb319bf00b5239f166be9b63d45ff3",
+      "signature": "aC-ITyEGbA1FaatiTKqHh9j1iNO9nhM7hEIZ_Fwol4G56QBmjG2srODUz2JkyNj6g1_IxVqpWhoPk22xNBgwDg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000001ad00000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f696e626f7800000020779666c00aa8e658b4d6016e2a229723904c2d3b5379ef428ae6c23fdbe6232400000018323032362d30312d30315430303a30353a30312e3130305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020ea907ff3896f0ac446c651a3d9141b36e6cb319bf00b5239f166be9b63d45ff3",
       "signer": "service key",
       "status": 429
     },
@@ -984,6 +1068,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f656e726f6c6c",
+          "name": "path"
+        },
+        {
           "hex": "5b03d0176bc8f4d4e458dfb96c49d4ead31604e0eb89f9fd34ee2c22af5286f2",
           "name": "BLAKE3(request signature)"
         },
@@ -992,29 +1084,43 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "b19ec636e1dbc92085a5cee534afd54aac81f6a244d7f133e4e01e9130ce6a27",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2025-12-30T00:00:00.040Z",
-        "switch-service-signature": "eeILlJh9MYhkbUK5MpcGJ1_oHxsE6wYGHNPCjhb6ktV8WQeIhpzgzsOacCy8kBSGM98md5Z1P57yS8tp8JQiCg"
+        "switch-service-signature": "9UKr1EWtA9Zc_lPUWwBOtqhi5_RPiaOuVaa-gIhjVpsVriZ4uPs2JC4wD5TEkUAZ8MC9cWkwlgMAqU6wyxnQBQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "signer: enrollment answer, signed with the new account's key",
+      "path": "/v1/enroll",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "BnmTysQ4_q34_w-EgiBsxu0RFUuZNnVfXisYKZlW1O9wtB6NgRCTmwQHzySyI9Nr6Tl8Ys0USSuIMtvcJI6RDA",
-      "signature": "eeILlJh9MYhkbUK5MpcGJ1_oHxsE6wYGHNPCjhb6ktV8WQeIhpzgzsOacCy8kBSGM98md5Z1P57yS8tp8JQiCg",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000205b03d0176bc8f4d4e458dfb96c49d4ead31604e0eb89f9fd34ee2c22af5286f200000018323032352d31322d33305430303a30303a30302e3034305a00000020b19ec636e1dbc92085a5cee534afd54aac81f6a244d7f133e4e01e9130ce6a27",
+      "signature": "9UKr1EWtA9Zc_lPUWwBOtqhi5_RPiaOuVaa-gIhjVpsVriZ4uPs2JC4wD5TEkUAZ8MC9cWkwlgMAqU6wyxnQBQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000000a2f76312f656e726f6c6c000000205b03d0176bc8f4d4e458dfb96c49d4ead31604e0eb89f9fd34ee2c22af5286f200000018323032352d31322d33305430303a30303a30302e3034305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020b19ec636e1dbc92085a5cee534afd54aac81f6a244d7f133e4e01e9130ce6a27",
       "signer": "service key",
       "status": 200
     },
     {
-      "body": "{\"code\":\"not_found\",\"message\":\"no such account\"}",
+      "body": "{\"code\":\"not_found\",\"message\":\"no such account\",\"current\":{\"hosted\":false}}",
       "fields": [
         {
           "hex": "0000000000000194",
           "name": "u64(status)"
+        },
+        {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f6964656e74697479",
+          "name": "path"
         },
         {
           "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
@@ -1025,20 +1131,26 @@
           "name": "server time"
         },
         {
-          "hex": "40322f43b80572957220b69e02507cf5e925bd2b287c97a50fde3e8fdbf40fd6",
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
+          "hex": "7ac94dc726c8f2f61c9bd21a2898727abe5c95411ab3b38322ab37bb7a4eec60",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:00:00.000Z",
-        "switch-service-signature": "eJLygjDFvMVsdttRjMpri0m1UXab6Vcpd7NvOqoG84o6Uqub1c9spUQrJSmAx6AzX7XmjvHTIFJKAqixUxZWAA"
+        "switch-service-signature": "jMM_X19v08sIc5iu4Hw3JzZswFxzaMG9mpp7xcpUxGa4PLE75nQRcyBOD14EpZu9rp6REUTdc43GfGPOvo6PDw"
       },
       "label": "pubky-switch/v1/http-response",
-      "name": "no signature on the request, unknown account: operator key, BLAKE3 of the empty string",
-      "public_key": "G4ccdZHE8gurcEdy9PAO3nn7T3pjObgU38PXavxaPEI",
+      "method": "GET",
+      "name": "anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head",
+      "path": "/v1/43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o/identity",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": null,
-      "signature": "eJLygjDFvMVsdttRjMpri0m1UXab6Vcpd7NvOqoG84o6Uqub1c9spUQrJSmAx6AzX7XmjvHTIFJKAqixUxZWAA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019400000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30303a30302e3030305a0000002040322f43b80572957220b69e02507cf5e925bd2b287c97a50fde3e8fdbf40fd6",
+      "signature": "jMM_X19v08sIc5iu4Hw3JzZswFxzaMG9mpp7xcpUxGa4PLE75nQRcyBOD14EpZu9rp6REUTdc43GfGPOvo6PDw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019400000003474554000000412f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f6964656e7469747900000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30303a30302e3030305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262000000207ac94dc726c8f2f61c9bd21a2898727abe5c95411ab3b38322ab37bb7a4eec60",
       "signer": "service key",
       "status": 404
     },
@@ -1050,6 +1162,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6578706f72742f6368756e6b732f3030303030",
+          "name": "path"
+        },
+        {
           "hex": "f42ff58e9fab54004ed5891651078101324cf633bf6a62b46c6bcb6d8ea082de",
           "name": "BLAKE3(request signature)"
         },
@@ -1058,20 +1178,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "ed789d15a9d625f2d3d52deba6443ac817ead1601476e4ff15dadf91ab5e9a49",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-04-11T00:03:00.020Z",
-        "switch-service-signature": "QP_Ic51r73UC4gGdOBs-Uo7gsZA1VEx1_zbJYYlM1xb8Lp9YlYUf34bOjQUv3bUw7O50AMXaLL3ZZ3t6KZNtBw"
+        "switch-service-signature": "mN3wkCYkZsqSprHYQmSjEVonWz5z9O-UpZsUZ_eFsGKGGdLgePrwF594CIHusS8AyxwkCPEh0ZlKYfZUec35Dg"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "next service: the export chunk, signed with the old service's key, no head",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/export/chunks/00000",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "4EHIRfPo6GN1ORXG7oUiitD38Sci4iqml8SSCofn1ujUMemroei-78ohjS2Yl1yaPx7P4VoEwZlIbTSBrgKeCw",
-      "signature": "QP_Ic51r73UC4gGdOBs-Uo7gsZA1VEx1_zbJYYlM1xb8Lp9YlYUf34bOjQUv3bUw7O50AMXaLL3ZZ3t6KZNtBw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020f42ff58e9fab54004ed5891651078101324cf633bf6a62b46c6bcb6d8ea082de00000018323032362d30342d31315430303a30333a30302e3032305a00000020ed789d15a9d625f2d3d52deba6443ac817ead1601476e4ff15dadf91ab5e9a49",
+      "signature": "mN3wkCYkZsqSprHYQmSjEVonWz5z9O-UpZsUZ_eFsGKGGdLgePrwF594CIHusS8AyxwkCPEh0ZlKYfZUec35Dg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000034745540000004c2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6578706f72742f6368756e6b732f303030303000000020f42ff58e9fab54004ed5891651078101324cf633bf6a62b46c6bcb6d8ea082de00000018323032362d30342d31315430303a30333a30302e3032305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020ed789d15a9d625f2d3d52deba6443ac817ead1601476e4ff15dadf91ab5e9a49",
       "signer": "service key",
       "status": 200
     },
@@ -1083,12 +1209,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e74697479",
+          "name": "path"
+        },
+        {
           "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30353a30302e3730305a",
           "name": "server time"
+        },
+        {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "1d00c0506b16942f947589959b7e577b14444bbcdf27039c7fb926557cbf53bd",
@@ -1098,14 +1236,16 @@
       "headers": {
         "cache-control": "public, max-age=60",
         "switch-server-time": "2026-01-01T00:05:00.700Z",
-        "switch-service-signature": "I--netuCaSwBbkDME8yB8Yb6PDT8hFYs1FjJ7ij9mKbixi2_8LoRcvx3ACWKPlZPE7ZRQo-eUBvlRUCCbgbyBw"
+        "switch-service-signature": "kZ0v8SZP6Gk1bhc85YunoHdqaFY7w7zHcGHfxYdrmUGmEfLWpvaDrH1FD8q1uavLfSNM-f7DwrVV5KHb8P8SBw"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "anyone: the public identity.json read, unsigned, answered with no head",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/identity",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": null,
-      "signature": "I--netuCaSwBbkDME8yB8Yb6PDT8hFYs1FjJ7ij9mKbixi2_8LoRcvx3ACWKPlZPE7ZRQo-eUBvlRUCCbgbyBw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30353a30302e3730305a000000201d00c0506b16942f947589959b7e577b14444bbcdf27039c7fb926557cbf53bd",
+      "signature": "kZ0v8SZP6Gk1bhc85YunoHdqaFY7w7zHcGHfxYdrmUGmEfLWpvaDrH1FD8q1uavLfSNM-f7DwrVV5KHb8P8SBw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000003474554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e7469747900000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30312d30315430303a30353a30302e3730305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262000000201d00c0506b16942f947589959b7e577b14444bbcdf27039c7fb926557cbf53bd",
       "signer": "service key",
       "status": 200
     },
@@ -1117,12 +1257,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e74697479",
+          "name": "path"
+        },
+        {
           "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30342d31315430303a30323a30302e3030305a",
           "name": "server time"
+        },
+        {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "7e8aa9fba8f39c5fa38dc49eafeee793f66a5ccae731ad0bacd5025a50503a6a",
@@ -1132,14 +1284,16 @@
       "headers": {
         "cache-control": "public, max-age=60",
         "switch-server-time": "2026-04-11T00:02:00.000Z",
-        "switch-service-signature": "jOJCNyAkODGeQm089kg24i12GltXvfm_ysBr1Yt5FHiiejvCjc4abqVL7bZMv3xdkKr6hYteyQJrLoX87GrLAg"
+        "switch-service-signature": "YKGf266jh6GT9V8YWWkn9cPs92vaon87FPBPUDJUmIIpIjk2Ed_spVKrK6VPnAb-VhznhNi2wxF6nSHCK5iFDg"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "anyone: a frozen service's public identity.json read, with the freeze",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/identity",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": null,
-      "signature": "jOJCNyAkODGeQm089kg24i12GltXvfm_ysBr1Yt5FHiiejvCjc4abqVL7bZMv3xdkKr6hYteyQJrLoX87GrLAg",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30342d31315430303a30323a30302e3030305a000000207e8aa9fba8f39c5fa38dc49eafeee793f66a5ccae731ad0bacd5025a50503a6a",
+      "signature": "YKGf266jh6GT9V8YWWkn9cPs92vaon87FPBPUDJUmIIpIjk2Ed_spVKrK6VPnAb-VhznhNi2wxF6nSHCK5iFDg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000003474554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e7469747900000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000018323032362d30342d31315430303a30323a30302e3030305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262000000207e8aa9fba8f39c5fa38dc49eafeee793f66a5ccae731ad0bacd5025a50503a6a",
       "signer": "service key",
       "status": 200
     },
@@ -1151,6 +1305,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365",
+          "name": "path"
+        },
+        {
           "hex": "9feb2af23bba834faf225304d1b8eae84515a99d2e081a09d9bfda4de9a5b61c",
           "name": "BLAKE3(request signature)"
         },
@@ -1159,20 +1321,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "Au8k9KTv9z7jSOLJhG_jXkXUuaJBd50GeHgWGvrA5gRobqnajPt2uLeBINb-eYd9Oiyjx7SYg7ubTPkoCh9ZDw"
+        "switch-service-signature": "Ro9aj6uVo0uSLiHdJt_21shtOxeU1jw7ik-_dYjTzbWcH9TTCLVrl2E7cr5HKXEyI460PJdGN1-oOiJwCpHwBg"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "signer: account erasure answer, signed with the account's key, no head",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "lQR6CtFRxyx5-OhUCjkDQqdMuQ2U4S4BM9Z7vkewqM1i5LTVRYV617ZJEb_arr8xxnDoGVt9Mu8WQUtoiyVuDQ",
-      "signature": "Au8k9KTv9z7jSOLJhG_jXkXUuaJBd50GeHgWGvrA5gRobqnajPt2uLeBINb-eYd9Oiyjx7SYg7ubTPkoCh9ZDw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000209feb2af23bba834faf225304d1b8eae84515a99d2e081a09d9bfda4de9a5b61c00000018323032362d30312d30315430303a30373a30302e3033305a00000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+      "signature": "Ro9aj6uVo0uSLiHdJt_21shtOxeU1jw7ik-_dYjTzbWcH9TTCLVrl2E7cr5HKXEyI460PJdGN1-oOiJwCpHwBg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000209feb2af23bba834faf225304d1b8eae84515a99d2e081a09d9bfda4de9a5b61c00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
       "signer": "service key",
       "status": 200
     },
@@ -1184,12 +1352,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "505554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e74697479",
+          "name": "path"
+        },
+        {
           "hex": "eba482f77d83101ae5dcd5e0df643f041274af792b71712c5762560a5468dc4a",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30383a30302e3033305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "11e7339dd50411ab8976e6b2cdac57fa15fa9f837aa1ba4391df6d88dc3c26cf",
@@ -1199,14 +1379,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
         "switch-server-time": "2026-01-01T00:08:00.030Z",
-        "switch-service-signature": "OMueMrWcb5_DwEHaBtw7TyeXTRXkK7sDM709fRFTLblnmRx62ENBiBAG3apLlpoCrXZnFc7ge7hn7dPGSX7qAw"
+        "switch-service-signature": "Z9RMEVu_xWFKnRhoV1TnKHF5Nf4ecwmjZK-nrcSYUzqqiJIfjMwJ8wRJd6DFcKX5FXFEt2k0qfHMs3e_vRrYAQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "PUT",
       "name": "signer: 409 conflict, a needed service key left out, current.proof_generations",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/identity",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "SHJT3s104UkRVUEaU7AF-N6fFy-aADlkism0Hz8oFFkiWegWxndncIICe2daI-XKk83k4le9zzC5pU7_JNa3Ag",
-      "signature": "OMueMrWcb5_DwEHaBtw7TyeXTRXkK7sDM709fRFTLblnmRx62ENBiBAG3apLlpoCrXZnFc7ge7hn7dPGSX7qAw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000020eba482f77d83101ae5dcd5e0df643f041274af792b71712c5762560a5468dc4a00000018323032362d30312d30315430303a30383a30302e3033305a0000002011e7339dd50411ab8976e6b2cdac57fa15fa9f837aa1ba4391df6d88dc3c26cf",
+      "signature": "Z9RMEVu_xWFKnRhoV1TnKHF5Nf4ecwmjZK-nrcSYUzqqiJIfjMwJ8wRJd6DFcKX5FXFEt2k0qfHMs3e_vRrYAQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000003505554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e7469747900000020eba482f77d83101ae5dcd5e0df643f041274af792b71712c5762560a5468dc4a00000018323032362d30312d30315430303a30383a30302e3033305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee3450000002011e7339dd50411ab8976e6b2cdac57fa15fa9f837aa1ba4391df6d88dc3c26cf",
       "signer": "service key",
       "status": 409
     },
@@ -1218,12 +1400,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "505554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e74697479",
+          "name": "path"
+        },
+        {
           "hex": "41bad279bd6568810c187e4d83159bf21cfdbb84f8b17958c3e89e421c2d2f1a",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a30393a30302e3033305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "01deb1cb2a7974bde75fb8733fd7672f83919818d5ae6c47ddeaeebbad9eb885",
@@ -1233,14 +1427,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
         "switch-server-time": "2026-01-01T00:09:00.030Z",
-        "switch-service-signature": "1GuibPrwqyrwFLjT-8xIgizQzU6Utk9T4Qb5Cf53DJcuK8Z6Kz8HRWCREA2xk1gGHV85uRvms-gmWXIH6gMRDQ"
+        "switch-service-signature": "MAnJWooHVN-NVK3Vx9DCZmrLLDtj2Irm6UWebdgPVLtMLNx3pw5NIr27CXKU6ATvzl3c466iMvzP6q4kthwpAA"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "PUT",
       "name": "signer: 409 stale_identity to a hand-over delivery after an abort won",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/identity",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "URCbvdIvG7krYJQt78G9x3HUxkWmfDhiZXnArBNNfuc0QMlqWXhiCjSiMbNf4OPDFB4f1H2TRpLEO-zKJgyeCQ",
-      "signature": "1GuibPrwqyrwFLjT-8xIgizQzU6Utk9T4Qb5Cf53DJcuK8Z6Kz8HRWCREA2xk1gGHV85uRvms-gmWXIH6gMRDQ",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000001990000002041bad279bd6568810c187e4d83159bf21cfdbb84f8b17958c3e89e421c2d2f1a00000018323032362d30312d30315430303a30393a30302e3033305a0000002001deb1cb2a7974bde75fb8733fd7672f83919818d5ae6c47ddeaeebbad9eb885",
+      "signature": "MAnJWooHVN-NVK3Vx9DCZmrLLDtj2Irm6UWebdgPVLtMLNx3pw5NIr27CXKU6ATvzl3c466iMvzP6q4kthwpAA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000003505554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6964656e746974790000002041bad279bd6568810c187e4d83159bf21cfdbb84f8b17958c3e89e421c2d2f1a00000018323032362d30312d30315430303a30393a30302e3033305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee3450000002001deb1cb2a7974bde75fb8733fd7672f83919818d5ae6c47ddeaeebbad9eb885",
       "signer": "service key",
       "status": 409
     },
@@ -1252,6 +1448,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "505554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f7065657273",
+          "name": "path"
+        },
+        {
           "hex": "ff6468d297a422431a4927df92d300fa39e6a46e2e0b4ccc8312843f5797c5b4",
           "name": "BLAKE3(request signature)"
         },
@@ -1260,20 +1464,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "aa947e1ac1a6035ea49a10367fbf6e1f065fcbf7c2cb848f67d0d4ce9d2de267",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:10:00.020Z",
-        "switch-service-signature": "wj2xTNT55EkdL6YK8RcGJvj1NXrJwvdKiCsber6PjTUKY4XJ8ID-zaAGhHi2iIHAUJKaGjwLdyP2OtLVPK4XBQ"
+        "switch-service-signature": "LPatCJS6CPbeLNH5PEl0gjoFTO5ISbQa6JJZnqfCgNV4ma95usOKdwEohDwQWL69-crT48cv1-e29yjD1zgGDA"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "PUT",
       "name": "app of another identity: the version held again with the same body, a no-op",
+      "path": "/v1/43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o/peers",
       "public_key": "Ex_fPZAzEJg__x3nRHIaZAvxqnOncr5ht1Z_oIv9vTI",
       "request_signature": "twFHEXYZaE4pY98QF7ZeCeNFGHr87n0xs78truD2g_PT0f-tAnD1ZGFYY5V8Mbz8c8HlaLYIW0zYsNMNmdLrDQ",
-      "signature": "wj2xTNT55EkdL6YK8RcGJvj1NXrJwvdKiCsber6PjTUKY4XJ8ID-zaAGhHi2iIHAUJKaGjwLdyP2OtLVPK4XBQ",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020ff6468d297a422431a4927df92d300fa39e6a46e2e0b4ccc8312843f5797c5b400000018323032362d30312d30315430303a31303a30302e3032305a00000020aa947e1ac1a6035ea49a10367fbf6e1f065fcbf7c2cb848f67d0d4ce9d2de267",
+      "signature": "LPatCJS6CPbeLNH5PEl0gjoFTO5ISbQa6JJZnqfCgNV4ma95usOKdwEohDwQWL69-crT48cv1-e29yjD1zgGDA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000035055540000003e2f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f706565727300000020ff6468d297a422431a4927df92d300fa39e6a46e2e0b4ccc8312843f5797c5b400000018323032362d30312d30315430303a31303a30302e3032305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020aa947e1ac1a6035ea49a10367fbf6e1f065fcbf7c2cb848f67d0d4ce9d2de267",
       "signer": "service key",
       "status": 200
     },
@@ -1285,6 +1495,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "505554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f7065657273",
+          "name": "path"
+        },
+        {
           "hex": "0c2ca26cfb948ea782ea73b9dc38fe3eab6012c98235967036e65567885072e6",
           "name": "BLAKE3(request signature)"
         },
@@ -1293,20 +1511,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "4c361ce6215cef444df22de2841b623d576ee6153f61fb55d702dcd5c6f6ed0c",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:10:01.020Z",
-        "switch-service-signature": "i_Fsn6AFGOiYoq9ITBNBxRPhXCC2JspXbUgVVe5lWkES8QSl2Ski0NsKzldyPbGYIkFmqovdoSiV9qp4es5ODg"
+        "switch-service-signature": "ntSJLLBfeNt6efz22cpizdIbngvnQojotvzWMQQGu4J1if5Z-ix7Kgvmt36gZQ03Z_A02_SmIrmKiYjY_QtNCQ"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "PUT",
       "name": "app of another identity: 409 stale_identity, another body at the version held, current the held copy",
+      "path": "/v1/43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o/peers",
       "public_key": "Ex_fPZAzEJg__x3nRHIaZAvxqnOncr5ht1Z_oIv9vTI",
       "request_signature": "wHTA2-czYfF2LI87Fq16u1_KQjjT02KWJGvxZ5qiv8_uWVWMLZ6LSAEPJQx7PxndhFzOHcHxY3I6aqx2Ww0dCg",
-      "signature": "i_Fsn6AFGOiYoq9ITBNBxRPhXCC2JspXbUgVVe5lWkES8QSl2Ski0NsKzldyPbGYIkFmqovdoSiV9qp4es5ODg",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e7365000000080000000000000199000000200c2ca26cfb948ea782ea73b9dc38fe3eab6012c98235967036e65567885072e600000018323032362d30312d30315430303a31303a30312e3032305a000000204c361ce6215cef444df22de2841b623d576ee6153f61fb55d702dcd5c6f6ed0c",
+      "signature": "ntSJLLBfeNt6efz22cpizdIbngvnQojotvzWMQQGu4J1if5Z-ix7Kgvmt36gZQ03Z_A02_SmIrmKiYjY_QtNCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e7365000000080000000000000199000000035055540000003e2f76312f3433787a3733626a7a73386338347377347369677535626d337839336d6a313779776a79316f613364626e726969796d6377346f2f7065657273000000200c2ca26cfb948ea782ea73b9dc38fe3eab6012c98235967036e65567885072e600000018323032362d30312d30315430303a31303a30312e3032305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262000000204c361ce6215cef444df22de2841b623d576ee6153f61fb55d702dcd5c6f6ed0c",
       "signer": "service key",
       "status": 409
     },
@@ -1318,12 +1542,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "505554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f68616e646f766572",
+          "name": "path"
+        },
+        {
           "hex": "66ca8aa6ce78cfaec48c03272b9333ed62ddc75e1ad85668e71e21fb8117eaba",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a31313a30302e3033305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "2f5e43a1b2ba714d478e5e5664561eedce41f5a09d600804cb31cfb68e6f9830",
@@ -1333,14 +1569,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
         "switch-server-time": "2026-01-01T00:11:00.030Z",
-        "switch-service-signature": "SbM2LKUGYpK5P_IBArsGt1kRhRD8T5y0wTWkN2AOtDjJpWwhcmdth1JBdfBGGdZa8MFc0fnnb4wLadeGsNepDw"
+        "switch-service-signature": "i-b32bFf2hy6_NxnwIWbJIhk2lDupLgTQF4LMtzMp9uchdq-keaFmsE57jL_uXJ6D6k_wFD6AXcEE48u20V0Cw"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "PUT",
       "name": "signer: the hand-over stored for the phone",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/handover",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "pVXeO9GMz71Zcr9HCI1B2UMXrgDtxAYSanrAFx_Jn9wUBwakzgvquOt_nvWm24p8DdG4Q6YxGTz9gqUqdQ_GAQ",
-      "signature": "SbM2LKUGYpK5P_IBArsGt1kRhRD8T5y0wTWkN2AOtDjJpWwhcmdth1JBdfBGGdZa8MFc0fnnb4wLadeGsNepDw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c80000002066ca8aa6ce78cfaec48c03272b9333ed62ddc75e1ad85668e71e21fb8117eaba00000018323032362d30312d30315430303a31313a30302e3033305a000000202f5e43a1b2ba714d478e5e5664561eedce41f5a09d600804cb31cfb68e6f9830",
+      "signature": "i-b32bFf2hy6_NxnwIWbJIhk2lDupLgTQF4LMtzMp9uchdq-keaFmsE57jL_uXJ6D6k_wFD6AXcEE48u20V0Cw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000003505554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f68616e646f7665720000002066ca8aa6ce78cfaec48c03272b9333ed62ddc75e1ad85668e71e21fb8117eaba00000018323032362d30312d30315430303a31313a30302e3033305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345000000202f5e43a1b2ba714d478e5e5664561eedce41f5a09d600804cb31cfb68e6f9830",
       "signer": "service key",
       "status": 200
     },
@@ -1352,12 +1590,24 @@
           "name": "u64(status)"
         },
         {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f68616e646f766572",
+          "name": "path"
+        },
+        {
           "hex": "4f6169cb1b1297546d592809b3a69bb252fe2513fc420cf9a8a14619f1e25ae3",
           "name": "BLAKE3(request signature)"
         },
         {
           "hex": "323032362d30312d30315430303a31313a30312e3033305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "BLAKE3(Switch-Head)"
         },
         {
           "hex": "262757819754b8bbdaf73cf6a3c902e3ac1b53a7b2988543283212cc864f4b6f",
@@ -1367,14 +1617,16 @@
       "headers": {
         "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
         "switch-server-time": "2026-01-01T00:11:01.030Z",
-        "switch-service-signature": "ATM5ma4DaPjSyKSN9_2mwClaNCaZ-xPl1aJCpSyVt_trHeqsxlyr2AGjs3K5a9N3Pr-ipOeLPSi2tHLUx1IxDw"
+        "switch-service-signature": "RdXKSc8xfTKi6rjNT1XEzkubV_CGimpDkNOugbMqgWu-mR2_uhXT2_HwETazhtUpADydaeKUfacYApTq6iVuCg"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "GET",
       "name": "own app: the hand-over the switch stores for the phone",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/handover",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "Z11hLcSvsC5PdKya8nrGAY6SqO1U1AEWkLb975b02QY0V8s-91vmxu_sJwsES_qUMrP94VQNGc95tD-jhEyZDg",
-      "signature": "ATM5ma4DaPjSyKSN9_2mwClaNCaZ-xPl1aJCpSyVt_trHeqsxlyr2AGjs3K5a9N3Pr-ipOeLPSi2tHLUx1IxDw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c8000000204f6169cb1b1297546d592809b3a69bb252fe2513fc420cf9a8a14619f1e25ae300000018323032362d30312d30315430303a31313a30312e3033305a00000020262757819754b8bbdaf73cf6a3c902e3ac1b53a7b2988543283212cc864f4b6f",
+      "signature": "RdXKSc8xfTKi6rjNT1XEzkubV_CGimpDkNOugbMqgWu-mR2_uhXT2_HwETazhtUpADydaeKUfacYApTq6iVuCg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000003474554000000412f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f68616e646f766572000000204f6169cb1b1297546d592809b3a69bb252fe2513fc420cf9a8a14619f1e25ae300000018323032362d30312d30315430303a31313a30312e3033305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee34500000020262757819754b8bbdaf73cf6a3c902e3ac1b53a7b2988543283212cc864f4b6f",
       "signer": "service key",
       "status": 200
     },
@@ -1386,6 +1638,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365",
+          "name": "path"
+        },
+        {
           "hex": "177f88c52112aaacbc80bfa883df8e8954633c56d5a3349c9ce5033312c4385e",
           "name": "BLAKE3(request signature)"
         },
@@ -1394,20 +1654,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "fG4pex7mZrFes_F--QoRyT_I8PrBgB2dCJRESZ2AZ25xNV-amWkRtMA7heYZqan2e3L24dU-WyxttonfF60GCQ"
+        "switch-service-signature": "IhbVSaCpF0jB5Lj5HC_HzK0VYX56Ss9iu-byZRDnXyxSQXSIFLfwy5ntUs45-x-yiZZ7Hr8jFAfIUXn8ehb3AA"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "v9IgTjnnOjucryLdr1txr1emHkExVP1zHUk3FZFhZw8XXluLOMJ2nBMVxp_gqP_Qp4iDRbdYpLwcivCr1Bl0Ag",
-      "signature": "fG4pex7mZrFes_F--QoRyT_I8PrBgB2dCJRESZ2AZ25xNV-amWkRtMA7heYZqan2e3L24dU-WyxttonfF60GCQ",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020177f88c52112aaacbc80bfa883df8e8954633c56d5a3349c9ce5033312c4385e00000018323032362d30312d30315430303a30373a30302e3033305a00000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+      "signature": "IhbVSaCpF0jB5Lj5HC_HzK0VYX56Ss9iu-byZRDnXyxSQXSIFLfwy5ntUs45-x-yiZZ7Hr8jFAfIUXn8ehb3AA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f657261736500000020177f88c52112aaacbc80bfa883df8e8954633c56d5a3349c9ce5033312c4385e00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
       "signer": "service key",
       "status": 200
     },
@@ -1419,6 +1685,14 @@
           "name": "u64(status)"
         },
         {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365",
+          "name": "path"
+        },
+        {
           "hex": "56b7469d4219815dc3c1110b346273724bacc073ad19dc7026cb52d229205abf",
           "name": "BLAKE3(request signature)"
         },
@@ -1427,20 +1701,26 @@
           "name": "server time"
         },
         {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(Switch-Head)"
+        },
+        {
           "hex": "024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "1G6Z8XEh0IFybM_JtGKOKADDZom8GaFgpSJPDjfJEafkejGDTeLD0yMPvoLNyETwErv9WTfkaZQnO4Eodg86AA"
+        "switch-service-signature": "wG7MTmDjLF_VBlAATd90NuAnLahSDjcRQJyGeFUOER6mfm_9R0D8-uAm9I3pH2RlHBC7uuapaPbquxtrhp0uAw"
       },
       "label": "pubky-switch/v1/http-response",
+      "method": "POST",
       "name": "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "MADfidQkjn4AvpxiRt-kgnJhDjL6ItbhQOMJmOwuiD5fqoZyusNezyRKpAu1lEbESVYpQHcNwOX6pJS6Yaw1Aw",
-      "signature": "1G6Z8XEh0IFybM_JtGKOKADDZom8GaFgpSJPDjfJEafkejGDTeLD0yMPvoLNyETwErv9WTfkaZQnO4Eodg86AA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000001990000002056b7469d4219815dc3c1110b346273724bacc073ad19dc7026cb52d229205abf00000018323032362d30312d30315430303a30373a30302e3033305a00000020024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
+      "signature": "wG7MTmDjLF_VBlAATd90NuAnLahSDjcRQJyGeFUOER6mfm_9R0D8-uAm9I3pH2RlHBC7uuapaPbquxtrhp0uAw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f65726173650000002056b7469d4219815dc3c1110b346273724bacc073ad19dc7026cb52d229205abf00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
       "signer": "service key",
       "status": 409
     }

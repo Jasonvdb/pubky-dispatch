@@ -1065,12 +1065,17 @@ mod tests {
             let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
             let by_operator = pubky_switch_core::http::verify_response(
                 &operator.verifying_key().to_bytes(),
-                answer.status,
-                None,
-                answer
-                    .header(pubky_switch_core::http::header::SERVER_TIME)
-                    .unwrap(),
-                &answer.body,
+                &pubky_switch_core::http::ResponseParts {
+                    status: answer.status,
+                    method: "POST",
+                    path: "/v1/enroll",
+                    request_signature: None,
+                    server_time: answer
+                        .header(pubky_switch_core::http::header::SERVER_TIME)
+                        .unwrap(),
+                    head: answer.header(pubky_switch_core::http::header::HEAD),
+                    body: &answer.body,
+                },
                 &signature,
             )
             .is_ok();

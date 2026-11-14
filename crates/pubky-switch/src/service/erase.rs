@@ -39,7 +39,10 @@ use std::sync::Arc;
 
 use pubky_switch_core::http::{ERASED_BODY, parse_erase_body};
 
-use super::{Answer, Deferred, PublicKeyBytes, Service, keyed::Proof};
+use super::{
+    Answer, Deferred, PublicKeyBytes, Service,
+    keyed::{Asked, Proof},
+};
 use crate::{
     http::{
         SwitchResponse,
@@ -94,7 +97,7 @@ impl Service {
         &self,
         mut txn: AccountTxn,
         signer: &ServiceSigner,
-        signature: Option<&[u8; 64]>,
+        signature: Asked<'_>,
         committed_ms: u64,
         time_ms: u64,
         base_ms: u64,

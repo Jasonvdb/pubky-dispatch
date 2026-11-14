@@ -356,6 +356,57 @@ pub fn header_text<'a>(response: &'a SwitchResponse, name: &str) -> Option<&'a s
         .and_then(|(_, value)| value.to_str().ok())
 }
 
+/// What a response signature covers of a request (Switch wire 7.1): its method, its path
+/// without the query, and its signature bytes, `None` when it has none that decodes.
+#[derive(Clone, Debug)]
+pub struct Sent {
+    /// The method.
+    pub method: String,
+    /// The path without the query.
+    pub path: String,
+    /// The request signature bytes.
+    pub signature: Option<[u8; 64]>,
+}
+
+impl Sent {
+    /// What the response signature covers of `request`.
+    pub fn of(request: &SwitchRequest) -> Self {
+        Sent {
+            method: request.method.clone(),
+            path: wire_http::path_of(&request.path_and_query).to_owned(),
+            signature: wire_http::request_signature_of(
+                request
+                    .headers
+                    .get(header::SIGNATURE)
+                    .and_then(|value| value.to_str().ok()),
+            ),
+        }
+    }
+}
+
+/// Whether `answer` to `sent` is signed with `key` (Switch wire 7.1).
+pub fn signed_with(answer: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
+    let Some(signature) = header_text(answer, header::SERVICE_SIGNATURE)
+        .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
+    else {
+        return false;
+    };
+    wire_http::verify_response(
+        key,
+        &wire_http::ResponseParts {
+            status: answer.status,
+            method: &sent.method,
+            path: &sent.path,
+            request_signature: sent.signature.as_ref(),
+            server_time: header_text(answer, header::SERVER_TIME).expect("time"),
+            head: header_text(answer, header::HEAD),
+            body: &answer.body,
+        },
+        &signature,
+    )
+    .is_ok()
+}
+
 /// The response matches the vector byte for byte: status, body, server time and signature.
 pub fn assert_matches(response: &SwitchResponse, expected: &Value) {
     let name = expected["name"].as_str().expect("name");

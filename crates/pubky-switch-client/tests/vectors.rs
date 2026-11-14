@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use pubky_switch_client::client::answers::{FeedItem, FeedQuery, StoredHandover};
-use pubky_switch_client::client::check_response;
+use pubky_switch_client::client::{SentRequest, check_response};
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::transport::{Header, MockTransport, Request, Response, Transport};
 use pubky_switch_client::{ClientError, Credentials, SwitchClient, TransportError};
@@ -425,26 +425,15 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             let bytes: [u8; 64] = b64(s).try_into().unwrap();
             bytes
         });
-        let Some(account) = account_of_key(&keys, &public) else {
-            // The operator's key, which no client knows: unauthenticated with any account
-            // key a client pins.
-            assert_eq!(response.status, 404, "{name}");
-            for (account, key) in &keys.services {
-                assert_eq!(
-                    check_response(
-                        &key.verifying_key().to_bytes(),
-                        &pubky_key(account).unwrap(),
-                        request_signature.as_ref(),
-                        &response,
-                    )
-                    .unwrap_err(),
-                    ClientError::BadServiceSignature { status: 404 },
-                    "{name}"
-                );
-            }
-            continue;
+        let account = account_of_key(&keys, &public)
+            .unwrap_or_else(|| panic!("{name}: a service key of keys.json"));
+        // The method and path the request sent, which the signature covers (wire 7.1).
+        let sent = SentRequest {
+            method: st(r, "method").to_owned(),
+            path: st(r, "path").to_owned(),
+            signature: request_signature,
         };
-        let checked = check_response(&public, &account, request_signature.as_ref(), &response);
+        let checked = check_response(&public, &account, &sent, &response);
         if response.status < 300 {
             let checked = checked.unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
@@ -477,8 +466,7 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
         // Another pinned key, another body or another request signature: refused.
         let wrong_key = keys.next_service.verifying_key().to_bytes();
         assert_eq!(
-            check_response(&wrong_key, &account, request_signature.as_ref(), &response)
-                .unwrap_err(),
+            check_response(&wrong_key, &account, &sent, &response).unwrap_err(),
             ClientError::BadServiceSignature {
                 status: response.status
             },
@@ -487,15 +475,45 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
         let mut tampered = response.clone();
         tampered.body.push(b' ');
         assert!(matches!(
-            check_response(&public, &account, request_signature.as_ref(), &tampered),
+            check_response(&public, &account, &sent, &tampered),
             Err(ClientError::BadServiceSignature { .. })
         ));
-        assert!(matches!(
-            check_response(&public, &account, Some(&[0; 64]), &response),
-            Err(ClientError::BadServiceSignature { .. })
-        ));
-        // A head is checked for the account it names; one that doesn't verify is ignored,
-        // as the response signature doesn't cover it (wire 7.1).
+        for other in [
+            SentRequest {
+                signature: Some([0; 64]),
+                ..sent.clone()
+            },
+            SentRequest {
+                method: "DELETE".into(),
+                ..sent.clone()
+            },
+            SentRequest {
+                path: format!("{}/x", sent.path),
+                ..sent.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    check_response(&public, &account, &other, &response),
+                    Err(ClientError::BadServiceSignature { .. })
+                ),
+                "{name}"
+            );
+        }
+        // The head's text is signed: an answer without it fails (wire 7.1).
+        if header_of(r, header::HEAD).is_some() {
+            let mut headless = response.clone();
+            headless.headers.retain(|h| h.name != header::HEAD);
+            assert!(
+                matches!(
+                    check_response(&public, &account, &sent, &headless),
+                    Err(ClientError::BadServiceSignature { .. })
+                ),
+                "{name}"
+            );
+        }
+        // A head is checked for the account it names; one that doesn't verify for it is
+        // ignored (wire 6.7).
         if header_of(r, header::HEAD).is_some() {
             let other = keys.identity("bob").public();
             let account = if other == account {
@@ -503,7 +521,7 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             } else {
                 other
             };
-            let checked = check_response(&public, &account, request_signature.as_ref(), &response);
+            let checked = check_response(&public, &account, &sent, &response);
             assert!(
                 matches!(&checked, Ok(c) if c.head.is_none())
                     || matches!(&checked, Err(ClientError::Switch { .. })),
@@ -519,14 +537,18 @@ fn replaying(key: SigningKey, r: &Value) -> Arc<MockTransport> {
     let template = response_of(r);
     Arc::new(MockTransport::with_handler(move |request| {
         let server_time = template.header(header::SERVER_TIME).unwrap().to_owned();
-        let request_signature =
-            pubky_switch_core::http::request_signature_of(request.header(header::SIGNATURE));
+        let sent = SentRequest::of(request);
         let signature = pubky_switch_core::http::sign_response(
             &key,
-            template.status,
-            request_signature.as_ref(),
-            &server_time,
-            &template.body,
+            &pubky_switch_core::http::ResponseParts {
+                status: template.status,
+                method: &sent.method,
+                path: &sent.path,
+                request_signature: sent.signature.as_ref(),
+                server_time: &server_time,
+                head: template.header(header::HEAD),
+                body: &template.body,
+            },
         );
         let mut headers: Vec<Header> = template
             .headers

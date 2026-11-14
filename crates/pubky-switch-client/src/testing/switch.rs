@@ -16,7 +16,7 @@ use pubky_switch_core::chain::{
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
 use pubky_switch_core::http::{
-    ErrorCode, frozen_refuses, header, request_signature_of, sign_response,
+    ErrorCode, ResponseParts, frozen_refuses, header, path_of, request_signature_of, sign_response,
 };
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
@@ -2033,16 +2033,20 @@ impl Inner {
     /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
     /// answered before that, nor to an enrollment or an erasure (Switch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
-        let mut response = self.respond_with(&self.service, request, status, body);
         let own =
             request.header(header::IDENTITY) == Some(pubky_id(&self.identity.public()).as_str());
         let path = request.path_and_query.as_str();
-        if own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase") {
-            response
-                .headers
-                .push(Header::new(header::HEAD, &self.head().to_header()));
-        }
-        response
+        let head =
+            (own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase"))
+                .then(|| self.head().to_header());
+        self.respond_signed(
+            &self.service,
+            request,
+            status,
+            body,
+            self.now(),
+            head.as_deref(),
+        )
     }
 
     /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
@@ -2113,20 +2117,43 @@ impl Inner {
         body: &Value,
         at: u64,
     ) -> Response {
+        self.respond_signed(key, request, status, body, at, None)
+    }
+
+    /// An answer whose `Switch-Server-Time` is `at`, carrying `head` as its `Switch-Head`;
+    /// the response signature covers the method and path of `request`, its signature, the
+    /// server time, the head's text and the body (Switch wire 7.1).
+    fn respond_signed(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+        head: Option<&str>,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
         let server_time = rfc3339(at);
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
             key,
-            status,
-            request_signature.as_ref(),
-            &server_time,
-            &bytes,
+            &ResponseParts {
+                status,
+                method: &request.method,
+                path: path_of(&request.path_and_query),
+                request_signature: request_signature.as_ref(),
+                server_time: &server_time,
+                head,
+                body: &bytes,
+            },
         );
         let mut headers = vec![
             Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
             Header::new(header::SERVER_TIME, &server_time),
         ];
+        if let Some(head) = head {
+            headers.push(Header::new(header::HEAD, head));
+        }
         // A `429` repeats its body's `retry_after` in `Retry-After` (Switch wire 7.1, 7.6).
         if let Some(seconds) = body
             .get("retry_after")

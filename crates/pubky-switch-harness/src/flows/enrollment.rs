@@ -6,7 +6,7 @@ use std::sync::Arc;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{header, verify_response};
+use pubky_switch_core::http::{ResponseParts, header, verify_response};
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
 use pubky_switch_signer::Signer;
 use serde_json::json;
@@ -72,10 +72,15 @@ pub async fn enrollment(world: &World) -> FlowResult {
         .ok_or("the public read carries no service time")?;
     verify_response(
         &delivered.inbox().service_key,
-        answer.status,
-        None,
-        server_time,
-        &answer.body,
+        &ResponseParts {
+            status: answer.status,
+            method: "GET",
+            path: &path,
+            request_signature: None,
+            server_time,
+            head: answer.header(header::HEAD),
+            body: &answer.body,
+        },
         &signature,
     )?;
     world.advance_ms(STEP_MS);

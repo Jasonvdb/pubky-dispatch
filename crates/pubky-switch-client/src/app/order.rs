@@ -86,15 +86,11 @@ pub(crate) struct Told {
     pub(crate) seq: u64,
 }
 
-/// Where the read's walk of the feed stands, for [`App::may_tell`].
+/// Where the read's walk of the feed stands, for [`App::may_tell`]: inside a page, it
+/// covered everything at or before this `seq` of the cursor's generation, and handles the
+/// item after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Walk {
-    /// Inside a page: it covered everything at or before this `seq` of the cursor's
-    /// generation, and handles the item after it.
-    At(u64),
-    /// The walk of this read ended, having covered through this `seq`.
-    Ended(u64),
-}
+pub(crate) struct Walk(pub(crate) u64);
 
 /// Something the cursor passed, or may pass, that is kept for the protocols it names
 /// until each takes it: a call (`owed/`) or the listing a feed item owes (`list_due`).
@@ -144,13 +140,10 @@ impl App {
     }
 
     /// The position a protocol must be told through to be told something now: inside a
-    /// page, where the walk stands; otherwise the read's front, or where this read's walk
-    /// ended if that is further.
+    /// page, where the walk stands; otherwise the read's front.
     fn walked(&self) -> FeedOrder {
-        let generation = self.state.cursor.generation;
         match self.walk {
-            Some(Walk::At(seq)) => self.feed_order(generation, seq),
-            Some(Walk::Ended(seq)) => self.front().max(self.feed_order(generation, seq)),
+            Some(Walk(seq)) => self.feed_order(self.state.cursor.generation, seq),
             None => self.front(),
         }
     }
@@ -161,9 +154,20 @@ impl App {
     /// protocol that is with the read. "Not yet" means the caller holds or keeps the thing
     /// for it.
     ///
+    /// Something kept for the protocol at the very item the walk handles, a call or a
+    /// listing, comes first: the protocol isn't told the item. And outside a page, a
+    /// protocol whose listing the read could not make yet is told nothing: the listing
+    /// comes before anything else.
+    ///
     /// With one protocol this is false only once that protocol didn't take an item, and
     /// the read stops there.
     pub(crate) fn may_tell(&self, name: &str) -> bool {
+        if self.kept_here.contains(name) {
+            return false;
+        }
+        if self.walk.is_none() && self.listing_names.contains(name) {
+            return false;
+        }
         self.told_order(name) >= self.walked()
     }
 
@@ -203,8 +207,8 @@ impl App {
                 self.told.insert(name, (generation, seq));
             }
         }
-        if self.walked() < at {
-            self.walk = Some(Walk::At(seq));
+        if self.walk.is_some() && self.walked() < at {
+            self.walk = Some(Walk(seq));
         }
     }
 
@@ -232,15 +236,23 @@ impl App {
     }
 
     /// Read the positions from the store (`told/`), as a call that follows a reload does.
+    /// One of a protocol that isn't registered, or of a generation past the newest own
+    /// `identity.json` the app holds, which no read writes, is a corrupt store: taken as
+    /// it is, it would stand as the read's front, and no other protocol would ever be
+    /// level with it.
     pub(crate) async fn load_told(&mut self) -> Result<(), AppError> {
         let stored = self.reader().scan::<Told>(TOLD_PREFIX).await?;
-        self.told = stored
-            .into_iter()
-            .filter(|(name, _)| self.protocols.contains(name))
-            .map(|(name, told)| (name, (told.generation, told.seq)))
-            .collect();
+        let mut told = Positions::new();
+        for (name, at) in stored {
+            if !self.protocols.contains(&name) || self.feed_order(at.generation, at.seq).0 == 2 {
+                return Err(AppError::Store(crate::error::StoreError::Corrupt));
+            }
+            told.insert(name, (at.generation, at.seq));
+        }
+        self.told = told;
         self.told_kept = self.told.clone();
         self.walk = None;
+        self.kept_here.clear();
         self.told_loaded = true;
         Ok(())
     }

@@ -1330,6 +1330,15 @@ impl App {
         let Some(due) = self.reader().get::<ListDue>(LIST_DUE).await? else {
             return Ok(Listing::NotDue);
         };
+        // Every writer names registered protocols: a listing owed to another could never
+        // be made, and would stay owed for ever.
+        if due
+            .to
+            .iter()
+            .any(|(name, _)| !self.protocols.contains(name))
+        {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
         self.listing_waits = false;
         self.listed_every = false;
         // The protocols whose listing is made now, in registration order: one owed outside
@@ -1403,15 +1412,15 @@ impl App {
                 left.to.push((name.clone(), *at));
             }
         }
-        // One that waits for a key while the read goes on for the others takes the place
-        // right after its protocol's position, which holds that protocol there.
+        // One owed outside the feed that waits for a key while the read goes on for the
+        // others takes its protocol's own position as its place: that protocol stays there,
+        // told nothing further, until the listing is made.
         for (name, at) in &waiting {
             if at.is_none() {
-                let (generation, seq) = self.told(name);
-                let next = (generation, seq.saturating_add(1));
+                let place = self.told(name);
                 for owed in &mut left.to {
                     if owed.0 == *name {
-                        owed.1 = Some(next);
+                        owed.1 = Some(place);
                     }
                 }
             }
@@ -1446,6 +1455,14 @@ impl App {
         } else {
             Listing::Listed
         })
+    }
+
+    /// Note the protocols a listing is still owed to (`list_due`), after a read's listing
+    /// step: outside a page they are told nothing before it ([`App::may_tell`]).
+    pub(crate) async fn note_listing_names(&mut self) -> Result<(), AppError> {
+        let due: ListDue = self.reader().get(LIST_DUE).await?.unwrap_or_default();
+        self.listing_names = due.to.into_iter().map(|(name, _)| name).collect();
+        Ok(())
     }
 
     /// The collections of protocol `name` the app's certificate reads.

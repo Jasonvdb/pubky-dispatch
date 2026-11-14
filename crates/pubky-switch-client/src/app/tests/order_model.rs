@@ -1142,3 +1142,75 @@ fn test_order_model_listing_waiting_for_one_protocols_key_lets_the_other_go_on()
         b.finish().await;
     });
 }
+
+#[test]
+fn test_order_model_listing_owed_outside_the_feed_waiting_for_a_key_holds_its_protocol() {
+    // A listing owed outside the feed to both protocols, with the key of `tasks`'s scope
+    // missing: `chat` is listed and goes on; `tasks` is handed nothing, not the entry
+    // right after its position either, until its listing is made.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 1).await;
+        let held = b.app.state.scope_keys.keys.clone();
+        b.app
+            .state
+            .scope_keys
+            .keys
+            .retain(|key| key.scope != "tasks");
+        let mut tx = b.app.tx().unwrap();
+        for key in held.iter().filter(|key| key.scope == "tasks") {
+            tx.delete(&crate::app::state::key::scope(key.data_epoch, &key.scope))
+                .unwrap();
+        }
+        let due = crate::app::records::ListDue {
+            to: vec![("tasks".into(), None), ("chat".into(), None)],
+        };
+        tx.put(crate::app::records::LIST_DUE, &due).unwrap();
+        b.app.commit(tx).await.unwrap();
+        let first = b.entry("tasks", "item");
+        let chat: Vec<u64> = (0..8).map(|_| b.entry("chat", "item")).collect();
+        let later = b.entry("tasks", "item");
+        for _ in 0..4 {
+            b.read().await;
+            assert!(
+                b.taken("tasks").0.is_empty(),
+                "`tasks` was handed {:?} while its listing is still owed",
+                b.taken("tasks").0
+            );
+        }
+        assert!(b.taken("chat").0.ends_with(&chat));
+        assert!(b.app.listing_owed().await.unwrap());
+        // The key comes back.
+        let mut tx = b.app.tx().unwrap();
+        for key in &held {
+            tx.put(
+                &crate::app::state::key::scope(key.data_epoch, &key.scope),
+                key,
+            )
+            .unwrap();
+        }
+        b.app.commit(tx).await.unwrap();
+        b.app.state.scope_keys.keys = held;
+        b.quiet(false).await;
+        assert_eq!(b.taken("tasks").0, [first, later]);
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_one_protocol_reads_its_marks_in_a_read_that_ends_for_a_second_listing() {
+    // One protocol: an upload, a `missed` item, an entry and another `missed` item in one
+    // page. The read lists once, and ends at the second item for the next read's listing,
+    // not stopped: the record the upload marked is read again at its end.
+    on_a_thread(async {
+        let mut b = Bench::new(1, 100).await;
+        b.upload("tasks");
+        b.missed();
+        b.entry("tasks", "item");
+        b.missed();
+        let report = b.read().await;
+        assert!(!report.stopped && report.more, "{report:?}");
+        let marks = b.app.reader().scan_raw("rcread/").await.unwrap();
+        assert!(marks.is_empty(), "the upload's mark was read");
+        b.finish().await;
+    });
+}

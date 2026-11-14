@@ -785,6 +785,7 @@ impl App {
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
+        self.note_listing_names().await?;
         // A listing this read made for every protocol before any item covers a gap ahead
         // its first page shows.
         self.listed_before_items = listed && self.listed_every;
@@ -880,7 +881,7 @@ impl App {
                 after = start;
                 blocked = blocked.filter(|held| *held <= start);
             }
-            self.walk = Some(Walk::At(after));
+            self.walk = Some(Walk(after));
             let mut feed_pages = 0u32;
             loop {
                 // At most FEED_PAGES_PER_READ pages, and none past the call's time budget
@@ -950,6 +951,7 @@ impl App {
                                 .list_collections_if_due(&mut pages, Some(budget))
                                 .await?;
                         }
+                        self.note_listing_names().await?;
                         if listing != Listing::WaitsForKey && self.listing_waits && !waits_told {
                             self.ask_again_while_a_listing_waits().await?;
                             self.events.push(AppEvent::ListingWaitsForKey);
@@ -985,10 +987,8 @@ impl App {
             }
         }
         // The walk is over: what isn't in feed order reaches only a protocol told through
-        // everything this read and the ones before covered (`order` module).
-        if let Some(Walk::At(seq)) = self.walk {
-            self.walk = Some(Walk::Ended(seq));
-        }
+        // everything the reads covered (`order` module).
+        self.walk = None;
         if self.state.alarm.is_none() {
             // What a fetch between pages owes, such as at a `missed` item's listing, before
             // the entries a key brought are tried again.
@@ -1113,6 +1113,7 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked);
+        self.kept_here.clear();
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -1221,6 +1222,9 @@ impl App {
                     held_before = k < seq;
                 }
                 if k == seq {
+                    // What is kept for them at this item comes first: they aren't told the
+                    // item, and stay right before it.
+                    self.kept_here.extend(kept.names.iter().cloned());
                     read.left.extend(kept.names);
                     kept_call = kept.call;
                 } else {
@@ -1312,6 +1316,7 @@ impl App {
             }
             // Each protocol that took the item, or had nothing in it, moves to it; one that
             // didn't stays right before it (`order` module).
+            self.kept_here.clear();
             if step != Step::Stop {
                 self.step_told(seq, &read.left, &read.run);
             }
@@ -1331,9 +1336,28 @@ impl App {
                 list_through = Some(seq);
             }
         }
+        self.kept_here.clear();
         let through = list_through
             .or(budget_through)
             .unwrap_or(page.scanned_through);
+        // A call or listing kept at a position the page covered without showing its item:
+        // the protocols it names stay right before it, and a deny list change among it
+        // stops the read there, as at its item.
+        if stopped.is_none() {
+            let none = std::collections::BTreeSet::new();
+            let covered: Vec<u64> = self.kept_ahead.range(..=through).map(|(k, _)| *k).collect();
+            for k in covered {
+                let Some(kept) = self.kept_ahead.remove(&k) else {
+                    continue;
+                };
+                let names = kept.names.into_iter().collect();
+                self.step_told(k, &names, &none);
+                if kept.deny {
+                    stopped = Some(k.saturating_add(1));
+                    break;
+                }
+            }
+        }
         let end = match (stopped, read.blocked) {
             (Some(stop), _) => stop
                 .saturating_sub(1)
@@ -2992,7 +3016,7 @@ impl App {
         // before anything after the gap (Switch spec 8.3).
         // The gap is no feed item: it is noted at the position the page starts from, which
         // every protocol in step is told through already.
-        self.hand_call(position, call, false, read)?;
+        self.hand_call(position, call, read)?;
         self.gap_handed(held, &mut read.tx)?;
         if list {
             self.owe_item_listing(position, false, read).await?;
@@ -3036,7 +3060,7 @@ impl App {
             return Ok(false);
         }
         // A protocol not asked yet is owed the call, and asked by a later read.
-        let asked = self.hand_call(seq, OwedCall::from(&needed), true, read)?;
+        let asked = self.hand_call(seq, OwedCall::from(&needed), read)?;
         read.tx.put(&key::asked(seq), &())?;
         Ok(asked)
     }
@@ -3045,27 +3069,11 @@ impl App {
     /// each answer's writes going with the read under that protocol's prefix. A protocol
     /// that fails it, or that isn't told through everything before the item
     /// ([`App::may_tell`]), has the call kept for it (Switch spec 8.3). Whether every
-    /// protocol took it now. For the call of a feed item (`item`), a protocol told through
-    /// the item already took it when the read first met the item, and is passed over.
-    fn hand_call(
-        &mut self,
-        seq: u64,
-        call: OwedCall,
-        item: bool,
-        read: &mut Read,
-    ) -> Result<bool, AppError> {
+    /// protocol took it now.
+    fn hand_call(&mut self, seq: u64, call: OwedCall, read: &mut Read) -> Result<bool, AppError> {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
         let mut owed_to = Vec::new();
         for registered in protocols {
-            // Told through the item already: it took this call when the read first met
-            // the item, and the read meets it again only on its way to a protocol behind.
-            let (told_generation, told) = self.told(&registered.name);
-            if item
-                && self.feed_order(told_generation, told)
-                    >= self.feed_order(self.state.cursor.generation, seq)
-            {
-                continue;
-            }
             // In step with the item, or waiting only for the listing the `missed` item
             // before it owes, which this one owes too.
             if !self.may_tell(&registered.name) && !read.run.contains(&registered.name) {
@@ -3173,7 +3181,7 @@ impl App {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(());
         }
-        self.hand_call(change.seq, OwedCall::from(change), true, read)
+        self.hand_call(change.seq, OwedCall::from(change), read)
             .map(|_| ())
     }
 
@@ -3897,7 +3905,7 @@ impl App {
                 accepted_from_ms,
                 accepted_until_ms: until.max(accepted_from_ms),
             };
-            self.hand_call(seq, call, true, read)?;
+            self.hand_call(seq, call, read)?;
             read.tx.put(&key::asked(seq), &())?;
             self.owe_item_listing(seq, true, read).await?;
             self.events.push(AppEvent::Missed { seq, entries });

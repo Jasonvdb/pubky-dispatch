@@ -654,8 +654,16 @@ pub struct App {
     told_kept: order::Positions,
     /// Whether the positions were read from the store since the last reload.
     told_loaded: bool,
-    /// Where the walk of the read under way stands ([`App::may_tell`]). In memory only.
+    /// Where the walk of the read under way stands, inside a page ([`App::may_tell`]). In
+    /// memory only.
     walk: Option<order::Walk>,
+    /// The protocols something is kept for at the very item the walk handles: they aren't
+    /// told the item ([`App::may_tell`]). In memory only.
+    kept_here: BTreeSet<String>,
+    /// The protocols a listing is owed to (`list_due`), as the read's last listing step
+    /// left them: outside a page, they are told nothing before it ([`App::may_tell`]). In
+    /// memory only.
+    listing_names: BTreeSet<String>,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
@@ -1038,6 +1046,8 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -1203,6 +1213,8 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -2057,6 +2069,8 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -3358,9 +3372,7 @@ impl App {
     async fn ready_local(&mut self) -> Result<(), AppError> {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;
-        if self.reload || !self.told_loaded {
-            self.load_told().await?;
-        }
+        let told = self.reload || !self.told_loaded;
         if self.reload {
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
@@ -3374,6 +3386,9 @@ impl App {
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
+        }
+        if told {
+            self.load_told().await?;
         }
         Ok(())
     }

@@ -52,13 +52,40 @@ pub(super) fn recovered(
     }))
 }
 
+/// An error as `Debug` shows it, without the switch's `message`s: a message is for people,
+/// not for programs (Switch wire 7.6), and the two switches word theirs apart, so the
+/// trace keeps none, here as in an answer's body.
+pub(super) fn shown_without_messages(error: &impl std::fmt::Debug) -> String {
+    const MESSAGE: &str = "message: \"";
+    let shown = format!("{error:?}");
+    let mut kept = String::with_capacity(shown.len());
+    let mut rest = shown.as_str();
+    while let Some(at) = rest.find(MESSAGE) {
+        kept.push_str(&rest[..at]);
+        let text = &rest[at + MESSAGE.len()..];
+        // The message ends at the first quote `Debug` didn't escape.
+        let mut escaped = false;
+        let end = text
+            .char_indices()
+            .find(|&(_, c)| {
+                let ends = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                ends
+            })
+            .map_or(text.len(), |(index, _)| index + 1);
+        rest = text[end..].strip_prefix(", ").unwrap_or(&text[end..]);
+    }
+    kept.push_str(rest);
+    kept
+}
+
 /// How a party's call ended, for the trace: the error's kinds and the status a switch
 /// refused with, never its text.
 pub(super) fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
         Err(error) => {
-            let shown = format!("{error:?}");
+            let shown = shown_without_messages(error);
             let kinds: Vec<&str> = shown
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))

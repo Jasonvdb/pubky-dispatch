@@ -49,7 +49,7 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
         Err(error) => {
-            let shown = format!("{error:?}");
+            let shown = super::recovery::shown_without_messages(error);
             let kinds: Vec<&str> = shown
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))

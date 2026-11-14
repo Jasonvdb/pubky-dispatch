@@ -55,7 +55,8 @@ pub struct World {
     checker: Arc<Checker>,
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
-    scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
+    /// The scripted switches, each with the origin it answers at.
+    scripted: Mutex<Vec<(String, Arc<ScriptedSwitch>)>>,
     /// The Homeserver writes and deletions to fail, each once.
     homeserver_faults: Arc<Mutex<Vec<HomeserverFault>>>,
 }
@@ -223,7 +224,7 @@ impl World {
                     }));
                     switch.set_uploads_per_app_per_hour(limits.uploads_per_app_per_hour);
                     accounts.push((identity.key().id(), switch.holding_transport()));
-                    lock(&self.scripted).push(switch);
+                    lock(&self.scripted).push((origin.to_owned(), switch));
                 }
                 self.router.add(origin, Arc::new(Accounts { accounts }));
             }
@@ -251,6 +252,177 @@ impl World {
         }
     }
 
+    /// The service at `origin`, out of the world's list while a change is made to it, and
+    /// put back after `change`, whatever it returned.
+    async fn change_service(
+        &self,
+        origin: &str,
+        change: impl AsyncFnOnce(&mut RealSwitch) -> Result<(), HarnessError>,
+    ) -> Result<(), HarnessError> {
+        let mut switch = {
+            let mut services = lock(&self.services);
+            let at = services
+                .iter()
+                .position(|switch| switch.origin() == origin)
+                .ok_or_else(|| HarnessError::Setup(format!("no service at {origin}")))?;
+            services.remove(at)
+        };
+        let changed = change(&mut switch).await;
+        lock(&self.services).push(switch);
+        changed
+    }
+
+    /// The scripted switch at `origin` that holds `identity`'s account.
+    fn scripted_switch(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<Arc<ScriptedSwitch>, HarnessError> {
+        lock(&self.scripted)
+            .iter()
+            .find(|(at, switch)| at == origin && switch.identity() == identity.public())
+            .map(|(_, switch)| switch.clone())
+            .ok_or_else(|| {
+                HarnessError::Setup(format!("no scripted account of the identity at {origin}"))
+            })
+    }
+
+    /// A restore of `identity`'s account at `origin` to a state one write behind its mark
+    /// (Switch wire 7.3, Table 3, "A restore of the state"): Table 1 judges the account
+    /// failing, `behind`. The scripted switch takes its state back one `seq`; the service,
+    /// stopped, finds its mark moved one `seq` past its state, and starts again.
+    ///
+    /// # Errors
+    ///
+    /// When the account has no mark that records a head, or the service can't be started
+    /// again.
+    pub async fn restore_behind_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.restore_behind_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                let switch = self.scripted_switch(origin, identity)?;
+                let (_, seq, _) = switch
+                    .mark()
+                    .filter(|(_, seq, _)| *seq > 0)
+                    .ok_or_else(|| HarnessError::Setup("no mark that records a head".into()))?;
+                switch.restore_to(seq - 1);
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s mark at `origin` records another chain hash at the state's pair (Switch
+    /// wire 7.3, Table 1): the account fails stop, `fork`. The service is stopped for it
+    /// and started again.
+    ///
+    /// # Errors
+    ///
+    /// When the account has no mark, or the service can't be started again.
+    pub async fn fork_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.fork_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.fork_mark();
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s mark at `origin` is lost from a mark store that reads (Switch wire 7.3,
+    /// Table 1): the account fails stop, `mark_lost`. The service is stopped for it and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When the mark can't be deleted, or the service can't be started again.
+    pub async fn lose_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.lose_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.lose_mark();
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s account at `origin` is lost, its mark staying, as after a restore to
+    /// before the enrollment or a lost database (Switch wire 7.3, Table 1, row "None"):
+    /// every call gets the notice, `behind` at the mark's generation, but the enrollment,
+    /// which takes the mark over, and the erasure. The service is stopped for it and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such account, or the service can't be started again.
+    pub async fn lose_account(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.lose_account(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.lose_account();
+                Ok(())
+            }
+        }
+    }
+
+    /// The operator of `origin` retires `generation` for `identity` (Switch spec 6.5): the
+    /// notice says `permanent: true` from then on. The service is stopped for the
+    /// operator's step, which refuses unless the account fails stop or is lost, and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When the service's step refuses or fails, or the service can't be started again.
+    pub async fn retire(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        generation: u64,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.retire(&id, generation).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.retire(generation);
+                Ok(())
+            }
+        }
+    }
+
     /// The transport every party of this world sends through: to the switch of the
     /// request's origin, recorded.
     pub fn transport(&self) -> Arc<dyn Transport> {
@@ -274,7 +446,7 @@ impl World {
             switch.sample_time();
         }
         // A read the scripted switch holds looks at the clock when told to.
-        for switch in lock(&self.scripted).iter() {
+        for (_, switch) in lock(&self.scripted).iter() {
             switch.release_held_reads();
         }
     }
@@ -503,7 +675,7 @@ impl World {
             .sum();
         let scripted: usize = lock(&self.scripted)
             .iter()
-            .map(|switch| switch.held_reads())
+            .map(|(_, switch)| switch.held_reads())
             .sum();
         service.saturating_add(scripted)
     }

@@ -2109,3 +2109,57 @@ async fn test_protocol_set_restored_gap_waits_behind_a_call_a_protocol_owes() {
     assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
     assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn test_protocol_set_upload_transition_waits_behind_a_call_its_protocol_owes() {
+    // An upload makes a record of `tasks` divergent while `tasks` owes a missed call it
+    // keeps failing: the transition is held, so `tasks` is told nothing of the record past
+    // the call, while `chat`'s later entry goes; once `tasks` takes the call, it is told.
+    let list = crate::app::Collection::new(
+        "tasks.list",
+        pubky_switch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let p = Pair::with(
+        Named {
+            collections: vec![list.clone()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let target = crate::app::RecordTarget::new(list, b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    read(&mut app, 2).await;
+    let key = app.record_key(&target).unwrap();
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let now = p.w.clock.now_ms();
+    let missed = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 3).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    app.take_events();
+    p.w.switch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    p.send(me, "chat.item");
+    let divergent = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::RecordDivergent { key: k, .. } if *k == key))
+            .count()
+    };
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert_eq!(divergent(&events), 0, "{events:?}");
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [missed]);
+    assert_eq!(divergent(&events), 1, "{events:?}");
+}

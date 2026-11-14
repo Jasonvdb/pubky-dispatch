@@ -3581,6 +3581,18 @@ impl App {
             .all(|registered| blocked.contains(&registered.name))
     }
 
+    /// Whether an upload transition listing `changes` waits behind a call a protocol owes:
+    /// it lists a record whose protocol owes one, or that the app can't place.
+    async fn upload_waits(&self, changes: &UploadChanges) -> Result<bool, AppError> {
+        for key in changes.records.iter().chain(&changes.divergent) {
+            match self.record_protocol(key).await? {
+                Some(name) if !self.owing.contains(&name) => {}
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether every registered protocol owes a call it hasn't taken yet ([`App::owe`]).
     fn all_owing(&self) -> bool {
         self.protocols
@@ -3786,6 +3798,14 @@ impl App {
                     // wire 7.4.14). Changes that don't read mark nothing.
                     ServiceTransition::Upload { changes, .. } => {
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
+                            // The records it lists are read, judged and told for their protocols
+                            // at the end of the read: not past a call one of them owes. It is
+                            // held, as a record write is, the cursor staying before it; so is
+                            // one listing a record whose protocol the app can't tell, while any
+                            // protocol owes (Switch spec 8.3). Claims are told to no protocol.
+                            if !self.owing.is_empty() && self.upload_waits(&changes).await? {
+                                return Ok(Step::Hold);
+                            }
                             // Owned keys: the read's future stays `Send` across the awaits.
                             let records = changes.records.iter().chain(&changes.divergent);
                             let claims = changes.claims.iter().chain(&changes.divergent_claims);

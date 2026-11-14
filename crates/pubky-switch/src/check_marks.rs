@@ -21,6 +21,7 @@ use std::{
 
 use pubky_switch_core::{
     chain::{ChainTip, ZERO_HASH},
+    http::RecoveryNotice,
     records::IdentityBody,
     sig::SignedDoc,
 };
@@ -31,7 +32,7 @@ use crate::{
     config::Config,
     keys::{KeyStoreError, KeyStoreView},
     marks::{MarkRead, MarkStoreError, MarkView},
-    service::verdict::{self, Account, AccountState, Inputs, MarkInput, Verdict},
+    service::verdict::{self, Account, AccountState, Inputs, Judgement, MarkInput, Verdict},
     store::{
         StoreError,
         heads::{self, StoredHead},
@@ -188,6 +189,9 @@ pub struct AccountReport {
     pub generation: Option<u64>,
     /// The operator retired that generation (Switch spec 6.5).
     pub permanent: bool,
+    /// The generations the operator retired for the identity, ascending (Switch spec 6.5,
+    /// `pubky-switch retire`).
+    pub retired: Vec<u64>,
     /// The head's `seq`; `None` without an account or before the first chain item.
     pub head_seq: Option<u64>,
     /// The mark's `seq`; `None` without a mark.
@@ -344,8 +348,58 @@ fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Accou
     )
 }
 
-/// Judge one identity: `head` its account, if the database holds one, read after `mark`;
-/// `stub_at_mark` the hash of the stub it holds at the mark's `seq`, if any.
+/// One identity as the check judges it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Judged {
+    /// The verdict's judgement.
+    pub(crate) judgement: Judgement,
+    /// The account, as the verdict took it, if the database holds one.
+    pub(crate) account: Option<Account>,
+    /// Whether the account serves: its newest `identity.json` names this service.
+    pub(crate) serving: bool,
+}
+
+/// Judge one identity as the service does at a request: `head` its account, if the
+/// database holds one, read after `mark`; `stub_at_mark` the hash of the stub it holds at
+/// the mark's `seq`, if any; `retired` its retired generations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn judge_identity(
+    identity: &str,
+    head: Option<&StoredHead>,
+    mark: &MarkInput,
+    stub_at_mark: Option<[u8; 32]>,
+    keys: &KeyStoreView,
+    retired: &[u64],
+    origin: &str,
+    service_key: &[u8; 32],
+) -> Judged {
+    let judged = head.map(|head| account_of(head, origin, service_key));
+    let judgement = verdict::judge(&Inputs {
+        account: judged.as_ref().map(|(account, _)| account),
+        mark,
+        stub_at_mark,
+        erasure_at_ms: keys.erasure(identity),
+        retired,
+        current_key: *service_key,
+    });
+    Judged {
+        judgement,
+        account: judged.map(|(account, _)| account),
+        serving: judged.is_some_and(|(_, serving)| serving),
+    }
+}
+
+/// The notice a verdict answers, where it gives one.
+pub(crate) fn notice_of(verdict: &Verdict) -> Option<RecoveryNotice> {
+    match *verdict {
+        Verdict::Bounded { notice, .. }
+        | Verdict::Failing { notice, .. }
+        | Verdict::Lost { notice } => Some(notice),
+        _ => None,
+    }
+}
+
+/// Judge one identity into its report line ([`judge_identity`]).
 #[allow(clippy::too_many_arguments)]
 fn judge_line(
     identity: &str,
@@ -357,23 +411,22 @@ fn judge_line(
     origin: &str,
     service_key: &[u8; 32],
 ) -> Option<AccountReport> {
-    let judged = head.map(|head| account_of(head, origin, service_key));
     let retired = marks.retired(identity);
-    let judgement = verdict::judge(&Inputs {
-        account: judged.as_ref().map(|(account, _)| account),
+    let judged = judge_identity(
+        identity,
+        head,
         mark,
         stub_at_mark,
-        erasure_at_ms: keys.erasure(identity),
-        retired: &retired,
-        current_key: *service_key,
-    });
-    let state = state_of(&judgement.verdict, judgement.erase_account_again)?;
-    let notice = match judgement.verdict {
-        Verdict::Bounded { notice, .. }
-        | Verdict::Failing { notice, .. }
-        | Verdict::Lost { notice } => Some(notice),
-        _ => None,
-    };
+        keys,
+        &retired,
+        origin,
+        service_key,
+    );
+    let state = state_of(
+        &judged.judgement.verdict,
+        judged.judgement.erase_account_again,
+    )?;
+    let notice = notice_of(&judged.judgement.verdict);
     let mark_seq = match mark {
         MarkInput::Mark(mark) => Some(mark.seq),
         _ => None,
@@ -381,12 +434,46 @@ fn judge_line(
     Some(AccountReport {
         account: identity.to_string(),
         hosted: head.is_some(),
-        serving: judged.is_some_and(|(_, serving)| serving),
+        serving: judged.serving,
         state,
         generation: notice.map(|notice| notice.generation),
         permanent: notice.is_some_and(|notice| notice.permanent),
+        retired,
         head_seq: head.and_then(|head| head.chain.map(|(seq, _)| seq)),
         mark_seq,
+    })
+}
+
+/// One identity as the check reads it ([`read_identity`]).
+#[derive(Clone, Debug)]
+pub(crate) struct IdentityRead {
+    /// Its mark.
+    pub(crate) mark: MarkInput,
+    /// Its account, read after the mark, if the database holds one.
+    pub(crate) head: Option<StoredHead>,
+    /// The hash of the stub the account holds at the mark's `seq`, where that counts.
+    pub(crate) stub_at_mark: Option<[u8; 32]>,
+}
+
+/// Read one identity: its mark, then its account, then the stub at the mark.
+pub(crate) async fn read_identity(
+    conn: &mut PgConnection,
+    marks: &MarkView,
+    identity: &str,
+) -> Result<IdentityRead, CheckError> {
+    let mark = mark_input(marks, identity)?;
+    let head = heads::heads(conn, &[identity.to_string()])
+        .await?
+        .into_iter()
+        .find(|head| head.id == identity);
+    let stub_at_mark = match &head {
+        Some(head) => stub_at(conn, head, &mark).await?,
+        None => None,
+    };
+    Ok(IdentityRead {
+        mark,
+        head,
+        stub_at_mark,
     })
 }
 
@@ -453,21 +540,13 @@ async fn check(
         if seen.contains(&identity) {
             continue;
         }
-        let mark = mark_input(marks, &identity)?;
         // Read again: one made meanwhile is a new account's.
-        let head = heads::heads(conn, std::slice::from_ref(&identity))
-            .await?
-            .into_iter()
-            .next();
-        let stub = match &head {
-            Some(head) => stub_at(conn, head, &mark).await?,
-            None => None,
-        };
+        let read = read_identity(conn, marks, &identity).await?;
         if let Some(line) = judge_line(
             &identity,
-            head.as_ref(),
-            &mark,
-            stub,
+            read.head.as_ref(),
+            &read.mark,
+            read.stub_at_mark,
             keys,
             marks,
             origin,

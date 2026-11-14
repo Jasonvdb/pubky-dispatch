@@ -26,6 +26,7 @@ pub mod limits;
 #[allow(dead_code)]
 pub mod marks;
 pub mod ratelimit;
+pub mod retire;
 pub mod service;
 pub mod store;
 pub mod telemetry;

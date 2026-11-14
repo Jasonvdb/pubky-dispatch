@@ -10,6 +10,7 @@ use pubky_switch::{
     config::Config,
     http,
     keys::{FileKeyStore, KeyStoreReadiness},
+    retire::{self, RetireOptions},
     service::Service,
     store::{Store, StoreReadiness},
     telemetry,
@@ -46,6 +47,16 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Retire a generation of an identity, one-way, once no state at or past its mark can
+    /// be brought back: its notice then says the loss is permanent. Only a failing account
+    /// this service serves, or a lost identity, at a generation above 0; refused while the
+    /// service runs on the key store. Prints a JSON line.
+    Retire {
+        /// The identity's Pubky ID.
+        identity: String,
+        /// The generation to retire: the mark's, or the account's where the mark is lost.
+        generation: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -75,7 +86,37 @@ fn main() -> ExitCode {
         Command::CheckMarks { replica, all } => {
             check_marks_command(&config, replica.as_deref(), all)
         }
+        Command::Retire {
+            identity,
+            generation,
+        } => retire_command(&config, &identity, generation),
         Command::Run => run(config),
+    }
+}
+
+fn retire_command(config: &Config, identity: &str, generation: u64) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("pubky-switch: retire: starting the runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let retired = RetireOptions::from_config(config, identity, generation)
+        .and_then(|options| runtime.block_on(retire::run(&options)))
+        .and_then(|retired| retired.to_json_line());
+    match retired {
+        Ok(line) => {
+            print!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("pubky-switch: retire: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -252,6 +252,28 @@ async fn test_check_marks_reports_behind_fork_and_mark_lost() {
 }
 
 #[tokio::test]
+async fn test_check_marks_reports_retired_generations() {
+    // alice's state went behind her mark and the operator retired generation 1: her line
+    // lists it, and the notice is permanent (Switch spec 6.5, Switch wire 7.3, Table 1).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    mark_at(&replay, &alice, 1, 4, 4).await;
+    let line = find(&check(&replay, false).await.accounts, &alice).clone();
+    assert_eq!((line.retired.clone(), line.permanent), (Vec::new(), false));
+
+    replay.marks.retire(&alice, 1).await.expect("retire");
+    // A retirement of another generation is listed, and doesn't count for this one.
+    replay.marks.retire(&alice, 7).await.expect("retire");
+    let line = find(&check(&replay, false).await.accounts, &alice).clone();
+    assert_eq!(
+        (line.state, line.generation, line.permanent, line.retired),
+        (MarkState::Behind, Some(1), true, vec![1, 7])
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_check_marks_reports_a_fork_past_the_mark() {
     // The state is past the mark in its generation and the stub it holds at the mark's seq
     // has another chain hash: a fork, as the service judges it (Switch wire 7.3, Table 1).
@@ -445,7 +467,7 @@ async fn test_check_marks_summary_and_exit_status() {
         lines[0],
         serde_json::json!({
             "account": "behind", "hosted": true, "serving": true, "state": "behind",
-            "generation": 1, "permanent": false, "head_seq": 1, "mark_seq": 3
+            "generation": 1, "permanent": false, "retired": [], "head_seq": 1, "mark_seq": 3
         })
     );
     assert_eq!(lines[3]["summary"]["needs_attention"], 3);

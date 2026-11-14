@@ -10,6 +10,7 @@ pubky-switch check-config --config /etc/pubky-switch/config.toml
 - `run`, the default command, starts the service. It needs a database (`database.url` or `PUBKY_SWITCH_DATABASE_URL`) and a key store (`keys.path`), applies pending schema migrations, and stops on `SIGTERM` or Ctrl-C.
 - `check-config` checks a file and prints it with every default written out.
 - `check-marks` judges every account against its mark, as the service does, and lists the accounts and marks that need attention after a database restore or before a failover; it writes nothing (Checking marks after a restore, below).
+- `retire <identity> <generation>` retires a lost generation of one identity, one-way, so its notice says the loss is permanent; it runs only while the service is stopped (Retiring a generation, below).
 - `--config` may also be given as `PUBKY_SWITCH_CONFIG`. Without a file, every setting takes its default.
 
 ### Container
@@ -257,8 +258,9 @@ Restoring a database backup, failing over to a replica that may lag, or replayin
 
 1. The marks stop the affected accounts on their own, and the readiness answer stays up for the others: their requests answer the recovery notice, `503 recovery_required`, with the generation and the reason (`behind`, `fork`, `mark_lost`; Switch wire 7.6).
 2. Find them with `pubky-switch check-marks` (Checking marks after a restore, below).
-3. Tell their users, by whatever means you reach them outside the service, that a provider loss must be declared. Their signers see the notice, and declare it here or at another service: the account starts a new generation, under the same service key.
-4. Never serve the lost generation again.
+3. Bring back a state at or past every mark if one exists: restore a newer backup, or fail over to a database that holds it (Choosing a database to fail over to, below), and the accounts serve again. For each account where none exists, retire the lost generation (Retiring a generation, below), so its notice says the loss is permanent.
+4. Tell their users, by whatever means you reach them outside the service, that a provider loss must be declared. Their signers see the notice, and declare it here or at another service: the account starts a new generation, under the same service key. The notice is how they learn it; a note sent any other way is optional context that starts nothing.
+5. Never serve the lost generation again.
 
 Database backups are for disaster recovery only: after a restore, every account whose state went back takes the steps above.
 
@@ -282,9 +284,23 @@ Each line gets one state:
 
 `healthy` and `staged` need no attention; every other state does, serving or not, since a database to fail over to must hold what the service signed for every account.
 
-It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `head_seq` and `mark_seq`; then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
+It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `retired` (the generations retired for the identity, ascending), `head_seq` and `mark_seq`; then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
 
 **Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. A database on which the check exits 0 holds every chain item and signed head the service acknowledged, since such an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
+
+### Retiring a generation
+
+`pubky-switch retire <identity> <generation>` records that the generation of one identity is lost for good (Switch spec 6.5, "Retiring a generation"). Until then a failing account's notice isn't permanent: the operator may still bring back a state at or past the mark, and the account then serves again. Retire only once no state at or past the mark can be brought back, from any backup or replica: the step is one-way. Nothing removes a retirement, not an enrollment, not an erasure; only a mark store rebuilt after its loss holds none (Switch wire 7.3, Table 3).
+
+What it does: from then on the identity's requests answer the recovery notice with `permanent: true`, and the reason the account had (`behind`, `fork` or `mark_lost`; `behind` for a lost identity). The signer still declares the loss and starts a new generation, here or elsewhere; the retirement counts only up to the retired generation, so the new one serves. The retirement lies beside the marks in `accounts/retired/`, apart from the backups, so it holds where the mark itself is lost.
+
+It refuses, and records nothing, unless:
+
+- the generation is above 0;
+- the identity is lost (no account, and a mark that records a head, no erasure's record covering it: `lost` in `check-marks`), or its account fails stop and its newest `identity.json` names this service (`serving` in `check-marks`, and `behind`, `fork` or `mark_lost`). A healthy account is refused, and so is every staged one, such as a move's target, bounded or failing: its ways out stay the abort and the erasure (Switch wire 7.3, Table 2);
+- the generation given is the one the retirement is of: the mark's, or the account's where the mark is lost. It is the `generation` `check-marks` reports for the line, and a refusal for another names it.
+
+It reads the configuration file as the service does (it needs `server.origin`, `keys.path` and the database), and runs only while the service is stopped: it takes the key store's lock, `<keys.path>/lock`, and refuses while the running service holds it, since the service reads the retirements when it starts. Under the lock it judges the identity as `check-marks` does, reading only, then records the retirement durably. Start the service again afterwards. It prints one JSON line: `account`, the generation `retired`, `already_retired` (`true` when that generation was retired already: nothing changed, and the exit code is still 0), and the `notice` the identity's requests now get. A refusal or a failure exits 1, with the reason on stderr.
 
 ## Known limits
 

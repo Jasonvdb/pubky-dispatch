@@ -1277,9 +1277,10 @@ impl ScriptedSwitch {
                         inner.seen(request);
                     }
                     // A `401` is answered before the request verifies, so before the lock:
-                    // with the last stamped time and no head (Switch wire 7.1).
+                    // at the identity's service time, which it doesn't move, and with no
+                    // head (Switch wire 7.1, 7.3 step 3).
                     if status == 401 {
-                        let at = inner.stamped_ms;
+                        let at = inner.stamped_ms.max(inner.now());
                         return Ok(inner.respond_at(&inner.service, request, status, &body, at));
                     }
                     return Ok(inner.respond(request, status, &body));
@@ -1355,8 +1356,8 @@ impl ScriptedSwitch {
         // its `app.put` (or doesn't parse, which the batch's checks refuse first): no key
         // verifies the request, so authentication refuses it,
         // whatever the route and before the account's lock, the staged and frozen answers
-        // included, as the service does: `403 not_current`, no head, the last committed
-        // time, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
+        // included, as the service does: `403 not_current`, no head, the identity's service
+        // time, which it doesn't move, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
         // own app's first call", 7.3 steps 5 to 8).
         if let Some(app) = caller
             && inner.hosts()
@@ -1376,7 +1377,9 @@ impl ScriptedSwitch {
                 "7.2: an own app's first call carries its app.put",
                 json!(null),
             );
-            return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
+            // At the identity's service time, which the refusal doesn't move.
+            let at = stamped_before.max(inner.now());
+            return Ok(inner.respond_at(&inner.service, request, status, &body, at));
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             // A staged account's refusal comes after authentication: the app was seen.
@@ -2098,9 +2101,10 @@ impl Inner {
 
     /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
     /// holds, is `401 stale_timestamp` (Switch wire 7.1, 7.6): `current.server_time` is the
-    /// time base, for the retry's timestamp, and `Switch-Server-Time` the last time stamped,
-    /// which the refusal, answered before the account's lock, doesn't move. A request that
-    /// passes stamps the time. A missing or unparsable timestamp isn't checked.
+    /// time base, for the retry's timestamp, and `Switch-Server-Time` the identity's service
+    /// time, the time base or the last time stamped if the time base is earlier, which the
+    /// refusal, answered before the account's lock, doesn't move (Switch wire 7.3 step 3). A
+    /// request that passes stamps the time. A missing or unparsable timestamp isn't checked.
     fn stale_timestamp(&mut self, request: &Request) -> Option<Response> {
         if !self.hosts() {
             return None;
@@ -2119,7 +2123,8 @@ impl Inner {
             "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
             json!({ "server_time": rfc3339(now) }),
         );
-        Some(self.respond_at(&self.service, request, status, &body, self.stamped_ms))
+        let service_ms = self.stamped_ms.max(now);
+        Some(self.respond_at(&self.service, request, status, &body, service_ms))
     }
 
     /// An enrollment whose `Switch-Timestamp` is more than 5 minutes from the time base is

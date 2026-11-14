@@ -116,8 +116,8 @@ pub fn check_timestamp(text: &str, base_ms: u64) -> Result<u64, ApiError> {
         .filter(|_| well_formed)
         .ok_or_else(|| ApiError::bad_request("7.1: Switch-Timestamp isn't YYYY-MM-DDTHH:MM:SSZ"))?;
     if at.abs_diff(base_ms) > fixed::TIMESTAMP_WINDOW_MS {
-        // The time base, for the retry's timestamp: the answer's Switch-Server-Time stays
-        // the identity's last committed time, which a refusal before the lock can't move.
+        // The time base, for the retry's timestamp: the answer's Switch-Server-Time is the
+        // identity's service time, which a refusal before the lock doesn't move (7.3 step 3).
         return Err(ApiError::new(
             ErrorCode::StaleTimestamp,
             "7.1: Switch-Timestamp is more than 5 minutes from the service's time",

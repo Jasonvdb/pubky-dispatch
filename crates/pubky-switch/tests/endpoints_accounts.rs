@@ -977,10 +977,21 @@ async fn test_stale_timestamp_gives_a_time_to_retry_with() {
         (refused.status, code(&refused).as_str()),
         (401, "stale_timestamp")
     );
-    // The signed time stays the identity's service time; the body gives the time base.
+    // The signed time is the identity's service time, here the time base, later than the
+    // last time it stamped, which the refusal doesn't move; the body gives the time base
+    // too (Switch wire 7.1 Timestamp, 7.3 step 3).
+    assert_eq!(header_of(&refused, header::SERVER_TIME), Some(T));
     assert_eq!(
-        header_of(&refused, header::SERVER_TIME),
-        Some(last_committed)
+        replay
+            .db
+            .store()
+            .lookup(&alice.id)
+            .await
+            .expect("lookup")
+            .expect("account")
+            .stamped_time_ms,
+        ms(last_committed),
+        "the refusal stamps nothing"
     );
     let retry_at = json(&refused)["current"]["server_time"]
         .as_str()

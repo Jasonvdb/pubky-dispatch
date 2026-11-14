@@ -16,12 +16,13 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `Switch-Identity` check; the caller is the `Switch-App` header as sent, and an app of
   another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
   minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
-  the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
+  the identity's service time in `Switch-Server-Time` (the clock's time, or the last
+  stamped time if the clock is earlier), as at the service; a missing or unparsable
   one isn't refused. An enrollment's timestamp is checked the same way, before the
   enrollment is looked at, and its `401` carries the clock's time in both places. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
-  erasure. An injected `401` fault is answered as before the lock, with the last stamped
-  time and no head; other injected faults with the clock's time and the head. A request an
+  erasure. An injected `401` fault is answered as before the lock, at the identity's
+  service time, which it doesn't move, and no head; other injected faults with the clock's time and the head. A request an
   `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
   in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
@@ -299,7 +300,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `app.put` or doesn't parse, gets `403 not_current`
   at authentication, before the account's lock and before a staged or frozen account's
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
-  `Switch-Server-Time` the last time stamped, and the app not seen. A revoked or departed
+  `Switch-Server-Time` the identity's service time, which it doesn't move, and the app not
+  seen. A revoked or departed
   app that delivered its record keeps it, so it goes on to the route's checks, as at the
   service, until it is purged (Purge of removed apps, above): then it meets the first
   call's refusal, without the head, as at the service.

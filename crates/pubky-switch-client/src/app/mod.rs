@@ -2871,7 +2871,7 @@ impl App {
     /// same key is misbehaviour, returned as the alarm.
     fn note_service_time(&mut self) -> Option<Alarm> {
         // Only the latest call's own stamped time: a refusal answered before the request
-        // verified carries the last committed time, and measures nothing (Switch wire 7.1).
+        // verified stamps nothing, and measures nothing (Switch wire 7.1).
         let time = self.client.latest_server_time()?;
         let now = self.now();
         self.time_fresh_at = Some(now);

@@ -586,29 +586,25 @@ impl Service {
         if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms, service_ms) {
             return answer;
         }
-        let Some(found) = found else {
+        if found.is_none() {
             // An identity without an account that the verdict lets through: the erasure at
             // a lost identity (Switch wire 7.4.16, 7.3 Table 2).
             return self
                 .erase_without_account(&account, &request, &routed, base_ms, asked)
                 .await;
-        };
-        let stamped_ms = found.stamped_time_ms;
-        // An answer before the account's lock: signed with the verdict's key, at the service
-        // time the account last committed, which no answer it shows later is behind (Switch
-        // wire 7.3 step 3).
+        }
+        // An answer before the account's lock: signed with the verdict's key, at the
+        // identity's service time, which it doesn't move (Switch wire 7.1 Timestamp, 7.3 step
+        // 3).
         let refused_early =
-            |error: ApiError| self.keyed_error(&routed.key, asked, stamped_ms, base_ms, &error);
+            |error: ApiError| self.keyed_error(&routed.key, asked, service_ms, base_ms, &error);
         // Everything that needs no account state comes before the lock: the limits that
         // apply before authentication, the headers and the signature (Switch wire 7.2).
         let PreLock {
             caller,
             verified,
             other,
-        } = match self
-            .pre_lock(&account, &request, base_ms, base_ms.max(stamped_ms))
-            .await
-        {
+        } = match self.pre_lock(&account, &request, base_ms, service_ms).await {
             Ok(pre) => pre,
             Err(error) => return refused_early(error),
         };
@@ -632,20 +628,15 @@ impl Service {
             }
             Call::RecoveryUpload => match verified.as_ref() {
                 Some(app) => Some(Prepared::Upload(Box::new(
-                    self.prepare_upload(&account, app, &request.body, base_ms.max(stamped_ms))
+                    self.prepare_upload(&account, app, &request.body, service_ms)
                         .await,
                 ))),
                 None => None,
             },
             Call::PutPush => match verified.as_ref() {
                 Some(app) => Some(Prepared::Push(Box::new(
-                    self.prepare_push(
-                        &account,
-                        &app.app_id(),
-                        &request.body,
-                        base_ms.max(stamped_ms),
-                    )
-                    .await,
+                    self.prepare_push(&account, &app.app_id(), &request.body, service_ms)
+                        .await,
                 ))),
                 None => None,
             },

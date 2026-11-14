@@ -151,6 +151,9 @@ pub enum Advance {
     Overtaken(AccountMark),
     /// The mark is at the head's pair with another chain hash: a fork, refused.
     Fork(AccountMark),
+    /// The mark is another account's: created at another time than the account the move
+    /// is for, which was erased, and another enrolled, since its commit. The mark stays.
+    OtherAccount(AccountMark),
     /// The identity has no mark to move ([`MarkStore::write_anew`] writes one).
     NoMark(MarkRead),
 }
@@ -376,7 +379,9 @@ impl MarkStore {
 
     /// The mark's key becomes `key`, its head and creation time staying (Switch wire 7.3,
     /// Table 3: an enrollment at a staged account that no document names yet, after a
-    /// service key change). Without a mark, or with that key already, nothing changes.
+    /// service key change). Only the mark of the account created at `created_at_ms`
+    /// changes: without a mark, with another account's, or with that key already, nothing
+    /// changes.
     ///
     /// # Errors
     ///
@@ -385,23 +390,32 @@ impl MarkStore {
         &self,
         identity: &str,
         key: [u8; 32],
+        created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
             inner.write_sync(&identity, |held| match held {
-                MarkRead::Mark(mark) if mark.key != key => Some(AccountMark { key, ..mark }),
+                MarkRead::Mark(mark) if mark.key != key && mark.created_at_ms == created_at_ms => {
+                    Some(AccountMark { key, ..mark })
+                }
                 MarkRead::Mark(_) | MarkRead::Missing | MarkRead::NotAMark => None,
             })
         })
         .await
     }
 
-    /// Move the identity's mark to `head`, answered with `key`, once the commit that holds
-    /// the head is durable (Switch wire 7.3, "Moving it"). The mark moves only to a higher
-    /// (generation, `seq`), durably before this returns; at the same head it stays, behind
-    /// a later one it stays, and at the head's pair with another chain hash it is refused.
+    /// Move the mark of the identity's account created at `created_at_ms` to `head`,
+    /// answered with `key`, once the commit that holds the head is durable (Switch wire 7.3,
+    /// "Moving it"). The mark moves only to a higher (generation, `seq`), durably before
+    /// this returns; at the same head it stays, behind a later one it stays, and at the
+    /// head's pair with another chain hash it is refused.
+    ///
+    /// A move runs after its commit, outside the identity's lock: the account may have been
+    /// erased, and another enrolled, meanwhile. Every writer keeps a mark's creation time
+    /// equal to its account's, so a mark of another creation time is another account's: it
+    /// stays, and the move answers [`Advance::OtherAccount`].
     ///
     /// # Errors
     ///
@@ -412,6 +426,7 @@ impl MarkStore {
         identity: &str,
         head: ChainTip,
         key: [u8; 32],
+        created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
         self.check_gate()?;
         let inner = self.inner.clone();
@@ -419,13 +434,15 @@ impl MarkStore {
         if !is_head(&head) {
             return Err(MarkStoreError::InvalidHead);
         }
-        blocking(move || inner.advance_sync(&identity, head, key)).await
+        blocking(move || inner.advance_sync(&identity, head, key, created_at_ms)).await
     }
 
     /// Write the mark anew at `head`, with `key` and `created_at_ms`, where the identity's
     /// mark is lost: missing, or a file that doesn't read as a mark (Switch wire 7.3,
     /// Table 3: a delivery that starts a generation where the mark is lost). A mark it
-    /// holds stays: [`MarkStore::advance`] moves it.
+    /// holds stays: [`MarkStore::advance`] moves it. Nothing is written for an account an
+    /// erasure's record covers, one created at or before the record: it was erased since
+    /// the commit that holds the head, and a mark written for it would be a leftover.
     ///
     /// # Errors
     ///
@@ -446,6 +463,12 @@ impl MarkStore {
         }
         blocking(move || {
             inner.write_sync(&identity, |held| match held {
+                // Read under the writes' lock, as the record is written.
+                MarkRead::Missing | MarkRead::NotAMark
+                    if inner.erased_after(&identity, created_at_ms) =>
+                {
+                    None
+                }
                 MarkRead::Missing | MarkRead::NotAMark => Some(AccountMark {
                     generation: head.generation,
                     seq: head.seq,
@@ -619,7 +642,10 @@ impl MarkStore {
 
     /// Forget the erasures recorded before `before_ms`, whose accounts no database backup
     /// the operator keeps can hold any more (Switch spec 6.5); the number forgotten. The
-    /// caller deletes the leftover marks a record covers first (Switch wire 7.3, Table 3).
+    /// caller deletes the leftover marks a record covers first (Switch wire 7.3, Table 3);
+    /// a record that still covers a mark, one created at or before it, stays for the next
+    /// pass, also when the mark was written after the caller's deletion: without its record
+    /// the leftover would read as a lost account's mark.
     ///
     /// # Errors
     ///
@@ -849,6 +875,16 @@ impl Inner {
         Ok(held)
     }
 
+    /// Whether an erasure's record covers an account of `identity` created at
+    /// `created_at_ms`: one dated at or after it, every record being dated no earlier than
+    /// the creation it erases (Switch wire 7.3, Table 3).
+    fn erased_after(&self, identity: &str, created_at_ms: u64) -> bool {
+        self.erasures
+            .lock()
+            .get(identity)
+            .is_some_and(|at_ms| created_at_ms <= *at_ms)
+    }
+
     fn read_sync(&self, identity: &str) -> Result<MarkRead, MarkStoreError> {
         self.reading(|id| self.load_mark(identity, id))
     }
@@ -888,12 +924,16 @@ impl Inner {
         identity: &str,
         head: ChainTip,
         key: [u8; 32],
+        created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
         self.writing(|id| {
             let mark = match self.load_mark(identity, id)? {
                 MarkRead::Mark(mark) => mark,
                 held => return Ok(Advance::NoMark(held)),
             };
+            if mark.created_at_ms != created_at_ms {
+                return Ok(Advance::OtherAccount(mark));
+            }
             let held = (mark.generation, mark.seq);
             let new = (head.generation, head.seq);
             if new < held {
@@ -1026,14 +1066,24 @@ impl Inner {
     /// Remove the records of erasures before `before_ms`, each removal durable before its
     /// entry leaves memory.
     fn forget_erasures_sync(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
-        self.writing(|_| {
-            let old: Vec<String> = self
+        self.writing(|id| {
+            let aged: Vec<(String, u64)> = self
                 .erasures
                 .lock()
                 .iter()
                 .filter(|(_, at)| **at < before_ms)
-                .map(|(identity, _)| identity.clone())
+                .map(|(identity, at)| (identity.clone(), *at))
                 .collect();
+            let mut old = Vec::with_capacity(aged.len());
+            for (identity, at_ms) in aged {
+                let covers_a_mark = matches!(
+                    self.load_mark(&identity, id)?,
+                    MarkRead::Mark(mark) if mark.created_at_ms <= at_ms
+                );
+                if !covers_a_mark {
+                    old.push(identity);
+                }
+            }
             let dir = self.erasures_dir();
             for identity in &old {
                 #[cfg(test)]
@@ -1362,7 +1412,11 @@ mod tests {
 
     async fn with_mark(store: &MarkStore, identity: &str, at: ChainTip) -> AccountMark {
         store.create_zero(identity, KEY, 100).await.expect("zero");
-        match store.advance(identity, at, KEY).await.expect("advance") {
+        match store
+            .advance(identity, at, KEY, 100)
+            .await
+            .expect("advance")
+        {
             Advance::Moved(mark) => mark,
             other => panic!("not moved: {other:?}"),
         }
@@ -1470,15 +1524,15 @@ mod tests {
             ..mark
         };
         assert_eq!(
-            store.set_key(ALICE, OTHER_KEY).await.expect("set"),
+            store.set_key(ALICE, OTHER_KEY, 100).await.expect("set"),
             MarkWrite::Written(changed)
         );
         assert_eq!(
-            store.set_key(ALICE, OTHER_KEY).await.expect("again"),
+            store.set_key(ALICE, OTHER_KEY, 100).await.expect("again"),
             MarkWrite::Unchanged(MarkRead::Mark(changed))
         );
         assert_eq!(
-            store.set_key(BOB, OTHER_KEY).await.expect("none"),
+            store.set_key(BOB, OTHER_KEY, 100).await.expect("none"),
             MarkWrite::Unchanged(MarkRead::Missing)
         );
     }
@@ -1489,13 +1543,16 @@ mod tests {
         store.create_zero(ALICE, KEY, 100).await.expect("zero");
         assert_eq!(
             store
-                .advance(ALICE, head(1, 5, 1), KEY)
+                .advance(ALICE, head(1, 5, 1), KEY, 100)
                 .await
                 .expect("first"),
             Advance::Moved(mark_at(1, 5, 1, 100))
         );
         assert_eq!(
-            store.advance(ALICE, head(1, 6, 2), KEY).await.expect("seq"),
+            store
+                .advance(ALICE, head(1, 6, 2), KEY, 100)
+                .await
+                .expect("seq"),
             Advance::Moved(mark_at(1, 6, 2, 100))
         );
         // A later generation is higher whatever its `seq`, and takes the key it names.
@@ -1505,7 +1562,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .advance(ALICE, head(2, 1, 3), OTHER_KEY)
+                .advance(ALICE, head(2, 1, 3), OTHER_KEY, 100)
                 .await
                 .expect("generation"),
             Advance::Moved(moved)
@@ -1524,21 +1581,21 @@ mod tests {
         let mark = with_mark(&store, ALICE, head(2, 5, 1)).await;
         assert_eq!(
             store
-                .advance(ALICE, head(2, 5, 1), OTHER_KEY)
+                .advance(ALICE, head(2, 5, 1), OTHER_KEY, 100)
                 .await
                 .expect("equal"),
             Advance::Unchanged(mark)
         );
         assert_eq!(
             store
-                .advance(ALICE, head(2, 4, 9), KEY)
+                .advance(ALICE, head(2, 4, 9), KEY, 100)
                 .await
                 .expect("lower seq"),
             Advance::Overtaken(mark)
         );
         assert_eq!(
             store
-                .advance(ALICE, head(1, 50, 9), KEY)
+                .advance(ALICE, head(1, 50, 9), KEY, 100)
                 .await
                 .expect("lower generation"),
             Advance::Overtaken(mark)
@@ -1552,7 +1609,7 @@ mod tests {
         let mark = with_mark(&store, ALICE, head(1, 5, 1)).await;
         assert_eq!(
             store
-                .advance(ALICE, head(1, 5, 2), KEY)
+                .advance(ALICE, head(1, 5, 2), KEY, 100)
                 .await
                 .expect("fork"),
             Advance::Fork(mark)
@@ -1561,11 +1618,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_marks_advance_refuses_another_creation_time() {
+        let (_dir, store) = open();
+        // Another account's (0, 0) mark, made after the account the move is for was erased.
+        store.create_zero(ALICE, KEY, 200).await.expect("zero");
+        let held = AccountMark::zero(KEY, 200);
+        for created_at_ms in [100, 300] {
+            assert_eq!(
+                store
+                    .advance(ALICE, head(1, 5, 1), KEY, created_at_ms)
+                    .await
+                    .expect("other account"),
+                Advance::OtherAccount(held)
+            );
+        }
+        assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Mark(held));
+        assert_eq!(
+            store
+                .advance(ALICE, head(1, 5, 1), KEY, 200)
+                .await
+                .expect("its own"),
+            Advance::Moved(mark_at(1, 5, 1, 200))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_set_key_refuses_another_creation_time() {
+        let (_dir, store) = open();
+        let mark = with_mark(&store, ALICE, head(1, 3, 1)).await;
+        assert_eq!(
+            store.set_key(ALICE, OTHER_KEY, 99).await.expect("other"),
+            MarkWrite::Unchanged(MarkRead::Mark(mark))
+        );
+        assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Mark(mark));
+    }
+
+    #[tokio::test]
+    async fn test_marks_write_anew_refused_for_an_erased_account() {
+        let (_dir, store) = open();
+        store.record_erasure(ALICE, 700).await.expect("record");
+        for created_at_ms in [600, 700] {
+            assert_eq!(
+                store
+                    .write_anew(ALICE, head(3, 1, 4), KEY, created_at_ms)
+                    .await
+                    .expect("erased"),
+                MarkWrite::Unchanged(MarkRead::Missing)
+            );
+        }
+        assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Missing);
+        // An account created after the record is a later one: its mark is written.
+        assert_eq!(
+            store
+                .write_anew(ALICE, head(3, 1, 4), KEY, 701)
+                .await
+                .expect("later account"),
+            MarkWrite::Written(mark_at(3, 1, 4, 701))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_forget_keeps_a_record_that_covers_a_mark() {
+        let (_dir, store) = open();
+        store.create_zero(ALICE, KEY, 1_000).await.expect("zero");
+        store.record_erasure(ALICE, 2_000).await.expect("record");
+        store.create_zero(BOB, KEY, 3_000).await.expect("zero");
+        store.record_erasure(BOB, 2_500).await.expect("record");
+        // Alice's mark is a leftover her record covers; Bob's is a later account's.
+        assert_eq!(
+            store.forget_erasures_before(5_000).await.expect("forget"),
+            1
+        );
+        assert_eq!(
+            store.erasures().await.expect("list"),
+            vec![(ALICE.to_string(), 2_000)]
+        );
+        store.delete_created_by(ALICE, 2_000).await.expect("delete");
+        assert_eq!(
+            store.forget_erasures_before(5_000).await.expect("forget"),
+            1
+        );
+        assert_eq!(store.erasures().await.expect("list"), vec![]);
+    }
+
+    #[tokio::test]
     async fn test_marks_advance_without_a_mark_changes_nothing() {
         let (dir, store) = open();
         assert_eq!(
             store
-                .advance(ALICE, head(1, 1, 1), KEY)
+                .advance(ALICE, head(1, 1, 1), KEY, 100)
                 .await
                 .expect("missing"),
             Advance::NoMark(MarkRead::Missing)
@@ -1573,7 +1714,7 @@ mod tests {
         fs::write(marks_dir(&dir).join(BOB), b"[]").expect("write");
         assert_eq!(
             store
-                .advance(BOB, head(1, 1, 1), KEY)
+                .advance(BOB, head(1, 1, 1), KEY, 100)
                 .await
                 .expect("not a mark"),
             Advance::NoMark(MarkRead::NotAMark)
@@ -1587,7 +1728,7 @@ mod tests {
         store.create_zero(ALICE, KEY, 100).await.expect("zero");
         for bad in [head(0, 0, 0), head(1, 0, 1), head(0, 3, 1)] {
             assert!(matches!(
-                store.advance(ALICE, bad, KEY).await,
+                store.advance(ALICE, bad, KEY, 100).await,
                 Err(MarkStoreError::InvalidHead)
             ));
             assert!(matches!(
@@ -1869,7 +2010,7 @@ mod tests {
         let mark = with_mark(&store, ALICE, head(1, 1, 1)).await;
         faults.lock().fail_sync(&marks_dir(&dir), 1);
         assert!(matches!(
-            store.advance(ALICE, head(1, 2, 2), KEY).await,
+            store.advance(ALICE, head(1, 2, 2), KEY, 100).await,
             Err(MarkStoreError::Io(_))
         ));
         // The process still holds the mark it last wrote durably.
@@ -1883,7 +2024,7 @@ mod tests {
         let (dir, store, faults) = open_faulty();
         with_mark(&store, ALICE, head(1, 1, 1)).await;
         faults.lock().fail_sync(&marks_dir(&dir), 1);
-        assert!(store.advance(ALICE, head(1, 2, 2), KEY).await.is_err());
+        assert!(store.advance(ALICE, head(1, 2, 2), KEY, 100).await.is_err());
         assert!(
             marks_dir(&dir).join(ALICE).exists(),
             "the rename landed without its sync"
@@ -1891,7 +2032,7 @@ mod tests {
         // The retry writes and syncs again before it reports the move.
         assert_eq!(
             store
-                .advance(ALICE, head(1, 2, 2), KEY)
+                .advance(ALICE, head(1, 2, 2), KEY, 100)
                 .await
                 .expect("retry"),
             Advance::Moved(mark_at(1, 2, 2, 100))
@@ -1920,7 +2061,7 @@ mod tests {
         let (dir, store, faults) = open_faulty();
         with_mark(&store, ALICE, head(1, 1, 1)).await;
         faults.lock().fail_sync(&marks_dir(&dir), 1);
-        assert!(store.advance(ALICE, head(1, 2, 2), KEY).await.is_err());
+        assert!(store.advance(ALICE, head(1, 2, 2), KEY, 100).await.is_err());
         drop(store);
         // The next process syncs before it reads: it reads the landed mark, and a crash
         // after can't take it back.
@@ -2225,8 +2366,13 @@ mod tests {
         };
         stale(store.create_zero(BOB, KEY, 1).await.map(|_| ()));
         stale(store.take(ALICE, mark, OTHER_KEY, 9).await.map(|_| ()));
-        stale(store.set_key(ALICE, OTHER_KEY).await.map(|_| ()));
-        stale(store.advance(ALICE, head(1, 5, 2), KEY).await.map(|_| ()));
+        stale(store.set_key(ALICE, OTHER_KEY, 100).await.map(|_| ()));
+        stale(
+            store
+                .advance(ALICE, head(1, 5, 2), KEY, 100)
+                .await
+                .map(|_| ()),
+        );
         stale(
             store
                 .write_anew(BOB, head(1, 5, 2), KEY, 9)

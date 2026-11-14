@@ -357,7 +357,7 @@ impl Service {
         txn.keep_enrollment_answer(&enrollment_hash, time_ms, self.limits.max_enrollments)
             .await
             .map_err(|e| store_error(&e))?;
-        if !serving && let Err(failure) = self.marks.set_key(identity_text, key).await {
+        if !serving && let Err(failure) = self.marks.set_key(identity_text, key, created).await {
             tracing::error!(%failure, "a staged account's mark taking the current key");
             return Err(unavailable());
         }

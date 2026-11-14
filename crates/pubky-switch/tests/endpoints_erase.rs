@@ -859,6 +859,67 @@ async fn test_erase_then_enrollment_starts_a_new_account() {
 }
 
 #[tokio::test]
+async fn test_erase_and_enrollment_before_a_mark_move_leave_the_new_mark() {
+    // A request's mark moves after its commit, outside the identity's lock. An erasure and
+    // a new enrollment that land in between leave the new account's (0, 0) mark as it is:
+    // the move is the erased account's, the request answers `503 unavailable` without a
+    // head, and nothing signed for its commit goes out (Switch wire 7.3, "Moving it",
+    // Table 3).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let chain = vectors("chain.json");
+    let at_ms = ms(&item_time(chain_item(&chain, 3)));
+    replay.clock.set_wall_ms(at_ms);
+    let batch = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        pubky_switch_core::ops::OpsRequest::new(&ops_at(&chain, &[3, 4]), None).to_json(),
+        at_ms,
+    );
+    let sent = Sent::of(&batch);
+    let pause = replay.service.pause_next_mark_move();
+    let later_ms = at_ms + 60_000;
+    let (answer, created) = tokio::join!(Box::pin(replay.service.handle(batch)), async {
+        pause.reached().await;
+        replay.clock.set_wall_ms(later_ms);
+        let erased = replay
+            .service
+            .handle(erasure(&replay, Some(&held_hash()), later_ms).await)
+            .await;
+        assert_eq!(erased.status, 200, "{}", text(&erased));
+        let enrolled = replay
+            .service
+            .handle(signer_request(
+                "POST",
+                "/v1/enroll",
+                fresh_enrollment(7),
+                later_ms,
+            ))
+            .await;
+        assert_eq!(enrolled.status, 200, "{}", text(&enrolled));
+        let created = created_at(&replay).await.expect("the new account");
+        pause.release();
+        created
+    });
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(no_head(&answer), "no head of the erased account");
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    let mark = held_mark(&replay, &alice_id()).await;
+    assert_eq!(
+        (
+            mark.generation,
+            mark.seq,
+            mark.chain_hash,
+            mark.created_at_ms
+        ),
+        (0, 0, [0; 32], created),
+        "the new account's mark stays"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_erase_wakes_the_reads_waiting_on_the_account() {
     // The erasure's change notice wakes a feed read waiting on the account at once, not at its
     // wait's end, and it answers as for an account the service doesn't host (Switch wire
@@ -1039,7 +1100,12 @@ async fn test_erase_conflict_at_a_failing_account_carries_the_held_copy() {
         } else {
             replay
                 .marks
-                .advance(&alice_id(), head_at(50), service_public(&replay))
+                .advance(
+                    &alice_id(),
+                    head_at(50),
+                    service_public(&replay),
+                    mark_created_at(&replay, &alice_id()).await,
+                )
                 .await
                 .expect("the mark ahead");
         }
@@ -2222,14 +2288,24 @@ async fn test_erase_wrong_created_conflict() {
             "bounded" => {
                 replay
                     .marks
-                    .advance(&alice_id(), head_at(2), service_public(&replay))
+                    .advance(
+                        &alice_id(),
+                        head_at(2),
+                        service_public(&replay),
+                        mark_created_at(&replay, &alice_id()).await,
+                    )
                     .await
                     .expect("a head in the staged account's mark");
             }
             "failing" => {
                 replay
                     .marks
-                    .advance(&alice_id(), head_at(50), service_public(&replay))
+                    .advance(
+                        &alice_id(),
+                        head_at(50),
+                        service_public(&replay),
+                        mark_created_at(&replay, &alice_id()).await,
+                    )
                     .await
                     .expect("the mark ahead");
             }

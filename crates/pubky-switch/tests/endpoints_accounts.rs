@@ -1310,7 +1310,12 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
     };
     replay
         .marks
-        .advance(&alice.id, head, key)
+        .advance(
+            &alice.id,
+            head,
+            key,
+            mark_created_at(&replay, &alice.id).await,
+        )
         .await
         .expect("a head");
     set_time(&replay.clock, T);
@@ -1694,7 +1699,12 @@ async fn test_erase_lost_identity_under_a_stale_instance_lock_writes_nothing() {
     };
     replay
         .marks
-        .advance(&alice.id, head, key)
+        .advance(
+            &alice.id,
+            head,
+            key,
+            mark_created_at(&replay, &alice.id).await,
+        )
         .await
         .expect("a head");
     let mark = mark_of(&replay, &alice.id).await;

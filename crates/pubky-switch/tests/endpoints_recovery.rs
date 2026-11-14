@@ -1073,7 +1073,7 @@ async fn restored(replay: &Replay, fork: bool) -> u64 {
         };
         replay
             .marks
-            .advance(&alice_id(), ahead, mark.key)
+            .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
             .await
             .expect("a mark ahead of the state");
     }
@@ -1213,7 +1213,12 @@ async fn test_recovery_failing_start_is_above_the_marks_generation() {
     };
     replay
         .marks
-        .advance(&alice_id(), ahead, key)
+        .advance(
+            &alice_id(),
+            ahead,
+            key,
+            mark_created_at(&replay, &alice_id()).await,
+        )
         .await
         .expect("a mark ahead");
     let before = held(&replay).await;

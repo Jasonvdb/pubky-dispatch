@@ -754,6 +754,15 @@ pub fn service_public(replay: &Replay) -> [u8; 32] {
     replay.keys.current().public_key()
 }
 
+/// The creation time of the mark `replay` holds for `id`, which a test's own move of the
+/// mark names (`MarkStore::advance`).
+pub async fn mark_created_at(replay: &Replay, id: &str) -> u64 {
+    match replay.marks.read(id).await.expect("read the mark") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.created_at_ms,
+        other => panic!("no mark to move: {other:?}"),
+    }
+}
+
 /// Wake requests waiting on an account's changes, as the service's listener does, until
 /// the returned sender is used or dropped.
 pub async fn listen(

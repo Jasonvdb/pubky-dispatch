@@ -55,6 +55,8 @@ mod upload;
 pub(crate) mod verdict;
 mod webhooks;
 
+#[cfg(any(test, feature = "test-util"))]
+pub use marking::MarkMovePause;
 pub use push::Resolver;
 pub use recovery::AdmissionEnd;
 pub use webhooks::PushRound;
@@ -153,6 +155,10 @@ pub struct Service {
     /// Where webhooks connect in tests.
     #[cfg(any(test, feature = "test-util"))]
     relay_route: Option<webhooks::RelayRoute>,
+    /// A pause before the next mark move, for tests of what lands between a commit and
+    /// its move.
+    #[cfg(any(test, feature = "test-util"))]
+    mark_move_pause: parking_lot::Mutex<Option<MarkMovePause>>,
 }
 
 /// A source of entry IDs.
@@ -403,6 +409,8 @@ impl Service {
             push_holds,
             #[cfg(any(test, feature = "test-util"))]
             relay_route: None,
+            #[cfg(any(test, feature = "test-util"))]
+            mark_move_pause: parking_lot::Mutex::default(),
         }
     }
 
@@ -438,6 +446,15 @@ impl Service {
     pub fn with_resolver(mut self, resolver: Resolver) -> Self {
         self.resolver = resolver;
         self
+    }
+
+    /// Pause the next mark move, after its commit, until [`MarkMovePause::release`], for
+    /// tests of what lands between a commit and its move (Switch wire 7.3, "Moving it").
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_mark_move(&self) -> MarkMovePause {
+        let pause = MarkMovePause::default();
+        *self.mark_move_pause.lock() = Some(pause.clone());
+        pause
     }
 
     /// The service with entry IDs from `ids`, for tests that replay the vectors' fixed ones.
@@ -1111,14 +1128,16 @@ impl Service {
         // a retry (Switch wire 7.3, "Moving it").
         if moves_mark
             && let Some(tip) = tip
-            && !self
+            && self
                 .move_mark(
                     &identity,
                     tip,
                     answer_key,
-                    answer.starts_generation.then_some(created_at_ms),
+                    created_at_ms,
+                    answer.starts_generation,
                 )
                 .await
+                != marking::MarkMove::Done
         {
             return Self::signed_error(&answer_signer, asked, time_ms, &unavailable());
         }

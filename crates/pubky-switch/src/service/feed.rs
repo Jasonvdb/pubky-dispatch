@@ -18,6 +18,7 @@ use serde_json::Value;
 use super::{
     Answer, Service,
     batch::{Stop, VerifiedApp, check_own_app},
+    marking::MarkMove,
     verdict::{self, RequestClass, Route},
 };
 use crate::{
@@ -168,6 +169,8 @@ pub(super) struct PageRefusal {
 #[derive(Debug)]
 pub(super) struct SnapshotHead {
     tip: ChainTip,
+    /// The creation time of the account the snapshot shows, whose mark the head moves.
+    created_at_ms: u64,
     identity_key: [u8; 32],
     signer: ServiceSigner,
 }
@@ -787,21 +790,32 @@ impl Service {
             // A refusal from a snapshot moves the mark to its head first, as a page does,
             // with the key the snapshot's verdict answers with; if it can't, or the instance
             // lock isn't confirmed now, after the wait, the refusal carries the request's own
-            // head instead, which its commit covers (Switch spec 6.5).
+            // head instead, which its commit covers (Switch spec 6.5). Where the account was
+            // erased meanwhile, no head of it goes out: the request's is the erased
+            // account's too.
             Err(FeedStop::Refused(mut refusal)) => {
-                if let Some(snapshot) = &refusal.snapshot
-                    && (!self.lock_is_fresh()
-                        || (snapshot.tip.seq > 0
-                            && !self
-                                .move_mark(
-                                    &read.account,
-                                    snapshot.tip,
-                                    super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
-                                    None,
-                                )
-                                .await))
-                {
-                    refusal.snapshot = None;
+                if let Some(snapshot) = &refusal.snapshot {
+                    let moved = if !self.lock_is_fresh() {
+                        MarkMove::Failed
+                    } else if snapshot.tip.seq == 0 {
+                        MarkMove::Done
+                    } else {
+                        self.move_mark(
+                            &read.account,
+                            snapshot.tip,
+                            super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
+                            snapshot.created_at_ms,
+                            false,
+                        )
+                        .await
+                    };
+                    match moved {
+                        MarkMove::Done => {}
+                        MarkMove::Failed => refusal.snapshot = None,
+                        MarkMove::AccountGone => {
+                            return Err(FeedStop::refused(temporary(), false, refusal.time_ms));
+                        }
+                    }
                 }
                 return Err(FeedStop::Refused(refusal));
             }
@@ -816,17 +830,27 @@ impl Service {
         // The mark moves to the page's head first, with the key the page is signed with, so
         // no head goes out that the mark is behind, also when the page shows a commit whose
         // own request hasn't moved it yet (Switch wire 7.3 step 10).
-        if answered.tip.seq > 0
-            && !self
+        // Where the account was erased meanwhile, the request's own head is the erased
+        // account's too: the refusal carries none.
+        if answered.tip.seq > 0 {
+            match self
                 .move_mark(
                     &read.account,
                     answered.tip,
                     super::PublicKeyBytes::public_key_bytes(&answered.signer),
-                    None,
+                    answered.created_at_ms,
+                    false,
                 )
                 .await
-        {
-            return Err(FeedStop::refused(temporary(), true, answered.time_ms));
+            {
+                MarkMove::Done => {}
+                MarkMove::Failed => {
+                    return Err(FeedStop::refused(temporary(), true, answered.time_ms));
+                }
+                MarkMove::AccountGone => {
+                    return Err(FeedStop::refused(temporary(), false, answered.time_ms));
+                }
+            }
         }
         Ok(answered)
     }
@@ -941,6 +965,7 @@ impl Service {
                     head: true,
                     snapshot: Some(SnapshotHead {
                         tip,
+                        created_at_ms: snapshot.created_at_ms,
                         identity_key: read.identity_key,
                         signer: signer.clone(),
                     }),
@@ -969,6 +994,7 @@ impl Service {
                 .and_then(|app| app.cursor)
                 .map_or(0, |cursor| cursor.seq),
             tip,
+            created_at_ms: snapshot.created_at_ms,
             checkpoint: snapshot.checkpoint,
             identity_key: read.identity_key,
             signer,
@@ -987,6 +1013,8 @@ pub(super) struct Answered {
     cursor: u64,
     /// The chain's head as the page shows it.
     tip: ChainTip,
+    /// The creation time of the account the page shows, whose mark the head moves.
+    created_at_ms: u64,
     /// The latest checkpoint, which the page carries (Switch wire 7.4.4).
     checkpoint: Option<SignedHead>,
     identity_key: [u8; 32],

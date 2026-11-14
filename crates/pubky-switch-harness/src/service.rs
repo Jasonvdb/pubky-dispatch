@@ -365,7 +365,7 @@ impl RealSwitch {
                 chain_hash: [0x5a; 32],
             };
             match marks
-                .advance(identity, past, mark.key)
+                .advance(identity, past, mark.key, mark.created_at_ms)
                 .await
                 .map_err(setup)?
             {

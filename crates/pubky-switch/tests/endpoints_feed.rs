@@ -823,7 +823,12 @@ async fn test_feed_long_poll_behind_the_mark_answers_the_notice() {
         };
         replay
             .marks
-            .advance(&alice_id(), ahead, service_public(&replay))
+            .advance(
+                &alice_id(),
+                ahead,
+                service_public(&replay),
+                mark_created_at(&replay, &alice_id()).await,
+            )
             .await
             .expect("mark");
         // Time passes during the wait.

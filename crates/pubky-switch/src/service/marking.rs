@@ -419,54 +419,105 @@ impl Service {
         );
     }
 
-    /// Move `identity`'s mark to `tip`, answered with `key`, once the commit that holds it
-    /// is durable (Switch wire 7.3, "Moving it"): whether the mark is there now, durably. A
-    /// mark a later move overtook stays. Where the mark is lost, a delivery that starts a
-    /// generation writes it anew with `anew_created_at_ms`, the account's creation time
+    /// Move the mark of `identity`'s account created at `created_at_ms` to `tip`, answered
+    /// with `key`, once the commit that holds it is durable (Switch wire 7.3, "Moving it").
+    /// A mark a later move overtook stays. Where the mark is lost, a delivery that starts a
+    /// generation (`starts_generation`) writes it anew with the account's creation time
     /// (Table 3); any other move finds no mark and fails.
+    ///
+    /// The move runs after the commit, outside the identity's lock: the account may have
+    /// been erased, and another enrolled, meanwhile. A mark of another creation time is the
+    /// other account's and stays, and a mark is written anew only under the identity's lock
+    /// while the account is still there; either way the move answers
+    /// [`MarkMove::AccountGone`], and nothing signed for the commit is released.
     pub(super) async fn move_mark(
         &self,
         identity: &str,
         tip: ChainTip,
         key: [u8; 32],
-        anew_created_at_ms: Option<u64>,
-    ) -> bool {
+        created_at_ms: u64,
+        starts_generation: bool,
+    ) -> MarkMove {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self.mark_move_pause.lock().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
         for _ in 0..2 {
-            match self.marks.advance(identity, tip, key).await {
+            match self.marks.advance(identity, tip, key, created_at_ms).await {
                 Ok(Advance::Moved(_) | Advance::Unchanged(_) | Advance::Overtaken(_)) => {
-                    return true;
+                    return MarkMove::Done;
                 }
                 Ok(Advance::Fork(_)) => {
                     tracing::error!("a mark at the head's pair with another chain hash");
-                    return false;
+                    return MarkMove::Failed;
                 }
+                Ok(Advance::OtherAccount(_)) => return account_gone(),
                 Ok(Advance::NoMark(_)) => {
-                    let Some(created_at_ms) = anew_created_at_ms else {
+                    if !starts_generation {
                         tracing::error!("a mark to move is gone");
-                        return false;
-                    };
-                    match self
-                        .marks
-                        .write_anew(identity, tip, key, created_at_ms)
-                        .await
-                    {
-                        Ok(MarkWrite::Written(_)) => return true,
-                        // Written meanwhile: moved by the next turn.
-                        Ok(MarkWrite::Unchanged(MarkRead::Mark(_))) => {}
-                        Ok(MarkWrite::Unchanged(_)) => return false,
-                        Err(failure) => {
-                            tracing::error!(%failure, "writing a mark anew");
-                            return false;
-                        }
+                        return MarkMove::Failed;
+                    }
+                    match self.write_anew(identity, tip, key, created_at_ms).await {
+                        Some(MarkWrite::Written(_)) => return MarkMove::Done,
+                        // Written meanwhile: moved, or told another account's, by the next
+                        // turn.
+                        Some(MarkWrite::Unchanged(MarkRead::Mark(_))) => {}
+                        Some(MarkWrite::Unchanged(_)) => return account_gone(),
+                        None => return MarkMove::Failed,
                     }
                 }
                 Err(failure) => {
                     tracing::error!(%failure, "moving a mark");
-                    return false;
+                    return MarkMove::Failed;
                 }
             }
         }
-        false
+        MarkMove::Failed
+    }
+
+    /// Write `identity`'s lost mark anew at `tip` under the identity's lock, only while its
+    /// account is the one created at `created_at_ms`: an account erased meanwhile gets no
+    /// mark, which would be a leftover, nor does a later one get this account's
+    /// (Switch wire 7.3, Table 3). `Unchanged(Missing)` for an account gone; `None` when the
+    /// lock, the account or the store can't be read, or the write failed.
+    async fn write_anew(
+        &self,
+        identity: &str,
+        tip: ChainTip,
+        key: [u8; 32],
+        created_at_ms: u64,
+    ) -> Option<MarkWrite> {
+        let mut lock = match self.store.lock_identity(identity).await {
+            Ok(lock) => lock,
+            Err(failure) => {
+                let _ = super::store_error(&failure);
+                return None;
+            }
+        };
+        match lock.account_created_at().await {
+            Ok(Some(at_ms)) if at_ms == created_at_ms => {}
+            Ok(_) => return Some(MarkWrite::Unchanged(MarkRead::Missing)),
+            Err(failure) => {
+                let _ = super::store_error(&failure);
+                return None;
+            }
+        }
+        let written = self
+            .marks
+            .write_anew(identity, tip, key, created_at_ms)
+            .await;
+        drop(lock);
+        match written {
+            Ok(written) => Some(written),
+            Err(failure) => {
+                tracing::error!(%failure, "writing a mark anew");
+                None
+            }
+        }
     }
 
     /// Whether the instance lock was confirmed recently enough for a commit that gives out a
@@ -476,6 +527,47 @@ impl Service {
             .as_ref()
             .is_none_or(crate::store::LockFreshness::is_fresh)
     }
+}
+
+/// A pause before a mark move, made by [`Service::pause_next_mark_move`].
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Debug, Default)]
+pub struct MarkMovePause {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl MarkMovePause {
+    /// Wait until a mark move reaches the pause, its commit durable.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the paused move go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// The outcome of [`Service::move_mark`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MarkMove {
+    /// The mark is at the head, or past it, durably.
+    Done,
+    /// The mark didn't move: the request answers `503`, and its retry is answered as a
+    /// retry.
+    Failed,
+    /// The account the move is for is gone: erased since its commit, perhaps with another
+    /// enrolled, whose mark stays. The request answers `503`, and nothing signed for the
+    /// commit is released.
+    AccountGone,
+}
+
+/// A move for an account erased since its commit, logged.
+fn account_gone() -> MarkMove {
+    tracing::warn!("an account erased before its mark moved: its answer is withheld");
+    MarkMove::AccountGone
 }
 
 /// The service's current key, as the verdict takes it.

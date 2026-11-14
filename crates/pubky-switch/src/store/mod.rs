@@ -802,6 +802,18 @@ impl IdentityLock {
         Ok(found.is_some())
     }
 
+    /// The creation time of the identity's account, read under the lock; `None` without an
+    /// account.
+    pub async fn account_created_at(&mut self) -> Result<Option<u64>, StoreError> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT created_at_ms FROM accounts WHERE id = $1")
+                .bind(&self.id)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
+        found.map(|at| from_db(at, "created_at_ms")).transpose()
+    }
+
     /// Insert `account`, the identity's, the lock held on until [`Creation::commit`]: `None`,
     /// changing nothing and letting the lock go, when one exists.
     pub async fn create(self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {

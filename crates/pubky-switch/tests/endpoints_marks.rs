@@ -404,7 +404,7 @@ async fn test_marks_database_older_than_the_mark_answers_behind() {
     };
     replay
         .marks
-        .advance(&alice_id(), ahead, mark.key)
+        .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
         .await
         .expect("advance");
     let request = apps_read(base);

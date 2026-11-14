@@ -98,7 +98,12 @@ async fn append(db: &TestDatabase, replay: Option<&Replay>, id: &str, hashes: &[
             let head = committed.head().chain_tip();
             let moved = replay
                 .marks
-                .advance(id, head, service_public(replay))
+                .advance(
+                    id,
+                    head,
+                    service_public(replay),
+                    mark_created_at(replay, id).await,
+                )
                 .await
                 .expect("advance");
             assert!(matches!(moved, Advance::Moved(_)), "{moved:?}");
@@ -116,7 +121,12 @@ async fn mark_at(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u8)
     };
     let moved = replay
         .marks
-        .advance(id, head, service_public(replay))
+        .advance(
+            id,
+            head,
+            service_public(replay),
+            mark_created_at(replay, id).await,
+        )
         .await
         .expect("advance");
     assert!(matches!(moved, Advance::Moved(_)), "{moved:?}");

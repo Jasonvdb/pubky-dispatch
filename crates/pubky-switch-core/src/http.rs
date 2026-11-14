@@ -239,8 +239,9 @@ pub struct ResponseParts<'a> {
 
 /// The fields after the label of a response signature: `u64(status)`, method, path,
 /// `hash(request signature bytes)`, the `Switch-Server-Time` text, `hash(Switch-Head text)`
-/// and `hash(body)` (Switch wire 7.1). An absent request signature or `Switch-Head` hashes
-/// as the empty string (Switch wire 2.3).
+/// and `hash(body)` (Switch wire 7.1), the method upper-cased. An absent request signature
+/// hashes as the empty string (Switch wire 2.3), and so does an absent `Switch-Head` (Switch
+/// wire 7.1).
 pub fn response_fields(parts: &ResponseParts<'_>) -> Vec<Vec<u8>> {
     let request_signature: &[u8] = match parts.request_signature {
         Some(signature) => signature,
@@ -812,9 +813,9 @@ pub enum NoticeReason {
 }
 
 /// The `current` of a `503 recovery_required`, the recovery notice (Switch wire 7.6, Switch
-/// spec 6.5). All three members are required; unknown members are refused (Switch wire 1.1).
+/// spec 6.5). All three members are required; unknown members are ignored, since an error
+/// body isn't among the places that refuse them (Switch wire 1.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RecoveryNotice {
     /// The higher of the account's generation here, 0 while it holds no document, and its
     /// mark's.
@@ -826,12 +827,14 @@ pub struct RecoveryNotice {
 }
 
 impl RecoveryNotice {
-    /// Read a notice from an error body's `current` (Switch wire 7.6).
+    /// Read a notice from an error body's `current` (Switch wire 7.6). Unknown members are
+    /// ignored (Switch wire 1.1).
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] if a member is missing, unknown or of another type, or `reason`
-    /// isn't one of the three.
+    /// [`Error::Invalid`] if a member is missing or of another type, or `reason` isn't one
+    /// of the three: a malformed notice, which a client still holds as a notice for the
+    /// generation it follows, with `permanent` `false` (Switch wire 7.6).
     pub fn from_current(current: &serde_json::Value) -> Result<Self> {
         Ok(serde_json::from_value(current.clone())?)
     }
@@ -976,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_notice_reads_strictly() {
+    fn test_recovery_notice_reads_its_members() {
         let notice = RecoveryNotice::from_current(&serde_json::json!({
             "generation": 3, "reason": "mark_lost", "permanent": false
         }))
@@ -993,11 +996,20 @@ mod tests {
             RecoveryNotice::from_current(&notice.to_current()).unwrap(),
             notice
         );
+        // An unknown member is ignored (Switch wire 1.1).
+        assert_eq!(
+            RecoveryNotice::from_current(&serde_json::json!({
+                "generation": 3, "reason": "mark_lost", "permanent": false, "x": 1
+            }))
+            .unwrap(),
+            notice
+        );
+        // A malformed notice: a member missing, an unknown `reason`, a wrong type.
         for bad in [
             serde_json::json!({ "generation": 3, "reason": "behind" }),
             serde_json::json!({ "generation": 3, "reason": "lost", "permanent": false }),
             serde_json::json!({ "generation": "3", "reason": "fork", "permanent": false }),
-            serde_json::json!({ "generation": 3, "reason": "fork", "permanent": false, "x": 1 }),
+            serde_json::json!({ "generation": 3, "reason": "fork", "permanent": "no" }),
         ] {
             assert!(RecoveryNotice::from_current(&bad).is_err(), "{bad}");
         }

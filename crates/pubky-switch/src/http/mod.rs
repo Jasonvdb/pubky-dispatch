@@ -158,7 +158,8 @@ pub struct SwitchResponse {
 pub enum Refusal {
     /// No such route: `404`, signed with the service key (Switch wire 7.3 step 1).
     UnknownRoute {
-        /// The method, upper case, which the answer's signature covers.
+        /// The method, as the request holds it, which the answer's signature covers
+        /// upper-cased ([`response_fields`](pubky_switch_core::http::response_fields)).
         method: String,
         /// The path and query exactly as sent; the answer's signature covers the path.
         path_and_query: String,
@@ -169,7 +170,8 @@ pub enum Refusal {
     TooLarge {
         /// The route, if the request had one.
         route: Option<Route>,
-        /// The method, upper case, which the answer's signature covers.
+        /// The method, as the request holds it, which the answer's signature covers
+        /// upper-cased ([`response_fields`](pubky_switch_core::http::response_fields)).
         method: String,
         /// The path and query exactly as sent; the answer's signature covers the path.
         path_and_query: String,

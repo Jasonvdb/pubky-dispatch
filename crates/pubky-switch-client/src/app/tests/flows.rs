@@ -2848,23 +2848,6 @@ async fn test_app_restore_asks_again_for_a_full_bundle_read_and_dropped() {
 // `crates/pubky-switch/tests/endpoints_keys.rs`.
 
 #[tokio::test]
-async fn test_scripted_keys_passed_parts_go_when_the_next_part_is_stored() {
-    let w = World::new();
-    let app = w.join("wallet").await;
-    let me = app.app_id();
-    let cert = app.cert().clone();
-    w.next_doc(|body| body.data_epoch = 2);
-    // Epoch 1's part, passed before the switch dropped parts at cursor moves.
-    let first = store_part(&w, me, &cert, 1, 1);
-    w.switch.set_cursor_unchecked(me, first);
-    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
-    // The next part stored: the passed part goes there.
-    store_part(&w, me, &cert, 2, 2);
-    assert_eq!(w.switch.bundles_of(&me), vec![(2, 2)]);
-    assert_eq!(w.switch.keys_through_of(&me), Some(1));
-}
-
-#[tokio::test]
 async fn test_scripted_keys_a_request_stays_in_force_until_the_completing_part_is_passed() {
     let w = World::new();
     let app = w.join("wallet").await;

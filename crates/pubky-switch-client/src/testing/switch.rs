@@ -1524,10 +1524,10 @@ impl ScriptedSwitch {
         self.lock().keep_passed = true;
     }
 
-    /// Set the cursor the switch holds for `app`, as another instance of the app moving it
-    /// would (Switch spec 8.3).
+    /// Move the cursor the switch holds for `app` forward to `seq`, as another instance of
+    /// the app moving it would, by a move's rules (Switch spec 8.3, wire 6.2).
     pub fn set_held_cursor(&self, app: &[u8; 16], seq: u64) {
-        self.lock().apps.entry(*app).or_default().cursor = seq;
+        self.lock().move_held_cursor(*app, seq);
     }
 
     /// Set the inbox quota (Switch wire 9.2 `quota_bytes`), which an enrollment announces
@@ -1739,13 +1739,6 @@ impl ScriptedSwitch {
             return Err(ScriptError::Refused { status, body });
         }
         Ok(())
-    }
-
-    /// Set `app`'s cursor to `seq` directly, with none of a move's rules: the state a switch
-    /// left from before it dropped parts at cursor moves. For tests.
-    #[cfg(test)]
-    pub(crate) fn set_cursor_unchecked(&self, app: [u8; 16], seq: u64) {
-        self.lock().apps.entry(app).or_default().cursor = seq;
     }
 
     /// `app`'s `keys_through` as `GET /apps` shows it (Switch wire 7.4.12). For tests.

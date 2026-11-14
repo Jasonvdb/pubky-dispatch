@@ -62,8 +62,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and its retry, aren't modelled. Per-account order is a mutex.
 - **One service key** (Switch wire 7.1): every answer, the account's and those it can't tie
   to an account (the `404` of an identity it doesn't host, an enrollment's errors), is
-  signed with the switch's one key, the key made from `service_secret`; there is no
-  operator key. A key change in place (`change_key_into`) is a switch of its own under the
+  signed with the switch's one key, the key made from `service_secret`. A key change in place (`change_key_into`) is a switch of its own under the
   new key, where the service keeps each mark's key until a start names the new one.
 - **Accounts and marks** (Switch wire 7.3, Tables 1 to 3), in `switch/marks.rs`: the
   account's mark (generation, `seq`, chain hash, key, creation time), its retired

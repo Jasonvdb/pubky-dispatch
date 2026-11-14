@@ -84,7 +84,7 @@ pub const HOLD_LOCK_TIMEOUT_MS: u64 = 1_000;
 pub const CLAIM_TIMEOUT_MS: u64 = 2_000;
 
 /// The advisory lock every claim takes (the module's doc), apart from every other
-/// advisory lock of the service, as `store::keying` derives its keys.
+/// advisory lock of the service: its key is the hash of its own label.
 fn claims_lock_key() -> i64 {
     let digest = pubky_switch_core::enc::hash(b"pubky-switch/push-claims");
     let mut bytes = [0u8; 8];

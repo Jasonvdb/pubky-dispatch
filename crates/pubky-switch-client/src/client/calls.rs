@@ -154,14 +154,15 @@ impl SwitchClient {
     ///
     /// The answer is checked as the core checks it, and its response signature with the key
     /// it names. A client without a pinned key pins that key. One that holds a key keeps it:
-    /// at a serving account the answer names the pending key of the next generation, which
-    /// [`SwitchClient::put_identity`] pins once the delivery naming it is accepted.
+    /// at a serving account the answer names that key, unless the service changed its key
+    /// since (Switch spec 12.5), and then [`SwitchClient::put_identity`] pins the new one once
+    /// the delivery naming it is accepted.
     ///
     /// # Errors
     ///
     /// [`ClientError::Usage`] for an enrollment of another identity or origin;
     /// [`ClientError::BadServiceSignature`] for an answer that doesn't verify, among them
-    /// every error answer before the account exists, which the operator key signs;
+    /// every error answer to a client that holds no key, which can't check it;
     /// [`ClientError::Core`] for an answer that names another enrollment.
     pub async fn enroll(&self, enrollment: &Enrollment) -> Result<EnrollmentAnswer, ClientError> {
         self.signer_only()?;
@@ -183,8 +184,8 @@ impl SwitchClient {
         let response = self.transport().send(signed.request).await?;
         let status = response.status;
         if !(200..300).contains(&status) {
-            // A serving account signs its errors with its key; anything else is the
-            // operator's, which no client knows (Switch wire 7.1, 7.4.1).
+            // Errors are signed with the service key: a client that pinned it checks them,
+            // one that holds none can't (Switch wire 7.1, 7.4.1 Errors).
             return Err(match self.pinned_key() {
                 Some(key) => match check_response(&key, &self.account(), &sent, &response) {
                     Err(error) => error,
@@ -208,8 +209,9 @@ impl SwitchClient {
     /// naming the version it builds on. The answer's proof is checked as the delivery's.
     ///
     /// A delivery whose document names this origin with another service key than the pinned
-    /// one starts a generation under that pending key, which signs its `200`: the answer, its
-    /// proof and its head are checked with the pending key, which is pinned once they verify.
+    /// one starts a generation under that key, the service's new key after a key change
+    /// (Switch spec 12.5), which signs its `200`: the answer, its proof and its head are
+    /// checked with it, and it is pinned once they verify.
     /// Any other status is checked with the pinned key, which stays pinned (Switch wire
     /// 7.4.2 "Which key signs the answer").
     ///
@@ -222,7 +224,7 @@ impl SwitchClient {
     ) -> Result<WriteAnswer, ClientError> {
         self.signer_only()?;
         let pinned = self.key()?;
-        let pending = IdentityDoc::verify(&delivery.identity, &self.account())
+        let new_key = IdentityDoc::verify(&delivery.identity, &self.account())
             .ok()
             .filter(|doc| doc.inbox().url == self.origin())
             .map(|doc| doc.inbox().service_key)
@@ -234,15 +236,15 @@ impl SwitchClient {
                 delivery.to_json(),
                 Body::Json,
                 Auth {
-                    success_key: pending,
+                    success_key: new_key,
                     ..Auth::default()
                 },
             )
             .await?;
-        let key = pending.unwrap_or(pinned);
+        let key = new_key.unwrap_or(pinned);
         let answer =
             self.write_answer_under(&checked, Expect::Identity(&delivery.identity), &key)?;
-        if pending.is_some() {
+        if new_key.is_some() {
             self.pin(key);
         }
         Ok(answer)

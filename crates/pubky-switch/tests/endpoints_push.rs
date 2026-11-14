@@ -534,7 +534,7 @@ async fn test_push_staged_account_keeps_nothing() {
     let http = vectors("http.json");
     let answered = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     let enrolled_at = answered["headers"]["switch-server-time"]
         .as_str()

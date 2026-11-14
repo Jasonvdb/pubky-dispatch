@@ -293,7 +293,8 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
     assert_eq!(sent.path_and_query, "/v1/enroll");
     assert!(sent.header(header::APP).is_none());
 
-    // A client that holds a key keeps it: the answer may name a pending key.
+    // A client that holds a key keeps it: after a service key change the answer names the
+    // new key, pinned only once the delivery naming it is accepted.
     let pending = SigningKey::from_bytes(&[6; 32]);
     let answer = EnrollmentAnswer::new(
         &enrollment,
@@ -1041,7 +1042,7 @@ async fn test_put_identity_starting_a_generation_keeps_the_pin_on_errors() {
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Conflict));
     assert_eq!(client.pinned_key(), Some(service_public()));
-    // A refusal signed with the pending key doesn't verify.
+    // A refusal signed with the new key doesn't verify: it is checked with the pinned one.
     let refusal = fixed(
         pending.clone(),
         409,

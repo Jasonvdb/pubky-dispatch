@@ -3702,7 +3702,7 @@ fn emptied_at_the_same_origin(world: &World) -> (Arc<ScriptedSwitch>, Arc<Router
 
 #[tokio::test]
 async fn test_provider_loss_in_place_at_an_emptied_service_recovers() {
-    // Control: the delivery's `200`, under the new account's key the version names, is taken.
+    // Control: the delivery's `200`, under the service's new key the version names, is taken.
     let world = World::new();
     let (signer, store) = world.enrolled().await;
     let lost = signer.identity_doc().unwrap().unwrap();

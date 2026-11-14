@@ -120,8 +120,8 @@ impl Service {
     }
 
     /// `error` signed with the service key at the time base `base_ms`, without a head: an
-    /// answer the service can't tie to an account, or one whose account's key it can't
-    /// find (Switch wire 7.1).
+    /// answer the service can't tie to an account, or one whose verdict's key it doesn't
+    /// hold (Switch wire 7.1).
     pub(super) fn service_error(
         &self,
         asked: Asked<'_>,

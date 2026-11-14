@@ -202,7 +202,7 @@
   ],
   "next_service_key": {
     "account": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-    "description": "alice's account key at the next service N of a move to another provider (wire 3.6, 10): documents.json's freeze names it (inbox.service_key), and it signs N's discard answer. service_keys holds each account's key at the service its identity.json names.",
+    "description": "the key of the next service N of alice's move to another provider (wire 3.6, 10): documents.json's freeze names it (inbox.service_key), and it signs N's discard answer. service_keys holds the key of the service each identity.json names.",
     "origin": "https://inbox.next.example",
     "public": "6FWRmADt_5se6vWPbPzsmizJDM9aLablPEpo5K-drd8",
     "secret_hex": "e7bbd64dc5381abe997945660cbf58fccfa44630bfc4d78b8e6847a435e7a994",

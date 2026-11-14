@@ -133,7 +133,7 @@ fn held_hash() -> [u8; 32] {
 fn enrolled_time() -> String {
     named(
         &vectors("http.json")["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     )["headers"]["switch-server-time"]
         .as_str()
         .expect("time")

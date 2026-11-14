@@ -109,10 +109,10 @@ async fn test_vectors_accounts_replay() {
     assert!(signed_with(&answer, &service_key, &sent));
     assert_eq!(service_public(&replay), service_key);
 
-    // The enrollment, answered with the new account's key.
+    // The enrollment, answered with the service key.
     let expected = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     set_time(
         &replay.clock,

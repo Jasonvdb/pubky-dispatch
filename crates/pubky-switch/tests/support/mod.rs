@@ -559,7 +559,7 @@ pub async fn serve_alice(replay: &Replay) {
     let alice_id = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
     let enrolled = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     set_time(
         &replay.clock,

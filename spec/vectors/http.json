@@ -1098,7 +1098,7 @@
       },
       "label": "pubky-switch/v1/http-response",
       "method": "POST",
-      "name": "signer: enrollment answer, signed with the new account's key",
+      "name": "signer: enrollment answer, signed with the service key",
       "path": "/v1/enroll",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "BnmTysQ4_q34_w-EgiBsxu0RFUuZNnVfXisYKZlW1O9wtB6NgRCTmwQHzySyI9Nr6Tl8Ys0USSuIMtvcJI6RDA",

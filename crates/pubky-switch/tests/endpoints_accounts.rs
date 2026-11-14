@@ -937,7 +937,7 @@ async fn test_enroll_retry_after_serving_gets_the_first_answer() {
         .await;
     let first = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     assert_eq!(again.status, 200);
     assert_eq!(
@@ -1047,7 +1047,7 @@ async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
         .await;
     let first = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     assert_eq!(
         String::from_utf8_lossy(&again.body),
@@ -1076,7 +1076,7 @@ async fn test_enroll_answer_dropped_past_the_bound_is_built_again() {
     // built again, since every answer names the current key (Switch wire 3.7, 9.1).
     let Some(replay) = replay().await else { return };
     set_time(&replay.clock, T);
-    // The creating enrollment, then a second while the account is staged: the account's key.
+    // The creating enrollment, then a second while the account is staged: the service key.
     let first = enroll(&replay, 20).await;
     let second = enroll(&replay, 21).await;
     assert_eq!(second.status, 200);

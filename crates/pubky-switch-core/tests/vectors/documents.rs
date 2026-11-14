@@ -583,7 +583,7 @@ fn account_view<'a>(held: Option<&'a IdentityDoc>, origin: &'a str) -> AccountVi
         app_limit: 32,
         staged: false,
         origin,
-        pending_key: None,
+        enrollment_key: None,
         kept_app_ids: &[],
         kept_proofs: KeptProofs::default(),
     }

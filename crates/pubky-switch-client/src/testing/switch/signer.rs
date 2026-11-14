@@ -435,7 +435,7 @@ impl Inner {
                 app_limit,
                 staged: false,
                 origin: &self.origin,
-                pending_key: None,
+                enrollment_key: None,
                 kept_app_ids: &refused,
                 kept_proofs: KeptProofs::default(),
             };
@@ -464,7 +464,7 @@ impl Inner {
             origin: &self.origin,
             // The next generation in place names the key the enrollments answer: the one
             // key (Switch wire 3.3, 3.7).
-            pending_key: (!self.staged).then(|| self.service.verifying_key().to_bytes()),
+            enrollment_key: (!self.staged).then(|| self.service.verifying_key().to_bytes()),
             kept_app_ids: &kept,
             kept_proofs: KeptProofs {
                 records: &records,

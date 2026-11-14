@@ -121,7 +121,7 @@ impl Service {
             app_limit,
             staged,
             origin: &self.origin,
-            pending_key: Some(next_key),
+            enrollment_key: Some(next_key),
             kept_app_ids: &kept_app_ids,
             kept_proofs: KeptProofs {
                 records: &records,

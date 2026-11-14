@@ -206,9 +206,9 @@ pub(crate) struct Auth<'a> {
     /// The signing time to send instead of the clock's: the `current.server_time` of a
     /// `401 stale_timestamp`, for its one retry (Switch wire 7.1).
     pub(crate) timestamp_ms: Option<u64>,
-    /// The key that signs a `2xx` answer instead of the pinned one: the pending key named by
-    /// a delivery that starts a generation (Switch wire 7.4.2). Other statuses are still
-    /// checked with the pinned key.
+    /// The key that signs a `2xx` answer instead of the pinned one: the new key a delivery
+    /// names that starts a generation after a service key change (Switch wire 7.4.2, spec
+    /// 12.5). Other statuses are still checked with the pinned key.
     pub(crate) success_key: Option<[u8; 32]>,
     /// How long the call may take ([`TimeoutClass`]), which goes to the transport with
     /// the request.

@@ -8,18 +8,20 @@
 //!    answer, and asks the user to revoke the Pubky grant of each app, listed or removed,
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
-//! 2. sends `POST /v1/{id}/erase` naming the pinned service key and, once this install
-//!    delivered a version there, the hash of its mark, the same body again until it is answered
-//!    or, after a request in doubt, the check's read meets the operator's `404`, marking
-//!    before each request that it may land. A `200` confirms the erasure. So does an
-//!    unsigned `404`, the operator's, but only after a request that may have landed, as a
-//!    lost `200` leaves it, and only once every check has met it for 24 hours: until then
-//!    the account is erased but unconfirmed ([`Refusal::ErasureUnconfirmed`]), the time of
-//!    the first `404` kept in the flow, and an answer the pinned key signs, at any read, ends
-//!    the wait (Switch wire 7.4.16, spec 12.7 step 5). A `404` is never itself a lost answer: with
-//!    no request in doubt it is an error, and the mark goes back. No answer, or another
-//!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
-//!    answer the pinned key signed shows the account still exists, and clears it.
+//! 2. sends `POST /v1/{id}/erase` naming, once this install delivered a version there, the
+//!    hash of its mark as `identity_hash`, the same body again until it is answered or, after
+//!    a request in doubt, the check's read meets the switch's `404`, marking before each
+//!    request that it may land. A `200` confirms the erasure. After a request that may have
+//!    landed, as a lost `200` leaves it, so does the `404` the pinned key signed for an
+//!    identity the service doesn't host, at once. A `404` the pinned key didn't sign, which
+//!    may be an intermediary's, confirms it only once every check has met it for 24 hours:
+//!    until then the account is erased but unconfirmed ([`Refusal::ErasureUnconfirmed`]), the
+//!    time of the first `404` kept in the flow, and any other answer the pinned key signs, at
+//!    any read, ends the wait (Switch wire 7.4.16 "The signer's `404`", spec 12.7 step 5). A
+//!    `404` is never itself a lost answer: with no request in doubt it is an error, and the
+//!    mark goes back. No answer, or another answer the pinned key didn't sign, such as a
+//!    gateway's `503`, keeps the mark; only an answer the pinned key signed shows the account
+//!    still exists, and clears it.
 //!
 //! Every deletion and every request comes after a fresh check that this install still signs,
 //! since the flow may be resumed much later: every copy, as before a delivery
@@ -28,9 +30,10 @@
 //! gate. Another install found signing ends the erasure without erasing, with nothing more
 //! deleted, sent or published by this install; an alarm or records behind keep it in
 //! progress, with nothing deleted or sent while the alarm is held; a copy that can't be read
-//! takes no step. After a request in doubt, an unsigned `404` to the check, with every other
-//! copy clean, is taken as the erasure done once it has held for 24 hours, and no other
-//! request goes out meanwhile. Revocations are refused during an erasure, and none pending is
+//! takes no step. After a request in doubt, the signed `404` of an identity the service
+//! doesn't host to the check, with every other copy clean, is the erasure done, and an
+//! unsigned `404` so is taken once it has held for 24 hours, no other request going out
+//! meanwhile. Revocations are refused during an erasure, and none pending is
 //! sent: it signs nothing else (spec 12.7 step 5).
 //!
 //! A `409 conflict`, signed, is the switch refusing it: another key, another `identity.json`
@@ -137,10 +140,14 @@ impl Signer {
             return self.unpublish().await;
         }
         // A request in doubt, then the switch's `404` and every other copy clean: erased
-        // already, once it has held for 24 hours, and no other request goes out without an
-        // ownership read.
-        if self.still_erasing(unanswered, true).await? == Checked::ErasedAlready {
-            return self.erased_after_doubt(reminded, self.erasure_wait()).await;
+        // already, at once when the pinned key signed it, else once it has held for 24 hours,
+        // and no other request goes out without an ownership read (Switch wire 7.4.16).
+        match self.still_erasing(unanswered, true).await? {
+            Checked::Signing => {}
+            Checked::NotHosted => return self.erased().await,
+            Checked::ErasedAlready => {
+                return self.erased_after_doubt(reminded, self.erasure_wait()).await;
+            }
         }
         // Before the request: it may land, however its answer goes.
         if !unanswered {
@@ -165,14 +172,18 @@ impl Signer {
         };
         match answer {
             Ok(()) => self.erased().await,
-            // An unsigned `404`, which may be the operator's, after a request that went
+            // After a request that went unanswered, the `404` the pinned key signed for an
+            // identity the service doesn't host, bound to this request: the erasure is
+            // confirmed at once (Switch wire 7.4.16 "The signer's `404`", spec 12.7 step 5).
+            Err(error) if unanswered && error.is_not_hosted() => self.erased().await,
+            // An unsigned `404`, which may be an intermediary's, after a request that went
             // unanswered: the service may host no account for the identity, as after a lost
             // `200`, once it has held for 24 hours (Switch wire 7.4.16). The wait is the
             // flow's as it stands after the check, which ends it on a signed answer.
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
                 self.erased_after_doubt(reminded, self.erasure_wait()).await
             }
-            // A `404` is never a lost answer: the operator's means the switch hosted no account
+            // A `404` is never a lost answer: a signed one means the switch hosted no account
             // when it answered, an intermediary's that the request wasn't routed. With no
             // request in doubt before, it erased nothing, and it never sets the doubt itself.
             Err(error @ ClientError::BadServiceSignature { status: 404 }) => {
@@ -191,7 +202,7 @@ impl Signer {
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
                 Err(error.into())
             }
-            // Signed with the account's key, so the request didn't land: another key, another
+            // Signed with the service key, so the request didn't land: another
             // `identity.json`, or a move in progress. The switch's copy is judged first, as
             // every copy (Switch spec 4.3): another install's newer copy ends the erasure
             // without erasing, this install's own newer one keeps it as records behind, and a
@@ -228,10 +239,10 @@ impl Signer {
         }
     }
 
-    /// The document hash an erasure names as the `identity.json` it follows (Switch wire
-    /// 7.4.16): the mark's, once it names this account's service key, that is, once this
-    /// install delivered a version here; `None` before, as at a staged account it delivered
-    /// nothing to, where the key alone is checked.
+    /// The erasure's body, `identity_hash`, the document hash of the newest `identity.json`
+    /// the account holds as this install knows it (Switch wire 7.4.16 Request): the mark's,
+    /// once it names this account's service, that is, once this install delivered a version
+    /// here; `None` before, as at a staged account it delivered nothing to, which holds none.
     fn erasure_follows(&self) -> Result<Option<[u8; 32]>> {
         let Some(service) = self.state.service.as_ref() else {
             return Ok(None);
@@ -261,21 +272,24 @@ impl Signer {
     /// goes on once the user has cleared it, or is aborted while no request is in doubt.
     /// Records behind keep it too, nothing deleted, sent or published, but the switch's copy is
     /// still read: another install's version there ends the erasure, and after a request in
-    /// doubt the operator's `404` shows it erased. A user who wants the account back restores
+    /// doubt the switch's `404` shows it erased. A user who wants the account back restores
     /// on a new install, which takes over; this install then finds it and ends its erasure.
     ///
-    /// With a request in doubt, `unanswered`, an unsigned `404` to the switch's read may be the
-    /// operator's after the erasure. The signer backup and the Homeserver are still judged; if
-    /// they show no other install, the account looks erased already, on the same
-    /// unauthenticated evidence wire 7.4.16 accepts for a retry's `404`, and no other request
-    /// goes out: the caller takes it as erased once the `404` has held for 24 hours
-    /// ([`Signer::erased_after_doubt`]). An answer the pinned key signs, here or at any other
-    /// read, ends that wait ([`Signer::read_apps`]), and an install that delivered behind a
-    /// proxy answering `404` is never erased.
+    /// With a request in doubt, `unanswered`, the `404` the pinned key signed for an identity
+    /// the service doesn't host, to the switch's read, is the erasure landed (Switch wire
+    /// 7.4.16 "The signer's `404`"): once the signer backup and the Homeserver show no other
+    /// install, the caller takes it as erased at once ([`Checked::NotHosted`]). An unsigned
+    /// `404` may be the service's after the erasure, or an intermediary's: on the same check
+    /// of the other copies the account looks erased already, on the unauthenticated evidence
+    /// wire 7.4.16 accepts for a retry's `404`, and no other request goes out: the caller
+    /// takes it as erased once the `404` has held for 24 hours
+    /// ([`Signer::erased_after_doubt`]). Any other answer the pinned key signs, here or at any
+    /// other read, ends that wait ([`Signer::read_apps`]), and an install that delivered
+    /// behind a proxy answering `404` is never erased.
     async fn still_erasing(&mut self, unanswered: bool, full: bool) -> Result<Checked> {
         // Records behind block every step that deletes or sends, not the read-only check of
         // the switch's copy, nor a conclusion drawn from it: another install's version there
-        // ends the erasure, and the operator's `404` after a request in doubt shows it done.
+        // ends the erasure, and the switch's `404` after a request in doubt shows it done.
         // Only that refusal of `check_named` is passed for the read; every other stops here.
         let behind = matches!(
             self.check_named(),
@@ -289,6 +303,10 @@ impl Signer {
             self.switch_and_homeserver().await
         };
         let checked = match checked {
+            Err(SignerError::Switch(error)) if unanswered && error.is_not_hosted() => self
+                .copies_but_the_switch()
+                .await
+                .map(|()| Checked::NotHosted),
             Err(SignerError::Switch(ClientError::BadServiceSignature { status: 404 }))
                 if unanswered =>
             {
@@ -302,7 +320,7 @@ impl Signer {
         // (`Signer::erasure_kept`); another install found signing ends it in its own.
         let checked = checked?;
         // The gate holds back a deletion or a request, not the conclusion that the account is
-        // erased already: wire 7.4.16 takes the operator's `404` after a request in doubt as
+        // erased already: wire 7.4.16 takes the switch's `404` after a request in doubt as
         // done whatever alarm is held, and `erased` keeps the alarm's alerts. Records still
         // behind after the read, as when the switch holds this install's own newer version or
         // the mark, are among the gate's refusals: no step.
@@ -324,8 +342,7 @@ impl Signer {
         Ok(())
     }
 
-    /// The copies but the switch's, after a request in doubt and an unsigned `404` from the
-    /// switch: the signer backup and the Homeserver's `identity.json`, judged for another
+    /// The copies but the switch's, after a request in doubt and a `404` from the switch: the signer backup and the Homeserver's `identity.json`, judged for another
     /// install signing, which stops it. This install's own newer version there, records behind,
     /// doesn't: the account is gone at the switch whatever this install's records say (Switch
     /// wire 7.4.16).
@@ -342,7 +359,7 @@ impl Signer {
         Ok(())
     }
 
-    /// When the erasure's wait for the operator's `404` to hold started, as the flow holds it
+    /// When the erasure's wait for an unsigned `404` to hold started, as the flow holds it
     /// now: an answer the pinned key signed since ends it ([`Signer::read_apps`]).
     fn erasure_wait(&self) -> Option<u64> {
         match &self.flow {
@@ -351,9 +368,9 @@ impl Signer {
         }
     }
 
-    /// The operator's `404` after a request in doubt, at a run of the erasure: how a landed
-    /// erasure looks, taken as one only once every check has met it for 24 hours, as an app
-    /// takes an erasure (Switch wire 7.4.16, spec 12.7 step 5). `first_404_ms` is when a check
+    /// A `404` the pinned key didn't sign after a request in doubt, at a run of the erasure:
+    /// how a landed erasure may look, taken as one only once every check has met it for 24
+    /// hours, as an app takes an erasure it can't check (Switch wire 7.4.16, spec 12.7 step 5). `first_404_ms` is when a check
     /// first met it, kept durably in the flow.
     ///
     /// The time is the device clock's, the only one there is: the `404` carries no time
@@ -496,8 +513,9 @@ pub(super) fn withdraw_reminders(
     Ok(())
 }
 
-/// How long every check must meet the operator's `404` after a request in doubt before the
-/// erasure is taken as done: 24 hours, as for an app (Switch spec 12.7 step 5).
+/// How long every check must meet a `404` the pinned key didn't sign after a request in
+/// doubt before the erasure is taken as done: 24 hours, as for an app (Switch spec 12.7 step
+/// 5).
 const ERASURE_CONFIRMATION_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// What a passing check before an erasure step found.
@@ -505,7 +523,12 @@ const ERASURE_CONFIRMATION_MS: u64 = 24 * 60 * 60 * 1000;
 enum Checked {
     /// This install still signs: the step goes on.
     Signing,
-    /// The account is erased already: a request in doubt, then the switch's `404`, with no
-    /// other install anywhere.
+    /// The account is erased: a request in doubt, then the `404` the pinned key signed for
+    /// an identity the service doesn't host, with no other install anywhere (Switch wire
+    /// 7.4.16 "The signer's `404`").
+    NotHosted,
+    /// The account looks erased already: a request in doubt, then a `404` the pinned key
+    /// didn't sign, with no other install anywhere; taken as erased once it has held for 24
+    /// hours.
     ErasedAlready,
 }

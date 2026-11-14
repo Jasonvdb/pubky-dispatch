@@ -122,8 +122,7 @@ impl Signer {
         // there with the same bytes, goes on. A new enrollment there could find the first
         // version taken, and a second at the same generation refused for good.
         // Declared again at a service an earlier declaration enrolled at: one that took that
-        // version serves it, and would answer a new enrollment with a pending key, so it is
-        // read first under the key it was answered with.
+        // version serves it, so it is read first under the key it was answered with.
         // The backup is judged first: an install that took over shows there, and its version
         // must never be superseded by an earlier one the pre-read would take.
         let goes_to = self.recovery_goes_to(origin);
@@ -431,13 +430,18 @@ impl Signer {
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
         }
-        // In place, the service may still serve the lost generation under its key there
-        // (Switch wire 7.4.2). A key kept from an earlier declaration or a restore stays, for
-        // whichever origin it was kept for, since only the service at that origin is read
-        // under it. Otherwise it is taken from a signed copy of the lost generation naming
-        // this origin: the version the recovery builds on, or, when that is a restored
-        // recovery's own version, the Homeserver's copy, as the restore takes it (Switch wire
-        // 3.13). A delivery whose answer shows that key no longer serves drops it.
+        // In place, the service keeps the one key it served the lost generation with, which
+        // its enrollment answers name again (Switch wire 3.7, 7.4.1), and the signer checks
+        // every answer with that key, the delivery's and its refusal's alike (Switch wire
+        // 7.4.2 "Which key signs the answer", spec 12.6 step 1). Only where the service
+        // changed its key since (Switch spec 12.5) does it still serve the lost generation
+        // under the key it had, until it takes the version: that key is then kept, read as
+        // below. A key kept from an earlier declaration or a restore stays, for whichever
+        // origin it was kept for, since only the service at that origin is read under it.
+        // Otherwise it is taken from a signed copy of the lost generation naming this origin:
+        // the version the recovery builds on, or, when that is a restored recovery's own
+        // version, the Homeserver's copy, as the restore takes it (Switch wire 3.13). A
+        // delivery whose answer shows that key no longer serves drops it.
         state.recovery_serving = match self.state.recovery_serving.clone() {
             Some(kept) => Some(kept),
             None => {
@@ -447,11 +451,13 @@ impl Signer {
                     self.lost_generations_key_on_homeserver(origin, lost, base.version())
                         .await?
                 };
-                earlier.map(|service_key| Service {
-                    origin: origin.to_owned(),
-                    service_key,
-                    limits: answer.limits,
-                })
+                earlier
+                    .filter(|earlier| *earlier != answer.service_key)
+                    .map(|service_key| Service {
+                        origin: origin.to_owned(),
+                        service_key,
+                        limits: answer.limits,
+                    })
             }
         };
         state.service = Some(service);

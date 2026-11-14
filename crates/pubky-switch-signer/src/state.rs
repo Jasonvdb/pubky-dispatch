@@ -351,16 +351,17 @@ pub(crate) struct SignerState {
     pub(crate) recovery_origin: Option<String>,
     /// Each service an earlier declaration of the recovery in progress enrolled at, with
     /// the key its enrollment answered: declared again there, the signer reads under that
-    /// key whether the earlier version was taken, since a service that took it answers
-    /// another enrollment with a pending key, and the version's refusal with the first
-    /// (Switch wire 3.7, 7.4.2).
+    /// key whether the earlier version was taken, since a service that took it may have
+    /// changed its key since (Switch wire 3.7, 7.4.2, spec 12.5).
     pub(crate) recovery_services: Vec<Service>,
-    /// A recovery declared in place, at the service that served the lost generation: that
-    /// service, under the key it served the lost generation with. Until it takes the
-    /// recovery's version it signs every answer with that key, but the `200` of the delivery
-    /// that starts the new generation, which the pending key the version names signs (Switch
-    /// wire 3.13, 7.4.1, 7.4.2). So the signer pins this key while the recovery goes there,
-    /// and the delivery's `200` alone is checked with the pending key. Kept through
+    /// A recovery declared in place, at the service that served the lost generation, after
+    /// that service changed its key (Switch spec 12.5): that service, under the key it served
+    /// the lost generation with. None where it kept its one key, which the version names
+    /// (Switch wire 3.7). Until it takes the recovery's version it signs every answer with
+    /// that key, but the `200` of the delivery that starts the new generation, which the new
+    /// key the version names signs (Switch wire 3.13, 7.4.1, 7.4.2). So the signer pins this
+    /// key while the recovery goes there, and the delivery's `200` alone is checked with the
+    /// new key. Kept through
     /// declarations at other origins, since only the service at its own origin is read under
     /// it; when none is kept, taken from a signed copy of the lost generation naming the
     /// declared origin: the version the recovery builds on, or the Homeserver's copy when that
@@ -677,10 +678,10 @@ pub(crate) enum Flow {
         /// erasing the account.
         reminded: Vec<[u8; 16]>,
         /// An erasure request went out and no answer came back: it may have landed, so the
-        /// operator's `404` now means it did, once it has held for 24 hours (Switch wire
-        /// 7.4.16).
+        /// signed `404` of an identity the service doesn't host now means it did, and an
+        /// unsigned `404` does once it has held for 24 hours (Switch wire 7.4.16).
         unanswered: bool,
-        /// The device time a check first met the operator's `404` after the request in
+        /// The device time a check first met an unsigned `404` after the request in
         /// doubt, kept until an answer the pinned key signs: erased but unconfirmed, the
         /// erasure done at the first run 24 hours on (Switch wire 7.4.16, spec 12.7 step 5).
         first_404_ms: Option<u64>,

@@ -241,14 +241,13 @@ pub enum Alert {
     /// clears itself at the first run that finds them agreeing.
     ClockOff,
     /// The switch answers `GET /apps` with a `404` its pinned key didn't sign, while no
-    /// erasure of this install's is in progress: the operator's answer for an identity the
-    /// service doesn't host, or an intermediary's. This install can't tell which, so it
+    /// erasure of this install's is in progress: an intermediary's, or the service's own
+    /// under a key it changed to (Switch spec 12.5). This install can't tell which, so it
     /// deletes and changes nothing, and signs nothing while the switch can't be read (Switch
     /// wire 7.3 step 2, 7.4.16). The account may have been erased from another copy of this
     /// install; the way out is the user's, a restore or an enrollment elsewhere. It clears
     /// itself at the next check whose `GET /apps` gets an answer the pinned key signs, an
-    /// error included, since only a hosted account's key signs one; an unsigned answer or no
-    /// answer leaves it. Every signing step checks first, so it outlasts the switch's
+    /// error included; an unsigned answer or no answer leaves it. Every signing step checks first, so it outlasts the switch's
     /// recovery by one check at most. Never raised once the account is erased.
     AccountNotHosted,
     /// A removed app's Pubky grants still let it write its Homeserver paths. Each approved

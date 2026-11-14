@@ -286,6 +286,31 @@ impl World {
         self.env_with(store, Protocols::new(vec![Arc::new(Notes)]).unwrap())
     }
 
+    /// The env, behind a transport that strips the signature from the switch's `404` answers
+    /// once it erased the account, as an intermediary answering for it would: a `404` the
+    /// signer can't check (Switch wire 7.4.16 "The signer's `404`"). Returns that transport
+    /// too, which sees every request.
+    pub fn env_with_unsigned_404s(
+        &self,
+        store: Arc<dyn StateStore>,
+    ) -> (SignerEnv, Arc<MockTransport>) {
+        let switch = Arc::clone(&self.switch);
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            let response = switch.handle(request)?;
+            if response.status == 404 && switch.erased() {
+                return Ok(pubky_switch_client::transport::Response {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+            Ok(response)
+        }));
+        let mut env = self.env(store);
+        env.transport = transport.clone();
+        (env, transport)
+    }
+
     /// The env with `protocols` registered in place of the test protocol.
     pub fn env_with(&self, store: Arc<dyn StateStore>, protocols: Protocols) -> SignerEnv {
         SignerEnv {

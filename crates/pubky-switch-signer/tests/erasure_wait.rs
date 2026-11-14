@@ -1,5 +1,5 @@
-//! The erasure's wait for the operator's `404` to hold, after a request in doubt (Switch wire
-//! 7.4.16, spec 12.7 step 5): what counts, what ends it, and what the signer sends meanwhile.
+//! The erasure's wait for a `404` the pinned key didn't sign to hold, after a request in doubt
+//! (Switch wire 7.4.16, spec 12.7 step 5): what counts, what ends it, and what the signer sends meanwhile.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -567,9 +567,8 @@ async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
     let flaky = FlakyStore::new(store.clone());
-    let mut signer = Signer::open(world.env(flaky.clone()), world.keyring())
-        .await
-        .unwrap();
+    let (env, _) = world.env_with_unsigned_404s(flaky.clone());
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/erase".into(),
     });
@@ -579,9 +578,8 @@ async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     flaky.fail(false);
     drop(signer);
     world.clock.advance_ms(24 * H);
-    let mut signer = Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
+    let (env, _) = world.env_with_unsigned_404s(store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erasing);
     let now = world.clock.now_ms();
     assert_eq!(
@@ -595,7 +593,10 @@ async fn test_erasure_wait_alarm_during_the_wait_keeps_since_and_concludes() {
     // The wait runs; an equivocation on the Homeserver raises the alarm on the in-doubt
     // path (the erasure and `since` kept); the user clears it; a run 24 h after T0 ends it.
     let world = World::new();
-    let (mut signer, _, _) = with_an_app(&world).await;
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let (env, _) = world.env_with_unsigned_404s(store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/erase".into(),
     });

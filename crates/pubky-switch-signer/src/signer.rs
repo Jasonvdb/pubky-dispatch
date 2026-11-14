@@ -1023,12 +1023,12 @@ impl Signer {
         Ok(matches!(read, Ok(_) | Err(ClientError::Switch { .. })))
     }
 
-    /// Where the clients of the enrolled switch go. While a recovery declared in place goes
-    /// to the service that served the lost generation, its answers are checked with the key
-    /// it served that generation with, but the `200` of the delivery that starts the new
-    /// generation, which the client checks with the pending key the version names (Switch
-    /// wire 3.13, 7.4.2): no answer under a third key is taken, and none under the earlier
-    /// key as the new generation's.
+    /// Where the clients of the enrolled switch go. While a recovery declared in place, after
+    /// the service changed its key (Switch spec 12.5), goes to the service that served the
+    /// lost generation, its answers are checked with the key it served that generation with,
+    /// but the `200` of the delivery that starts the new generation, which the client checks
+    /// with the new key the version names (Switch wire 3.13, 7.4.2): no answer under a third
+    /// key is taken, and none under the earlier key as the new generation's.
     fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
         let serving = self
             .state
@@ -1287,7 +1287,7 @@ impl Signer {
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
         // Any answer the pinned key signs, an error included, shows the account hosted: it
-        // clears the alert, and ends an erasure's wait for the operator's `404` to hold, here
+        // clears the alert, and ends an erasure's wait for an unsigned `404` to hold, here
         // where it arrives, whatever the step that read it does next (Switch wire 7.3 step 2,
         // 7.4.16).
         let signed = matches!(

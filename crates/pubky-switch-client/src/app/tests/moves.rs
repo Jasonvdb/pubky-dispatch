@@ -2129,6 +2129,76 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
     assert!(app.push_record().await.unwrap().is_some());
 }
 
+/// The signer erases alice's account at the switch (Switch wire 7.4.16): from then on the
+/// switch answers every call for her with the `404` of an identity it doesn't host, signed
+/// with its service key.
+async fn signer_erases(w: &World) {
+    let signer = crate::client::SwitchClient::new(
+        ORIGIN,
+        w.alice.public(),
+        crate::client::Credentials::Signer {
+            identity: w.alice.public(),
+            key: Arc::new(IdentityKey::from_secret(w.alice.secret_bytes())),
+        },
+        Some(w.switch.service_key()),
+        w.switch.transport(),
+        w.clock.clone(),
+    )
+    .unwrap();
+    let held = w.switch.identity_doc().map(|doc| doc.hash());
+    signer.erase(held).await.unwrap();
+    assert!(w.switch.erased());
+}
+
+#[tokio::test]
+async fn test_erased_account_signed_404_and_no_identity_is_gone_at_once() {
+    // The signed `404` of an identity the switch doesn't host and a missing identity.json
+    // together are an erasure, at once: the first read stops with `AccountGone` (Switch spec
+    // 12.7 step 5, wire 7.4.16 "Afterwards").
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    signer_erases(&w).await;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::AccountGone { .. })),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erased_account_signed_404_with_identity_published_ends_nothing() {
+    // A signed `404` while identity.json still names the service ends nothing: the service
+    // counts as unreachable, the call fails as it came, and no wait starts (Switch spec 12.7
+    // step 5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    signer_erases(&w).await;
+    for _ in 0..2 {
+        let result = app.receive(None).await;
+        assert!(
+            matches!(&result, Err(AppError::Switch(error)) if error.is_not_hosted()),
+            "{result:?}"
+        );
+        assert!(app.state.gone.is_none());
+        assert!(app.state.erasing.is_none());
+    }
+    let checked = app.check_for_move().await;
+    assert!(
+        matches!(&checked, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{checked:?}"
+    );
+    assert!(app.state.gone.is_none());
+}
+
 #[tokio::test]
 async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
     let w = World::new();

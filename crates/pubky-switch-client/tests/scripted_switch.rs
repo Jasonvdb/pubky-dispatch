@@ -802,17 +802,13 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
         .header("switch-service-signature")
         .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
         .expect("a signature");
+    let sent = pubky_switch_client::client::SentRequest::of(&request);
     let verifies = |key: &[u8; 32]| {
         pubky_switch_core::http::verify_response(
             key,
             &pubky_switch_core::http::ResponseParts {
                 status: answer.status,
-                method: &request.method,
-                path: pubky_switch_core::http::path_of(&request.path_and_query),
-                request_signature: pubky_switch_core::http::request_signature_of(
-                    request.header("switch-signature"),
-                )
-                .as_ref(),
+                request: sent.received(true),
                 server_time: answer.header("switch-server-time").expect("a time"),
                 head: answer.header("switch-head"),
                 body: &answer.body,
@@ -1047,4 +1043,74 @@ async fn test_testing_held_read_given_up_is_held_no_more() {
     // Its caller gives the read up, as at a timeout of its own.
     drop(read);
     assert_eq!(switch.held_reads(), 0);
+}
+
+#[tokio::test]
+async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
+    // As at the service: a body over its call's cap is `413 too_large` over the empty body
+    // field, and a signed request header sent twice is `400 bad_request`, both signed with
+    // the service key, without a head (Switch wire 7.1).
+    use pubky_switch_client::client::SentRequest;
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let id = s.alice.identity().key().id();
+    let service = switch.service_key();
+    let verifies = |request: &Request, answer: &Response, body_read: bool| {
+        let signature = answer
+            .header("switch-service-signature")
+            .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
+            .expect("a signature");
+        pubky_switch_core::http::verify_response(
+            &service,
+            &pubky_switch_core::http::ResponseParts {
+                status: answer.status,
+                request: SentRequest::of(request).received(body_read),
+                server_time: answer.header("switch-server-time").expect("a time"),
+                head: answer.header("switch-head"),
+                body: &answer.body,
+            },
+            &signature,
+        )
+        .is_ok()
+    };
+    let over = Request {
+        method: "POST".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!("/v1/{id}/inbox?apps_version=1"),
+        headers: Vec::new(),
+        body: vec![0; 65_537],
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+    };
+    let answer = switch.transport().send(over.clone()).await.unwrap();
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (413, "too_large")
+    );
+    assert!(answer.header("switch-head").is_none());
+    assert!(verifies(&over, &answer, false));
+    assert!(!verifies(&over, &answer, true));
+    let repeated = Request {
+        method: "GET".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!("/v1/{id}/feed"),
+        headers: vec![
+            Header::new("switch-app", "a"),
+            Header::new("switch-app", "a"),
+        ],
+        body: Vec::new(),
+        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+    };
+    let answer = switch.transport().send(repeated.clone()).await.unwrap();
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (400, "bad_request")
+    );
+    assert!(verifies(&repeated, &answer, true));
+    // The public read uses no header, so it is answered as any public read.
+    let read = Request {
+        path_and_query: format!("/v1/{id}/identity"),
+        ..repeated
+    };
+    let answer = switch.transport().send(read).await.unwrap();
+    assert_ne!(answer.status, 400);
 }

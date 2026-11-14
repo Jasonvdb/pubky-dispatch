@@ -291,13 +291,13 @@ fn set_read_only(dir: &std::path::Path, read_only: bool) {
 
 fn signature_of(request: &SwitchRequest) -> Sent {
     let sent = Sent::of(request);
-    assert!(sent.signature.is_some(), "signature");
+    assert!(sent.signed(), "signature");
     sent
 }
 
 /// `answer` to `sent` is the not-hosted `404` (Switch wire 7.3 step 2, 7.4.16 Afterwards):
-/// `current: { "hosted": false }`, no head, signed with the service key over the request's
-/// method and path.
+/// `current: { "hosted": false }`, no head, signed with the service key over the request as
+/// the service received it.
 fn assert_not_hosted(replay: &Replay, answer: &SwitchResponse, sent: &Sent, name: &str) {
     assert_eq!(answer.status, 404, "{name}: {}", text(answer));
     assert_eq!(text(answer), NOT_HOSTED, "{name}");
@@ -306,18 +306,12 @@ fn assert_not_hosted(replay: &Replay, answer: &SwitchResponse, sent: &Sent, name
         signed_with(answer, &service_public(replay), sent),
         "{name}: signed with the service key"
     );
-    let elsewhere = Sent {
-        path: format!("{}/x", sent.path),
-        ..sent.clone()
-    };
+    let elsewhere = sent.clone().at_path(format!("/v1/{}/x", alice_id()));
     assert!(
         !signed_with(answer, &service_public(replay), &elsewhere),
         "{name}: bound to the path"
     );
-    let other_method = Sent {
-        method: "DELETE".into(),
-        ..sent.clone()
-    };
+    let other_method = sent.clone().with_method("DELETE");
     assert!(
         !signed_with(answer, &service_public(replay), &other_method),
         "{name}: bound to the method"

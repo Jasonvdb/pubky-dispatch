@@ -117,7 +117,8 @@ enum Class {
 }
 
 fn class_of(request: &Request) -> Class {
-    let path = pubky_switch_core::http::path_of(&request.path_and_query);
+    // The route, without the query.
+    let path = request.path_and_query.split('?').next().unwrap_or_default();
     match request.method.as_str() {
         "POST" if path == "/v1/enroll" => Class::Enroll,
         "POST" if path.ends_with("/erase") => Class::Erase,

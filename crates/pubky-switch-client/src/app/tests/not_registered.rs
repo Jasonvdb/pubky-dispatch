@@ -31,9 +31,7 @@ impl Transport for Headless {
                     &self.1,
                     &pubky_switch_core::http::ResponseParts {
                         status: response.status,
-                        method: &sent.method,
-                        path: &sent.path,
-                        request_signature: sent.signature.as_ref(),
+                        request: sent.received(true),
                         server_time: &server_time,
                         head: None,
                         body: &response.body,

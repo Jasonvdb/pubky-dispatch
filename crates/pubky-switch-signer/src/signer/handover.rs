@@ -276,7 +276,11 @@ impl Signer {
                     "Switch wire 7.4.17: the hand-over is stored for another app".into(),
                 )));
             }
+            // Final only when the answer binds the request as sent, its body included, or for a
+            // body over its call's cap, which the client refuses before sending it (Switch
+            // wire 7.1).
             Err(ClientError::Switch { status, .. }) if definite(*status) => HandOverSent::Refused,
+            Err(ClientError::BodyOverCap { .. }) => HandOverSent::Refused,
             Err(_) => HandOverSent::Pending,
         };
         if sent != HandOverSent::Pending {

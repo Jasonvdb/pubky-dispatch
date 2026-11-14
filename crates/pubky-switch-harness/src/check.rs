@@ -49,15 +49,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use pubky_switch_client::client::SentRequest;
 use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::chain::{
     ChainEnvelope, ItemType, ServiceTransition, SignedHead, Stub, TransitionProof, Verifier,
     ZERO_HASH,
 };
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{
-    ResponseParts, header, path_of, request_signature_of, verify_response,
-};
+use pubky_switch_core::http::{ErrorCode, ResponseParts, header, verify_response};
 use pubky_switch_core::records::IdentityDoc;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -289,6 +288,40 @@ impl Checker {
     ///
     /// What is wrong with it.
     pub fn signature(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
+        // As a client checks it (Switch wire 7.1): each header the signature decides on at
+        // most once, and a head that is there verifies as the account's with the key that
+        // signed the answer.
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD] {
+            let count = answer
+                .headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case(name))
+                .count();
+            if count > 1 {
+                return Err(format!("the answer carries {name} {count} times"));
+            }
+        }
+        let with = self.signed_with(request, answer)?;
+        if let Some(text) = answer.header(header::HEAD) {
+            let account = account_id(request).and_then(|id| {
+                lock(&self.accounts)
+                    .get(id)
+                    .map(|account| (account.identity, account.key_of(with)))
+            });
+            let verifies = SignedHead::from_header(text).ok().zip(account).is_some_and(
+                |(head, (identity, key))| {
+                    key.is_some_and(|key| head.verify(&key, &identity).is_ok())
+                },
+            );
+            if !verifies {
+                return Err("its Switch-Head doesn't verify as the account's head".into());
+            }
+        }
+        Ok(with)
+    }
+
+    /// The key [`Checker::signature`] finds `answer`'s signature verifies with.
+    fn signed_with(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
         let signature = answer
             .header(header::SERVICE_SIGNATURE)
             .and_then(|text| unb64_array::<64>(text).ok())
@@ -296,22 +329,35 @@ impl Checker {
         let server_time = answer
             .header(header::SERVER_TIME)
             .ok_or("the answer carries no service time")?;
-        let request_signature = request_signature_of(request.header(header::SIGNATURE));
+        // The request as the switch received it; the empty body field only for the answers
+        // a switch may give before it reads the body, without a head (Switch wire 7.1).
+        let sent = SentRequest::of(request);
+        let before_the_body = answer.header(header::HEAD).is_none()
+            && serde_json::from_slice::<Value>(&answer.body)
+                .ok()
+                .and_then(|body| body["code"].as_str().and_then(ErrorCode::parse))
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        ErrorCode::TooLarge | ErrorCode::RateLimited | ErrorCode::NotFound
+                    ) && code.status() == answer.status
+                });
         let verifies = |key: &[u8; 32]| {
-            verify_response(
-                key,
-                &ResponseParts {
-                    status: answer.status,
-                    method: &request.method,
-                    path: path_of(&request.path_and_query),
-                    request_signature: request_signature.as_ref(),
-                    server_time,
-                    head: answer.header(header::HEAD),
-                    body: &answer.body,
-                },
-                &signature,
-            )
-            .is_ok()
+            let with = |body_read: bool| {
+                verify_response(
+                    key,
+                    &ResponseParts {
+                        status: answer.status,
+                        request: sent.received(body_read),
+                        server_time,
+                        head: answer.header(header::HEAD),
+                        body: &answer.body,
+                    },
+                    &signature,
+                )
+                .is_ok()
+            };
+            with(true) || (before_the_body && with(false))
         };
         // An enrollment's answer brings its key with it.
         let _ = self.enrolled_key(request, answer, &verifies);
@@ -679,9 +725,7 @@ mod tests {
             service,
             &ResponseParts {
                 status,
-                method: &request.method,
-                path: path_of(&request.path_and_query),
-                request_signature: None,
+                request: SentRequest::of(request).received(true),
                 server_time: TIME,
                 head: None,
                 body: &body,
@@ -902,6 +946,65 @@ mod tests {
                 .any(|v| v.contains("in an answer about no account")),
             "{unattached:?}"
         );
+    }
+
+    /// An answer to `request` that `service` signs carrying `head` as its `Switch-Head`.
+    fn answer_with_head(request: &Request, service: &IdentityKey, head: &str) -> Response {
+        let body = b"{}".to_vec();
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: Some(head),
+                body: &body,
+            },
+        );
+        Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, TIME),
+                Header::new(header::HEAD, head),
+            ],
+            body,
+        }
+    }
+
+    #[test]
+    fn test_signature_refuses_what_a_client_refuses() {
+        // As the client's check (Switch wire 7.1): a signed response header sent twice, and a
+        // head that doesn't verify as the account's, fail the answer.
+        let service = key(2);
+        let checker = checker(&service);
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        let get = request("GET", "feed", &json!(null));
+        let plain = answer(&get, &service, 200, &json!({}));
+        assert!(checker.signature(&get, &plain).is_ok());
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME] {
+            let mut repeated = plain.clone();
+            let copy = repeated.header(name).unwrap().to_owned();
+            repeated.headers.push(Header::new(name, &copy));
+            assert!(checker.signature(&get, &repeated).is_err(), "{name}");
+        }
+        let tip = ChainTip {
+            generation: 1,
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        };
+        let good = SignedHead::sign(&service, &alice().public(), &tip).to_header();
+        let headed = answer_with_head(&get, &service, &good);
+        assert!(checker.signature(&get, &headed).is_ok());
+        let mut doubled = headed.clone();
+        doubled.headers.push(Header::new(header::HEAD, &good));
+        assert!(checker.signature(&get, &doubled).is_err());
+        // Signed by another key, or not a head at all.
+        let forged = SignedHead::sign(&key(9), &alice().public(), &tip).to_header();
+        for head in [forged.as_str(), "not a head"] {
+            let answer = answer_with_head(&get, &service, head);
+            assert!(checker.signature(&get, &answer).is_err(), "{head}");
+        }
     }
 
     #[test]

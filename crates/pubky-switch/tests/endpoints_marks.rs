@@ -291,6 +291,44 @@ async fn test_marks_lost_mark_answers_the_notice() {
 }
 
 #[tokio::test]
+async fn test_marks_notice_to_the_public_read_binds_no_header() {
+    // The public read decides nothing by its headers on the notice's path either: a read
+    // signed by the signer, one with headers that decode to nothing and the unsigned read
+    // get the same notice, byte for byte, bound to no header (Switch wire 7.1, 7.3, 7.4.15).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, base) = served(&replay).await;
+    let (service, _marks) = lose_mark(&replay, Limits::default()).await;
+    let bare = public_read();
+    let sent = Sent::of(&bare);
+    let unsigned = service.handle(bare).await;
+    assert_notice(&replay, &unsigned, &sent, "mark_lost", mark.generation);
+    let path = format!("/v1/{}/identity", alice_id());
+    let signed = service
+        .handle(signer_request("GET", &path, Vec::new(), base))
+        .await;
+    let junk = service
+        .handle(request(
+            "GET",
+            &path,
+            &[
+                (header::SIGNATURE, "junk"),
+                (header::INVITE_CODE, ""),
+                (header::TIMESTAMP, "never"),
+            ],
+            Vec::new(),
+        ))
+        .await;
+    for answer in [&signed, &junk] {
+        assert_eq!(answer.status, unsigned.status);
+        assert_eq!(answer.headers, unsigned.headers);
+        assert_eq!(answer.body, unsigned.body);
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_marks_corrupt_mark_answers_the_notice() {
     let Some(replay) = replay().await else {
         return;
@@ -604,10 +642,11 @@ async fn test_marks_413_from_the_transport_stays() {
             cap: 64,
         })
         .await;
-    // Refused before the body is read, by the transport: no verdict is judged (Switch wire
-    // 7.1).
+    // Refused before the body is read, by the transport: no verdict is judged, and the
+    // answer binds the empty body field (Switch wire 7.1).
     assert_eq!((answer.status, code(&answer).as_str()), (413, "too_large"));
-    assert_signed_without_head(&replay, &answer, &sent);
+    assert_signed_without_head(&replay, &answer, &sent.clone().unread());
+    assert!(!signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(service.mark_refusals(), 0);
     replay.db.drop_database().await.expect("drop");
 }
@@ -812,16 +851,10 @@ async fn test_marks_not_hosted_404_is_bound_to_the_request() {
             )
         );
         assert_signed_without_head(&replay, &answer, &sent);
-        // Bound to the request's method and path (7.1).
-        let elsewhere = Sent {
-            path: format!("{}/other", sent.path),
-            ..sent.clone()
-        };
+        // Bound to the request as received, its method and path among it (7.1).
+        let elsewhere = sent.clone().at_path(format!("/v1/{}/other", bob_id()));
         assert!(!signed_with(&answer, &service_public(&replay), &elsewhere));
-        let other_method = Sent {
-            method: "POST".into(),
-            ..sent
-        };
+        let other_method = sent.with_method("POST");
         assert!(!signed_with(
             &answer,
             &service_public(&replay),
@@ -840,26 +873,20 @@ async fn test_marks_unknown_route_404_is_signed() {
     let base = time_of(2);
     replay.clock.set_wall_ms(base);
     let path = "/v2/no/such/route";
-    let sent = Sent {
-        method: "GET".into(),
-        path: path.into(),
-        signature: None,
-    };
+    let sent = Sent::unrouted("GET", path);
     let answer = replay
         .service
         .refuse(Refusal::UnknownRoute {
             method: "GET".into(),
             path_and_query: path.into(),
             headers: HeaderMap::new(),
+            body: Default::default(),
         })
         .await;
     // Step 1: an unknown route is `404`, signed with the service key (Switch wire 7.3).
     assert_eq!((answer.status, code(&answer).as_str()), (404, "not_found"));
     assert_signed_without_head(&replay, &answer, &sent);
-    let elsewhere = Sent {
-        path: "/v2/another/route".into(),
-        ..sent
-    };
+    let elsewhere = sent.at_path("/v2/another/route".into());
     assert!(!signed_with(&answer, &service_public(&replay), &elsewhere));
     replay.db.drop_database().await.expect("drop");
 }

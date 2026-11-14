@@ -83,8 +83,8 @@ async fn test_vectors_accounts_replay() {
         .expect("32 bytes");
 
     // An identity the service doesn't host, a request without a signature: `404 not_found`
-    // with `hosted: false`, without a head, signed with the service key, byte for byte
-    // (Switch wire 7.6).
+    // with `hosted: false`, without a head, signed with the service key over the request
+    // its received request names, byte for byte (Switch wire 7.3 step 2, 7.6).
     let expected = named(
         &http["responses"],
         "anyone: an identity the service doesn't host, 404 not_found with hosted false, \
@@ -96,12 +96,13 @@ async fn test_vectors_accounts_replay() {
             .as_str()
             .expect("time"),
     );
-    let unknown = request(
-        expected["method"].as_str().expect("method"),
-        expected["path"].as_str().expect("path"),
-        &[],
-        Vec::new(),
-    );
+    let field = |at: usize| {
+        let hex = expected["received_request"]["fields"][at]["hex"]
+            .as_str()
+            .expect("field");
+        String::from_utf8(hex::decode(hex).expect("hex")).expect("text")
+    };
+    let unknown = request(&field(0), &field(1), &[], Vec::new());
     let sent = Sent::of(&unknown);
     let answer = replay.service.handle(unknown).await;
     assert_matches(&answer, expected);

@@ -5,7 +5,7 @@
 //! The transport is the caller's: these functions build and check the signed fields of a
 //! request or response whose method, path, headers and body the caller holds.
 
-use crate::enc::{hash, u64be, unb64_array};
+use crate::enc::{hash, lp, u64be, unb64_array};
 use crate::error::{Error, Result, invalid};
 use crate::labels;
 use crate::sig;
@@ -62,7 +62,7 @@ pub struct RequestHeaders {
 /// The parts of a request its signature covers besides the headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestTarget<'a> {
-    /// The method, in upper case.
+    /// The method, exactly as sent; the routes name theirs in upper case.
     pub method: &'a str,
     /// The path and query, exactly as sent.
     pub path_and_query: &'a str,
@@ -73,13 +73,13 @@ pub struct RequestTarget<'a> {
     pub origin: &'a str,
 }
 
-/// The fields after the label of a request signature: method, path and query,
+/// The fields after the label of a request signature: method, as sent, path and query,
 /// `hash(body)`, `Switch-Timestamp`, switch origin, `Switch-Identity`, `Switch-App`,
 /// `Switch-Cert` and `Switch-Invite-Code`, an absent header as an empty field (Switch wire
 /// 7.1).
 pub fn request_fields(target: &RequestTarget<'_>, headers: &RequestHeaders) -> Vec<Vec<u8>> {
     vec![
-        target.method.to_ascii_uppercase().into_bytes(),
+        target.method.as_bytes().to_vec(),
         target.path_and_query.as_bytes().to_vec(),
         hash(target.body).to_vec(),
         headers.timestamp.as_bytes().to_vec(),
@@ -159,7 +159,7 @@ pub fn transfer_request_fields(
     headers: &TransferHeaders,
 ) -> Vec<Vec<u8>> {
     vec![
-        target.method.to_ascii_uppercase().into_bytes(),
+        target.method.as_bytes().to_vec(),
         target.path_and_query.as_bytes().to_vec(),
         hash(target.body).to_vec(),
         headers.timestamp.as_bytes().to_vec(),
@@ -201,19 +201,137 @@ pub fn verify_transfer_request(
     )
 }
 
-/// The request signature bytes a response signs: the 64 bytes decoded from the request's
-/// `Switch-Signature`, or `None` when it has none that decodes (Switch wire 2.3, 7.1).
-pub fn request_signature_of(header_value: Option<&str>) -> Option<[u8; 64]> {
-    header_value.and_then(|text| unb64_array::<64>(text).ok())
+/// The request headers a received request covers, in its order (Switch wire 7.1).
+pub const RECEIVED_HEADERS: [&str; 7] = [
+    header::IDENTITY,
+    header::APP,
+    header::CERT,
+    header::INVITE_CODE,
+    header::TRANSFER,
+    header::TIMESTAMP,
+    header::SIGNATURE,
+];
+
+/// The body field of a received request (Switch wire 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyField {
+    /// The answer came before the service read the body: an empty field. Only a `413
+    /// too_large`, a `429 rate_limited` before authentication and the `404` of an unknown
+    /// route may come so.
+    NotRead,
+    /// `hash(body)`, once the service has read the body whole.
+    Read([u8; 32]),
 }
 
-/// The path a response signature covers: the request's path and query cut at the first `?`,
-/// as sent and not percent-decoded (Switch wire 7.1).
-pub fn path_of(path_and_query: &str) -> &str {
-    match path_and_query.split_once('?') {
-        Some((path, _)) => path,
-        None => path_and_query,
+impl BodyField {
+    /// The field of a body read whole.
+    pub fn read(body: &[u8]) -> Self {
+        BodyField::Read(hash(body))
     }
+
+    /// The field's bytes: empty, or the 32 bytes of the hash.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            BodyField::NotRead => &[],
+            BodyField::Read(hash) => hash,
+        }
+    }
+}
+
+/// The values of the request headers a received request covers ([`RECEIVED_HEADERS`]), each
+/// with its presence: every value of a header in the order received, none for a header
+/// absent (Switch wire 7.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReceivedHeaders {
+    values: [Vec<Vec<u8>>; 7],
+}
+
+impl ReceivedHeaders {
+    /// The headers of `pairs`, a request's headers as (name, value) in the order received;
+    /// names are compared case-insensitively, and headers a received request doesn't cover
+    /// are left out.
+    pub fn of<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Self {
+        let mut headers = ReceivedHeaders::default();
+        for (name, value) in pairs {
+            if let Some(at) = RECEIVED_HEADERS
+                .iter()
+                .position(|covered| covered.eq_ignore_ascii_case(name))
+                && let Some(values) = headers.values.get_mut(at)
+            {
+                values.push(value.to_vec());
+            }
+        }
+        headers
+    }
+
+    /// The values of the header `name` in the order received; empty when it is absent or
+    /// isn't one a received request covers.
+    pub fn values(&self, name: &str) -> &[Vec<u8>] {
+        RECEIVED_HEADERS
+            .iter()
+            .position(|covered| covered.eq_ignore_ascii_case(name))
+            .and_then(|at| self.values.get(at))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The request a response answers, exactly as the service received it (Switch wire 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceivedRequest<'a> {
+    /// The method, exactly as received, never case-folded.
+    pub method: &'a str,
+    /// The path and query, exactly as received: not percent-decoded, the query included.
+    pub path_and_query: &'a str,
+    /// `hash(body)` once the body is read whole; [`BodyField::NotRead`] for an answer given
+    /// before.
+    pub body: BodyField,
+    /// The switch origin, as the request signature takes it.
+    pub origin: &'a str,
+    /// The request headers it covers, each with its presence.
+    pub headers: &'a ReceivedHeaders,
+}
+
+/// Whether `method` and `path_and_query` are the public read, `GET /v1/{id}/identity`
+/// (Switch wire 7.4.15), as the service routes it: the method exactly `GET`, the path, before
+/// any query, `/v1/`, a non-empty `{id}` and `/identity`.
+pub fn is_public_read(method: &str, path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let Some(rest) = path.strip_prefix("/v1/") else {
+        return false;
+    };
+    method == "GET"
+        && matches!(rest.split('/').collect::<Vec<_>>().as_slice(), [id, "identity"] if !id.is_empty())
+}
+
+/// The bytes of a received request (Switch wire 7.1): `lp(method, path and query, body
+/// field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert),
+/// H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature))`.
+/// `H` of a header is empty when it is absent and `lp()` of its values in the order received
+/// when present. The public read binds every header field as absent, whatever the request
+/// carries ([`is_public_read`]). Every signer and verifier of a response takes the received
+/// request from here.
+pub fn received_request(request: &ReceivedRequest<'_>) -> Vec<u8> {
+    let public_read = is_public_read(request.method, request.path_and_query);
+    let header_fields: Vec<Vec<u8>> = request
+        .headers
+        .values
+        .iter()
+        .map(|values| {
+            if public_read || values.is_empty() {
+                Vec::new()
+            } else {
+                lp(&refs(values))
+            }
+        })
+        .collect();
+    let mut fields: Vec<&[u8]> = vec![
+        request.method.as_bytes(),
+        request.path_and_query.as_bytes(),
+        request.body.as_bytes(),
+        request.origin.as_bytes(),
+    ];
+    fields.extend(header_fields.iter().map(Vec::as_slice));
+    lp(&fields)
 }
 
 /// What a response signature covers besides its label (Switch wire 7.1, 2.3).
@@ -221,14 +339,8 @@ pub fn path_of(path_and_query: &str) -> &str {
 pub struct ResponseParts<'a> {
     /// The HTTP status.
     pub status: u16,
-    /// The method of the request the response answers.
-    pub method: &'a str,
-    /// The path of the request the response answers, as sent and not percent-decoded,
-    /// without the query ([`path_of`]).
-    pub path: &'a str,
-    /// The request signature bytes ([`request_signature_of`]); `None` when the request has
-    /// none that decodes, and for the public read (Switch wire 7.4.15).
-    pub request_signature: Option<&'a [u8; 64]>,
+    /// The request the response answers, as the service received it.
+    pub request: ReceivedRequest<'a>,
     /// The `Switch-Server-Time` text.
     pub server_time: &'a str,
     /// The `Switch-Head` text, exactly as sent; `None` when the response carries none.
@@ -237,23 +349,19 @@ pub struct ResponseParts<'a> {
     pub body: &'a [u8],
 }
 
-/// The fields after the label of a response signature: `u64(status)`, method, path,
-/// `hash(request signature bytes)`, the `Switch-Server-Time` text, `hash(Switch-Head text)`
-/// and `hash(body)` (Switch wire 7.1), the method upper-cased. An absent request signature
-/// hashes as the empty string (Switch wire 2.3), and so does an absent `Switch-Head` (Switch
-/// wire 7.1).
+/// The fields after the label of a response signature: `u64(status)`, `hash(received
+/// request)` ([`received_request`]), the `Switch-Server-Time` text, the head field and
+/// `hash(body)` (Switch wire 7.1). The head field is empty when the response carries no
+/// `Switch-Head` and `hash` of its text when it carries one, so an absent head and an empty
+/// one differ.
 pub fn response_fields(parts: &ResponseParts<'_>) -> Vec<Vec<u8>> {
-    let request_signature: &[u8] = match parts.request_signature {
-        Some(signature) => signature,
-        None => &[],
-    };
     vec![
         u64be(u64::from(parts.status)).to_vec(),
-        parts.method.to_ascii_uppercase().into_bytes(),
-        parts.path.as_bytes().to_vec(),
-        hash(request_signature).to_vec(),
+        hash(&received_request(&parts.request)).to_vec(),
         parts.server_time.as_bytes().to_vec(),
-        hash(parts.head.unwrap_or_default().as_bytes()).to_vec(),
+        parts
+            .head
+            .map_or_else(Vec::new, |head| hash(head.as_bytes()).to_vec()),
         hash(parts.body).to_vec(),
     ]
 }
@@ -265,8 +373,8 @@ pub fn sign_response(key: &impl Signs, parts: &ResponseParts<'_>) -> [u8; 64] {
 
 /// Check a response signature with the service key the client pinned (Switch wire 7.1).
 ///
-/// A client checks this before it uses anything in the response, with the method and path
-/// it sent.
+/// A client checks this before it uses anything in the response, with the received request
+/// built from what it sent.
 ///
 /// # Errors
 ///
@@ -889,98 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn test_request_signature_covers_body_and_headers() {
-        let app = AppKeys::from_secrets([1; 32], [2; 32]);
-        let headers = RequestHeaders {
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            identity: "id".into(),
-            app: Some(app.app_id()),
-            ..RequestHeaders::default()
-        };
-        let signature = sign_request(&app, &target(b"{}"), &headers);
-        let public = app.signing_public();
-        assert!(verify_request(&public, &target(b"{}"), &headers, &signature).is_ok());
-        assert!(verify_request(&public, &target(b"{ }"), &headers, &signature).is_err());
-        let mut other = headers.clone();
-        other.invite_code = Some("code".into());
-        assert!(verify_request(&public, &target(b"{}"), &other, &signature).is_err());
-    }
-
-    #[test]
-    fn test_response_signature_covers_the_request_signature() {
-        let key = AppKeys::from_secrets([3; 32], [4; 32]);
-        let request = [7u8; 64];
-        let parts = ResponseParts {
-            status: 200,
-            method: "GET",
-            path: "/v1/accounts/x/feed",
-            request_signature: Some(&request),
-            server_time: "2026-01-01T00:00:00.000Z",
-            head: Some("aGVhZA"),
-            body: b"{}",
-        };
-        let signature = sign_response(&key, &parts);
-        let public = key.signing_public();
-        assert!(verify_response(&public, &parts, &signature).is_ok());
-        let changed = [
-            ResponseParts {
-                request_signature: None,
-                ..parts
-            },
-            ResponseParts {
-                status: 201,
-                ..parts
-            },
-            ResponseParts {
-                method: "POST",
-                ..parts
-            },
-            ResponseParts {
-                path: "/v1/accounts/y/feed",
-                ..parts
-            },
-            ResponseParts {
-                head: None,
-                ..parts
-            },
-            ResponseParts {
-                head: Some("aGVhZB"),
-                ..parts
-            },
-        ];
-        for other in changed {
-            assert!(verify_response(&public, &other, &signature).is_err());
-        }
-        // The method is signed in upper case.
-        let lower = ResponseParts {
-            method: "get",
-            ..parts
-        };
-        assert!(verify_response(&public, &lower, &signature).is_ok());
-        // A request without a decodable signature, and a response without a head, sign the
-        // hash of the empty string.
-        let bare = ResponseParts {
-            request_signature: None,
-            head: None,
-            ..parts
-        };
-        let fields = response_fields(&bare);
-        assert_eq!(fields[3], crate::enc::hash(b"").to_vec());
-        assert_eq!(fields[5], crate::enc::hash(b"").to_vec());
-        assert_eq!(request_signature_of(Some("not base64url")), None);
-    }
-
-    #[test]
-    fn test_response_path_drops_the_query() {
-        assert_eq!(
-            path_of("/v1/accounts/x/feed?after=3"),
-            "/v1/accounts/x/feed"
-        );
-        assert_eq!(path_of("/v1/accounts/x/feed"), "/v1/accounts/x/feed");
-        assert_eq!(path_of("/v1/a%20b?x=1?y"), "/v1/a%20b");
-    }
-
-    #[test]
     fn test_recovery_notice_reads_its_members() {
         let notice = RecoveryNotice::from_current(&serde_json::json!({
             "generation": 3, "reason": "mark_lost", "permanent": false
@@ -1025,6 +1041,276 @@ mod tests {
             Retry::HeldForNextGeneration
         );
         assert_eq!(not_hosted_current(), serde_json::json!({ "hosted": false }));
+    }
+
+    #[test]
+    fn test_request_signature_covers_body_and_headers() {
+        let app = AppKeys::from_secrets([1; 32], [2; 32]);
+        let headers = RequestHeaders {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            identity: "id".into(),
+            app: Some(app.app_id()),
+            ..RequestHeaders::default()
+        };
+        let signature = sign_request(&app, &target(b"{}"), &headers);
+        let public = app.signing_public();
+        assert!(verify_request(&public, &target(b"{}"), &headers, &signature).is_ok());
+        assert!(verify_request(&public, &target(b"{ }"), &headers, &signature).is_err());
+        let mut other = headers.clone();
+        other.invite_code = Some("code".into());
+        assert!(verify_request(&public, &target(b"{}"), &other, &signature).is_err());
+    }
+
+    #[test]
+    fn test_request_signature_takes_the_method_as_sent() {
+        let app = AppKeys::from_secrets([1; 32], [2; 32]);
+        let headers = RequestHeaders {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            identity: "id".into(),
+            ..RequestHeaders::default()
+        };
+        let signature = sign_request(&app, &target(b"{}"), &headers);
+        let lower = RequestTarget {
+            method: "post",
+            ..target(b"{}")
+        };
+        assert_eq!(request_fields(&lower, &headers)[0], b"post".to_vec());
+        assert!(verify_request(&app.signing_public(), &lower, &headers, &signature).is_err());
+    }
+
+    fn honest_headers() -> ReceivedHeaders {
+        ReceivedHeaders::of([
+            (header::IDENTITY, b"id".as_slice()),
+            (header::APP, b"app".as_slice()),
+            (header::TIMESTAMP, b"2026-01-01T00:00:00Z".as_slice()),
+            (header::SIGNATURE, b"c2ln".as_slice()),
+        ])
+    }
+
+    fn received<'a>(headers: &'a ReceivedHeaders) -> ReceivedRequest<'a> {
+        ReceivedRequest {
+            method: "GET",
+            path_and_query: "/v1/x/feed?after=3",
+            body: BodyField::read(b""),
+            origin: "https://switch.example",
+            headers,
+        }
+    }
+
+    #[test]
+    fn test_response_signature_binds_the_received_request() {
+        let key = AppKeys::from_secrets([3; 32], [4; 32]);
+        let public = key.signing_public();
+        let headers = honest_headers();
+        let parts = ResponseParts {
+            status: 200,
+            request: received(&headers),
+            server_time: "2026-01-01T00:00:00.000Z",
+            head: Some("aGVhZA"),
+            body: b"{}",
+        };
+        let signature = sign_response(&key, &parts);
+        assert!(verify_response(&public, &parts, &signature).is_ok());
+        let forged_signature = ReceivedHeaders::of([
+            (header::IDENTITY, b"id".as_slice()),
+            (header::APP, b"app".as_slice()),
+            (header::TIMESTAMP, b"2026-01-01T00:00:00Z".as_slice()),
+            (header::SIGNATURE, b"c2lo".as_slice()),
+        ]);
+        let other_time = ReceivedHeaders::of([
+            (header::IDENTITY, b"id".as_slice()),
+            (header::APP, b"app".as_slice()),
+            (header::TIMESTAMP, b"2026-01-01T00:00:01Z".as_slice()),
+            (header::SIGNATURE, b"c2ln".as_slice()),
+        ]);
+        let request = received(&headers);
+        let changed = [
+            ResponseParts {
+                status: 201,
+                ..parts
+            },
+            ResponseParts {
+                head: None,
+                ..parts
+            },
+            ResponseParts {
+                head: Some("aGVhZB"),
+                ..parts
+            },
+            ResponseParts {
+                server_time: "2026-01-01T00:00:00.001Z",
+                ..parts
+            },
+            ResponseParts {
+                body: b"{ }",
+                ..parts
+            },
+        ];
+        for other in changed {
+            assert!(verify_response(&public, &other, &signature).is_err());
+        }
+        // Every part of the received request: the method as received, the query, the body
+        // field, the origin and each header.
+        let requests = [
+            ReceivedRequest {
+                method: "get",
+                ..request
+            },
+            ReceivedRequest {
+                path_and_query: "/v1/x/feed?after=4",
+                ..request
+            },
+            ReceivedRequest {
+                path_and_query: "/v1/x/feed",
+                ..request
+            },
+            ReceivedRequest {
+                body: BodyField::NotRead,
+                ..request
+            },
+            ReceivedRequest {
+                body: BodyField::read(b"x"),
+                ..request
+            },
+            ReceivedRequest {
+                origin: "https://other.example",
+                ..request
+            },
+            ReceivedRequest {
+                headers: &forged_signature,
+                ..request
+            },
+            ReceivedRequest {
+                headers: &other_time,
+                ..request
+            },
+        ];
+        for other in requests {
+            let other = ResponseParts {
+                request: other,
+                ..parts
+            };
+            assert!(verify_response(&public, &other, &signature).is_err());
+        }
+    }
+
+    #[test]
+    fn test_response_head_field_tells_absent_from_empty() {
+        let headers = honest_headers();
+        let parts = ResponseParts {
+            status: 403,
+            request: received(&headers),
+            server_time: "2026-01-01T00:00:00.000Z",
+            head: None,
+            body: b"{}",
+        };
+        let absent = response_fields(&parts);
+        assert!(absent[3].is_empty());
+        let empty = response_fields(&ResponseParts {
+            head: Some(""),
+            ..parts
+        });
+        assert_eq!(empty[3], hash(b"").to_vec());
+        let key = AppKeys::from_secrets([3; 32], [4; 32]);
+        let signature = sign_response(&key, &parts);
+        assert!(
+            verify_response(
+                &key.signing_public(),
+                &ResponseParts {
+                    head: Some(""),
+                    ..parts
+                },
+                &signature
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_received_request_header_presence_and_repeats() {
+        let none = ReceivedHeaders::default();
+        let empty = ReceivedHeaders::of([(header::INVITE_CODE, b"".as_slice())]);
+        let once = ReceivedHeaders::of([(header::APP, b"a".as_slice())]);
+        let twice = ReceivedHeaders::of([
+            (header::APP, b"a".as_slice()),
+            (header::APP, b"a".as_slice()),
+        ]);
+        let joined = ReceivedHeaders::of([(header::APP, b"a, a".as_slice())]);
+        let encodings: Vec<Vec<u8>> = [&none, &empty, &once, &twice, &joined]
+            .into_iter()
+            .map(|headers| received_request(&received(headers)))
+            .collect();
+        for (i, a) in encodings.iter().enumerate() {
+            for b in &encodings[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // An absent header is an empty field; one present once with an empty value is
+        // `u32_be(0)`.
+        let fields = crate::enc::split_lp(&encodings[1]).unwrap();
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields[7], vec![0, 0, 0, 0]);
+        assert!(
+            fields[4..11]
+                .iter()
+                .enumerate()
+                .all(|(i, f)| i == 3 || f.is_empty())
+        );
+        // Names are compared case-insensitively, and headers it doesn't cover are left out.
+        let mixed = ReceivedHeaders::of([
+            ("Switch-App", b"a".as_slice()),
+            ("content-type", b"x".as_slice()),
+        ]);
+        assert_eq!(mixed, once);
+        assert_eq!(mixed.values(header::APP), [b"a".to_vec()]);
+        // The body field: empty before the body is read, 32 bytes after.
+        let fields = crate::enc::split_lp(&received_request(&ReceivedRequest {
+            body: BodyField::NotRead,
+            ..received(&none)
+        }))
+        .unwrap();
+        assert!(fields[2].is_empty());
+        assert_eq!(BodyField::read(b"").as_bytes(), hash(b""));
+    }
+
+    #[test]
+    fn test_public_read_binds_no_header() {
+        let headers = honest_headers();
+        let read = ReceivedRequest {
+            path_and_query: "/v1/x/identity",
+            ..received(&headers)
+        };
+        let bare = ReceivedHeaders::default();
+        assert_eq!(
+            received_request(&read),
+            received_request(&ReceivedRequest {
+                headers: &bare,
+                ..read
+            })
+        );
+        // Only the call decides: another method's or another path's headers count.
+        for (method, path) in [
+            ("get", "/v1/x/identity"),
+            ("PUT", "/v1/x/identity"),
+            ("GET", "/v1/x/identity/"),
+            ("GET", "/v1//identity"),
+            ("GET", "/v1/x/feed"),
+        ] {
+            assert!(!is_public_read(method, path), "{method} {path}");
+            let other = ReceivedRequest {
+                method,
+                path_and_query: path,
+                ..read
+            };
+            assert_ne!(
+                received_request(&other),
+                received_request(&ReceivedRequest {
+                    headers: &bare,
+                    ..other
+                })
+            );
+        }
+        assert!(is_public_read("GET", "/v1/x/identity?x=1"));
     }
 
     #[test]

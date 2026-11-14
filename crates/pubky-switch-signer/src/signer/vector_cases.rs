@@ -573,7 +573,7 @@ async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["request_signature"] == request["signature"])
+        .find(|r| r["request"] == request["name"])
         .unwrap();
     let response = Response {
         status: u16::try_from(answer["status"].as_u64().unwrap()).unwrap(),

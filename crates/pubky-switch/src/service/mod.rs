@@ -88,7 +88,7 @@ use crate::{
 };
 
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
-use self::signed::{Asked, sign_answer};
+use self::signed::{Asked, Received, sign_answer};
 use self::verdict::{RequestClass, Route};
 
 /// How many claims whose time has passed one request deletes at most (Switch wire 7.3
@@ -538,7 +538,16 @@ impl Service {
         let reading = self.time.read();
         let base_ms = reading.base_ms;
         let due = reading.trusted.then_some(base_ms);
-        let asked = Asked::of(&request.method, &request.path_and_query, &request.headers);
+        // The request as received, which every answer to it signs (Switch wire 7.1).
+        let received = Received::read(&request, &self.origin);
+        let asked = received.asked();
+        // A signed request header sent more than once is refused before the account is looked
+        // up and before any signature work: the service never chooses between two signed
+        // values. The public read uses none of them (Switch wire 7.1).
+        if received.repeats_a_signed_header() && request.route.call != Call::GetIdentity {
+            let error = ApiError::bad_request("7.1: a signed request header sent more than once");
+            return self.service_error(asked, base_ms, &error);
+        }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
         }
@@ -548,13 +557,6 @@ impl Service {
             return self.service_error(asked, base_ms, &error);
         };
         let call = &request.route.call;
-        // The public read's answer signs the hash of the empty string as the request
-        // signature, so it is the same for every reader (Switch wire 7.4.15).
-        let asked = if *call == Call::GetIdentity {
-            asked.unsigned()
-        } else {
-            asked
-        };
         // Step 2: the account and its mark, judged together, before the lock (Switch wire
         // 7.3, Table 1).
         let (found, judged) = match self.judge_at_step_two(&account).await {
@@ -1776,20 +1778,8 @@ impl Handler for Service {
                 Refusal::UnknownRoute { .. } => ApiError::not_found("no such route"),
                 Refusal::TooLarge { cap, .. } => ApiError::body_too_large(*cap),
             };
-            let asked = match &refusal {
-                Refusal::UnknownRoute {
-                    method,
-                    path_and_query,
-                    headers,
-                }
-                | Refusal::TooLarge {
-                    method,
-                    path_and_query,
-                    headers,
-                    ..
-                } => Asked::of(method, path_and_query, headers),
-            };
-            self.service_error(asked, base_ms, &error)
+            let received = Received::refused(&refusal, &self.origin);
+            self.service_error(received.asked(), base_ms, &error)
         })
     }
 }

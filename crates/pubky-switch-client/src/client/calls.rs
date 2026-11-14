@@ -830,10 +830,10 @@ impl SwitchClient {
     /// or holds another document answers `409 conflict`, carrying `current.created`, and
     /// erases nothing.
     ///
-    /// A signer whose `200` was lost gets, on a retry, the operator-signed `404` of an
-    /// account the service doesn't host, as
-    /// [`ClientError::BadServiceSignature`] with status 404; it takes that as the erasure
-    /// done (Switch wire 7.4.16).
+    /// A signer whose `200` was lost gets, on a retry, the `404` of an identity the service
+    /// doesn't host, signed with the key it pinned and bound to the retry
+    /// ([`ClientError::is_not_hosted`]); it takes that as the erasure done (Switch wire
+    /// 7.4.16).
     ///
     /// # Errors
     ///

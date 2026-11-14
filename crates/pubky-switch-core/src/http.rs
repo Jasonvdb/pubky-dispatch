@@ -10,7 +10,6 @@ use crate::error::{Error, Result, invalid};
 use crate::labels;
 use crate::sig;
 use crate::signing::Signs;
-use serde::{Deserialize, Serialize};
 
 /// Header names, as the switch sends them, in lower case; names are case-insensitive
 /// (Switch wire 7.1).
@@ -648,9 +647,6 @@ pub enum ErrorCode {
     Staged,
     /// `503`: a temporary failure.
     Unavailable,
-    /// `503`: the account awaits a recovery; its `current` is a [`RecoveryNotice`] (Switch
-    /// wire 7.3, 7.6).
-    RecoveryRequired,
 }
 
 /// Whether the same request may succeed later (the Retry column of Switch spec 6.4).
@@ -678,14 +674,11 @@ pub enum Retry {
     WhenLimitFrees,
     /// Yes, unchanged.
     Yes,
-    /// Held for the next generation: neither sent again to this generation nor final
-    /// (Switch wire 7.6, Switch spec 6.4).
-    HeldForNextGeneration,
 }
 
 impl ErrorCode {
     /// Every code, in the order of the table.
-    pub const ALL: [ErrorCode; 21] = [
+    pub const ALL: [ErrorCode; 20] = [
         ErrorCode::BadRequest,
         ErrorCode::BadSignature,
         ErrorCode::StaleTimestamp,
@@ -706,7 +699,6 @@ impl ErrorCode {
         ErrorCode::QuotaExceeded,
         ErrorCode::Staged,
         ErrorCode::Unavailable,
-        ErrorCode::RecoveryRequired,
     ];
 
     /// The `code` text.
@@ -732,7 +724,6 @@ impl ErrorCode {
             ErrorCode::QuotaExceeded => "quota_exceeded",
             ErrorCode::Staged => "staged",
             ErrorCode::Unavailable => "unavailable",
-            ErrorCode::RecoveryRequired => "recovery_required",
         }
     }
 
@@ -762,7 +753,7 @@ impl ErrorCode {
             ErrorCode::Moved => 410,
             ErrorCode::TooLarge => 413,
             ErrorCode::RateLimited | ErrorCode::QuotaExceeded => 429,
-            ErrorCode::Staged | ErrorCode::Unavailable | ErrorCode::RecoveryRequired => 503,
+            ErrorCode::Staged | ErrorCode::Unavailable => 503,
         }
     }
 
@@ -788,7 +779,6 @@ impl ErrorCode {
             ErrorCode::RateLimited => Retry::AfterRetryAfter,
             ErrorCode::QuotaExceeded => Retry::WhenLimitFrees,
             ErrorCode::Staged | ErrorCode::Unavailable => Retry::Yes,
-            ErrorCode::RecoveryRequired => Retry::HeldForNextGeneration,
         }
     }
 
@@ -797,63 +787,6 @@ impl ErrorCode {
     pub fn carries_known_version(self) -> bool {
         self == ErrorCode::IdentityNeeded
     }
-}
-
-/// Why an account awaits a recovery, the `reason` of a [`RecoveryNotice`] (Switch wire 7.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NoticeReason {
-    /// `behind`: the account's state is behind the newest head the service signed for it,
-    /// or of an earlier generation than its mark, or the account is gone while its mark is
-    /// there, or is staged and bounded by its mark.
-    Behind,
-    /// `fork`: the account is at that head's `seq` with another chain hash.
-    Fork,
-    /// `mark_lost`: the account's mark is missing or doesn't read as a mark.
-    MarkLost,
-}
-
-/// The `current` of a `503 recovery_required`, the recovery notice (Switch wire 7.6, Switch
-/// spec 6.5). All three members are required; unknown members are ignored, since an error
-/// body isn't among the places that refuse them (Switch wire 1.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoveryNotice {
-    /// The higher of the account's generation here, 0 while it holds no document, and its
-    /// mark's.
-    pub generation: u64,
-    /// Why the account awaits a recovery.
-    pub reason: NoticeReason,
-    /// `true` once the operator retired this generation for the account.
-    pub permanent: bool,
-}
-
-impl RecoveryNotice {
-    /// Read a notice from an error body's `current` (Switch wire 7.6). Unknown members are
-    /// ignored (Switch wire 1.1).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] if a member is missing or of another type, or `reason` isn't one
-    /// of the three: a malformed notice, which a client still holds as a notice for the
-    /// generation it follows, with `permanent` `false` (Switch wire 7.6).
-    pub fn from_current(current: &serde_json::Value) -> Result<Self> {
-        Ok(serde_json::from_value(current.clone())?)
-    }
-
-    /// The notice as an error body's `current`.
-    pub fn to_current(&self) -> serde_json::Value {
-        serde_json::json!({
-            "generation": self.generation,
-            "reason": self.reason,
-            "permanent": self.permanent,
-        })
-    }
-}
-
-/// The `current` of the `404 not_found` to an identity the service doesn't host,
-/// `{ "hosted": false }`, and of nothing else (Switch wire 7.3 step 2, 7.6).
-pub fn not_hosted_current() -> serde_json::Value {
-    serde_json::json!({ "hosted": false })
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -977,53 +910,6 @@ mod tests {
         );
         assert_eq!(path_of("/v1/accounts/x/feed"), "/v1/accounts/x/feed");
         assert_eq!(path_of("/v1/a%20b?x=1?y"), "/v1/a%20b");
-    }
-
-    #[test]
-    fn test_recovery_notice_reads_its_members() {
-        let notice = RecoveryNotice::from_current(&serde_json::json!({
-            "generation": 3, "reason": "mark_lost", "permanent": false
-        }))
-        .unwrap();
-        assert_eq!(
-            notice,
-            RecoveryNotice {
-                generation: 3,
-                reason: NoticeReason::MarkLost,
-                permanent: false
-            }
-        );
-        assert_eq!(
-            RecoveryNotice::from_current(&notice.to_current()).unwrap(),
-            notice
-        );
-        // An unknown member is ignored (Switch wire 1.1).
-        assert_eq!(
-            RecoveryNotice::from_current(&serde_json::json!({
-                "generation": 3, "reason": "mark_lost", "permanent": false, "x": 1
-            }))
-            .unwrap(),
-            notice
-        );
-        // A malformed notice: a member missing, an unknown `reason`, a wrong type.
-        for bad in [
-            serde_json::json!({ "generation": 3, "reason": "behind" }),
-            serde_json::json!({ "generation": 3, "reason": "lost", "permanent": false }),
-            serde_json::json!({ "generation": "3", "reason": "fork", "permanent": false }),
-            serde_json::json!({ "generation": 3, "reason": "fork", "permanent": "no" }),
-        ] {
-            assert!(RecoveryNotice::from_current(&bad).is_err(), "{bad}");
-        }
-        assert_eq!(ErrorCode::RecoveryRequired.status(), 503);
-        assert_eq!(
-            ErrorCode::parse("recovery_required"),
-            Some(ErrorCode::RecoveryRequired)
-        );
-        assert_eq!(
-            ErrorCode::RecoveryRequired.retry(),
-            Retry::HeldForNextGeneration
-        );
-        assert_eq!(not_hosted_current(), serde_json::json!({ "hosted": false }));
     }
 
     #[test]

@@ -472,8 +472,7 @@ pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
         | Retry::AtNextService
         | Retry::AfterRetryAfter
         | Retry::WhenLimitFrees
-        | Retry::Yes
-        | Retry::HeldForNextGeneration => None,
+        | Retry::Yes => None,
     }
 }
 

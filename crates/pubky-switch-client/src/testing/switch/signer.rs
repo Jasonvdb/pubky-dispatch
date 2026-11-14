@@ -892,6 +892,7 @@ mod tests {
             body: json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         switch.lock().enroll(&request).unwrap()
     }
@@ -950,7 +951,8 @@ mod tests {
                 origin: SWITCH_ORIGIN.into(),
                 path_and_query: "/v1/x/erase".into(),
                 headers: Vec::new(),
-                body: pubky_switch_core::http::erase_body(Some(&hash)),
+                body: pubky_switch_core::http::erase_body(None, Some(&hash)),
+                timeout: crate::transport::TimeoutClass::default(),
             };
             assert_eq!(inner.erase_answer(&erasure).0, 200);
         }
@@ -1020,6 +1022,7 @@ mod tests {
             body: json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         let refused = |answer: &crate::transport::Response| {
             let body: Value = serde_json::from_slice(&answer.body).unwrap();
@@ -1186,7 +1189,8 @@ mod tests {
             origin: SWITCH_ORIGIN.into(),
             path_and_query: "/v1/x/erase".into(),
             headers: Vec::new(),
-            body: erase_body(hash),
+            body: erase_body(None, hash),
+            timeout: crate::transport::TimeoutClass::default(),
         };
         let mut inner = switch.lock();
         assert!(inner.doc.is_none());

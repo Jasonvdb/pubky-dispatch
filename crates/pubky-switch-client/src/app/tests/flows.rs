@@ -787,40 +787,6 @@ async fn test_missed_entries_last_time_unparsable_asks_for_nothing() {
     assert!(!app.listing_owed().await.unwrap());
 }
 
-/// A missed-entries call kept owed in the form written before, without the item's last
-/// acceptance time, still reads and is made, with no end.
-#[tokio::test]
-async fn test_missed_entries_owed_call_of_the_earlier_form_is_made_without_an_end() {
-    let w = World::new();
-    let mut app = w.join("wallet").await;
-    let me = app.app_id();
-    app.receive(None).await.unwrap();
-    let now = w.clock.now_ms();
-    // Owed at the cursor, as a call is when its item is passed.
-    let at = app.cursor().seq;
-    let mut tx = app.tx().unwrap();
-    tx.put(
-        &crate::app::state::key::owed(1, at),
-        &json!({ "Missed": { "seq": at, "entries": 2, "accepted_from_ms": now } }),
-    )
-    .unwrap();
-    app.commit(tx).await.unwrap();
-    drop(app);
-    let mut app = w.load(me).await;
-    app.receive(None).await.unwrap();
-    let missed = w.protocol.missed.lock().unwrap().clone();
-    assert_eq!(missed.len(), 1);
-    assert_eq!(
-        (
-            missed[0].seq,
-            missed[0].accepted_from_ms,
-            missed[0].accepted_until_ms
-        ),
-        (at, now, u64::MAX)
-    );
-    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
-}
-
 #[tokio::test]
 async fn test_app_owed_call_failing_for_good_holds_the_later_ones() {
     // Switch spec 8.3: every notice the protocol can't take yet is kept in feed order, and
@@ -1719,7 +1685,7 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
     }
     assert!(app.state.pending_effect.is_some());
     // Kept in service time, whatever the device read.
-    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms.unwrap();
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
     assert!(kept <= w.clock.now_ms(), "{kept}");
     // The clock is set right. 30 days and half an hour after the service applied it, its
     // proofs are gone and a retry would be answered `409 conflict`.
@@ -1810,10 +1776,6 @@ fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
 
 /// A write while the service can't be reached: kept, never sent.
 async fn write_offline(w: &World, app: &mut App) {
-    w.switch.fail_next(Fault::Unreachable {
-        path: "feed".into(),
-        after: 0,
-    });
     w.switch.fail_next(Fault::Unreachable {
         path: "ops".into(),
         after: 0,
@@ -2160,7 +2122,7 @@ async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
     let _ = app.receive(None).await;
     let pending = app.state.pending_effect.as_ref().unwrap();
     assert_eq!(pending.seq, seq);
-    let age = w.clock.now_ms() - pending.kept_ms.unwrap();
+    let age = w.clock.now_ms() - pending.kept_ms;
     assert!(age < HOUR, "kept {age} ms before now");
 }
 
@@ -2506,20 +2468,20 @@ impl Protocol for LifecycleProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive_with(
+    fn receive(
         &self,
         message: &crate::app::ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> crate::app::Outcome {
         if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         }
         if self.in_context {
             let answer = cx.op(Vec::new(), self.extra.clone());
             self.answers.lock().unwrap().push(answer.is_ok());
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         }
-        match self.sample.receive(message) {
+        match self.sample.receive(message, cx) {
             crate::app::Outcome::Apply(mut effect) => {
                 effect.ops.push((Vec::new(), self.extra.clone()));
                 crate::app::Outcome::Apply(effect)
@@ -3674,14 +3636,15 @@ fn test_app_config_keeps_the_spec_bounds() {
 }
 
 #[tokio::test]
-async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
+async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let me = app.app_id();
     w.note(me, "one");
     app.receive(None).await.unwrap();
     let ns = app.ns.clone();
-    // Every value of the app's own, as schema 1 wrote it.
+    // Every value of the app's own, under another version.
+    let other = crate::app::SCHEMA_VERSION + 1;
     let mut batch = crate::store::WriteBatch::new();
     for (key, bytes) in app.reader().scan_raw("").await.unwrap() {
         if key.starts_with("p/") {
@@ -3691,7 +3654,7 @@ async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
             continue;
         };
         if value.get("v") == Some(&json!(crate::app::SCHEMA_VERSION)) {
-            value["v"] = json!(1);
+            value["v"] = json!(other);
             batch
                 .put(
                     &ns,
@@ -3707,10 +3670,7 @@ async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
     drop(app);
     let loaded = App::load(w.env(), w.protocol.clone(), World::config(), me).await;
     assert!(
-        matches!(
-            loaded,
-            Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
-        ),
+        matches!(loaded, Err(AppError::Store(crate::StoreError::Corrupt))),
         "{:?}",
         loaded.map(|_| ())
     );
@@ -3725,28 +3685,18 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // An earlier schema's backup is an old schema, as its store is; a later one doesn't
-    // read.
-    value["v"] = json!(1);
-    let old = serde_json::to_vec(&value).unwrap();
-    assert!(matches!(
-        AppBackup::from_bytes(&old),
-        Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
-    ));
-    // A layered backup as schema 1 wrote it, at version 2.
-    value["v"] = json!(2);
-    value["protocol"] =
-        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
-    let old_layered = serde_json::to_vec(&value).unwrap();
-    assert!(matches!(
-        AppBackup::from_bytes(&old_layered),
-        Err(AppError::Store(crate::StoreError::OldSchema { found: 2 }))
-    ));
+    // Another version doesn't read, with or without a layer.
     value["v"] = json!(9);
-    value.as_object_mut().unwrap().remove("protocol");
     let other = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other),
+        Err(AppError::InvalidData(_))
+    ));
+    value["protocol"] =
+        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
+    let other_layered = serde_json::to_vec(&value).unwrap();
+    assert!(matches!(
+        AppBackup::from_bytes(&other_layered),
         Err(AppError::InvalidData(_))
     ));
     assert!(AppBackup::from_bytes(b"{}").is_err());
@@ -4429,7 +4379,11 @@ impl Protocol for WideProtocol {
         self.0.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        _: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let ops = (0..8u8)
             .map(|n| (Vec::new(), OpKind::DenyPut { pubky: [n; 32] }))
             .collect();
@@ -4540,9 +4494,20 @@ impl Protocol for BigProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         if message.message.body.get("text").and_then(Value::as_str) != Some("big") {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
+        }
+        if self.via_context {
+            for write in self.writes() {
+                let added = cx.local(write).map_err(|error| error.to_string());
+                self.added.lock().unwrap().push(added);
+            }
+            return Outcome::Apply(Effect::default());
         }
         let ops = if self.ops {
             vec![(
@@ -4559,22 +4524,6 @@ impl Protocol for BigProtocol {
             ops,
             local: self.writes(),
         })
-    }
-
-    fn receive_with(
-        &self,
-        message: &ReceivedMessage,
-        cx: &mut crate::app::ReceiveContext<'_>,
-    ) -> Outcome {
-        let big = message.message.body.get("text").and_then(Value::as_str) == Some("big");
-        if !self.via_context || !big {
-            return self.receive(message);
-        }
-        for write in self.writes() {
-            let added = cx.local(write).map_err(|error| error.to_string());
-            self.added.lock().unwrap().push(added);
-        }
-        Outcome::Apply(Effect::default())
     }
 
     fn resend_needed(
@@ -4813,6 +4762,7 @@ async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
                     ),
                 ],
                 body,
+                timeout: crate::transport::TimeoutClass::default(),
             })
             .unwrap()
             .status
@@ -4908,7 +4858,11 @@ impl Protocol for FillProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
         let text = message
             .message
             .body
@@ -4928,7 +4882,7 @@ impl Protocol for FillProtocol {
                 })
                 .collect()
         } else {
-            return self.sample.receive(message);
+            return self.sample.receive(message, cx);
         };
         Outcome::Apply(Effect {
             ops: Vec::new(),
@@ -5471,9 +5425,13 @@ impl Protocol for OrderedProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
         self.log.lock().unwrap().push(("message", message.seq));
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -5716,7 +5674,11 @@ impl Protocol for KindsProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
         {
             let mut retries = self.retries.lock().unwrap();
             if *retries > 0 {
@@ -5727,7 +5689,7 @@ impl Protocol for KindsProtocol {
             }
         }
         self.log.lock().unwrap().push(("message", message.seq));
-        self.sample.receive(message)
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(
@@ -6970,8 +6932,12 @@ impl Protocol for LayeredDenyProtocol {
         self.sample.check_body(message)
     }
 
-    fn receive(&self, message: &crate::app::ReceivedMessage) -> crate::app::Outcome {
-        self.sample.receive(message)
+    fn receive(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
+        self.sample.receive(message, cx)
     }
 
     fn resend_needed(

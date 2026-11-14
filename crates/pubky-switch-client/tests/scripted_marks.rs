@@ -581,6 +581,7 @@ async fn test_one_key_earlier_answer_replayed_is_refused() {
             path_and_query: format!("/v1/{}/identity", alice.identity().key().id()),
             headers: Vec::new(),
             body: delivery(&recovery, Some(held)).to_json(),
+            timeout: pubky_switch_client::transport::TimeoutClass::default(),
         })
         .await
         .unwrap();

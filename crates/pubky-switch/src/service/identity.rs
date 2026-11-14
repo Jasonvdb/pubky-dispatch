@@ -12,7 +12,7 @@ use pubky_switch_core::{
 };
 use serde_json::{Value, json};
 
-use super::{Answer, Service, store_error};
+use super::{Answer, Service, marking::Judged, store_error};
 use crate::{
     http::{
         SwitchRequest,
@@ -57,33 +57,37 @@ pub(super) fn write_answer(
 }
 
 impl Service {
-    /// `PUT /v1/{id}/identity`, from the signer (Switch wire 7.4.2).
+    /// `PUT /v1/{id}/identity`, from the signer (Switch wire 7.4.2), under the verdict
+    /// `judged`; `afresh` where it is the start a failing or bounded account takes (Switch
+    /// wire 7.3, Table 2).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn put_identity(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
         held: Option<&IdentityDoc>,
+        judged: &Judged,
+        afresh: bool,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<(Answer, bool), ApiError> {
+    ) -> Result<Answer, ApiError> {
         let identity_key = txn.head().identity_key;
         let delivery = IdentityDelivery::parse(&request.body)
             .map_err(|_| ApiError::bad_request("7.4.2: the body isn't a delivery"))?;
         let doc = IdentityDoc::verify(&delivery.identity, &identity_key).map_err(|_| {
             ApiError::bad_request("3.3: the identity.json doesn't verify for this identity")
         })?;
+        if afresh {
+            return self
+                .start_afresh(txn, held, judged, &doc, trusted, time_ms)
+                .await;
+        }
         let service_key = super::PublicKeyBytes::public_key_bytes(signer);
         let staged = !super::rules::names_this_service(held, &self.origin, &service_key);
-        let pending_key = match txn.pending_key().await.map_err(|e| store_error(&e))? {
-            Some(id) => Some(
-                self.keys
-                    .public_key(&id)
-                    .await
-                    .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))?,
-            ),
-            None => None,
-        };
+        // The next generation in place names the key the service's enrollments answer, its
+        // current key (Switch wire 3.3, 3.7).
+        let next_key = self.current_key();
         let kept_app_ids = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
         let app_limit = txn
             .announced_limits()
@@ -117,7 +121,7 @@ impl Service {
             app_limit,
             staged,
             origin: &self.origin,
-            pending_key,
+            pending_key: Some(next_key),
             kept_app_ids: &kept_app_ids,
             kept_proofs: KeptProofs {
                 records: &records,
@@ -148,14 +152,24 @@ impl Service {
                     .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
                 let proofs: Vec<_> = proof.iter().collect();
                 let body = write_answer(&proofs, &head.to_json())?;
-                Ok((Answer::ok(body).with_head(Some(head)), !staged))
+                Ok(Answer::ok(body).with_head(Some(head)))
             }
-            // A provider loss at this service: the account starts afresh under its pending
-            // key (Switch wire 3.3, 7.4.2).
+            // A provider loss at this service: the account starts afresh (Switch wire 3.3,
+            // 7.4.2).
             Ok(Delivery::New(Some(GenerationChange::ProviderLoss))) => {
                 self.recover_in_place(txn, &doc, trusted, time_ms).await
             }
-            // A key rotation, and the move to a staged account, aren't served.
+            // Without `recovery_from`, a service key change: its key differs from the ending
+            // generation's (Switch wire 3.3).
+            Ok(Delivery::New(Some(GenerationChange::KeyRotation)))
+                if held.is_some_and(|held| held.inbox().service_key == doc.inbox().service_key) =>
+            {
+                Err(ApiError::bad_request(
+                    "3.3: a service key change names another key than the ending generation's",
+                ))
+            }
+            // A key change to a key the service changed to, and the move to a staged account,
+            // aren't served.
             Ok(Delivery::New(Some(_))) => Err(ApiError::unavailable(
                 "7.4.2: a generation change isn't served yet",
             )),
@@ -177,8 +191,11 @@ impl Service {
                     .map_err(|e| store_error(&e))?;
                 self.chain_recovery(txn, signer, recovery_from, time_ms)
                     .await?;
-                self.chain_delivery(txn, signer, None, &doc, trusted, time_ms)
-                    .await
+                let mut answer = self
+                    .chain_delivery(txn, signer, None, &doc, trusted, time_ms)
+                    .await?;
+                answer.starts_generation = true;
+                Ok(answer)
             }
             // A first document at another generation than the account's, an account enrolled
             // with a document: not taken without a recovery.
@@ -190,26 +207,105 @@ impl Service {
                 ))
             }
             Ok(Delivery::New(None)) => {
-                self.chain_delivery(txn, signer, held, &doc, trusted, time_ms)
-                    .await
+                let mut answer = self
+                    .chain_delivery(txn, signer, held, &doc, trusted, time_ms)
+                    .await?;
+                // An account's first document starts its first generation (Switch wire 7.3,
+                // Table 3).
+                answer.starts_generation = held.is_none();
+                Ok(answer)
             }
         }
     }
 
+    /// The start a failing or bounded account takes (Switch wire 3.3, 7.3 Table 2): `doc`,
+    /// at a generation above both the held document's and the mark's with `recovery_from`
+    /// its generation less one, which the verdict checked, naming this origin and a key the
+    /// service holds. The account starts afresh, without the compare-and-swap of `prev`: its
+    /// chain begins with the `recovery` transition, and `doc` is taken as its first document.
+    /// Answered as the account stands after the commit, with the key `doc` names.
+    async fn start_afresh(
+        &self,
+        txn: &mut AccountTxn,
+        held: Option<&IdentityDoc>,
+        judged: &Judged,
+        doc: &IdentityDoc,
+        trusted: bool,
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let temporary = || ApiError::unavailable("7.6: a temporary failure");
+        let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        let floor = judged
+            .account
+            .map_or(0, |account| account.generation())
+            .max(judged.mark().map_or(0, |mark| mark.generation));
+        if doc.generation() <= floor || recovery_from.checked_add(1) != Some(doc.generation()) {
+            return Err(temporary());
+        }
+        if doc.inbox().url != self.origin {
+            return Err(ApiError::bad_request(
+                "7.4.2: a recovery's document names this service",
+            ));
+        }
+        let Some(new_signer) = self.keys.signer_for(&doc.inbox().service_key) else {
+            return Err(ApiError::bad_request(
+                "7.4.2: a recovery's document names this service's key",
+            ));
+        };
+        let app_limit = txn
+            .announced_limits()
+            .await
+            .map_err(|e| store_error(&e))?
+            .app_limit;
+        if u64::try_from(doc.body().apps.len()).unwrap_or(u64::MAX) > app_limit {
+            return Err(ApiError::bad_request("3.3: more apps than the app limit"));
+        }
+        // It lists no App ID the enrollments since the generation began named, nor one the
+        // account keeps for good unless the version held still lists it: the new generation
+        // keeps them from its start (Switch wire 3.3, 3.7).
+        let kept = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
+        let held_revoked = txn.held_revoked_apps().await.map_err(|e| store_error(&e))?;
+        let listed = |app: &[u8; 16]| held.is_some_and(|held| held.listed_cert(app).is_some());
+        if doc.body().apps.iter().any(|app| {
+            held_revoked.contains(&app.app_id)
+                || (kept.contains(&app.app_id) && !listed(&app.app_id))
+                || held.is_some_and(|held| held.lists_removed(&app.app_id))
+        }) {
+            return Err(ApiError::bad_request(
+                "3.3: apps lists an App ID the service revoked or saw depart",
+            ));
+        }
+        txn.start_afresh(
+            doc.generation(),
+            recovery_from,
+            time_ms,
+            !doc.body().apps.is_empty(),
+        )
+        .await
+        .map_err(|e| store_error(&e))?;
+        self.chain_recovery(txn, &new_signer, recovery_from, time_ms)
+            .await?;
+        let mut answer = self
+            .chain_delivery(txn, &new_signer, None, doc, trusted, time_ms)
+            .await?;
+        answer.key = Some(doc.inbox().service_key);
+        answer.starts_generation = true;
+        Ok(answer)
+    }
+
     /// A provider loss at this service (Switch wire 3.3, 3.7, 7.4.2): `doc`, at the next
-    /// generation, names the account's pending key and `recovery_from` the generation that
-    /// ends. Under the account's row lock, the keying lock is taken exclusive first, so no
-    /// answer of the outgoing key is signed once this commits, and nothing here signs with
-    /// it. Then the account starts afresh under the pending key
-    /// ([`AccountTxn::start_recovery_in_place`]), its chain begins with the `recovery`
-    /// transition, and `doc` is taken as its first document. The answer is the new key's.
+    /// generation, names the service's current key and `recovery_from` the generation that
+    /// ends. The account starts afresh ([`AccountTxn::start_afresh`]), the App IDs held for
+    /// the next generation joining its tombstones, its chain begins with the `recovery`
+    /// transition, and `doc` is taken as its first document. The answer is the key's `doc`
+    /// names.
     async fn recover_in_place(
         &self,
         txn: &mut AccountTxn,
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<(Answer, bool), ApiError> {
+    ) -> Result<Answer, ApiError> {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
         let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
         // The generation after the one it ends, the account's (wire 3.3): checked by the
@@ -219,12 +315,9 @@ impl Service {
         {
             return Err(temporary());
         }
-        // It lists no App ID the pending key's enrollments named: the new generation keeps
-        // them from its start, as a new account does (wire 3.7).
-        let held_revoked = txn
-            .pending_revoked_apps()
-            .await
-            .map_err(|e| store_error(&e))?;
+        // It lists no App ID the enrollments since the generation began named: the new
+        // generation keeps them from its start, as a new account does (wire 3.7).
+        let held_revoked = txn.held_revoked_apps().await.map_err(|e| store_error(&e))?;
         if doc
             .body()
             .apps
@@ -235,29 +328,26 @@ impl Service {
                 "3.3: apps lists an App ID the service revoked or saw depart",
             ));
         }
-        let new_key = txn
-            .pending_key()
-            .await
-            .map_err(|e| store_error(&e))?
+        let new_signer = self
+            .keys
+            .signer_for(&doc.inbox().service_key)
             .ok_or_else(temporary)?;
-        let new_signer = self.keys.signer(&new_key).await.map_err(|_| temporary())?;
-        txn.exclude_signers().await.map_err(|e| store_error(&e))?;
-        txn.start_recovery_in_place(
-            &new_key,
+        txn.start_afresh(
+            doc.generation(),
             recovery_from,
             time_ms,
-            self.limits.max_enrollments,
             !doc.body().apps.is_empty(),
         )
         .await
         .map_err(|e| store_error(&e))?;
         self.chain_recovery(txn, &new_signer, recovery_from, time_ms)
             .await?;
-        let (mut answer, serving) = self
+        let mut answer = self
             .chain_delivery(txn, &new_signer, None, doc, trusted, time_ms)
             .await?;
-        answer.rekeyed = Some(new_key);
-        Ok((answer, serving))
+        answer.key = Some(doc.inbox().service_key);
+        answer.starts_generation = true;
+        Ok(answer)
     }
 
     /// The `recovery` transition, the first chain item of the generation a provider loss
@@ -306,7 +396,7 @@ impl Service {
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<(Answer, bool), ApiError> {
+    ) -> Result<Answer, ApiError> {
         let failure = |_| ApiError::unavailable("7.6: a temporary failure");
         let identity_key = txn.head().identity_key;
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
@@ -379,9 +469,7 @@ impl Service {
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
         let body = write_answer(&[proof.signed()], &head.to_json())?;
-        let service_key = super::PublicKeyBytes::public_key_bytes(signer);
-        let serving = super::rules::names_this_service(Some(doc), &self.origin, &service_key);
-        Ok((Answer::ok(body).with_head(Some(head)), serving))
+        Ok(Answer::ok(body).with_head(Some(head)))
     }
 
     /// The public read of the newest `identity.json` (Switch wire 7.4.15): its limits are

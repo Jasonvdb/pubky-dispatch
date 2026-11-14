@@ -12,13 +12,9 @@
 
 mod support;
 
-use pubky_switch::{
-    http::Handler,
-    keys::{KeyId, KeyStore, Mark},
-    limits::Limits,
-};
+use pubky_switch::{http::Handler, limits::Limits};
 use pubky_switch_core::{
-    chain::SignedHead,
+    chain::{ChainTip, SignedHead},
     enc::pubky_key,
     ops::{AllowKind, Condition, OpKind, OpsRequest, SignedOp, sign_batch},
     sig::SignedDoc,
@@ -226,15 +222,20 @@ async fn hash_at(replay: &Replay, seq: u64) -> Vec<u8> {
     hash
 }
 
-async fn service_key(replay: &Replay) -> KeyId {
-    let mut conn = conn(replay).await;
-    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
-        .bind(alice_id())
-        .fetch_one(&mut conn)
+/// Move alice's mark ahead of the state the account holds, to (1, 500), as a database
+/// restored from before the heads the key signed leaves it: the account fails stop (Switch
+/// wire 7.3, Table 1).
+async fn mark_ahead(replay: &Replay) {
+    let ahead = ChainTip {
+        generation: 1,
+        seq: 500,
+        chain_hash: [0xcd; 32],
+    };
+    replay
+        .marks
+        .advance(&alice_id(), ahead, service_public(replay))
         .await
-        .expect("key");
-    conn.close().await.expect("close");
-    KeyId::parse(&id).expect("key id")
+        .expect("mark");
 }
 
 async fn head_seq(replay: &Replay) -> u64 {
@@ -272,7 +273,7 @@ async fn test_retention_cursors_passed_sign_a_checkpoint_and_drop_behind_it() {
     // Every current app's cursor is at the head: a request signs a checkpoint at the
     // newest of the stubs it read that may go, short of the head, and drops them; a feed
     // page, whose own request sweeps first, carries the checkpoint kept then, signed by the
-    // account's key at the chain hash there; and the current state reads the same (wire
+    // service key at the chain hash there; and the current state reads the same (wire
     // 7.4.4, 9.1).
     let Some(replay) = registered(small(), false).await else {
         return;
@@ -302,14 +303,9 @@ async fn test_retention_cursors_passed_sign_a_checkpoint_and_drop_behind_it() {
         .expect("hash")
         .1;
     assert_eq!(signed.chain_hash.as_slice(), hash.as_slice());
-    let key = replay
-        .keys
-        .public_key(&service_key(&replay).await)
-        .await
-        .expect("public");
     signed
-        .verify(&key, &alice_key())
-        .expect("signed by the account's key");
+        .verify(&service_public(&replay), &alice_key())
+        .expect("signed by the service key");
     // Read from behind the oldest kept stub: no stub before it.
     let first = page["items"].as_array().expect("items")[0]["seq"].as_u64();
     assert_eq!(first, kept(&replay).await.first().copied());
@@ -506,28 +502,111 @@ async fn test_retention_waits_for_trusted_time() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The signer's start of generation 2 with `recovery_from` 1, as a start at a failing account
+/// must be (Switch wire 7.3, Table 2), its `identity.json` carrying a signature that doesn't
+/// verify: the request reaches the lock and runs step 4, and the endpoint refuses it with
+/// `400`; the answer.
+async fn refused_start(replay: &Replay) -> pubky_switch::http::SwitchResponse {
+    use pubky_switch_core::{
+        http::IdentityDelivery,
+        keys::IdentityKey,
+        records::{IdentityBody, IdentityDoc},
+    };
+    let held: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("document");
+    let mut next: IdentityBody =
+        serde_json::from_slice(&held.body_bytes().expect("body")).expect("identity body");
+    next.version += 1;
+    next.generation = 2;
+    next.recovery_from = Some(1);
+    next.inbox.service_key = service_public(replay);
+    let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let mut forged = IdentityDoc::sign(&key, next)
+        .expect("sign")
+        .signed()
+        .clone();
+    forged.sig = held.sig.clone();
+    let delivery = IdentityDelivery {
+        identity: forged,
+        prev: None,
+    };
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery.to_json(), ms(AT)))
+        .await;
+    assert_eq!(
+        answer.status,
+        400,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    answer
+}
+
 #[tokio::test]
-async fn test_retention_signs_and_drops_nothing_behind_the_mark() {
-    // The key signed a head beyond the state the account holds: the request is refused
-    // with the mark's 503, and its step 4 signs no checkpoint and drops no stub (spec 6.5,
-    // wire 7.3 step 10).
+async fn test_retention_refused_start_at_a_healthy_account_signs_a_checkpoint() {
+    // Step 4 runs before the endpoint, so a refusal doesn't undo it: at a healthy account
+    // the refused start signs a checkpoint and drops the stubs behind it (wire 7.3, 9.1).
     let Some(replay) = registered(small(), false).await else {
         return;
     };
     chain(&replay, 10, 6, AT).await;
     let before = kept(&replay).await;
     cursors(&replay, ALL, head_seq(&replay).await).await;
-    let mark = Mark {
-        generation: 1,
-        seq: 500,
-        chain_hash: [0xcd; 32],
+    refused_start(&replay).await;
+    let (Some(checkpoint), Some(dropped)) = retained(&replay).await else {
+        panic!("a checkpoint and a drop");
     };
-    replay
-        .keys
-        .advance_mark(&service_key(&replay).await, mark)
-        .await
-        .expect("mark");
-    assert_eq!(request(&replay, AT).await, 503);
+    assert_eq!(dropped, checkpoint);
+    assert!(kept(&replay).await.len() < before.len());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_retention_signs_no_checkpoint_at_a_failing_account() {
+    // The mark is ahead of the state the account holds, so the account fails stop: an
+    // app's request gets the notice, and the refused start, which Table 2 lets through to
+    // the lock, runs step 4 with a verdict that isn't healthy, so it signs no checkpoint and
+    // drops no stub (spec 6.5, wire 7.3 step 10, Table 2).
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    chain(&replay, 10, 6, AT).await;
+    let before = kept(&replay).await;
+    cursors(&replay, ALL, head_seq(&replay).await).await;
+    mark_ahead(&replay).await;
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/claims/{}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&[7; 32])
+    );
+    let refused = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &path,
+            Vec::new(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(refused.status, 503);
+    let body: Value = serde_json::from_slice(&refused.body).expect("json");
+    assert_eq!(body["code"], "recovery_required");
+    assert_eq!(retained(&replay).await, (None, None));
+    let answer = refused_start(&replay).await;
+    assert!(
+        header_text(&answer, "switch-head").is_none(),
+        "no head at a failing account"
+    );
     assert_eq!(retained(&replay).await, (None, None));
     assert_eq!(kept(&replay).await, before);
     replay.db.drop_database().await.expect("drop");
@@ -770,7 +849,7 @@ async fn test_retention_an_app_of_another_identity_sweeps_the_chain() {
 #[tokio::test]
 async fn test_retention_behind_the_mark_keeps_the_stubs_behind_an_earlier_checkpoint() {
     // With `checkpoint_at_head`, a checkpoint at the head leaves stubs behind it that the
-    // cursors held. Then the state falls behind the key's mark and every cursor passes
+    // cursors held. Then the state falls behind the account's mark and every cursor passes
     // them: a request signs nothing and drops nothing behind the earlier checkpoint.
     let Some(replay) = registered(
         Limits {
@@ -793,16 +872,7 @@ async fn test_retention_behind_the_mark_keeps_the_stubs_behind_an_earlier_checkp
         "stubs kept behind it"
     );
     let before = kept(&replay).await;
-    let mark = Mark {
-        generation: 1,
-        seq: 500,
-        chain_hash: [0xcd; 32],
-    };
-    replay
-        .keys
-        .advance_mark(&service_key(&replay).await, mark)
-        .await
-        .expect("mark");
+    mark_ahead(&replay).await;
     cursors(&replay, ALL, head_seq(&replay).await).await;
     assert_eq!(request(&replay, AT).await, 503);
     assert_eq!(
@@ -1065,14 +1135,9 @@ async fn test_retention_a_page_with_no_items_carries_the_checkpoint() {
     };
     let signed = SignedHead::from_value(&page["checkpoint"]).expect("checkpoint");
     assert_eq!((signed.generation, signed.seq), (1, checkpoint));
-    let key = replay
-        .keys
-        .public_key(&service_key(&replay).await)
-        .await
-        .expect("public");
     signed
-        .verify(&key, &alice_key())
-        .expect("signed by the account's key");
+        .verify(&service_public(&replay), &alice_key())
+        .expect("signed by the service key");
     assert_eq!(
         SignedHead::from_value(&page["head"]).expect("head").seq,
         head

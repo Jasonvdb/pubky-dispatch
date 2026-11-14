@@ -780,9 +780,9 @@ impl SwitchClient {
         PublicIdentity::read(Obj::of(&value, what)?, &self.account())
     }
 
-    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming the pinned service key and,
-    /// when given, `identity_hash`, the document hash of the `identity.json` the erasure
-    /// follows: a switch holding another answers `409 conflict` and erases nothing.
+    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming `identity_hash`, the
+    /// document hash of the newest `identity.json` the account holds, or none for an account
+    /// that holds none: a switch holding another answers `409 conflict` and erases nothing.
     ///
     /// A signer whose `200` was lost gets, on a retry, the operator-signed `404` of an
     /// account the service doesn't host, as
@@ -794,7 +794,7 @@ impl SwitchClient {
     /// As every call.
     pub async fn erase(&self, identity_hash: Option<[u8; 32]>) -> Result<(), ClientError> {
         self.signer_only()?;
-        let body = erase_body(&self.key()?, identity_hash.as_ref());
+        let body = erase_body(None, identity_hash.as_ref());
         let checked = self.send_json("POST", "erase", body).await?;
         let (value, what) = Self::json_answer(
             &checked,

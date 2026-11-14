@@ -156,7 +156,7 @@ pub struct SwitchResponse {
 /// it, so that the answer is signed like every other.
 #[derive(Debug)]
 pub enum Refusal {
-    /// No such route: `404`, signed with the operator key (Switch wire 7.3 step 1).
+    /// No such route: `404`, signed with the service key (Switch wire 7.3 step 1).
     UnknownRoute {
         /// The method, upper case, which the answer's signature covers.
         method: String,

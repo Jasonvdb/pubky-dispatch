@@ -34,7 +34,7 @@ enum Command {
     Run,
     /// Check the configuration, and print it with every default written out.
     CheckConfig,
-    /// Compare every account's chain head with its service key's mark, reading only:
+    /// Judge every account against its mark, and every mark without an account, reading only:
     /// prints JSON lines, and exits 2 when an account needs attention.
     CheckMarks {
         /// Read this database instead of the configured one, against the same key store.
@@ -171,10 +171,12 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // serves anything.
     let _key_dir_lock = FileKeyStore::lock_dir(&key_dir)?;
     let keys = FileKeyStore::open(&key_dir)?;
+    let marks = pubky_switch::marks::MarkStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
     let instance = store
         .hold_instance_lock(pubky_switch::store::LockTiming::SERVICE)
         .await?;
+    let freshness = instance.freshness();
     // The database's lock lives with its session: once another session holds it, or it
     // can't be confirmed, this one stops (docs/configuration.md, "Topology").
     tokio::spawn(async move {
@@ -200,17 +202,20 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let api = match config.server.origin.clone() {
         Some(origin) => {
-            // Keys an erasure left owed, by a key store failure or a crash, go first (Switch
-            // wire 7.4.16), then accounts a restored database brought back after their
-            // erasure (spec 6.5), before the API listener takes a request.
+            // Push keys left owed, by a key store failure or a crash, go first (Switch wire
+            // 8.1), then accounts a restored database brought back after their erasure and
+            // the erasures' leftover marks (Switch wire 7.3, Table 1), before the API
+            // listener takes a request.
             let service = Arc::new(
                 Service::new(
                     origin.clone(),
                     store.clone(),
                     Arc::new(keys.clone()),
+                    marks,
                     time.clone(),
                     config.limits.clone(),
                 )
+                .with_lock_freshness(freshness)
                 .with_push(config.push.enabled)
                 .with_push_concurrency(config.push.concurrency)
                 .with_backup_retention_days(config.keys.backup_retention_days)

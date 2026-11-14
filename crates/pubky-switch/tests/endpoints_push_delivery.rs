@@ -28,7 +28,7 @@ use axum::{
 };
 use pubky_switch::{
     http::{Handler, SwitchResponse},
-    keys::{KeyFuture, KeyId, KeyStore, Mark, MarkCheck, ServiceKey, ServiceSigner},
+    keys::{FileKeyStore, KeyFuture, KeyId, KeyStore, ServiceKey, ServiceSigner},
     limits::Limits,
     service::{PushRound, RelayRoute, Resolver, Service},
     time::{ManualClock, TrustedTime, TrustedTimeConfig},
@@ -242,6 +242,7 @@ impl Setup {
             ORIGIN.into(),
             self.replay.db.store().clone(),
             self.replay.keys.clone(),
+            self.replay.marks.clone(),
             Arc::new(time),
             Limits::default(),
         ))
@@ -437,7 +438,11 @@ async fn queue_rows(replay: &Replay, account: &str, count: u32) {
 /// `fast.example` with a push key of its own and `H1`: its ID.
 async fn other_account(setup: &Setup) -> String {
     let replay = &setup.replay;
-    let key = replay.keys.generate().await.expect("push key");
+    let key = replay
+        .keys
+        .generate_as(&KeyId::random().expect("id"))
+        .await
+        .expect("push key");
     let other = "other-account".to_string();
     let mut conn = conn(replay).await;
     sqlx::query(
@@ -470,7 +475,11 @@ async fn other_account(setup: &Setup) -> String {
 /// with a push key of its own and `H1`: its ID.
 async fn silent_account(setup: &Setup, id: &str) -> String {
     let replay = &setup.replay;
-    let key = replay.keys.generate().await.expect("push key");
+    let key = replay
+        .keys
+        .generate_as(&KeyId::random().expect("id"))
+        .await
+        .expect("push key");
     let mut conn = conn(replay).await;
     sqlx::query(
         "INSERT INTO accounts SELECT (jsonb_populate_record(NULL::accounts, \
@@ -593,22 +602,6 @@ fn relay_checks(seen: &Seen, push_key: &[u8; 32], handles: &[&str], now_ms: u64)
     handle.to_string()
 }
 
-/// alice's service key.
-async fn service_key(replay: &Replay) -> [u8; 32] {
-    let mut conn = conn(replay).await;
-    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
-        .bind(alice_id())
-        .fetch_one(&mut conn)
-        .await
-        .expect("service key");
-    conn.close().await.expect("close");
-    replay
-        .keys
-        .public_key(&KeyId::parse(&id).expect("key id"))
-        .await
-        .expect("public")
-}
-
 async fn registrations(replay: &Replay) -> i64 {
     let mut conn = conn(replay).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations")
@@ -698,8 +691,8 @@ async fn test_push_delivery_sends_signed_webhooks_and_drops_the_rows() {
         .is_err()
     );
     assert!(verify_webhook(&[7; 32], RELAY, &seen[0].body, &signature).is_err());
-    // Never signed with the account's service key.
-    assert!(verify_webhook(&service_key(replay).await, RELAY, &seen[0].body, &signature).is_err());
+    // Never signed with the service key.
+    assert!(verify_webhook(&service_public(replay), RELAY, &seen[0].body, &signature).is_err());
     // Nothing more is due.
     assert_eq!(replay.service.deliver_pushes().await, PushRound::default());
     setup.replay.db.drop_database().await.expect("drop");
@@ -718,24 +711,18 @@ async fn test_push_delivery_of_a_restored_erased_account_is_never_sent() {
     append(replay, 1, true).await;
     assert_eq!(queued(replay).await.len(), 1);
     let mut db = conn(replay).await;
-    let (key, created): (String, i64) =
-        sqlx::query_as("SELECT service_key, created_at_ms FROM accounts WHERE id = $1")
-            .bind(alice_id())
-            .fetch_one(&mut db)
-            .await
-            .expect("account");
+    let created: i64 = sqlx::query_scalar("SELECT created_at_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut db)
+        .await
+        .expect("account");
     db.close().await.expect("close");
-    // The key store as the erasure left it: the erasure recorded, the service key gone.
+    // The key store as the erasure left it: the erasure recorded (Switch wire 7.3, Table 3).
     replay
         .keys
         .record_erasure(&alice_id(), u64::try_from(created).expect("time") + 60_000)
         .await
         .expect("ledger");
-    replay
-        .keys
-        .delete(&KeyId::parse(&key).expect("key id"))
-        .await
-        .expect("delete");
     let _ = replay.service.deliver_pushes().await;
     assert!(setup.relay.seen().is_empty(), "no webhook");
     assert!(queued(replay).await.is_empty(), "erased with the account");
@@ -913,8 +900,8 @@ async fn test_push_delivery_not_sent_unless_the_registration_names_it() {
             another_key.as_str()
         ),
         "UPDATE push_deliveries SET handle = 'another-handle'".to_string(),
-        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
-         SELECT push_key_id, account_id, 0, 'push' FROM push_registrations"
+        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) \
+         SELECT push_key_id, account_id, 0 FROM push_registrations"
             .to_string(),
     ] {
         let Some((setup, _)) = registered(&[H1]).await else {
@@ -1089,15 +1076,18 @@ async fn test_push_delivery_two_workers_never_send_one_twice() {
 
 /// A key store over the replay's whose next `signer` call, once armed, waits for a release.
 struct Gate {
-    inner: Arc<pubky_switch::keys::FixedKeys>,
+    inner: Arc<FileKeyStore>,
     armed: AtomicBool,
     paused: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
 impl KeyStore for Gate {
-    fn generate(&self) -> KeyFuture<'_, ServiceKey> {
-        self.inner.generate()
+    fn current(&self) -> ServiceSigner {
+        self.inner.current()
+    }
+    fn signer_for(&self, public: &[u8; 32]) -> Option<ServiceSigner> {
+        self.inner.signer_for(public)
     }
     fn generate_as<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceKey> {
         self.inner.generate_as(id)
@@ -1114,20 +1104,24 @@ impl KeyStore for Gate {
             self.inner.signer(id).await
         })
     }
-    fn operator(&self) -> KeyFuture<'_, ServiceSigner> {
-        self.inner.operator()
-    }
-    fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>> {
-        self.inner.mark(id)
-    }
-    fn advance_mark<'a>(&'a self, id: &'a KeyId, head: Mark) -> KeyFuture<'a, MarkCheck> {
-        self.inner.advance_mark(id, head)
-    }
     fn delete<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ()> {
         self.inner.delete(id)
     }
-    fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()> {
+    fn record_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+    ) -> KeyFuture<'a, Option<u64>> {
         self.inner.record_erasure(identity, erased_at_ms)
+    }
+    fn withdraw_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+        previous: Option<u64>,
+    ) -> KeyFuture<'a, ()> {
+        self.inner
+            .withdraw_erasure(identity, erased_at_ms, previous)
     }
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         self.inner.erasure(identity)
@@ -1154,6 +1148,7 @@ fn gated(setup: &Setup) -> (Arc<Gate>, Arc<Service>) {
         ORIGIN.into(),
         setup.replay.db.store().clone(),
         gate.clone(),
+        setup.replay.marks.clone(),
         setup.replay.time.clone(),
         Limits::default(),
     ));
@@ -1576,7 +1571,11 @@ async fn test_push_delivery_one_entry_queues_at_most_8_toward_a_host() {
             pubky_switch_core::enc::app_id_decode(app(&keys, name)["app_id"].as_str().expect("id"))
                 .expect("app id");
         targets.push(app_id);
-        let key = replay.keys.generate().await.expect("push key");
+        let key = replay
+            .keys
+            .generate_as(&KeyId::random().expect("id"))
+            .await
+            .expect("push key");
         let handles: Vec<String> = (0..8).map(|n| format!("{name}-handle-{n}")).collect();
         let mut conn = conn(replay).await;
         sqlx::query(
@@ -1905,7 +1904,11 @@ async fn test_push_handles_past_8_at_one_relay_host_are_refused() {
         app(&keys, "executor")["app_id"].as_str().expect("id"),
     )
     .expect("app id");
-    let executor_key = replay.keys.generate().await.expect("push key");
+    let executor_key = replay
+        .keys
+        .generate_as(&KeyId::random().expect("id"))
+        .await
+        .expect("push key");
     let mut conn = conn(replay).await;
     sqlx::query(
         "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
@@ -2049,11 +2052,10 @@ async fn test_push_delivery_attempt_runs_while_the_worker_waits_on_a_claim() {
 }
 
 #[tokio::test]
-async fn test_push_delivery_of_a_restored_erased_account_holding_its_keys_is_never_sent() {
-    // A database restored from before alice's erasure, the key store still holding her
-    // service key and the registration's push key (a deletion that failed): only the ledger
-    // tells. The webhook isn't sent, and the account is erased again (Switch spec 6.5).
-    let Some((setup, _key)) = registered(&[H1]).await else {
+async fn test_push_delivery_of_an_account_enrolled_after_an_erasure_is_sent() {
+    // The ledger holds an erasure from before the account's creation: the account is a new
+    // one, enrolled since, so its webhook is signed and sent (Switch wire 7.3, Table 1).
+    let Some((setup, key)) = registered(&[H1]).await else {
         return;
     };
     let replay = &setup.replay;
@@ -2068,12 +2070,17 @@ async fn test_push_delivery_of_a_restored_erased_account_holding_its_keys_is_nev
     db.close().await.expect("close");
     replay
         .keys
-        .record_erasure(&alice_id(), u64::try_from(created).expect("time") + 60_000)
+        .record_erasure(&alice_id(), u64::try_from(created).expect("time") - 1)
         .await
         .expect("ledger");
     let _ = replay.service.deliver_pushes().await;
-    assert!(setup.relay.seen().is_empty(), "no webhook");
-    assert!(queued(replay).await.is_empty(), "erased with the account");
-    assert_eq!(registrations(replay).await, 0);
+    let seen = setup.relay.seen();
+    assert_eq!(seen.len(), 1, "one webhook");
+    let signature: [u8; 64] = unb64(&seen[0].signature)
+        .expect("b64")
+        .try_into()
+        .expect("64");
+    assert!(verify_webhook(&key, RELAY, &seen[0].body, &signature).is_ok());
+    assert_eq!(registrations(replay).await, 1);
     setup.replay.db.drop_database().await.expect("drop");
 }

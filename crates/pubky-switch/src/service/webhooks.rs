@@ -329,14 +329,7 @@ impl Service {
             .identity
             .as_ref()
             .and_then(|doc| IdentityDoc::verify(doc, &held.identity_key).ok());
-        let service_key = self
-            .keys
-            .public_key(&held.service_key)
-            .await
-            .map_err(|failure| {
-                tracing::error!(%failure, "push deliveries: the account's service key");
-                Failure::Internal
-            })?;
+        let service_key = self.current_key();
         if !names_this_service(identity.as_ref(), &self.origin, &service_key) {
             return Ok(None);
         }
@@ -390,19 +383,12 @@ impl Service {
             .map_err(|_| Failure::Internal)?
             .is_some()
         {
-            let found = self
-                .store
-                .lookup(&push.account)
+            // The first row of Table 1 erases such an account again (Switch wire 7.3).
+            let (found, _) = self
+                .judge_at_step_two(&push.account)
                 .await
                 .map_err(|_| Failure::Internal)?;
-            let Some(found) = found else {
-                return Ok(None);
-            };
-            if self
-                .erase_if_restored(&push.account, found.created_at_ms)
-                .await
-                .map_err(|_| Failure::Internal)?
-            {
+            if found.is_none() {
                 return Ok(None);
             }
         }

@@ -22,8 +22,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -32,8 +32,12 @@ use parking_lot::Mutex;
 use pubky_switch_core::chain::{ChainTip, ZERO_HASH};
 use serde::{Deserialize, Serialize};
 
-/// The longest identity the store names a file after, in characters.
-const MAX_IDENTITY_LEN: usize = 64;
+#[cfg(test)]
+use crate::keys::Faults;
+use crate::keys::{
+    KeyStoreError, create_private_dir, hex_bytes, is_ledger_name, is_temp_file, rename_into_place,
+    sync_dir,
+};
 
 /// The largest mark file the store reads, in bytes; a larger one doesn't read as a mark.
 const MAX_MARK_FILE: u64 = 4096;
@@ -154,6 +158,17 @@ pub enum MarkStoreError {
     Random,
 }
 
+impl From<KeyStoreError> for MarkStoreError {
+    fn from(error: KeyStoreError) -> Self {
+        match error {
+            KeyStoreError::Io(error) => Self::Io(error),
+            KeyStoreError::Random => Self::Random,
+            KeyStoreError::InvalidId => Self::InvalidIdentity,
+            other => Self::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
 /// The per-account mark store, in `accounts/` under the key store's directory.
 ///
 /// One process at a time may use the directory: the key store's lock
@@ -192,53 +207,6 @@ struct Inner {
     /// Fails directory syncs and tracks what a crash would undo, for tests.
     #[cfg(test)]
     faults: Arc<Mutex<Faults>>,
-}
-
-/// Directory syncs that fail on request, and a model of a crash: every rename and removal
-/// no directory sync covers yet, which a crash may undo.
-#[cfg(test)]
-#[derive(Default)]
-struct Faults {
-    /// How many of a directory's next syncs fail.
-    failing: HashMap<PathBuf, usize>,
-    /// Each rename or removal not yet covered by a sync of its directory, with the content
-    /// the file had before it, if it existed.
-    unsynced: Vec<(PathBuf, Option<Vec<u8>>)>,
-}
-
-#[cfg(test)]
-impl Faults {
-    fn fail_sync(&mut self, dir: &Path, times: usize) {
-        self.failing.insert(dir.to_path_buf(), times);
-    }
-
-    fn fails(&mut self, dir: &Path) -> bool {
-        match self.failing.get_mut(dir) {
-            Some(left) if *left > 0 => {
-                *left -= 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn changed(&mut self, path: &Path, before: Option<Vec<u8>>) {
-        self.unsynced.push((path.to_path_buf(), before));
-    }
-
-    fn synced(&mut self, dir: &Path) {
-        self.unsynced.retain(|(path, _)| path.parent() != Some(dir));
-    }
-
-    /// Crash: undo every change no directory sync covers, newest first.
-    fn crash(&mut self) {
-        while let Some((path, before)) = self.unsynced.pop() {
-            match before {
-                Some(bytes) => fs::write(&path, bytes).expect("restore"),
-                None => fs::remove_file(&path).expect("remove"),
-            }
-        }
-    }
 }
 
 impl MarkStore {
@@ -561,7 +529,7 @@ impl Inner {
             .ok_or_else(|| MarkStoreError::Io(std::io::Error::other("path without a directory")))?;
         #[cfg(test)]
         let before = fs::read(path).ok();
-        rename_into_place(dir, path, bytes)?;
+        rename_into_place(dir, path, bytes, false)?;
         #[cfg(test)]
         self.faults.lock().changed(path, before);
         self.sync_dir(dir)
@@ -622,7 +590,7 @@ impl Inner {
                 create_private_dir(&temp.join(dir))?;
                 self.sync_dir(&temp.join(dir))?;
             }
-            rename_into_place(&temp, &temp.join("store-id"), id.as_bytes())?;
+            rename_into_place(&temp, &temp.join("store-id"), id.as_bytes(), false)?;
             self.sync_dir(&temp)?;
             fs::rename(&temp, self.accounts())?;
             Ok(())
@@ -826,6 +794,67 @@ impl Inner {
     }
 }
 
+/// A read-only view of the mark store, for an operator's check beside a running service: it
+/// creates, writes, syncs and locks nothing, and reads each mark as its file is then. The
+/// retirements are read once, when it opens.
+#[derive(Debug)]
+pub struct MarkView {
+    accounts: PathBuf,
+    store_id: String,
+    retired: HashMap<String, BTreeSet<u64>>,
+}
+
+impl MarkView {
+    /// Open the view of the mark store under the key store's directory `root`.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkStoreError::StoreUnreadable`] when the store isn't there or can't be read.
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, MarkStoreError> {
+        let accounts = root.as_ref().join("accounts");
+        let store_id = read_store_id(&accounts)?;
+        let retired = read_retired(&accounts.join("retired"))?;
+        Ok(Self {
+            accounts,
+            store_id,
+            retired,
+        })
+    }
+
+    /// The identity's mark as its file holds it now.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read, or its identity changed since the view opened;
+    /// [`MarkStoreError::InvalidIdentity`].
+    pub fn read(&self, identity: &str) -> Result<MarkRead, MarkStoreError> {
+        let identity = valid_identity(identity)?;
+        if read_store_id(&self.accounts)? != self.store_id {
+            return Err(MarkStoreError::StoreUnreadable(
+                "the store's identity changed".into(),
+            ));
+        }
+        read_mark_file(&self.accounts.join("marks").join(identity))
+    }
+
+    /// The identity's retired generations, ascending, as the view read them.
+    pub fn retired(&self, identity: &str) -> Vec<u64> {
+        self.retired
+            .get(identity)
+            .map(|generations| generations.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every identity with a mark file now, ascending.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read.
+    pub fn list(&self) -> Result<Vec<String>, MarkStoreError> {
+        list_marks(&self.accounts.join("marks"))
+    }
+}
+
 /// Run blocking file work off the async runtime; it runs to its end even if the caller
 /// stops waiting.
 async fn blocking<T: Send + 'static>(
@@ -836,24 +865,12 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| MarkStoreError::Io(std::io::Error::other(error.to_string())))?
 }
 
-fn is_identity(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_IDENTITY_LEN
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
-
 fn valid_identity(identity: &str) -> Result<String, MarkStoreError> {
-    if is_identity(identity) {
+    if is_ledger_name(identity) {
         Ok(identity.to_string())
     } else {
         Err(MarkStoreError::InvalidIdentity)
     }
-}
-
-fn is_temp_file(name: &str) -> bool {
-    name.starts_with('.') && name.ends_with(".tmp")
 }
 
 /// The store's identity record in `accounts`: 32 lowercase hex characters.
@@ -895,7 +912,7 @@ fn read_retired(dir: &Path) -> Result<HashMap<String, BTreeSet<u64>>, MarkStoreE
         }
         let parsed = name.split_once('.').and_then(|(identity, generation)| {
             let value = generation.parse::<u64>().ok()?;
-            (is_identity(identity) && value.to_string() == generation)
+            (is_ledger_name(identity) && value.to_string() == generation)
                 .then(|| (identity.to_string(), value))
         });
         let Some((identity, generation)) = parsed else {
@@ -925,7 +942,7 @@ fn list_marks(dir: &Path) -> Result<Vec<String>, MarkStoreError> {
         if is_temp_file(name) {
             continue;
         }
-        if !is_identity(name) {
+        if !is_ledger_name(name) {
             return Err(MarkStoreError::StoreUnreadable(format!(
                 "marks: {name} names no identity"
             )));
@@ -954,75 +971,6 @@ fn read_mark_file(path: &Path) -> Result<MarkRead, MarkStoreError> {
         Ok(mark) if mark.is_valid() => MarkRead::Mark(mark),
         Ok(_) | Err(_) => MarkRead::NotAMark,
     })
-}
-
-/// Create `dir` and its parents, readable by the owner only.
-fn create_private_dir(dir: &Path) -> Result<(), MarkStoreError> {
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-/// Write `bytes` to a temporary file in `dir`, sync it and rename it to `path`, a file in
-/// `dir`. The rename isn't durable until `dir` is synced.
-fn rename_into_place(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), MarkStoreError> {
-    let mut suffix = [0u8; 8];
-    getrandom::fill(&mut suffix).map_err(|_| MarkStoreError::Random)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(MarkStoreError::InvalidIdentity)?;
-    let temp = dir.join(format!(".{name}.{}.tmp", hex::encode(suffix)));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-/// Sync a directory, so a rename or removal in it is durable.
-fn sync_dir(dir: &Path) -> Result<(), MarkStoreError> {
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
-}
-
-/// Lowercase hex for 32-byte values in JSON.
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
-        let text = String::deserialize(deserializer)?;
-        if text.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(D::Error::custom("uppercase hex"));
-        }
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(text, &mut bytes).map_err(D::Error::custom)?;
-        Ok(bytes)
-    }
 }
 
 #[cfg(test)]

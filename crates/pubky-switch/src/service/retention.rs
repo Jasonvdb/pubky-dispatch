@@ -17,15 +17,15 @@
 //!    records whose proofs are gone and none of whose stubs is kept (wire 6.4 step 5).
 //!
 //! Nothing is signed or dropped with `chain_retention` off, for a staged account, which
-//! doesn't serve the chain, or one whose state is behind its key's mark, which signs no
-//! checkpoint (spec 6.5), or when the mark can't be read: keeping a stub is always safe.
+//! doesn't serve the chain, or unless the verdict finds the account's state at or past its
+//! mark (Switch wire 7.3 step 10, Table 1): keeping a stub is always safe.
 //! Freezes aren't served, so there is no frozen account to stop at; the check comes with
 //! the cooperative move (spec 12.5). Each write is in the request's transaction, so a
 //! failure rolls the whole step back.
 //!
 //! Each run reads the oldest kept stub first and stops there when it can't go, so a request
 //! with nothing to drop reads one stub, not `retention_per_request`; it still reads the held
-//! `identity.json`, the apps' cursors and the key's mark for that.
+//! `identity.json` and the apps' cursors for that.
 //!
 //! Current state never depends on a dropped row: records, claim entries and key bundle parts
 //! keep their own signed operations and proofs, and the feed reads current documents through
@@ -37,7 +37,7 @@ use pubky_switch_core::{
 
 use super::Service;
 use crate::{
-    keys::{ServiceSigner, check_mark, sign_checkpoint},
+    keys::{ServiceSigner, sign_checkpoint},
     store::{AccountTxn, KeptStub, StoreError},
 };
 
@@ -122,18 +122,20 @@ impl Service {
     }
 
     /// Step 4's chain stub retention at service time `base` (the module's doc), with
-    /// `signer`, the account's service key.
+    /// `signer`, the key the verdict answers the account with; `healthy` when the verdict
+    /// finds its state at or past its mark (Switch wire 7.3 step 10).
     pub(super) async fn retain_chain(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
+        healthy: bool,
         base: u64,
     ) -> Result<(), StoreError> {
-        if !self.limits.chain_retention {
+        if !self.limits.chain_retention || !healthy {
             return Ok(());
         }
         let head = txn.head().clone();
-        let Some(head_mark) = head.head_mark() else {
+        let Some(head_mark) = head.head_tip() else {
             return Ok(());
         };
         let Some(current) = self.current_cursors(txn).await? else {
@@ -144,12 +146,6 @@ impl Service {
             &self.origin,
             &signer.public_key(),
         ) {
-            return Ok(());
-        }
-        let Ok(mark) = self.keys.mark(&head.service_key).await else {
-            return Ok(());
-        };
-        if !check_mark(mark.as_ref(), &head_mark).allows_signing() {
             return Ok(());
         }
         let retained = txn.chain_retention().await?;
@@ -210,13 +206,8 @@ impl Service {
                 })
         };
         if let Some(at) = at {
-            let Ok(signed) = sign_checkpoint(
-                signer,
-                mark.as_ref(),
-                &head.identity_key,
-                &head.chain_tip(),
-                &at,
-            ) else {
+            let Some(signed) = sign_checkpoint(signer, &head.identity_key, &head.chain_tip(), &at)
+            else {
                 return Ok(());
             };
             txn.keep_checkpoint(&signed).await?;

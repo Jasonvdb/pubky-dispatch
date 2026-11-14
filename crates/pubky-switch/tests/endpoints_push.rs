@@ -21,13 +21,13 @@ use std::{
 
 use pubky_switch::{
     http::{Handler, SwitchResponse},
-    keys::{KeyFuture, KeyId, KeyStore, KeyStoreError, Mark, MarkCheck, ServiceKey, ServiceSigner},
+    keys::{FileKeyStore, KeyFuture, KeyId, KeyStore, KeyStoreError, ServiceKey, ServiceSigner},
     service::{Resolver, Service},
     store::{PushRegistration, StoreError},
 };
 use pubky_switch_core::{
     enc::{app_id_decode, b64, unb64},
-    http::{IdentityDelivery, erase_body, header},
+    http::{IdentityDelivery, header},
     keys::IdentityKey,
     records::{IdentityBody, IdentityDoc, RemovedApp},
     sig::SignedDoc,
@@ -80,14 +80,17 @@ fn key_of(text: &Value) -> [u8; 32] {
 /// A key store over the replay's that records the push keys it mints and can fail their
 /// deletion.
 struct Recording {
-    inner: Arc<pubky_switch::keys::FixedKeys>,
+    inner: Arc<FileKeyStore>,
     minted: Mutex<Vec<KeyId>>,
     fail_delete: AtomicBool,
 }
 
 impl KeyStore for Recording {
-    fn generate(&self) -> KeyFuture<'_, ServiceKey> {
-        self.inner.generate()
+    fn current(&self) -> ServiceSigner {
+        self.inner.current()
+    }
+    fn signer_for(&self, public: &[u8; 32]) -> Option<ServiceSigner> {
+        self.inner.signer_for(public)
     }
     fn generate_as<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceKey> {
         self.minted.lock().expect("lock").push(id.clone());
@@ -99,24 +102,27 @@ impl KeyStore for Recording {
     fn signer<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceSigner> {
         self.inner.signer(id)
     }
-    fn operator(&self) -> KeyFuture<'_, ServiceSigner> {
-        self.inner.operator()
-    }
-    fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>> {
-        self.inner.mark(id)
-    }
-    fn advance_mark<'a>(&'a self, id: &'a KeyId, head: Mark) -> KeyFuture<'a, MarkCheck> {
-        self.inner.advance_mark(id, head)
-    }
     fn delete<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ()> {
-        // Only push keys: the service key's deletion still works.
         if self.fail_delete.load(Ordering::SeqCst) && self.minted().contains(id) {
             return Box::pin(async { Err(KeyStoreError::Io(std::io::Error::other("read-only"))) });
         }
         self.inner.delete(id)
     }
-    fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()> {
+    fn record_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+    ) -> KeyFuture<'a, Option<u64>> {
         self.inner.record_erasure(identity, erased_at_ms)
+    }
+    fn withdraw_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+        previous: Option<u64>,
+    ) -> KeyFuture<'a, ()> {
+        self.inner
+            .withdraw_erasure(identity, erased_at_ms, previous)
     }
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         self.inner.erasure(identity)
@@ -173,6 +179,7 @@ fn service_on(replay: &Replay, keys: Arc<Recording>) -> Service {
         ORIGIN.into(),
         replay.db.store().clone(),
         keys,
+        replay.marks.clone(),
         replay.time.clone(),
         pubky_switch::limits::Limits::default(),
     )
@@ -264,11 +271,10 @@ async fn stored(replay: &Replay) -> Option<(String, KeyId, [u8; 32], Vec<String>
 /// The push keys owed deleting, by ID.
 async fn owed(replay: &Replay) -> Vec<String> {
     let mut conn = conn(replay).await;
-    let rows: Vec<String> =
-        sqlx::query_scalar("SELECT key_id FROM erased_keys WHERE reason = 'push' ORDER BY key_id")
-            .fetch_all(&mut conn)
-            .await
-            .expect("owed");
+    let rows: Vec<String> = sqlx::query_scalar("SELECT key_id FROM erased_keys ORDER BY key_id")
+        .fetch_all(&mut conn)
+        .await
+        .expect("owed");
     conn.close().await.expect("close");
     rows
 }
@@ -675,31 +681,8 @@ async fn test_push_recovery_in_place_removes_every_registration() {
     let id = stored(&replay).await.expect("held").1;
     queue_one(&replay).await;
     assert_eq!(deliveries(&replay).await, 1);
-    // An enrollment at the serving account: its pending key starts the next generation.
-    let enrollment = {
-        use pubky_switch_core::records::{Enrollment, EnrollmentBody};
-        let http = vectors("http.json");
-        let vector = named(&http["requests"], "signer: enrollment");
-        let request: Value = serde_json::from_slice(
-            &unb64(vector["body_b64"].as_str().expect("body")).expect("b64"),
-        )
-        .expect("json");
-        let signed: SignedDoc =
-            serde_json::from_value(request["enrollment"].clone()).expect("signed");
-        let mut fields: EnrollmentBody =
-            serde_json::from_slice(&signed.body_bytes().expect("body")).expect("fields");
-        fields.nonce = [3; 16];
-        fields.identity_doc = None;
-        let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
-        let enrollment = Enrollment::sign(&key, fields).expect("sign");
-        serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json")
-    };
-    let answer = replay
-        .service
-        .handle(signer_request("POST", "/v1/enroll", enrollment, ms(&at())))
-        .await;
-    assert_eq!(answer.status, 200);
-    let pending = key_of(&body(&answer)["service_key"]);
+    // The next generation at this service, naming its service key, with `recovery_from`:
+    // a provider loss in place, which starts the account afresh (7.4.2).
     let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
     let v3: SignedDoc = serde_json::from_value(
         named(
@@ -713,7 +696,7 @@ async fn test_push_recovery_in_place_removes_every_registration() {
     let mut next: IdentityBody = held.body().clone();
     next.version += 1;
     next.generation += 1;
-    next.inbox.service_key = pending;
+    next.inbox.service_key = service_public(&replay);
     next.recovery_from = Some(held.generation());
     let next = IdentityDoc::sign(&key, next).expect("sign");
     let delivery = IdentityDelivery {
@@ -738,36 +721,28 @@ async fn test_push_recovery_in_place_removes_every_registration() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// alice's service key, from `keys.json`.
-fn alice_service_key() -> [u8; 32] {
-    let keys = vectors("keys.json");
-    let service = keys["service_keys"]
-        .as_array()
-        .expect("service keys")
-        .iter()
-        .find(|s| s["account"] == alice_id().as_str())
-        .expect("alice's service key")
-        .clone();
-    key_of(&service["public"])
+/// The document hash of alice's newest `identity.json`, which the erasure names (7.4.16).
+fn alice_identity_hash() -> [u8; 32] {
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("version 3");
+    v3.doc_hash().expect("hash")
 }
 
 async fn erase(replay: &Replay) -> SwitchResponse {
-    let path = format!("/v1/{}/erase", alice_id());
-    replay
-        .service
-        .handle(signer_request(
-            "POST",
-            &path,
-            erase_body(&alice_service_key(), None),
-            ms(&at()),
-        ))
-        .await
+    let erasure = erasure_of(replay, &alice_id(), Some(&alice_identity_hash()), ms(&at())).await;
+    replay.service.handle(erasure).await
 }
 
 #[tokio::test]
 async fn test_push_erasure_deletes_the_push_keys() {
-    // The erasure owes the push key with the service key, and releases its `200` once both
-    // are gone (7.4.16, 8.1).
+    // The erasure owes the push key in the deletion's commit and deletes it before its
+    // `200` (7.4.16, 8.1).
     let Some((replay, keys)) = pushing().await else {
         return;
     };
@@ -782,21 +757,24 @@ async fn test_push_erasure_deletes_the_push_keys() {
 }
 
 #[tokio::test]
-async fn test_push_erasure_withheld_while_a_push_key_stays() {
-    // The push key can't be deleted, the service key can: the erasure's answer is withheld
-    // all the same, the push key owed, until the retry's sweep deletes it (7.4.16 Order).
+async fn test_push_erasure_answered_while_a_push_key_stays_owed() {
+    // The push key can't be deleted: the deletion of the account committed, so the erasure
+    // is answered, and the key stays owed until a later sweep deletes it (7.4.16 Order,
+    // 8.1).
     let Some((replay, keys)) = pushing().await else {
         return;
     };
     started(&replay, RELAY, None).await;
     let id = stored(&replay).await.expect("held").1;
     keys.fail_delete.store(true, Ordering::SeqCst);
-    assert_eq!(code(&erase(&replay).await), (503, json!("unavailable")));
+    assert_eq!(erase(&replay).await.status, 200);
     assert!(exists(&keys, &id).await);
+    assert_eq!(owed(&replay).await, vec![id.as_str().to_string()]);
     keys.fail_delete.store(false, Ordering::SeqCst);
-    assert_eq!(code(&erase(&replay).await), (404, json!("not_found")));
+    replay.service.sweep_erased_keys().await;
     assert!(!exists(&keys, &id).await);
     assert!(owed(&replay).await.is_empty());
+    assert_eq!(code(&erase(&replay).await), (404, json!("not_found")));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -858,6 +836,7 @@ async fn test_push_minted_key_left_by_a_crash_is_swept_at_start() {
         ORIGIN.into(),
         replay.db.store().clone(),
         keys.clone(),
+        replay.marks.clone(),
         replay.time.clone(),
         pubky_switch::limits::Limits::default(),
     )

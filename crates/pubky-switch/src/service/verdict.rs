@@ -17,11 +17,14 @@ use crate::marks::{AccountMark, MarkRead, MarkStoreError};
 pub enum AccountState {
     /// Staged, holding no chain: it has activated no import, and has no state to compare.
     StagedNoChain,
-    /// Staged, holding an activated import (Switch wire 10.5), ending at this head.
+    /// Staged, holding an activated import (Switch wire 10.5), ending at this head; also a
+    /// staged account holding the chain it served, whose newest document names another
+    /// service.
     StagedImport(ChainTip),
     /// Serving, at this head.
     Serving(ChainTip),
-    /// Frozen, at this head.
+    /// Frozen, at this head. The freeze isn't served yet, so no request finds one.
+    #[cfg_attr(not(test), allow(dead_code))]
     Frozen(ChainTip),
 }
 
@@ -384,10 +387,7 @@ pub enum RequestClass {
     /// A step of a move.
     Move(MoveStep),
     /// `POST /erase`.
-    Erase {
-        /// Whether its `Switch-Timestamp` is earlier than the mark's creation time.
-        earlier_than_mark: bool,
-    },
+    Erase,
 }
 
 /// A step of a move (Switch wire 10).
@@ -436,8 +436,6 @@ pub enum Route {
     },
     /// The erasure at a lost identity: the record is written, then the mark deleted.
     EraseLost,
-    /// `401 stale_timestamp`: an erasure earlier than the mark's creation time.
-    StaleTimestamp,
     /// `503 recovery_required` with this notice, without a head.
     Notice(RecoveryNotice),
     /// `503 unavailable`, without a head.
@@ -463,7 +461,7 @@ pub fn answer(judgement: &Judgement, class: &RequestClass, current_key: [u8; 32]
         RequestClass::Ordinary
         | RequestClass::PutIdentity { .. }
         | RequestClass::Move(_)
-        | RequestClass::Erase { .. } => judgement.key,
+        | RequestClass::Erase => judgement.key,
     };
     Answer {
         route: route(&judgement.verdict, class),
@@ -478,15 +476,18 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
             RequestClass::Ordinary
             | RequestClass::PutIdentity { .. }
             | RequestClass::Move(_)
-            | RequestClass::Erase { .. } => Route::NotHosted,
+            | RequestClass::Erase => Route::NotHosted,
         },
         Verdict::Staged | Verdict::Healthy => match class {
             // An enrollment signs no head (Switch wire 7.4.1).
             RequestClass::Enroll => Route::Proceed { head: false },
+            // At any staged account, an import of a retired generation isn't activated: the
+            // same `409 conflict` as at a bounded one (Switch wire 7.3, Table 2).
+            RequestClass::Move(MoveStep::Activate { clears_mark: false }) => Route::Conflict,
             RequestClass::Ordinary | RequestClass::PutIdentity { .. } | RequestClass::Move(_) => {
                 Route::Proceed { head: true }
             }
-            RequestClass::Erase { .. } => Route::Erase {
+            RequestClass::Erase => Route::Erase {
                 fails_stop: false,
                 import_bars: true,
             },
@@ -508,7 +509,7 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
                 MoveStep::Abort if abort_allowed => Route::Proceed { head: false },
                 MoveStep::Abort | MoveStep::Export => Route::Notice(notice),
             },
-            RequestClass::Erase { .. } => Route::Erase {
+            RequestClass::Erase => Route::Erase {
                 fails_stop: false,
                 import_bars: abort_allowed,
             },
@@ -526,19 +527,14 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
             // The abort discards the import, signs no head and gives the discard answer.
             RequestClass::Move(MoveStep::Abort) if abort_allowed => Route::Proceed { head: false },
             RequestClass::Move(_) => Route::Notice(notice),
-            RequestClass::Erase { .. } => Route::Erase {
+            RequestClass::Erase => Route::Erase {
                 fails_stop: true,
                 import_bars: abort_allowed,
             },
         },
         Verdict::Lost { notice } => match *class {
             RequestClass::Enroll => Route::TakeOverMark,
-            RequestClass::Erase {
-                earlier_than_mark: true,
-            } => Route::StaleTimestamp,
-            RequestClass::Erase {
-                earlier_than_mark: false,
-            } => Route::EraseLost,
+            RequestClass::Erase => Route::EraseLost,
             RequestClass::Ordinary | RequestClass::PutIdentity { .. } | RequestClass::Move(_) => {
                 Route::Notice(notice)
             }
@@ -566,6 +562,8 @@ fn start_or_notice(notice: RecoveryNotice, generation: u64, recovery_from: Optio
 /// there. `hash_at_mark` is the import's chain hash at the mark's generation and `seq`,
 /// `None` where its chain doesn't reach it. With the mark lost only the retirement bounds
 /// it.
+// The activation isn't served yet: its endpoint will compute `MoveStep::Activate` with it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn activation_clears_mark(
     import_head: ChainTip,
     hash_at_mark: Option<[u8; 32]>,
@@ -1466,9 +1464,7 @@ mod tests {
         answer(&judgement, &class, CURRENT).route
     }
 
-    const ERASE: RequestClass = RequestClass::Erase {
-        earlier_than_mark: false,
-    };
+    const ERASE: RequestClass = RequestClass::Erase;
     const STEPS: [MoveStep; 5] = [
         MoveStep::ImportOrUpload,
         MoveStep::Activate { clears_mark: true },
@@ -1556,8 +1552,37 @@ mod tests {
         assert_eq!(route_of(verdict, RequestClass::Ordinary), on);
         assert_eq!(route_of(verdict, put(5, Some(4))), on);
         for step in STEPS {
-            assert_eq!(route_of(verdict, RequestClass::Move(step)), on);
+            let expected = if step == (MoveStep::Activate { clears_mark: false }) {
+                Route::Conflict
+            } else {
+                on
+            };
+            assert_eq!(route_of(verdict, RequestClass::Move(step)), expected);
         }
+    }
+
+    #[test]
+    fn test_answer_staged_activation_of_a_retired_generation_is_refused() {
+        // At a staged account at its (0, 0) mark, an import of a generation the operator
+        // retired for the identity doesn't clear the mark, and its activation is refused.
+        let zero = AccountMark::zero(MARK_KEY, 1);
+        let head = ChainTip {
+            generation: 3,
+            seq: 9,
+            chain_hash: [1; 32],
+        };
+        assert!(!activation_clears_mark(head, None, Some(&zero), &[3]));
+        assert!(activation_clears_mark(head, None, Some(&zero), &[2]));
+        let clears = activation_clears_mark(head, None, Some(&zero), &[3]);
+        assert_eq!(
+            route_of(
+                Verdict::Staged,
+                RequestClass::Move(MoveStep::Activate {
+                    clears_mark: clears
+                })
+            ),
+            Route::Conflict
+        );
     }
 
     #[test]
@@ -1804,15 +1829,6 @@ mod tests {
     #[test]
     fn test_answer_lost_erase() {
         assert_eq!(route_of(LOST, ERASE), Route::EraseLost);
-        assert_eq!(
-            route_of(
-                LOST,
-                RequestClass::Erase {
-                    earlier_than_mark: true
-                }
-            ),
-            Route::StaleTimestamp
-        );
     }
 
     #[test]

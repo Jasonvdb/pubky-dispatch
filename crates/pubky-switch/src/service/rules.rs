@@ -212,44 +212,6 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
     }
 }
 
-/// Which key answers an enrollment (Switch wire 3.7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EnrollmentKey {
-    /// No account yet: make one, with a new key.
-    NewAccount,
-    /// A staged account: its own key, changing nothing.
-    AccountKey,
-    /// A serving account: the pending key of the next generation, made now if there is none
-    /// yet, and the same for every enrollment until a document names it.
-    PendingKey {
-        /// Whether a pending key exists already.
-        exists: bool,
-    },
-}
-
-/// The key an enrollment is answered with, by what the account is.
-pub fn enrollment_key(account: Option<AccountState>) -> EnrollmentKey {
-    match account {
-        None => EnrollmentKey::NewAccount,
-        Some(AccountState { serving: false, .. }) => EnrollmentKey::AccountKey,
-        Some(AccountState {
-            serving: true,
-            pending_key,
-        }) => EnrollmentKey::PendingKey {
-            exists: pending_key,
-        },
-    }
-}
-
-/// What an enrollment's answer depends on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AccountState {
-    /// Whether the account serves.
-    pub serving: bool,
-    /// Whether it has a pending key for the next generation.
-    pub pending_key: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,31 +346,5 @@ mod tests {
             assert_eq!(other_app_refusal(&call).code, ErrorCode::PermissionMissing);
         }
         assert_eq!(other_app_refusal(&Call::Ops).code, ErrorCode::NotAdmitted);
-    }
-
-    #[test]
-    fn test_rules_enrollment_key() {
-        assert_eq!(enrollment_key(None), EnrollmentKey::NewAccount);
-        let staged = AccountState {
-            serving: false,
-            pending_key: false,
-        };
-        assert_eq!(enrollment_key(Some(staged)), EnrollmentKey::AccountKey);
-        let serving = AccountState {
-            serving: true,
-            pending_key: false,
-        };
-        assert_eq!(
-            enrollment_key(Some(serving)),
-            EnrollmentKey::PendingKey { exists: false }
-        );
-        let pending = AccountState {
-            serving: true,
-            pending_key: true,
-        };
-        assert_eq!(
-            enrollment_key(Some(pending)),
-            EnrollmentKey::PendingKey { exists: true }
-        );
     }
 }

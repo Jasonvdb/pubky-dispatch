@@ -14,9 +14,9 @@
 //! `remote_apply`, so a commit is durable on every replica that could be promoted; an
 //! asynchronous replica must never be promoted to serve writes (Switch spec 6.5).
 //!
-//! **The key's mark** (Switch spec 6.5) lives in the key store, apart from the database and
-//! its backups. [`AccountTxn::commit_marked`] moves it once the state is durable, and
-//! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
+//! **The account's mark** (Switch spec 6.5) lives beside the key store, apart from the
+//! database and its backups ([`crate::marks`]): the service moves it once a commit is
+//! durable, and judges every state against it (Switch wire 7.3, "Accounts and marks").
 
 mod account;
 mod allow;
@@ -32,7 +32,6 @@ pub mod heads;
 mod identity;
 mod inbox;
 mod instance;
-mod keying;
 mod ops;
 mod peers;
 mod push;
@@ -53,9 +52,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{
-    AccountHead, AccountTxn, CommitError, Committed, Creation, NewAccount, Savepoint,
-};
+pub use account::{AccountHead, AccountTxn, Committed, Creation, NewAccount, Savepoint};
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
@@ -64,8 +61,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::{InstanceLock, InstanceLockLost, LockTiming};
-pub use keying::{Keyed, keying_lock_key};
+pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
     StoredInvite, StoredListEntry, StoredRecord,
@@ -90,14 +86,10 @@ pub const DATABASE_URL_ENV: &str = "PUBKY_SWITCH_DATABASE_URL";
 pub struct ErasedKey {
     /// The key's ID in the key store.
     pub key: crate::keys::KeyId,
-    /// The erased account's Pubky ID.
+    /// The account that let it go.
     pub account: String,
-    /// When the account was erased, in its service time.
+    /// When it was let go, in the account's service time.
     pub erased_at_ms: u64,
-    /// The key wasn't erased with its account, so its deletion records no erasure: a service
-    /// key a generation change retired at an account that lives on (Switch wire 3.3), or a
-    /// push key (Switch wire 8.1).
-    pub retired: bool,
 }
 
 /// The schema migrations, applied in order.
@@ -440,10 +432,10 @@ impl Store {
         }
     }
 
-    /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).
+    /// The push keys owed deleting, oldest first (Switch wire 8.1).
     pub async fn erased_keys(&self) -> Result<Vec<ErasedKey>, StoreError> {
         let rows = sqlx::query(
-            "SELECT key_id, account_id, erased_at_ms, reason FROM erased_keys \
+            "SELECT key_id, account_id, erased_at_ms FROM erased_keys \
              ORDER BY erased_at_ms, key_id",
         )
         .fetch_all(&self.pool)
@@ -457,27 +449,18 @@ impl Store {
                         .map_err(|_| StoreError::Corrupt("erased_keys.key_id"))?,
                     account: row.try_get("account_id")?,
                     erased_at_ms: from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
-                    retired: row.try_get::<String, _>("reason")? != "erasure",
                 })
             })
             .collect()
     }
 
-    /// Whether an erased account of the identity `account` still owes the deletion of a key
-    /// (Switch wire 7.4.16).
-    pub async fn owes_erased_keys(&self, account: &str) -> Result<bool, StoreError> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM erased_keys WHERE account_id = $1)")
-            .bind(account)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(StoreError::from_db)
-    }
-
-    /// Look account `id` up without taking its lock: its service key and the service time
-    /// it last committed, for the checks that come before the lock (Switch wire 7.2 Order).
+    /// Look account `id` up without taking its lock: what the verdict of its account and
+    /// mark reads (Switch wire 7.3 step 2) and the service time it last committed, for the
+    /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT service_key, stamped_time_ms, created_at_ms FROM accounts WHERE id = $1",
+            "SELECT generation, chain_seq, chain_hash, stamped_time_ms, created_at_ms, \
+             identity_doc FROM accounts WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -486,13 +469,52 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
-        let service_key: String = row.try_get("service_key")?;
+        let chain_seq: Option<i64> = row.try_get("chain_seq")?;
+        let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
+        let chain = match (chain_seq, chain_hash) {
+            (Some(seq), Some(hash)) => Some((
+                from_db(seq, "chain_seq")?,
+                <[u8; 32]>::try_from(hash.as_slice())
+                    .map_err(|_| StoreError::Corrupt("chain_hash"))?,
+            )),
+            (None, None) => None,
+            _ => return Err(StoreError::Corrupt("chain head")),
+        };
+        let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
         Ok(Some(FoundAccount {
-            service_key: crate::keys::KeyId::parse(&service_key)
-                .map_err(|_| StoreError::Corrupt("service_key"))?,
+            generation: from_db(row.try_get("generation")?, "generation")?,
+            chain,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
+            identity_doc: doc
+                .map(|doc| identity::decode_doc(&doc, "identity_doc"))
+                .transpose()?,
         }))
+    }
+
+    /// The chain hash of the stub account `id` still holds at `generation` and `seq`, if it
+    /// holds one: where it does, a state past the mark with another hash there is a fork
+    /// (Switch wire 7.3, Table 1).
+    pub async fn stub_hash_at(
+        &self,
+        id: &str,
+        generation: u64,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        let hash: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT chain_hash FROM chain_items WHERE account_id = $1 AND generation = $2 \
+             AND seq = $3",
+        )
+        .bind(id)
+        .bind(to_db(generation, "generation")?)
+        .bind(to_db(seq, "seq")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::from_db)?;
+        hash.map(|hash| {
+            <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| StoreError::Corrupt("chain_hash"))
+        })
+        .transpose()
     }
 
     /// Of `erased`, identities with the time of an erasure the key store's ledger holds,
@@ -693,12 +715,16 @@ async fn connect_first(
 /// An account found by [`Store::lookup`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoundAccount {
-    /// Its service key.
-    pub service_key: crate::keys::KeyId,
+    /// The generation it holds.
+    pub generation: u64,
+    /// Its newest chain item's `seq` and the chain hash there; `None` before the first.
+    pub chain: Option<(u64, [u8; 32])>,
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// When it was created, in service time.
     pub created_at_ms: u64,
+    /// The newest `identity.json` it holds, as signed; it was verified when it was taken.
+    pub identity_doc: Option<pubky_switch_core::sig::SignedDoc>,
 }
 
 /// The readiness check of the database: a round trip on a pooled connection.

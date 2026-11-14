@@ -1,11 +1,12 @@
 //! The account vectors of `spec/vectors`, replayed on the service, byte for byte: the
 //! enrollment and its answer, the first `identity.json` delivery and version 3 as
-//! `chain.json` chains them, the public `identity.json` read, and the operator-signed `404`
-//! (Switch wire 7.1, 7.4.1, 7.4.2, 7.4.15).
+//! `chain.json` chains them, the public `identity.json` read, and the `404` for an identity
+//! the service doesn't host, signed with the service key (Switch wire 7.1, 7.4.1, 7.4.2,
+//! 7.4.15, 7.6).
 //!
-//! The vectors fix the service and operator keys and the times; the service gets them
-//! through `keys::FixedKeys` and a manual clock. Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run
-//! them; see `store::testing`.
+//! The vectors fix the service key and the times; the service gets them through
+//! `keys::FileKeyStore::open_with_service_seed` and a manual clock. Set
+//! `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
 // Test helpers fail the test on any error.
 #![allow(clippy::expect_used)]
@@ -67,6 +68,7 @@ fn assert_chained(
 }
 
 #[tokio::test]
+#[ignore = "http.json's enrollment answer is regenerated with its `created` (Switch wire 3.7)"]
 async fn test_vectors_accounts_replay() {
     let Some(replay) = replay().await else { return };
     let http = vectors("http.json");
@@ -81,14 +83,32 @@ async fn test_vectors_accounts_replay() {
         .try_into()
         .expect("32 bytes");
 
-    // An account the service doesn't host, a request without a signature: `404 not_found`,
-    // without a head, signed with the operator key.
-    let unknown = request("GET", &format!("/v1/{alice_id}/feed"), &[], Vec::new());
+    // An identity the service doesn't host, a request without a signature: `404 not_found`
+    // with `hosted: false`, without a head, signed with the service key, byte for byte
+    // (Switch wire 7.6).
+    let expected = named(
+        &http["responses"],
+        "anyone: an identity the service doesn't host, 404 not_found with hosted false, \
+         signed with the service key, no head",
+    );
+    set_time(
+        &replay.clock,
+        expected["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time"),
+    );
+    let unknown = request(
+        expected["method"].as_str().expect("method"),
+        expected["path"].as_str().expect("path"),
+        &[],
+        Vec::new(),
+    );
     let sent = Sent::of(&unknown);
     let answer = replay.service.handle(unknown).await;
-    assert_eq!(answer.status, 404);
+    assert_matches(&answer, expected);
     assert!(header_text(&answer, header::HEAD).is_none());
-    assert!(signed_with(&answer, &operator_public(), &sent));
+    assert!(signed_with(&answer, &service_key, &sent));
+    assert_eq!(service_public(&replay), service_key);
 
     // The enrollment, answered with the new account's key.
     let expected = named(

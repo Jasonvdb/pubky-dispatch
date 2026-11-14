@@ -15,10 +15,11 @@ use pubky_switch::{
     changes::ChangeListener,
     http::Handler,
     http::SwitchResponse,
-    keys::{KeyId, KeyStore, Mark},
     limits::Limits,
+    marks::{AccountMark, MarkRead},
 };
 use pubky_switch_core::{
+    chain::ChainTip,
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
     http::header,
@@ -245,8 +246,9 @@ async fn test_feed_page_with_no_items_beyond_the_head_and_of_another_sequence() 
 
 #[tokio::test]
 async fn test_feed_page_with_no_items_fails_stop_behind_the_mark() {
-    // A state behind its key's mark answers a page with no items as it answers any call:
-    // `503`, with no head (Switch wire 7.3 step 10).
+    // A state behind the account's mark answers a page with no items as it answers any
+    // call: the notice, `503 recovery_required` with the reason `behind`, with no head
+    // (Switch wire 7.3, Tables 1 and 2).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
@@ -264,8 +266,9 @@ async fn test_feed_page_with_no_items_fails_stop_behind_the_mark() {
     let answer = read(&replay, "wallet", "?limit=0", &revoke_time()).await;
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
-        (503, json!("unavailable"))
+        (503, json!("recovery_required"))
     );
+    assert_eq!(body(&answer)["current"]["reason"], json!("behind"));
     assert!(
         header_text(&answer, header::HEAD).is_none(),
         "no head behind the mark"
@@ -651,9 +654,8 @@ async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
         (403, json!("not_current"))
     );
     // Its head is the one the page was read at, the revocation's, past the one its request
-    // committed (Switch wire 7.1), and the key's mark covers it (7.3 step 10).
-    let key = service_key(&replay).await;
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    // committed (Switch wire 7.1), and the account's mark covers it (7.3 step 10).
+    let mark = mark_of(&replay).await;
     assert_eq!(head_seq(&answer), Some(11));
     assert!(mark.seq >= 11);
     let fresh = read(&replay, "wallet", "?after=1:11", at).await;
@@ -726,16 +728,24 @@ async fn test_feed_refuses_an_app_of_another_identity() {
     replay.db.drop_database().await.expect("drop");
 }
 
-async fn service_key(replay: &Replay) -> KeyId {
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
-        .bind(alice_id())
-        .fetch_one(&mut conn)
-        .await
-        .expect("key");
-    KeyId::parse(&id).expect("key id")
+/// Wait until a long-poll waits on the account, its page read after the lock.
+async fn until_held(replay: &Replay) {
+    let changes = replay.service.changes();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while changes.waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read is held");
+}
+
+/// alice's mark.
+async fn mark_of(replay: &Replay) -> AccountMark {
+    match replay.marks.read(&alice_id()).await.expect("mark store") {
+        MarkRead::Mark(mark) => mark,
+        other => panic!("no mark: {other:?}"),
+    }
 }
 
 async fn sql(replay: &Replay, statement: &str) {
@@ -753,9 +763,10 @@ async fn sql(replay: &Replay, statement: &str) {
 async fn test_feed_moves_the_mark_to_the_head_it_shows() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
+    assert_eq!(mark_of(&replay).await.seq, 9);
     // A head committed meanwhile by a request that hasn't moved the mark yet: the page
-    // shows it, so the mark moves to it before the answer goes out.
+    // shows it, so the mark moves to it before the answer goes out (Switch wire 7.3 step
+    // 10).
     let at = revoke_time();
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -773,45 +784,65 @@ async fn test_feed_moves_the_mark_to_the_head_it_shows() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(body(&answer)["head"]["seq"], 10);
+    assert_eq!(head_seq(&answer), Some(10));
     assert_eq!(
-        replay.keys.mark(&key).await.expect("mark"),
-        Some(Mark {
+        mark_of(&replay).await.head(),
+        ChainTip {
             generation: 1,
             seq: 10,
             chain_hash: [0xab; 32],
-        })
+        }
     );
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_feed_refuses_a_head_behind_the_mark() {
+async fn test_feed_long_poll_behind_the_mark_answers_the_notice() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
-    // The key signed a head beyond the state the page reads: the page is refused with the
-    // mark's 503, which carries no head.
+    // A head beyond the state the page reads is signed meanwhile: the page read at the end
+    // of the wait is judged again, from a mark read before its snapshot, and answers the
+    // notice, signed with the key in the mark, without a head (Switch wire 7.3, Tables 1
+    // and 2).
     let at = revoke_time();
-    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let mark = Mark {
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:9&wait=1", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let sent = Sent::of(&request);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        until_held(&replay).await;
+        let ahead = ChainTip {
             generation: 1,
             seq: 50,
             chain_hash: [0xcd; 32],
         };
-        replay.keys.advance_mark(&key, mark).await.expect("mark");
+        replay
+            .marks
+            .advance(&alice_id(), ahead, service_public(&replay))
+            .await
+            .expect("mark");
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
-        (503, json!("unavailable"))
+        (503, json!("recovery_required"))
     );
+    assert_eq!(body(&answer)["current"]["reason"], json!("behind"));
     assert!(header_text(&answer, header::HEAD).is_none());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(replay.service.mark_refusals(), 1);
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
+async fn test_feed_long_poll_of_an_account_erased_meanwhile_is_not_hosted() {
+    // The page read at the end of the wait is judged again: the account is gone, so the
+    // read answers the not-hosted `404`, signed with the service key, without a head
+    // (Switch wire 7.4.16 Afterwards, 7.3 step 2).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
@@ -825,30 +856,21 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
     );
     let sent = Sent::of(&request);
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // The signer erases the account (Switch wire 7.4.16).
-        let key = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
-        let service = keys["service_keys"]
-            .as_array()
-            .expect("service keys")
-            .iter()
-            .find(|s| s["account"] == key.as_str())
-            .expect("alice's service key")["public"]
-            .as_str()
-            .expect("public")
-            .to_string();
-        let service: [u8; 32] = pubky_switch_core::enc::unb64(&service)
-            .expect("key")
-            .try_into()
-            .expect("32 bytes");
+        until_held(&replay).await;
+        // The signer erases the account, naming its newest identity.json (Switch wire
+        // 7.4.16).
+        let held: SignedDoc = serde_json::from_value(
+            named(
+                &vectors("documents.json")["documents"],
+                "alice identity.json",
+            )["signed"]
+                .clone(),
+        )
+        .expect("version 3");
+        let held = held.doc_hash().expect("hash");
         let erased = replay
             .service
-            .handle(signer_request(
-                "POST",
-                &format!("/v1/{}/erase", alice_id()),
-                pubky_switch_core::http::erase_body(&service, None),
-                ms(&at),
-            ))
+            .handle(erasure_of(&replay, &alice_id(), Some(&held), ms(&at)).await)
             .await;
         assert_eq!(
             erased.status,
@@ -861,9 +883,9 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
         (answer.status, body(&answer)["code"].clone()),
         (404, json!("not_found"))
     );
+    assert_eq!(body(&answer)["current"], json!({ "hosted": false }));
     assert!(header_text(&answer, header::HEAD).is_none());
-    // Signed with the operator key, as for an account the service doesn't hold.
-    assert!(signed_with(&answer, &operator_public(), &sent));
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -877,7 +899,6 @@ fn head_seq(answer: &SwitchResponse) -> Option<u64> {
 async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
     // A second after the revocation, so the read stamps a time of its own.
     let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
     set_time(&replay.clock, &at);
@@ -911,7 +932,7 @@ async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
     );
     // The snapshot's head, at 10, past the request's own 9 (Switch wire 7.1), the mark moved
     // to it first (7.3 step 10).
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    let mark = mark_of(&replay).await;
     assert_eq!(head_seq(&answer), Some(10));
     assert!(mark.seq >= 10);
     assert_eq!(
@@ -1179,104 +1200,27 @@ async fn stamped_time(replay: &Replay) -> i64 {
         .expect("stamp")
 }
 
-/// A key store whose `advance_mark` fails while armed.
-struct MarkStuck {
-    inner: std::sync::Arc<pubky_switch::keys::FixedKeys>,
-    armed: std::sync::atomic::AtomicBool,
-    /// The marks moved while it wasn't armed.
-    moved: std::sync::atomic::AtomicUsize,
-}
-
-impl KeyStore for MarkStuck {
-    fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
-        self.inner.generate()
-    }
-    fn generate_as<'a>(
-        &'a self,
-        id: &'a KeyId,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
-        self.inner.generate_as(id)
-    }
-    fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
-        self.inner.public_key(id)
-    }
-    fn signer<'a>(
-        &'a self,
-        id: &'a KeyId,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
-        self.inner.signer(id)
-    }
-    fn operator(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceSigner> {
-        self.inner.operator()
-    }
-    fn mark<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, Option<Mark>> {
-        self.inner.mark(id)
-    }
-    fn advance_mark<'a>(
-        &'a self,
-        id: &'a KeyId,
-        head: Mark,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::MarkCheck> {
-        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Box::pin(async {
-                Err(pubky_switch::keys::KeyStoreError::Corrupt("stuck".into()))
-            });
-        }
-        let moving = self.inner.advance_mark(id, head);
-        Box::pin(async move {
-            let moved = moving.await;
-            self.moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            moved
-        })
-    }
-    fn delete<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, ()> {
-        self.inner.delete(id)
-    }
-    fn record_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
-        self.inner.record_erasure(identity, erased_at_ms)
-    }
-    fn erasure<'a>(&'a self, identity: &'a str) -> pubky_switch::keys::KeyFuture<'a, Option<u64>> {
-        self.inner.erasure(identity)
-    }
-
-    fn erasures(&self) -> pubky_switch::keys::KeyFuture<'_, Vec<(String, u64)>> {
-        self.inner.erasures()
-    }
-
-    fn forget_erasures_before(&self, before_ms: u64) -> pubky_switch::keys::KeyFuture<'_, usize> {
-        self.inner.forget_erasures_before(before_ms)
-    }
+/// Make alice's mark unable to move, or able again: the mark store's directory of marks
+/// read-only, or writable.
+fn marks_writable(replay: &Replay, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = replay.key_dir().join("accounts").join("marks");
+    let mode = if writable { 0o700 } else { 0o500 };
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
 #[tokio::test]
 async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
-    // As in the expiry test, a held read is refused from a later snapshot; but the key's
-    // mark can't move to that snapshot's head, so the refusal carries the head the request
+    // As in the expiry test, a held read is refused from a later snapshot; but the mark
+    // can't move to that snapshot's head, so the refusal carries the head the request
     // committed, which the mark covers, never the snapshot's (Switch wire 7.3 step 10).
-    // The key store sticks only once the read's own commit has moved the mark: stuck
-    // between the commit and that move, the read would answer the temporary `503`, which
-    // is right for a key store that fails there, and not what this test is about.
-    let Some(mut replay) = replay().await else {
+    // The mark sticks only once the read's own commit is in: stuck before it, the read
+    // would answer the temporary `503`, which is right for a mark store that fails there,
+    // and not what this test is about.
+    let Some(replay) = replay().await else {
         return;
     };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
-    let stuck = std::sync::Arc::new(MarkStuck {
-        inner: replay.keys.clone(),
-        armed: std::sync::atomic::AtomicBool::new(false),
-        moved: std::sync::atomic::AtomicUsize::new(0),
-    });
-    replay.service = pubky_switch::service::Service::new(
-        ORIGIN.into(),
-        replay.db.store().clone(),
-        stuck.clone(),
-        replay.time.clone(),
-        Limits::default(),
-    );
     let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
     set_time(&replay.clock, &at);
     let read_ms = i64::try_from(ms(&at)).expect("time");
@@ -1286,16 +1230,14 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     let (stop, task) = listen(&replay).await;
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=25", &at), async {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while stamped_time(&replay).await != read_ms
-            || stuck.moved.load(std::sync::atomic::Ordering::SeqCst) == 0
-        {
+        while stamped_time(&replay).await != read_ms {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the read never committed its stamp and moved the mark"
+                "the read never committed its stamp"
             );
             tokio::task::yield_now().await;
         }
-        stuck.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        marks_writable(&replay, false);
         sql(
             &replay,
             &format!(
@@ -1311,6 +1253,7 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
         )
         .await;
     });
+    marks_writable(&replay, true);
     let _ = stop.send(());
     task.await.expect("listener");
     assert_eq!(
@@ -1318,8 +1261,8 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
         (403, json!("cert_expired"))
     );
     assert_eq!(head_seq(&answer), Some(9));
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
-    assert!(mark.seq < 10, "the mark didn't move: {mark:?}");
+    let mark = mark_of(&replay).await;
+    assert_eq!(mark.seq, 9, "the mark didn't move: {mark:?}");
     replay.db.drop_database().await.expect("drop");
 }
 

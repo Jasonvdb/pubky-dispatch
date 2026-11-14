@@ -1,17 +1,19 @@
 //! The storage layer against PostgreSQL: per-account transactions, durability before the
-//! answer, crashes before the commit, per-account ordering, and the key's mark.
+//! answer, crashes before the commit, per-account ordering, account creation after an
+//! erasure, erasure, a generation started afresh, and the reads the verdict takes.
 //!
 //! Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
-// Test helpers fail the test on any error.
+// A test fails on any error.
 #![allow(clippy::expect_used)]
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use pubky_switch::{
-    keys::{FileKeyStore, KeyStore, Mark, MarkCheck},
+    keys::{FileKeyStore, KeyId, KeyStore},
     store::{
-        CommitError, DatabaseConfig, NewAccount, Store, StoreError,
+        DatabaseConfig, ErasedKey, HeldIdentity, NewAccount, RECOVERY_KEEPS, Recovery, Store,
+        StoreError, recovery_clears,
         testing::{TestDatabase, test_database},
     },
 };
@@ -19,6 +21,8 @@ use sqlx::{Connection, Executor, PgConnection};
 
 const ID_A: &str = "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy";
 const ID_B: &str = "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo";
+const ID_C: &str = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty";
+const ID_D: &str = "9xk3pd5ojmm4z8ckab1nrqjzo6aiu4e7fxg8b3fyeq7tts1yhcwo";
 const T0: u64 = 1_767_225_600_000;
 
 struct Fixture {
@@ -33,18 +37,7 @@ impl Fixture {
     }
 
     async fn account(&self, id: &str) -> NewAccount {
-        let key = self.keys.generate().await.expect("service key");
-        let account = NewAccount {
-            id: id.into(),
-            identity_key: [7; 32],
-            generation: 1,
-            service_key: key.id,
-            created_at_ms: T0,
-            limits: pubky_switch_core::records::Limits::default(),
-            identity_doc: None,
-            revoked_apps: Vec::new(),
-            enrollment_hash: [0; 32],
-        };
+        let account = new_account(id);
         assert!(self.store().create_account(&account).await.expect("create"));
         account
     }
@@ -54,6 +47,20 @@ impl Fixture {
             .drop_database()
             .await
             .expect("drop the test database");
+    }
+}
+
+/// Account `id` at generation 1, created at `T0`, holding no `identity.json`.
+fn new_account(id: &str) -> NewAccount {
+    NewAccount {
+        id: id.into(),
+        identity_key: [7; 32],
+        generation: 1,
+        created_at_ms: T0,
+        limits: pubky_switch_core::records::Limits::default(),
+        identity_doc: None,
+        revoked_apps: Vec::new(),
+        enrollment_hash: [0; 32],
     }
 }
 
@@ -108,7 +115,7 @@ async fn test_store_creates_account_once() {
     let head = txn.head();
     assert_eq!(head.id, ID_A);
     assert_eq!(head.generation, 1);
-    assert_eq!(head.service_key, account.service_key);
+    assert_eq!(head.created_at_ms, account.created_at_ms);
     assert_eq!(head.last_seq, 0);
     assert_eq!(head.chain, None);
     assert_eq!(head.stamped_time_ms, T0);
@@ -283,181 +290,13 @@ async fn test_store_crash_before_commit_leaves_no_trace() {
 }
 
 #[tokio::test]
-async fn test_store_failed_commit_releases_no_answer_and_keeps_the_mark() {
-    let Some(fx) = fixture().await else { return };
-    let account = fx.account(ID_A).await;
-    let mut txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    append(&mut txn, 1);
-    txn.commit_marked(&fx.keys).await.expect("first commit");
-    let mark = fx.keys.mark(&account.service_key).await.expect("mark");
-    assert_eq!(mark.map(|m| m.seq), Some(1));
-
-    let mut txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    append(&mut txn, 2);
-    let pid = backend_pid(&mut txn).await;
-    kill_backend(&fx.db, pid).await;
-    // No `Committed`, so no answer carrying the new seq or head can be built, and the
-    // mark stays at the durable state.
-    assert!(matches!(
-        txn.commit_marked(&fx.keys).await,
-        Err(CommitError::NotCommitted(_))
-    ));
-    assert_eq!(
-        fx.keys.mark(&account.service_key).await.expect("mark"),
-        mark
-    );
-    let txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    assert_eq!(txn.head().chain, Some((1, [1; 32])));
-    assert_eq!(
-        txn.mark_check(&fx.keys).await.expect("check"),
-        MarkCheck::Current
-    );
-    drop(txn);
-    fx.finish().await;
-}
-
-#[tokio::test]
-async fn test_store_mark_follows_commits() {
-    let Some(fx) = fixture().await else { return };
-    let account = fx.account(ID_A).await;
-    let txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    assert_eq!(
-        txn.mark_check(&fx.keys).await.expect("check"),
-        MarkCheck::Unmarked
-    );
-    // A request that adds no chain item leaves the key unmarked.
-    txn.commit_marked(&fx.keys).await.expect("commit");
-    assert_eq!(
-        fx.keys.mark(&account.service_key).await.expect("mark"),
-        None
-    );
-    for hash in 1..=3 {
-        let mut txn = fx
-            .store()
-            .begin(ID_A)
-            .await
-            .expect("begin")
-            .expect("account");
-        append(&mut txn, hash);
-        txn.commit_marked(&fx.keys).await.expect("commit");
-    }
-    assert_eq!(
-        fx.keys.mark(&account.service_key).await.expect("mark"),
-        Some(Mark {
-            generation: 1,
-            seq: 3,
-            chain_hash: [3; 32]
-        })
-    );
-    fx.finish().await;
-}
-
-#[tokio::test]
-async fn test_store_restored_state_behind_the_mark_is_refused() {
-    let Some(fx) = fixture().await else { return };
-    fx.account(ID_A).await;
-    for hash in 1..=3 {
-        let mut txn = fx
-            .store()
-            .begin(ID_A)
-            .await
-            .expect("begin")
-            .expect("account");
-        append(&mut txn, hash);
-        txn.commit_marked(&fx.keys).await.expect("commit");
-    }
-    // A backup taken at seq 2 is restored: the key's mark, kept apart, still says 3.
-    let mut admin = PgConnection::connect_with(fx.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("UPDATE accounts SET last_seq = 2, chain_seq = 2, chain_hash = $2 WHERE id = $1")
-        .bind(ID_A)
-        .bind([2u8; 32].as_slice())
-        .execute(&mut admin)
-        .await
-        .expect("restore");
-    let txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    assert_eq!(
-        txn.mark_check(&fx.keys).await.expect("check"),
-        MarkCheck::Behind
-    );
-    drop(txn);
-    // Another history at the mark's seq is a fork.
-    sqlx::query("UPDATE accounts SET last_seq = 3, chain_seq = 3, chain_hash = $2 WHERE id = $1")
-        .bind(ID_A)
-        .bind([9u8; 32].as_slice())
-        .execute(&mut admin)
-        .await
-        .expect("fork");
-    let txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    assert_eq!(
-        txn.mark_check(&fx.keys).await.expect("check"),
-        MarkCheck::Fork
-    );
-    drop(txn);
-    // A restore to before the first chain item is behind as well.
-    sqlx::query(
-        "UPDATE accounts SET last_seq = 0, chain_seq = NULL, chain_hash = NULL WHERE id = $1",
-    )
-    .bind(ID_A)
-    .execute(&mut admin)
-    .await
-    .expect("empty");
-    let txn = fx
-        .store()
-        .begin(ID_A)
-        .await
-        .expect("begin")
-        .expect("account");
-    assert_eq!(
-        txn.mark_check(&fx.keys).await.expect("check"),
-        MarkCheck::Behind
-    );
-    drop(txn);
-    admin.close().await.expect("close");
-    fx.finish().await;
-}
-
-#[tokio::test]
 async fn test_store_serializes_one_account() {
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
     let store = fx.store().clone();
-    let keys = Arc::new(fx.keys.clone());
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let store = store.clone();
-        let keys = keys.clone();
         tasks.push(tokio::spawn(async move {
             let mut txn = store.begin(ID_A).await.expect("begin").expect("account");
             let before = txn.head().last_seq;
@@ -468,7 +307,7 @@ async fn test_store_serializes_one_account() {
             hash[..8].copy_from_slice(&seq.to_be_bytes());
             txn.set_chain_head(seq, hash).expect("head");
             tokio::time::sleep(Duration::from_millis(5)).await;
-            txn.commit_marked(keys.as_ref()).await.expect("commit");
+            txn.commit().await.expect("commit");
             seq
         }));
     }
@@ -480,10 +319,7 @@ async fn test_store_serializes_one_account() {
     assert_eq!(seqs, (1..=12).collect::<Vec<u64>>());
     let txn = store.begin(ID_A).await.expect("begin").expect("account");
     assert_eq!(txn.head().last_seq, 12);
-    assert_eq!(
-        txn.mark_check(keys.as_ref()).await.expect("check"),
-        MarkCheck::Current
-    );
+    assert_eq!(txn.head().chain.map(|(seq, _)| seq), Some(12));
     drop(txn);
     fx.finish().await;
 }
@@ -720,8 +556,8 @@ async fn test_store_empty_database_comes_up_at_the_current_schema() {
         .expect("begin")
         .expect("account");
     assert_eq!(
-        (txn.head().id.as_str(), &txn.head().service_key),
-        (ID_A, &account.service_key)
+        (txn.head().id.as_str(), txn.head().generation),
+        (ID_A, account.generation)
     );
     drop(txn);
     // Migrating again changes nothing: no migration runs, and the account stays.
@@ -1447,8 +1283,9 @@ async fn insert_waits(db: &TestDatabase, context: &str) {
 #[tokio::test]
 async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
     // An account inserted while an erasure of the same ID is still committing waits for the
-    // deletion, then is created after that erasure, which the database still owes keys for,
-    // whatever isolation level the database gives new sessions (Switch spec 6.5).
+    // deletion, then is created after that erasure's record in the ledger, which is durable
+    // before the deletion commits, whatever isolation level the database gives new sessions
+    // (Switch spec 6.5; Switch wire 7.3, Table 3).
     for level in ["read committed", "repeatable read", "serializable"] {
         let Some(fx) = fixture().await else { return };
         let old = fx.account(ID_A).await;
@@ -1468,6 +1305,10 @@ async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
             .await
             .expect("store");
         let erased_at = T0 + 60_000;
+        fx.keys
+            .record_erasure(ID_A, erased_at)
+            .await
+            .expect("record");
         let mut erasing = PgConnection::connect_with(fx.db.options())
             .await
             .expect("conn");
@@ -1477,25 +1318,17 @@ async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
             .execute(&mut erasing)
             .await
             .expect("delete");
-        sqlx::query(
-            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)",
-        )
-        .bind(old.service_key.as_str())
-        .bind(ID_A)
-        .bind(i64::try_from(erased_at).expect("time"))
-        .execute(&mut erasing)
-        .await
-        .expect("owed");
-        let key = fx.keys.generate().await.expect("service key");
         let account = NewAccount {
-            service_key: key.id,
             created_at_ms: T0 + 1_000,
             ..old.clone()
         };
         let (created, ()) = tokio::join!(
             async {
                 match store.begin_create(&account).await {
-                    Ok(Some(creation)) => creation.commit(None).await.ok(),
+                    Ok(Some(creation)) => {
+                        let ledger = fx.keys.erasure(ID_A).await.expect("ledger");
+                        creation.commit(ledger).await.ok()
+                    }
                     _ => None,
                 }
             },
@@ -1515,9 +1348,9 @@ async fn test_store_creation_waiting_on_an_erasure_never_commits_before_it() {
 #[tokio::test]
 async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout() {
     // An account inserted while an erasure of the same ID holds its row waits at most the
-    // configured lock timeout, then is refused, writing nothing, so the enrollment deletes
-    // its unused key and answers `503`; a retry once the erasure committed creates the
-    // account after it (Switch spec 6.5).
+    // configured lock timeout, then is refused, writing nothing, so the enrollment answers
+    // `503`; a retry once the erasure committed creates the account after it (Switch spec
+    // 6.5).
     let Some(fx) = fixture().await else { return };
     let old = fx.account(ID_A).await;
     let config = DatabaseConfig {
@@ -1528,6 +1361,10 @@ async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout(
         .await
         .expect("store");
     let erased_at = T0 + 60_000;
+    fx.keys
+        .record_erasure(ID_A, erased_at)
+        .await
+        .expect("record");
     let mut erasing = PgConnection::connect_with(fx.db.options())
         .await
         .expect("conn");
@@ -1537,16 +1374,7 @@ async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout(
         .execute(&mut erasing)
         .await
         .expect("delete");
-    sqlx::query("INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3)")
-        .bind(old.service_key.as_str())
-        .bind(ID_A)
-        .bind(i64::try_from(erased_at).expect("time"))
-        .execute(&mut erasing)
-        .await
-        .expect("owed");
-    let key = fx.keys.generate().await.expect("service key");
     let account = NewAccount {
-        service_key: key.id,
         created_at_ms: T0 + 1_000,
         ..old.clone()
     };
@@ -1560,19 +1388,432 @@ async fn test_store_creation_waiting_on_an_erasure_gives_up_at_the_lock_timeout(
     erasing.close().await.expect("close");
     assert!(store.lookup(ID_A).await.expect("lookup").is_none());
 
-    let key = fx.keys.generate().await.expect("service key");
-    let account = NewAccount {
-        service_key: key.id,
-        ..account
-    };
     let creation = store
         .begin_create(&account)
         .await
         .expect("retry")
         .expect("no account");
-    let created = creation.commit(None).await.expect("commit");
+    let ledger = fx.keys.erasure(ID_A).await.expect("ledger");
+    let created = creation.commit(ledger).await.expect("commit");
     assert!(created > erased_at, "created at {created}");
     assert!(store.lookup(ID_A).await.expect("lookup").is_some());
     store.close().await;
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_creation_is_raised_past_the_ledger_record() {
+    // An account whose identity's latest erasure is recorded at or after the time asked for
+    // is created 1 ms after the record, its stamped time with it; a record before that time,
+    // or none, leaves the time asked for (Switch spec 6.5; Switch wire 7.3, Table 1).
+    let Some(fx) = fixture().await else { return };
+    for (id, ledger, expected) in [
+        (ID_A, Some(T0 + 5_000), T0 + 5_001),
+        (ID_B, Some(T0), T0 + 1),
+        (ID_C, Some(T0 - 1), T0),
+        (ID_D, None, T0),
+    ] {
+        let creation = fx
+            .store()
+            .begin_create(&new_account(id))
+            .await
+            .expect("begin")
+            .expect("no account");
+        assert_eq!(
+            creation.commit(ledger).await.expect("commit"),
+            expected,
+            "{id}"
+        );
+        let found = fx
+            .store()
+            .lookup(id)
+            .await
+            .expect("lookup")
+            .expect("account");
+        assert_eq!(
+            (found.created_at_ms, found.stamped_time_ms),
+            (expected, expected),
+            "{id}"
+        );
+    }
+    // An account that exists already is no creation, and keeps its time.
+    assert!(
+        fx.store()
+            .begin_create(&new_account(ID_A))
+            .await
+            .expect("begin")
+            .is_none()
+    );
+    fx.finish().await;
+}
+
+/// The tables with an account column.
+async fn account_tables(db: &TestDatabase) -> Vec<String> {
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let mut tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND column_name = 'account_id' \
+         ORDER BY table_name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("tables");
+    conn.close().await.expect("close");
+    tables.dedup();
+    tables
+}
+
+/// The rows of `table` account `id` holds.
+async fn rows_of(db: &TestDatabase, table: &str, id: &str) -> i64 {
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let count = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE account_id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&mut conn)
+    .await
+    .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
+/// Give account `id` state of its generation: a chain item, a shared record, a push
+/// registration, an App ID kept for good, one held for the next generation and an
+/// identity.json. The push registration's key.
+async fn seed_state(fx: &Fixture, id: &str) -> KeyId {
+    let push_key = KeyId::random().expect("key id");
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO chain_items (account_id, generation, seq, item_type, envelope, \
+         chain_hash, server_time_ms) VALUES ($1, 1, 1, 'op', '\\x7b7d', $2, $3)",
+    )
+    .bind(id)
+    .bind([1u8; 32].as_slice())
+    .bind(i64::try_from(T0).expect("t0"))
+    .execute(&mut conn)
+    .await
+    .expect("chain item");
+    sqlx::query(
+        "INSERT INTO push_registrations (account_id, app_id, relay_url, push_key_id, \
+         push_public, handles, set_at_ms) VALUES ($1, $2, 'https://relay.example', $3, $4, \
+         '{}', $5)",
+    )
+    .bind(id)
+    .bind([5u8; 16].as_slice())
+    .bind(push_key.as_str())
+    .bind([6u8; 32].as_slice())
+    .bind(i64::try_from(T0).expect("t0"))
+    .execute(&mut conn)
+    .await
+    .expect("push registration");
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+         VALUES ($1, $2, 'revoked', $3)",
+    )
+    .bind(id)
+    .bind([9u8; 16].as_slice())
+    .bind(i64::try_from(T0).expect("t0"))
+    .execute(&mut conn)
+    .await
+    .expect("kept app id");
+    conn.close().await.expect("close");
+    let mut txn = fx.store().begin(id).await.expect("begin").expect("account");
+    let seq = txn.next_seq().expect("seq");
+    txn.set_chain_head(seq, [1; 32]).expect("chain head");
+    txn.put_record(&shared_record([0x21; 32], [1; 32], "tasks", false, 1))
+        .await
+        .expect("record");
+    txn.hold_revoked_apps(&[[8; 16]]).await.expect("hold");
+    txn.set_identity(&HeldIdentity {
+        doc: pubky_switch_core::sig::SignedDoc::from_parts(b"{}", &[0; 64]),
+        proof: None,
+    })
+    .await
+    .expect("identity");
+    txn.commit().await.expect("commit");
+    push_key
+}
+
+/// The rows account `id` holds in each table with an account column.
+async fn holdings_of(fx: &Fixture, id: &str) -> Vec<(String, i64)> {
+    let mut held = Vec::new();
+    for table in account_tables(&fx.db).await {
+        let rows = rows_of(&fx.db, &table, id).await;
+        held.push((table, rows));
+    }
+    held
+}
+
+#[tokio::test]
+async fn test_store_erase_deletes_every_row_and_owes_the_push_keys() {
+    // An erasure deletes the account's row and every row of its state, and owes deleting its
+    // apps' push keys; another account's rows stay (Switch wire 7.4.16, 8.1).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    fx.account(ID_B).await;
+    let push_a = seed_state(&fx, ID_A).await;
+    seed_state(&fx, ID_B).await;
+    let before_b = holdings_of(&fx, ID_B).await;
+    for table in [
+        "chain_items",
+        "shared_records",
+        "push_registrations",
+        "kept_app_ids",
+        "held_revoked_apps",
+        "enrollment_answers",
+    ] {
+        assert_eq!(rows_of(&fx.db, table, ID_A).await, 1, "{table}");
+    }
+    let erased_at = T0 + 9_000;
+    let txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.erase(erased_at).await.expect("erase");
+
+    assert!(fx.store().lookup(ID_A).await.expect("lookup").is_none());
+    assert!(fx.store().begin(ID_A).await.expect("begin").is_none());
+    for (table, rows) in holdings_of(&fx, ID_A).await {
+        let expected = i64::from(table == "erased_keys");
+        assert_eq!(rows, expected, "{table}");
+    }
+    assert_eq!(
+        fx.store().erased_keys().await.expect("owed"),
+        vec![ErasedKey {
+            key: push_a,
+            account: ID_A.into(),
+            erased_at_ms: erased_at,
+        }]
+    );
+    assert_eq!(holdings_of(&fx, ID_B).await, before_b, "B's rows stay");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_erase_that_fails_to_commit_keeps_the_account() {
+    // An erasure whose connection dies before its commit deletes nothing and owes nothing.
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    seed_state(&fx, ID_A).await;
+    let before = holdings_of(&fx, ID_A).await;
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let pid = backend_pid(&mut txn).await;
+    kill_backend(&fx.db, pid).await;
+    assert!(txn.erase(T0 + 9_000).await.is_err());
+    assert!(fx.store().lookup(ID_A).await.expect("lookup").is_some());
+    assert_eq!(holdings_of(&fx, ID_A).await, before);
+    assert!(fx.store().erased_keys().await.expect("owed").is_empty());
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_start_afresh_keeps_and_empties_the_right_tables() {
+    // A generation started afresh empties every table of the generation's state, keeps the
+    // App IDs kept for good, joined by those held for the next generation, the enrollment
+    // answers and the push keys owed, the registration's key among them; the account keeps
+    // its row and service time, and serves the new generation from an empty chain (Switch
+    // wire 3.3, 3.7, 7.3 Table 2).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    fx.account(ID_B).await;
+    let push_a = seed_state(&fx, ID_A).await;
+    seed_state(&fx, ID_B).await;
+    let before_a = holdings_of(&fx, ID_A).await;
+    let before_b = holdings_of(&fx, ID_B).await;
+    let at = T0 + 3_000;
+
+    // Not committed: nothing changes.
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.start_afresh(2, 1, at, true).await.expect("afresh");
+    drop(txn);
+    assert_eq!(holdings_of(&fx, ID_A).await, before_a);
+
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let stamped = txn.head().stamped_time_ms;
+    txn.start_afresh(2, 1, at, true).await.expect("afresh");
+    assert_eq!(
+        (txn.head().generation, txn.head().last_seq, txn.head().chain),
+        (2, 0, None)
+    );
+    // The new generation's first chain item is seq 1.
+    assert_eq!(txn.next_seq().expect("seq"), 1);
+    txn.commit().await.expect("commit");
+
+    for table in recovery_clears() {
+        assert_eq!(rows_of(&fx.db, table, ID_A).await, 0, "{table} emptied");
+    }
+    for table in RECOVERY_KEEPS {
+        assert!(rows_of(&fx.db, table, ID_A).await > 0, "{table} kept");
+    }
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let mut kept = txn.kept_app_ids().await.expect("kept");
+    kept.sort_unstable();
+    assert_eq!(kept, vec![[8; 16], [9; 16]], "the held App ID joins");
+    assert!(txn.held_revoked_apps().await.expect("held").is_empty());
+    assert_eq!(
+        txn.recovery().await.expect("recovery"),
+        Some(Recovery {
+            recovery_from: 1,
+            declared_at_ms: at,
+            admission_staged: true,
+        })
+    );
+    assert!(txn.held_identity().await.expect("identity").is_none());
+    drop(txn);
+    let found = fx
+        .store()
+        .lookup(ID_A)
+        .await
+        .expect("lookup")
+        .expect("account");
+    assert_eq!(
+        (found.generation, found.chain, found.stamped_time_ms),
+        (2, None, stamped)
+    );
+    assert!(
+        fx.store()
+            .erased_keys()
+            .await
+            .expect("owed")
+            .iter()
+            .any(|owed| owed.key == push_a && owed.account == ID_A),
+        "the registration's key is owed"
+    );
+    assert_eq!(holdings_of(&fx, ID_B).await, before_b, "B's rows stay");
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_lookup_reads_generation_chain_and_document() {
+    // The verdict's read of an account before its lock: generation, chain head, times and
+    // the newest identity.json (Switch wire 7.3 step 2).
+    let Some(fx) = fixture().await else { return };
+    assert!(fx.store().lookup(ID_A).await.expect("lookup").is_none());
+    fx.account(ID_A).await;
+    let found = fx
+        .store()
+        .lookup(ID_A)
+        .await
+        .expect("lookup")
+        .expect("account");
+    assert_eq!(
+        (
+            found.generation,
+            found.chain,
+            found.stamped_time_ms,
+            found.created_at_ms,
+            found.identity_doc
+        ),
+        (1, None, T0, T0, None)
+    );
+    let doc = pubky_switch_core::sig::SignedDoc::from_parts(b"{\"v\":1}", &[4; 64]);
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.stamp(T0 + 1_000);
+    append(&mut txn, 0xab);
+    txn.set_identity(&HeldIdentity {
+        doc: doc.clone(),
+        proof: None,
+    })
+    .await
+    .expect("identity");
+    txn.commit().await.expect("commit");
+    // It doesn't wait for the account's lock, and reads what was committed.
+    let held = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let found = tokio::time::timeout(Duration::from_secs(2), fx.store().lookup(ID_A))
+        .await
+        .expect("not blocked by the lock")
+        .expect("lookup")
+        .expect("account");
+    drop(held);
+    assert_eq!(
+        (
+            found.generation,
+            found.chain,
+            found.stamped_time_ms,
+            found.created_at_ms,
+            found.identity_doc
+        ),
+        (1, Some((1, [0xab; 32])), T0 + 1_000, T0, Some(doc))
+    );
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_stub_hash_at_reads_the_held_stub() {
+    // The chain hash of the stub an account holds at a generation and seq, for a fork past
+    // the mark (Switch wire 7.3, Table 1); none where it holds no stub there.
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    fx.account(ID_B).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    for (id, seq, hash) in [(ID_A, 1i64, 1u8), (ID_A, 2, 2), (ID_B, 3, 3)] {
+        sqlx::query(
+            "INSERT INTO chain_items (account_id, generation, seq, item_type, envelope, \
+             chain_hash, server_time_ms) VALUES ($1, 1, $2, 'op', '\\x7b7d', $3, 0)",
+        )
+        .bind(id)
+        .bind(seq)
+        .bind([hash; 32].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("chain item");
+    }
+    conn.close().await.expect("close");
+    let store = fx.store();
+    assert_eq!(
+        store.stub_hash_at(ID_A, 1, 2).await.expect("stub"),
+        Some([2; 32])
+    );
+    assert_eq!(
+        store.stub_hash_at(ID_A, 1, 1).await.expect("stub"),
+        Some([1; 32])
+    );
+    for (id, generation, seq) in [(ID_A, 1, 3), (ID_A, 2, 1), (ID_B, 1, 2), (ID_C, 1, 1)] {
+        assert_eq!(
+            store.stub_hash_at(id, generation, seq).await.expect("stub"),
+            None,
+            "{id} ({generation}, {seq})"
+        );
+    }
     fx.finish().await;
 }

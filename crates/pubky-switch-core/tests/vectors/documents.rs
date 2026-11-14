@@ -683,8 +683,12 @@ fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
             assert_eq!(e.revoked_apps(), [removed]);
         }
         // An answer for it, checked as the signer checks it.
-        let answer =
-            records::EnrollmentAnswer::new(&e, v3.inbox().service_key, records::Limits::default());
+        let answer = records::EnrollmentAnswer::new(
+            &e,
+            v3.inbox().service_key,
+            records::Limits::default(),
+            0,
+        );
         answer.check(&e).unwrap();
     }
 }

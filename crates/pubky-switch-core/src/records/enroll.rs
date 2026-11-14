@@ -200,7 +200,7 @@ impl Default for Limits {
 /// with the account's service key. Unknown members are ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EnrollmentAnswer {
-    /// The account's service key, or the pending key of the next generation.
+    /// The service's key.
     #[serde(with = "serde_b64")]
     pub service_key: [u8; 32],
     /// The account's limits.
@@ -216,11 +216,21 @@ pub struct EnrollmentAnswer {
     /// The document hash of the enrollment it answers.
     #[serde(with = "serde_b64")]
     pub enrollment: [u8; 32],
+    /// The account's creation time, in Unix milliseconds, fixed for the account: an
+    /// erasure names it (Switch wire 3.7, 7.4.16).
+    #[serde(with = "fmt::time_ms")]
+    pub created: u64,
 }
 
 impl EnrollmentAnswer {
-    /// The answer to `enrollment` with this key and these limits.
-    pub fn new(enrollment: &Enrollment, service_key: [u8; 32], limits: Limits) -> Self {
+    /// The answer to `enrollment` with this key and these limits, at the account created at
+    /// `created` (Unix milliseconds).
+    pub fn new(
+        enrollment: &Enrollment,
+        service_key: [u8; 32],
+        limits: Limits,
+        created: u64,
+    ) -> Self {
         Self {
             service_key,
             limits,
@@ -228,6 +238,7 @@ impl EnrollmentAnswer {
             origin: enrollment.body.origin.clone(),
             nonce: enrollment.body.nonce,
             enrollment: enrollment.hash,
+            created,
         }
     }
 
@@ -347,7 +358,7 @@ mod tests {
     #[test]
     fn test_enrollment_answer_checks() {
         let e = Enrollment::sign(&identity(), body()).unwrap();
-        let answer = EnrollmentAnswer::new(&e, [5; 32], Limits::default());
+        let answer = EnrollmentAnswer::new(&e, [5; 32], Limits::default(), 1_767_225_600_123);
         answer.check(&e).unwrap();
         let read = EnrollmentAnswer::from_json(&answer.to_json().unwrap()).unwrap();
         assert_eq!(read, answer);

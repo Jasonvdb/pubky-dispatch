@@ -258,7 +258,7 @@ async fn test_unpinned_client_sends_nothing() {
 #[tokio::test]
 async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
     let enrollment = enrollment([4; 16]);
-    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
     let body = answer.to_json().unwrap();
     let key = service_key();
     let transport = Arc::new(MockTransport::with_handler(move |request| {
@@ -278,6 +278,7 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
         &enrollment,
         pending.verifying_key().to_bytes(),
         Limits::default(),
+        0,
     );
     let body = answer.to_json().unwrap();
     let transport = Arc::new(MockTransport::with_handler(move |request| {
@@ -291,7 +292,7 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
 #[tokio::test]
 async fn test_enrollment_answer_signed_by_another_key_is_refused() {
     let enrollment = enrollment([4; 16]);
-    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
     let other = SigningKey::from_bytes(&[6; 32]);
     let body = answer.to_json().unwrap();
     let forged = Arc::new(MockTransport::with_handler(move |request| {
@@ -323,7 +324,7 @@ async fn test_enrollment_answer_signed_by_another_key_is_refused() {
 async fn test_enrollment_answer_for_another_enrollment_is_refused() {
     let sent = enrollment([4; 16]);
     let other = enrollment([5; 16]);
-    let answer = EnrollmentAnswer::new(&other, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&other, service_public(), Limits::default(), 0);
     let transport = fixed(
         service_key(),
         200,

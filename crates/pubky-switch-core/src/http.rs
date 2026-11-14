@@ -406,31 +406,30 @@ pub const ERASED_BODY: &[u8] = br#"{"erased":true}"#;
 /// The body of `POST /v1/{id}/erase` (Switch wire 7.4.16).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EraseBody {
-    /// The account's service key, the one the signer pinned.
-    pub service_key: [u8; 32],
-    /// The document hash of the newest `identity.json` the signer holds, its mark: the
-    /// erasure is refused when the account holds another. Absent when the signer delivered
-    /// nothing to this account.
+    /// The account's creation time, in Unix milliseconds, as its enrollment answer named it:
+    /// the erasure is refused when the account was created at another time. Absent where the
+    /// signer holds none; the refusal names it.
+    pub created: Option<u64>,
+    /// The document hash of the newest `identity.json` the account holds: the erasure is
+    /// refused when the account holds another, or none. Absent only for an account that
+    /// holds no `identity.json`.
     pub identity_hash: Option<[u8; 32]>,
 }
 
-/// Read the body of `POST /v1/{id}/erase`: `{ "service_key": b64(32), "identity_hash":
-/// b64(32) }`, the hash optional (Switch wire 7.4.16).
+/// Read the body of `POST /v1/{id}/erase`: `{ "created": time, "identity_hash": b64(32) }`,
+/// both optional in shape (Switch wire 7.4.16).
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] (`400 bad_request`) for any other member, or a key or hash that isn't
-/// `b64(32)`.
+/// [`Error::Invalid`] (`400 bad_request`) for any other member, a `created` that isn't a
+/// time (Switch wire 1.6), or a hash that isn't `b64(32)`.
 pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
     let value: serde_json::Value = crate::json::parse_json(body)?;
-    crate::json::reject_unknown_members(
-        &value,
-        &["service_key", "identity_hash"],
-        "the erasure body",
-    )?;
-    let service_key = match value.get("service_key") {
-        Some(serde_json::Value::String(text)) => unb64_array::<32>(text)?,
-        _ => return invalid("Switch wire 7.4.16: the erasure body names `service_key`"),
+    crate::json::reject_unknown_members(&value, &["created", "identity_hash"], "the erasure body")?;
+    let created = match value.get("created") {
+        None => None,
+        Some(serde_json::Value::String(text)) => Some(crate::time::parse_rfc3339(text)?),
+        Some(_) => return invalid("Switch wire 7.4.16: `created` is a time"),
     };
     let identity_hash = match value.get("identity_hash") {
         None => None,
@@ -438,23 +437,23 @@ pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
         Some(_) => return invalid("Switch wire 7.4.16: `identity_hash` is b64(32)"),
     };
     Ok(EraseBody {
-        service_key,
+        created,
         identity_hash,
     })
 }
 
-/// Write the body of `POST /v1/{id}/erase` (Switch wire 7.4.16): the service key, then the
-/// hash of the `identity.json` the erasure follows, when given.
-pub fn erase_body(service_key: &[u8; 32], identity_hash: Option<&[u8; 32]>) -> Vec<u8> {
-    let key = crate::enc::b64(service_key);
-    match identity_hash {
-        Some(hash) => format!(
-            "{{\"service_key\":\"{key}\",\"identity_hash\":\"{}\"}}",
-            crate::enc::b64(hash)
-        ),
-        None => format!("{{\"service_key\":\"{key}\"}}"),
+/// The body of `POST /v1/{id}/erase` naming `created`, the account's creation time from its
+/// enrollment answer, and `identity_hash`, the document hash of the newest `identity.json`
+/// the account holds, each left out when `None` (Switch wire 7.4.16).
+pub fn erase_body(created: Option<u64>, identity_hash: Option<&[u8; 32]>) -> Vec<u8> {
+    let mut members = Vec::new();
+    if let Some(created) = created {
+        members.push(format!("\"created\":\"{}\"", crate::time::rfc3339(created)));
     }
-    .into_bytes()
+    if let Some(hash) = identity_hash {
+        members.push(format!("\"identity_hash\":\"{}\"", crate::enc::b64(hash)));
+    }
+    format!("{{{}}}", members.join(",")).into_bytes()
 }
 
 /// The most handles one push registration holds, one per device (Switch wire 8.1).
@@ -1137,33 +1136,44 @@ mod tests {
 
     #[test]
     fn test_erase_body_refuses_other_members() {
-        let key = [3; 32];
         assert_eq!(
-            parse_erase_body(&erase_body(&key, None)).unwrap(),
+            parse_erase_body(&erase_body(None, None)).unwrap(),
             EraseBody {
-                service_key: key,
+                created: None,
                 identity_hash: None
             }
         );
-        assert!(parse_erase_body(br#"{"service_key":"AA","x":1}"#).is_err());
-        assert!(parse_erase_body(b"{}").is_err());
+        assert_eq!(erase_body(None, None), b"{}");
+        let key = crate::enc::b64(&[3; 32]);
+        let body = format!(r#"{{"service_key":"{key}"}}"#);
+        assert!(parse_erase_body(body.as_bytes()).is_err());
+        assert!(parse_erase_body(br#"{"x":1}"#).is_err());
+        assert!(parse_erase_body(b"[]").is_err());
     }
 
     #[test]
-    fn test_erase_body_carries_the_identity_hash() {
-        let (key, hash) = ([3; 32], [4; 32]);
+    fn test_erase_body_carries_the_creation_time_and_the_identity_hash() {
+        let (created, hash) = (1_767_225_600_123, [4; 32]);
+        let body = erase_body(Some(created), Some(&hash));
         assert_eq!(
-            parse_erase_body(&erase_body(&key, Some(&hash))).unwrap(),
+            body,
+            format!(
+                r#"{{"created":"2026-01-01T00:00:00.123Z","identity_hash":"{}"}}"#,
+                crate::enc::b64(&hash)
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            parse_erase_body(&body).unwrap(),
             EraseBody {
-                service_key: key,
+                created: Some(created),
                 identity_hash: Some(hash)
             }
         );
-        let text = crate::enc::b64(&key);
-        let body = format!(r#"{{"service_key":"{text}","identity_hash":7}}"#);
-        assert!(parse_erase_body(body.as_bytes()).is_err());
-        let body = format!(r#"{{"service_key":"{text}","identity_hash":"AA"}}"#);
-        assert!(parse_erase_body(body.as_bytes()).is_err());
+        assert!(parse_erase_body(br#"{"identity_hash":7}"#).is_err());
+        assert!(parse_erase_body(br#"{"identity_hash":"AA"}"#).is_err());
+        assert!(parse_erase_body(br#"{"created":"yesterday"}"#).is_err());
+        assert!(parse_erase_body(br#"{"created":1767225600123}"#).is_err());
     }
 
     #[test]

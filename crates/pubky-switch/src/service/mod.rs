@@ -48,6 +48,8 @@ mod retention;
 pub mod rules;
 mod sweeps;
 mod upload;
+#[allow(dead_code)]
+mod verdict;
 mod webhooks;
 
 pub use push::Resolver;

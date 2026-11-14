@@ -23,6 +23,8 @@ pub mod config;
 pub mod http;
 pub mod keys;
 pub mod limits;
+#[allow(dead_code)]
+pub mod marks;
 pub mod ratelimit;
 pub mod service;
 pub mod store;

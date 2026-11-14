@@ -274,7 +274,7 @@
       "signer": "next service: export chunk fetch under the export transfer"
     },
     {
-      "body_b64": "eyJzZXJ2aWNlX2tleSI6Ikw2SU9NLXYzSGlUWWdCSU1ZSzVLWEE2b1ZFNmxjUmNCc3J1Uk1rcWJHakkifQ",
+      "body_b64": "eyJjcmVhdGVkIjoiMjAyNS0xMi0zMFQwMDowMDowMC4wNDBaIn0",
       "fields": [
         {
           "hex": "504f5354",
@@ -285,7 +285,7 @@
           "name": "path and query"
         },
         {
-          "hex": "fd58abb13dcd2dbe8d9732fb2c58b63000955f67f26a28301708186cf3ba09d1",
+          "hex": "97ba2b70901ce9622c3211830ac3dd16d3ffe63f2915095c01798e228c30ea82",
           "name": "BLAKE3(body)"
         },
         {
@@ -315,18 +315,18 @@
       ],
       "headers": {
         "switch-identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-        "switch-signature": "lQR6CtFRxyx5-OhUCjkDQqdMuQ2U4S4BM9Z7vkewqM1i5LTVRYV617ZJEb_arr8xxnDoGVt9Mu8WQUtoiyVuDQ",
+        "switch-signature": "lAzu_paDS_ymsHR5JaJdQ32KPZAKJMGZ4V0LGH0wFxdlINEkUA6dsB6UZBTA1YNU6Z1HAjVE5KT6RLZvqoMiCQ",
         "switch-timestamp": "2026-01-01T00:07:00Z"
       },
       "label": "pubky-switch/v1/http",
       "method": "POST",
-      "name": "signer: account erasure, naming the account's service key",
+      "name": "signer: account erasure, naming the account's creation time",
       "origin": "https://inbox.example",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "ODLgaN93QfhQQ5H5ZQ4PG-80TjWeS5_IghTfcT1ubsM",
-      "signature": "lQR6CtFRxyx5-OhUCjkDQqdMuQ2U4S4BM9Z7vkewqM1i5LTVRYV617ZJEb_arr8xxnDoGVt9Mu8WQUtoiyVuDQ",
-      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f657261736500000020fd58abb13dcd2dbe8d9732fb2c58b63000955f67f26a28301708186cf3ba09d100000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
-      "signer": "signer: account erasure, naming the account's service key"
+      "signature": "lAzu_paDS_ymsHR5JaJdQ32KPZAKJMGZ4V0LGH0wFxdlINEkUA6dsB6UZBTA1YNU6Z1HAjVE5KT6RLZvqoMiCQ",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f65726173650000002097ba2b70901ce9622c3211830ac3dd16d3ffe63f2915095c01798e228c30ea8200000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
+      "signer": "signer: account erasure, naming the account's creation time"
     },
     {
       "body_b64": "eyJpZGVudGl0eSI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1sa1pXNTBhWFI1SWl3aWFXUmxiblJwZEhraU9pSTRlVE54ZVRSbk9YRTNlVGx2ZDI1a01UaG9jMnRrYjNoa2VIcDFaWFYwYVhVelpqTTVNWEp1Ym5WNGVtNTRiWEZ3TldKdklpd2lkbVZ5YzJsdmJpSTZOQ3dpWjJWdVpYSmhkR2x2YmlJNk1pd2ljMmxuYm1WeUlqb2llbmhpWmw4MFVGOTBOSFpzV1dKMFdqSmFkVXhPVVNJc0ltbHVZbTk0SWpwN0luVnliQ0k2SW1oMGRIQnpPaTh2YVc1aWIzZ3VaWGhoYlhCc1pTSXNJbk5sY25acFkyVmZhMlY1SWpvaVVERnFWa2xsV2xoc1FWVnNhRmxJVVRWcFIxVkhNak5zTFVoYVVWUTRUVXhoTTJWcGNrNW1jemRrVVNKOUxDSndiMnhwWTNraU9uc2lZV1J0YVhOemFXOXVJam9pWTI5dWRHRmpkSE5mWVc1a1gyTnZiblpsY25OaGRHbHZibk1pTENKamIyNXVaV04wWDNKbGNYVmxjM1J6SWpwN0ltVnVZV0pzWldRaU9tWmhiSE5sTENKdFlYaGZjR1Z1WkdsdVp5STZOVEFzSW5CMWMyZ2lPbVpoYkhObGZYMHNJbUZ3Y0hNaU9sdDdJbUZ3Y0Y5cFpDSTZJbmM0WVcxMGJXNHhNMjAyY0RWaWQyNXRhamwzWldwaWNUUmpJaXdpWTJWeWRDSTZJa1EzVldWS2ExTXpSbmhJWVU5eWNIWm5WRlp2UkRkbWREYzVNRWhGY0RKM2FVVmpaVk5CYjJkUGFFVWlmU3g3SW1Gd2NGOXBaQ0k2SW1NeGRYUmhhRGxxYVhScWN6UXpaWFI2Wkd0cU5tTnhaSGR5SWl3aVkyVnlkQ0k2SW5kNGJUSnVlbGxCVDI4MFpWRklOMVpPTVU0NVlVNVJiR1l6WTBSTVFXOU1WVGw1Tm5KQ1luTndNRUVpZlN4N0ltRndjRjlwWkNJNkltWTBaSFI0YVc1M1pHdGlOVFZuWkhkcmMzQm9PRFZ0TVRoM0lpd2lZMlZ5ZENJNkltWjVOa3BHV21KV2JUaGxVV3RhVEdKSGJsODJaR2xTTkVOeFYwZGZheTF1TFdSb2FFb3lhalZDZDJzaWZWMHNJbkpsYlc5MlpXUWlPbHQ3SW1Gd2NGOXBaQ0k2SW1wcGEzTnhjemxwZUhGbVltZDBhVzVuWkdweGFETnpiM05qSWl3aVpHbHpkSEoxYzNSZlpuSnZiU0k2SWpJd01qVXRNVEl0TVRWVU1EQTZNREE2TURBdU1EQXdXaUo5WFN3aVpHRjBZVjlsY0c5amFDSTZNaXdpY21WamIzWmxjbmxmWm5KdmJTSTZiblZzYkgwIiwic2lnIjoiZlhaZG9DdXA1cHJQU3dab1c2eHRCS2l4R0NqeFFPNGlTWVltdzh1SlpuM2dUVkJsYWFSQktpdEF6MGhBbzl1RlpmS3luSExzcktRS0ZsVkJIcUwtQUEifSwicHJldiI6Im5iaXJIbWRDZExYZXRac0k4V3pGaFdES25fZmthTWRNLTB0SE5UN1o3Rk0ifQ",
@@ -664,7 +664,7 @@
       "signer": "own app: the phone fetches the hand-over stored for it"
     },
     {
-      "body_b64": "eyJzZXJ2aWNlX2tleSI6Ikw2SU9NLXYzSGlUWWdCSU1ZSzVLWEE2b1ZFNmxjUmNCc3J1Uk1rcWJHakkiLCJpZGVudGl0eV9oYXNoIjoibmJpckhtZENkTFhldFpzSThXekZoV0RLbl9ma2FNZE0tMHRITlQ3WjdGTSJ9",
+      "body_b64": "eyJjcmVhdGVkIjoiMjAyNS0xMi0zMFQwMDowMDowMC4wNDBaIiwiaWRlbnRpdHlfaGFzaCI6Im5iaXJIbWRDZExYZXRac0k4V3pGaFdES25fZmthTWRNLTB0SE5UN1o3Rk0ifQ",
       "fields": [
         {
           "hex": "504f5354",
@@ -675,7 +675,7 @@
           "name": "path and query"
         },
         {
-          "hex": "1593186d58fedf6710ed0ea6ba9b9c0ffabfe1f615f446993c90808bfbe31b1f",
+          "hex": "0f7266a580c593a7dccb9b38a6b7716dcfe1161acb43561806ebb17c7ef25780",
           "name": "BLAKE3(body)"
         },
         {
@@ -705,21 +705,21 @@
       ],
       "headers": {
         "switch-identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-        "switch-signature": "v9IgTjnnOjucryLdr1txr1emHkExVP1zHUk3FZFhZw8XXluLOMJ2nBMVxp_gqP_Qp4iDRbdYpLwcivCr1Bl0Ag",
+        "switch-signature": "ra-Sn-ihmsRTmmIl-fyVJmsF-E1gyxEGCxU5KwC0dBHNPDeXY5Xsr-FG_8jNIm1dd6rIBKMNxpdISkrsM5rrDw",
         "switch-timestamp": "2026-01-01T00:07:00Z"
       },
       "label": "pubky-switch/v1/http",
       "method": "POST",
-      "name": "signer: account erasure, naming the account's service key and the identity.json it follows",
+      "name": "signer: account erasure, naming the account's creation time and the identity.json it follows",
       "origin": "https://inbox.example",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "ODLgaN93QfhQQ5H5ZQ4PG-80TjWeS5_IghTfcT1ubsM",
-      "signature": "v9IgTjnnOjucryLdr1txr1emHkExVP1zHUk3FZFhZw8XXluLOMJ2nBMVxp_gqP_Qp4iDRbdYpLwcivCr1Bl0Ag",
-      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000201593186d58fedf6710ed0ea6ba9b9c0ffabfe1f615f446993c90808bfbe31b1f00000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
-      "signer": "signer: account erasure, naming the account's service key and the identity.json it follows"
+      "signature": "ra-Sn-ihmsRTmmIl-fyVJmsF-E1gyxEGCxU5KwC0dBHNPDeXY5Xsr-FG_8jNIm1dd6rIBKMNxpdISkrsM5rrDw",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000200f7266a580c593a7dccb9b38a6b7716dcfe1161acb43561806ebb17c7ef2578000000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
+      "signer": "signer: account erasure, naming the account's creation time and the identity.json it follows"
     },
     {
-      "body_b64": "eyJzZXJ2aWNlX2tleSI6Ikw2SU9NLXYzSGlUWWdCSU1ZSzVLWEE2b1ZFNmxjUmNCc3J1Uk1rcWJHakkiLCJpZGVudGl0eV9oYXNoIjoibnVZdjZlbW1ncUJmbkljbExFZEVnMTkzSktlLVpaSXo0eHhXSTBiQVNzNCJ9",
+      "body_b64": "eyJjcmVhdGVkIjoiMjAyNS0xMi0zMFQwMDowMDowMC4wNDBaIiwiaWRlbnRpdHlfaGFzaCI6Im51WXY2ZW1tZ3FCZm5JY2xMRWRFZzE5M0pLZS1aWkl6NHh4V0kwYkFTczQifQ",
       "fields": [
         {
           "hex": "504f5354",
@@ -730,7 +730,7 @@
           "name": "path and query"
         },
         {
-          "hex": "45b42aa3faf4e0489d3efe4b242756d58899ebf7e2cf0ae796b29ac4197ee308",
+          "hex": "f812c9b96c9ca677ea76462ce667e061c12a535a86dbf4ba0607b01c11d21ed9",
           "name": "BLAKE3(body)"
         },
         {
@@ -760,7 +760,7 @@
       ],
       "headers": {
         "switch-identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-        "switch-signature": "MADfidQkjn4AvpxiRt-kgnJhDjL6ItbhQOMJmOwuiD5fqoZyusNezyRKpAu1lEbESVYpQHcNwOX6pJS6Yaw1Aw",
+        "switch-signature": "d7dNdHv3F8frahIPy959vMDYIzgvs15-iEjOx4WjUfPr3GqwT6udzR3-mU_mK55EknscbDYyr03YY8f3FWKPBQ",
         "switch-timestamp": "2026-01-01T00:07:00Z"
       },
       "label": "pubky-switch/v1/http",
@@ -769,8 +769,8 @@
       "origin": "https://inbox.example",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "ODLgaN93QfhQQ5H5ZQ4PG-80TjWeS5_IghTfcT1ubsM",
-      "signature": "MADfidQkjn4AvpxiRt-kgnJhDjL6ItbhQOMJmOwuiD5fqoZyusNezyRKpAu1lEbESVYpQHcNwOX6pJS6Yaw1Aw",
-      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f65726173650000002045b42aa3faf4e0489d3efe4b242756d58899ebf7e2cf0ae796b29ac4197ee30800000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
+      "signature": "d7dNdHv3F8frahIPy959vMDYIzgvs15-iEjOx4WjUfPr3GqwT6udzR3-mU_mK55EknscbDYyr03YY8f3FWKPBQ",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f657261736500000020f812c9b96c9ca677ea76462ce667e061c12a535a86dbf4ba0607b01c11d21ed900000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f000000000000000000000000",
       "signer": "signer: account erasure naming an identity.json the account doesn't hold"
     }
   ],
@@ -1061,7 +1061,7 @@
       "status": 429
     },
     {
-      "body": "{\"service_key\":\"L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI\",\"limits\":{\"app_limit\":32,\"max_envelope\":65536,\"max_sealed_value\":262144,\"quota_bytes\":67108864,\"max_batch\":8,\"record_quota_bytes\":67108864,\"max_import_bytes\":4294967296},\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"origin\":\"https://inbox.example\",\"nonce\":\"y6aw9gQLsoxRMM6deQh0gA\",\"enrollment\":\"lC6Xmj6jfvx2H_zixYqVwcHKlpdT6Mn87HJLx8TmrEY\"}",
+      "body": "{\"service_key\":\"L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI\",\"limits\":{\"app_limit\":32,\"max_envelope\":65536,\"max_sealed_value\":262144,\"quota_bytes\":67108864,\"max_batch\":8,\"record_quota_bytes\":67108864,\"max_import_bytes\":4294967296},\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"origin\":\"https://inbox.example\",\"nonce\":\"y6aw9gQLsoxRMM6deQh0gA\",\"enrollment\":\"lC6Xmj6jfvx2H_zixYqVwcHKlpdT6Mn87HJLx8TmrEY\",\"created\":\"2025-12-30T00:00:00.040Z\"}",
       "fields": [
         {
           "hex": "00000000000000c8",
@@ -1088,13 +1088,13 @@
           "name": "BLAKE3(Switch-Head)"
         },
         {
-          "hex": "b19ec636e1dbc92085a5cee534afd54aac81f6a244d7f133e4e01e9130ce6a27",
+          "hex": "68a5469f08b6fbeb8cfc4dd1f05c08272a1d561fe52496d8ded31edc277006af",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2025-12-30T00:00:00.040Z",
-        "switch-service-signature": "9UKr1EWtA9Zc_lPUWwBOtqhi5_RPiaOuVaa-gIhjVpsVriZ4uPs2JC4wD5TEkUAZ8MC9cWkwlgMAqU6wyxnQBQ"
+        "switch-service-signature": "KC-NMN3_Q3R5M5XvhbSJ3J9xaw2-iQbgGZBbM-rcfuxpV8nStZF_AMKSMh8oF5nvtGVsFyPnkLRBXSbBqKpeCQ"
       },
       "label": "pubky-switch/v1/http-response",
       "method": "POST",
@@ -1102,8 +1102,8 @@
       "path": "/v1/enroll",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
       "request_signature": "BnmTysQ4_q34_w-EgiBsxu0RFUuZNnVfXisYKZlW1O9wtB6NgRCTmwQHzySyI9Nr6Tl8Ys0USSuIMtvcJI6RDA",
-      "signature": "9UKr1EWtA9Zc_lPUWwBOtqhi5_RPiaOuVaa-gIhjVpsVriZ4uPs2JC4wD5TEkUAZ8MC9cWkwlgMAqU6wyxnQBQ",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000000a2f76312f656e726f6c6c000000205b03d0176bc8f4d4e458dfb96c49d4ead31604e0eb89f9fd34ee2c22af5286f200000018323032352d31322d33305430303a30303a30302e3034305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020b19ec636e1dbc92085a5cee534afd54aac81f6a244d7f133e4e01e9130ce6a27",
+      "signature": "KC-NMN3_Q3R5M5XvhbSJ3J9xaw2-iQbgGZBbM-rcfuxpV8nStZF_AMKSMh8oF5nvtGVsFyPnkLRBXSbBqKpeCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000000a2f76312f656e726f6c6c000000205b03d0176bc8f4d4e458dfb96c49d4ead31604e0eb89f9fd34ee2c22af5286f200000018323032352d31322d33305430303a30303a30302e3034305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000002068a5469f08b6fbeb8cfc4dd1f05c08272a1d561fe52496d8ded31edc277006af",
       "signer": "service key",
       "status": 200
     },
@@ -1313,7 +1313,7 @@
           "name": "path"
         },
         {
-          "hex": "9feb2af23bba834faf225304d1b8eae84515a99d2e081a09d9bfda4de9a5b61c",
+          "hex": "0047f3eb990ba60c74dbe6f1500713f3141f509c5b357155ec5a7b68415b8f72",
           "name": "BLAKE3(request signature)"
         },
         {
@@ -1331,16 +1331,16 @@
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "Ro9aj6uVo0uSLiHdJt_21shtOxeU1jw7ik-_dYjTzbWcH9TTCLVrl2E7cr5HKXEyI460PJdGN1-oOiJwCpHwBg"
+        "switch-service-signature": "vvJRkv19lmreCFBAaRNAgcligBcrau5q-0mN4a9qcu_qYcSMA2WBDgZ2A2aZM2i84bK0UO1X5Dh8H4mXtP-UCQ"
       },
       "label": "pubky-switch/v1/http-response",
       "method": "POST",
-      "name": "signer: account erasure answer, signed with the account's key, no head",
+      "name": "signer: account erasure answer, signed with the service key, no head",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
-      "request_signature": "lQR6CtFRxyx5-OhUCjkDQqdMuQ2U4S4BM9Z7vkewqM1i5LTVRYV617ZJEb_arr8xxnDoGVt9Mu8WQUtoiyVuDQ",
-      "signature": "Ro9aj6uVo0uSLiHdJt_21shtOxeU1jw7ik-_dYjTzbWcH9TTCLVrl2E7cr5HKXEyI460PJdGN1-oOiJwCpHwBg",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000209feb2af23bba834faf225304d1b8eae84515a99d2e081a09d9bfda4de9a5b61c00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+      "request_signature": "lAzu_paDS_ymsHR5JaJdQ32KPZAKJMGZ4V0LGH0wFxdlINEkUA6dsB6UZBTA1YNU6Z1HAjVE5KT6RLZvqoMiCQ",
+      "signature": "vvJRkv19lmreCFBAaRNAgcligBcrau5q-0mN4a9qcu_qYcSMA2WBDgZ2A2aZM2i84bK0UO1X5Dh8H4mXtP-UCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000200047f3eb990ba60c74dbe6f1500713f3141f509c5b357155ec5a7b68415b8f7200000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
       "signer": "service key",
       "status": 200
     },
@@ -1646,7 +1646,7 @@
           "name": "path"
         },
         {
-          "hex": "177f88c52112aaacbc80bfa883df8e8954633c56d5a3349c9ce5033312c4385e",
+          "hex": "0fa0e4a0005a52663d44c0b36042e8a7fa5ff70759934f8a9bf4605013ff87db",
           "name": "BLAKE3(request signature)"
         },
         {
@@ -1664,21 +1664,21 @@
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "IhbVSaCpF0jB5Lj5HC_HzK0VYX56Ss9iu-byZRDnXyxSQXSIFLfwy5ntUs45-x-yiZZ7Hr8jFAfIUXn8ehb3AA"
+        "switch-service-signature": "_zku2tsxfZ0uACJxMRzKKteY5stAFN7Ko6w9AjHCbsyOCcZI1pucydlNgvPnM2jHqOFbmDF3wWJVZim9YdJECA"
       },
       "label": "pubky-switch/v1/http-response",
       "method": "POST",
-      "name": "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+      "name": "signer: account erasure answer to the request naming its identity.json, signed with the service key, no head",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
-      "request_signature": "v9IgTjnnOjucryLdr1txr1emHkExVP1zHUk3FZFhZw8XXluLOMJ2nBMVxp_gqP_Qp4iDRbdYpLwcivCr1Bl0Ag",
-      "signature": "IhbVSaCpF0jB5Lj5HC_HzK0VYX56Ss9iu-byZRDnXyxSQXSIFLfwy5ntUs45-x-yiZZ7Hr8jFAfIUXn8ehb3AA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f657261736500000020177f88c52112aaacbc80bfa883df8e8954633c56d5a3349c9ce5033312c4385e00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+      "request_signature": "ra-Sn-ihmsRTmmIl-fyVJmsF-E1gyxEGCxU5KwC0dBHNPDeXY5Xsr-FG_8jNIm1dd6rIBKMNxpdISkrsM5rrDw",
+      "signature": "_zku2tsxfZ0uACJxMRzKKteY5stAFN7Ko6w9AjHCbsyOCcZI1pucydlNgvPnM2jHqOFbmDF3wWJVZim9YdJECA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000200fa0e4a0005a52663d44c0b36042e8a7fa5ff70759934f8a9bf4605013ff87db00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
       "signer": "service key",
       "status": 200
     },
     {
-      "body": "{\"code\":\"conflict\",\"message\":\"7.4.16: the account holds another identity.json\"}",
+      "body": "{\"code\":\"conflict\",\"message\":\"7.4.16: the account holds another identity.json\",\"current\":{\"created\":\"2025-12-30T00:00:00.040Z\"}}",
       "fields": [
         {
           "hex": "0000000000000199",
@@ -1693,7 +1693,7 @@
           "name": "path"
         },
         {
-          "hex": "56b7469d4219815dc3c1110b346273724bacc073ad19dc7026cb52d229205abf",
+          "hex": "5b6d89faf193aa241f35771ca8f26fd08aaa260d412e33c7add34092511a8ed1",
           "name": "BLAKE3(request signature)"
         },
         {
@@ -1705,22 +1705,22 @@
           "name": "BLAKE3(Switch-Head)"
         },
         {
-          "hex": "024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
+          "hex": "29e8ef08dad2ee8bb55deb680b98eebdbb4feaea69dd35e7e534c06f42759a24",
           "name": "BLAKE3(body)"
         }
       ],
       "headers": {
         "switch-server-time": "2026-01-01T00:07:00.030Z",
-        "switch-service-signature": "wG7MTmDjLF_VBlAATd90NuAnLahSDjcRQJyGeFUOER6mfm_9R0D8-uAm9I3pH2RlHBC7uuapaPbquxtrhp0uAw"
+        "switch-service-signature": "NS3mz5XZ-P565gaS8bdZfigxvezjo5IniuyjmmMS-Pqj7FFgc-DwtaflKQ6oD4Shsi5XK2Y7BITPd76yJIYNCA"
       },
       "label": "pubky-switch/v1/http-response",
       "method": "POST",
-      "name": "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+      "name": "signer: account erasure refused, the account holds another identity.json, 409 conflict with current.created, no head",
       "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/erase",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
-      "request_signature": "MADfidQkjn4AvpxiRt-kgnJhDjL6ItbhQOMJmOwuiD5fqoZyusNezyRKpAu1lEbESVYpQHcNwOX6pJS6Yaw1Aw",
-      "signature": "wG7MTmDjLF_VBlAATd90NuAnLahSDjcRQJyGeFUOER6mfm_9R0D8-uAm9I3pH2RlHBC7uuapaPbquxtrhp0uAw",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f65726173650000002056b7469d4219815dc3c1110b346273724bacc073ad19dc7026cb52d229205abf00000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
+      "request_signature": "d7dNdHv3F8frahIPy959vMDYIzgvs15-iEjOx4WjUfPr3GqwT6udzR3-mU_mK55EknscbDYyr03YY8f3FWKPBQ",
+      "signature": "NS3mz5XZ-P565gaS8bdZfigxvezjo5IniuyjmmMS-Pqj7FFgc-DwtaflKQ6oD4Shsi5XK2Y7BITPd76yJIYNCA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000004504f53540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6572617365000000205b6d89faf193aa241f35771ca8f26fd08aaa260d412e33c7add34092511a8ed100000018323032362d30312d30315430303a30373a30302e3033305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000002029e8ef08dad2ee8bb55deb680b98eebdbb4feaea69dd35e7e534c06f42759a24",
       "signer": "service key",
       "status": 409
     }

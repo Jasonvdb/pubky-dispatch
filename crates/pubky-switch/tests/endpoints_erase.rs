@@ -144,7 +144,7 @@ fn enrolled_time() -> String {
 fn hash_vector_time() -> String {
     named(
         &vectors("http.json")["responses"],
-        "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+        "signer: account erasure answer to the request naming its identity.json, signed with the service key, no head",
     )["headers"]["switch-server-time"]
         .as_str()
         .expect("time")
@@ -348,17 +348,17 @@ async fn started(replay: &Replay, retention_days: Option<u64>) -> Service {
 }
 
 #[tokio::test]
-#[ignore = "http.json's erasure cases are regenerated with the erasure's binding to its enrollment (Switch wire 7.4.16)"]
 async fn test_erase_vector_answer() {
-    // http.json's erasure with the body `{}`, at alice's account after her enrollment and
-    // before her first delivery, which holds no `identity.json`, and its answer: `{
-    // "erased": true }`, signed with the service key, without a head (Switch wire 7.4.16).
+    // http.json's erasure naming only the account's creation time, the `created` of its
+    // enrollment answer, at alice's account after her enrollment and before her first
+    // delivery, which holds no `identity.json`, and its answer: `{ "erased": true }`, signed
+    // with the service key, without a head (Switch wire 7.4.16).
     let Some(replay) = replay().await else { return };
     enroll_alice(&replay).await;
     let http = vectors("http.json");
     let expected = named(
         &http["responses"],
-        "signer: account erasure answer, signed with the account's key, no head",
+        "signer: account erasure answer, signed with the service key, no head",
     );
     let at = expected["headers"]["switch-server-time"]
         .as_str()
@@ -366,9 +366,12 @@ async fn test_erase_vector_answer() {
     set_time(&replay.clock, at);
     let request = vector_request(named(
         &http["requests"],
-        "signer: account erasure, naming the account's service key",
+        "signer: account erasure, naming the account's creation time",
     ));
-    assert_eq!(request.body.as_ref(), b"{}");
+    assert_eq!(
+        request.body.as_ref(),
+        erase_body(Some(ms(&enrolled_time())), None).as_slice()
+    );
     let answer = replay.service.handle(request).await;
     assert_matches(&answer, expected);
     assert!(no_head(&answer));
@@ -379,7 +382,6 @@ async fn test_erase_vector_answer() {
 }
 
 #[tokio::test]
-#[ignore = "http.json's erasure cases are regenerated with the erasure's binding to its enrollment (Switch wire 7.4.16)"]
 async fn test_erase_vector_naming_the_identity_json_it_follows() {
     // http.json's erasure naming the hash of alice's version 3, which her account holds, and
     // its answer: `{ "erased": true }`, signed with the service key, without a head (Switch
@@ -389,12 +391,12 @@ async fn test_erase_vector_naming_the_identity_json_it_follows() {
     let http = vectors("http.json");
     let expected = named(
         &http["responses"],
-        "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+        "signer: account erasure answer to the request naming its identity.json, signed with the service key, no head",
     );
     set_time(&replay.clock, &hash_vector_time());
     let request = vector_request(named(
         &http["requests"],
-        "signer: account erasure, naming the account's service key and the identity.json it follows",
+        "signer: account erasure, naming the account's creation time and the identity.json it follows",
     ));
     let answer = replay.service.handle(request).await;
     assert_matches(&answer, expected);
@@ -404,12 +406,12 @@ async fn test_erase_vector_naming_the_identity_json_it_follows() {
 }
 
 #[tokio::test]
-#[ignore = "http.json's erasure cases are regenerated with the erasure's binding to its enrollment (Switch wire 7.4.16)"]
 async fn test_erase_vector_naming_another_identity_json_is_conflict() {
     // http.json's erasure naming alice's version 1 while her account holds version 3: the
-    // vector's `409 conflict`, signed with the service key, without a head and, at a healthy
-    // account, without `current`; nothing is deleted, the record and the mark included
-    // (Switch wire 7.4.16).
+    // vector's `409 conflict`, signed with the service key, without a head, carrying the
+    // creation time it was checked against in `current.created` and, at a healthy account,
+    // nothing else there; nothing is deleted, the record and the mark included (Switch wire
+    // 7.4.16).
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
     let before = rows(&replay, &alice_id()).await;
@@ -417,7 +419,7 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
     let http = vectors("http.json");
     let expected = named(
         &http["responses"],
-        "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+        "signer: account erasure refused, the account holds another identity.json, 409 conflict with current.created, no head",
     );
     set_time(&replay.clock, &hash_vector_time());
     let request = vector_request(named(
@@ -427,7 +429,10 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
     let answer = replay.service.handle(request).await;
     assert_matches(&answer, expected);
     assert!(no_head(&answer));
-    assert_eq!(body(&answer).get("current"), None);
+    assert_eq!(
+        body(&answer)["current"],
+        serde_json::json!({ "created": enrolled_time() })
+    );
     assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
     assert_eq!(held_mark(&replay, &alice_id()).await, mark);
     assert_eq!(record_of(&replay).await, None);
@@ -2332,6 +2337,59 @@ async fn test_enroll_created_later_than_taken_over_mark() {
         assert_eq!(created, expected, "{case}");
         replay.db.drop_database().await.expect("drop");
     }
+}
+
+#[tokio::test]
+async fn test_enroll_accounts_within_one_millisecond_are_created_in_order() {
+    // The time base doesn't move: an account whose row is lost, leaving its (0, 0) mark,
+    // and the enrollment that takes the mark over, then the same once more, get creation
+    // times one millisecond apart, so no two accounts of the identity have the same (Switch
+    // wire 7.3, The mark; Table 3).
+    let Some(replay) = replay().await else { return };
+    let base = ms(&enrolled_time());
+    set_time(&replay.clock, &enrolled_time());
+    let mut earlier = enroll_named(&replay, 1, base).await;
+    assert_eq!(earlier, base);
+    for nonce in [2, 3] {
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .execute(&mut conn)
+            .await
+            .expect("the account's row lost");
+        conn.close().await.expect("close");
+        let created = enroll_named(&replay, nonce, base).await;
+        assert_eq!(created, earlier + 1, "taking the mark over");
+        earlier = created;
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enroll_right_after_an_erasure_is_created_after_its_record() {
+    // The time base doesn't move between an enrollment, its erasure and the next
+    // enrollment: the record is dated at the erased creation time, and the new account one
+    // millisecond after it, at once, so the erasure, sent again, can't reach it (Switch wire
+    // 7.3, The mark; Table 3; 7.4.16).
+    let Some(replay) = replay().await else { return };
+    let base = ms(&enrolled_time());
+    set_time(&replay.clock, &enrolled_time());
+    let first = enroll_named(&replay, 1, base).await;
+    let request = erasure_naming(Some(first), None, base);
+    let again = replayed(&request);
+    let erased = replay.service.handle(request).await;
+    assert_eq!(erased.status, 200, "{}", text(&erased));
+    assert_eq!(record_of(&replay).await, Some(first));
+    let later = enroll_named(&replay, 2, base).await;
+    assert_eq!(later, first + 1);
+    let answer = replay.service.handle(again).await;
+    assert_eq!(
+        conflict_current(&answer),
+        json!({ "created": rfc3339(later) })
+    );
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]

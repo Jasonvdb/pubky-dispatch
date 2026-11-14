@@ -68,7 +68,6 @@ fn assert_chained(
 }
 
 #[tokio::test]
-#[ignore = "http.json's enrollment answer is regenerated with its `created` (Switch wire 3.7)"]
 async fn test_vectors_accounts_replay() {
     let Some(replay) = replay().await else { return };
     let http = vectors("http.json");

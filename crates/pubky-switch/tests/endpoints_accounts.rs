@@ -922,7 +922,6 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
 }
 
 #[tokio::test]
-#[ignore = "http.json's enrollment answer is regenerated with its `created` (Switch wire 3.7)"]
 async fn test_enroll_retry_after_serving_gets_the_first_answer() {
     let Some(replay) = replay().await else { return };
     serving(&replay).await;
@@ -997,7 +996,6 @@ async fn test_stale_timestamp_gives_a_time_to_retry_with() {
 }
 
 #[tokio::test]
-#[ignore = "http.json's enrollment answer is regenerated with its `created` (Switch wire 3.7)"]
 async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
     let limits = Limits {
         max_enrollments: 2,

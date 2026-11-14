@@ -1276,41 +1276,49 @@ impl Signer {
     /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
     /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
     /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
-    /// it is; the next answer the pinned key signs clears it, an error included. Never raised
-    /// once the account is erased. Nothing else changes: an unauthenticated `404` with no
-    /// request in doubt is never an erasure (Switch wire 7.4.16).
+    /// it is; the next answer the pinned key signs clears it, an error included. The signed
+    /// `404` of an identity the service doesn't host, with no erasure of this install's in
+    /// progress, is the service's word that it holds no account: it raises
+    /// [`Alert::ServiceHoldsNoAccount`], which any other answer the pinned key signs clears
+    /// (Switch wire 7.3 step 2, 7.4.16). Neither is raised once the account is erased.
+    /// Nothing else changes: a `404` with no request in doubt is never an erasure (Switch
+    /// wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
         let read = self.service_client()?.apps().await;
         // The device clock when the answer came, before the alert's commit below, so a step
         // judging the clock against the answer's time isn't off by that commit.
         let device_ms = self.env.clock.now_ms();
-        let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
-        // Any answer the pinned key signs, an error included, shows the account hosted: it
-        // clears the alert, and ends an erasure's wait for an unsigned `404` to hold, here
-        // where it arrives, whatever the step that read it does next (Switch wire 7.3 step 2,
-        // 7.4.16).
+        let judged = !erasing && !self.state.erased;
+        // Any answer the pinned key signs, an error included, shows the switch answering for
+        // the account under that key: it clears the alert for an unsigned `404`, and ends an
+        // erasure's wait for one to hold, here where it arrives, whatever the step that read
+        // it does next (Switch wire 7.3 step 2, 7.4.16).
         let signed = matches!(
             &read,
             Ok(_) | Err(ClientError::Switch { .. } | ClientError::InvalidResponse(_))
         );
-        let raise = match &read {
-            _ if signed && raised => Some(false),
-            Err(ClientError::BadServiceSignature { status: 404 })
-                if !raised && !erasing && !self.state.erased =>
-            {
-                Some(true)
-            }
-            _ => None,
-        };
+        // The signed `404` of an identity the service doesn't host is its word that it holds
+        // no account, never an answer that shows one hosted (Switch wire 7.3 step 2, 7.4.16).
+        let not_held = read.as_ref().err().is_some_and(ClientError::is_not_hosted);
+        let unsigned_404 = matches!(&read, Err(ClientError::BadServiceSignature { status: 404 }));
         let mut state = self.state.clone();
-        match raise {
-            Some(true) => state.alert(Alert::AccountNotHosted),
-            Some(false) => state
+        if signed {
+            state
                 .alerts
-                .retain(|alert| *alert != Alert::AccountNotHosted),
-            None => {}
+                .retain(|alert| *alert != Alert::AccountNotHosted);
+        }
+        if signed && !not_held {
+            state
+                .alerts
+                .retain(|alert| *alert != Alert::ServiceHoldsNoAccount);
+        }
+        if judged && unsigned_404 {
+            state.alert(Alert::AccountNotHosted);
+        }
+        if judged && not_held {
+            state.alert(Alert::ServiceHoldsNoAccount);
         }
         // Whether the end of a staged admission is owed is the switch's to say (Switch wire
         // 7.4.12 `recovery`), so a restore or a take-over finds it too: owed while the wait is

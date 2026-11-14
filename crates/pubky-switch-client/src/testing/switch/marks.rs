@@ -526,9 +526,37 @@ impl ScriptedSwitch {
 
     /// A restore of the account's state to `seq` of its generation, the mark staying where
     /// it is: past the mark, the account fails stop, `behind` (Switch wire 7.3, Table 3 "A
-    /// restore of the state").
+    /// restore of the state"). The `identity.json` the account holds goes back with it: a
+    /// delivery past `seq` is undone, and the newest one at or below it is held again.
     pub fn restore_to(&self, seq: u64) {
         let mut inner = self.lock();
+        let is_delivery = |item: &super::Item| {
+            matches!(
+                item,
+                super::Item::Chain {
+                    item_type: pubky_switch_core::chain::ItemType::Identity,
+                    ..
+                }
+            )
+        };
+        if inner
+            .items
+            .iter()
+            .any(|item| item.seq() > seq && is_delivery(item))
+        {
+            let identity = inner.identity.public();
+            inner.doc = inner
+                .items
+                .iter()
+                .rev()
+                .filter(|item| item.seq() <= seq && is_delivery(item))
+                .find_map(|item| match item {
+                    super::Item::Chain { item, .. } => {
+                        pubky_switch_core::records::IdentityDoc::verify(item, &identity).ok()
+                    }
+                    _ => None,
+                });
+        }
         inner.items.retain(|item| item.seq() <= seq);
         if let Some(tip) = inner.tips.iter().rev().find(|tip| tip.seq <= seq).copied() {
             inner.tip = tip;

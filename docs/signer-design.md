@@ -347,6 +347,8 @@ Alert = Equivocation { version, ours, theirs }      // stop, show
       | RenewalSkipped { app, reason }              // past half its lifetime, not renewed by itself: unowned or refused scopes, or other permissions now
       | ClockOff                                    // the device clock is off the switch's time: nothing issued or renewed
       | AccountNotHosted                            // GET /apps got an unsigned 404, no erasure in progress: nothing deleted, cleared by any signed answer to GET /apps, an error included
+      | ServiceHoldsNoAccount                       // GET /apps got the signed not-hosted 404, no erasure in progress: the service's word, nothing deleted, cleared by any other signed answer
+      | ServiceKeyTaken { origin, pinned, service_key } // a declaration's enrollment named another key than the pinned one: taken, and shown
       | IdentityNearLimit { bytes, limit }          // identity.json past 3/4 of the 256 KiB cap of a delivery or a move's enrollment
       | AppIdle { app, last_seen }                  // suggest removal after 90 days
       | LapsingWithOpenAttempts { app, expires_at, open_attempts }   // renewals stopped, attempts it would orphan at its expiry

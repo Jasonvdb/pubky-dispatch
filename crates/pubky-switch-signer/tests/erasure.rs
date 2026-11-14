@@ -2567,3 +2567,166 @@ async fn test_signer_erase_malformed_created_stops() {
         assert_eq!(signer.status(), SignerStatus::Erasing);
     }
 }
+
+#[tokio::test]
+async fn test_erasure_signed_not_hosted_404_raises_service_holds_no_account() {
+    // With no erasure of its own in progress, the signed `404` of an identity the service
+    // doesn't host is the service's word that it holds no account: it clears the alert for
+    // an unsigned `404` and raises its own, which stays through the next such answer and
+    // goes at any other answer the pinned key signs. Nothing else changes (Switch wire 7.3
+    // step 2, 7.4.16).
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    // Every `GET /apps` gets an unsigned `404` while the first flag is up, the switch's own
+    // signed not-hosted `404` while the second is.
+    let unsigned = Arc::new(std::sync::Mutex::new(None));
+    let not_hosted = Arc::new(std::sync::Mutex::new(false));
+    let switch = Arc::clone(&world.switch);
+    let (status, flag) = (Arc::clone(&unsigned), Arc::clone(&not_hosted));
+    let mut env = world.env(store);
+    env.transport = Arc::new(MockTransport::with_handler(move |request| {
+        let apps = request.method == "GET" && request.path_and_query.ends_with("/apps");
+        if apps && let Some(status) = *status.lock().unwrap() {
+            return Ok(Response {
+                status,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        if apps && *flag.lock().unwrap() {
+            switch.fail_next(SwitchFault::Error {
+                path: "/apps".into(),
+                code: ErrorCode::NotFound,
+                current: pubky_switch_core::http::not_hosted_current(),
+            });
+        }
+        switch.handle(request)
+    }));
+    *unsigned.lock().unwrap() = Some(404);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.run_due().await.unwrap_err();
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    *unsigned.lock().unwrap() = None;
+    *not_hosted.lock().unwrap() = true;
+    for _ in 0..2 {
+        let error = signer.run_due().await.unwrap_err();
+        assert!(
+            matches!(&error, SignerError::Switch(error) if error.is_not_hosted()),
+            "{error:?}"
+        );
+        assert!(signer.alerts().contains(&Alert::ServiceHoldsNoAccount));
+        assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+    }
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(signer.identity_doc().unwrap().unwrap(), mark);
+    assert!(!world.switch.erased());
+    *not_hosted.lock().unwrap() = false;
+    signer.run_due().await.unwrap();
+    assert!(!signer.alerts().contains(&Alert::ServiceHoldsNoAccount));
+}
+
+/// The `identity_hash` each erasure request named, in order.
+fn named_hashes(world: &World) -> Vec<Option<[u8; 32]>> {
+    world
+        .transport
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/erase"))
+        .map(|r| {
+            pubky_switch_core::http::parse_erase_body(&r.body)
+                .unwrap()
+                .identity_hash
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_erasure_at_a_notice_names_the_older_copy_its_409_shows() {
+    // The account was restored to before this install's newest delivery, and answers the
+    // notice. The erasure goes through it: its `409` shows the copy the account holds, older
+    // than the newest delivered there, which is the state the account lost; the signer names
+    // it in the erasure sent again, and the account is erased (Switch wire 7.4.16, 7.3 Table
+    // 2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let seq = world.switch.seq();
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    assert!(mark.version() > first.version());
+    world.switch.restore_to(seq);
+    assert_eq!(world.switch.identity_doc().unwrap().hash(), first.hash());
+    signer.close_account(confirmed()).await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert!(world.switch.erased());
+    assert_eq!(
+        named_hashes(&world),
+        [Some(mark.hash()), Some(first.hash())]
+    );
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::Rollback { .. })),
+        "the account's lost state raises no alarm"
+    );
+}
+
+#[tokio::test]
+async fn test_erasure_409_with_a_copy_that_doesnt_verify_stops_and_tells() {
+    // A `409` whose `current.identity` doesn't verify: the erasure stops there, in progress,
+    // and the user is told; the next run sends the same request again (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    let mut current = checked_against(world.switch.created());
+    current["identity"] = serde_json::json!("not a document");
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/erase".into(),
+        code: ErrorCode::Conflict,
+        current,
+    });
+    let error = signer.close_account(confirmed()).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(pubky_switch_client::ClientError::InvalidResponse(_))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    assert_eq!(erase_requests(&world), 1);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert_eq!(named_hashes(&world), [Some(mark.hash()), Some(mark.hash())]);
+}
+
+#[tokio::test]
+async fn test_erasure_409_showing_another_installs_newer_copy_ends_it() {
+    // A `409` at an account that answers the notice shows another install's newer copy: it
+    // is taken as every newer copy is, and the erasure ends without erasing (Switch wire
+    // 7.4.16, spec 4.3).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    let newer = world.other_install_version(&mark, [7; 16]);
+    let mut current = checked_against(world.switch.created());
+    current["identity"] = serde_json::to_value(newer.signed()).unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/erase".into(),
+        code: ErrorCode::Conflict,
+        current,
+    });
+    let error = signer.close_account(confirmed()).await.unwrap_err();
+    assert!(
+        matches!(error, SignerError::NotNamed { install } if install == [7; 16]),
+        "{error:?}"
+    );
+    assert_ne!(signer.status(), SignerStatus::Erasing);
+    assert!(!world.switch.erased());
+    assert_eq!(erase_requests(&world), 1);
+}

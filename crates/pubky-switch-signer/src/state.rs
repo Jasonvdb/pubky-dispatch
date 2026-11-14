@@ -187,6 +187,15 @@ pub(crate) struct Service {
     pub(crate) created: Option<u64>,
 }
 
+/// The `identity.json` an account that answers the notice holds, as a signed `409` to an
+/// erasure showed it in `current.identity`, judged as every copy (Switch wire 7.4.16, spec
+/// 4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ShownCopy {
+    /// Its document hash; `None` where the account holds none.
+    pub(crate) hash: Option<[u8; 32]>,
+}
+
 /// The newest `identity.json` a service accepted from this signer, or that it adopted: its
 /// high-water mark (Switch spec 4.3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +698,10 @@ pub(crate) enum Flow {
         /// doubt, kept until an answer the pinned key signs: erased but unconfirmed, the
         /// erasure done at the first run 24 hours on (Switch wire 7.4.16, spec 12.7 step 5).
         first_404_ms: Option<u64>,
+        /// The copy a signed `409` at an account that answers the notice showed it to hold,
+        /// which the erasure names in place of the mark's, its retries included; `None`
+        /// until one did (Switch wire 7.4.16).
+        shown: Option<ShownCopy>,
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {

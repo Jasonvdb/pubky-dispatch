@@ -42,7 +42,10 @@
 //! was checked against: one other than the request named is kept as the account's and the
 //! erasure sent again naming it, once, as a signer that holds none, after a restore or a
 //! hand-over, learns it; a `409` without a readable one stops the erasure there, in progress,
-//! and tells the user (Switch wire 7.4.16). The request didn't land, so it is no longer in doubt,
+//! and tells the user (Switch wire 7.4.16). At an account that answers the notice, where `GET
+//! /apps` answers the notice too, the `409` also carries the copy the account holds, which is
+//! judged as every copy and named in the erasure sent again, a copy older than the newest
+//! delivered there included: the state the account lost. The request didn't land, so it is no longer in doubt,
 //! and the switch's copy is judged first, as every copy: another install's newer copy ends
 //! the erasure as any other install found signing does, this install's own keeps it as
 //! records behind, and a copy that went back raises the alarm. With the mark still held, the
@@ -65,11 +68,14 @@ use pubky_switch_client::ClientError;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{IDENTITY_PATH, app_record_path};
 
+use pubky_switch_core::records::IdentityDoc;
+use pubky_switch_core::sig::SignedDoc;
+
 use super::revocation::UserConfirmed;
-use super::{Signer, gate};
+use super::{Signer, Verdict, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::state::Flow;
+use crate::state::{Flow, ShownCopy};
 
 impl Signer {
     /// Erase the identity's account at its switch, once the user has confirmed it (Switch spec
@@ -90,12 +96,20 @@ impl Signer {
     /// Homeserver's, the switch's or the store's error, the erasure kept and finished by
     /// [`Signer::resume`].
     pub async fn close_account(&mut self, _confirmed: UserConfirmed) -> Result<()> {
-        self.ready().await?;
+        // An account that answers the notice lets the erasure through (Switch wire 7.3, Table
+        // 2), and its `GET /apps` answers the notice too: the erasure starts on the checks
+        // before that read, and its first step checks the other copies and the gate
+        // ([`Signer::still_erasing`]) before anything is deleted or sent.
+        match self.ready().await {
+            Err(SignerError::Switch(error)) if answers_the_notice(&error) => {}
+            ready => ready?,
+        }
         let flow = Flow::Erase {
             unpublished: false,
             reminded: Vec::new(),
             unanswered: false,
             first_404_ms: None,
+            shown: None,
         };
         // Unpublished from the first deletion on: an erasure that ends without erasing, after
         // any part of the Homeserver's files went, has `identity.json` published again.
@@ -161,6 +175,7 @@ impl Signer {
                 reminded: reminded.clone(),
                 unanswered: true,
                 first_404_ms: None,
+                shown: self.erasure_shown(),
             };
             self.commit(self.state.clone(), Some(flow)).await?;
         }
@@ -212,6 +227,7 @@ impl Signer {
                     reminded,
                     unanswered: false,
                     first_404_ms: None,
+                    shown: self.erasure_shown(),
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
@@ -235,12 +251,24 @@ impl Signer {
                     reminded,
                     unanswered: false,
                     first_404_ms: None,
+                    shown: self.erasure_shown(),
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(ClientError::InvalidResponse(
                     "Switch wire 7.4.16: a 409 to the erasure without the creation time".into(),
                 )
                 .into())
+            }
+            // At an account that answers the notice, the `409` carries the copy the account
+            // holds, which is judged, then named in the erasure sent again (Switch wire
+            // 7.4.16).
+            Err(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            }) if relearn && current.get("identity").is_some() => {
+                self.erase_naming_the_shown_copy(unpublished, reminded, &current)
+                    .await
             }
             // One other than the request named is the account's: it is kept, and the erasure
             // is sent again naming it, whatever time was held, once (Switch wire 7.4.16).
@@ -258,6 +286,7 @@ impl Signer {
                     reminded: reminded.clone(),
                     unanswered: false,
                     first_404_ms: None,
+                    shown: self.erasure_shown(),
                 };
                 self.commit(state, Some(flow)).await?;
                 Box::pin(self.send_erasure(unpublished, reminded, false, false)).await
@@ -277,6 +306,7 @@ impl Signer {
                     reminded: reminded.clone(),
                     unanswered: false,
                     first_404_ms: None,
+                    shown: self.erasure_shown(),
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 self.switch_at_mark().await?;
@@ -291,6 +321,7 @@ impl Signer {
                     reminded,
                     unanswered: false,
                     first_404_ms: None,
+                    shown: self.erasure_shown(),
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
@@ -302,20 +333,104 @@ impl Signer {
     /// What the erasure's body names (Switch wire 7.4.16 Request), in one place: `created`,
     /// the account's creation time its enrollment answer gave, or a `409` since, `None` where
     /// this install holds none, after a restore or a hand-over; and `identity_hash`, the
-    /// document hash of the newest `identity.json` the account holds as this install knows
-    /// it: the mark's, once it names this account's service, that is, once this install
-    /// delivered a version here; `None` before, as at a staged account it delivered nothing
-    /// to, which holds none.
+    /// document hash of the `identity.json` this install knows the account to hold: the copy
+    /// a `409` at an account that answers the notice showed, once one did
+    /// ([`Signer::erase_naming_the_shown_copy`]); else the mark's, once it names this
+    /// account's service, that is, once this install delivered a version here; `None` before,
+    /// as at a staged account it delivered nothing to, which holds none.
     fn erasure_names(&self) -> Result<(Option<u64>, Option<[u8; 32]>)> {
         let Some(service) = self.state.service.as_ref() else {
             return Ok((None, None));
         };
+        if let Some(shown) = self.erasure_shown() {
+            return Ok((service.created, shown.hash));
+        }
         let following = self
             .state
             .newest_doc()?
             .filter(|mark| mark.inbox().service_key == service.service_key)
             .map(|mark| mark.hash());
         Ok((service.created, following))
+    }
+
+    /// The copy a `409` at an account that answers the notice showed, as the erasure in
+    /// progress keeps it.
+    fn erasure_shown(&self) -> Option<ShownCopy> {
+        match &self.flow {
+            Some(Flow::Erase { shown, .. }) => *shown,
+            _ => None,
+        }
+    }
+
+    /// A signed `409` to the erasure at an account that answers the notice, which carries
+    /// `current.identity`, the copy the account holds, and `current.created`, the creation
+    /// time it checked against (Switch wire 7.4.16). The copy is judged as every copy (Switch
+    /// spec 4.3) before the erasure is sent again naming both, once:
+    ///
+    /// - this install's mark, or none or a copy older than the newest version delivered
+    ///   there, which is the state the account lost: it is named, and the rule against going
+    ///   back doesn't stop the erasure;
+    /// - a newer copy is taken as every newer copy is: another install's ends the erasure
+    ///   without erasing, this install's own keeps it as records behind;
+    /// - another body at the mark's version raises the alarm, and the erasure waits;
+    /// - a copy that doesn't verify stops the erasure there, in progress, and tells the user.
+    async fn erase_naming_the_shown_copy(
+        &mut self,
+        unpublished: bool,
+        reminded: Vec<[u8; 16]>,
+        current: &serde_json::Value,
+    ) -> Result<()> {
+        let kept = |shown: Option<ShownCopy>| Flow::Erase {
+            unpublished,
+            reminded: reminded.clone(),
+            unanswered: false,
+            first_404_ms: None,
+            shown,
+        };
+        let held = current.get("identity").unwrap_or(&serde_json::Value::Null);
+        let copy = if held.is_null() {
+            None
+        } else {
+            let verified = serde_json::from_value::<SignedDoc>(held.clone())
+                .ok()
+                .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok());
+            let Some(copy) = verified else {
+                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
+                    .await?;
+                return Err(ClientError::InvalidResponse(
+                    "Switch wire 7.4.16: a 409 to the erasure with a copy that doesn't verify"
+                        .into(),
+                )
+                .into());
+            };
+            Some(copy)
+        };
+        match self.judge_copy(copy.as_ref()) {
+            Ok(Verdict::AtMark) | Err(Alert::Rollback { .. }) => {}
+            Ok(Verdict::Newer) if copy.is_none() => {}
+            Ok(Verdict::Newer) => {
+                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
+                    .await?;
+                let signed = copy.as_ref().map(|copy| copy.signed().clone());
+                self.confirm_copy(signed.as_ref()).await?;
+                self.end_erasure(&reminded).await?;
+                return Err(Refusal::ErasureRefused.into());
+            }
+            Err(alert) => {
+                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
+                    .await?;
+                return self.alarm(alert).await;
+            }
+        }
+        let mut state = self.state.clone();
+        if let Some(service) = state.service.as_mut() {
+            service.created = checked_against(current);
+        }
+        let shown = ShownCopy {
+            hash: copy.as_ref().map(IdentityDoc::hash),
+        };
+        self.commit(state, Some(kept(Some(shown)))).await?;
+        Box::pin(self.send_erasure(unpublished, reminded, false, false)).await
     }
 
     /// Before each step of an erasure that deletes or asks to erase, a fresh check that this
@@ -378,6 +493,12 @@ impl Signer {
                     .await
                     .map(|()| Checked::ErasedAlready)
             }
+            // An account that answers the notice holds its copy back from `GET /apps` and
+            // shows it in a `409` to the erasure instead (Switch wire 7.4.16): the other
+            // copies are judged, and the step goes on.
+            Err(SignerError::Switch(error)) if answers_the_notice(&error) => {
+                self.copies_at_a_notice().await.map(|()| Checked::Signing)
+            }
             checked => checked.map(|()| Checked::Signing),
         };
         // An alarm or records behind keep the erasure in the commit that records them
@@ -400,6 +521,19 @@ impl Signer {
     async fn switch_and_homeserver(&mut self) -> Result<()> {
         self.check_named()?;
         self.switch_at_mark().await?;
+        if let Some(newest) = self.state.newest_doc()? {
+            self.judge_homeserver(&newest).await?;
+        }
+        Ok(())
+    }
+
+    /// The copies but the switch's, where the account answers the notice, before an erasure
+    /// step: this install is named, its records aren't behind, and neither the signer backup
+    /// nor the Homeserver's `identity.json` shows another install or a newer version (Switch
+    /// spec 4.3, wire 3.13).
+    async fn copies_at_a_notice(&mut self) -> Result<()> {
+        self.check_named()?;
+        self.check_backup_copy().await?;
         if let Some(newest) = self.state.newest_doc()? {
             self.judge_homeserver(&newest).await?;
         }
@@ -458,6 +592,7 @@ impl Signer {
                 reminded,
                 unanswered: true,
                 first_404_ms: Some(since_ms),
+                shown: self.erasure_shown(),
             };
             self.commit(self.state.clone(), Some(flow)).await?;
         }
@@ -546,6 +681,7 @@ impl Signer {
             reminded,
             unanswered: false,
             first_404_ms: None,
+            shown: None,
         };
         self.commit(state, Some(flow)).await
     }
@@ -604,4 +740,10 @@ fn checked_against(current: &serde_json::Value) -> Option<u64> {
         .get("created")
         .and_then(serde_json::Value::as_str)
         .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())
+}
+
+/// Whether `error` is the switch's signed notice that the account awaits a recovery, `503
+/// recovery_required` (Switch wire 7.3, Table 2; 7.6).
+fn answers_the_notice(error: &ClientError) -> bool {
+    error.code() == Some(ErrorCode::RecoveryRequired)
 }

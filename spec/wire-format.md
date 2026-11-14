@@ -1628,6 +1628,8 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 | `Switch-Timestamp` | every caller | the signing time, `YYYY-MM-DDTHH:MM:SSZ` (1.6) |
 | `Switch-Signature` | every caller | `b64(64)`, the request signature |
 
+**Each header at most once.** A request that carries any of these seven headers more than once is `400 bad_request` as soon as it is routed (7.3 step 1), before the account is looked up and before any signature work, as a JSON member named twice is (1.1): the service never acts on a request whose signed values it would have to choose between. Its answer binds the request as it arrived, both values included (Response signature, below), so it is final for nothing at a client that sent each header once. The public read (7.4.15), which uses none of these headers and binds none, is exempt.
+
 **Request signature** (label `pubky-switch/v1/http`): `lp(label, method, path and query, hash(body), Switch-Timestamp, switch origin, Switch-Identity, Switch-App, Switch-Cert, Switch-Invite-Code)`. A next service's request carries `Switch-Transfer` and no `Switch-App`, and is signed over `lp("pubky-switch/v1/transfer-request", method, path and query, hash(body), Switch-Timestamp, switch origin, Switch-Identity, Switch-Transfer)`.
 
 - The method is signed as sent, its exact text, never case-folded. The routes name their methods in upper case (7.4); a method in any other case is an unknown route (7.3 step 1). The body hash is over the raw body bytes, so a request without a body signs `hash` of the empty string.
@@ -2368,7 +2370,7 @@ A stub names no object: its envelope gives the item's type (6.6), not the claim,
 
 | HTTP | `code` | When | `current` |
 |---|---|---|---|
-| 400 | `bad_request` | malformed request, document or operation; unknown members where 1.1 rejects them; a missing or unparsable `Switch-Timestamp` or `Switch-Identity`; an append without `apps_version`; an envelope size that isn't a bucket; a policy or collection that differs from the record's; a batch writing one record twice; an `evidence_ref` on a claim entry other than `done` | |
+| 400 | `bad_request` | malformed request, document or operation; a signed request header sent more than once (7.1); unknown members where 1.1 rejects them; a missing or unparsable `Switch-Timestamp` or `Switch-Identity`; an append without `apps_version`; an envelope size that isn't a bucket; a policy or collection that differs from the record's; a batch writing one record twice; an `evidence_ref` on a claim entry other than `done` | |
 | 401 | `bad_signature` | a request, operation, certificate, freeze, unfreeze or key bundle signature that doesn't verify | |
 | 401 | `stale_timestamp` | `Switch-Timestamp` more than 5 minutes from the service's clock | `{ "server_time" }`: the service's time base when it checked the timestamp (7.1) |
 | 403 | `not_admitted` | a sender not admitted or denied; a connect request where they are off; a signer of another identity. An admission refusal has one message, `7: sender not admitted`, whatever the reason (denied, unknown, an unknown, expired or used-up code) | |

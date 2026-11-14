@@ -138,25 +138,66 @@ async fn test_response_binding_changed_timestamp_refusal_isnt_the_honest_answer(
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The head of alice's account, from the signer's `GET /apps`.
+async fn head_now(replay: &Replay) -> String {
+    let answer = replay.service.handle(honest_apps()).await;
+    assert_eq!(answer.status, 200);
+    header_text(&answer, header::HEAD).expect("head").to_owned()
+}
+
 #[tokio::test]
-async fn test_response_binding_repeated_signed_header_changes_the_binding() {
+async fn test_response_binding_repeated_signed_header_is_refused() {
+    // A signed request header sent twice is `400 bad_request`, before any signature work:
+    // the service never chooses between two signed values. Its answer binds the request as
+    // it arrived, so it doesn't pass for the honest one (Switch wire 7.1).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let honest = honest_apps();
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+    let honest = signer_request("POST", &path, Vec::new(), ms(&revoke_time()));
     let sent = Sent::of(&honest);
-    let mut repeated = copy_of(&honest);
-    let identity = honest
+    let before = head_now(&replay).await;
+    let signature = honest
         .headers
-        .get(header::IDENTITY)
-        .expect("identity")
+        .get(header::SIGNATURE)
+        .expect("signature")
         .clone();
-    repeated
-        .headers
-        .append(HeaderName::from_static(header::IDENTITY), identity);
-    let repeated_sent = Sent::of(&repeated);
-    let answer = replay.service.handle(repeated).await;
-    assert!(signed_with(&answer, &alice_service_key(), &repeated_sent));
-    assert!(!signed_with(&answer, &alice_service_key(), &sent));
+    for (name, value) in [
+        (header::APP, HeaderValue::from_str(&wallet).expect("value")),
+        (header::SIGNATURE, signature),
+    ] {
+        let mut repeated = copy_of(&honest);
+        repeated
+            .headers
+            .append(HeaderName::from_static(name), value.clone());
+        repeated
+            .headers
+            .append(HeaderName::from_static(name), value);
+        let repeated_sent = Sent::of(&repeated);
+        let answer = replay.service.handle(repeated).await;
+        assert_eq!(code_of(&answer), (400, json!("bad_request")), "{name}");
+        assert!(
+            signed_with(&answer, &operator_public(), &repeated_sent),
+            "{name}"
+        );
+        assert!(!signed_with(&answer, &operator_public(), &sent), "{name}");
+        // Nothing was committed.
+        assert_eq!(head_now(&replay).await, before, "{name}");
+    }
+    // The honest write is served.
+    let answer = replay.service.handle(honest).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_with(&answer, &alice_service_key(), &sent));
+    assert_ne!(head_now(&replay).await, before);
     replay.db.drop_database().await.expect("drop");
 }
 

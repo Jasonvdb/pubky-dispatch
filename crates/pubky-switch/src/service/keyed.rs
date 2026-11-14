@@ -96,6 +96,14 @@ impl<'a> Received<'a> {
         }
     }
 
+    /// Whether it carries one of the signed request headers more than once (Switch wire
+    /// 7.1).
+    pub(super) fn repeats_a_signed_header(&self) -> bool {
+        wire_http::RECEIVED_HEADERS
+            .iter()
+            .any(|name| self.headers.values(name).len() > 1)
+    }
+
     /// The request every answer to it signs.
     pub(super) fn asked(&self) -> Asked<'_> {
         Asked(ReceivedRequest {

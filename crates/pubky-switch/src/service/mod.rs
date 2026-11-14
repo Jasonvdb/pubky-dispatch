@@ -543,6 +543,13 @@ impl Service {
         // The request as received, which every answer to it signs (Switch wire 7.1).
         let received = Received::read(&request, &self.origin);
         let asked = received.asked();
+        // A signed request header sent more than once is refused before the account is looked
+        // up and before any signature work: the service never chooses between two signed
+        // values. The public read uses none of them (Switch wire 7.1).
+        if received.repeats_a_signed_header() && request.route.call != Call::GetIdentity {
+            let error = ApiError::bad_request("7.1: a signed request header sent more than once");
+            return self.operator_answer(asked, base_ms, &error).await;
+        }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
         }

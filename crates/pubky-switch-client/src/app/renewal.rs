@@ -26,7 +26,14 @@ use crate::error::ClientError;
 impl App {
     /// A `cert.put` for this app seen in the feed: kept if it renews the certificate the
     /// app presents (the same App ID, signing key and bundle key, a later `issued_at`).
-    pub(crate) fn note_renewal(&mut self, signed: &SignedDoc, tx: &mut Tx) -> Result<(), AppError> {
+    /// `at` is the item's position, (generation, `seq`): a listing its adoption owes is owed
+    /// there, or later (`App::take_cert`).
+    pub(crate) fn note_renewal(
+        &mut self,
+        signed: &SignedDoc,
+        at: (u64, u64),
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let Ok(cert) = AppCert::verify(signed, &self.state.meta.identity) else {
             return Ok(());
         };
@@ -37,6 +44,7 @@ impl App {
             .is_none_or(|kept| cert.issued_at() > kept.issued_at());
         if is_renewal(&self.state.cert, &cert) && newer_than_kept {
             tx.put(key::CERT_RENEWAL, cert.signed())?;
+            tx.put(key::CERT_RENEWAL_AT, &at)?;
             self.state.renewal = Some(cert);
             self.events.push(AppEvent::RenewalSeen);
         }
@@ -44,8 +52,9 @@ impl App {
     }
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
-    /// carrying it. Returns whether the certificate changed.
-    pub(crate) async fn adopt_renewal(&mut self) -> Result<bool, AppError> {
+    /// carrying it. Returns whether the certificate changed. `at` is the position of the feed
+    /// item that lists it, (generation, `seq`), when one does.
+    pub(crate) async fn adopt_renewal(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
         let Some(renewal) = self.state.renewal.clone() else {
             return Ok(false);
         };
@@ -60,7 +69,7 @@ impl App {
         body.updated_at = self.now().max(old.updated_at().saturating_add(1));
         let record = AppRecord::sign(&self.state.keys, body)?;
         if !self
-            .take_cert(renewal, record.signed().clone(), true, None)
+            .take_cert(renewal, record.signed().clone(), true, None, at)
             .await?
         {
             return Ok(false);
@@ -82,12 +91,19 @@ impl App {
     /// registered protocol owns or one a protocol refuses, as a join or a load would, isn't
     /// taken: the app would never load again with it ([`App::refuse_cert`]). Returns
     /// whether `cert` was taken.
+    ///
+    /// The listing a widening certificate owes is owed at the later of `at`, the feed item
+    /// that lists it, and the `cert.put` that brought the renewal kept, so a protocol that
+    /// owes a call before them has its collections listed only after it (Switch spec 8.3,
+    /// `order` module); one shown on neither, as one taken from the directory or the own
+    /// record, owes it outside the feed.
     async fn take_cert(
         &mut self,
         cert: AppCert,
         record: SignedDoc,
         deliver: bool,
         accepted: Option<SignedDoc>,
+        at: Option<(u64, u64)>,
     ) -> Result<bool, AppError> {
         if let Some(refusal) = self.protocols.certificate_refusal(&cert) {
             self.refuse_cert(&cert, refusal).await?;
@@ -117,11 +133,37 @@ impl App {
         // removed with it, so that read doesn't wait out its day for the baseline.
         let lists_read_added = cert.has_permission(Permission::ListsRead)
             && !self.state.cert.has_permission(Permission::ListsRead);
+        let listing_at = if widened {
+            let kept_at = if self
+                .state
+                .renewal
+                .as_ref()
+                .is_some_and(|held| held.hash() == cert.hash())
+            {
+                self.reader()
+                    .get::<(u64, u64)>(key::CERT_RENEWAL_AT)
+                    .await?
+            } else {
+                None
+            };
+            // A listing owed already, and not made yet, keeps its place.
+            let due = self
+                .reader()
+                .get::<super::records::ListDue>(super::records::LIST_DUE)
+                .await?
+                .and_then(|due| due.at);
+            [at, kept_at, due]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(generation, seq)| self.feed_order(*generation, *seq))
+        } else {
+            None
+        };
         self.state.cert = cert;
         self.rebuild_client()?;
         let mut tx = self.tx()?;
         if widened {
-            super::records::owe_listing(&mut tx)?;
+            super::records::owe_listing(&mut tx, listing_at)?;
         }
         if lists_read_added {
             tx.delete(super::admission::LISTS_AT)?;
@@ -132,6 +174,7 @@ impl App {
         tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {
             tx.delete(key::CERT_RENEWAL)?;
+            tx.delete(key::CERT_RENEWAL_AT)?;
         }
         if let Some(accepted) = &accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
@@ -184,6 +227,7 @@ impl App {
         let mut tx = self.tx()?;
         if held {
             tx.delete(key::CERT_RENEWAL)?;
+            tx.delete(key::CERT_RENEWAL_AT)?;
         }
         if !told {
             tx.put(key::CERT_REFUSED, &hash)?;
@@ -347,7 +391,7 @@ impl App {
             // into the dropped body; and before the drop, so a crash between the two leaves
             // the kept record, whose re-send then finds the later record under the
             // certificate presented.
-            self.take_cert(cert.clone(), later.signed().clone(), false, None)
+            self.take_cert(cert.clone(), later.signed().clone(), false, None, None)
                 .await?;
         }
         if newer {
@@ -488,7 +532,7 @@ impl App {
             .as_ref()
             .is_some_and(|r| r.hash() == listed)
         {
-            self.adopt_renewal().await?;
+            self.adopt_renewal(None).await?;
             return Ok(Listed::Key(key));
         }
         let cert = entry.record.cert().clone();
@@ -519,7 +563,8 @@ impl App {
             };
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            self.take_cert(cert, record, kept, Some(taken)).await?;
+            self.take_cert(cert, record, kept, Some(taken), None)
+                .await?;
         }
         Ok(Listed::Key(key))
     }

@@ -2163,3 +2163,678 @@ async fn test_protocol_set_upload_transition_waits_behind_a_call_its_protocol_ow
     assert_eq!(*p.tasks.missed.lock().unwrap(), [missed]);
     assert_eq!(divergent(&events), 1, "{events:?}");
 }
+
+/// One kind of item a read meets, for the order test below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    /// A message of `tasks`.
+    TasksEntry,
+    /// A message of `chat`.
+    ChatEntry,
+    /// An item no app of the identity can read.
+    Unreadable,
+    /// A `missed` item: a call to each protocol, and a listing.
+    Missed,
+    /// A `missed` item whose times don't parse: a listing alone.
+    MissedUnparsable,
+    /// Another own app's write of a new `tasks` record.
+    TasksWrite,
+    /// The same of a `chat` record.
+    ChatWrite,
+    /// An upload making the `tasks` record the app holds divergent.
+    TasksUpload,
+    /// The same of the `chat` record.
+    ChatUpload,
+    /// An upload of more records than the app keeps marks for: a listing.
+    UploadPastCap,
+    /// A renewal adding the read scope of a `chat` collection: a listing.
+    Widening,
+}
+
+const SHOWN: [Shown; 11] = [
+    Shown::TasksEntry,
+    Shown::ChatEntry,
+    Shown::Unreadable,
+    Shown::Missed,
+    Shown::MissedUnparsable,
+    Shown::TasksWrite,
+    Shown::ChatWrite,
+    Shown::TasksUpload,
+    Shown::ChatUpload,
+    Shown::UploadPastCap,
+    Shown::Widening,
+];
+
+/// An app running `tasks` (collection `tasks.list`) and `chat` (`chat.list`, and
+/// `chat.wide`, whose read scope a renewal adds), with `lists.read`, while `tasks` owes a
+/// missed call it keeps failing; another own app, `phone`, writes records.
+struct Owing {
+    p: Pair,
+    app: App,
+    phone: App,
+    tasks_list: crate::app::Collection,
+    chat_list: crate::app::Collection,
+    /// The record of each the app holds.
+    tasks_record: [u8; 32],
+    chat_record: [u8; 32],
+    /// The keys of `tasks`'s records: held, or written since by `phone`.
+    tasks_keys: std::collections::BTreeSet<[u8; 32]>,
+    /// What the app held of `tasks`'s records when `tasks` began to owe, with their marks.
+    held: Vec<(crate::app::SharedRecord, Option<Vec<u8>>)>,
+    /// The `seq` of each feed item `tasks` is owed, in feed order: the missed item it
+    /// fails, then each later message and missed item of its own.
+    owed: Vec<u64>,
+    /// The `seq` of each `chat` message, in feed order.
+    chat_seqs: Vec<u64>,
+    /// The missed items, in feed order.
+    missed: Vec<u64>,
+    /// How many records `phone` wrote.
+    written: u32,
+}
+
+fn tasks_list() -> crate::app::Collection {
+    crate::app::Collection::new(
+        "tasks.list",
+        pubky_switch_core::ident::Policy::new("tasks", &["tasks"]),
+    )
+}
+
+/// The scopes of the app's certificate, `extra` added, with its permissions in the fixed
+/// order (Switch wire 3.1).
+fn owing_spec(extra: &[&str]) -> AppSpec {
+    let mut scopes = vec!["tasks", "chat"];
+    scopes.extend_from_slice(extra);
+    let permissions: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| matches!(p, Permission::ConversationAdd | Permission::ListsRead))
+        .collect();
+    AppSpec::new(&scopes).with_permissions(&permissions)
+}
+
+/// Read until a read says there is nothing more to do now, at most six times: a read
+/// that keeps saying `more` while nothing but a held protocol's work is left fails.
+async fn read_quiet(app: &mut App) -> (Vec<AppEvent>, crate::app::ReceiveReport) {
+    let mut events = Vec::new();
+    for _ in 0..6 {
+        let report = app.receive(None).await.unwrap();
+        events.extend(report.events.clone());
+        if !report.more {
+            return (events, report);
+        }
+    }
+    panic!("the read keeps saying more: {events:?}");
+}
+
+/// The record keys `events` names, by duty or not.
+fn record_event_keys(events: &[AppEvent]) -> Vec<[u8; 32]> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::RecordChanged { key }
+            | AppEvent::WriteFlagged { key, .. }
+            | AppEvent::RecordUncheckable { key, .. }
+            | AppEvent::RecordDivergent { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Owing {
+    /// Join, write the records, then show in one page an upload marking 17 `tasks`
+    /// records, an upload making the `chat` record divergent, and the missed item `tasks`
+    /// fails: the `tasks` marks wait, unread, and the read says nothing more is to do, while
+    /// the `chat` mark is read past them.
+    async fn new() -> Self {
+        let chat_list = crate::app::Collection::new(
+            "chat.list",
+            pubky_switch_core::ident::Policy::new("chat", &["chat"]),
+        );
+        let chat_wide = crate::app::Collection::new(
+            "chat.wide",
+            pubky_switch_core::ident::Policy::new("chat_wide", &["chat"]),
+        );
+        let p = Pair::with(
+            Named {
+                collections: vec![tasks_list()],
+                ..named("tasks")
+            },
+            Named {
+                collections: vec![chat_list.clone(), chat_wide],
+                ..named("chat")
+            },
+        );
+        let request =
+            p.w.signer
+                .approve(&app_keys("wallet"), &owing_spec(&[]))
+                .unwrap();
+        let mut app = App::join(p.env(), p.set(), World::config(), request)
+            .await
+            .unwrap();
+        let request =
+            p.w.signer
+                .approve(&app_keys("phone"), &owing_spec(&[]))
+                .unwrap();
+        let mut phone = App::join(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            p.set(),
+            World::config(),
+            request,
+        )
+        .await
+        .unwrap();
+        read_quiet(&mut app).await;
+        read_quiet(&mut phone).await;
+        let tasks_list = tasks_list();
+        let mut marked = std::collections::BTreeSet::new();
+        for n in 0..=17u8 {
+            let target = crate::app::RecordTarget::new(tasks_list.clone(), &[b'k', n]);
+            app.put_record(&target, b"{}", vec![]).await.unwrap();
+            marked.insert(app.record_key(&target).unwrap());
+        }
+        let tasks_record = *marked.first().unwrap();
+        let target = crate::app::RecordTarget::new(chat_list.clone(), b"c");
+        app.put_record(&target, b"{}", vec![]).await.unwrap();
+        let chat_record = app.record_key(&target).unwrap();
+        read_quiet(&mut app).await;
+        p.tasks.gaps.lock().unwrap().clear();
+        p.chat.gaps.lock().unwrap().clear();
+        app.take_events();
+        // In one page: the marks come before `tasks` owes; the missed item after them.
+        *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+        let by = app_keys("phone").app_id_bytes();
+        let changes = pubky_switch_core::recovery::UploadChanges {
+            records: marked.iter().skip(1).copied().collect(),
+            ..Default::default()
+        };
+        p.w.switch.chain_upload(by, changes.to_value()).unwrap();
+        p.w.switch.make_divergent(by, chat_record, [1; 32]).unwrap();
+        let now = p.w.clock.now_ms();
+        let first = p.w.switch.push_missed(1, now, now);
+        let report = app.receive(None).await.unwrap();
+        assert!(!report.more, "{report:?}");
+        assert!(!report.stopped, "{report:?}");
+        assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+        assert_eq!(*p.chat.missed.lock().unwrap(), [first]);
+        assert_eq!(
+            record_event_keys(&report.events)
+                .into_iter()
+                .filter(|key| *key == chat_record)
+                .count(),
+            1,
+            "the chat mark is read past the waiting tasks marks: {:?}",
+            report.events
+        );
+        assert!(
+            app.shared_record(&chat_record)
+                .await
+                .unwrap()
+                .unwrap()
+                .divergent
+        );
+        let marks = p
+            .snapshot(&app.app_id())
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(b"rcread/"))
+            .count();
+        assert_eq!(marks, 17, "the tasks marks wait, unread");
+        let mut held = Vec::new();
+        for key in &marked {
+            let record = app.shared_record(key).await.unwrap().unwrap();
+            held.push((record, app.record_seen(key).await.unwrap()));
+        }
+        Self {
+            p,
+            app,
+            phone,
+            tasks_list,
+            chat_list,
+            tasks_record,
+            chat_record,
+            tasks_keys: marked,
+            held,
+            owed: vec![first],
+            chat_seqs: Vec::new(),
+            missed: vec![first],
+            written: 0,
+        }
+    }
+
+    /// Show `shown` on the feed. Returns whether it is held for `tasks` itself.
+    async fn show(&mut self, shown: Shown) -> bool {
+        let me = self.app.app_id();
+        let now = self.p.w.clock.now_ms();
+        let by = app_keys("phone").app_id_bytes();
+        match shown {
+            Shown::TasksEntry => {
+                self.owed.push(self.p.send(me, "tasks.item"));
+                return true;
+            }
+            Shown::ChatEntry => self.chat_seqs.push(self.p.send(me, "chat.item")),
+            Shown::Unreadable => {
+                self.p.w.switch.push_unreadable([9; 32], now);
+            }
+            Shown::Missed => {
+                let seq = self.p.w.switch.push_missed(1, now, now);
+                self.owed.push(seq);
+                self.missed.push(seq);
+            }
+            Shown::MissedUnparsable => {
+                self.p.w.switch.push_missed_unparsable(1);
+            }
+            Shown::TasksWrite | Shown::ChatWrite => {
+                self.written += 1;
+                let collection = if shown == Shown::TasksWrite {
+                    self.tasks_list.clone()
+                } else {
+                    self.chat_list.clone()
+                };
+                let natural = format!("w{}", self.written);
+                let target = crate::app::RecordTarget::new(collection, natural.as_bytes());
+                self.phone.put_record(&target, b"{}", vec![]).await.unwrap();
+                if shown == Shown::TasksWrite {
+                    self.tasks_keys
+                        .insert(self.phone.record_key(&target).unwrap());
+                    return true;
+                }
+            }
+            Shown::TasksUpload | Shown::ChatUpload => {
+                let key = if shown == Shown::TasksUpload {
+                    self.tasks_record
+                } else {
+                    self.chat_record
+                };
+                let hash = [u8::try_from(self.written).unwrap().wrapping_add(2); 32];
+                self.written += 1;
+                self.p.w.switch.make_divergent(by, key, hash).unwrap();
+            }
+            Shown::UploadPastCap => {
+                let records = (0..=crate::app::MAX_RECORD_MARKS)
+                    .map(|i| {
+                        let mut key = [0xee; 32];
+                        key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+                        key
+                    })
+                    .collect();
+                let changes = pubky_switch_core::recovery::UploadChanges {
+                    records,
+                    ..Default::default()
+                };
+                self.p
+                    .w
+                    .switch
+                    .chain_upload(by, changes.to_value())
+                    .unwrap();
+            }
+            Shown::Widening => {
+                let renewed = issue_cert(
+                    &self.p.w.alice,
+                    &app_keys("wallet"),
+                    &owing_spec(&["chat_wide"]),
+                    now + 1000,
+                )
+                .unwrap();
+                let old = self.app.cert().clone();
+                self.p
+                    .w
+                    .switch
+                    .signer_op(OpKind::CertPut {
+                        target_app_id: me,
+                        cert: renewed.signed().clone(),
+                    })
+                    .unwrap();
+                self.p.w.next_doc(|body| {
+                    body.apps.retain(|a| a.app_id != me);
+                    body.apps.push(pubky_switch_core::records::ListedApp {
+                        app_id: me,
+                        cert: renewed.hash(),
+                    });
+                    body.renewed.retain(|r| r.app_id != me);
+                    body.renewed.push(pubky_switch_core::records::RenewedCert {
+                        app_id: me,
+                        cert: old.hash(),
+                        until: None,
+                    });
+                });
+            }
+        }
+        false
+    }
+
+    /// `tasks` was handed nothing, and nothing of its records was judged, marked, flagged
+    /// or noted divergent, in `events` or in the app's copy, since it began to owe.
+    async fn tasks_told_nothing(&self, events: &[AppEvent]) {
+        let tasks = &self.p.tasks;
+        assert!(kinds(tasks).is_empty(), "{:?}", tasks.received);
+        assert!(tasks.missed.lock().unwrap().is_empty());
+        assert!(tasks.gaps.lock().unwrap().is_empty());
+        assert!(tasks.denies.lock().unwrap().is_empty());
+        for key in record_event_keys(events) {
+            assert!(!self.tasks_keys.contains(&key), "{events:?}");
+        }
+        let now = self.app.records_of("tasks.list").await.unwrap();
+        assert_eq!(now.len(), self.held.len(), "no tasks record taken: {now:?}");
+        for (record, seen) in &self.held {
+            let key = &record.key;
+            assert_eq!(
+                self.app.shared_record(key).await.unwrap().as_ref(),
+                Some(record)
+            );
+            assert_eq!(self.app.record_seen(key).await.unwrap(), *seen);
+        }
+    }
+
+    /// `chat` took each of its messages once, in feed order, up to the ones shown: all of
+    /// them unless the feed stops at an item owed to `tasks` ahead of the cursor.
+    fn chat_in_order(&self, all: bool) {
+        let taken: Vec<u64> = self
+            .p
+            .chat
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        assert!(
+            self.chat_seqs.starts_with(&taken),
+            "{taken:?} {:?}",
+            self.chat_seqs
+        );
+        if all {
+            assert_eq!(taken, self.chat_seqs);
+        }
+    }
+}
+
+/// While `tasks` owes a missed call it keeps failing, `order` is shown, a read after each
+/// item; then `tasks` takes its call.
+async fn while_tasks_owes(order: &[Shown], tail: bool) {
+    let mut w = Owing::new().await;
+    // An item owed to `tasks` past the cursor, a call or a listing, stops the feed for
+    // every protocol there until the cursor reaches it: once `tasks` holds an item, the
+    // next item that owes it one stops `chat` there.
+    let mut held = false;
+    let mut stopped = false;
+    for shown in order {
+        held |= w.show(*shown).await;
+        let owes_tasks_one = matches!(
+            shown,
+            Shown::Missed | Shown::MissedUnparsable | Shown::UploadPastCap | Shown::Widening
+        );
+        stopped |= held && owes_tasks_one;
+        let (events, report) = read_quiet(&mut w.app).await;
+        assert!(stopped || !report.stopped, "{shown:?}: {report:?}");
+        w.tasks_told_nothing(&events).await;
+        w.chat_in_order(!stopped);
+    }
+    let mut manager = None;
+    if tail {
+        // A deny list change and a gap, which every protocol takes in feed order: the read
+        // holds for both, `tasks` told neither.
+        let mut deny = manager_of(&w.p).await;
+        deny.deny(&[7; 32]).await.unwrap();
+        let (events, report) = read_quiet(&mut w.app).await;
+        w.tasks_told_nothing(&events).await;
+        w.app.allow_list().await.unwrap();
+        let (events, report_after) = read_quiet(&mut w.app).await;
+        assert!(report.stopped || report_after.stopped, "{report:?}");
+        w.tasks_told_nothing(&events).await;
+        assert!(w.p.chat.gaps.lock().unwrap().is_empty());
+        manager = Some(deny);
+    }
+    w.app.take_events();
+    let listings = w.p.w.switch.lock().shared.listings;
+    // `tasks` takes its call: it gets everything once, in feed order.
+    *w.p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        events.extend(read_quiet(&mut w.app).await.0);
+    }
+    assert_eq!(*w.p.tasks.taken.lock().unwrap(), w.owed, "{order:?}");
+    assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(!w.app.listing_owed().await.unwrap());
+    // A listing owed while it owed left its collections out: its own came after its call.
+    let owes_a_listing = order.iter().any(|shown| {
+        matches!(
+            shown,
+            Shown::Missed | Shown::MissedUnparsable | Shown::UploadPastCap | Shown::Widening
+        )
+    });
+    if owes_a_listing {
+        assert!(w.p.w.switch.lock().shared.listings > listings, "{order:?}");
+    }
+    w.chat_in_order(true);
+    for key in &w.tasks_keys {
+        assert!(
+            w.app.shared_record(key).await.unwrap().is_some(),
+            "every tasks record taken"
+        );
+    }
+    if order.contains(&Shown::TasksUpload) {
+        let told = record_event_keys(&events)
+            .into_iter()
+            .filter(|key| *key == w.tasks_record)
+            .count();
+        assert!(told >= 1, "{events:?}");
+        let record = w.app.shared_record(&w.tasks_record).await.unwrap().unwrap();
+        assert!(record.divergent);
+    }
+    if manager.is_some() {
+        assert_eq!(*w.p.tasks.denies.lock().unwrap(), [[7; 32]]);
+        assert_eq!(*w.p.chat.denies.lock().unwrap(), [[7; 32]], "handed once");
+        assert!(!w.p.tasks.gaps.lock().unwrap().is_empty());
+        assert!(!w.p.chat.gaps.lock().unwrap().is_empty());
+    }
+}
+
+/// A manager app of the identity, with `lists.manage`, beside the app the test reads.
+async fn manager_of(p: &Pair) -> App {
+    let permissions: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| {
+            matches!(
+                p,
+                Permission::ConversationAdd | Permission::ListsRead | Permission::ListsManage
+            )
+        })
+        .collect();
+    let request =
+        p.w.signer
+            .approve(
+                &app_keys("manager"),
+                &AppSpec::new(&["tasks", "chat"]).with_permissions(&permissions),
+            )
+            .unwrap();
+    App::join(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_later_in_any_order() {
+    // Every kind of item a read meets, shown in turn while `tasks` owes a call: `tasks` is
+    // handed nothing past it, and nothing of its records is judged, marked or noted
+    // divergent, while `chat` takes its own items once and in order and no read keeps
+    // saying more; then `tasks` takes everything once, in feed order. Each order is a
+    // rotation of the kinds, and their reverse.
+    let n = SHOWN.len();
+    for start in [0, 3, 5, 8] {
+        let order: Vec<Shown> = (0..n).map(|i| SHOWN[(start + i) % n]).collect();
+        while_tasks_owes(&order, start == 0).await;
+    }
+    let mut reversed = SHOWN;
+    reversed.reverse();
+    while_tasks_owes(&reversed, true).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_listing() {
+    // A second missed item, after an upload makes a `tasks` record divergent: the listing
+    // it owes leaves `tasks.list` out, so `tasks` isn't told the divergence until it takes
+    // its call, when its own listing comes after it.
+    while_tasks_owes(
+        &[Shown::TasksUpload, Shown::Missed, Shown::ChatEntry],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_upload() {
+    // An upload making a `tasks` record divergent past its call: the record is read again
+    // only once `tasks` took the call.
+    while_tasks_owes(&[Shown::TasksUpload, Shown::ChatEntry], false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_call_after_one_its_protocol_failed_is_owed_behind_it() {
+    // `tasks` fails the first of two missed items in one page, once: the second isn't
+    // handed to it past the first, but owed behind it, while `chat` takes both; the next
+    // read hands `tasks` both, in feed order.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(1),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let first = p.w.switch.push_missed(1, now, now);
+    let second = p.w.switch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert_eq!(*p.chat.missed.lock().unwrap(), [first, second]);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [first, second]);
+    assert_eq!(
+        *p.chat.missed.lock().unwrap(),
+        [first, second],
+        "handed once"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_duty_event_past_a_call_its_protocol_owes_is_refused() {
+    // A duty event raised past a call its protocol owes is never kept: the commit fails.
+    // One for another protocol, or at the owed call's own item, is kept.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    app.owed_from.insert("tasks".into(), (1, 0, 3));
+    let duty = || crate::app::events::Duty::RecordDivergent { key: [5; 32] };
+    let place = crate::app::order::Place::Item((1, 0, 4));
+    let mut tx = app.tx().unwrap();
+    assert!(
+        app.keep_duty_for(&mut tx, vec!["tasks".into()], duty(), place)
+            .is_err()
+    );
+    assert!(
+        app.keep_duty_for(&mut tx, vec!["chat".into()], duty(), place)
+            .is_ok()
+    );
+    let at_the_call = crate::app::order::Place::Item((1, 0, 3));
+    assert!(
+        app.keep_duty_for(&mut tx, vec!["tasks".into()], duty(), at_the_call)
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_listing_takes_a_new_divergent_record_while_another_protocol_owes() {
+    // While `tasks` owes a call, a missed item's listing takes a `chat` record the app
+    // didn't hold, which the service shows divergent: `chat` is told, and the read goes on.
+    let mut w = Owing::new().await;
+    let now = w.p.w.clock.now_ms();
+    let missed = w.p.w.switch.push_missed(1, now, now);
+    w.owed.push(missed);
+    w.missed.push(missed);
+    let target = crate::app::RecordTarget::new(w.chat_list.clone(), b"new");
+    w.phone.put_record(&target, b"{}", vec![]).await.unwrap();
+    let key = w.phone.record_key(&target).unwrap();
+    let by = app_keys("phone").app_id_bytes();
+    w.p.w.switch.make_divergent(by, key, [3; 32]).unwrap();
+    let (events, _) = read_quiet(&mut w.app).await;
+    assert!(record_event_keys(&events).contains(&key), "{events:?}");
+    assert!(w.app.shared_record(&key).await.unwrap().unwrap().divergent);
+    w.tasks_told_nothing(&events).await;
+    let kept = w.app.unacknowledged_events_for("chat").await.unwrap();
+    let id = kept
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::RecordDivergent { id, key: k } if *k == key => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        w.app.event_owners(id),
+        Some(&["chat".to_owned()][..]),
+        "for chat alone"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_marks_wait_for_what_was_held_before_them() {
+    // `tasks` owes a call; its entry is held, then `chat` entries, then an upload makes the
+    // `tasks` record divergent. With pages of one item, the first read after `tasks` takes
+    // its call goes on from where the last read got, past the held entry: the record is
+    // read again for `tasks` only once that entry was handed.
+    let p = Pair::with(
+        Named {
+            collections: vec![tasks_list()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut config = World::config();
+    config.page_size = 1;
+    let request = p.approve("wallet", &[]);
+    let mut app = App::join(p.env(), p.set(), config, request).await.unwrap();
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let target = crate::app::RecordTarget::new(tasks_list(), b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    let key = app.record_key(&target).unwrap();
+    read_quiet(&mut app).await;
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(1, now, now);
+    read_quiet(&mut app).await;
+    let held = p.send(me, "tasks.item");
+    for _ in 0..6 {
+        p.send(me, "chat.item");
+    }
+    p.w.switch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    let marked_at = p.w.switch.seq();
+    // Read part of the way: the last read stops on its pages with more left.
+    app.receive(None).await.unwrap();
+    app.take_events();
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut told = false;
+    for _ in 0..12 {
+        let report = app.receive(None).await.unwrap();
+        if report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordDivergent { key: k, .. } if *k == key))
+        {
+            let taken = p.tasks.taken.lock().unwrap().clone();
+            assert!(taken.contains(&held), "{taken:?} before {marked_at}");
+            told = true;
+        }
+    }
+    assert!(told);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert_eq!(kinds(&p.chat).len(), 6, "handed once");
+}

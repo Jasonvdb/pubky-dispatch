@@ -953,7 +953,7 @@ impl App {
                     None => tx.delete(&out_key(&msg_id))?,
                 }
                 note_given_up(&mut tx, &msg_id, now)?;
-                self.keep_duty_for(&mut tx, to, duty)?;
+                self.keep_duty_for(&mut tx, to, duty, super::order::Place::Outside)?;
                 self.commit(tx).await?;
                 withdrawn.push(msg_id);
             }
@@ -976,6 +976,7 @@ impl App {
                             msg_id: msg_id.clone(),
                             resend: false,
                         },
+                        super::order::Place::Outside,
                     )?;
                     self.commit(tx).await?;
                     withdrawn.push(msg_id);
@@ -1674,6 +1675,7 @@ impl App {
                     msg_id: msg_id.to_owned(),
                     resend,
                 },
+                super::order::Place::Outside,
             )?;
             match self.commit(tx).await {
                 // A record that still doesn't fit goes too, its record job with it.
@@ -1723,7 +1725,7 @@ impl App {
                         note_given_up(&mut tx, msg_id, self.now())?;
                     }
                 }
-                self.keep_duty_for(&mut tx, to, duty)?;
+                self.keep_duty_for(&mut tx, to, duty, super::order::Place::Outside)?;
                 self.commit(tx).await?;
                 return Ok(true);
             }
@@ -1836,6 +1838,7 @@ impl App {
                 msg_id: item.msg_id.clone(),
                 resend,
             },
+            super::order::Place::Outside,
         )?;
         self.commit(tx).await?;
         Ok(true)
@@ -1930,6 +1933,7 @@ impl App {
                 msg_id: item.msg_id.clone(),
                 batch_id: item.record_batch.clone(),
             },
+            super::order::Place::Outside,
         )?;
         self.commit(tx).await
     }

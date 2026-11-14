@@ -1068,6 +1068,7 @@ impl App {
                 batch_id: *id,
                 code: code.as_str().to_owned(),
             },
+            super::order::Place::Outside,
         )?;
         self.commit(tx).await
     }

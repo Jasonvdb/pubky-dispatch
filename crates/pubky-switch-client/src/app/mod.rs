@@ -44,6 +44,7 @@ mod held_cursor;
 mod identity;
 mod kept;
 mod keys;
+mod order;
 mod own_record;
 mod parked;
 mod peek;
@@ -646,9 +647,15 @@ pub struct App {
     /// calls are owed. In memory only.
     owed_known: Option<bool>,
     /// The protocols owed a call about a feed item at or before the cursor, as the last
-    /// retry of `owed/` left them, and as calls are owed: each is handed nothing later until
-    /// it takes its calls (Switch spec 8.3). In memory only.
+    /// retry of `owed/` left them, and as calls are owed: a call every registered protocol
+    /// owes stops the read, as with one protocol (`App::owe`). What each is told meanwhile
+    /// is decided by `owed_from` ([`App::may_tell`]). In memory only.
     owing: BTreeSet<String>,
+    /// Where each protocol that owes something is first owed it: its first owed call or
+    /// owed listing, in feed order (`order` module). It is told nothing past it
+    /// ([`App::may_tell`]). Read from the store at each read's start and after the owed
+    /// calls are made, and set as calls and listings are owed. In memory only.
+    owed_from: std::collections::BTreeMap<String, order::FeedOrder>,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
@@ -1024,6 +1031,7 @@ impl App {
                 events: Vec::new(),
                 owed_known: None,
                 owing: BTreeSet::new(),
+                owed_from: std::collections::BTreeMap::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
@@ -1074,7 +1082,7 @@ impl App {
             tx.put(key::DEVICE, &app.state.device)?;
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
-            records::owe_listing(&mut tx)?;
+            records::owe_listing(&mut tx, None)?;
             tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
@@ -1184,6 +1192,7 @@ impl App {
                 events: Vec::new(),
                 owed_known: None,
                 owing: BTreeSet::new(),
+                owed_from: std::collections::BTreeMap::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
@@ -2033,6 +2042,7 @@ impl App {
                 events: Vec::new(),
                 owed_known: None,
                 owing: BTreeSet::new(),
+                owed_from: std::collections::BTreeMap::new(),
                 owed_held_reads: 0,
                 owed_ahead: None,
                 deny_directory_read: None,
@@ -2067,7 +2077,7 @@ impl App {
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
-                records::owe_listing(&mut tx)?;
+                records::owe_listing(&mut tx, None)?;
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
@@ -2737,18 +2747,32 @@ impl App {
 
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
     /// reports, and reported once that commit is done (`events` module, "Duty events").
+    ///
+    /// Each is about the app's own handling of an item already handed, a receive step's
+    /// effect or a stored entry, or about something outside the feed: it is at
+    /// [`order::Place::Outside`].
     pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
         let to = self.duty_to(&duty);
-        self.keep_duty_for(tx, to, duty)
+        self.keep_duty_for(tx, to, duty, order::Place::Outside)
     }
 
-    /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does.
+    /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does, raised at
+    /// `place` in the order the protocols are told things (Switch spec 8.3): one that a
+    /// protocol in `to` may not be told yet ([`App::may_tell`]) is never kept; the call
+    /// fails, and the commit with it, so no path tells a protocol a duty event past a call
+    /// it owes. The paths that raise one there hold the item before they get here.
     pub(crate) fn keep_duty_for(
         &mut self,
         tx: &mut Tx,
         to: Vec<String>,
         duty: events::Duty,
+        place: order::Place,
     ) -> Result<(), AppError> {
+        if !to.iter().all(|name| self.may_tell(Some(name), place)) {
+            return Err(AppError::InvalidData(
+                "Switch spec 8.3: a duty event past a call its protocol owes".into(),
+            ));
+        }
         let n = self.state.next_duty;
         let next = n.checked_add(1).ok_or_else(corrupt)?;
         let kept = events::KeptDuty { to, duty };
@@ -3220,6 +3244,9 @@ impl App {
             "p/",
             key::DUTY_PREFIX,
             key::OWED_PREFIX,
+            order::OWED_LISTING_PREFIX,
+            order::OWED_LISTING_AT_PREFIX,
+            order::GATE_HELD_PREFIX,
         ] {
             tx.delete_prefix(prefix)?;
         }

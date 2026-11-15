@@ -5776,3 +5776,160 @@ pub(super) async fn writes_kept_during_a_freeze_reach_the_next_service() {
     assert_eq!(order, pubkys, "each once, in the order kept");
     assert_eq!(w.switch.applied().len(), old_ops);
 }
+
+#[tokio::test]
+async fn test_loss_upload_over_cap_reports_refusal_after_reload() {
+    Box::pin(loss_upload_with_records(40)).await;
+}
+
+#[tokio::test]
+async fn test_loss_upload_within_cap_completes_after_reload() {
+    Box::pin(loss_upload_with_records(1)).await;
+}
+
+async fn loss_upload_with_records(count: usize) {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+
+    const CAP: usize = 16 * 1024 * 1024;
+    let store = Arc::new(MemoryStore::new());
+    let w = World::new();
+    let router = Router::of(&w);
+    let protocol = Arc::new(LossProtocol::default());
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        &[],
+    )
+    .await;
+    let value = json!({"items": [], "pad": "x".repeat(200_000)})
+        .to_string()
+        .into_bytes();
+    for n in 0..count {
+        let target = crate::app::RecordTarget::new(
+            super::shared_flows::items(),
+            format!("record-{n}").as_bytes(),
+        );
+        app.put_record(&target, &value, vec![]).await.unwrap();
+    }
+    let kept = app.shared_evidence().await.unwrap();
+    let records: Vec<UploadedOp> = kept
+        .ops
+        .iter()
+        .map(|op| UploadedOp {
+            op: op.op.clone(),
+            cert: op.cert.clone(),
+            proof: op.proof.clone(),
+        })
+        .collect();
+    assert_eq!(records.len(), count);
+    for record in &records {
+        let cert = AppCert::verify(&record.cert, &w.alice.public()).unwrap();
+        pubky_switch_core::ops::SignedOp::verify_with_cert(&record.op, &cert, &w.alice.public())
+            .unwrap();
+        assert!(record.proof.is_some());
+    }
+    let bytes = RecoveryUpload {
+        records,
+        ..RecoveryUpload::default()
+    }
+    .to_json()
+    .len();
+    let too_large = count == 40;
+    assert_eq!(
+        bytes > CAP,
+        too_large,
+        "the aggregate, not one operation, exceeds the cap"
+    );
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    drop(app);
+    let load = || {
+        App::load(
+            router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+            Arc::clone(&protocol) as Arc<dyn Protocol>,
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+    };
+    let mut app = load().await.unwrap();
+    app.refresh_identity().await.unwrap();
+    let first = app.receive(None).await;
+    let first_done = app.recovery_info().await.unwrap().unwrap().steps_done;
+    assert_eq!(
+        app.shared_evidence().await.unwrap(),
+        kept,
+        "retained signed evidence survives"
+    );
+    drop(app);
+    let mut app = load().await.unwrap();
+    let second = app.receive(None).await;
+    assert_eq!(
+        app.shared_evidence().await.unwrap(),
+        kept,
+        "reload preserves retained evidence"
+    );
+    let sent = router
+        .log()
+        .iter()
+        .filter(|line| line.contains("/recovery/upload"))
+        .count();
+    assert_eq!(
+        sent,
+        usize::from(!too_large),
+        "a local cap refusal sends nothing"
+    );
+    assert_eq!(
+        next.lock().shared.records.len(),
+        if too_large { 0 } else { count }
+    );
+    assert!(
+        first_done,
+        "an upload refused for good must let recovery continue: {first:?}; retry: {second:?}"
+    );
+    let first = first.unwrap();
+    assert_eq!(
+        has(&first.events, |event| matches!(event,
+            AppEvent::EvidenceRefused { code } if code == "too_large"
+        )),
+        too_large
+    );
+    second.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    assert_eq!(protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_upload_refusal_keeps_unread_answers_retryable() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    for code in [
+        ErrorCode::TooLarge,
+        ErrorCode::RateLimited,
+        ErrorCode::NotFound,
+    ] {
+        let error = ClientError::BodyUnread {
+            status: code.status(),
+            code,
+            retry_after: None,
+        };
+        app.events.clear();
+        assert_eq!(
+            app.uploaded(Err(error.clone())),
+            Err(AppError::Switch(error))
+        );
+        assert!(app.events.is_empty());
+    }
+}

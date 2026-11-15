@@ -305,27 +305,21 @@ impl Checker {
                 return Err(format!("the answer carries {name} {count} times"));
             }
         }
-        let with = self.signed_with(request, answer)?;
-        if let Some(text) = answer.header(header::HEAD) {
-            let account = account_id(request).and_then(|id| {
-                lock(&self.accounts)
-                    .get(id)
-                    .map(|account| (account.identity, account.key_of(with)))
-            });
-            let verifies = SignedHead::from_header(text).ok().zip(account).is_some_and(
-                |(head, (identity, key))| {
-                    key.is_some_and(|key| head.verify(&key, &identity).is_ok())
-                },
-            );
-            if !verifies {
-                return Err("its Switch-Head doesn't verify as the account's head".into());
-            }
-        }
-        Ok(with)
+        let head = answer
+            .header(header::HEAD)
+            .map(SignedHead::from_header)
+            .transpose()
+            .map_err(|_| "its Switch-Head doesn't read as a head".to_owned())?;
+        self.signed_with(request, answer, head.as_ref())
     }
 
     /// The key [`Checker::signature`] finds `answer`'s signature verifies with.
-    fn signed_with(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
+    fn signed_with(
+        &self,
+        request: &Request,
+        answer: &Response,
+        head: Option<&SignedHead>,
+    ) -> Result<SignedWith, String> {
         let signature = answer
             .header(header::SERVICE_SIGNATURE)
             .and_then(|text| unb64_array::<64>(text).ok())
@@ -346,7 +340,16 @@ impl Checker {
                         ErrorCode::TooLarge | ErrorCode::RateLimited | ErrorCode::NotFound
                     ) && code.status() == answer.status
                 });
+        let identity = account_id(request)
+            .and_then(|id| lock(&self.accounts).get(id).map(|account| account.identity));
         let verifies = |key: &[u8; 32]| {
+            // A response cannot bring a key or start a generation until its present head
+            // verifies with that same key (Switch wire 7.1, 6.7).
+            if head.is_some_and(|head| {
+                identity.is_none_or(|identity| head.verify(key, &identity).is_err())
+            }) {
+                return false;
+            }
             let with = |body_read: bool| {
                 verify_response(
                     key,
@@ -1004,6 +1007,128 @@ mod tests {
             ],
             body,
         }
+    }
+
+    fn account_snapshot(checker: &Checker) -> Value {
+        let accounts = lock(&checker.accounts);
+        let account = accounts.get(&alice().id()).unwrap();
+        let chain: Vec<_> = account
+            .chain
+            .iter()
+            .map(|(seq, link)| json!([seq, link.chain_hash, link.prev]))
+            .collect();
+        json!({"current": account.current, "keys": account.keys,
+            "named": account.named, "chain_since": account.chain_since, "chain": chain})
+    }
+
+    fn answer_with_body_head(
+        request: &Request,
+        service: &IdentityKey,
+        body: &Value,
+        head: &str,
+    ) -> Response {
+        let mut response = answer(request, service, 200, body);
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: Some(head),
+                body: &response.body,
+            },
+        );
+        response.headers = vec![
+            Header::new(header::SERVER_TIME, TIME),
+            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            Header::new(header::HEAD, head),
+        ];
+        response
+    }
+
+    #[test]
+    fn test_signature_rejected_enrollment_keeps_account_observations() {
+        rejected_enrollment("not a head");
+    }
+
+    #[test]
+    fn test_signature_wrong_enrollment_head_keeps_account_observations() {
+        rejected_enrollment(&head_from_another_key());
+    }
+
+    fn head_from_another_key() -> String {
+        SignedHead::sign(
+            &key(9),
+            &alice().public(),
+            &ChainTip {
+                generation: 2,
+                seq: 0,
+                chain_hash: ZERO_HASH,
+            },
+        )
+        .to_header()
+    }
+
+    fn rejected_enrollment(head: &str) {
+        let (first, next) = (key(2), key(3));
+        let checker = checker(&first);
+        let enroll = request("POST", "enroll", &json!({}));
+        let body = json!({"service_key": b64(&next.public())});
+        let before = account_snapshot(&checker);
+        let rejected = answer_with_body_head(&enroll, &next, &body, head);
+        assert!(checker.signature(&enroll, &rejected).is_err());
+        assert_eq!(account_snapshot(&checker), before);
+        let get = request("GET", "apps", &json!({}));
+        assert_eq!(
+            checker.signature(&get, &answer(&get, &first, 200, &json!({}))),
+            Ok(SignedWith::Brought(1))
+        );
+        assert!(
+            checker
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
+                .is_err()
+        );
+        assert_eq!(
+            checker.signature(&enroll, &answer(&enroll, &next, 200, &body)),
+            Ok(SignedWith::Brought(2))
+        );
+    }
+
+    #[test]
+    fn test_signature_rejected_delivery_keeps_account_observations() {
+        rejected_delivery("not a head");
+    }
+
+    #[test]
+    fn test_signature_wrong_delivery_head_keeps_account_observations() {
+        rejected_delivery(&head_from_another_key());
+    }
+
+    fn rejected_delivery(head: &str) {
+        let (first, next) = (key(2), key(3));
+        let checker = checker(&first);
+        deliver(&checker, 1, &first, &first, None).unwrap();
+        let chain = stubs(1, 2);
+        assert!(violations(&checker, &first, &shown(&[&chain[0], &chain[1]])).is_empty());
+        let before = account_snapshot(&checker);
+        let put = request("PUT", "identity", &document(2, &next, Some(1)));
+        let rejected = answer_with_body_head(&put, &next, &json!({}), head);
+        assert!(checker.signature(&put, &rejected).is_err());
+        assert_eq!(account_snapshot(&checker), before);
+        let get = request("GET", "apps", &json!({}));
+        assert_eq!(
+            checker.signature(&get, &answer(&get, &first, 200, &json!({}))),
+            Ok(SignedWith::Generation(1, 1))
+        );
+        assert!(
+            checker
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
+                .is_err()
+        );
+        assert_eq!(
+            deliver(&checker, 2, &next, &next, Some(1)),
+            Ok(SignedWith::Generation(2, 2))
+        );
     }
 
     #[test]

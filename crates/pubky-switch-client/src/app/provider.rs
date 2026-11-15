@@ -1040,22 +1040,24 @@ impl App {
         &mut self,
         answer: Result<(Option<u64>, Option<u64>), ClientError>,
     ) -> Result<(), AppError> {
-        match answer {
+        let code = match answer {
             Ok((heads, proofs)) => {
                 self.events.push(AppEvent::EvidenceUploaded {
                     heads: heads.unwrap_or(0),
                     proofs: proofs.unwrap_or(0),
                 });
-                Ok(())
+                return Ok(());
             }
-            Err(ClientError::Switch { code, .. }) => {
-                self.events.push(AppEvent::EvidenceRefused {
-                    code: code.as_str().to_owned(),
-                });
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+            Err(ClientError::Switch { code, .. }) => code,
+            // The same bytes can never be sent; report the refusal and keep the evidence
+            // as after an authenticated too_large answer (Switch wire 7.1, 7.4.14).
+            Err(ClientError::BodyOverCap { .. }) => ErrorCode::TooLarge,
+            Err(error) => return Err(error.into()),
+        };
+        self.events.push(AppEvent::EvidenceRefused {
+            code: code.as_str().to_owned(),
+        });
+        Ok(())
     }
 
     /// Whether the newest own `identity.json` names the next generation: taken from the

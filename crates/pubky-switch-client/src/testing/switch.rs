@@ -1300,6 +1300,35 @@ impl ScriptedSwitch {
                 None => {}
             }
         }
+        let public = pubky_switch_core::http::is_public_read(&request.method, &path);
+        let finish = |inner: &Inner, (status, mut body): Answer| {
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
+                object.remove(&member);
+            }
+            if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
+                object.insert(member, value);
+            }
+            if let Some(secret) = sign_with {
+                let key = SigningKey::from_bytes(&secret);
+                return Ok(inner.respond_with(&key, request, status, &body));
+            }
+            if public && (inner.erased || inner.enrolled.is_none()) {
+                let operator = SigningKey::from_bytes(&[42; 32]);
+                return Ok(inner.respond_with(&operator, request, status, &body));
+            }
+            Ok(inner.respond(request, status, &body))
+        };
+        // Public identity reads decide nothing by a caller header, including its time,
+        // app and identity. Faults remain explicit (Switch wire 7.1, 7.4.15).
+        if public {
+            let answer = inner
+                .gate(&request.method, &path)
+                .unwrap_or_else(|| inner.identity_answer());
+            return finish(&inner, answer);
+        }
         if request.method == "POST" && path == "/v1/enroll" {
             // Its timestamp is checked first, as every request's (Switch wire 7.1): a stale
             // enrollment is refused whatever the switch holds for it.
@@ -1389,22 +1418,9 @@ impl ScriptedSwitch {
         };
         // An own app's request: its last-seen time, also for the request that registered it.
         inner.seen(request);
-        let (status, mut body) =
+        let answer =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
-        if lose {
-            return Err(TransportError::Timeout);
-        }
-        if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
-            object.remove(&member);
-        }
-        if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
-            object.insert(member, value);
-        }
-        if let Some(secret) = sign_with {
-            let key = SigningKey::from_bytes(&secret);
-            return Ok(inner.respond_with(&key, request, status, &body));
-        }
-        Ok(inner.respond(request, status, &body))
+        finish(&inner, answer)
     }
 
     /// Deliver an own `identity.json` (the signer's `PUT /identity`): an `identity` chain
@@ -1904,7 +1920,9 @@ impl Inner {
     /// The scripted switch takes an app with a record, not revoked, departed or kept, as
     /// authenticated; the service sees no other.
     fn seen(&mut self, request: &Request) {
-        if self.seen_at_arrival {
+        if self.seen_at_arrival
+            || pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
+        {
             return;
         }
         let Some(app) = request
@@ -2075,9 +2093,12 @@ impl Inner {
         let own =
             request.header(header::IDENTITY) == Some(pubky_id(&self.identity.public()).as_str());
         let path = request.path_and_query.as_str();
-        let head =
-            (own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase"))
-                .then(|| self.head().to_header());
+        let head = (own
+            && status != 401
+            && !path.ends_with("/enroll")
+            && !path.ends_with("/erase")
+            && !pubky_switch_core::http::is_public_read(&request.method, path))
+        .then(|| self.head().to_header());
         self.respond_signed(
             &self.service,
             request,

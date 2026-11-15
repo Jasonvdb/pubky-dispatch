@@ -2475,3 +2475,189 @@ async fn test_erasure_signed_409_from_a_clone_delivery_keeps_the_erasure_abortab
     );
     assert_ne!(signer.status(), SignerStatus::Erasing);
 }
+
+fn signed_malformed_time(
+    request: &pubky_switch_client::transport::Request,
+    read: bool,
+    status: u16,
+    head: Option<&str>,
+) -> Response {
+    use pubky_switch_client::client::SentRequest;
+    use pubky_switch_client::transport::Header;
+    use pubky_switch_core::enc::b64;
+    use pubky_switch_core::http::{ResponseParts, header, sign_response};
+    let body = if status == 413 {
+        br#"{"code":"too_large","message":"m"}"#.to_vec()
+    } else {
+        b"{}".to_vec()
+    };
+    let signature = sign_response(
+        &pubky_switch_core::keys::IdentityKey::from_secret(SERVICE_SECRET),
+        &ResponseParts {
+            status,
+            request: SentRequest::of(request).received(read),
+            server_time: "not-a-time",
+            head,
+            body: &body,
+        },
+    );
+    let mut headers = vec![
+        Header::new(header::SERVER_TIME, "not-a-time"),
+        Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+    ];
+    if let Some(head) = head {
+        headers.push(Header::new(header::HEAD, head));
+    }
+    Response {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn persisted_observations(store: &MemoryStore, world: &World) -> (Vec<u8>, Option<Vec<u8>>) {
+    use pubky_switch_client::store::StateStore;
+    let ns = pubky_switch_signer::state::signer_namespace(&world.key.public());
+    (
+        store.get(&ns, b"state").unwrap().unwrap(),
+        store.get(&ns, b"flow").unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn test_erasure_unread_malformed_time_keeps_request_in_doubt() {
+    Box::pin(erasure_malformed_time(false, None)).await;
+}
+
+#[tokio::test]
+async fn test_erasure_rejected_head_keeps_request_in_doubt() {
+    Box::pin(erasure_malformed_time(true, Some("not a head"))).await;
+}
+
+async fn erasure_malformed_time(read: bool, head: Option<&'static str>) {
+    use pubky_switch_client::store::StateStore;
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let switch = Arc::clone(&world.switch);
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let before = Arc::clone(&captured);
+    let persisted = Arc::clone(&store);
+    let ns = pubky_switch_signer::state::signer_namespace(&world.key.public());
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.method == "POST" && request.path_and_query.ends_with("/erase") {
+            *before.lock().unwrap() = Some((
+                persisted.get(&ns, b"state").unwrap().unwrap(),
+                persisted.get(&ns, b"flow").unwrap(),
+            ));
+            return Ok(signed_malformed_time(
+                request,
+                read,
+                if read { 200 } else { 413 },
+                head,
+            ));
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store.clone());
+    env.transport = transport;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let error = signer.close_account(confirmed()).await.unwrap_err();
+    let before = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the erase request was sent");
+    let flow: serde_json::Value = serde_json::from_slice(before.1.as_ref().unwrap()).unwrap();
+    assert_eq!(flow["Erase"]["unanswered"], true);
+    assert_eq!(
+        persisted_observations(&store, &world),
+        before,
+        "a rejected binding cannot settle the request: {error:?}"
+    );
+    assert!(!world.switch.erased());
+    drop(signer);
+    let mut reopened = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+}
+
+#[tokio::test]
+async fn test_apps_rejected_head_preserves_account_not_hosted() {
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let (env, _, unsigned) = apps_answers(&world, store.clone());
+    *unsigned.lock().unwrap() = Some(404);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.run_due().await.unwrap_err();
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    drop(signer);
+    let before = persisted_observations(&store, &world);
+    let switch = Arc::clone(&world.switch);
+    let mut env = world.env(store.clone());
+    env.transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.path_and_query.ends_with("/apps") {
+            return Ok(signed_malformed_time(
+                request,
+                true,
+                200,
+                Some("not a head"),
+            ));
+        }
+        switch.handle(request)
+    }));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let error = signer.run_due().await.unwrap_err();
+    assert_eq!(
+        persisted_observations(&store, &world),
+        before,
+        "an unaccepted answer changes no durable observation: {error:?}"
+    );
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    drop(signer);
+    let signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+#[tokio::test]
+async fn test_apps_unread_malformed_time_preserves_erasure_wait() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    signer.resume().await.unwrap_err();
+    let before = persisted_observations(&store, &world);
+    let flow: serde_json::Value = serde_json::from_slice(before.1.as_ref().unwrap()).unwrap();
+    assert_eq!(flow["Erase"]["unanswered"], true);
+    assert!(flow["Erase"]["first_404_ms"].as_u64().is_some());
+    drop(signer);
+    let switch = Arc::clone(&world.switch);
+    let mut env = world.env(store.clone());
+    env.transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.path_and_query.ends_with("/apps") {
+            return Ok(signed_malformed_time(request, false, 413, None));
+        }
+        switch.handle(request)
+    }));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let error = signer.resume().await.unwrap_err();
+    assert_eq!(
+        persisted_observations(&store, &world),
+        before,
+        "an unread answer cannot reset the erasure's wait: {error:?}"
+    );
+    drop(signer);
+    let _reopened = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(persisted_observations(&store, &world), before);
+}

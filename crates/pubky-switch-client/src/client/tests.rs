@@ -1666,3 +1666,95 @@ async fn test_body_over_its_cap_is_never_sent() {
     );
     assert!(transport.last_request().is_none(), "nothing was sent");
 }
+
+#[test]
+fn test_response_malformed_time_preserves_binding_rejections() {
+    let key = service_key();
+    let request = Request {
+        method: "POST".into(),
+        origin: ORIGIN.into(),
+        path_and_query: format!("/v1/{}/erase", identity().id()),
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        timeout: TimeoutClass::default(),
+    };
+    let sent = SentRequest::of(&request);
+    let valid_head = SignedHead::sign(
+        &key,
+        &identity().public(),
+        &ChainTip {
+            generation: 1,
+            seq: 0,
+            chain_hash: [0; 32],
+        },
+    )
+    .to_header();
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (read, status, code, head) in [
+        (true, 200, None, None),
+        (true, 200, None, Some(valid_head.as_str())),
+        (true, 200, None, Some("not a head")),
+        (false, 200, None, None),
+        (false, 413, Some("too_large"), None),
+        (false, 429, Some("rate_limited"), None),
+        (false, 404, Some("not_found"), None),
+        (false, 413, Some("too_large"), Some(valid_head.as_str())),
+        (false, 413, Some("too_large"), Some("not a head")),
+    ] {
+        for time in [rfc3339(NOW), "not-a-time".into()] {
+            let body = match code {
+                Some(code) => json!({"code": code, "message": "m"})
+                    .to_string()
+                    .into_bytes(),
+                None => b"{}".to_vec(),
+            };
+            let signature = sign_response(
+                &key,
+                &http::ResponseParts {
+                    status,
+                    request: sent.received(read),
+                    server_time: &time,
+                    head,
+                    body: &body,
+                },
+            );
+            let mut headers = vec![
+                Header::new(header::SERVER_TIME, &time),
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            ];
+            if let Some(head) = head {
+                headers.push(Header::new(header::HEAD, head));
+            }
+            let response = Response {
+                status,
+                headers,
+                body,
+            };
+            let checked = check_response(&service_public(), &identity().public(), &sent, &response);
+            let observed = match checked {
+                Ok(_) => "accepted",
+                Err(ClientError::BadServiceSignature { .. }) => "unauthenticated",
+                Err(error @ ClientError::BodyUnread { .. }) => {
+                    assert_eq!((error.code(), error.retry()), (None, None));
+                    "unread"
+                }
+                Err(ClientError::InvalidResponse(_)) => "authenticated malformed",
+                other => panic!("unexpected result: {other:?}"),
+            };
+            actual.push(observed);
+            expected.push(
+                if head == Some("not a head") || (!read && (status == 200 || head.is_some())) {
+                    "unauthenticated"
+                } else if !read {
+                    "unread"
+                } else if time == "not-a-time" {
+                    "authenticated malformed"
+                } else {
+                    "accepted"
+                },
+            );
+        }
+    }
+    assert_eq!(actual, expected, "all binding, head and time combinations");
+}

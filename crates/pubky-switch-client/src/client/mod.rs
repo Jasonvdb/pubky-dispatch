@@ -369,10 +369,6 @@ pub fn check_response(
     } else {
         return Err(unauthenticated);
     };
-    // From here on the answer is the service's.
-    let server_time_ms = parse_rfc3339(server_time).map_err(|_| {
-        ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
-    })?;
     // A head that is there must be the account's (Switch wire 7.1).
     let head = match head_text {
         None => None,
@@ -398,6 +394,11 @@ pub fn check_response(
             _ => Err(unauthenticated),
         };
     }
+    // Only a full binding and an accepted head can establish an authenticated malformed
+    // answer. An unread answer remains final for nothing (Switch wire 7.1).
+    let server_time_ms = parse_rfc3339(server_time).map_err(|_| {
+        ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
+    })?;
     if !(200..300).contains(&status) {
         return Err(parse_error(status, &response.body));
     }

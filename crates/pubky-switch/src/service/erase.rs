@@ -132,9 +132,47 @@ impl Service {
         };
         // The deletion, and the push keys' after it, run to their end in a task of their
         // own: a signer that hangs up between them leaves no key to the next sweep.
-        let (store, keys) = (self.store.clone(), self.keys.clone());
+        let (store, keys, marks, identity) = (
+            self.store.clone(),
+            self.keys.clone(),
+            self.marks.clone(),
+            account.clone(),
+        );
+        #[cfg(any(test, feature = "test-util"))]
+        let pause = self.erase_failure_pause.lock().take();
         let erased = to_the_end(async move {
-            txn.erase(time_ms).await?;
+            if let Err(failure) = txn.erase(time_ms).await {
+                let (error, account) = failure.into_parts();
+                #[cfg(any(test, feature = "test-util"))]
+                if let Some(pause) = pause {
+                    pause.wait().await;
+                }
+                // A failed statement rolled back under the account lock. Keep it until
+                // its record is withdrawn, so a waiting request cannot finish this failed
+                // erasure. After an ambiguous commit, reacquire the identity lock and
+                // check for the same account before touching its record (Table 3).
+                let mut lock = None;
+                let withdraw = if account.is_some() {
+                    true
+                } else {
+                    lock = store.lock_identity(&identity).await.ok();
+                    match lock.as_mut() {
+                        Some(lock) => {
+                            lock.account_created_at().await.ok().flatten() == Some(created_at_ms)
+                        }
+                        None => false,
+                    }
+                };
+                if withdraw
+                    && let Err(failure) =
+                        marks.withdraw_erasure(&identity, record_at, previous).await
+                {
+                    tracing::error!(%failure, "taking back an erasure's record");
+                }
+                drop(account);
+                drop(lock);
+                return Err(error);
+            }
             let _ = sweep_owed(store, keys).await;
             Ok::<_, crate::store::StoreError>(())
         })
@@ -142,18 +180,6 @@ impl Service {
         if !matches!(erased, Some(Ok(()))) {
             if let Some(Err(failure)) = &erased {
                 tracing::error!(%failure, "an erasure");
-            }
-            // The record goes again where the deletion didn't commit: the account is still
-            // there. Where that can't be told, the record stays, and the account, if it is
-            // still there, is erased again at its next request.
-            if let Ok(Some(found)) = self.store.lookup(&account).await
-                && found.created_at_ms == created_at_ms
-                && let Err(failure) = self
-                    .marks
-                    .withdraw_erasure(&account, record_at, previous)
-                    .await
-            {
-                tracing::error!(%failure, "taking back an erasure's record");
             }
             return Self::signed_error(
                 signer,
@@ -266,14 +292,14 @@ impl Service {
     }
 
     /// Erase again account `account`, which a restored database brought back after its
-    /// erasure at `erased_at_ms` (Switch wire 7.3, Table 1 first row), under the identity's
-    /// lock: the record again, durably, as a record held only in memory, as a write that
-    /// failed leaves it, would not survive a restart (Table 3); then, as an erasure does, its
-    /// state deleted and its push keys owed in one commit, then the owed keys deleted, with
+    /// erasure (Switch wire 7.3, Table 1 first row), under the identity's lock: read the
+    /// record again, since a deletion that failed while this request waited can withdraw
+    /// it (Table 3); then, as an erasure does, its state deleted and its push keys owed in
+    /// one commit, then the owed keys deleted, with
     /// no answer to sign. Whether the identity holds no such account any more: gone, erased
     /// here, or a new account made since; `false` when the record or the erasure didn't
     /// commit.
-    pub(super) async fn erase_restored(&self, account: &str, erased_at_ms: u64) -> bool {
+    pub(super) async fn erase_restored(&self, account: &str) -> bool {
         let (store, keys, marks, id) = (
             self.store.clone(),
             self.keys.clone(),
@@ -287,12 +313,22 @@ impl Service {
                 Ok(lock) => lock,
                 Err(failure) => return Err(failure.to_string()),
             };
+            let erased_at_ms = match marks.erasure(&id).await {
+                Ok(Some(at)) => at,
+                Ok(None) => return Ok(false),
+                Err(failure) => return Err(failure.to_string()),
+            };
             if let Err(failure) = marks.record_erasure(&id, erased_at_ms).await {
                 return Err(failure.to_string());
             }
             let txn = match lock.account().await {
                 Ok(Some(txn)) => txn,
-                Ok(None) => return Ok(false),
+                Ok(None) => {
+                    if let Err(failure) = marks.delete_created_by(&id, erased_at_ms).await {
+                        tracing::warn!(%failure, "deleting an erased account's mark");
+                    }
+                    return Ok(false);
+                }
                 Err(failure) => return Err(failure.to_string()),
             };
             if txn.head().created_at_ms > erased_at_ms {
@@ -301,6 +337,9 @@ impl Service {
             txn.erase(erased_at_ms)
                 .await
                 .map_err(|failure| failure.to_string())?;
+            if let Err(failure) = marks.delete_created_by(&id, erased_at_ms).await {
+                tracing::warn!(%failure, "deleting an erased account's mark");
+            }
             let _ = sweep_owed(store, keys).await;
             Ok(true)
         })
@@ -347,8 +386,8 @@ impl Service {
             }
         };
         let mut erased = 0;
-        for (account, erased_at_ms) in &restored {
-            if self.erase_again(account, *erased_at_ms).await.is_ok() {
+        for (account, _) in &restored {
+            if self.erase_again(account).await.is_ok() {
                 erased += 1;
             }
         }

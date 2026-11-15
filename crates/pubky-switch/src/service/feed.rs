@@ -133,6 +133,8 @@ impl FeedRead {
 /// How a feed read that can't answer with a page is answered.
 #[derive(Debug)]
 pub(super) enum FeedStop {
+    /// The snapshot observed erasure intent: complete it and judge again before answering.
+    AccountChanged,
     /// The verdict of the account and its mark, judged from a page's snapshot, answers in
     /// place of the page: the not-hosted `404`, the notice or the `503` of an unknown
     /// verdict, signed with `key`, without a head (Switch wire 7.3): the first two at the
@@ -864,6 +866,17 @@ impl Service {
             }
         }
         let result = match result {
+            Err(FeedStop::AccountChanged) => {
+                return self
+                    .answer_after_account_change(
+                        &read.account.id,
+                        &RequestClass::Ordinary,
+                        asked,
+                        self.time.read().base_ms,
+                        Some(read.time_ms),
+                    )
+                    .await;
+            }
             Err(FeedStop::Verdict { key, error, at }) => {
                 return self.keyed_error(&key, asked, at.at(|| self.time.read().base_ms), &error);
             }
@@ -915,7 +928,17 @@ impl Service {
         );
         let judged = self.judge(&read.account.id, Some(account)).await;
         if judged.judgement.erase_account_again {
-            return failed(at);
+            let committed_ms = txn.head().stamped_time_ms;
+            drop(txn);
+            return self
+                .answer_after_account_change(
+                    &read.account.id,
+                    &RequestClass::Ordinary,
+                    asked,
+                    self.time.read().base_ms,
+                    Some(committed_ms),
+                )
+                .await;
         }
         let routed = verdict::answer(
             &judged.judgement,
@@ -1047,14 +1070,8 @@ impl Service {
             &RequestClass::Ordinary,
             super::PublicKeyBytes::public_key_bytes(&current),
         );
-        // An account the first row of Table 1 erases again is answered as gone; the next
-        // request erases it.
         if judged.judgement.erase_account_again {
-            return Err(FeedStop::Verdict {
-                key: super::PublicKeyBytes::public_key_bytes(&current),
-                error: Box::new(super::marking::not_hosted()),
-                at: LaterTime::TimeBase(Uncompared::NotHosted),
-            });
+            return Err(FeedStop::AccountChanged);
         }
         let signer = match routed.route {
             Route::Proceed { head: true } => self

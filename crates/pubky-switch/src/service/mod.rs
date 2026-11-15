@@ -169,6 +169,9 @@ pub struct Service {
     /// A pause after retention's reads and before its checkpoint signature.
     #[cfg(any(test, feature = "test-util"))]
     checkpoint_sign_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause before withdrawing an erasure whose deletion failed.
+    #[cfg(any(test, feature = "test-util"))]
+    erase_failure_pause: parking_lot::Mutex<Option<RequestPause>>,
 }
 
 /// A source of entry IDs.
@@ -427,6 +430,8 @@ impl Service {
             feed_locked_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
             checkpoint_sign_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            erase_failure_pause: parking_lot::Mutex::default(),
         }
     }
 
@@ -497,6 +502,15 @@ impl Service {
     pub fn pause_next_checkpoint_sign(&self) -> RequestPause {
         let pause = RequestPause::default();
         *self.checkpoint_sign_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause after an erasure's deletion fails and before its record is withdrawn, for
+    /// tests of requests waiting on that identity (Switch wire 7.3, Table 3).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_erase_failure(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.erase_failure_pause.lock() = Some(pause.clone());
         pause
     }
 
@@ -735,11 +749,10 @@ impl Service {
             };
             let txn = match begun {
                 Ok(Some(txn)) => txn,
-                // Erased between the lookup and the lock: as for an account the service
-                // doesn't host (Switch wire 7.4.16 Afterwards).
                 Ok(None) => {
-                    let at = AnswerTime::TimeBase(base_ms, Uncompared::NotHosted);
-                    return self.service_error(asked, at, &marking::not_hosted());
+                    return self
+                        .answer_after_account_change(&account, &class, asked, base_ms, None)
+                        .await;
                 }
                 Err(error) => return refused_early(store_error(&error)),
             };
@@ -1044,18 +1057,11 @@ impl Service {
             held.as_ref().map(IdentityDoc::body),
         );
         let judged = self.judge(&identity, Some(account)).await;
-        if judged.judgement.erase_account_again
-            && let Some(erased_at_ms) = judged.erasure_at_ms
-        {
+        if judged.judgement.erase_account_again {
             drop(txn);
-            return match self.erase_again(&identity, erased_at_ms).await {
-                Ok(()) => self.service_error(
-                    asked,
-                    AnswerTime::TimeBase(base_ms, Uncompared::NotHosted),
-                    &marking::not_hosted(),
-                ),
-                Err(error) => self.service_error(asked, AnswerTime::Account(committed_ms), &error),
-            };
+            return self
+                .answer_after_account_change(&identity, class, asked, base_ms, Some(committed_ms))
+                .await;
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
         if let Some(answer) =

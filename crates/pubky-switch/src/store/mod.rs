@@ -60,7 +60,9 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, Committed, Creation, NewAccount, Savepoint};
+pub use account::{
+    AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
+};
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;

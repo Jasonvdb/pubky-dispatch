@@ -243,26 +243,16 @@ impl Service {
         }
     }
 
-    /// Erase again `identity`'s account, created at or before the erasure's record at
-    /// `erased_at_ms` (Switch wire 7.3, Table 1 first row), under the identity's lock: the
-    /// record again, durably, then the account's deletion; then only a mark created at or
-    /// before the record goes, and a later account's mark stays (Table 3).
+    /// Complete the erasure the identity's current record requires, under its lock, then
+    /// delete only a mark the record covers (Switch wire 7.3, Tables 1 and 3).
     ///
     /// # Errors
     ///
     /// `503` when the erasure doesn't commit: nothing is served for the account, and the
     /// next request tries again.
-    pub(super) async fn erase_again(
-        &self,
-        identity: &str,
-        erased_at_ms: u64,
-    ) -> Result<(), ApiError> {
-        if !self.erase_restored(identity, erased_at_ms).await {
+    pub(super) async fn erase_again(&self, identity: &str) -> Result<(), ApiError> {
+        if !self.erase_restored(identity).await {
             return Err(ApiError::unavailable("7.6: a temporary failure"));
-        }
-        if let Err(failure) = self.marks.delete_created_by(identity, erased_at_ms).await {
-            // Left as an erasure's leftover, deleted at a later request or at start.
-            tracing::warn!(%failure, "deleting an erased account's mark");
         }
         Ok(())
     }
@@ -318,10 +308,8 @@ impl Service {
         let account = found.as_ref().map(|found| self.found_input(found));
         let mut judged = self.judge_with(identity, account, inputs).await;
         let mut found = found;
-        if judged.judgement.erase_account_again
-            && let Some(erased_at_ms) = judged.erasure_at_ms
-        {
-            self.erase_again(identity, erased_at_ms).await?;
+        if judged.judgement.erase_account_again {
+            self.erase_again(identity).await?;
             // Gone now, or a later account made meanwhile.
             let inputs = self.mark_inputs(identity).await;
             found = self
@@ -338,6 +326,39 @@ impl Service {
             let _ = self.delete_leftover(identity, erased_at_ms).await;
         }
         Ok((found, judged))
+    }
+
+    /// Judge again after a request loses its account or observes an erasure while waiting.
+    /// An erasure's intent alone confirms no absence: finish it first, then judge the
+    /// remaining mark. If an account can serve again, a fresh request must repeat its
+    /// checks against that account (Switch wire 7.3, Tables 1 and 2).
+    pub(super) async fn answer_after_account_change(
+        &self,
+        identity: &str,
+        class: &RequestClass,
+        asked: Asked<'_>,
+        base_ms: u64,
+        committed_ms: Option<u64>,
+    ) -> SwitchResponse {
+        let failed_at = committed_ms.map_or(
+            AnswerTime::TimeBase(base_ms, Uncompared::Unavailable),
+            AnswerTime::Account,
+        );
+        let (found, judged) = match self.judge_at_step_two(identity).await {
+            Ok(judged) => judged,
+            Err(error) => return self.service_error(asked, failed_at, &error),
+        };
+        let routed = verdict::answer(&judged.judgement, class, self.current_key());
+        let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
+        self.verdict_answer(identity, &routed, asked, base_ms, committed_ms)
+            .unwrap_or_else(|| {
+                self.keyed_error(
+                    &routed.key,
+                    asked,
+                    committed_ms.map_or(failed_at, AnswerTime::Account),
+                    &ApiError::unavailable("7.6: the account changed; repeat the request"),
+                )
+            })
     }
 
     /// The answer of step 2 or of the judgement under the lock that replaces every other:

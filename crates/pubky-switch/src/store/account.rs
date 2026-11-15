@@ -97,6 +97,26 @@ impl Committed {
     }
 }
 
+/// An erasure that failed, retaining the account lock when its deletion was rolled back.
+/// The caller can withdraw its erasure record before another request judges that account
+/// (Switch wire 7.3, Table 3). A failed commit may have committed and retains no lock.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ErasureFailure {
+    #[source]
+    error: StoreError,
+    account: Option<Box<AccountTxn>>,
+}
+
+impl ErasureFailure {
+    /// The storage error and, when rollback succeeded, the still-locked account.
+    /// Without that account, the caller must acquire the identity lock and check whether
+    /// deletion committed before withdrawing its record.
+    pub fn into_parts(self) -> (StoreError, Option<Box<AccountTxn>>) {
+        (self.error, self.account)
+    }
+}
+
 /// Where a request's endpoint started, so a refusal can undo what it wrote
 /// ([`AccountTxn::rollback_to`]).
 #[derive(Debug)]
@@ -490,7 +510,27 @@ impl AccountTxn {
     /// request waiting on the account's changes wakes, and finds it gone. The push keys go
     /// after the commit: a key deleted first, by an erasure that then failed to commit, would
     /// leave a registration no key signs for.
-    pub async fn erase(mut self, erased_at: u64) -> Result<(), StoreError> {
+    pub async fn erase(mut self, erased_at: u64) -> Result<(), ErasureFailure> {
+        let savepoint = self.savepoint().await.map_err(|error| ErasureFailure {
+            error,
+            account: None,
+        })?;
+        if let Err(error) = self.delete_account(erased_at).await {
+            let account = self
+                .rollback_to(savepoint)
+                .await
+                .ok()
+                .map(|()| Box::new(self));
+            return Err(ErasureFailure { error, account });
+        }
+        self.tx.commit().await.map_err(|error| ErasureFailure {
+            error: StoreError::from_db(error),
+            account: None,
+        })
+    }
+
+    /// Delete the account and owe its push keys, within the erasure's savepoint.
+    async fn delete_account(&mut self, erased_at: u64) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) \
              SELECT push_key_id, account_id, $2 FROM push_registrations \
@@ -516,7 +556,6 @@ impl AccountTxn {
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;
-        self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(())
     }
 

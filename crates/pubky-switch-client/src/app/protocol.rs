@@ -874,9 +874,11 @@ pub trait Protocol: Send + Sync {
     /// and every [`super::App::allow_list`]: whenever the app's copy of
     /// the lists is taken whole from a list read, every protocol is given that list as a
     /// gap. It is told to every protocol in turn, and all their writes go in one commit:
-    /// when every protocol took it, that commit deletes the gap, and the copy of the lists
-    /// is then replaced from the same answer in a commit of its own, best effort, which
-    /// lists too large for one commit leave as it was, not known complete. When one fails,
+    /// when every protocol took it, that commit deletes the gap and marks the copy of the
+    /// lists unknown. The copy is then replaced from the same answer in a commit of its
+    /// own, best effort. A failed replacement leaves the copy unknown after reload too;
+    /// the next read owes a fresh gap, except while a whole copy that was too large waits
+    /// for its retry time ([`super::App::allow_list`]). When one protocol fails,
     /// the writes of those that took it are committed with the gap still owed to every
     /// protocol, so a later read tells it to each again, with the list the copy is then
     /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a

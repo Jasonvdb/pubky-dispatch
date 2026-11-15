@@ -3234,10 +3234,12 @@ impl App {
     /// (Switch spec 8.3): the lists are read (`GET /allow`) for it, however long the copy
     /// of the lists waits after one too large for a commit, and the gap is told with the
     /// deny list they give, in a commit of its own. The copy of the lists is then replaced
-    /// from the same answer, best effort. A read that fails or is refused leaves the gap
-    /// owed and the read held; only an answer that verifies but can't be read tells the gap
-    /// without the list (`list_read` false), and deletes `lc/lists_at` in the telling
-    /// commit, so the next read owes a gap again (`App::refresh_lists_if_owed`): such a
+    /// from the same answer, best effort. Completing the gap deletes `lc/lists_at` in the
+    /// same commit: only the replacement can mark the new baseline complete. A failed
+    /// replacement leaves it unknown, so the next read owes a gap again unless a whole
+    /// copy was too large (`App::refresh_lists_if_owed`). A read that fails or is refused
+    /// leaves the gap owed and the read held; only an answer that verifies but can't be
+    /// read tells the gap without the list (`list_read` false). Such a
     /// protocol is told `list_read` false at each read for as long as the answer can't be
     /// read, and the list once it can.
     /// Whether a gap is still owed.
@@ -3332,11 +3334,13 @@ impl App {
             return Ok(true);
         }
         tx.delete(DENY_GAP)?;
+        // The gap's baseline replaces any previous complete copy, including one refreshed
+        // by `allow_list` while this gap was owed. Retire that baseline with the gap: a
+        // failed replacement must leave it unknown after reload (Switch spec 8.3).
+        tx.delete(super::admission::LISTS_AT)?;
         if list.is_none() {
-            // The protocol has no baseline yet: the copy isn't known complete either, so the
-            // next read owes the gap again, with the list once it reads, whatever waits on
-            // the copy (one `GET /allow` a read while the answer can't be read).
-            tx.delete(super::admission::LISTS_AT)?;
+            // No readable baseline: try again at the next read, whatever waits on the copy
+            // (one `GET /allow` a read while the answer can't be read).
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
         self.commit(tx).await?;

@@ -2,6 +2,8 @@
 //! `chat`, each with its own kinds, scope root, local state, backup layer, owed calls and
 //! duty events.
 
+mod gap_completion;
+
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::message::Message;
@@ -43,6 +45,8 @@ struct Named {
     failing_deny: Mutex<u32>,
     /// The position of each deny list gap it took, and whether its list was read.
     gaps: Mutex<Vec<(u64, bool)>>,
+    /// Whether each gap keeps its full baseline in protocol-local state.
+    keep_gap: bool,
     /// How many of the next deny list gap calls fail.
     failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
@@ -191,7 +195,14 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.gaps.lock().unwrap().push((gap.seq, gap.list_read));
-        Ok(Vec::new())
+        Ok(if self.keep_gap {
+            vec![LocalWrite::Put {
+                key: b"gap".to_vec(),
+                value: serde_json::to_vec(&(gap.list_read, &gap.denied)).unwrap(),
+            }]
+        } else {
+            Vec::new()
+        })
     }
 
     fn may_send(&self, message: &Message) -> bool {

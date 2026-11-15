@@ -448,6 +448,112 @@ mod tests {
     use super::*;
     use crate::{Backend, run_here};
 
+    async fn gap_replacement(world: &World) -> FlowResult {
+        use pubky_switch_client::app::AppError;
+        use pubky_switch_client::error::StoreError;
+        use pubky_switch_client::store::{Fault, FaultStore};
+
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
+        let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
+        let tasks = Arc::new(OrderedProtocol {
+            inner: sample_protocol(TASKS),
+            held: AtomicBool::new(false),
+            hold_receive: false,
+            deny_changes: AtomicUsize::new(0),
+        });
+        let protocols = ProtocolSet::new(vec![tasks.clone(), sample_protocol(CHAT)])?;
+        let store = Arc::new(FaultStore::new(Arc::new(MemoryStore::new()), Fault::None));
+        let asking = Asking::for_scopes(world.app_keys(&alice, "wallet")?, &[TASKS, CHAT])?;
+        let request = alice_signer.review(asking.request.signed(), &asking.auth)?;
+        let approved = alice_signer.approve(request).await?;
+        alice_signer.claim_delivered(&approved.request).await?;
+        world.advance_ms(STEP_MS);
+        let mut wallet = Box::pin(App::join(
+            world.app_env(store.clone()),
+            protocols.clone(),
+            AppConfig::default(),
+            asking.join_request(alice.public(), &approved)?,
+        ))
+        .await?;
+        let (manager_tasks, manager_chat) = both();
+        let mut manager = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut alice_signer,
+            "manager",
+            set_of(&manager_tasks, &manager_chat)?,
+        ))
+        .await?;
+        let (shop_tasks, shop_chat) = both();
+        let mut shop = Box::pin(joined_with_both(
+            world,
+            &bob,
+            &mut bob_signer,
+            "shop",
+            set_of(&shop_tasks, &shop_chat)?,
+        ))
+        .await?;
+        wallet.add_contact(&bob.public()).await?;
+        wallet.receive(None).await?;
+        wallet.allow_list().await?;
+        // The message precedes the deny in the feed, but the gap reads the newer list.
+        shop.send(OutgoingMessage::new(
+            alice.public(),
+            &format!("{TASKS}.item"),
+            serde_json::Map::new(),
+        ))
+        .await?;
+        world.advance_ms(STEP_MS);
+        manager.deny(&bob.public()).await?;
+        store.fail_put_once(b"lc/lists_at");
+        if !matches!(
+            wallet.receive(None).await,
+            Err(AppError::Store(StoreError::Unavailable))
+        ) {
+            return Err("the replacement did not reach its failed commit".into());
+        }
+        wallet = App::load(
+            world.app_env(store.inner()),
+            protocols,
+            AppConfig::default(),
+            wallet.app_id(),
+        )
+        .await?;
+        wallet.receive(None).await?;
+        let blocked = wallet.protocol_get(TASKS, b"blocked").await?;
+        if blocked != Some(vec![1]) {
+            return Err("a message used the obsolete baseline after gap completion".into());
+        }
+        world.outcome(
+            "the message observed the refreshed baseline",
+            &json!({"blocked": true}),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_gap_replacement_runs_on_the_calling_thread_at_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, gap_replacement))
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(service) = Box::pin(run_here(Backend::Service, gap_replacement))
+            .await
+            .unwrap()
+        else {
+            return;
+        };
+        let verdict = crate::compare::judge(
+            "protocol gap replacement",
+            crate::compare::differences(&service, &scripted),
+            crate::allowed::ALLOWED,
+        );
+        assert!(verdict.agrees(), "{verdict}");
+    }
+
     #[tokio::test]
     async fn test_protocol_deny_flows_run_on_the_calling_thread() {
         for backend in [Backend::Scripted, Backend::Service] {

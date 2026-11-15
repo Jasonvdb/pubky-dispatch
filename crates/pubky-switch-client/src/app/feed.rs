@@ -81,7 +81,7 @@ use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
-use super::order::Walk;
+use super::order::{Kept, Walk};
 use super::protocol::{
     DenyListChange, Effect, FeedPosition, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
@@ -222,6 +222,23 @@ pub(crate) struct Owed {
     pub(crate) to: Vec<String>,
     /// The call.
     pub(crate) call: OwedCall,
+}
+
+impl Owed {
+    /// A remaining-owner set is nonempty, unique and registered. Completed owners may
+    /// be absent: their effects and removal committed together (Switch spec 8.3).
+    pub(crate) fn check_owners(&self, protocols: &super::ProtocolSet) -> Result<(), AppError> {
+        let mut names = std::collections::BTreeSet::new();
+        if self.to.is_empty()
+            || self
+                .to
+                .iter()
+                .any(|name| !protocols.contains(name) || !names.insert(name))
+        {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
+        Ok(())
+    }
 }
 
 /// A call about a feed item, as [`Owed`] keeps it.
@@ -667,6 +684,9 @@ impl App {
             self.leave_on_compromise().await;
         }
         self.refuse_when_halted()?;
+        // Retained obligations constrain every callback and shared view used below.
+        // Refuse a corrupt owner set before any upkeep can change those views.
+        self.owed_calls().await?;
         self.finish_join().await?;
         if let Some(report) = self.follow_provider_change().await? {
             return Ok(report);
@@ -1021,9 +1041,11 @@ impl App {
             self.maybe_rotate().await?;
             self.flush_cursor_if_due().await?;
         }
-        // Entries the cursor stays before come again at each read, with nothing new on the
-        // feed: a wait past them ends in a read when nothing comes.
-        let again = !self.state.held.is_empty() || !self.state.retries.is_empty();
+        // Held entries and failed callbacks need another read even when another protocol
+        // reached the end of the feed and nothing new arrives (Switch spec 8.3).
+        let again = !self.state.held.is_empty()
+            || !self.state.retries.is_empty()
+            || self.owed_held_reads != 0;
         self.next_wait = if key_wait {
             super::wait::NextWait::Later
         } else {
@@ -1113,7 +1135,6 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked);
-        self.kept_here.clear();
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -1222,9 +1243,8 @@ impl App {
                     held_before = k < seq;
                 }
                 if k == seq {
-                    // What is kept for them at this item comes first: they aren't told the
-                    // item, and stay right before it.
-                    self.kept_here.extend(kept.names.iter().cloned());
+                    // What is kept for them at this item comes first: they stay right
+                    // before it.
                     read.left.extend(kept.names);
                     kept_call = kept.call;
                 } else {
@@ -1257,7 +1277,10 @@ impl App {
                     sender,
                     accepted_at,
                     ..
-                } => self.handle_unreadable(*seq, *sender, *accepted_at, &mut read)?,
+                } => {
+                    self.handle_unreadable(*seq, *sender, *accepted_at, &mut read)
+                        .await?
+                }
                 FeedItem::Missed {
                     seq,
                     entries,
@@ -1316,7 +1339,6 @@ impl App {
             }
             // Each protocol that took the item, or had nothing in it, moves to it; one that
             // didn't stays right before it (`order` module).
-            self.kept_here.clear();
             if step != Step::Stop {
                 self.step_told(seq, &read.left, &read.run);
             }
@@ -1336,7 +1358,6 @@ impl App {
                 list_through = Some(seq);
             }
         }
-        self.kept_here.clear();
         let through = list_through
             .or(budget_through)
             .unwrap_or(page.scanned_through);
@@ -1479,7 +1500,7 @@ impl App {
                 .map(|held| (held.key.n, held.key.secret()))
         });
         let Some((n, secret)) = opener else {
-            return self.unopenable(&entry, read);
+            return self.unopenable(&entry, read).await;
         };
         let identity = self.state.meta.identity;
         let plaintext = match MessagePlaintext::open(&item.envelope, &identity, &secret) {
@@ -2064,6 +2085,7 @@ impl App {
             &mut read.tx,
             &entry.sender,
             &received.message.msg_id,
+            &received.message.kind,
             received.hash(),
             now,
         )?;
@@ -2275,7 +2297,14 @@ impl App {
             self.settle_op(op, proofs.get(index), &settles, &mut tx)
                 .await?;
         }
-        processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
+        processed_writes(
+            &mut tx,
+            &pending.sender,
+            &pending.msg_id,
+            &pending.kind,
+            pending.hash,
+            now,
+        )?;
         tx.local(&pending.local)?;
         for key in &pending.forget {
             tx.delete(key)?;
@@ -2411,7 +2440,14 @@ impl App {
         // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
         // 11).
         let now = self.now();
-        uncertain_processed(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
+        uncertain_processed(
+            tx,
+            &pending.sender,
+            &pending.msg_id,
+            &pending.kind,
+            pending.hash,
+            now,
+        )?;
         if pending.stored.is_some() {
             // Stored before, and passed then.
         } else if pending.past_held {
@@ -2738,12 +2774,20 @@ impl App {
             return Ok(false);
         }
         if read.tx.size().saturating_add(needed) > MAX_BATCH_BYTES && !read.tx.is_empty() {
-            read.tx.put(key::CURSOR, &self.state.cursor)?;
-            self.put_told(&mut read.tx)?;
-            let tx = std::mem::replace(&mut read.tx, self.tx()?);
-            self.commit(tx).await?;
+            self.commit_read(read).await?;
         }
         Ok(true)
+    }
+
+    /// Commit the read's completed work before starting a separately retained notice.
+    async fn commit_read(&mut self, read: &mut Read) -> Result<(), AppError> {
+        if read.tx.is_empty() {
+            return Ok(());
+        }
+        read.tx.put(key::CURSOR, &self.state.cursor)?;
+        self.put_told(&mut read.tx)?;
+        let tx = std::mem::replace(&mut read.tx, self.tx()?);
+        self.commit(tx).await
     }
 
     fn effect_refused(
@@ -3016,11 +3060,12 @@ impl App {
         // before anything after the gap (Switch spec 8.3).
         // The gap is no feed item: it is noted at the position the page starts from, which
         // every protocol in step is told through already.
-        self.hand_call(position, call, read)?;
+        self.commit_read(read).await?;
         self.gap_handed(held, &mut read.tx)?;
         if list {
             self.owe_item_listing(position, false, read).await?;
         }
+        self.hand_call(position, call, read).await?;
         Ok(())
     }
 
@@ -3028,20 +3073,22 @@ impl App {
         self.state.cursor.time_ms.saturating_sub(CLOCK_TOLERANCE_MS)
     }
 
-    fn unopenable(&mut self, entry: &Entry, read: &mut Read) -> Result<Step, AppError> {
+    async fn unopenable(&mut self, entry: &Entry, read: &mut Read) -> Result<Step, AppError> {
         let ask =
             entry.accepted_at_ms >= self.resend_floor() && entry.sender != self.state.meta.identity;
         let asked = ask
-            && self.ask_resend(
-                entry.seq,
-                ResendNeeded {
-                    sender: entry.sender,
-                    accepted_from_ms: entry.accepted_at_ms,
-                    accepted_until_ms: entry.accepted_at_ms,
-                    reason: ResendReason::Unopenable,
-                },
-                read,
-            )?;
+            && self
+                .ask_resend(
+                    entry.seq,
+                    ResendNeeded {
+                        sender: entry.sender,
+                        accepted_from_ms: entry.accepted_at_ms,
+                        accepted_until_ms: entry.accepted_at_ms,
+                        reason: ResendReason::Unopenable,
+                    },
+                    read,
+                )
+                .await?;
         self.events.push(AppEvent::Unopenable {
             seq: entry.seq,
             resend_asked: asked,
@@ -3050,54 +3097,97 @@ impl App {
     }
 
     /// Hand a re-send to the protocol once per item; returns whether it was asked now.
-    fn ask_resend(
+    async fn ask_resend(
         &mut self,
         seq: u64,
         needed: ResendNeeded,
         read: &mut Read,
     ) -> Result<bool, AppError> {
-        if !self.state.asked.insert(seq) {
+        if self.state.asked.contains(&seq) {
             return Ok(false);
         }
+        self.commit_read(read).await?;
         // A protocol not asked yet is owed the call, and asked by a later read.
-        let asked = self.hand_call(seq, OwedCall::from(&needed), read)?;
-        read.tx.put(&key::asked(seq), &())?;
-        Ok(asked)
+        self.hand_call(seq, OwedCall::from(&needed), read).await
     }
 
     /// Hand a call about the feed item at `seq` to every protocol, in registration order,
-    /// each answer's writes going with the read under that protocol's prefix. A protocol
+    /// each answer committed under that protocol's prefix with its remaining owners and
+    /// progress. The intent is kept first, with the item's other obligations; successful
+    /// callbacks never have to share one bounded transaction (Switch spec 8.3). A protocol
     /// that fails it, or that isn't told through everything before the item
     /// ([`App::may_tell`]), has the call kept for it (Switch spec 8.3). Whether every
     /// protocol took it now.
-    fn hand_call(&mut self, seq: u64, call: OwedCall, read: &mut Read) -> Result<bool, AppError> {
+    async fn hand_call(
+        &mut self,
+        seq: u64,
+        call: OwedCall,
+        read: &mut Read,
+    ) -> Result<bool, AppError> {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
-        let mut owed_to = Vec::new();
+        let mut owed_to = self.protocols.names();
+        let generation = self.state.cursor.generation;
+        let at = key::owed(generation, seq);
+        read.tx.put(
+            &at,
+            &Owed {
+                to: owed_to.clone(),
+                call: call.clone(),
+            },
+        )?;
+        self.state.asked.insert(seq);
+        read.tx.put(&key::asked(seq), &())?;
+        self.commit_read(read).await?;
         for registered in protocols {
-            // A listing kept for it at this very item: the item was handled for it when the
-            // read first met it, its call taken or kept then (a kept call makes the read
-            // pass the item whole).
-            if self.kept_here.contains(&registered.name) {
-                continue;
-            }
             // In step with the item, or waiting only for the listing the `missed` item
             // before it owes, which this one owes too.
             if !self.may_tell(&registered.name) && !read.run.contains(&registered.name) {
-                owed_to.push(registered.name);
                 continue;
             }
+            let mut tx = self.tx()?;
             match call.make(registered.protocol.as_ref()) {
                 Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
-                    self.local_writes_refused(seq, &registered.name, call.clone(), read)?;
+                    self.keep_duty_for(
+                        &mut tx,
+                        vec![registered.name.clone()],
+                        Duty::LocalWritesRefused {
+                            call: KeptRefusal::Owed {
+                                seq,
+                                call: call.clone(),
+                            },
+                        },
+                    )?;
                 }
-                Ok(writes) => read
-                    .tx
-                    .local(&super::protocols::qualify(&registered.name, writes))?,
-                Err(_) => owed_to.push(registered.name),
+                Ok(writes) => tx.local(&super::protocols::qualify(&registered.name, writes))?,
+                Err(_) => continue,
             }
+            owed_to.retain(|name| name != &registered.name);
+            if owed_to.is_empty() {
+                tx.delete(&at)?;
+                if let OwedCall::Deny { pubky, added, .. } = &call {
+                    self.note_deny_change(pubky, *added, &mut tx)?;
+                }
+            } else {
+                tx.put(
+                    &at,
+                    &Owed {
+                        to: owed_to.clone(),
+                        call: call.clone(),
+                    },
+                )?;
+            }
+            // A listing at this item still holds the position, even when its notice took.
+            if !read.left.contains(&registered.name) {
+                self.told_through(&registered.name, generation, seq);
+            }
+            self.put_told(&mut tx)?;
+            self.commit(tx).await?;
         }
         if owed_to.is_empty() {
             return Ok(true);
+        }
+        for name in &owed_to {
+            read.run.remove(name);
         }
         self.owe(seq, owed_to, call, read)?;
         Ok(false)
@@ -3157,38 +3247,21 @@ impl App {
         Ok(())
     }
 
-    /// A call whose answer's local writes are over [`MAX_STEP_LOCAL_BYTES`]: not committed,
-    /// and not owed, since making it again would bring the same answer; the protocol that
-    /// gave them is told in the commit that passes its item.
-    fn local_writes_refused(
-        &mut self,
-        seq: u64,
-        protocol: &str,
-        call: OwedCall,
-        read: &mut Read,
-    ) -> Result<(), AppError> {
-        self.keep_duty_for(
-            &mut read.tx,
-            vec![protocol.to_owned()],
-            Duty::LocalWritesRefused {
-                call: KeptRefusal::Owed { seq, call },
-            },
-        )
-    }
-
-    /// Hand a deny list change to the protocol, its writes committed with the cursor passing
-    /// the item; owed when the protocol fails, or when an earlier change is still owed, so
+    /// Hand a deny list change to each protocol, committing its writes with its progress
+    /// and remaining owners; owed when it fails, or when an earlier change is still owed, so
     /// the protocol gets them in feed order (Switch spec 8.3).
-    fn tell_deny_change(
+    async fn tell_deny_change(
         &mut self,
         change: &DenyListChange,
         read: &mut Read,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
-            return Ok(());
+            self.note_deny_change(&change.pubky, change.added, &mut read.tx)?;
+            return Ok(true);
         }
+        self.commit_read(read).await?;
         self.hand_call(change.seq, OwedCall::from(change), read)
-            .map(|_| ())
+            .await
     }
 
     /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
@@ -3228,10 +3301,12 @@ impl App {
     /// (Switch spec 8.3): the lists are read (`GET /allow`) for it, however long the copy
     /// of the lists waits after one too large for a commit, and the gap is told with the
     /// deny list they give, in a commit of its own. The copy of the lists is then replaced
-    /// from the same answer, best effort. A read that fails or is refused leaves the gap
-    /// owed and the read held; only an answer that verifies but can't be read tells the gap
-    /// without the list (`list_read` false), and deletes `lc/lists_at` in the telling
-    /// commit, so the next read owes a gap again (`App::refresh_lists_if_owed`): such a
+    /// from the same answer, best effort. Completing the gap deletes `lc/lists_at` in the
+    /// same commit: only the replacement can mark the new baseline complete. A failed
+    /// replacement leaves it unknown, so the next read owes a gap again unless a whole
+    /// copy was too large (`App::refresh_lists_if_owed`). A read that fails or is refused
+    /// leaves the gap owed and the read held; only an answer that verifies but can't be
+    /// read tells the gap without the list (`list_read` false). Such a
     /// protocol is told `list_read` false at each read for as long as the answer can't be
     /// read, and the list once it can.
     /// Whether a gap is still owed.
@@ -3242,8 +3317,10 @@ impl App {
         let Some(owed) = self.reader().get::<OwedGap>(DENY_GAP).await? else {
             return Ok(false);
         };
-        // Every writer names at least one protocol: a gap owed to none is a corrupt store.
-        if owed.to.is_empty() {
+        // Every current gap is owed to every registered protocol, including after a
+        // partial pass. Validate the complete set before any callback (Switch spec 8.3).
+        let owners = self.protocols.names();
+        if owed.to.len() != owners.len() || owners.iter().any(|name| !owed.to.contains(name)) {
             return Err(AppError::Store(crate::error::StoreError::Corrupt));
         }
         // A gap goes to every protocol after everything at or before it: while one isn't
@@ -3283,11 +3360,17 @@ impl App {
                 .unwrap_or_default(),
             list_read: list.is_some(),
         };
-        // Each protocol owed the gap, its writes in this commit; one that fails keeps the
+        // Each protocol owed the gap commits its own response. One that fails keeps the
         // gap owed to every one of them, and the read holds.
         let mut tx = self.tx()?;
         let mut left = Vec::new();
         for name in owed.to.iter().cloned() {
+            // The original gap stays owed to all until a complete pass takes one answer.
+            // Commit the preceding callback before adding another valid response.
+            if !tx.is_empty() {
+                self.commit(tx).await?;
+                tx = self.tx()?;
+            }
             let Some(protocol) = self.protocols.get(&name).cloned() else {
                 return Err(AppError::Store(crate::error::StoreError::Corrupt));
             };
@@ -3326,11 +3409,13 @@ impl App {
             return Ok(true);
         }
         tx.delete(DENY_GAP)?;
+        // The gap's baseline replaces any previous complete copy, including one refreshed
+        // by `allow_list` while this gap was owed. Retire that baseline with the gap: a
+        // failed replacement must leave it unknown after reload (Switch spec 8.3).
+        tx.delete(super::admission::LISTS_AT)?;
         if list.is_none() {
-            // The protocol has no baseline yet: the copy isn't known complete either, so the
-            // next read owes the gap again, with the list once it reads, whatever waits on
-            // the copy (one `GET /allow` a read while the answer can't be read).
-            tx.delete(super::admission::LISTS_AT)?;
+            // No readable baseline: try again at the next read, whatever waits on the copy
+            // (one `GET /allow` a read while the answer can't be read).
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
         self.commit(tx).await?;
@@ -3445,8 +3530,7 @@ impl App {
             .await?
         {
             DenyCheck::Genuine => {
-                self.note_list_op(body, &mut read.tx)?;
-                self.tell_deny_change(&change, read)?;
+                self.tell_deny_change(&change, read).await?;
             }
             DenyCheck::NotGenuine(reason) => {
                 self.events.push(AppEvent::DenyListChangeRefused {
@@ -3574,6 +3658,18 @@ impl App {
         a == b || (self.feed_order(a, 0).0 == 1 && self.feed_order(b, 0).0 == 1)
     }
 
+    /// Read and validate the complete retained-call set before it supplies ordering,
+    /// readiness or callbacks. Valid remaining owners need not include completed ones.
+    pub(crate) async fn owed_calls(&self) -> Result<Vec<(String, Owed)>, AppError> {
+        let owed = self.reader().scan::<Owed>(key::OWED_PREFIX).await?;
+        for (rest, call) in &owed {
+            owed_place(rest)?;
+            call.check_owners(&self.protocols)?;
+            call.call.kept_op_body()?;
+        }
+        Ok(owed)
+    }
+
     /// The calls kept for protocols, made again in feed order ([`App::feed_order`]), each
     /// for the protocols it names whose position has reached it: those told through
     /// everything before its item, and owed no listing at or before it. Each goes in one
@@ -3591,7 +3687,7 @@ impl App {
     ///
     /// Returns whether a protocol failed a call in this pass.
     async fn retry_owed(&mut self) -> Result<bool, AppError> {
-        let owed = self.reader().scan::<Owed>(key::OWED_PREFIX).await?;
+        let owed = self.owed_calls().await?;
         let due: super::records::ListDue = self
             .reader()
             .get(super::records::LIST_DUE)
@@ -3615,16 +3711,19 @@ impl App {
             })
             .collect::<Result<Vec<_>, AppError>>()?;
         queue.sort_by_key(|(order, ..)| *order);
+        let mut kept = due.kept();
+        kept.extend(queue.iter().map(|(_, (generation, seq), _, owed)| Kept {
+            generation: *generation,
+            seq: *seq,
+            names: owed.to.clone(),
+            call: true,
+            deny: owed.call.is_deny(),
+        }));
+        kept.sort_by_key(|item| self.feed_order(item.generation, item.seq));
         for (order, (generation, seq), rest, Owed { to, call }) in queue {
             // The positions, by what is still kept: a protocol that took a call is told
             // through to right before the next thing kept for it.
-            let kept = self.kept_things().await?;
             self.settle_told(&kept);
-            // Every writer names at least one protocol: a call kept for none is a corrupt
-            // store, neither made nor dropped.
-            if to.is_empty() {
-                return Err(AppError::Store(crate::error::StoreError::Corrupt));
-            }
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // Whose turn it is: a protocol told through everything before the call's item,
             // and owed no listing at or before it, which goes first.
@@ -3694,7 +3793,7 @@ impl App {
                                 seq: *seq,
                                 reason: reason.into(),
                             });
-                            tx.delete(&at)?;
+                            self.kept_gone(&at, (*generation, *seq), false, &mut kept, &mut tx)?;
                             self.commit(tx).await?;
                             continue;
                         }
@@ -3707,7 +3806,7 @@ impl App {
                 }
                 self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
                     .await?;
-                tx.delete(&at)?;
+                self.kept_gone(&at, (generation, seq), false, &mut kept, &mut tx)?;
                 self.commit(tx).await?;
                 continue;
             }
@@ -3725,9 +3824,9 @@ impl App {
                     };
                     match self.check_deny_op(&op, &body, at_ms, &tx).await? {
                         DenyCheck::Genuine => {
-                            self.note_list_op(&body, &mut tx)?;
                             if !self.state.cert.has_permission(Permission::ListsRead) {
-                                self.kept_gone(&at, seq, ahead, &mut tx)?;
+                                self.note_list_op(&body, &mut tx)?;
+                                self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                                 self.commit(tx).await?;
                                 continue;
                             }
@@ -3745,7 +3844,7 @@ impl App {
                                 seq,
                                 reason: reason.into(),
                             });
-                            self.kept_gone(&at, seq, ahead, &mut tx)?;
+                            self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                             self.commit(tx).await?;
                             continue;
                         }
@@ -3756,25 +3855,21 @@ impl App {
                         DenyCheck::Unverifiable => {
                             self.note_deny_gap(generation, seq.saturating_sub(1), &mut tx)
                                 .await?;
-                            self.kept_gone(&at, seq, ahead, &mut tx)?;
+                            self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                             self.commit(tx).await?;
                             continue;
                         }
                     }
                 }
-                // At the cursor: the copy of the lists takes the change in the commit that
-                // hands it to the protocol, so the two never disagree after a crash. Where
-                // the feed applied it when the call was owed, this sets the same state
-                // again; after a restore in place, whose feed passes the carried call's
-                // item without applying it, this is where the copy takes it, after the
-                // changes the feed handed before it (Switch spec 8.3).
+                // A change is applied below with the last successful callback, so the
+                // shared copy never moves ahead of a protocol (Switch spec 8.3).
                 // An app that no longer holds `lists.read`, a renewal having removed it, is
                 // handed no deny list change (Switch spec 8.3): the copy still takes it, and
                 // the call is gone, as for a change checked here.
                 call @ OwedCall::Deny { pubky, added, .. } => {
-                    self.note_deny_change(&pubky, added, &mut tx)?;
                     if !self.state.cert.has_permission(Permission::ListsRead) {
-                        self.kept_gone(&at, seq, ahead, &mut tx)?;
+                        self.note_deny_change(&pubky, added, &mut tx)?;
+                        self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                         self.commit(tx).await?;
                         continue;
                     }
@@ -3782,11 +3877,9 @@ impl App {
                 }
                 call => call,
             };
-            let mut left = Vec::new();
-            let mut took = Vec::new();
+            let mut left = to.clone();
             for name in to {
                 if !ready.contains(&name) {
-                    left.push(name);
                     continue;
                 }
                 let Some(protocol) = self.protocols.get(&name).cloned() else {
@@ -3794,7 +3887,6 @@ impl App {
                 };
                 let Ok(writes) = call.make(protocol.as_ref()) else {
                     failed_any = true;
-                    left.push(name);
                     continue;
                 };
                 if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES {
@@ -3813,29 +3905,41 @@ impl App {
                 } else {
                     tx.local(&super::protocols::qualify(&name, writes))?;
                 }
-                took.push(name);
+                left.retain(|owner| owner != &name);
+                if left.is_empty() {
+                    if let OwedCall::Deny { pubky, added, .. } = &call {
+                        self.note_deny_change(pubky, *added, &mut tx)?;
+                    }
+                    self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
+                } else {
+                    for item in &mut kept {
+                        if item.call && (item.generation, item.seq) == (generation, seq) {
+                            item.names.clone_from(&left);
+                        }
+                    }
+                    tx.put(
+                        &at,
+                        &Owed {
+                            to: left.clone(),
+                            call: call.clone(),
+                        },
+                    )?;
+                }
+                // One valid response and its progress fit independently of every other
+                // protocol's response; commit them together before taking the next.
+                self.told_through(&name, generation, seq);
+                self.put_told(&mut tx)?;
+                self.commit(tx).await?;
+                tx = self.tx()?;
             }
-            let failed_deny = call.is_deny() && !left.is_empty();
-            if left.is_empty() {
-                self.kept_gone(&at, seq, ahead, &mut tx)?;
-            } else {
-                tx.put(&at, &Owed { to: left, call })?;
-            }
-            // Each that took it is told through its item, in the call's commit.
-            for name in &took {
-                self.told_through(name, generation, seq);
-            }
-            self.put_told(&mut tx)?;
-            self.commit(tx).await?;
             // A deny list change one failed: nothing later is made for any protocol.
-            if failed_deny {
+            if call.is_deny() && !left.is_empty() {
                 held = true;
                 break;
             }
         }
         // What is kept past the cursor, by the `seq` of its item in the cursor's sequence:
         // the walk leaves the protocols it names right before it.
-        let kept = self.kept_things().await?;
         self.settle_told(&kept);
         self.kept_ahead.clear();
         for thing in &kept {
@@ -3866,15 +3970,23 @@ impl App {
     /// A kept call is gone, in `tx`: taken by every protocol it named, refused, or made a
     /// gap. One whose item the cursor hasn't passed (`ahead`) leaves `asked/<seq>`, so the
     /// read, which still meets the item, passes it without handling it again.
-    fn kept_gone(&mut self, at: &str, seq: u64, ahead: bool, tx: &mut Tx) -> Result<(), AppError> {
+    fn kept_gone(
+        &mut self,
+        at: &str,
+        (generation, seq): (u64, u64),
+        ahead: bool,
+        kept: &mut Vec<Kept>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         tx.delete(at)?;
+        kept.retain(|item| !item.call || (item.generation, item.seq) != (generation, seq));
         if ahead && self.state.asked.insert(seq) {
             tx.put(&key::asked(seq), &())?;
         }
         Ok(())
     }
 
-    fn handle_unreadable(
+    async fn handle_unreadable(
         &mut self,
         seq: u64,
         sender: [u8; 32],
@@ -3890,16 +4002,18 @@ impl App {
         let asked = departed
             && sender != self.state.meta.identity
             && accepted_at >= self.resend_floor()
-            && self.ask_resend(
-                seq,
-                ResendNeeded {
-                    sender,
-                    accepted_from_ms: accepted_at,
-                    accepted_until_ms: accepted_at,
-                    reason: ResendReason::Unreadable,
-                },
-                read,
-            )?;
+            && self
+                .ask_resend(
+                    seq,
+                    ResendNeeded {
+                        sender,
+                        accepted_from_ms: accepted_at,
+                        accepted_until_ms: accepted_at,
+                        reason: ResendReason::Unreadable,
+                    },
+                    read,
+                )
+                .await?;
         self.events.push(AppEvent::Unreadable {
             seq,
             resend_asked: asked,
@@ -3925,6 +4039,7 @@ impl App {
             return Ok(Step::Pass);
         };
         if self.state.asked.insert(seq) {
+            self.commit_read(read).await?;
             let accepted_from_ms = from.max(self.resend_floor());
             let call = OwedCall::Missed {
                 seq,
@@ -3932,9 +4047,8 @@ impl App {
                 accepted_from_ms,
                 accepted_until_ms: until.max(accepted_from_ms),
             };
-            self.hand_call(seq, call, read)?;
-            read.tx.put(&key::asked(seq), &())?;
             self.owe_item_listing(seq, true, read).await?;
+            self.hand_call(seq, call, read).await?;
             self.events.push(AppEvent::Missed { seq, entries });
         }
         Ok(Step::Pass)
@@ -3973,6 +4087,11 @@ impl App {
                 };
                 let body = op.body();
                 if let OpKind::DenyPut { pubky } | OpKind::DenyDelete { pubky } = &body.kind {
+                    // The copy is shared: no protocol may see this change while another
+                    // still has an earlier message to take (Switch spec 8.3).
+                    if !self.may_tell_of(None) {
+                        return Ok(Step::Stop);
+                    }
                     let change = DenyListChange {
                         generation: envelope.generation,
                         seq: item.seq,
@@ -4306,10 +4425,11 @@ pub(crate) fn uncertain_processed(
     tx: &mut Tx,
     sender: &[u8; 32],
     msg_id: &str,
+    kind: &str,
     hash: [u8; 32],
     now: u64,
 ) -> Result<(), AppError> {
-    processed_writes(tx, sender, msg_id, hash, now)
+    processed_writes(tx, sender, msg_id, kind, hash, now)
 }
 
 /// The processed pair and its time index.
@@ -4317,12 +4437,17 @@ pub(crate) fn processed_writes(
     tx: &mut Tx,
     sender: &[u8; 32],
     msg_id: &str,
+    kind: &str,
     hash: [u8; 32],
     now: u64,
 ) -> Result<(), AppError> {
     tx.put(
         &key::processed(sender, msg_id),
-        &Processed { hash, at_ms: now },
+        &Processed {
+            kind: kind.to_owned(),
+            hash,
+            at_ms: now,
+        },
     )?;
     tx.put(&key::processed_at(now, sender, msg_id), &())?;
     Ok(())

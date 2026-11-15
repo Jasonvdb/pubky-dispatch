@@ -92,6 +92,26 @@ async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[tokio::test]
+async fn test_protocol_deny_barrier_at_the_service_and_the_scripted_switch() {
+    let Some(comparison) = compare_backends("protocol deny barrier", flows::protocol_deny_barrier)
+        .await
+        .expect("the deny barrier flow")
+    else {
+        return;
+    };
+    assert!(comparison.verdict.agrees(), "{}", comparison.verdict);
+    let Some(comparison) = compare_backends(
+        "protocol retry after deny",
+        flows::protocol_retry_after_deny,
+    )
+    .await
+    .expect("the deny retry flow") else {
+        return;
+    };
+    assert!(comparison.verdict.agrees(), "{}", comparison.verdict);
+}
+
 #[test]
 fn test_allowed_differences_name_flows_that_exist() {
     for entry in ALLOWED {

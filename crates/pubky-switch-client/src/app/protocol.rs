@@ -28,6 +28,20 @@
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
+//!
+//! Feed order is per protocol (Switch spec 8.3). The shared deny copy changes only after
+//! every protocol has taken the preceding items and the deny change itself; the read
+//! stops there while any protocol waits. Entries reached in order but held for sender
+//! validation, a key or a retry follow Section 8.2 and may run under a later deny copy.
+//! Other shared views are current observations:
+//! claims and records, including another protocol's records, may be newer than the
+//! message. Use their conditions when a write depends on them; a foreign record does not
+//! prove that its protocol has handled it. The certificate, identity, data epoch and keys
+//! are the current verified authority, never restored to earlier authority for an older
+//! message. Allowlist entries and sender flags are current copies; an explicit list read
+//! or gap supplies a current baseline. Reconcile mode and provider-loss restrictions
+//! apply immediately to all protocols, and the highest verified service time remains
+//! current. None of these current views establishes cross-protocol event order.
 
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
@@ -177,6 +191,10 @@ pub struct FeedPosition {
 ///   `k + v + 72`: at most 4 MiB. An applied effect's outcome
 ///   adds at most 7 cached record writes (each under 1.2 MiB with its proof and opened
 ///   value), under 13 MiB in all, below the 32 MiB batch size.
+/// - **Several protocols:** each callback commits separately with its remaining owners
+///   and progress. Valid responses do not have to fit together in one transaction. A
+///   shared deny barrier stays until every callback completes; an interrupted gap is
+///   told to all protocols again from one fresh list answer.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// The most bytes a [`Protocol::record_seen`] mark takes: 64 KiB, 85.6 KiB as stored in
@@ -847,6 +865,9 @@ pub trait Protocol: Send + Sync {
     ///   past, as after a restore in place from a newer backup, or one of a lost sequence
     ///   once the app reads the next, isn't made: it would come after later changes, so
     ///   the protocol is told a gap at that position instead.
+    ///   With several protocols, the change waits until every protocol has taken the
+    ///   preceding items. The shared deny copy changes in the commit of the last
+    ///   successful callback; no later item is handed to any protocol while one fails.
     /// - **After a restore:** a backup holds the protocol's layer as committed when it was
     ///   taken, and none of the changes or gaps owed then. So every restore tells every
     ///   protocol a gap at the backup's position, with the full list, whatever the backup
@@ -855,8 +876,10 @@ pub trait Protocol: Send + Sync {
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
     ///   keeps by the change's place, or takes it as setting a state.
-    /// - **Before and after:** an entry held, accepted before a change, may come again at a
-    ///   later read, after the change.
+    /// - **Before and after:** an entry reached in order but held for its sender, a key
+    ///   or a retry, or stored locally, may be tried after a later change and sees the
+    ///   current copy then (Switch spec 8.2). The barrier protects an eligible entry
+    ///   not yet handed because its protocol is behind.
     ///
     /// # Errors
     ///
@@ -881,14 +904,20 @@ pub trait Protocol: Send + Sync {
     /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
     /// and every [`super::App::allow_list`]: whenever the app's copy of
     /// the lists is taken whole from a list read, every protocol is given that list as a
-    /// gap. It is told to every protocol in turn, and all their writes go in one commit:
-    /// when every protocol took it, that commit deletes the gap, and the copy of the lists
-    /// is then replaced from the same answer in a commit of its own, best effort, which
-    /// lists too large for one commit leave as it was, not known complete. When one fails,
-    /// the writes of those that took it are committed with the gap still owed to every
+    /// gap. It is told to every protocol in turn, each response in a separate commit.
+    /// The gap stays owed to all until one complete pass takes the same answer. The
+    /// final callback's commit then deletes the gap and marks the copy of the
+    /// lists unknown. The copy is then replaced from the same answer in a commit of its
+    /// own, best effort. A failed replacement leaves the copy unknown after reload too;
+    /// the next read owes a fresh gap, except while a whole copy that was too large waits
+    /// for its retry time ([`super::App::allow_list`]). When one protocol fails,
+    /// the writes of those that took it remain committed with the gap still owed to every
     /// protocol, so a later read tells it to each again, with the list the copy is then
     /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a
     /// call or a listing from at or before it is kept for a protocol.
+    /// A failed or uncertain commit interrupts the pass too: after reload every protocol
+    /// is told again from the list read for the next pass, including protocols whose
+    /// earlier writes committed. No partially completed pass establishes a baseline.
     ///
     /// A gap may be told again at the same position, each time with the full list, which
     /// sets the same state: every gap noted is told to every protocol, one that took an

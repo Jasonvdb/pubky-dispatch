@@ -469,6 +469,8 @@ struct LayerOut {
 /// them back without these would hand the entries to the protocols again.
 #[derive(Clone, Serialize, Deserialize)]
 struct BeyondCursor {
+    /// The registered protocols whose layers and feed progress were taken together.
+    protocols: Vec<String>,
     seen: Vec<u64>,
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
@@ -661,9 +663,6 @@ pub struct App {
     /// Where the walk of the read under way stands, inside a page ([`App::may_tell`]). In
     /// memory only.
     walk: Option<order::Walk>,
-    /// The protocols something is kept for at the very item the walk handles: they aren't
-    /// told the item ([`App::may_tell`]). In memory only.
-    kept_here: BTreeSet<String>,
     /// The protocols a listing is owed to (`list_due`), as the read's last listing step
     /// left them: outside a page, they are told nothing before it ([`App::may_tell`]). In
     /// memory only.
@@ -1050,7 +1049,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
@@ -1217,7 +1215,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
@@ -1667,6 +1664,7 @@ impl App {
                 processed.push((
                     rest,
                     Processed {
+                        kind: pending.kind.clone(),
                         hash: pending.hash,
                         at_ms: self.now(),
                     },
@@ -1687,6 +1685,7 @@ impl App {
                 });
             }
             backup.beyond_cursor = Some(BeyondCursor {
+                protocols: self.protocols.names(),
                 seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
@@ -1739,8 +1738,10 @@ impl App {
     /// carries beside them, in one commit: the app checks its own state, that every scope
     /// of the certificate is a registered protocol's and each protocol runs with it
     /// ([`Protocol::check_own_certificate`]), that each layer names a registered protocol,
-    /// then has each registered protocol's [`Protocol::restore_layer`] check its own layer,
-    /// or `None` when the backup has none for it, with the backup's identity and `blind`
+    /// and that a layered snapshot's original protocol roster matches its layers and
+    /// processed owners, before any restore callback. It then has each registered
+    /// protocol's [`Protocol::restore_layer`] check its own layer, or `None` for a newly
+    /// registered protocol or a plain backup, with the backup's identity and `blind`
     /// under its naming key ([`RestoreContext`]), and give its writes, which land under its
     /// own prefix, all before it writes anything. The app keeps the names it registers
     /// (`protos`) for later loads. When this returns `Ok`, every layer is in the store; on
@@ -1923,6 +1924,25 @@ impl App {
                     "its layers come without the feed beyond its cursor",
                 ));
             }
+            if let Some(beyond) = &backup.beyond_cursor {
+                // Seen marks can outlive processed pairs. The whole original roster,
+                // rather than just kinds still held in `proc/`, binds this progress to
+                // its layers. An empty layer still has an entry; a new registration has
+                // neither an original layer nor original progress (Switch spec 12.4).
+                let owners: BTreeSet<_> = beyond.protocols.iter().collect();
+                if owners.is_empty()
+                    || owners.len() != beyond.protocols.len()
+                    || owners.len() != layers.len()
+                    || layers.iter().any(|layer| !owners.contains(&layer.protocol))
+                    || beyond.processed.iter().any(|(_, pair)| {
+                        protocols
+                            .of_kind(&pair.kind)
+                            .is_some_and(|owner| !owners.contains(&owner.name))
+                    })
+                {
+                    return Err(invalid("its feed progress and protocol layers disagree"));
+                }
+            }
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
@@ -1955,7 +1975,9 @@ impl App {
                                 .ok_or_else(|| invalid("processed pairs"))?;
                             let sender = pubky_switch_core::enc::pubky_key(sender)
                                 .map_err(|_| invalid("processed pairs"))?;
-                            Ok((sender, msg_id.to_owned(), *record))
+                            pubky_switch_core::message::check_kind(&record.kind)
+                                .map_err(|_| invalid("processed message kind"))?;
+                            Ok((sender, msg_id.to_owned(), record.clone()))
                         })
                         .collect::<Result<Vec<_>, AppError>>()?,
                 ),
@@ -2117,7 +2139,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
@@ -2153,7 +2174,14 @@ impl App {
                 tx.delete_prefix("")?;
                 app.write_all(&mut tx).await?;
                 for (sender, msg_id, record) in &processed {
-                    feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
+                    feed::processed_writes(
+                        &mut tx,
+                        sender,
+                        msg_id,
+                        &record.kind,
+                        record.hash,
+                        record.at_ms,
+                    )?;
                 }
                 records::owe_listing(&mut tx, &protocols_names)?;
                 // The entries it brings back are told to the protocol again, in steps after
@@ -2612,11 +2640,34 @@ impl App {
         Ok(u64::try_from(owed.len()).unwrap_or(u64::MAX))
     }
 
+    /// Inspect the duty events kept and not acknowledged yet, by ascending ID.
+    ///
+    /// After a failed commit, this first reloads the durable state and queues any duty
+    /// events still owed to the host, just as the next app call would. Inspection does
+    /// not hand events to the host, remove events from the next report or make their IDs
+    /// eligible for [`App::ack_events`]. Repeated inspections return the same events
+    /// until the kept duties change.
+    ///
+    /// A protocol can use this snapshot before acting on current state without consuming
+    /// the host's reports. The host still takes a call's report, [`App::take_events`] or
+    /// [`App::unacknowledged_events`], acts on every duty through an ID, and acknowledges
+    /// that ID only after its protocol has kept what those duties say. Inspection adds
+    /// no stored queue and imposes no retention limit (the `events` module, "Duty events").
+    ///
+    /// # Errors
+    ///
+    /// A failed store read or reload. An error hands no events to the host.
+    pub async fn pending_duty_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        self.ready_local().await?;
+        self.kept_duties().await
+    }
+
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
     /// lost its copy of the reports still has to act on. Nothing but [`App::ack_events`]
     /// shortens this list (`events` module, "Duty events"). Listing them hands them to the
     /// host, as [`App::take_events`] does, so an acknowledgement up to the last of them
-    /// removes them all.
+    /// removes them all. Use [`App::pending_duty_events`] to inspect without handing them
+    /// over or changing the next report.
     ///
     /// # Errors
     ///
@@ -2736,7 +2787,8 @@ impl App {
     /// so a host acknowledges after acting on every duty event it took up to that ID. An
     /// ID no event has yet acknowledges only those before it. IDs compare only within one
     /// store ([`EventId::cmp_same_store`]). Only events this app value handed to the host,
-    /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
+    /// by [`App::take_events`], [`App::unacknowledged_events`] or a call's report, are
+    /// removed. Inspection with [`App::pending_duty_events`] is not delivery: one kept but not yet taken,
     /// such as one queued after a reload, stays until it is taken and acknowledged.
     ///
     /// It acknowledges for every protocol at once: each event goes for all the protocols
@@ -2967,7 +3019,7 @@ impl App {
             match read {
                 Ok(mut owed) => {
                     owed.to.retain(|name| protocols.contains(name));
-                    if owed.to.is_empty() {
+                    if owed.check_owners(protocols).is_err() {
                         carried.lost_owed = carried.lost_owed.saturating_add(1);
                         continue;
                     }
@@ -3019,7 +3071,7 @@ impl App {
                 }
             };
             owed.to.retain(|name| protocols.contains(name));
-            if owed.to.is_empty() {
+            if owed.check_owners(protocols).is_err() {
                 lost = lost.saturating_add(1);
                 continue;
             }

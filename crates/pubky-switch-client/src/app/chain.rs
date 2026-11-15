@@ -52,6 +52,9 @@ pub(crate) type ChainExport = (ChainRecord, Vec<(u64, [u8; 32])>, Vec<([u8; 16],
 #[derive(Clone, Debug)]
 pub(crate) struct ChainView {
     verifier: Verifier,
+    /// The highest authenticated feed position scanned, including items outside the
+    /// chain. Only stored-position validation uses it, never delivery or acknowledgment.
+    pub(crate) read_through: (u64, u64),
     /// The verifier's state as last saved, to write only what changed.
     saved: VerifierState,
     pub(crate) newest: Option<SignedHead>,
@@ -98,6 +101,7 @@ impl ChainView {
         };
         Self {
             verifier: Verifier::from_state(state),
+            read_through: (generation, seq),
             saved: VerifierState::default(),
             newest: None,
             gap: None,
@@ -265,6 +269,9 @@ impl ChainView {
         if !page.more {
             self.verifier.end_of_feed().map_err(rollback)?;
         }
+        if page.scanned_through >= self.read_through.1 {
+            self.read_through = (page.head.generation, page.scanned_through);
+        }
         Ok(check)
     }
 
@@ -331,6 +338,7 @@ impl ChainView {
     fn record_of(&self, state: &VerifierState) -> ChainRecord {
         ChainRecord {
             generation: state.generation,
+            read_through: self.read_through,
             last_seq: state.last_seq,
             last_hash: state.last_hash,
             last_time: state.last_time,
@@ -401,6 +409,7 @@ impl ChainView {
         };
         Ok(Self {
             verifier: Verifier::from_state(state.clone()),
+            read_through: record.read_through,
             saved: state,
             newest: record.newest.as_ref().map(head).transpose()?,
             gap: record.gap,
@@ -696,7 +705,18 @@ mod tests {
         tx.commit(&store).await.unwrap();
         let mut loaded = ChainView::load(&reader).await.unwrap().unwrap();
         assert_eq!(loaded.verified_seq(), 5);
+        assert_eq!(loaded.read_through, (1, 5));
         assert_eq!(loaded.hash_at(4), view.hash_at(4));
+        loaded.switch_service();
+        assert_eq!(loaded.read_through, (1, 5));
+        let (record, at, batches) = loaded.export();
+        let restored = ChainView::import(
+            record,
+            at.into_iter().collect(),
+            batches.into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(restored.read_through, (1, 5));
         // The reloaded view goes on checking: a head that doesn't match is refused.
         let mut bad = head(&tips[4]);
         bad.chain_hash = [1; 32];

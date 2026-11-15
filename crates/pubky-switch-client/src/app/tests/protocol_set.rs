@@ -2,10 +2,15 @@
 //! `chat`, each with its own kinds, scope root, local state, backup layer, owed calls and
 //! duty events.
 
+mod callback_batches;
+mod gap_completion;
+mod ownership;
+mod retained_authority;
+
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::scopes::Permission;
 use serde_json::json;
@@ -43,12 +48,22 @@ struct Named {
     failing_deny: Mutex<u32>,
     /// The position of each deny list gap it took, and whether its list was read.
     gaps: Mutex<Vec<(u64, bool)>>,
+    /// Whether each gap keeps its full baseline in protocol-local state.
+    keep_gap: bool,
+    /// The byte count of each gap response, including temporary writes when nonzero.
+    gap_bytes: usize,
+    /// The byte count of each ordinary notice response, including temporary writes.
+    notice_bytes: usize,
+    /// The number of re-send callbacks taken.
+    resends: Mutex<usize>,
     /// How many of the next deny list gap calls fail.
     failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
     retrying: Mutex<u32>,
     /// Its effects carry a conversation entry for the sender.
     with_ops: bool,
+    /// Raw operations returned by each receive step.
+    raw_ops: Mutex<Vec<(Vec<Condition>, OpKind)>>,
     /// It refuses every own certificate.
     refuse_cert: Mutex<bool>,
     /// Whether each restore step was handed a layer.
@@ -70,11 +85,48 @@ fn named(name: &str) -> Named {
     }
 }
 
+#[test]
+fn test_protocol_set_one_owner_can_register_collection_policy_members() {
+    let family = crate::app::Collection::with_sub_scopes(
+        "task_lists",
+        pubky_switch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let protocol = Arc::new(Named {
+        collections: vec![
+            family.sub_scope("alpha").unwrap(),
+            family.sub_scope("beta").unwrap(),
+        ],
+        ..named("tasks")
+    });
+    let result = ProtocolSet::new(vec![protocol]);
+    assert!(
+        result.is_ok(),
+        "one collection with two policies still has one owner: {result:?}"
+    );
+}
+
 fn count_down(counter: &Mutex<u32>) -> bool {
     let mut left = counter.lock().unwrap();
     let fails = *left > 0;
     *left = left.saturating_sub(1);
     fails
+}
+
+fn pad_local(mut writes: Vec<LocalWrite>, bytes: usize) -> Vec<LocalWrite> {
+    if bytes == 0 {
+        return writes;
+    }
+    let key = b"padding".to_vec();
+    let room = bytes
+        - crate::app::local_writes_bytes(&writes)
+        - 2 * (key.len() + crate::app::LOCAL_WRITE_OVERHEAD_BYTES);
+    writes.push(LocalWrite::Put {
+        key: key.clone(),
+        value: vec![0; room],
+    });
+    writes.push(LocalWrite::Delete { key });
+    assert_eq!(crate::app::local_writes_bytes(&writes), bytes);
+    writes
 }
 
 impl Protocol for Named {
@@ -137,7 +189,7 @@ impl Protocol for Named {
                 value: self.name.clone().into_bytes(),
             }]
         };
-        let ops = if self.with_ops {
+        let mut ops = if self.with_ops {
             vec![(
                 Vec::new(),
                 OpKind::AllowPut {
@@ -148,11 +200,23 @@ impl Protocol for Named {
         } else {
             Vec::new()
         };
+        ops.extend(self.raw_ops.lock().unwrap().clone());
         Outcome::Apply(Effect { ops, local })
     }
 
     fn resend_needed(&self, _: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
-        Ok(Vec::new())
+        *self.resends.lock().unwrap() += 1;
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"resend".to_vec(),
+                    value: vec![1],
+                }]
+            },
+            self.notice_bytes,
+        ))
     }
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
@@ -166,10 +230,13 @@ impl Protocol for Named {
         } else {
             b"1".to_vec()
         };
-        Ok(vec![LocalWrite::Put {
-            key: format!("missed/{}", missed.seq).into_bytes(),
-            value,
-        }])
+        Ok(pad_local(
+            vec![LocalWrite::Put {
+                key: format!("missed/{}", missed.seq).into_bytes(),
+                value,
+            }],
+            self.notice_bytes,
+        ))
     }
 
     fn deny_list_changed(
@@ -180,7 +247,17 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.denies.lock().unwrap().push(change.pubky);
-        Ok(Vec::new())
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"deny".to_vec(),
+                    value: vec![u8::from(change.added)],
+                }]
+            },
+            self.notice_bytes,
+        ))
     }
 
     fn deny_list_gap(
@@ -191,7 +268,17 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.gaps.lock().unwrap().push((gap.seq, gap.list_read));
-        Ok(Vec::new())
+        Ok(pad_local(
+            if self.keep_gap {
+                vec![LocalWrite::Put {
+                    key: b"gap".to_vec(),
+                    value: serde_json::to_vec(&(gap.list_read, &gap.denied)).unwrap(),
+                }]
+            } else {
+                Vec::new()
+            },
+            self.gap_bytes,
+        ))
     }
 
     fn may_send(&self, message: &Message) -> bool {
@@ -750,29 +837,36 @@ async fn test_protocol_set_restore_refuses_a_layer_of_no_registered_protocol() {
 async fn test_protocol_set_restore_hands_none_to_a_protocol_without_a_layer() {
     let p = Pair::new();
     let (_app, backup) = with_state(&p).await;
-    let only_tasks = edited(&backup, |layers| {
-        layers.retain(|layer| layer["name"] == json!("tasks"));
-    });
+    let news = Arc::new(named("news"));
+    let protocols = ProtocolSet::new(vec![
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        Arc::clone(&p.chat) as Arc<dyn Protocol>,
+        Arc::clone(&news) as Arc<dyn Protocol>,
+    ])
+    .unwrap();
     p.chat.restored.lock().unwrap().clear();
     p.tasks.restored.lock().unwrap().clear();
-    let restored = App::restore(
+    let restored = Box::pin(App::restore(
         p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-        p.set(),
+        protocols,
         World::config(),
-        &only_tasks,
-    )
+        &backup,
+    ))
     .await
     .unwrap();
-    assert_eq!(*p.chat.restored.lock().unwrap(), [false]);
+    assert_eq!(*news.restored.lock().unwrap(), [false]);
+    assert_eq!(*p.chat.restored.lock().unwrap(), [true]);
     assert_eq!(*p.tasks.restored.lock().unwrap(), [true]);
     assert!(
         restored
-            .protocol_scan("chat", b"")
+            .protocol_scan("news", b"")
             .await
             .unwrap()
             .is_empty()
     );
-    assert_eq!(restored.protocol_scan("tasks", b"").await.unwrap().len(), 1);
+    for name in ["tasks", "chat"] {
+        assert_eq!(restored.protocol_scan(name, b"").await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

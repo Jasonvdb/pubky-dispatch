@@ -4,6 +4,7 @@
 //! 12.4).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pubky_switch_client::app::{App, AppConfig, OutgoingMessage, ProtocolSet};
 use pubky_switch_client::store::MemoryStore;
@@ -16,6 +17,131 @@ use super::join::{app_status, events};
 use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, CHAT, TASKS, sample_protocol};
 use crate::{FlowResult, World};
+
+#[cfg(test)]
+mod retained_authority;
+
+struct OrderedProtocol {
+    inner: Arc<TestProtocol>,
+    held: AtomicBool,
+    hold_receive: bool,
+    deny_changes: AtomicUsize,
+    local_bytes: usize,
+}
+
+impl OrderedProtocol {
+    fn notice(&self, key: &[u8], value: u8) -> Vec<pubky_switch_client::app::LocalWrite> {
+        use pubky_switch_client::app::{
+            LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, local_writes_bytes,
+        };
+        if self.local_bytes == 0 {
+            return Vec::new();
+        }
+        let mut writes = vec![LocalWrite::Put {
+            key: key.to_vec(),
+            value: vec![value],
+        }];
+        let padding = b"padding".to_vec();
+        let bytes = self.local_bytes
+            - local_writes_bytes(&writes)
+            - 2 * (padding.len() + LOCAL_WRITE_OVERHEAD_BYTES);
+        writes.push(LocalWrite::Put {
+            key: padding.clone(),
+            value: vec![0; bytes],
+        });
+        writes.push(LocalWrite::Delete { key: padding });
+        writes
+    }
+}
+
+impl pubky_switch_client::app::Protocol for OrderedProtocol {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn has_keys(&self, scope: &str) -> bool {
+        self.inner.has_keys(scope)
+    }
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.inner.sent_between_own_apps(kind)
+    }
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &pubky_switch_core::records::AppCert,
+        own: &pubky_switch_core::records::AppCert,
+    ) -> Result<(), String> {
+        self.inner.check_scopes(message, sender, own)
+    }
+    fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+        self.inner.accepts(cert)
+    }
+    fn check_body(
+        &self,
+        message: &pubky_switch_client::app::ReceivedMessage,
+    ) -> Result<(), String> {
+        self.inner.check_body(message)
+    }
+    fn receive(
+        &self,
+        message: &pubky_switch_client::app::ReceivedMessage,
+        cx: &mut pubky_switch_client::app::ReceiveContext<'_>,
+    ) -> pubky_switch_client::app::Outcome {
+        use pubky_switch_client::app::{Effect, LocalWrite, Outcome, StoreFailure};
+        if self.hold_receive && self.held.load(Ordering::Relaxed) {
+            return Outcome::Retry(StoreFailure::unavailable(
+                pubky_switch_client::error::StoreError::Unavailable,
+            ));
+        }
+        match cx.sender_disposition(&message.sender) {
+            Ok(standing) => Outcome::Apply(Effect {
+                ops: Vec::new(),
+                local: vec![LocalWrite::Put {
+                    key: b"blocked".to_vec(),
+                    value: vec![u8::from(standing.blocked)],
+                }],
+            }),
+            Err(error) => Outcome::Drop {
+                reason: error.to_string(),
+            },
+        }
+    }
+    fn resend_needed(
+        &self,
+        needed: &pubky_switch_client::app::ResendNeeded,
+    ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+    {
+        self.inner.resend_needed(needed)
+    }
+    fn missed(
+        &self,
+        missed: &pubky_switch_client::app::MissedEntries,
+    ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+    {
+        if !self.hold_receive && self.held.load(Ordering::Relaxed) {
+            return Err(pubky_switch_client::app::StoreFailure::unavailable(
+                pubky_switch_client::error::StoreError::Unavailable,
+            ));
+        }
+        self.inner.missed(missed)
+    }
+
+    fn deny_list_changed(
+        &self,
+        change: &pubky_switch_client::app::DenyListChange,
+    ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+    {
+        self.deny_changes.fetch_add(1, Ordering::Relaxed);
+        Ok(self.notice(b"deny", u8::from(change.added)))
+    }
+
+    fn deny_list_gap(
+        &self,
+        _: &pubky_switch_client::app::DenyListGap,
+    ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+    {
+        Ok(self.notice(b"gap", 1))
+    }
+}
 
 /// `tasks` and `chat`, in that order.
 fn both() -> (Arc<TestProtocol>, Arc<TestProtocol>) {
@@ -220,4 +346,393 @@ pub async fn two_protocols(world: &World) -> FlowResult {
         return Err("each protocol takes its own message after the restore, once".into());
     }
     Ok(())
+}
+
+/// A deny change waits while either protocol still holds an earlier message. Both
+/// messages observe the sender's standing before the change (Switch spec 8.3).
+///
+/// # Errors
+///
+/// When an earlier message sees the later deny, or an ordinary operation fails.
+pub async fn protocol_deny_barrier(world: &World) -> FlowResult {
+    Box::pin(ordered_deny(world, false)).await
+}
+
+/// An entry already handed to a protocol may be retried after a later deny change,
+/// observing the current deny copy on that retry (Switch spec 8.2, 8.3).
+///
+/// # Errors
+///
+/// When a retry observes the earlier copy, or an ordinary operation fails.
+pub async fn protocol_retry_after_deny(world: &World) -> FlowResult {
+    Box::pin(ordered_deny(world, true)).await
+}
+
+async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
+    let limits = pubky_switch::limits::Limits {
+        quota_bytes: if retry { 64 * 1024 * 1024 } else { 8 * 1024 },
+        sender_share_percent: 100,
+        ..pubky_switch::limits::Limits::default()
+    };
+    world
+        .add_switch_with(ORIGIN, &[&alice, &bob], limits)
+        .await?;
+    let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
+    let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
+    let tasks = Arc::new(OrderedProtocol {
+        inner: sample_protocol(TASKS),
+        held: AtomicBool::new(true),
+        hold_receive: retry,
+        deny_changes: AtomicUsize::new(0),
+        local_bytes: 0,
+    });
+    let chat = Arc::new(OrderedProtocol {
+        inner: sample_protocol(CHAT),
+        held: AtomicBool::new(false),
+        hold_receive: retry,
+        deny_changes: AtomicUsize::new(0),
+        local_bytes: 0,
+    });
+    let protocols = ProtocolSet::new(vec![tasks.clone(), chat.clone()])?;
+    let mut wallet = Box::pin(joined_with_both(
+        world,
+        &alice,
+        &mut alice_signer,
+        "wallet",
+        protocols,
+    ))
+    .await?;
+    let (manager_tasks, manager_chat) = both();
+    let mut manager = Box::pin(joined_with_both(
+        world,
+        &alice,
+        &mut alice_signer,
+        "manager",
+        set_of(&manager_tasks, &manager_chat)?,
+    ))
+    .await?;
+    let (shop_tasks, shop_chat) = both();
+    let mut shop = Box::pin(joined_with_both(
+        world,
+        &bob,
+        &mut bob_signer,
+        "shop",
+        set_of(&shop_tasks, &shop_chat)?,
+    ))
+    .await?;
+    wallet.add_contact(&bob.public()).await?;
+    wallet.receive(None).await?;
+    if !retry {
+        for _ in 0..8 {
+            let mut body = serde_json::Map::new();
+            body.insert("text".into(), json!("x".repeat(1000)));
+            shop.send(OutgoingMessage::new(
+                alice.public(),
+                &format!("{CHAT}.item"),
+                body,
+            ))
+            .await?;
+            manager.receive(None).await?;
+            manager.flush_cursor().await?;
+            world.advance_ms(STEP_MS);
+        }
+        wallet.receive(None).await?;
+        if wallet.owed_protocol_calls().await? == 0 {
+            return Err("inbox pressure did not leave the missed callback owed".into());
+        }
+    }
+    for name in [TASKS, CHAT] {
+        shop.send(OutgoingMessage::new(
+            alice.public(),
+            &format!("{name}.item"),
+            serde_json::Map::new(),
+        ))
+        .await?;
+        world.advance_ms(STEP_MS);
+    }
+    manager.deny(&bob.public()).await?;
+    wallet.receive(None).await?;
+    if chat.deny_changes.load(Ordering::Relaxed) != usize::from(retry) {
+        return Err("a deny callback crossed the first-delivery barrier".into());
+    }
+    if wallet.protocol_get(TASKS, b"blocked").await?.is_some()
+        || wallet.protocol_get(CHAT, b"blocked").await? != Some(vec![0])
+    {
+        return Err("the ready protocol did not take its earlier message".into());
+    }
+    tasks.held.store(false, Ordering::Relaxed);
+    wallet.receive(None).await?;
+    if tasks.deny_changes.load(Ordering::Relaxed) != 1
+        || chat.deny_changes.load(Ordering::Relaxed) != 1
+    {
+        return Err("the deny change was not handed once to each protocol".into());
+    }
+    for name in [TASKS, CHAT] {
+        let expected = u8::from(retry && name == TASKS);
+        if wallet.protocol_get(name, b"blocked").await? != Some(vec![expected]) {
+            return Err("a protocol observed the wrong deny copy".into());
+        }
+    }
+    world.outcome(
+        "the protocols observed the deny copy",
+        &json!({"tasks_blocked": retry, "chat_blocked": false}),
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Backend, run_here};
+
+    async fn collection_policy_owner(world: &World) -> FlowResult {
+        use pubky_switch_client::app::{AppError, Collection, OpBatch, RecordTarget, Refusal};
+        use pubky_switch_client::testing::ProtocolSpec;
+        use pubky_switch_core::ident::Policy;
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let protocols = ProtocolSet::new(
+            [TASKS, CHAT]
+                .into_iter()
+                .map(|name| {
+                    Arc::new(TestProtocol::new(ProtocolSpec {
+                        name: name.to_owned(),
+                        keyed_scopes: vec![name.to_owned()],
+                        accepts: vec![format!("{name}.item")],
+                        collections: vec![Collection::new(
+                            &format!("{name}.list"),
+                            Policy::new(name, &[name]),
+                        )],
+                    })) as Arc<dyn pubky_switch_client::app::Protocol>
+                })
+                .collect(),
+        )?;
+        let mut wallet = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut signer,
+            "wallet",
+            protocols,
+        ))
+        .await?;
+        let target = RecordTarget::new(
+            Collection::new("tasks.list", Policy::new(CHAT, &[CHAT])),
+            b"different-policy",
+        );
+        let (_, write) = wallet.record_op(&target, Some(b"{}"), vec![]).await?;
+        match wallet
+            .submit_batch(OpBatch::for_protocol(CHAT).op(write))
+            .await
+        {
+            Err(AppError::Refused(Refusal::Usage(_))) => Ok(()),
+            other => Err(format!("foreign collection write was not refused: {other:?}").into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_collection_owner_uses_its_id_on_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, collection_policy_owner)).await;
+        let service = Box::pin(run_here(Backend::Service, collection_policy_owner)).await;
+        assert!(
+            scripted.is_ok() && service.is_ok(),
+            "scripted={scripted:?}; service={service:?}"
+        );
+    }
+
+    async fn callback_batches(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let protocols: Vec<_> = [
+            TASKS, CHAT, "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+        ]
+        .into_iter()
+        .map(|name| {
+            Arc::new(OrderedProtocol {
+                inner: sample_protocol(name),
+                held: AtomicBool::new(false),
+                hold_receive: false,
+                deny_changes: AtomicUsize::new(0),
+                local_bytes: pubky_switch_client::app::MAX_STEP_LOCAL_BYTES,
+            })
+        })
+        .collect();
+        let set = ProtocolSet::new(
+            protocols
+                .iter()
+                .map(|p| p.clone() as Arc<dyn pubky_switch_client::app::Protocol>)
+                .collect(),
+        )?;
+        let mut wallet =
+            Box::pin(joined_with_both(world, &alice, &mut signer, "wallet", set)).await?;
+        let (tasks, chat) = both();
+        let mut manager = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut signer,
+            "manager",
+            set_of(&tasks, &chat)?,
+        ))
+        .await?;
+        manager.deny(&[83; 32]).await?;
+        wallet.receive(None).await?;
+        for protocol in protocols {
+            let name = pubky_switch_client::app::Protocol::name(protocol.as_ref());
+            for key in [b"gap".as_slice(), b"deny".as_slice()] {
+                if wallet.protocol_get(&name, key).await? != Some(vec![1]) {
+                    return Err("a valid callback did not commit its local writes".into());
+                }
+            }
+            if protocol.deny_changes.load(Ordering::Relaxed) != 1 {
+                return Err("a completed callback was handed again".into());
+            }
+        }
+        world.outcome(
+            "all valid callbacks completed",
+            &json!({"protocols": 9, "local_bytes": pubky_switch_client::app::MAX_STEP_LOCAL_BYTES}),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_callback_batches_run_on_the_calling_thread_at_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, callback_batches))
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(service) = Box::pin(run_here(Backend::Service, callback_batches))
+            .await
+            .unwrap()
+        else {
+            return;
+        };
+        let verdict = crate::compare::judge(
+            "protocol callback batches",
+            crate::compare::differences(&service, &scripted),
+            crate::allowed::ALLOWED,
+        );
+        assert!(verdict.agrees(), "{verdict}");
+    }
+
+    async fn gap_replacement(world: &World) -> FlowResult {
+        use pubky_switch_client::app::AppError;
+        use pubky_switch_client::error::StoreError;
+        use pubky_switch_client::store::{Fault, FaultStore};
+
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
+        let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
+        let tasks = Arc::new(OrderedProtocol {
+            inner: sample_protocol(TASKS),
+            held: AtomicBool::new(false),
+            hold_receive: false,
+            deny_changes: AtomicUsize::new(0),
+            local_bytes: 0,
+        });
+        let protocols = ProtocolSet::new(vec![tasks.clone(), sample_protocol(CHAT)])?;
+        let store = Arc::new(FaultStore::new(Arc::new(MemoryStore::new()), Fault::None));
+        let asking = Asking::for_scopes(world.app_keys(&alice, "wallet")?, &[TASKS, CHAT])?;
+        let request = alice_signer.review(asking.request.signed(), &asking.auth)?;
+        let approved = alice_signer.approve(request).await?;
+        alice_signer.claim_delivered(&approved.request).await?;
+        world.advance_ms(STEP_MS);
+        let mut wallet = Box::pin(App::join(
+            world.app_env(store.clone()),
+            protocols.clone(),
+            AppConfig::default(),
+            asking.join_request(alice.public(), &approved)?,
+        ))
+        .await?;
+        let (manager_tasks, manager_chat) = both();
+        let mut manager = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut alice_signer,
+            "manager",
+            set_of(&manager_tasks, &manager_chat)?,
+        ))
+        .await?;
+        let (shop_tasks, shop_chat) = both();
+        let mut shop = Box::pin(joined_with_both(
+            world,
+            &bob,
+            &mut bob_signer,
+            "shop",
+            set_of(&shop_tasks, &shop_chat)?,
+        ))
+        .await?;
+        wallet.add_contact(&bob.public()).await?;
+        wallet.receive(None).await?;
+        wallet.allow_list().await?;
+        // The message precedes the deny in the feed, but the gap reads the newer list.
+        shop.send(OutgoingMessage::new(
+            alice.public(),
+            &format!("{TASKS}.item"),
+            serde_json::Map::new(),
+        ))
+        .await?;
+        world.advance_ms(STEP_MS);
+        manager.deny(&bob.public()).await?;
+        store.fail_put_once(b"lc/lists_at");
+        if !matches!(
+            wallet.receive(None).await,
+            Err(AppError::Store(StoreError::Unavailable))
+        ) {
+            return Err("the replacement did not reach its failed commit".into());
+        }
+        wallet = App::load(
+            world.app_env(store.inner()),
+            protocols,
+            AppConfig::default(),
+            wallet.app_id(),
+        )
+        .await?;
+        wallet.receive(None).await?;
+        let blocked = wallet.protocol_get(TASKS, b"blocked").await?;
+        if blocked != Some(vec![1]) {
+            return Err("a message used the obsolete baseline after gap completion".into());
+        }
+        world.outcome(
+            "the message observed the refreshed baseline",
+            &json!({"blocked": true}),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_gap_replacement_runs_on_the_calling_thread_at_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, gap_replacement))
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(service) = Box::pin(run_here(Backend::Service, gap_replacement))
+            .await
+            .unwrap()
+        else {
+            return;
+        };
+        let verdict = crate::compare::judge(
+            "protocol gap replacement",
+            crate::compare::differences(&service, &scripted),
+            crate::allowed::ALLOWED,
+        );
+        assert!(verdict.agrees(), "{verdict}");
+    }
+
+    #[tokio::test]
+    async fn test_protocol_deny_flows_run_on_the_calling_thread() {
+        for backend in [Backend::Scripted, Backend::Service] {
+            Box::pin(run_here(backend, protocol_deny_barrier))
+                .await
+                .unwrap();
+            Box::pin(run_here(backend, protocol_retry_after_deny))
+                .await
+                .unwrap();
+        }
+    }
 }

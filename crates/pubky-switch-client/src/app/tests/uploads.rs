@@ -21,6 +21,7 @@ use crate::app::{
     AppEvent, ClaimOp, MAX_RECORD_MARKS, ObligationDeadline, RECORD_REREADS_PER_READ, RecordTarget,
     UserConfirmed,
 };
+use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
 
 /// An app of another identity's apps, the uploader the tests name.
@@ -1030,6 +1031,78 @@ async fn test_upload_divergence_marked_and_cleared_in_one_commit_is_told_after_a
     let events = app.take_events();
     assert_eq!(divergent_ids(&events, key).len(), 1, "{events:?}");
     assert!(events.iter().all(AppEvent::is_duty), "{events:?}");
+}
+
+#[tokio::test]
+async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag() {
+    Box::pin(async {
+        for fault in [StoreFault::FailBefore(1), StoreFault::FailAfter(1)] {
+            for failing_scan in 0..=2 {
+                let store = Arc::new(MemoryStore::new());
+                let w = World::new();
+                let router = super::moves::Router::of(&w);
+                let protocol = Arc::new(super::moves::LossProtocol::default());
+                let (app, key) = holding_a_record(&w, &router, &store, &protocol).await;
+                let id = app.app_id();
+                drop(app);
+                let faulty = Arc::new(FaultStore::new(
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                    fault,
+                ));
+                let mut app = App::load(
+                    router.env(&w, Arc::clone(&faulty) as Arc<dyn StateStore>),
+                    Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+                    World::config(),
+                    id,
+                )
+                .await
+                .unwrap();
+                let mut tx = app.tx().unwrap();
+                app.note_divergent(&key, true, &mut tx).await.unwrap();
+                app.note_divergent(&key, false, &mut tx).await.unwrap();
+                assert!(app.commit(tx).await.is_err());
+                let kept = app.kept_duties().await.unwrap();
+                assert_eq!(
+                    kept.len(),
+                    usize::from(matches!(fault, StoreFault::FailAfter(_)))
+                );
+                faulty.fail_scan(b"duty/", failing_scan);
+                assert!(
+                    app.pending_duty_events().await.is_err(),
+                    "{fault:?}, scan {failing_scan}"
+                );
+                assert_eq!(app.duty_handed, 0);
+                for _ in 0..2 {
+                    assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                    assert!(!app.reload);
+                    assert_eq!(app.duty_handed, 0);
+                }
+                assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+                faulty.fail_put_once(b"p/");
+                let writes = [LocalWrite::Put {
+                    key: b"pause".to_vec(),
+                    value: vec![1],
+                }];
+                assert!(app.protocol_commit(&writes).await.is_err());
+                assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                assert!(!app.reload);
+                assert_eq!(app.protocol_get(b"pause").await.unwrap(), None);
+                assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+                assert_eq!(app.duty_handed, 0);
+                let ids = divergent_ids(&kept, key);
+                if let Some(id) = ids.first() {
+                    app.ack_events(*id).await.unwrap();
+                    assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                }
+                assert_eq!(app.take_events(), kept);
+                if let Some(id) = ids.first() {
+                    app.ack_events(*id).await.unwrap();
+                }
+                assert!(app.pending_duty_events().await.unwrap().is_empty());
+            }
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

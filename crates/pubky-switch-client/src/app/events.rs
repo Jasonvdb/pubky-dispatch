@@ -23,6 +23,15 @@
 //! therefore tolerate a duty event seen twice, and act on it only once they have kept what
 //! it says, then acknowledge it.
 //!
+//! A protocol that needs to inspect durable observations before acting can call
+//! [`super::App::pending_duty_events`]. It returns the kept duties by ascending ID after
+//! any automatic reload owed by a failed commit. It leaves report delivery and
+//! acknowledgement eligibility unchanged. The host still receives each duty through a
+//! call's report, [`super::App::take_events`] or [`super::App::unacknowledged_events`],
+//! keeps what it says, and acknowledges only after handling every duty through that ID.
+//! Unlike inspection, `unacknowledged_events` hands over the kept duties and removes them
+//! from the next report. Neither operation acknowledges them or adds a stored queue.
+//!
 //! Every other event is informational: kept in memory only, and shown once.
 //!
 //! Nothing in the app bounds the stored duty events: only the host's acknowledgements

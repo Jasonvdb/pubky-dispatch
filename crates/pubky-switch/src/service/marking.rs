@@ -2,7 +2,7 @@
 //! 10, "Accounts and marks", Tables 1 to 3; Switch spec 6.5).
 //!
 //! Every request reads the identity's account, its mark, the erasure's record and the
-//! retirements, and [`verdict::judge`] gives the verdict: at step 2, from the lookup before
+//! selected retirement, and [`verdict::judge`] gives the verdict: at step 2, from the lookup before
 //! the account's lock, and again under the lock before the endpoint, since the state may have
 //! changed while the request waited. [`verdict::answer`] gives what the request gets and the
 //! key it is signed with. The notice, the not-hosted `404` and the `503` of an unknown verdict
@@ -37,7 +37,6 @@ const MARK_REFUSALS_LOGGED: usize = 1024;
 #[derive(Clone, Debug)]
 pub(super) struct MarkInputs {
     mark: MarkInput,
-    retired: Vec<u64>,
     erasure_at_ms: Option<u64>,
 }
 
@@ -150,7 +149,7 @@ impl Service {
         )
     }
 
-    /// Read `identity`'s mark, the erasure's record and the retirements, before the state
+    /// Read `identity`'s mark and the erasure's record before the state
     /// they are judged with: a mark moves only after the head it names is committed, so a
     /// state read after its mark is at the mark or past it, unless state was lost (Switch
     /// wire 7.3, "Moving it"). A store that can't be read leaves the verdict unknown.
@@ -164,15 +163,6 @@ impl Service {
                 MarkInput::StoreUnreadable
             }
         };
-        let retired = match self.marks.retired(identity).await {
-            Ok(retired) => retired,
-            Err(MarkStoreError::InvalidIdentity) => Vec::new(),
-            Err(failure) => {
-                tracing::error!(%failure, "reading the retirements");
-                mark = MarkInput::StoreUnreadable;
-                Vec::new()
-            }
-        };
         let erasure_at_ms = match self.marks.erasure(identity).await {
             Ok(at) => at,
             Err(failure) => {
@@ -183,7 +173,6 @@ impl Service {
         };
         MarkInputs {
             mark,
-            retired,
             erasure_at_ms,
         }
     }
@@ -197,7 +186,8 @@ impl Service {
     }
 
     /// Judge `identity`'s `account` with `inputs`, read before the account was (Switch wire
-    /// 7.3, Table 1). A stub that can't be read is a store that can't be read: the verdict
+    /// 7.3, Table 1). Read the selected retirement once its generation is known. A stub
+    /// or retirement that can't be read is a store that can't be read: the verdict
     /// is unknown.
     pub(super) async fn judge_with(
         &self,
@@ -207,9 +197,25 @@ impl Service {
     ) -> Judged {
         let MarkInputs {
             mut mark,
-            retired,
             erasure_at_ms,
         } = inputs;
+        // Table 1 selects exactly one retirement: the mark's generation, or the
+        // account's when the mark is lost. No unrelated generation affects this verdict.
+        let generation = match &mark {
+            MarkInput::Mark(held) => Some(held.generation),
+            _ => account.map(|held| held.generation()),
+        };
+        let mut retired = None;
+        if let Some(generation) = generation {
+            match self.marks.is_retired(identity, generation).await {
+                Ok(true) => retired = Some(generation),
+                Ok(false) | Err(MarkStoreError::InvalidIdentity) => {}
+                Err(failure) => {
+                    tracing::error!(%failure, "reading the retirement");
+                    mark = MarkInput::StoreUnreadable;
+                }
+            }
+        }
         // The stub at the mark's generation and `seq`, where the state is past the mark,
         // whatever the state's generation (Switch wire 7.3 under Table 1).
         let mut stub_at_mark = None;
@@ -232,7 +238,7 @@ impl Service {
             mark: &mark,
             stub_at_mark,
             erasure_at_ms,
-            retired: &retired,
+            retired: retired.as_slice(),
             current_key: verdict_key(self),
         });
         Judged {

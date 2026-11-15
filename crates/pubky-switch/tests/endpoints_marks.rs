@@ -1279,3 +1279,85 @@ async fn test_marks_live_missing_record_refuses_a_write() {
 async fn test_marks_live_corrupt_record_refuses_a_write() {
     live_record_loss(true, true).await;
 }
+
+#[tokio::test]
+async fn test_marks_verdict_reads_the_selected_retirement() {
+    let Some(replay) = replay().await else { return };
+    let (_, base) = served(&replay).await;
+    let identity = alice_id();
+    replay
+        .marks
+        .retire(&identity, 2)
+        .await
+        .expect("other generation");
+    let retired_dir = accounts_dir(&replay).join("retired");
+    std::fs::write(retired_dir.join(format!("{identity}.2")), b"invalid")
+        .expect("other generation corrupt");
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    assert_eq!(answer.status, 200, "an unselected generation is not read");
+    assert!(header_text(&answer, header::HEAD).is_some());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    replay
+        .marks
+        .retire(&identity, 1)
+        .await
+        .expect("selected generation");
+    for lose_mark in [false, true] {
+        if lose_mark {
+            std::fs::remove_file(mark_file(&replay)).expect("lose mark");
+        }
+        let answer = Box::pin(replay.service.handle(apps_read(base))).await;
+        assert_eq!(
+            (answer.status, code(&answer).as_str()),
+            (503, "recovery_required")
+        );
+        assert_eq!(
+            body(&answer)["current"]["permanent"],
+            true,
+            "mark generation or account generation"
+        );
+    }
+    std::fs::write(retired_dir.join(format!("{identity}.1")), b"invalid")
+        .expect("selected generation corrupt");
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert_signed_without_head_at(&replay, &answer, &sent, base);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_unrelated_erasure_loss_leaves_account_serving() {
+    let Some(replay) = replay().await else { return };
+    let (_, base) = served(&replay).await;
+    replay
+        .marks
+        .record_erasure(&bob_id(), 100)
+        .await
+        .expect("other account erasure");
+    std::fs::remove_file(accounts_dir(&replay).join("erasures").join(bob_id()))
+        .expect("lose other record");
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    assert_eq!(answer.status, 200);
+    assert!(header_text(&answer, header::HEAD).is_some());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    let request = wallet_batch(&replay, &[3, 4]);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    assert_eq!(answer.status, 200);
+    assert!(header_text(&answer, header::HEAD).is_some());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    assert!(
+        replay.marks.erasures().await.is_err(),
+        "aggregate checks every record"
+    );
+    replay.db.drop_database().await.expect("drop");
+}

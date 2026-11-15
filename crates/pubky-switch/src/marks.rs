@@ -217,6 +217,14 @@ impl std::fmt::Debug for MarkStore {
     }
 }
 
+/// Routine calls read only the identity's records. Enumeration and maintenance validate
+/// the complete store (Switch wire 7.3, Table 1).
+#[derive(Clone, Copy)]
+enum RecordScope<'a> {
+    Identity(&'a str),
+    All,
+}
+
 struct Inner {
     /// The key store's directory.
     root: PathBuf,
@@ -548,7 +556,29 @@ impl MarkStore {
         blocking(move || inner.retire_sync(gate.as_ref(), &identity, generation)).await
     }
 
-    /// The identity's retired generations, ascending.
+    /// Whether `generation` is retired for `identity`, reading that record now. A pending
+    /// retirement whose directory sync failed does not count until a sync succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The store or this identity's record cannot be read; [`MarkStoreError::InvalidIdentity`].
+    pub async fn is_retired(
+        &self,
+        identity: &str,
+        generation: u64,
+    ) -> Result<bool, MarkStoreError> {
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            inner.reading(RecordScope::Identity(&identity), |_| {
+                inner.retirement(&identity, generation)
+            })
+        })
+        .await
+    }
+
+    /// The identity's retired generations, ascending, after validating the complete
+    /// ledgers. A verdict uses [`MarkStore::is_retired`] for its selected generation.
     ///
     /// # Errors
     ///
@@ -557,7 +587,7 @@ impl MarkStore {
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.reading(|_| {
+            inner.reading(RecordScope::All, |_| {
                 Ok(inner
                     .retired
                     .lock()
@@ -578,7 +608,7 @@ impl MarkStore {
     /// identity.
     pub async fn list(&self) -> Result<Vec<String>, MarkStoreError> {
         let inner = self.inner.clone();
-        blocking(move || inner.reading(|_| list_marks(&inner.marks_dir()))).await
+        blocking(move || inner.reading(RecordScope::All, |_| list_marks(&inner.marks_dir()))).await
     }
 
     /// Record, durably, that `identity`'s account is erased at `erased_at_ms` (Switch wire
@@ -634,7 +664,12 @@ impl MarkStore {
             return Ok(None);
         };
         let inner = self.inner.clone();
-        blocking(move || inner.reading(|_| Ok(inner.erasures.lock().get(&identity).copied()))).await
+        blocking(move || {
+            inner.reading(RecordScope::Identity(&identity), |_| {
+                Ok(inner.erasures.lock().get(&identity).copied())
+            })
+        })
+        .await
     }
 
     /// Every erasure's record the store holds: each identity, with the time of its latest
@@ -646,7 +681,7 @@ impl MarkStore {
     pub async fn erasures(&self) -> Result<Vec<(String, u64)>, MarkStoreError> {
         let inner = self.inner.clone();
         blocking(move || {
-            inner.reading(|_| {
+            inner.reading(RecordScope::All, |_| {
                 let mut all: Vec<(String, u64)> = inner
                     .erasures
                     .lock()
@@ -888,7 +923,6 @@ impl Inner {
         let known = self.store_id.lock().clone();
         if let Some(id) = known {
             self.confirm_store(&id)?;
-            self.confirm_records()?;
             return Ok(id);
         }
         // An earlier process, or an earlier call, may have landed a rename or a removal
@@ -917,7 +951,7 @@ impl Inner {
 
     /// Compare live ledgers with the durable values and exact writes still awaiting a
     /// sync. Missing, malformed or replaced records make this store unknown (wire 7.3).
-    fn confirm_records(&self) -> Result<(), MarkStoreError> {
+    fn confirm_all_records(&self) -> Result<(), MarkStoreError> {
         let mut expected_retired = self.retired.lock().clone();
         let mut expected_erasures = self.erasures.lock().clone();
         let pending = self.pending.lock();
@@ -960,13 +994,68 @@ impl Inner {
         Ok(())
     }
 
+    /// Check the record this identity's verdict uses, without walking other identities.
+    /// A directory sync still covers all known pending changes in that directory.
+    fn confirm_records(&self, scope: RecordScope<'_>) -> Result<(), MarkStoreError> {
+        let RecordScope::Identity(identity) = scope else {
+            return self.confirm_all_records();
+        };
+        let path = self.erasures_dir().join(identity);
+        let bytes = read_record_file(&path, MAX_ERASURE_FILE)?;
+        let pending = self.pending.lock().get(&path).cloned();
+        let expected = match &pending {
+            Some(bytes) => bytes.clone(),
+            None => self
+                .erasures
+                .lock()
+                .get(identity)
+                .map(|at| at.to_string().into_bytes()),
+        };
+        if bytes != expected {
+            return Err(MarkStoreError::StoreUnreadable(
+                "an erasure record changed".into(),
+            ));
+        }
+        if pending.is_some() {
+            // An uncertain erasure intent counts only after its durability barrier.
+            self.sync_dir(&self.erasures_dir())?;
+        }
+        Ok(())
+    }
+
+    /// Table 1 consults the mark's generation, or the account's when its mark is lost.
+    /// Never replace an observed one-way retirement with absence or an unexpected file.
+    fn retirement(&self, identity: &str, generation: u64) -> Result<bool, MarkStoreError> {
+        let path = self.retired_path(identity, generation);
+        let bytes = read_record_file(&path, 0)?;
+        let retired = self
+            .retired
+            .lock()
+            .get(identity)
+            .is_some_and(|held| held.contains(&generation));
+        let expected = self
+            .pending
+            .lock()
+            .get(&path)
+            .cloned()
+            .unwrap_or_else(|| retired.then(Vec::new));
+        if bytes != expected {
+            return Err(MarkStoreError::StoreUnreadable(
+                "a retirement record changed".into(),
+            ));
+        }
+        Ok(retired)
+    }
+
     /// Serialize live reads with file changes and publication of their durability.
     fn reading<T>(
         &self,
+        scope: RecordScope<'_>,
         read: impl FnOnce(&str) -> Result<T, MarkStoreError>,
     ) -> Result<T, MarkStoreError> {
         let _writes = self.writes.lock();
         let id = self.readable_locked()?;
+        self.confirm_records(scope)?;
         read(&id)
     }
 
@@ -975,6 +1064,7 @@ impl Inner {
     fn writing<T>(
         &self,
         gate: Option<&LockFreshness>,
+        scope: RecordScope<'_>,
         write: impl FnOnce(&str) -> Result<T, MarkStoreError>,
     ) -> Result<T, MarkStoreError> {
         #[cfg(test)]
@@ -983,6 +1073,7 @@ impl Inner {
         }
         let _writes = self.writes.lock();
         let id = self.readable_locked()?;
+        self.confirm_records(scope)?;
         if gate.is_some_and(|freshness| !freshness.is_fresh()) {
             return Err(MarkStoreError::LockStale);
         }
@@ -1002,22 +1093,28 @@ impl Inner {
         let bytes = read_record_file(&path, MAX_MARK_FILE)?;
         let observed = mark_from_bytes(bytes.as_deref());
         let mut marks = self.marks.lock();
-        if let Some(held) = marks.get(identity) {
+        let read = if let Some(held) = marks.get(identity) {
             if self
                 .pending
                 .lock()
                 .get(&path)
                 .is_some_and(|pending| *pending == bytes)
             {
-                return Ok(*held);
+                *held
+            } else {
+                match observed {
+                    MarkRead::Mark(_) if observed != *held => MarkRead::NotAMark,
+                    other => other,
+                }
             }
-            return Ok(match observed {
-                MarkRead::Mark(_) if observed != *held => MarkRead::NotAMark,
-                other => other,
-            });
+        } else {
+            marks.insert(identity.to_string(), observed);
+            observed
+        };
+        if let MarkRead::Mark(mark) = read {
+            self.retirement(identity, mark.generation)?;
         }
-        marks.insert(identity.to_string(), observed);
-        Ok(observed)
+        Ok(read)
     }
 
     /// Whether an erasure's record covers an account of `identity` created at
@@ -1031,7 +1128,9 @@ impl Inner {
     }
 
     fn read_sync(&self, identity: &str) -> Result<MarkRead, MarkStoreError> {
-        self.reading(|id| self.load_mark(identity, id))
+        self.reading(RecordScope::Identity(identity), |id| {
+            self.load_mark(identity, id)
+        })
     }
 
     /// Write what `next` makes of the mark held, if anything, durably, then hold it.
@@ -1041,10 +1140,11 @@ impl Inner {
         identity: &str,
         next: impl FnOnce(MarkRead) -> Option<AccountMark>,
     ) -> Result<MarkWrite, MarkStoreError> {
-        self.writing(gate, |id| {
+        self.writing(gate, RecordScope::Identity(identity), |id| {
             let held = self.load_mark(identity, id)?;
             match next(held) {
                 Some(mark) => {
+                    self.retirement(identity, mark.generation)?;
                     self.put_mark(identity, mark)?;
                     Ok(MarkWrite::Written(mark))
                 }
@@ -1069,7 +1169,7 @@ impl Inner {
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
-        self.writing(gate, |id| {
+        self.writing(gate, RecordScope::Identity(identity), |id| {
             let mark = match self.load_mark(identity, id)? {
                 MarkRead::Mark(mark) => mark,
                 held => return Ok(Advance::NoMark(held)),
@@ -1096,6 +1196,7 @@ impl Inner {
                 key,
                 created_at_ms: mark.created_at_ms,
             };
+            self.retirement(identity, moved.generation)?;
             self.put_mark(identity, moved)?;
             Ok(Advance::Moved(moved))
         })
@@ -1107,7 +1208,7 @@ impl Inner {
         identity: &str,
         created_by: Option<u64>,
     ) -> Result<bool, MarkStoreError> {
-        self.writing(gate, |id| {
+        self.writing(gate, RecordScope::Identity(identity), |id| {
             let held = self.load_mark(identity, id)?;
             if let Some(at_ms) = created_by {
                 match held {
@@ -1130,12 +1231,8 @@ impl Inner {
         identity: &str,
         generation: u64,
     ) -> Result<(), MarkStoreError> {
-        self.writing(gate, |_| {
-            let held = self
-                .retired
-                .lock()
-                .get(identity)
-                .is_some_and(|generations| generations.contains(&generation));
+        self.writing(gate, RecordScope::Identity(identity), |_| {
+            let held = self.retirement(identity, generation)?;
             if held {
                 // Memory holds only a retirement whose file is durable.
                 return Ok(());
@@ -1152,7 +1249,7 @@ impl Inner {
         identity: &str,
         erased_at_ms: u64,
     ) -> Result<Option<u64>, MarkStoreError> {
-        self.writing(gate, |_| {
+        self.writing(gate, RecordScope::Identity(identity), |_| {
             let path = self.erasures_dir().join(identity);
             let recorded = read_erasure_file(&path)?;
             let written = if recorded.is_some_and(|recorded| recorded >= erased_at_ms) {
@@ -1177,7 +1274,7 @@ impl Inner {
         erased_at_ms: u64,
         previous: Option<u64>,
     ) -> Result<(), MarkStoreError> {
-        self.writing(gate, |_| {
+        self.writing(gate, RecordScope::Identity(identity), |_| {
             let path = self.erasures_dir().join(identity);
             // Memory holds what the files hold, and a record whose file's removal landed
             // without its directory sync: the retry syncs it.
@@ -1201,7 +1298,7 @@ impl Inner {
         gate: Option<&LockFreshness>,
         before_ms: u64,
     ) -> Result<usize, MarkStoreError> {
-        self.writing(gate, |id| {
+        self.writing(gate, RecordScope::All, |id| {
             let aged: Vec<(String, u64)> = self
                 .erasures
                 .lock()
@@ -2916,14 +3013,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_marks_selected_retirement_checks_live_authority() {
+        for fault in ["missing", "corrupt", "unexpected", "unexpected_zero"] {
+            let (dir, store) = open();
+            let generation = if fault == "unexpected_zero" { 0 } else { 1 };
+            let path = dir
+                .path()
+                .join("accounts/retired")
+                .join(format!("alice.{generation}"));
+            if matches!(fault, "missing" | "corrupt") {
+                store.retire(ALICE, generation).await.expect("record");
+                assert!(store.is_retired(ALICE, generation).await.expect("durable"));
+                if fault == "missing" {
+                    fs::remove_file(&path).expect("remove");
+                } else {
+                    fs::write(&path, b"invalid").expect("corrupt");
+                }
+            } else {
+                assert!(!store.is_retired(ALICE, generation).await.expect("absent"));
+                fs::write(&path, b"").expect("unexpected record");
+            }
+            for _ in 0..2 {
+                assert!(
+                    store.is_retired(ALICE, generation).await.is_err(),
+                    "{fault}"
+                );
+                if generation != 0 {
+                    assert!(store.retire(ALICE, generation).await.is_err(), "{fault}");
+                }
+            }
+            assert!(
+                !store
+                    .is_retired(BOB, generation)
+                    .await
+                    .expect("other identity")
+            );
+            assert!(!store.is_retired(ALICE, 2).await.expect("other generation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_marks_selected_erasure_refuses_unexpected_record() {
+        let (dir, store) = open();
+        assert_eq!(store.erasure(ALICE).await.expect("none"), None);
+        fs::write(dir.path().join("accounts/erasures/alice"), b"100").expect("unexpected record");
+        for _ in 0..2 {
+            assert!(store.erasure(ALICE).await.is_err());
+            assert!(store.record_erasure(ALICE, 200).await.is_err());
+            assert!(store.withdraw_erasure(ALICE, 100, None).await.is_err());
+        }
+        assert_eq!(store.erasure(BOB).await.expect("other identity"), None);
+        assert!(store.erasures().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_marks_selected_retirement_waits_for_sync() {
+        let (dir, store, faults) = open_faulty();
+        let directory = dir.path().join("accounts/retired");
+        faults.lock().fail_sync(&directory, 1);
+        assert!(store.retire(ALICE, 1).await.is_err());
+        assert!(!store.is_retired(ALICE, 1).await.expect("not durable"));
+        store.retire(BOB, 1).await.expect("same directory sync");
+        assert!(store.is_retired(ALICE, 1).await.expect("covered"));
+        let store = crash_and_reopen(&dir, &faults);
+        assert!(
+            store
+                .is_retired(ALICE, 1)
+                .await
+                .expect("durable after crash")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_unrelated_ledger_loss_does_not_stop_an_account() {
+        for ledger in ["retired", "erasures"] {
+            for corrupt in [false, true] {
+                let (dir, store) = open();
+                let mark = with_mark(&store, ALICE, head(1, 4, 4)).await;
+                store.retire(BOB, 1).await.expect("retire other account");
+                store
+                    .record_erasure(BOB, 1_000)
+                    .await
+                    .expect("record other account");
+                let name = if ledger == "retired" { "bob.1" } else { BOB };
+                let path = dir.path().join("accounts").join(ledger).join(name);
+                if corrupt {
+                    fs::write(path, b"invalid").expect("corrupt other record");
+                } else {
+                    fs::remove_file(path).expect("remove other record");
+                }
+                assert_eq!(
+                    store.read(ALICE).await.expect("unaffected mark"),
+                    MarkRead::Mark(mark)
+                );
+                assert_eq!(
+                    store.erasure(ALICE).await.expect("unaffected erasure"),
+                    None
+                );
+                assert_eq!(
+                    store.read("carol").await.expect("missing mark"),
+                    MarkRead::Missing
+                );
+                assert_eq!(store.erasure("carol").await.expect("missing erasure"), None);
+                assert!(matches!(
+                    store
+                        .advance(ALICE, head(1, 5, 5), KEY, 100)
+                        .await
+                        .expect("unaffected write"),
+                    Advance::Moved(_)
+                ));
+                assert!(
+                    store.list().await.is_err(),
+                    "aggregate validates all records"
+                );
+                assert!(
+                    store.erasures().await.is_err(),
+                    "aggregate validates all records"
+                );
+                assert!(
+                    store.retired(BOB).await.is_err(),
+                    "retirement listing validates all records"
+                );
+                assert!(store.forget_erasures_before(2_000).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_marks_unselected_retirement_does_not_stop_an_account() {
+        let (dir, store) = open();
+        let mark = with_mark(&store, ALICE, head(1, 4, 4)).await;
+        store.retire(ALICE, 2).await.expect("other generation");
+        fs::write(dir.path().join("accounts/retired/alice.2"), b"invalid")
+            .expect("corrupt other generation");
+        assert_eq!(
+            store.read(ALICE).await.expect("mark generation"),
+            MarkRead::Mark(mark)
+        );
+        assert_eq!(store.erasure(ALICE).await.expect("erasure"), None);
+        assert!(
+            store.retired(ALICE).await.is_err(),
+            "complete retirement listing"
+        );
+    }
+
+    #[tokio::test]
     async fn test_marks_live_ledger_changes_refuse_reads_and_writes() {
         for ledger in ["retired", "erasures"] {
             for fault in ["missing", "corrupt", "replacement"] {
                 let (dir, store) = open();
                 let mark = with_mark(&store, ALICE, head(1, 4, 4)).await;
                 store.retire(ALICE, 1).await.expect("retire");
-                store.record_erasure(BOB, 1_000).await.expect("record");
-                let name = if ledger == "retired" { "alice.1" } else { BOB };
+                store.record_erasure(ALICE, 1_000).await.expect("record");
+                let name = if ledger == "retired" {
+                    "alice.1"
+                } else {
+                    ALICE
+                };
                 let path = dir.path().join("accounts").join(ledger).join(name);
                 let original = fs::read(&path).expect("original");
                 let replacement = path.with_file_name("alice.2");
@@ -2937,13 +3183,12 @@ mod tests {
                     _ => unreachable!(),
                 }
                 for _ in 0..2 {
-                    let outcomes = vec![
+                    let mut outcomes = vec![
                         store.read(ALICE).await.map(|_| ()),
                         store.retired(ALICE).await.map(|_| ()),
-                        store.erasure(BOB).await.map(|_| ()),
                         store.erasures().await.map(|_| ()),
                         store.list().await.map(|_| ()),
-                        store.create_zero("carol", KEY, 100).await.map(|_| ()),
+                        store.create_zero(ALICE, KEY, 100).await.map(|_| ()),
                         store.take(ALICE, mark, KEY, 200).await.map(|_| ()),
                         store.set_key(ALICE, OTHER_KEY, 100).await.map(|_| ()),
                         store
@@ -2956,11 +3201,17 @@ mod tests {
                             .map(|_| ()),
                         store.delete(ALICE).await,
                         store.delete_created_by(ALICE, 100).await.map(|_| ()),
-                        store.retire(ALICE, 2).await,
-                        store.record_erasure(BOB, 2_000).await.map(|_| ()),
-                        store.withdraw_erasure(BOB, 1_000, None).await,
+                        store.retire(ALICE, 1).await,
                         store.forget_erasures_before(2_000).await.map(|_| ()),
                     ];
+                    if ledger == "erasures" {
+                        outcomes.extend([
+                            store.erasure(ALICE).await.map(|_| ()),
+                            store.record_erasure(ALICE, 2_000).await.map(|_| ()),
+                            store.withdraw_erasure(ALICE, 1_000, None).await,
+                        ]);
+                    }
+                    outcomes.push(store.is_retired(ALICE, 1).await.map(|_| ()));
                     assert!(
                         outcomes.iter().all(|outcome| matches!(
                             outcome,
@@ -2975,7 +3226,7 @@ mod tests {
                 fs::write(path, original).expect("restore");
                 assert_eq!(store.read(ALICE).await.expect("mark"), MarkRead::Mark(mark));
                 assert_eq!(store.retired(ALICE).await.expect("retired"), vec![1]);
-                assert_eq!(store.erasure(BOB).await.expect("erasure"), Some(1_000));
+                assert_eq!(store.erasure(ALICE).await.expect("erasure"), Some(1_000));
             }
         }
     }
@@ -3078,7 +3329,7 @@ mod tests {
                     Err(MarkStoreError::StoreUnreadable(_))
                 ));
                 assert!(matches!(
-                    store.erasure(ALICE).await,
+                    store.is_retired(ALICE, 1).await,
                     Err(MarkStoreError::StoreUnreadable(_))
                 ));
             }

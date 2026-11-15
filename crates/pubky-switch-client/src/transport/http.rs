@@ -8,7 +8,8 @@
 //! as another one, such as `127.1`, is refused. The resolver refuses a host with any address
 //! that isn't public and hands the connector only the addresses it checked, at every new
 //! connection, so DNS rebinding can't move a connection to a private address. Redirects
-//! aren't followed.
+//! aren't followed. A path or query the URL parser changes is refused before connecting:
+//! the request target must be exactly the bytes signed (Switch wire 7.1).
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -214,6 +215,13 @@ impl HttpTransport {
             None => reqwest::Url::parse(&request.url())
                 .map_err(|_| TransportError::InvalidRequest("the URL doesn't parse".into()))?,
         };
+        // Cap selection and both signatures use these exact bytes, not a normalized route
+        // or re-encoded query (Switch wire 7.1).
+        if url[url::Position::BeforePath..url::Position::AfterQuery] != request.path_and_query {
+            return Err(TransportError::InvalidRequest(
+                "the URL changes the signed path or query".into(),
+            ));
+        }
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| TransportError::InvalidRequest("the method".into()))?;
         let timeout = call_timeout(&request, self.request_timeout, self.long_timeout);
@@ -345,6 +353,10 @@ impl Transport for HttpTransport {
         Box::pin(self.call(request))
     }
 }
+
+#[cfg(test)]
+#[path = "http_targets.rs"]
+mod target_tests;
 
 #[cfg(test)]
 mod tests {

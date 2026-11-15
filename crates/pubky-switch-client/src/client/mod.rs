@@ -467,6 +467,42 @@ fn stale_timestamp_hint(checked: &Result<CheckedResponse, ClientError>) -> Optio
     }
 }
 
+/// Comparable answers from one call, including its automatic timestamp retry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComparedTimes {
+    pub(crate) first: u64,
+    pub(crate) highest: u64,
+    pub(crate) backwards: Option<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct CallTimes {
+    latest: Option<u64>,
+    compared: Option<ComparedTimes>,
+}
+
+impl CallTimes {
+    fn observe(&mut self, time: Option<u64>) {
+        self.latest = time;
+        let Some(time) = time else { return };
+        match &mut self.compared {
+            Some(held) => {
+                if time < held.highest && held.backwards.is_none() {
+                    held.backwards = Some((held.highest, time));
+                }
+                held.highest = held.highest.max(time);
+            }
+            None => {
+                self.compared = Some(ComparedTimes {
+                    first: time,
+                    highest: time,
+                    backwards: None,
+                })
+            }
+        }
+    }
+}
+
 /// Whether a text is safe as a header value and a path segment: visible ASCII without the
 /// characters a path or query gives meaning to.
 fn is_token(text: &str) -> bool {
@@ -484,7 +520,7 @@ pub struct SwitchClient {
     pinned: Mutex<Option<[u8; 32]>>,
     last_server_time: Mutex<Option<u64>>,
     latest_server_time: Mutex<Option<u64>>,
-    latest_compared_time: Mutex<Option<u64>>,
+    call_times: Mutex<CallTimes>,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
 }
@@ -539,7 +575,7 @@ impl SwitchClient {
             pinned: Mutex::new(pinned_key),
             last_server_time: Mutex::new(None),
             latest_server_time: Mutex::new(None),
-            latest_compared_time: Mutex::new(None),
+            call_times: Mutex::new(CallTimes::default()),
             transport,
             clock,
         })
@@ -615,19 +651,28 @@ impl SwitchClient {
     /// may carry the time base; every other answer carries a time the service stamped, or the
     /// last time it committed for the identity, which no later answer goes behind.
     pub(crate) fn latest_compared_time(&self) -> Option<u64> {
-        *self
-            .latest_compared_time
+        self.call_times
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .latest
+    }
+
+    /// All comparable answers of the call, even if its retry answered an excluded class
+    /// or failed to return a verified answer.
+    pub(crate) fn compared_times(&self) -> Option<ComparedTimes> {
+        self.call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .compared
     }
 
     /// Forget the latest call's times, before a call.
     fn forget_latest(&self) {
         self.set_latest(None);
         *self
-            .latest_compared_time
+            .call_times
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner) = CallTimes::default();
     }
 
     fn set_latest(&self, time: Option<u64>) {
@@ -687,10 +732,10 @@ impl SwitchClient {
             }
             Err(_) => None,
         };
-        *self
-            .latest_compared_time
+        self.call_times
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = compared;
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(compared);
         self.set_latest(time);
         if let Some(time) = time {
             *self

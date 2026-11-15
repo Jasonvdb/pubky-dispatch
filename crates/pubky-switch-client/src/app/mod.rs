@@ -2173,11 +2173,11 @@ impl App {
     }
 
     /// How far apart the device clock and the service's are (Switch spec 10.1), `None`
-    /// before any verified answer.
+    /// before any stamped answer.
     pub fn clock_skew_ms(&self) -> Option<u64> {
         let time = self.state.service_time?;
         let ahead = time.highest_ms.saturating_sub(self.now());
-        Some(time.offset_ms.unsigned_abs().max(ahead))
+        Some(time.offset_ms?.unsigned_abs().max(ahead))
     }
 
     /// Reconciliation finished (Switch spec 12.4 step 2.4): reconcile mode ends, and with it
@@ -2833,6 +2833,9 @@ impl App {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;
         if self.reload {
+            // A refusal's time may still be dirty after a failed commit. Keep it before
+            // replacing memory with the stored state; a second failure stops this call.
+            self.keep_service_time().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
                 &self.env,
@@ -2879,6 +2882,9 @@ impl App {
         if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
             self.clear_erasing().await?;
         }
+        if result.is_err() {
+            self.keep_service_time().await?;
+        }
         match result {
             Ok(value) => Ok(value),
             Err(ClientError::Chain(error)) => Err(self
@@ -2890,31 +2896,44 @@ impl App {
         }
     }
 
-    /// The service time of the latest checked answer (Switch spec 10.1): the highest is
-    /// kept with its key, and the offset of the latest stamped one from the device clock; an
-    /// earlier one from the same key is misbehaviour, returned as the alarm.
+    /// Keep comparison evidence even when a refusal has no other state to commit.
+    async fn keep_service_time(&mut self) -> Result<(), AppError> {
+        if self.service_time_dirty {
+            let tx = self.tx()?;
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Keep every comparable answer, independently of the latest stamped clock sample
+    /// (Switch spec 10.1). The first backward answer of an internal retry also counts.
     fn note_service_time(&mut self) -> Option<Alarm> {
-        // Every checked answer counts in the comparison but those at the time base: a
-        // refusal that committed nothing carries the last time the service committed, which
-        // no later answer goes behind (Switch wire 7.1 Timestamp).
-        let compared = self.client.latest_compared_time()?;
+        let compared = self.client.compared_times()?;
         let key = self.state.meta.service_key;
         let held = self.state.service_time.filter(|held| held.key == key);
-        let alarm = held.filter(|held| compared < held.highest_ms).map(|held| {
-            Alarm::ServiceTimeBackwards {
-                highest: held.highest_ms,
-                signed: compared,
-            }
+        let backwards = held
+            .filter(|held| compared.first < held.highest_ms)
+            .map(|held| (held.highest_ms, compared.first))
+            .or(compared.backwards);
+        let alarm =
+            backwards.map(|(highest, signed)| Alarm::ServiceTimeBackwards { highest, signed });
+        let highest_ms = held.map_or(compared.highest, |held| {
+            held.highest_ms.max(compared.highest)
         });
-        let highest_ms = held.map_or(compared, |held| held.highest_ms.max(compared));
-        // Only a time the latest call stamped measures the clock: the last committed time a
-        // refusal carries may be days old on an idle account (Switch wire 7.1). Such a time
-        // raises the highest one held, and starts none: the first stamped one does.
-        let Some(time) = self.client.latest_server_time() else {
-            if let Some(held) = held
-                && held.highest_ms < highest_ms
-            {
-                self.state.service_time = Some(ServiceTime { highest_ms, ..held });
+        // A headless refusal supplies a lower bound, never a clock-offset sample: on an
+        // idle account its last committed time may be days old (Switch wire 7.1).
+        let stamped = self
+            .client
+            .latest_compared_time()
+            .and(self.client.latest_server_time());
+        let Some(time) = stamped else {
+            let record = ServiceTime {
+                key,
+                highest_ms,
+                offset_ms: held.and_then(|held| held.offset_ms),
+            };
+            if self.state.service_time != Some(record) {
+                self.state.service_time = Some(record);
                 self.service_time_dirty = true;
             }
             return alarm;
@@ -2927,7 +2946,7 @@ impl App {
         let record = ServiceTime {
             key,
             highest_ms,
-            offset_ms: offset,
+            offset_ms: Some(offset),
         };
         if time > now.saturating_add(SERVICE_TIME_AHEAD_MS)
             || offset.unsigned_abs() > CLOCK_TOLERANCE_MS

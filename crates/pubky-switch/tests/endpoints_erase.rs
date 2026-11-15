@@ -3127,3 +3127,64 @@ async fn test_erase_freshness_checked_after_committed_receipt_write() {
 async fn test_erase_freshness_checked_after_rejected_receipt_write() {
     Box::pin(receipt_waits_past_freshness(true)).await;
 }
+
+#[tokio::test]
+async fn test_enroll_waiting_for_unresolved_erasure_changes_nothing() {
+    // An enrollment which already passed step 2 must repeat that judgement after it
+    // waits for the identity lock (Switch wire 7.3, Table 3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let before = rows(&replay, &alice_id()).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    for statement in [
+        "CREATE FUNCTION refuse_queued_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected receipt failure'; END $$",
+        "CREATE TRIGGER refuse_queued_receipt BEFORE INSERT OR UPDATE ON erasure_outcomes FOR EACH ROW EXECUTE FUNCTION refuse_queued_receipt()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("receipt trigger");
+    }
+    let at = revoke_time();
+    set_time(&replay.clock, &at);
+    let enrollment = signer_request("POST", "/v1/enroll", fresh_enrollment(99), ms(&at));
+    // queued holds the account row. The erasure takes the identity lock and waits for
+    // that row before its pending attempt is written. The enrollment passes step 2,
+    // waits for the same identity lock, then wakes after the deletion rolled back.
+    let (erased, enrolled) = queued(
+        &replay,
+        erase(&replay, Some(&held_hash()), &at),
+        replay.service.handle(enrollment),
+    )
+    .await;
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    assert!(
+        replay
+            .key_dir()
+            .join("accounts/erasure-attempts")
+            .join(alice_id())
+            .exists(),
+        "the unresolved attempt remains durable"
+    );
+    assert_eq!(durable_record(&replay), None);
+    let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("receipts");
+    assert_eq!(receipts, 0, "neither outcome receipt committed");
+    let after = rows(&replay, &alice_id()).await;
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        code_of(&enrolled),
+        (503, json!("unavailable")),
+        "an enrollment may not answer an unresolved account"
+    );
+    assert!(no_head(&enrolled));
+    assert_eq!(
+        after, before,
+        "the waiting enrollment commits no account state"
+    );
+}

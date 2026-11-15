@@ -368,6 +368,30 @@ impl Service {
         base_ms: u64,
     ) -> Result<Enrolled, ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let held = txn
+            .held_identity()
+            .await
+            .map_err(|e| store_error(&e))?
+            .map(|held| IdentityDoc::verify(&held.doc, &enrollment.body().identity))
+            .transpose()
+            .map_err(|_| unavailable())?;
+        // The account and its erasure authority may have changed while enrollment waited
+        // for the identity lock. Rejudge before stamping or keeping an enrollment answer
+        // (Switch wire 7.3 step 2, Tables 1-3).
+        let head = txn.head();
+        let account = self.account_input(
+            head.generation,
+            head.chain,
+            head.created_at_ms,
+            held.as_ref().map(IdentityDoc::body),
+        );
+        let judged = self.judge(identity_text, Some(account)).await;
+        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
+        if judged.judgement.decision.erase_account_again
+            || routed.route != (Route::Proceed { head: false })
+        {
+            return Err(unavailable());
+        }
         let time_ms = txn.stamp(base_ms);
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The account's creation time, read under the lock: the mark's, or the account's
@@ -380,13 +404,6 @@ impl Service {
                 return Err(ApiError::unavailable("7.4.1: the mark store can't be read"));
             }
         };
-        let held = txn
-            .held_identity()
-            .await
-            .map_err(|e| store_error(&e))?
-            .map(|held| IdentityDoc::verify(&held.doc, &enrollment.body().identity))
-            .transpose()
-            .map_err(|_| unavailable())?;
         let key = self.current_key();
         let serving = held.as_ref().is_some_and(|doc| {
             doc.inbox().url == self.origin

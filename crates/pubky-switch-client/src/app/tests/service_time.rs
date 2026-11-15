@@ -172,3 +172,413 @@ async fn test_service_time_brought_before_a_change_of_service_isnt_fresh_after_i
     assert_eq!(reads.len(), 1, "{reads:?}");
     assert!(reads[0].ends_with("limit=0"), "{reads:?}");
 }
+
+#[tokio::test]
+async fn test_service_time_restored_headless_refusal_establishes_watermark() {
+    use crate::app::{Alarm, AppError, AppEvent};
+    use crate::error::ClientError;
+    use pubky_switch_core::http::ErrorCode;
+
+    let w = World::new();
+    let original = Box::pin(w.join("wallet")).await;
+    let backup = Box::pin(original.backup()).await.unwrap();
+    let router = Router::of(&w);
+    let mut app = Box::pin(App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.refresh_identity()).await.unwrap();
+    assert!(
+        router.log().is_empty(),
+        "restore and revalidation sent no service call"
+    );
+    assert_eq!(app.highest_service_time(), None);
+    let high = START + 2_000;
+    let low = START + 1_000;
+    w.switch.lock().stamped_ms = high;
+    w.switch.fail_next(Fault::Error {
+        path: "/directory".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    let first = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(
+            first,
+            AppError::Switch(ClientError::Switch {
+                status: 401,
+                code: ErrorCode::BadSignature,
+                ..
+            })
+        ),
+        "first refusal must verify: {first:?}"
+    );
+    assert_eq!(app.client.latest_compared_time(), Some(high));
+    assert_eq!(
+        app.client.latest_server_time(),
+        None,
+        "headless, not a clock-offset sample"
+    );
+    assert!(app.alarm().is_none());
+    assert!(
+        !app.events
+            .iter()
+            .any(|event| matches!(event, AppEvent::ClockSkew { .. }))
+    );
+    assert_eq!(router.log().len(), 1, "{:?}", router.log());
+    assert!(router.log()[0].ends_with("/directory"));
+
+    w.switch.lock().stamped_ms = low;
+    w.switch.fail_next(Fault::Error {
+        path: "/directory".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    let second = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(
+        router.log().len(),
+        2,
+        "no successful call between refusals: {:?}",
+        router.log()
+    );
+    assert_eq!(app.client.latest_compared_time(), Some(low));
+    assert!(
+        matches!(second, AppError::Alarm(Alarm::ServiceTimeBackwards {
+        highest, signed
+    }) if highest == high && signed == low),
+        "a restored app must compare its first verified headless answer: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_service_time_stamped_baseline_detects_headless_refusal() {
+    use crate::app::{Alarm, AppError};
+    use pubky_switch_core::http::ErrorCode;
+
+    let w = World::new();
+    let original = Box::pin(w.join("wallet")).await;
+    let backup = Box::pin(original.backup()).await.unwrap();
+    let router = Router::of(&w);
+    let mut app = Box::pin(App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.refresh_identity()).await.unwrap();
+    assert!(router.log().is_empty());
+    assert_eq!(app.highest_service_time(), None);
+    let high = START + 2_000;
+    let low = START + 1_000;
+    w.clock.set_ms(high);
+    Box::pin(app.receive(None)).await.unwrap();
+    assert_eq!(
+        app.highest_service_time(),
+        Some(high),
+        "stamped baseline established normally"
+    );
+    let before = router.log().len();
+    w.switch.lock().stamped_ms = low;
+    w.switch.fail_next(Fault::Error {
+        path: "/feed".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    let refused = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(router.log().len(), before + 1, "{:?}", router.log());
+    assert_eq!(app.client.latest_compared_time(), Some(low));
+    assert_eq!(app.client.latest_server_time(), None);
+    assert!(
+        matches!(refused, AppError::Alarm(Alarm::ServiceTimeBackwards {
+        highest, signed
+    }) if highest == high && signed == low),
+        "the same refusal must alarm after a stamped baseline: {refused:?}"
+    );
+}
+
+/// A restored app has a pinned service key but no clock sample or time watermark.
+async fn restored(w: &World, router: &Router, store: Arc<dyn StateStore>) -> App {
+    let original = Box::pin(w.join("wallet")).await;
+    let backup = Box::pin(original.backup()).await.unwrap();
+    let mut app = Box::pin(App::restore(
+        router.env(w, store),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.refresh_identity()).await.unwrap();
+    assert_eq!(app.highest_service_time(), None);
+    app
+}
+
+/// Each request gets the next signed refusal, including the client's automatic retry.
+fn refuse_at(
+    w: &World,
+    router: &Router,
+    answers: impl IntoIterator<Item = (u64, pubky_switch_core::http::ErrorCode)>,
+) -> Arc<crate::transport::MockTransport> {
+    let answers = Mutex::new(
+        answers
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let switch = w.switch.clone();
+    let transport = Arc::new(crate::transport::MockTransport::with_handler(
+        move |request| {
+            let (time, code) = answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted refusal");
+            switch.lock().stamped_ms = time;
+            switch.fail_next(Fault::Error {
+                path: request.path_and_query.clone(),
+                code,
+                current: json!({"server_time": pubky_switch_core::time::rfc3339(START)}),
+            });
+            switch.handle(request)
+        },
+    ));
+    router.add_transport(crate::testing::SWITCH_ORIGIN, transport.clone());
+    transport
+}
+
+fn assert_time_alarm(error: crate::app::AppError, highest: u64, signed: u64) {
+    assert!(
+        matches!(error, crate::app::AppError::Alarm(crate::app::Alarm::ServiceTimeBackwards {
+            highest: held, signed: shown
+        }) if held == highest && shown == signed),
+        "expected time alarm ({highest}, {signed}), got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_service_time_first_headless_refusal_survives_load_without_clock_sample() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = Box::pin(restored(&w, &router, store.clone())).await;
+    let id = app.app_id();
+    let high = START + 2_000;
+    let low = START + 1_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::BadSignature),
+            (low, ErrorCode::BadSignature),
+        ],
+    );
+    assert!(Box::pin(app.receive(None)).await.is_err());
+    drop(app);
+    let mut loaded = Box::pin(App::load(
+        router.env(&w, store),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        loaded.highest_service_time(),
+        Some(high),
+        "the first refusal is durable"
+    );
+    assert_eq!(loaded.clock_skew_ms(), None, "no stamped clock sample");
+    Box::pin(loaded.refresh_identity()).await.unwrap();
+    assert_time_alarm(Box::pin(loaded.receive(None)).await.unwrap_err(), high, low);
+    assert_eq!(transport.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_service_time_higher_headless_refusal_survives_error_reload() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = Box::pin(join(&w, &router)).await;
+    assert_eq!(app.highest_service_time(), Some(START));
+    let high = START + 2_000;
+    let low = START + 1_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::BadSignature),
+            (low, ErrorCode::BadSignature),
+        ],
+    );
+    assert!(Box::pin(app.receive(None)).await.is_err());
+    assert_eq!(app.highest_service_time(), Some(high));
+    assert!(app.reload, "the failed receive reloads before the next one");
+    assert_time_alarm(Box::pin(app.receive(None)).await.unwrap_err(), high, low);
+    assert_eq!(transport.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_service_time_retry_compares_both_headless_answers() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = Box::pin(restored(&w, &router, Arc::new(MemoryStore::new()))).await;
+    let high = START + 2_000;
+    let low = START + 1_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::StaleTimestamp),
+            (low, ErrorCode::BadSignature),
+        ],
+    );
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(transport.requests().len(), 2, "the same call retried once");
+    assert_time_alarm(error, high, low);
+}
+
+#[tokio::test]
+async fn test_service_time_retry_cannot_hide_first_backward_answer() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = Box::pin(join(&w, &router)).await;
+    assert_eq!(app.highest_service_time(), Some(START));
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (START - 1_000, ErrorCode::StaleTimestamp),
+            (START + 1_000, ErrorCode::BadSignature),
+        ],
+    );
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(transport.requests().len(), 2);
+    assert_time_alarm(error, START, START - 1_000);
+}
+
+#[tokio::test]
+async fn test_service_time_retry_uncompared_answer_preserves_first_watermark() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = Box::pin(restored(&w, &router, store.clone())).await;
+    let id = app.app_id();
+    let high = START + 2_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::StaleTimestamp),
+            (START, ErrorCode::Unavailable),
+        ],
+    );
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::app::AppError::Switch(crate::error::ClientError::Switch {
+                code: ErrorCode::Unavailable,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(transport.requests().len(), 2);
+    drop(app);
+    let loaded = Box::pin(App::load(
+        router.env(&w, store),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(loaded.highest_service_time(), Some(high));
+    assert_eq!(loaded.clock_skew_ms(), None);
+    assert!(
+        loaded.alarm().is_none(),
+        "the unavailable time does not compare"
+    );
+}
+
+#[tokio::test]
+async fn test_service_time_retry_nondecreasing_headless_answers_are_not_an_alarm() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = Box::pin(join(&w, &router)).await;
+    let high = START + 2_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (START + 1_000, ErrorCode::StaleTimestamp),
+            (high, ErrorCode::BadSignature),
+        ],
+    );
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::app::AppError::Switch(crate::error::ClientError::Switch {
+                code: ErrorCode::BadSignature,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(app.highest_service_time(), Some(high));
+    assert!(app.alarm().is_none());
+}
+
+#[tokio::test]
+async fn test_service_time_failed_watermark_commit_is_retried_before_reload() {
+    use pubky_switch_core::http::ErrorCode;
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let app = Box::pin(restored(&w, &router, store.clone())).await;
+    let id = app.app_id();
+    drop(app);
+    let fault = Arc::new(crate::store::FaultStore::new(
+        store,
+        crate::store::Fault::FailBefore(1),
+    ));
+    let mut app = Box::pin(App::load(
+        router.env(&w, fault.clone()),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.refresh_identity()).await.unwrap();
+    let high = START + 2_000;
+    let low = START + 1_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::BadSignature),
+            (low, ErrorCode::BadSignature),
+        ],
+    );
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(error, crate::app::AppError::Store(_)),
+        "watermark commit must fail: {error:?}"
+    );
+    assert_eq!(fault.commits(), 1);
+    assert_time_alarm(Box::pin(app.receive(None)).await.unwrap_err(), high, low);
+    assert_eq!(transport.requests().len(), 2);
+}

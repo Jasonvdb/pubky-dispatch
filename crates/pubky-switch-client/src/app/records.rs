@@ -1515,10 +1515,7 @@ impl App {
     /// The calls kept for protocols (`owed/`), in feed order, each with the protocols it
     /// names ([`Kept`]).
     pub(crate) async fn kept_calls(&self) -> Result<Vec<Kept>, AppError> {
-        let owed = self
-            .reader()
-            .scan::<super::feed::Owed>(super::state::key::OWED_PREFIX)
-            .await?;
+        let owed = self.owed_calls().await?;
         let mut kept = owed
             .into_iter()
             .map(|(rest, owed)| {

@@ -18,6 +18,9 @@ use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, CHAT, TASKS, sample_protocol};
 use crate::{FlowResult, World};
 
+#[cfg(test)]
+mod retained_authority;
+
 struct OrderedProtocol {
     inner: Arc<TestProtocol>,
     held: AtomicBool,

@@ -5,6 +5,7 @@
 mod callback_batches;
 mod gap_completion;
 mod ownership;
+mod retained_authority;
 
 use std::sync::{Arc, Mutex};
 
@@ -836,29 +837,36 @@ async fn test_protocol_set_restore_refuses_a_layer_of_no_registered_protocol() {
 async fn test_protocol_set_restore_hands_none_to_a_protocol_without_a_layer() {
     let p = Pair::new();
     let (_app, backup) = with_state(&p).await;
-    let only_tasks = edited(&backup, |layers| {
-        layers.retain(|layer| layer["name"] == json!("tasks"));
-    });
+    let news = Arc::new(named("news"));
+    let protocols = ProtocolSet::new(vec![
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        Arc::clone(&p.chat) as Arc<dyn Protocol>,
+        Arc::clone(&news) as Arc<dyn Protocol>,
+    ])
+    .unwrap();
     p.chat.restored.lock().unwrap().clear();
     p.tasks.restored.lock().unwrap().clear();
-    let restored = App::restore(
+    let restored = Box::pin(App::restore(
         p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-        p.set(),
+        protocols,
         World::config(),
-        &only_tasks,
-    )
+        &backup,
+    ))
     .await
     .unwrap();
-    assert_eq!(*p.chat.restored.lock().unwrap(), [false]);
+    assert_eq!(*news.restored.lock().unwrap(), [false]);
+    assert_eq!(*p.chat.restored.lock().unwrap(), [true]);
     assert_eq!(*p.tasks.restored.lock().unwrap(), [true]);
     assert!(
         restored
-            .protocol_scan("chat", b"")
+            .protocol_scan("news", b"")
             .await
             .unwrap()
             .is_empty()
     );
-    assert_eq!(restored.protocol_scan("tasks", b"").await.unwrap().len(), 1);
+    for name in ["tasks", "chat"] {
+        assert_eq!(restored.protocol_scan(name, b"").await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

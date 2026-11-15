@@ -224,6 +224,23 @@ pub(crate) struct Owed {
     pub(crate) call: OwedCall,
 }
 
+impl Owed {
+    /// A remaining-owner set is nonempty, unique and registered. Completed owners may
+    /// be absent: their effects and removal committed together (Switch spec 8.3).
+    pub(crate) fn check_owners(&self, protocols: &super::ProtocolSet) -> Result<(), AppError> {
+        let mut names = std::collections::BTreeSet::new();
+        if self.to.is_empty()
+            || self
+                .to
+                .iter()
+                .any(|name| !protocols.contains(name) || !names.insert(name))
+        {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
+        Ok(())
+    }
+}
+
 /// A call about a feed item, as [`Owed`] keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum OwedCall {
@@ -667,6 +684,9 @@ impl App {
             self.leave_on_compromise().await;
         }
         self.refuse_when_halted()?;
+        // Retained obligations constrain every callback and shared view used below.
+        // Refuse a corrupt owner set before any upkeep can change those views.
+        self.owed_calls().await?;
         self.finish_join().await?;
         if let Some(report) = self.follow_provider_change().await? {
             return Ok(report);
@@ -3617,6 +3637,18 @@ impl App {
         a == b || (self.feed_order(a, 0).0 == 1 && self.feed_order(b, 0).0 == 1)
     }
 
+    /// Read and validate the complete retained-call set before it supplies ordering,
+    /// readiness or callbacks. Valid remaining owners need not include completed ones.
+    pub(crate) async fn owed_calls(&self) -> Result<Vec<(String, Owed)>, AppError> {
+        let owed = self.reader().scan::<Owed>(key::OWED_PREFIX).await?;
+        for (rest, call) in &owed {
+            owed_place(rest)?;
+            call.check_owners(&self.protocols)?;
+            call.call.kept_op_body()?;
+        }
+        Ok(owed)
+    }
+
     /// The calls kept for protocols, made again in feed order ([`App::feed_order`]), each
     /// for the protocols it names whose position has reached it: those told through
     /// everything before its item, and owed no listing at or before it. Each goes in one
@@ -3634,7 +3666,7 @@ impl App {
     ///
     /// Returns whether a protocol failed a call in this pass.
     async fn retry_owed(&mut self) -> Result<bool, AppError> {
-        let owed = self.reader().scan::<Owed>(key::OWED_PREFIX).await?;
+        let owed = self.owed_calls().await?;
         let due: super::records::ListDue = self
             .reader()
             .get(super::records::LIST_DUE)
@@ -3671,11 +3703,6 @@ impl App {
             // The positions, by what is still kept: a protocol that took a call is told
             // through to right before the next thing kept for it.
             self.settle_told(&kept);
-            // Every writer names at least one protocol: a call kept for none is a corrupt
-            // store, neither made nor dropped.
-            if to.is_empty() {
-                return Err(AppError::Store(crate::error::StoreError::Corrupt));
-            }
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // Whose turn it is: a protocol told through everything before the call's item,
             // and owed no listing at or before it, which goes first.

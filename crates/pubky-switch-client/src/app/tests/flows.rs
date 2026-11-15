@@ -3719,7 +3719,8 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
         Err(AppError::InvalidData(_))
     ));
     value["layers"] = json!([{ "name": "sample", "data": "" }]);
-    value["beyond_cursor"] = json!({ "seen": [], "parked": [], "processed": [] });
+    value["beyond_cursor"] =
+        json!({ "protocols": ["sample"], "seen": [], "parked": [], "processed": [] });
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),

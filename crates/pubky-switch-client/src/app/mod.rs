@@ -465,6 +465,8 @@ struct LayerOut {
 /// them back without these would hand the entries to the protocols again.
 #[derive(Clone, Serialize, Deserialize)]
 struct BeyondCursor {
+    /// The registered protocols whose layers and feed progress were taken together.
+    protocols: Vec<String>,
     seen: Vec<u64>,
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
@@ -1650,6 +1652,7 @@ impl App {
                 });
             }
             backup.beyond_cursor = Some(BeyondCursor {
+                protocols: self.protocols.names(),
                 seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
@@ -1702,8 +1705,10 @@ impl App {
     /// carries beside them, in one commit: the app checks its own state, that every scope
     /// of the certificate is a registered protocol's and each protocol runs with it
     /// ([`Protocol::check_own_certificate`]), that each layer names a registered protocol,
-    /// then has each registered protocol's [`Protocol::restore_layer`] check its own layer,
-    /// or `None` when the backup has none for it, with the backup's identity and `blind`
+    /// and that a layered snapshot's original protocol roster matches its layers and
+    /// processed owners, before any restore callback. It then has each registered
+    /// protocol's [`Protocol::restore_layer`] check its own layer, or `None` for a newly
+    /// registered protocol or a plain backup, with the backup's identity and `blind`
     /// under its naming key ([`RestoreContext`]), and give its writes, which land under its
     /// own prefix, all before it writes anything. The app keeps the names it registers
     /// (`protos`) for later loads. When this returns `Ok`, every layer is in the store; on
@@ -1885,6 +1890,25 @@ impl App {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
                 ));
+            }
+            if let Some(beyond) = &backup.beyond_cursor {
+                // Seen marks can outlive processed pairs. The whole original roster,
+                // rather than just kinds still held in `proc/`, binds this progress to
+                // its layers. An empty layer still has an entry; a new registration has
+                // neither an original layer nor original progress (Switch spec 12.4).
+                let owners: BTreeSet<_> = beyond.protocols.iter().collect();
+                if owners.is_empty()
+                    || owners.len() != beyond.protocols.len()
+                    || owners.len() != layers.len()
+                    || layers.iter().any(|layer| !owners.contains(&layer.protocol))
+                    || beyond.processed.iter().any(|(_, pair)| {
+                        protocols
+                            .of_kind(&pair.kind)
+                            .is_some_and(|owner| !owners.contains(&owner.name))
+                    })
+                {
+                    return Err(invalid("its feed progress and protocol layers disagree"));
+                }
             }
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
@@ -2937,7 +2961,7 @@ impl App {
             match read {
                 Ok(mut owed) => {
                     owed.to.retain(|name| protocols.contains(name));
-                    if owed.to.is_empty() {
+                    if owed.check_owners(protocols).is_err() {
                         carried.lost_owed = carried.lost_owed.saturating_add(1);
                         continue;
                     }
@@ -2989,7 +3013,7 @@ impl App {
                 }
             };
             owed.to.retain(|name| protocols.contains(name));
-            if owed.to.is_empty() {
+            if owed.check_owners(protocols).is_err() {
                 lost = lost.saturating_add(1);
                 continue;
             }

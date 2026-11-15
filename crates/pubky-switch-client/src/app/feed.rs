@@ -88,8 +88,8 @@ use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
     DenyListChange, Effect, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
-    ResendReason, Rules, StoreFailure, local_writes_bytes,
+    PARKED_RETRIES_PER_READ, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules,
+    StoreFailure, local_writes_bytes,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
@@ -2747,7 +2747,7 @@ impl App {
 
     /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
     /// app holding `lists.read`: the protocol is told of it, with the lists read after it,
-    /// before anything later ([`Protocol::deny_list_gap`]). The earliest gap owed is kept.
+    /// before anything later ([`super::protocol::Protocol::deny_list_gap`]). The earliest gap owed is kept.
     /// Every gap noted is told, also at a position a gap was told at before: that gap's list
     /// may predate what this one covers, and a gap told again only sets the same state.
     /// Whether one was noted now.
@@ -3480,8 +3480,8 @@ const PARK_ROOM_BYTES: u64 = 256 * 1024;
 ///   own at once (`send_effect`);
 /// - an effect without operations, its local writes at most 4 MiB as stored
 ///   (`MAX_STEP_LOCAL_BYTES`), with its processed pair;
-/// - a call's local writes ([`Protocol::resend_needed`], [`Protocol::missed`],
-///   [`Protocol::deny_list_changed`]), at most 4 MiB, or a duty event refusing them;
+/// - a call's local writes ([`super::protocol::Protocol::resend_needed`], [`super::protocol::Protocol::missed`],
+///   [`super::protocol::Protocol::deny_list_changed`]), at most 4 MiB, or a duty event refusing them;
 /// - an entry stored locally ([`PARK_ROOM_BYTES`]) and its duty events;
 /// - a chain item's cached record write, its operation and proof and opened value, under
 ///   1.2 MiB.

@@ -34,8 +34,9 @@
 //! in feed order ([`App::settle_told`], `retry_owed`), a protocol's listing before a call at
 //! the same item: the listing an item owes is not held by that item's own call, with one
 //! protocol or several. A kept call or listing past the cursor waits for the read to reach
-//! its item: the protocols it names stay right before it, and are told it at the start of
-//! the read after, whether or not the cursor got there.
+//! its item: the protocols it names stay right before it, aren't told the item, and are
+//! told what is kept at the start of the read after, whether or not the cursor got there.
+//! A protocol a listing is still owed to is told nothing that isn't in feed order either.
 //!
 //! A read that stopped on its pages goes on from where it got (`feed_at`), unless a
 //! protocol is behind that with a feed item next: then it starts at that protocol's

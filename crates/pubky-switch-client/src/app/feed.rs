@@ -3074,6 +3074,12 @@ impl App {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
         let mut owed_to = Vec::new();
         for registered in protocols {
+            // A listing kept for it at this very item: the item was handled for it when the
+            // read first met it, its call taken or kept then (a kept call makes the read
+            // pass the item whole).
+            if self.kept_here.contains(&registered.name) {
+                continue;
+            }
             // In step with the item, or waiting only for the listing the `missed` item
             // before it owes, which this one owes too.
             if !self.may_tell(&registered.name) && !read.run.contains(&registered.name) {

@@ -1629,6 +1629,7 @@ impl App {
                 processed.push((
                     rest,
                     Processed {
+                        kind: pending.kind.clone(),
                         hash: pending.hash,
                         at_ms: self.now(),
                     },
@@ -1917,7 +1918,9 @@ impl App {
                                 .ok_or_else(|| invalid("processed pairs"))?;
                             let sender = pubky_switch_core::enc::pubky_key(sender)
                                 .map_err(|_| invalid("processed pairs"))?;
-                            Ok((sender, msg_id.to_owned(), *record))
+                            pubky_switch_core::message::check_kind(&record.kind)
+                                .map_err(|_| invalid("processed message kind"))?;
+                            Ok((sender, msg_id.to_owned(), record.clone()))
                         })
                         .collect::<Result<Vec<_>, AppError>>()?,
                 ),
@@ -2099,7 +2102,14 @@ impl App {
                 tx.delete_prefix("")?;
                 app.write_all(&mut tx).await?;
                 for (sender, msg_id, record) in &processed {
-                    feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
+                    feed::processed_writes(
+                        &mut tx,
+                        sender,
+                        msg_id,
+                        &record.kind,
+                        record.hash,
+                        record.at_ms,
+                    )?;
                 }
                 records::owe_listing(&mut tx, &protocols_names)?;
                 // The entries it brings back are told to the protocol again, in steps after

@@ -94,6 +94,22 @@ pub(crate) struct ListDue {
 }
 
 impl ListDue {
+    /// The listings at feed positions, before calls at the same position.
+    pub(crate) fn kept(&self) -> Vec<Kept> {
+        self.to
+            .iter()
+            .filter_map(|(name, at)| {
+                at.map(|(generation, seq)| Kept {
+                    generation,
+                    seq,
+                    names: vec![name.clone()],
+                    call: false,
+                    deny: false,
+                })
+            })
+            .collect()
+    }
+
     /// Where the listing owed to protocol `name` is owed, if one is: `Some(None)` outside
     /// the feed.
     pub(crate) fn at(&self, name: &str) -> Option<Option<(u64, u64)>> {
@@ -1504,20 +1520,12 @@ impl App {
     /// (`owed/`) and the listings feed items owe (`list_due`), a listing before a call at
     /// the same item ([`Kept`]).
     pub(crate) async fn kept_things(&self) -> Result<Vec<Kept>, AppError> {
-        let mut kept = Vec::new();
-        if let Some(due) = self.reader().get::<ListDue>(LIST_DUE).await? {
-            for (name, at) in due.to {
-                if let Some((generation, seq)) = at {
-                    kept.push(Kept {
-                        generation,
-                        seq,
-                        names: vec![name],
-                        call: false,
-                        deny: false,
-                    });
-                }
-            }
-        }
+        let mut kept = self
+            .reader()
+            .get::<ListDue>(LIST_DUE)
+            .await?
+            .unwrap_or_default()
+            .kept();
         kept.extend(self.kept_calls().await?);
         kept.sort_by_key(|kept| self.feed_order(kept.generation, kept.seq));
         Ok(kept)

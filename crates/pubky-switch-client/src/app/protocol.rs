@@ -28,6 +28,20 @@
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
+//!
+//! Feed order is per protocol (Switch spec 8.3). The shared deny copy changes only after
+//! every protocol has taken the preceding items and the deny change itself; the read
+//! stops there while any protocol waits. Entries reached in order but held for sender
+//! validation, a key or a retry follow Section 8.2 and may run under a later deny copy.
+//! Other shared views are current observations:
+//! claims and records, including another protocol's records, may be newer than the
+//! message. Use their conditions when a write depends on them; a foreign record does not
+//! prove that its protocol has handled it. The certificate, identity, data epoch and keys
+//! are the current verified authority, never restored to earlier authority for an older
+//! message. Allowlist entries and sender flags are current copies; an explicit list read
+//! or gap supplies a current baseline. Reconcile mode and provider-loss restrictions
+//! apply immediately to all protocols, and the highest verified service time remains
+//! current. None of these current views establishes cross-protocol event order.
 
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
@@ -820,6 +834,9 @@ pub trait Protocol: Send + Sync {
     ///   past, as after a restore in place from a newer backup, or one of a lost sequence
     ///   once the app reads the next, isn't made: it would come after later changes, so
     ///   the protocol is told a gap at that position instead.
+    ///   With several protocols, the change waits until every protocol has taken the
+    ///   preceding items. The shared deny copy changes in the commit of the last
+    ///   successful callback; no later item is handed to any protocol while one fails.
     /// - **After a restore:** a backup holds the protocol's layer as committed when it was
     ///   taken, and none of the changes or gaps owed then. So every restore tells every
     ///   protocol a gap at the backup's position, with the full list, whatever the backup
@@ -828,8 +845,10 @@ pub trait Protocol: Send + Sync {
     /// - **Again:** a change may come twice, after a crash before its commit and after a
     ///   restore, whose feed hands it again; its writes commit once. A protocol keys what it
     ///   keeps by the change's place, or takes it as setting a state.
-    /// - **Before and after:** an entry held, accepted before a change, may come again at a
-    ///   later read, after the change.
+    /// - **Before and after:** an entry reached in order but held for its sender, a key
+    ///   or a retry, or stored locally, may be tried after a later change and sees the
+    ///   current copy then (Switch spec 8.2). The barrier protects an eligible entry
+    ///   not yet handed because its protocol is behind.
     ///
     /// # Errors
     ///

@@ -61,7 +61,8 @@
 //! read hands anything), and a duty event about an entry stored locally: such an entry was
 //! stored when its protocol's position had reached it, so it lies in that protocol's past.
 //! A receive step and a protocol's batch write only that protocol's own records
-//! (`refuse_foreign_target`), so none of those changes what another protocol sees.
+//! (`refuse_foreign_target`). A step may read another protocol's record as a current view,
+//! which establishes no order with that protocol's notifications (`Protocol`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -235,14 +236,24 @@ impl App {
 
     /// Read the positions from the store (`told/`), as a call that follows a reload does.
     /// One of a protocol that isn't registered, or of a generation past the newest own
-    /// `identity.json` the app holds, which no read writes, is a corrupt store: taken as
+    /// `identity.json` the app holds, or beyond every authenticated feed page read and the
+    /// cursor, which no read writes, is a corrupt store: taken as
     /// it is, it would stand as the read's front, and no other protocol would ever be
     /// level with it.
     pub(crate) async fn load_told(&mut self) -> Result<(), AppError> {
         let stored = self.reader().scan::<Told>(TOLD_PREFIX).await?;
+        let mut read = self.feed_order(self.state.cursor.generation, self.state.cursor.seq);
+        if let Some(chain) = &self.state.chain {
+            let scanned = self.feed_order(chain.read_through.0, chain.read_through.1);
+            if scanned.0 == 2 {
+                return Err(AppError::Store(crate::error::StoreError::Corrupt));
+            }
+            read = read.max(scanned);
+        }
         let mut told = Positions::new();
         for (name, at) in stored {
-            if !self.protocols.contains(&name) || self.feed_order(at.generation, at.seq).0 == 2 {
+            let order = self.feed_order(at.generation, at.seq);
+            if !self.protocols.contains(&name) || order.0 == 2 || order > read {
                 return Err(AppError::Store(crate::error::StoreError::Corrupt));
             }
             told.insert(name, (at.generation, at.seq));

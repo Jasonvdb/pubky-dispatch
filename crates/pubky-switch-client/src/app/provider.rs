@@ -1255,7 +1255,14 @@ impl App {
                 for op in Batch::from_body(pending.body.clone())?.ops() {
                     self.settle_op(op, None, &settles, tx).await?;
                 }
-                processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
+                processed_writes(
+                    tx,
+                    &pending.sender,
+                    &pending.msg_id,
+                    &pending.kind,
+                    pending.hash,
+                    now,
+                )?;
                 tx.local(&pending.local)?;
                 for key in &pending.forget {
                     tx.delete(key)?;

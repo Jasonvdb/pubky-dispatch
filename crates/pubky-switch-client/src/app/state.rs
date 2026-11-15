@@ -334,6 +334,9 @@ pub(crate) struct Cursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChainRecord {
     pub(crate) generation: u64,
+    /// The highest feed position scanned in this sequence, including inbox items.
+    /// A bound for stored protocol positions, not evidence of chain continuity.
+    pub(crate) read_through: (u64, u64),
     pub(crate) last_seq: u64,
     #[serde(with = "serde_b64")]
     pub(crate) last_hash: [u8; 32],
@@ -368,8 +371,10 @@ pub(crate) enum RestorePending {
 }
 
 /// `proc/<sender>/<msg_id>`: a processed message (Switch spec 11).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Processed {
+    /// The message kind, which determines the protocol allowed to forget it.
+    pub(crate) kind: String,
     #[serde(with = "serde_b64")]
     pub(crate) hash: [u8; 32],
     /// When it was processed, app clock, for the retention.

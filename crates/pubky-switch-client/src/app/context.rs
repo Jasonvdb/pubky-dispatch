@@ -468,7 +468,10 @@ impl<'a> ReceiveContext<'a> {
         self.record_at(&key)
     }
 
-    /// The record the app holds at `key`.
+    /// The newest accepted record the app holds at `key`, also for another protocol's
+    /// collection. It may be newer than this message: listings and explicit reads show
+    /// current records (Switch spec 8.3). It does not prove that another protocol handled
+    /// it. Use [`ReceiveContext::record_condition`] for a write depending on its version.
     ///
     /// # Errors
     ///
@@ -509,7 +512,10 @@ impl<'a> ReceiveContext<'a> {
         Ok(Condition::RecordVersion { key: *key, version })
     }
 
-    /// The newest view the app keeps of the claim `claim_key` (Switch wire 6.8).
+    /// The newest view the app keeps of the claim `claim_key` (Switch wire 6.8), including
+    /// later feed items and explicit reads. It is not a snapshot at this message's
+    /// position; use its expected step or [`ReceiveContext::claim_condition`] for writes
+    /// depending on it (Switch spec 8.3).
     ///
     /// # Errors
     ///
@@ -544,11 +550,13 @@ impl<'a> ReceiveContext<'a> {
             .map(|(_, fetch)| fetch)
     }
 
-    /// What the app knows of `pubky`'s standing in the own identity's lists before this
-    /// message: on the app's copy of the deny list, among the flagged senders of its last
+    /// What the app knows of `pubky`'s standing in the own identity's lists: on the app's copy of the deny list, among the flagged senders of its last
     /// [`super::App::allow_list`], and when that was ([`SenderDisposition`]). It reads the
     /// copy as committed, with the changes the feed showed earlier in the same read, which
     /// aren't committed yet.
+    /// Feed deny changes wait for every protocol's preceding items. Flags and an explicit
+    /// list refresh or gap are current observations, which may be later than this message
+    /// (Switch spec 8.3); a retry of an entry stored locally also sees the current copy.
     ///
     /// A protocol that keeps only a count of messages from a blocked or flagged sender
     /// (Switch spec 7 "Spam") asks for the message's sender. Both values are only as fresh
@@ -804,7 +812,8 @@ impl<'a> ReceiveContext<'a> {
     /// # Errors
     ///
     /// [`Refusal::NotNow`] while the message's effect is kept to be sent, or an entry stored
-    /// locally holds it; [`Refusal::Usage`] when the forget would take the step past
+    /// locally holds it; [`Refusal::Usage`] when another registered protocol owns the
+    /// message's kind, or when the forget would take the step past
     /// [`MAX_STEP_LOCAL_BYTES`], as for [`ReceiveContext::local`]: nothing is added, and an
     /// effect the step then applies is stored and passed as too large; a store failure.
     pub fn forget_processed(&mut self, sender: [u8; 32], msg_id: &str) -> Result<bool, AppError> {
@@ -812,6 +821,7 @@ impl<'a> ReceiveContext<'a> {
             .app_get(&super::state::key::processed(&sender, msg_id))?
             .map(|bytes| super::state::decode::<super::state::Processed>(&bytes))
             .transpose()?;
+        super::forget::check_owner(self.protocols, self.name, processed.as_ref())?;
         let Some(keys) = super::forget::held_pair(self.state, &sender, msg_id, processed)? else {
             return Ok(false);
         };

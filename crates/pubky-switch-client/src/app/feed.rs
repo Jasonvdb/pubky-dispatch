@@ -69,7 +69,7 @@ use std::sync::Arc;
 use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, Verifier};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::message::MessagePlaintext;
+use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp};
 use pubky_switch_core::receive::{
     OpenedEntry, Received, Refusal as CheckRefusal, SenderIdentity, check_opened,
@@ -1208,6 +1208,23 @@ impl App {
                 return Ok(Step::Pass);
             }
             Err(CheckRefusal::SenderUnverifiable) => {
+                // Checks 1 to 6 passed. A held pair already rules out an effect, even
+                // while the sender's standing cannot be checked (Switch wire 5.1).
+                let rules = Rules::new(self.protocol.as_ref(), &self.state.cert, &read.opaque);
+                let message = Message::parse(plaintext.json(), &rules.opaque)?;
+                if let Some(hash) = self.processed_hash(entry, &message.msg_id, read).await? {
+                    if hash == plaintext.hash() || entry.stored.is_some_and(|id| self.released(id))
+                    {
+                        self.duplicate(entry, &message.msg_id, hash != plaintext.hash(), read)?;
+                        return Ok(Step::Pass);
+                    }
+                    self.unpark(entry.stored, &mut read.tx)?;
+                    return Ok(self.dropped(
+                        entry.seq,
+                        9,
+                        "the pair is processed; the copy's sender standing is unchecked".into(),
+                    ));
+                }
                 if parked {
                     return Ok(Step::Hold);
                 }
@@ -1216,22 +1233,35 @@ impl App {
         };
         // Check 9, with the pairs processed in this read and not committed yet, then the
         // app's own record of processed messages.
-        let pair = (entry.sender, received.message.msg_id.clone());
-        if let Some(hash) = read.pairs.get(&pair).copied() {
-            let conflicting = hash != received.hash();
-            self.duplicate(entry, &received.message.msg_id, conflicting, read)?;
-            return Ok(Step::Pass);
-        }
-        let processed: Option<Processed> = self
-            .reader()
-            .get(&key::processed(&entry.sender, &received.message.msg_id))
-            .await?;
-        if let Some(seen) = processed {
-            let conflicting = seen.hash != received.hash();
-            self.duplicate(entry, &received.message.msg_id, conflicting, read)?;
+        if let Some(hash) = self
+            .processed_hash(entry, &received.message.msg_id, read)
+            .await?
+        {
+            self.duplicate(
+                entry,
+                &received.message.msg_id,
+                hash != received.hash(),
+                read,
+            )?;
             return Ok(Step::Pass);
         }
         self.apply(entry, received, parked, read).await
+    }
+
+    async fn processed_hash(
+        &self,
+        entry: &Entry,
+        msg_id: &str,
+        read: &Read,
+    ) -> Result<Option<[u8; 32]>, AppError> {
+        if let Some(hash) = read.pairs.get(&(entry.sender, msg_id.to_owned())) {
+            return Ok(Some(*hash));
+        }
+        Ok(self
+            .reader()
+            .get::<Processed>(&key::processed(&entry.sender, msg_id))
+            .await?
+            .map(|processed| processed.hash))
     }
 
     /// Checks 2 to 9 of `entry` against `doc`, the sender's `identity.json` (`None` when it
@@ -1363,6 +1393,8 @@ impl App {
         parked: bool,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        let retirement_bytes =
+            self.retirement_bytes(&entry.sender, &received.message.msg_id, entry.stored)?;
         let mut message = ReceivedMessage {
             seq: entry.seq,
             generation: entry.generation,
@@ -1378,6 +1410,10 @@ impl App {
             conflict: None,
         };
         if let Err(reason) = self.protocol.check_body(&message) {
+            if !self.make_room(read, retirement_bytes).await? {
+                self.too_large(entry, &received, read).await?;
+                return Ok(Step::Pass);
+            }
             self.note_processed(entry, &received, &[], read)?;
             return Ok(self.dropped(entry.seq, 10, reason));
         }
@@ -1405,6 +1441,10 @@ impl App {
             let consume = matches!(outcome, Outcome::Consume);
             let mut effect = match outcome {
                 Outcome::Drop { reason } => {
+                    if !self.make_room(read, retirement_bytes).await? {
+                        self.too_large(entry, &received, read).await?;
+                        return Ok(Step::Pass);
+                    }
                     self.note_processed(entry, &received, &[], read)?;
                     return Ok(self.dropped(entry.seq, 10, reason));
                 }
@@ -1493,9 +1533,13 @@ impl App {
                 self.effect_refused(entry, &received, stored, None, read)?;
                 return Ok(Step::Pass);
             }
-            if !self
-                .make_room(read, local_size(&self.ns, &effect.local))
-                .await?
+            let outcome_bytes = local_size(&self.ns, &effect.local)
+                .saturating_add(super::forget::forget_bytes(&forget) as u64)
+                .saturating_add(if consume { 0 } else { retirement_bytes })
+                .saturating_add(
+                    (effect.ops.len() as u64).saturating_mul(CACHED_RECORD_BYTES + KEPT_MARK_BYTES),
+                );
+            if !self.make_room(read, outcome_bytes).await?
                 || effect.local.iter().any(|write| {
                     matches!(write, LocalWrite::Put { value, .. }
                         if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_VALUE_BYTES)
@@ -1721,8 +1765,13 @@ impl App {
             received.hash(),
         );
         read.tx.local(local)?;
-        self.unpark(entry.stored, &mut read.tx)?;
-        Ok(())
+        self.retire_processed(
+            &entry.sender,
+            &received.message.msg_id,
+            received.hash(),
+            entry.stored,
+            &mut read.tx,
+        )
     }
 
     /// Sign the effect's batch with the cursor move, keep it with what the answer commits,
@@ -1929,10 +1978,15 @@ impl App {
         for key in &pending.forget {
             tx.delete(key)?;
         }
+        self.retire_processed(
+            &pending.sender,
+            &pending.msg_id,
+            pending.hash,
+            pending.stored,
+            &mut tx,
+        )?;
         // Processed: a count of the store's retries at it goes with it.
-        if pending.stored.is_some() {
-            self.unpark(pending.stored, &mut tx)?;
-        } else if self.state.retries.remove(&pending.seq).is_some() {
+        if pending.stored.is_none() && self.state.retries.remove(&pending.seq).is_some() {
             tx.delete(&key::retry(pending.seq))?;
         }
         if pending.stored.is_some() {
@@ -2351,6 +2405,114 @@ impl App {
             tx.delete(&key::stored_retry(id))?;
         }
         Ok(())
+    }
+
+    /// The extra deletes and released-copy notices a completed message commits. This is
+    /// checked before an effect is sent, so a remote success always fits its local commit.
+    fn retirement_bytes(
+        &self,
+        sender: &[u8; 32],
+        msg_id: &str,
+        current: Option<u64>,
+    ) -> Result<u64, AppError> {
+        let mut bytes = 0u64;
+        let mut next_duty = self.state.next_duty;
+        let key_bytes = |key: &str| (self.ns.len() + key.len()) as u64;
+        for (id, stored) in &self.state.parked {
+            if Some(*id) == current
+                || &stored.sender != sender
+                || super::parked::stored_msg_id(stored).as_deref() != Some(msg_id)
+            {
+                continue;
+            }
+            bytes = bytes.saturating_add(key_bytes(&key::parked(*id)));
+            if self.state.stored_retries.contains_key(id) {
+                bytes = bytes.saturating_add(key_bytes(&key::stored_retry(*id)));
+            }
+            // The host may release an uncertain copy while an effect awaits its answer.
+            if stored.released || stored.reason == ParkReason::Uncertain {
+                let duty = Duty::ReleasedDuplicate {
+                    seq: stored.seq,
+                    stored_id: *id,
+                    sender: *sender,
+                    msg_id: msg_id.to_owned(),
+                    conflicting: false,
+                };
+                bytes = bytes
+                    .saturating_add(key_bytes(&key::duty(next_duty)))
+                    .saturating_add(encode(&duty)?.len() as u64);
+                next_duty = next_duty.checked_add(1).ok_or_else(super::corrupt)?;
+                bytes = bytes
+                    .saturating_add(key_bytes(key::DUTY_NEXT))
+                    .saturating_add(encode(&u64::MAX)?.len() as u64);
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Successful processing retires the copies of the pair atomically (Switch spec 11).
+    /// An independently uncertain effect still needs the host's decision.
+    fn retire_processed(
+        &mut self,
+        sender: &[u8; 32],
+        msg_id: &str,
+        hash: [u8; 32],
+        current: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let copies: Vec<_> = self
+            .state
+            .parked
+            .iter()
+            .filter_map(|(id, stored)| {
+                if &stored.sender != sender || stored.reason == ParkReason::Uncertain {
+                    return None;
+                }
+                let plaintext = MessagePlaintext::decode(&stored.plaintext).ok()?;
+                (super::parked::stored_msg_id(stored).as_deref() == Some(msg_id)).then_some((
+                    *id,
+                    stored.seq,
+                    stored.released,
+                    plaintext.hash() != hash,
+                ))
+            })
+            .collect();
+        for (id, seq, released, conflicting) in copies {
+            if Some(id) != current {
+                if released {
+                    self.keep_duty(
+                        tx,
+                        Duty::ReleasedDuplicate {
+                            seq,
+                            stored_id: id,
+                            sender: *sender,
+                            msg_id: msg_id.to_owned(),
+                            conflicting,
+                        },
+                    )?;
+                }
+                if conflicting
+                    && !released
+                    && self
+                        .state
+                        .parked
+                        .get(&id)
+                        .is_some_and(|stored| stored.reason == ParkReason::Unverifiable)
+                {
+                    self.dropped(
+                        seq,
+                        9,
+                        "the pair is processed; the copy's sender standing is unchecked".into(),
+                    );
+                } else {
+                    self.events.push(AppEvent::Duplicate { seq, conflicting });
+                }
+            }
+            if Some(id) != current {
+                self.unpark(Some(id), tx)?;
+            }
+        }
+        self.unpark(current, tx)
     }
 
     /// The entry stored locally at `stored`, if any, goes: processed, dropped or a
@@ -3500,6 +3662,7 @@ const PARK_ROOM_BYTES: u64 = 256 * 1024;
 ///   1.2 MiB.
 ///
 /// The largest is under 11 MiB; [`ENTRY_RESERVE_BYTES`] and a margin make 12 MiB.
+/// Other stored copies are measured separately by [`App::retirement_bytes`].
 pub(crate) const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
 
 /// What an applied effect's outcome caches of one record write, at most: its operation
@@ -3573,4 +3736,57 @@ fn local_size(ns: &str, local: &[LocalWrite]) -> u64 {
             .saturating_add(len(key))
             .saturating_add(len(value))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::World;
+    use crate::testing::Fault;
+    use pubky_switch_core::records::DAY_MS;
+
+    #[tokio::test]
+    async fn test_processed_copy_reservation_covers_release_before_settlement() {
+        let world = World::new();
+        let mut app = world.join("wallet").await;
+        let (seq, message) = world.note(app.app_id(), "uncertain");
+        world
+            .switch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        world.clock.advance_ms(31 * DAY_MS);
+        world.switch.lock().batches.clear();
+        app.receive(None).await.unwrap();
+        let id = app.stored_id_at(seq).unwrap();
+        let entry = app
+            .parked_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.stored_id == id)
+            .unwrap();
+        assert_eq!(entry.reason, ParkReason::Uncertain);
+        let reserved = app
+            .retirement_bytes(&world.bob.public(), &message.msg_id, None)
+            .unwrap();
+        app.release_parked(id, &entry.hash).await.unwrap();
+        let mut tx = app.tx().unwrap();
+        app.retire_processed(
+            &world.bob.public(),
+            &message.msg_id,
+            entry.hash,
+            None,
+            &mut tx,
+        )
+        .unwrap();
+        assert!(
+            reserved >= tx.size(),
+            "reserved {reserved}, completion {}",
+            tx.size()
+        );
+        assert!(
+            tx.size() > 0,
+            "retirement includes the release-ended notice and deletions"
+        );
+    }
 }

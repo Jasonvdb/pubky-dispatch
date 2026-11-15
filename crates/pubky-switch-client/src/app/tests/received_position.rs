@@ -188,7 +188,7 @@ fn at(generation: u64, seq: u64) -> FeedPosition {
 
 /// Across a key change in place the sequence goes on: positions compare by `seq` alone,
 /// whatever generation they were read at, where the plain pair puts them the other way;
-/// a generation past the followed one comes after everything.
+/// a future generation that disagrees with the sequence remains incomparable.
 #[tokio::test]
 async fn test_received_order_compares_by_seq_across_a_key_change() {
     use std::cmp::Ordering::{Equal, Greater, Less};

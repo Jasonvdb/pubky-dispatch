@@ -594,6 +594,46 @@ impl OutboxItem {
         &self.msg_id
     }
 
+    /// The cached routing fields agree with the plaintext authenticated by this app
+    /// (Switch wire 5.1). Body rules are not needed to retain an unregistered kind.
+    pub(crate) fn is_own(
+        &self,
+        meta: &super::state::Meta,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> bool {
+        #[derive(Deserialize)]
+        struct SenderHead {
+            identity: String,
+            app_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Head {
+            kind: String,
+            msg_id: String,
+            from: SenderHead,
+            to: String,
+        }
+        let Ok(plaintext) = self.plaintext() else {
+            return false;
+        };
+        if plaintext.sender_app_id() != meta.app_id
+            || plaintext
+                .verify_signature(&cert.signing_key(), &self.to)
+                .is_err()
+        {
+            return false;
+        }
+        serde_json::from_slice::<Head>(plaintext.json()).is_ok_and(|head| {
+            head.kind == self.kind
+                && head.msg_id == self.msg_id
+                && pubky_switch_core::enc::pubky_key(&head.to).is_ok_and(|to| to == self.to)
+                && pubky_switch_core::enc::pubky_key(&head.from.identity)
+                    .is_ok_and(|from| from == meta.identity)
+                && pubky_switch_core::enc::app_id_decode(&head.from.app_id)
+                    .is_ok_and(|from| from == meta.app_id)
+        })
+    }
+
     fn complete(&self) -> bool {
         self.accepted_at_ms.is_some() && !self.resend && (self.record.is_none() || self.record_done)
     }
@@ -810,6 +850,26 @@ enum Tried {
 
 fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
+}
+
+/// Check the indexed outbox and every retained producer before a load or reload can
+/// expose its routing fields (Switch spec 11).
+pub(crate) async fn validate_outbox(
+    reader: &super::state::Reader,
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Result<(), AppError> {
+    for (msg_id, item) in reader.scan::<OutboxItem>(OUT_PREFIX).await? {
+        if msg_id != item.msg_id || !item.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
+    for item in super::batch::kept_queued(reader).await? {
+        if !item.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
+    Ok(())
 }
 
 impl App {
@@ -1064,6 +1124,7 @@ impl App {
     /// [`Refusal::Usage`] for a protocol not registered; a store failure.
     pub async fn held_messages(&self, protocol: &str) -> Result<Vec<String>, AppError> {
         self.check_registered(protocol)?;
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         Ok(held_messages_of(&self.reader(), self.now())
             .await?
             .into_iter()
@@ -1091,6 +1152,7 @@ impl App {
     async fn owned_owed(&self, protocol: &str, msg_id: &str) -> Result<Option<String>, AppError> {
         self.check_registered(protocol)?;
         let reader = self.reader();
+        validate_outbox(&reader, &self.state.meta, &self.state.cert).await?;
         let kept = super::batch::kept_queued(&reader).await?;
         let kind = owed_kind(&reader, msg_id, self.now(), &kept).await?;
         match kind {
@@ -1111,9 +1173,9 @@ impl App {
     /// never queued again by this store: [`App::queue_stored`] refuses it, and a re-send
     /// after the counterparty's provider loss leaves it out. Only the host's own
     /// [`App::resend`] of it sends it again. Returns the messages given up: those of the
-    /// outbox in queue order, then those of kept batches. Until its batch settles,
-    /// [`App::delivery`] of a message given up from a kept batch still reads
-    /// [`Delivery::Kept`], and `None` after. Local only: it sends nothing.
+    /// outbox in queue order, then those of kept batches. The retained queued copies and
+    /// their delivery index are removed in the same commit, leaving the batch's other
+    /// operations and local writes intact. Local only: it sends nothing.
     ///
     /// # Errors
     ///
@@ -1186,6 +1248,7 @@ impl App {
                 Some(kept) => tx.put(&out_key(&msg_id), kept)?,
                 None => tx.delete(&out_key(&msg_id))?,
             }
+            self.remove_kept_delivery(&msg_id, &mut tx).await?;
             note_given_up(&mut tx, &msg_id, now)?;
             self.keep_duty_for(&mut tx, to, duty)?;
             self.commit(tx).await?;
@@ -1201,6 +1264,7 @@ impl App {
                     continue;
                 }
                 let mut tx = self.tx()?;
+                self.remove_kept_delivery(&msg_id, &mut tx).await?;
                 note_given_up(&mut tx, &msg_id, now)?;
                 let to = self.owners_of_kind(&item.kind);
                 self.keep_duty_for(
@@ -1925,6 +1989,9 @@ impl App {
         let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
             return Ok(false);
         };
+        if !item.is_own(&self.state.meta, &self.state.cert) {
+            return Err(store_corrupt());
+        }
         if item.failed.is_some() {
             return Ok(false);
         }

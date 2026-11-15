@@ -1260,6 +1260,7 @@ impl App {
         let keys: AppKeys = reader.get(key::KEYS).await?.ok_or_else(missing)?;
         let cert_doc: SignedDoc = reader.get(key::CERT).await?.ok_or_else(missing)?;
         let cert = AppCert::verify(&cert_doc, &meta.identity).map_err(|_| corrupt())?;
+        send::validate_outbox(reader, &meta, &cert).await?;
         let renewal = match reader.get::<SignedDoc>(key::CERT_RENEWAL).await? {
             None => None,
             Some(doc) => Some(AppCert::verify(&doc, &meta.identity).map_err(|_| corrupt())?),
@@ -1828,6 +1829,22 @@ impl App {
                 .map_err(|_| invalid("its certificate doesn't verify"))?;
             if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
                 return Err(invalid("its certificate isn't its keys'"));
+            }
+            let mut carried_ids = BTreeSet::new();
+            for item in &backup.outbox {
+                if !carried_ids.insert(item.msg_id()) || !item.is_own(&meta, &cert) {
+                    return Err(invalid(
+                        "its outbox identity or signed message is inconsistent",
+                    ));
+                }
+            }
+            let mut omitted_ids = BTreeSet::new();
+            for (msg_id, _) in &backup.outbox_left_out {
+                if carried_ids.contains(msg_id.as_str()) || !omitted_ids.insert(msg_id) {
+                    return Err(invalid(
+                        "its outbox identities are both carried and omitted or repeated",
+                    ));
+                }
             }
             // The app record the restore installs carries that very certificate, so what the
             // protocol checks below is all that is installed: the app writes the two

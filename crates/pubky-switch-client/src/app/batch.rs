@@ -1336,6 +1336,24 @@ pub(crate) async fn kept_queued(
 }
 
 impl App {
+    /// Remove every retained copy of one withdrawn delivery with its message index.
+    /// The retained batches are bounded together at 12 MiB; with an outbox value and
+    /// duty this fits one store commit (Switch spec 11).
+    pub(crate) async fn remove_kept_delivery(
+        &self,
+        msg_id: &str,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        for (id, mut pending) in self.kept_batches().await? {
+            let before = pending.queued.len();
+            pending.queued.retain(|item| item.msg_id() != msg_id);
+            if pending.queued.len() != before {
+                tx.put(&pending_key(&id), &pending)?;
+            }
+        }
+        super::kept::forget_delivery(tx, msg_id)
+    }
+
     /// End, in `tx`, the holds ([`App::hold_message`]) of the messages the kept batch
     /// `batch_id` would queue, as the batch is dropped: the delivery of each ends with it,
     /// unless the outbox holds the message or another kept batch this commit keeps would
@@ -1376,6 +1394,13 @@ impl App {
             .await?
             .into_iter()
             .map(|(id, pending)| {
+                if pending
+                    .queued
+                    .iter()
+                    .any(|item| !item.is_own(&self.state.meta, &self.state.cert))
+                {
+                    return Err(AppError::Store(crate::error::StoreError::Corrupt));
+                }
                 pubky_switch_core::enc::unb64_array::<16>(&id)
                     .map(|id| (id, pending))
                     .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))

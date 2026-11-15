@@ -4,6 +4,8 @@
 //! service time, collections with a policy per sub-scope, and two identities messaging each
 //! other, each on its own scripted switch.
 
+mod delivery_lifecycle;
+
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::chain::TransitionProof;
@@ -5293,33 +5295,7 @@ async fn test_hold_message_backup_whose_held_message_is_not_carried_owed_is_refu
 /// protocols brings back, is any protocol's to list and release.
 #[tokio::test]
 async fn test_hold_message_of_a_kind_no_protocol_owns_is_any_protocols() {
-    let p = Pair::new();
-    let protocol = ApiProtocol::new(Mode::Plain);
-    let (mut wallet, _shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
-    assert!(
-        wallet
-            .hold_message("sample", signed.msg_id())
-            .await
-            .unwrap()
-    );
-    let bytes = wallet.backup().await.unwrap().to_bytes().unwrap();
-    drop(wallet);
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    value["outbox"][0]["kind"] = json!("nobody.note");
-    let backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
-    let env = p.env(&p.alice, Arc::new(MemoryStore::new()));
-    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
-        .await
-        .unwrap();
-    assert_eq!(
-        restored.held_messages("sample").await.unwrap(),
-        vec![signed.msg_id().to_owned()]
-    );
-    restored
-        .release_message("sample", signed.msg_id())
-        .await
-        .unwrap();
-    assert!(restored.held_messages("sample").await.unwrap().is_empty());
+    delivery_lifecycle::orphaned_kind().await;
 }
 
 /// The per-message calls name a registered protocol.

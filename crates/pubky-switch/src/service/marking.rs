@@ -94,13 +94,13 @@ impl Judged {
     pub(super) fn created_at_ms(&self) -> Option<u64> {
         self.mark()
             .map(|mark| mark.created_at_ms)
-            .or(self.account.map(|account| account.created_at_ms))
+            .or(self.account.map(|account| account.model.created_at_ms))
     }
 
     /// Whether the account answers the notice: it fails stop or is bounded (Table 2).
     pub(super) fn answers_notice(&self) -> bool {
         matches!(
-            self.judgement.verdict,
+            self.judgement.decision.verdict,
             verdict::Verdict::Bounded { .. } | verdict::Verdict::Failing { .. }
         )
     }
@@ -267,7 +267,7 @@ impl Service {
         // whatever the state's generation (Switch wire 7.3 under Table 1).
         let mut stub_at_mark = None;
         let state = account
-            .and_then(|account| account.state.state())
+            .and_then(|account| account.model.state.state())
             .map(|state| (state.generation, state.seq));
         if let MarkInput::Mark(held) = &mark
             && let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held)
@@ -367,7 +367,7 @@ impl Service {
         let account = found.as_ref().map(|found| self.found_input(found));
         let mut judged = self.judge_with(identity, account, inputs).await;
         let mut found = found;
-        if judged.judgement.erase_account_again {
+        if judged.judgement.decision.erase_account_again {
             self.erase_again(identity).await?;
             // Gone now, or a later account made meanwhile.
             let inputs = self.mark_inputs(identity).await;
@@ -380,7 +380,7 @@ impl Service {
             judged = self.judge_with(identity, account, inputs).await;
         }
         if let (verdict::Verdict::NotHosted { delete_mark: true }, Some(erased_at_ms)) =
-            (judged.judgement.verdict, judged.erasure_at_ms)
+            (judged.judgement.decision.verdict, judged.erasure_at_ms)
         {
             let _ = self.delete_leftover(identity, erased_at_ms).await;
         }

@@ -927,7 +927,7 @@ impl Service {
             body.as_ref(),
         );
         let judged = self.judge(&read.account.id, Some(account)).await;
-        if judged.judgement.erase_account_again {
+        if judged.judgement.decision.erase_account_again {
             let committed_ms = txn.head().stamped_time_ms;
             drop(txn);
             return self
@@ -1073,7 +1073,7 @@ impl Service {
             &RequestClass::Ordinary,
             super::PublicKeyBytes::public_key_bytes(&current),
         );
-        if judged.judgement.erase_account_again {
+        if judged.judgement.decision.erase_account_again {
             return Err(FeedStop::AccountChanged);
         }
         let signer = match routed.route {

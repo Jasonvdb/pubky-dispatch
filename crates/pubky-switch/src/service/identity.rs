@@ -234,7 +234,7 @@ impl Service {
         trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
-        let refused = || match judged.judgement.verdict {
+        let refused = || match judged.judgement.decision.verdict {
             verdict::Verdict::Failing { notice, .. } | verdict::Verdict::Bounded { notice, .. } => {
                 self.notice(&txn.head().id, notice)
             }
@@ -242,6 +242,7 @@ impl Service {
         };
         let floor = judged
             .judgement
+            .decision
             .recovery_floor
             .max(held.map_or(0, IdentityDoc::generation));
         if !verdict::recovery_starts_above(floor, doc.generation(), doc.body().recovery_from) {

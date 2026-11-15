@@ -1082,7 +1082,7 @@ impl Service {
             held.as_ref().map(IdentityDoc::body),
         );
         let judged = self.judge(&identity, Some(account)).await;
-        if judged.judgement.erase_account_again {
+        if judged.judgement.decision.erase_account_again {
             drop(txn);
             return self
                 .answer_after_account_change(&identity, class, asked, base_ms, Some(committed_ms))
@@ -1100,7 +1100,7 @@ impl Service {
         // Only an answer the verdict lets carry a head carries one (Switch wire 7.3 under
         // Table 2): the start of a generation carries its own.
         let carries_head = matches!(routed.route, Route::Proceed { head: true });
-        let healthy = matches!(judged.judgement.verdict, verdict::Verdict::Healthy);
+        let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
         // Step 3: the identity's service time, which never goes back.
         let time_ms = txn.stamp(base_ms);
         // A failure under the lock: the transaction is dropped, nothing of it stays, and the

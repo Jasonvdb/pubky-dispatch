@@ -411,7 +411,8 @@ impl Service {
                 &verdict::RequestClass::Erase,
                 self.current_key(),
             );
-            if !matches!(routed.route, Route::Erase { .. }) || judged.judgement.erase_account_again
+            if !matches!(routed.route, Route::Erase { .. })
+                || judged.judgement.decision.erase_account_again
             {
                 return refuse(unavailable());
             }
@@ -447,7 +448,7 @@ impl Service {
             );
         }
         let judged = self.judge_with(identity, None, inputs).await;
-        if matches!(judged.judgement.verdict, verdict::Verdict::Unknown) {
+        if matches!(judged.judgement.decision.verdict, verdict::Verdict::Unknown) {
             return refuse(unavailable());
         }
         if judged

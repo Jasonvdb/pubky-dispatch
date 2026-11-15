@@ -5,12 +5,13 @@
 //! The transport is the caller's: these functions build and check the signed fields of a
 //! request or response whose method, path, headers and body the caller holds.
 
+use serde::{Deserialize, Serialize};
+
 use crate::enc::{hash, lp, u64be, unb64_array};
 use crate::error::{Error, Result, invalid};
 use crate::labels;
 use crate::sig;
 use crate::signing::Signs;
-use serde::{Deserialize, Serialize};
 
 /// Header names, as the switch sends them, in lower case; names are case-insensitive
 /// (Switch wire 7.1).
@@ -928,63 +929,6 @@ impl ErrorCode {
     }
 }
 
-/// Why an account awaits a recovery, the `reason` of a [`RecoveryNotice`] (Switch wire 7.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NoticeReason {
-    /// `behind`: the account's state is behind the newest head the service signed for it,
-    /// or of an earlier generation than its mark, or the account is gone while its mark is
-    /// there, or is staged and bounded by its mark.
-    Behind,
-    /// `fork`: the account is at that head's `seq` with another chain hash.
-    Fork,
-    /// `mark_lost`: the account's mark is missing or doesn't read as a mark.
-    MarkLost,
-}
-
-/// The `current` of a `503 recovery_required`, the recovery notice (Switch wire 7.6, Switch
-/// spec 6.5). All three members are required; unknown members are ignored, since an error
-/// body isn't among the places that refuse them (Switch wire 1.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoveryNotice {
-    /// The higher of the account's generation here, 0 while it holds no document, and its
-    /// mark's.
-    pub generation: u64,
-    /// Why the account awaits a recovery.
-    pub reason: NoticeReason,
-    /// `true` once the operator retired this generation for the account.
-    pub permanent: bool,
-}
-
-impl RecoveryNotice {
-    /// Read a notice from an error body's `current` (Switch wire 7.6). Unknown members are
-    /// ignored (Switch wire 1.1).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Invalid`] if a member is missing or of another type, or `reason` isn't one
-    /// of the three: a malformed notice, which a client still holds as a notice for the
-    /// generation it follows, with `permanent` `false` (Switch wire 7.6).
-    pub fn from_current(current: &serde_json::Value) -> Result<Self> {
-        Ok(serde_json::from_value(current.clone())?)
-    }
-
-    /// The notice as an error body's `current`.
-    pub fn to_current(&self) -> serde_json::Value {
-        serde_json::json!({
-            "generation": self.generation,
-            "reason": self.reason,
-            "permanent": self.permanent,
-        })
-    }
-}
-
-/// The `current` of the `404 not_found` to an identity the service doesn't host,
-/// `{ "hosted": false }`, and of nothing else (Switch wire 7.3 step 2, 7.6).
-pub fn not_hosted_current() -> serde_json::Value {
-    serde_json::json!({ "hosted": false })
-}
-
 /// The classes of answer that count in no comparison of service times, the only answers
 /// to a request a client sends that the service signs at its time base (Switch wire 7.1
 /// Timestamp, spec 10.1). A client tells each from the answer and the call it made alone
@@ -1066,8 +1010,133 @@ pub fn decode_signature(text: &str) -> Result<[u8; 64]> {
         .map_err(|_| Error::Signature("Switch wire 7.1: a signature header isn't b64(64)".into()))
 }
 
+/// Why an account awaits a recovery, the `reason` of a [`RecoveryNotice`] (Switch wire 7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeReason {
+    /// `behind`: the account's state is behind the newest head the service signed for it,
+    /// or of an earlier generation than its mark, or the account is gone while its mark is
+    /// there, or is staged and bounded by its mark.
+    Behind,
+    /// `fork`: the account is at that head's `seq` with another chain hash.
+    Fork,
+    /// `mark_lost`: the account's mark is missing or doesn't read as a mark.
+    MarkLost,
+}
+
+/// The `current` of a `503 recovery_required`, the recovery notice (Switch wire 7.6, Switch
+/// spec 6.5). All three members are required; unknown members are ignored, since an error
+/// body isn't among the places that refuse them (Switch wire 1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryNotice {
+    /// The higher of the account's chain generation (its document's without a chain,
+    /// zero with neither) and its mark's generation.
+    pub generation: u64,
+    /// Why the account awaits a recovery.
+    pub reason: NoticeReason,
+    /// `true` once the operator retired this generation for the account.
+    pub permanent: bool,
+}
+
+impl RecoveryNotice {
+    /// Read a notice from an error body's `current` (Switch wire 7.6). Unknown members are
+    /// ignored (Switch wire 1.1).
+    /// The error body has already passed [`crate::json::parse_json`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if a member is missing or of another type, or `reason` isn't one
+    /// of the three: a malformed notice, which a client still holds as a notice for the
+    /// generation it follows, with `permanent` `false` (Switch wire 7.6).
+    pub fn from_current(current: &serde_json::Value) -> Result<Self> {
+        Ok(serde_json::from_value(current.clone())?)
+    }
+
+    /// The notice as an error body's `current`.
+    pub fn to_current(&self) -> serde_json::Value {
+        serde_json::json!({
+            "generation": self.generation,
+            "reason": self.reason,
+            "permanent": self.permanent,
+        })
+    }
+}
+
+/// The `current` of the `404 not_found` to an identity the service doesn't host,
+/// `{ "hosted": false }`, and of nothing else (Switch wire 7.3 step 2, 7.6).
+pub fn not_hosted_current() -> serde_json::Value {
+    serde_json::json!({ "hosted": false })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_recovery_notice_round_trips_each_reason() {
+        for (reason, text) in [
+            (NoticeReason::Behind, "behind"),
+            (NoticeReason::Fork, "fork"),
+            (NoticeReason::MarkLost, "mark_lost"),
+        ] {
+            for (generation, permanent) in [(0, false), (3, true), (crate::json::MAX_INT, false)] {
+                let notice = RecoveryNotice {
+                    generation,
+                    reason,
+                    permanent,
+                };
+                let expected = serde_json::json!({
+                    "generation": generation, "reason": text, "permanent": permanent
+                });
+                assert_eq!(notice.to_current(), expected);
+                assert_eq!(RecoveryNotice::from_current(&expected).unwrap(), notice);
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery_notice_requires_each_member() {
+        let full = serde_json::json!({"generation": 3, "reason": "behind", "permanent": false});
+        for field in ["generation", "reason", "permanent"] {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(RecoveryNotice::from_current(&missing).is_err(), "{field}");
+        }
+        assert!(RecoveryNotice::from_current(&full).is_ok());
+    }
+
+    #[test]
+    fn test_recovery_notice_rejects_invalid_member_types() {
+        for value in [
+            serde_json::json!({"generation": -1, "reason": "fork", "permanent": false}),
+            serde_json::json!({"generation": "3", "reason": "fork", "permanent": false}),
+            serde_json::json!({"generation": 3, "reason": "unknown", "permanent": false}),
+            serde_json::json!({"generation": 3, "reason": null, "permanent": false}),
+            serde_json::json!({"generation": 3, "reason": "fork", "permanent": "false"}),
+            serde_json::json!({"generation": 3, "reason": "fork", "permanent": null}),
+        ] {
+            assert!(RecoveryNotice::from_current(&value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_recovery_notice_ignores_unknown_members() {
+        let with_extra = serde_json::json!({
+            "generation": 2, "reason": "behind", "permanent": true, "extra": {"value": 1}
+        });
+        assert_eq!(
+            RecoveryNotice::from_current(&with_extra).unwrap(),
+            RecoveryNotice {
+                generation: 2,
+                reason: NoticeReason::Behind,
+                permanent: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_not_hosted_current_has_no_account_fields() {
+        assert_eq!(not_hosted_current(), serde_json::json!({ "hosted": false }));
+    }
+
     use super::*;
     use crate::keys::AppKeys;
 

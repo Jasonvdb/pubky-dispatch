@@ -85,6 +85,17 @@ pub struct AccountMark {
     pub created_at_ms: u64,
 }
 
+impl From<&AccountMark> for crate::account::Mark {
+    fn from(mark: &AccountMark) -> Self {
+        Self {
+            generation: mark.generation,
+            seq: mark.seq,
+            chain_hash: mark.chain_hash,
+            created_at_ms: mark.created_at_ms,
+        }
+    }
+}
+
 impl AccountMark {
     /// A mark that has recorded no head: (0, 0).
     pub fn zero(key: [u8; 32], created_at_ms: u64) -> Self {

@@ -1,66 +1,29 @@
-//! The verdict for an account and its mark, and what each verdict answers (Switch wire 7.3,
-//! "Accounts and marks", Tables 1 and 2; Switch spec 6.5).
+//! The account model's stored inputs and response signing keys (Switch wire 7.3,
+//! Tables 1 and 2; Switch spec 6.5).
 //!
-//! Pure functions: the request path reads the account, its mark, the erasure's record and
-//! the retirements, and [`judge`] gives the verdict of Table 1 and the key of Table 2's
-//! "Signed with" column; [`answer`] gives the route of Table 2 for the request's class.
+//! The shared [`crate::account`] model decides the verdict and route. These adapters read
+//! the held document and persisted mark, and select the key of Table 2's "Signed with"
+//! column without changing that decision.
 
 use pubky_switch_core::{
     chain::{ChainTip, ZERO_HASH},
-    http::{NoticeReason, RecoveryNotice},
     records::IdentityBody,
 };
 
-use crate::marks::{AccountMark, MarkRead, MarkStoreError};
+pub(super) use crate::account::recovery_starts_above;
+pub use crate::account::{AccountState, MoveStep, RequestClass, Route, Verdict};
+use crate::{
+    account,
+    marks::{AccountMark, MarkRead, MarkStoreError},
+};
 
-/// What an account holds, as the request finds it (Switch wire 7.3, "The state").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccountState {
-    /// Staged, holding no chain: it has activated no import, and has no state to compare.
-    StagedNoChain,
-    /// Staged, holding an activated import (Switch wire 10.5), ending at this head; also a
-    /// staged account holding the chain it served, whose newest document names another
-    /// service.
-    StagedImport(ChainTip),
-    /// Serving, at this head.
-    Serving(ChainTip),
-    /// Frozen, at this head. The freeze isn't served yet, so no request finds one.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Frozen(ChainTip),
-}
-
-impl AccountState {
-    /// The head of the chain it holds: its state, if it has one.
-    pub fn state(&self) -> Option<ChainTip> {
-        match self {
-            Self::StagedNoChain => None,
-            Self::StagedImport(head) | Self::Serving(head) | Self::Frozen(head) => Some(*head),
-        }
-    }
-
-    /// Whether the account is staged.
-    pub fn is_staged(&self) -> bool {
-        matches!(self, Self::StagedNoChain | Self::StagedImport(_))
-    }
-}
-
-/// An account, as [`judge`] needs it.
+/// The held account and the service key its newest document names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Account {
-    /// What it holds.
-    pub state: AccountState,
-    /// When it was created, in Unix milliseconds.
-    pub created_at_ms: u64,
-    /// The generation of the newest `identity.json` it holds, `None` while it holds none.
-    pub document_generation: Option<u64>,
-    /// The service key its newest `identity.json` names, where that document names this
-    /// service.
+    /// The account state the shared model judges.
+    pub model: account::Account,
+    /// The key named at this origin, where the service holds it.
     pub named_key: Option<[u8; 32]>,
-    /// The generation of the `identity.json` it was enrolled with (Switch wire 7.3, Table 2),
-    /// for an account enrolled without one 1, the generation its first document starts
-    /// (Switch wire 3.3). The account's row holds it while the account is staged, the only
-    /// time the abort it bounds counts.
-    pub enrolled_generation: u64,
 }
 
 impl Account {
@@ -96,22 +59,19 @@ impl Account {
             AccountState::StagedNoChain
         };
         Self {
-            state,
-            created_at_ms,
-            document_generation: doc.map(|body| body.generation),
+            model: account::Account {
+                state,
+                created_at_ms,
+                document_generation: doc.map(|body| body.generation),
+                enrolled_generation: generation,
+            },
             named_key,
-            enrolled_generation: generation,
         }
     }
 
-    /// Its generation here (Switch wire 7.6): that of the state it holds, its chain's where
-    /// it holds one (an activated import included), else its document's, 0 only while it
-    /// holds neither.
+    /// Its generation here (Switch wire 7.6).
     pub fn generation(&self) -> u64 {
-        match self.state.state() {
-            Some(state) => state.generation,
-            None => self.document_generation.unwrap_or(0),
-        }
+        self.model.generation()
     }
 }
 
@@ -141,6 +101,15 @@ impl From<&Result<MarkRead, MarkStoreError>> for MarkInput {
 }
 
 impl MarkInput {
+    fn model(&self) -> account::MarkInput {
+        match self {
+            Self::StoreUnreadable => account::MarkInput::StoreUnreadable,
+            Self::Missing => account::MarkInput::Missing,
+            Self::NotAMark => account::MarkInput::NotAMark,
+            Self::Mark(mark) => account::MarkInput::Mark(mark.into()),
+        }
+    }
+
     fn mark(&self) -> Option<&AccountMark> {
         match self {
             Self::Mark(mark) => Some(mark),
@@ -168,357 +137,46 @@ pub struct Inputs<'a> {
     pub current_key: [u8; 32],
 }
 
-/// The verdict of Table 1 (Switch wire 7.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The service doesn't host the identity. With `delete_mark`, the mark is an erasure's
-    /// leftover, deleted.
-    NotHosted {
-        /// Whether the mark is deleted.
-        delete_mark: bool,
-    },
-    /// A staged account at its (0, 0) mark.
-    Staged,
-    /// The account's state is at or past its mark.
-    Healthy,
-    /// A staged account holding no chain, bounded by its mark.
-    Bounded {
-        /// The notice it answers.
-        notice: RecoveryNotice,
-        /// Whether the abort of a move goes through (Table 2).
-        abort_allowed: bool,
-    },
-    /// The account fails stop.
-    Failing {
-        /// The notice it answers.
-        notice: RecoveryNotice,
-        /// Whether the abort of a move goes through: only at a staged account (Table 2).
-        abort_allowed: bool,
-    },
-    /// No account, with a mark that records a head, or of a retired generation.
-    Lost {
-        /// The notice it answers.
-        notice: RecoveryNotice,
-    },
-    /// The mark store can't be read.
-    Unknown,
-}
-
-/// What [`judge`] finds.
+/// The shared model's decision and its response signing key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judgement {
-    /// Table 1's first row: the account was created at or before the time of an erasure's
-    /// record for the identity, and is erased again before anything is served or signed;
-    /// `verdict` is that of the identity without it.
-    pub erase_account_again: bool,
-    /// The verdict.
-    pub verdict: Verdict,
-    /// The held document's generation or the mark's, whichever is greater: a recovery
-    /// start must exceed it (Switch wire 7.3, Table 2). This is independent of the notice's
-    /// chain generation. Unused while the verdict is unknown.
-    pub recovery_floor: u64,
-    /// The key the verdict's answers are signed with (Table 2, "Signed with"), but an
-    /// enrollment's ([`answer`]).
+    /// The account model's verdict, erasure duty and recovery floor.
+    pub decision: account::Judgement,
+    /// The key for responses other than enrollment (Switch wire 7.3, Table 2).
     pub key: [u8; 32],
 }
 
-/// The columns of Table 1 other than the retired one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Column {
-    /// No mark, or one that doesn't read as a mark.
-    NoMark,
-    /// Mark (0, 0).
-    Zero,
-    /// The mark records a head; the account has no state to compare.
-    Head,
-    /// The mark records a head; the state is at or past it.
-    AtOrPast,
-    /// The mark records a head; the state is behind it.
-    Behind,
-    /// The mark is at the state's pair with another chain hash, or the state is past the
-    /// mark with another chain hash at the mark's `seq`.
-    Fork,
-}
-
-/// Judge the account and its mark together (Switch wire 7.3, Table 1).
-///
-/// The first row comes before every other, and the columns are read from the right: a store
-/// that can't be read, then a retired generation, then the rest.
+/// Judge the persisted inputs with the shared model and select the response key.
 pub fn judge(inputs: &Inputs<'_>) -> Judgement {
-    if matches!(inputs.mark, MarkInput::StoreUnreadable) {
-        // While the verdict is unknown no mark is created, moved or deleted, nor is an
-        // account erased again.
-        let key = inputs
-            .account
-            .and_then(|account| account.named_key)
-            .unwrap_or(inputs.current_key);
-        return Judgement {
-            erase_account_again: false,
-            verdict: Verdict::Unknown,
-            recovery_floor: 0,
-            key,
-        };
-    }
-    let mut account = inputs.account;
-    let mut erase_account_again = false;
-    if let (Some(held), Some(erased_at)) = (account, inputs.erasure_at_ms)
-        && held.created_at_ms <= erased_at
-    {
-        // A restore brought it back, or its deletion never committed: then a row "None"
-        // applies.
-        erase_account_again = true;
-        account = None;
-    }
-    let verdict = match account {
-        None => judge_without_account(inputs),
-        Some(account) => judge_account(account, inputs),
-    };
+    let decision = account::judge(&account::Inputs {
+        account: inputs.account.map(|account| &account.model),
+        mark: &inputs.mark.model(),
+        stub_at_mark: inputs.stub_at_mark,
+        erasure_at_ms: inputs.erasure_at_ms,
+        retired: inputs.retired,
+    });
+    let named_key = inputs
+        .account
+        .filter(|_| !decision.erase_account_again)
+        .and_then(|account| account.named_key);
     let mark_key = inputs.mark.mark().map(|mark| mark.key);
-    let named_key = account.and_then(|account| account.named_key);
-    let key = match verdict {
-        Verdict::NotHosted { .. } | Verdict::Unknown => inputs.current_key,
+    let key = match decision.verdict {
+        Verdict::NotHosted { .. } => inputs.current_key,
+        Verdict::Unknown => named_key.unwrap_or(inputs.current_key),
         Verdict::Staged | Verdict::Healthy => named_key.or(mark_key).unwrap_or(inputs.current_key),
         Verdict::Bounded { .. } | Verdict::Failing { .. } | Verdict::Lost { .. } => {
             mark_key.or(named_key).unwrap_or(inputs.current_key)
         }
     };
-    Judgement {
-        erase_account_again,
-        verdict,
-        recovery_floor: account
-            .and_then(|account| account.document_generation)
-            .unwrap_or(0)
-            .max(inputs.mark.mark().map_or(0, |mark| mark.generation)),
-        key,
-    }
+    Judgement { decision, key }
 }
 
-/// Table 1, rows "None" and "None, erased".
-fn judge_without_account(inputs: &Inputs<'_>) -> Verdict {
-    let Some(mark) = inputs.mark.mark() else {
-        return Verdict::NotHosted { delete_mark: false };
-    };
-    // An erasure's record names the identity at or after the mark's creation: the mark is
-    // an erasure's leftover. A mark created after the record belongs to a later account.
-    if inputs
-        .erasure_at_ms
-        .is_some_and(|erased_at| erased_at >= mark.created_at_ms)
-    {
-        return Verdict::NotHosted { delete_mark: true };
-    }
-    // With no account there is no state, so a retirement always counts.
-    if inputs.retired.contains(&mark.generation) {
-        return lost(mark, true);
-    }
-    if mark.records_head() {
-        lost(mark, false)
-    } else {
-        Verdict::NotHosted { delete_mark: false }
-    }
-}
-
-fn lost(mark: &AccountMark, permanent: bool) -> Verdict {
-    Verdict::Lost {
-        notice: RecoveryNotice {
-            generation: mark.generation,
-            reason: NoticeReason::Behind,
-            permanent,
-        },
-    }
-}
-
-/// Table 1, the rows of an account.
-fn judge_account(account: &Account, inputs: &Inputs<'_>) -> Verdict {
-    let state = account.state.state();
-    let mark = inputs.mark.mark();
-    let column = column(state, mark, inputs.stub_at_mark);
-    // A retirement is of the mark's generation, or of the account's where the mark is
-    // lost, and counts only while the state isn't of a later generation than that.
-    let retired_generation = mark.map_or(account.generation(), |mark| mark.generation);
-    let retired = inputs.retired.contains(&retired_generation)
-        && state.is_none_or(|state| state.generation <= retired_generation);
-    let generation = account
-        .generation()
-        .max(mark.map_or(0, |mark| mark.generation));
-    let abort_allowed = account.state.is_staged()
-        && mark.is_none_or(|mark| mark.generation <= account.enrolled_generation);
-    let notice = |reason, permanent| RecoveryNotice {
-        generation,
-        reason,
-        permanent,
-    };
-    let failing = |reason, permanent| Verdict::Failing {
-        notice: notice(reason, permanent),
-        abort_allowed,
-    };
-    let bounded = |permanent| Verdict::Bounded {
-        notice: notice(NoticeReason::Behind, permanent),
-        abort_allowed,
-    };
-    if state.is_none() {
-        // Row "Staged, holding no chain".
-        if retired {
-            // Where the mark is lost the retirement is of the account's generation, and
-            // the account fails stop as one that lost its mark.
-            return if mark.is_none() {
-                failing(NoticeReason::MarkLost, true)
-            } else {
-                bounded(true)
-            };
-        }
-        return match column {
-            Column::NoMark => failing(NoticeReason::MarkLost, false),
-            Column::Zero => Verdict::Staged,
-            Column::Head | Column::AtOrPast | Column::Behind | Column::Fork => bounded(false),
-        };
-    }
-    // Rows "Staged, holding an activated import", "Serving" and "Frozen". "Permanent" keeps
-    // the reason the account had before it was retired.
-    let reason = match column {
-        Column::NoMark => Some(NoticeReason::MarkLost),
-        Column::Behind => Some(NoticeReason::Behind),
-        Column::Fork => Some(NoticeReason::Fork),
-        Column::Zero | Column::Head | Column::AtOrPast => None,
-    };
-    match (retired, reason) {
-        (true, reason) => failing(reason.unwrap_or(NoticeReason::Behind), true),
-        (false, Some(reason)) => failing(reason, false),
-        (false, None) => Verdict::Healthy,
-    }
-}
-
-/// The stub whose chain hash the fork rule under Table 1 compares with the mark's (Switch
-/// wire 7.3): "Where the service still holds the chain stub at the mark's `seq`, a state past
-/// the mark with another chain hash there is a fork too". The mark's generation and `seq`,
-/// where the mark records a head and `state`, the account's (generation, `seq`), is past it,
-/// whatever the state's generation; `None` where the rule doesn't look. In one place for the
-/// service and its offline check.
+/// The historical stub the model needs to compare a persisted mark (Switch wire 7.3).
 pub fn stub_for_fork_rule(state: Option<(u64, u64)>, mark: &AccountMark) -> Option<(u64, u64)> {
-    let marked = (mark.generation, mark.seq);
-    (mark.records_head() && state.is_some_and(|at| at > marked)).then_some(marked)
+    account::stub_for_fork_rule(state, &mark.into())
 }
 
-/// Which of Table 1's columns, other than the two read first, the state and the mark fall
-/// in.
-fn column(
-    state: Option<ChainTip>,
-    mark: Option<&AccountMark>,
-    stub_at_mark: Option<[u8; 32]>,
-) -> Column {
-    let Some(mark) = mark else {
-        return Column::NoMark;
-    };
-    if !mark.records_head() {
-        return Column::Zero;
-    }
-    let Some(state) = state else {
-        return Column::Head;
-    };
-    let at = (state.generation, state.seq);
-    let marked = (mark.generation, mark.seq);
-    if at < marked {
-        Column::Behind
-    } else if at == marked {
-        if state.chain_hash == mark.chain_hash {
-            Column::AtOrPast
-        } else {
-            Column::Fork
-        }
-    } else if stub_at_mark.is_some_and(|hash| hash != mark.chain_hash) {
-        // Where the service still holds the stub at the mark's `seq`, a state past the
-        // mark with another chain hash there is a fork too.
-        Column::Fork
-    } else {
-        Column::AtOrPast
-    }
-}
-
-/// A request, by the columns of Table 2 (Switch wire 7.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestClass {
-    /// An own signed request, another identity's caller, or the public read.
-    Ordinary,
-    /// `POST /v1/enroll`.
-    Enroll,
-    /// `PUT /identity`: the delivered document's generation and `recovery_from`.
-    PutIdentity {
-        /// The document's generation.
-        generation: u64,
-        /// Its `recovery_from`, if it carries one.
-        recovery_from: Option<u64>,
-    },
-    /// A step of a move.
-    Move(MoveStep),
-    /// `POST /erase`.
-    Erase,
-}
-
-/// A step of a move (Switch wire 10).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoveStep {
-    /// The import and the uploads: `POST /import`, `PUT /import/chunks/{chunk_id}`,
-    /// `POST /recovery/upload`.
-    ImportOrUpload,
-    /// `POST /import/activate`, once its import is judged.
-    // The activation isn't served yet: its endpoint will route it so.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Activate {
-        /// Whether the import clears the mark ([`activation_clears_mark`]).
-        clears_mark: bool,
-    },
-    /// `POST /import/activate` as the request arrives, before its import is judged: no
-    /// verdict lets it activate anything, and wherever the import could clear the mark it is
-    /// routed to [`Route::JudgeActivation`], so an activation is only ever answered as
-    /// [`MoveStep::Activate`] with `clears_mark` computed from its import. This keeps the
-    /// refusal of an import of a retired generation, at any staged account, from being
-    /// passed over (Switch wire 7.3, Table 2).
-    ActivateUnjudged,
-    /// The abort, `POST /unfreeze` (Switch wire 10.6).
-    Abort,
-    /// The export, `GET /export` and `GET /export/chunks/{chunk_id}`.
-    Export,
-}
-
-/// What a request gets under a verdict (Switch wire 7.3, Table 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
-    /// The `404 not_found` of step 2, `current: { "hosted": false }`, without a head.
-    NotHosted,
-    /// The enrollment creates the account (Table 3).
-    CreateAccount,
-    /// The enrollment creates a staged account that takes the mark over (Table 3).
-    TakeOverMark,
-    /// The request goes on as the endpoint gives. With `head` false its answer carries no
-    /// head.
-    Proceed {
-        /// Whether its answer may carry a head.
-        head: bool,
-    },
-    /// The start of a generation above both the held document's and the mark's, which
-    /// starts the account afresh (Switch wire 3.3); its `200` carries the head.
-    StartAfresh,
-    /// `409 conflict`: an activation that doesn't clear the mark.
-    Conflict,
-    /// An activation whose import isn't judged yet ([`MoveStep::ActivateUnjudged`]): the
-    /// endpoint computes [`activation_clears_mark`] from the import and routes it again as
-    /// [`MoveStep::Activate`]; nothing is activated and no head is signed on this route.
-    JudgeActivation,
-    /// The erasure as Switch wire 7.4.16 gives.
-    Erase {
-        /// The account fails stop: a frozen account's unfinished export doesn't bar it.
-        fails_stop: bool,
-        /// Whether an import bars it: only while the abort can go through.
-        import_bars: bool,
-    },
-    /// The erasure at a lost identity: the record is written, then the mark deleted.
-    EraseLost,
-    /// `503 recovery_required` with this notice, without a head.
-    Notice(RecoveryNotice),
-    /// `503 unavailable`, without a head.
-    Unavailable,
-}
-
-/// What a request gets, and the key its answer is signed with.
+/// A request's route and the key its response uses (Switch wire 7.3, Table 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Answer {
     /// The route.
@@ -540,143 +198,30 @@ pub fn answer(judgement: &Judgement, class: &RequestClass, current_key: [u8; 32]
         | RequestClass::Erase => judgement.key,
     };
     Answer {
-        route: route(&judgement.verdict, class, judgement.recovery_floor),
+        route: account::request_route(&judgement.decision, class),
         key,
     }
 }
 
-fn route(verdict: &Verdict, class: &RequestClass, recovery_floor: u64) -> Route {
-    match *verdict {
-        Verdict::NotHosted { .. } => match class {
-            RequestClass::Enroll => Route::CreateAccount,
-            RequestClass::Ordinary
-            | RequestClass::PutIdentity { .. }
-            | RequestClass::Move(_)
-            | RequestClass::Erase => Route::NotHosted,
-        },
-        Verdict::Staged | Verdict::Healthy => match class {
-            // An enrollment signs no head (Switch wire 7.4.1).
-            RequestClass::Enroll => Route::Proceed { head: false },
-            // At any staged account, an import of a retired generation isn't activated: the
-            // same `409 conflict` as at a bounded one (Switch wire 7.3, Table 2).
-            RequestClass::Move(MoveStep::Activate { clears_mark: false }) => Route::Conflict,
-            RequestClass::Move(MoveStep::ActivateUnjudged) => Route::JudgeActivation,
-            RequestClass::Ordinary | RequestClass::PutIdentity { .. } | RequestClass::Move(_) => {
-                Route::Proceed { head: true }
-            }
-            RequestClass::Erase => Route::Erase {
-                fails_stop: false,
-                import_bars: true,
-            },
-        },
-        Verdict::Bounded {
-            notice,
-            abort_allowed,
-        } => match *class {
-            RequestClass::Ordinary => Route::Notice(notice),
-            RequestClass::Enroll => Route::Proceed { head: false },
-            RequestClass::PutIdentity {
-                generation,
-                recovery_from,
-            } => start_or_notice(notice, recovery_floor, generation, recovery_from),
-            RequestClass::Move(step) => match step {
-                MoveStep::ImportOrUpload => Route::Proceed { head: false },
-                MoveStep::Activate { clears_mark: true } => Route::Proceed { head: true },
-                MoveStep::Activate { clears_mark: false } => Route::Conflict,
-                MoveStep::ActivateUnjudged => Route::JudgeActivation,
-                MoveStep::Abort if abort_allowed => Route::Proceed { head: false },
-                MoveStep::Abort | MoveStep::Export => Route::Notice(notice),
-            },
-            RequestClass::Erase => Route::Erase {
-                fails_stop: false,
-                import_bars: abort_allowed,
-            },
-        },
-        Verdict::Failing {
-            notice,
-            abort_allowed,
-        } => match *class {
-            RequestClass::Ordinary => Route::Notice(notice),
-            RequestClass::Enroll => Route::Proceed { head: false },
-            RequestClass::PutIdentity {
-                generation,
-                recovery_from,
-            } => start_or_notice(notice, recovery_floor, generation, recovery_from),
-            // The abort discards the import, signs no head and gives the discard answer.
-            RequestClass::Move(MoveStep::Abort) if abort_allowed => Route::Proceed { head: false },
-            RequestClass::Move(_) => Route::Notice(notice),
-            RequestClass::Erase => Route::Erase {
-                fails_stop: true,
-                import_bars: abort_allowed,
-            },
-        },
-        Verdict::Lost { notice } => match *class {
-            RequestClass::Enroll => Route::TakeOverMark,
-            RequestClass::Erase => Route::EraseLost,
-            RequestClass::Ordinary | RequestClass::PutIdentity { .. } | RequestClass::Move(_) => {
-                Route::Notice(notice)
-            }
-        },
-        Verdict::Unknown => Route::Unavailable,
-    }
-}
-
-/// Only a recovery above the held document and mark starts; any other delivery gets the
-/// unchanged notice (Switch wire 7.3, Table 2; 7.6).
-fn start_or_notice(
-    notice: RecoveryNotice,
-    recovery_floor: u64,
-    generation: u64,
-    recovery_from: Option<u64>,
-) -> Route {
-    if recovery_starts_above(recovery_floor, generation, recovery_from) {
-        Route::StartAfresh
-    } else {
-        Route::Notice(notice)
-    }
-}
-
-/// Whether a delivery starts a recovery above the held document and mark (Switch wire
-/// 7.3, Table 2), for routing and the final check before replacing account state.
-pub(super) fn recovery_starts_above(floor: u64, generation: u64, from: Option<u64>) -> bool {
-    generation > floor && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
-}
-
-/// Whether an activation at a bounded account clears its mark (Switch wire 7.3, Table 2):
-/// the import's head is at or past the mark and not of a retired generation, and its chain,
-/// where it reaches the mark's `seq` in the mark's generation, has the mark's chain hash
-/// there. `hash_at_mark` is the import's chain hash at the mark's generation and `seq`,
-/// `None` where its chain doesn't reach it. With the mark lost only the retirement bounds
-/// it.
-// The activation isn't served yet: its endpoint will compute `MoveStep::Activate` with it,
-// from the request routed to `Route::JudgeActivation`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn activation_clears_mark(
+#[cfg(test)]
+fn activation_clears_mark(
     import_head: ChainTip,
     hash_at_mark: Option<[u8; 32]>,
     mark: Option<&AccountMark>,
     retired: &[u64],
 ) -> bool {
-    if retired.contains(&import_head.generation) {
-        return false;
-    }
-    let Some(mark) = mark else {
-        return true;
-    };
-    let head = (import_head.generation, import_head.seq);
-    let marked = (mark.generation, mark.seq);
-    if head < marked {
-        return false;
-    }
-    if head == marked && import_head.chain_hash != mark.chain_hash {
-        return false;
-    }
-    hash_at_mark.is_none_or(|hash| hash == mark.chain_hash)
+    account::activation_clears_mark(
+        import_head,
+        hash_at_mark,
+        mark.map(Into::into).as_ref(),
+        retired,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pubky_switch_core::http::{NoticeReason, RecoveryNotice};
 
     const MARK_KEY: [u8; 32] = [1; 32];
     const DOC_KEY: [u8; 32] = [2; 32];
@@ -721,18 +266,22 @@ mod tests {
 
     fn account(row: Row) -> Option<Account> {
         let staged = |state| Account {
-            state,
-            created_at_ms: 100,
-            document_generation: None,
+            model: account::Account {
+                state,
+                created_at_ms: 100,
+                document_generation: None,
+                enrolled_generation: 2,
+            },
             named_key: None,
-            enrolled_generation: 2,
         };
         let serving = |state| Account {
-            state,
-            created_at_ms: 100,
-            document_generation: Some(2),
+            model: account::Account {
+                state,
+                created_at_ms: 100,
+                document_generation: Some(2),
+                enrolled_generation: 2,
+            },
             named_key: Some(DOC_KEY),
-            enrolled_generation: 2,
         };
         match row {
             Row::None | Row::NoneErased => None,
@@ -769,7 +318,7 @@ mod tests {
     }
 
     fn verdict(row: Row, mark: MarkInput, retired: &[u64]) -> Verdict {
-        judged(row, mark, retired).verdict
+        judged(row, mark, retired).decision.verdict
     }
 
     fn notice(generation: u64, reason: NoticeReason, permanent: bool) -> RecoveryNotice {
@@ -826,8 +375,8 @@ mod tests {
 
     fn assert_erased_again(mark: MarkInput, retired: &[u64], then: Verdict) {
         let judgement = judged(Row::ErasedAgain, mark, retired);
-        assert!(judgement.erase_account_again);
-        assert_eq!(judgement.verdict, then);
+        assert!(judgement.decision.erase_account_again);
+        assert_eq!(judgement.decision.verdict, then);
     }
 
     // Table 1, row "Any, created at or before the time of an erasure's record".
@@ -855,15 +404,17 @@ mod tests {
         );
         // A later generation's state over another hash there is a fork.
         let serving = Account {
-            state: AccountState::Serving(ChainTip {
-                generation: 2,
-                seq: 3,
-                chain_hash: [2; 32],
-            }),
-            created_at_ms: 0,
-            document_generation: Some(2),
+            model: account::Account {
+                state: AccountState::Serving(ChainTip {
+                    generation: 2,
+                    seq: 3,
+                    chain_hash: [2; 32],
+                }),
+                created_at_ms: 0,
+                document_generation: Some(2),
+                enrolled_generation: 2,
+            },
             named_key: Some(CURRENT),
-            enrolled_generation: 2,
         };
         let judged = judge(&Inputs {
             account: Some(&serving),
@@ -875,7 +426,7 @@ mod tests {
         });
         assert!(
             matches!(
-                judged.verdict,
+                judged.decision.verdict,
                 Verdict::Failing {
                     notice: RecoveryNotice {
                         reason: NoticeReason::Fork,
@@ -885,7 +436,7 @@ mod tests {
                 }
             ),
             "{:?}",
-            judged.verdict
+            judged.decision.verdict
         );
     }
 
@@ -923,8 +474,8 @@ mod tests {
     #[test]
     fn test_verdict_erased_again_store_unreadable() {
         let judgement = judged(Row::ErasedAgain, MarkInput::StoreUnreadable, &[]);
-        assert!(!judgement.erase_account_again);
-        assert_eq!(judgement.verdict, Verdict::Unknown);
+        assert!(!judgement.decision.erase_account_again);
+        assert_eq!(judgement.decision.verdict, Verdict::Unknown);
     }
 
     #[test]
@@ -966,8 +517,8 @@ mod tests {
     #[test]
     fn test_verdict_none_store_unreadable() {
         let judgement = judged(Row::None, MarkInput::StoreUnreadable, &[]);
-        assert_eq!(judgement.verdict, Verdict::Unknown);
-        assert!(!judgement.erase_account_again);
+        assert_eq!(judgement.decision.verdict, Verdict::Unknown);
+        assert!(!judgement.decision.erase_account_again);
     }
 
     #[test]
@@ -1282,8 +833,8 @@ mod tests {
             Row::Serving,
         ] {
             let judgement = judged(row, MarkInput::StoreUnreadable, &[0, 1, 2, 3]);
-            assert_eq!(judgement.verdict, Verdict::Unknown);
-            assert!(!judgement.erase_account_again);
+            assert_eq!(judgement.decision.verdict, Verdict::Unknown);
+            assert!(!judgement.decision.erase_account_again);
         }
     }
 
@@ -1302,10 +853,10 @@ mod tests {
             })
         };
         // Created at 100: a record at 100 erases it again, one at 99 doesn't.
-        assert!(at(100).erase_account_again);
+        assert!(at(100).decision.erase_account_again);
         let later = at(99);
-        assert!(!later.erase_account_again);
-        assert_eq!(later.verdict, Verdict::Healthy);
+        assert!(!later.decision.erase_account_again);
+        assert_eq!(later.decision.verdict, Verdict::Healthy);
     }
 
     #[test]
@@ -1314,8 +865,8 @@ mod tests {
         assert_eq!(verdict(Row::NoneErased, later, &[]), lost(2, false));
         // Also after the first row erased an earlier account again.
         let judgement = judged(Row::ErasedAgain, later, &[]);
-        assert!(judgement.erase_account_again);
-        assert_eq!(judgement.verdict, lost(2, false));
+        assert!(judgement.decision.erase_account_again);
+        assert_eq!(judgement.decision.verdict, lost(2, false));
         let zero = MarkInput::Mark(mark_created(0, 0, 0, ERASED_AT + 1));
         assert_eq!(verdict(Row::NoneErased, zero, &[]), NOT_HOSTED);
         // A record at the mark's creation covers it.
@@ -1327,11 +878,14 @@ mod tests {
     fn test_verdict_rule_fork_past_the_mark_by_the_stub() {
         let past = mark(2, 5, 7);
         for row in STATE_ROWS {
-            let fork = judged_with(row, past, Some([8; 32]), &[]).verdict;
+            let fork = judged_with(row, past, Some([8; 32]), &[]).decision.verdict;
             assert_eq!(fork, failing(2, NoticeReason::Fork, false, abort_at(row)));
-            let same = judged_with(row, past, Some([7; 32]), &[]).verdict;
+            let same = judged_with(row, past, Some([7; 32]), &[]).decision.verdict;
             assert_eq!(same, Verdict::Healthy);
-            assert_eq!(judged_with(row, past, None, &[]).verdict, Verdict::Healthy);
+            assert_eq!(
+                judged_with(row, past, None, &[]).decision.verdict,
+                Verdict::Healthy
+            );
         }
     }
 
@@ -1370,11 +924,13 @@ mod tests {
     #[test]
     fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generation() {
         let import = Account {
-            state: AccountState::StagedImport(tip(3, 7, 1)),
-            created_at_ms: 100,
-            document_generation: None,
+            model: account::Account {
+                state: AccountState::StagedImport(tip(3, 7, 1)),
+                created_at_ms: 100,
+                document_generation: None,
+                enrolled_generation: 3,
+            },
             named_key: None,
-            enrolled_generation: 3,
         };
         assert_eq!(import.generation(), 3);
         let at = |account: &Account, mark: MarkInput, retired: &[u64]| {
@@ -1389,36 +945,47 @@ mod tests {
         };
         let judgement = at(&import, MarkInput::Missing, &[]);
         assert_eq!(
-            judgement.verdict,
+            judgement.decision.verdict,
             failing(3, NoticeReason::MarkLost, false, true)
         );
         assert_eq!(judgement.key, CURRENT);
         assert_eq!(
-            at(&import, MarkInput::NotAMark, &[3]).verdict,
+            at(&import, MarkInput::NotAMark, &[3]).decision.verdict,
             failing(3, NoticeReason::MarkLost, true, true)
         );
         assert_eq!(
-            at(&import, mark(3, 9, 7), &[]).verdict,
+            at(&import, mark(3, 9, 7), &[]).decision.verdict,
             failing(3, NoticeReason::Behind, false, true)
         );
         // Its chain's generation, also above the document it holds.
         let with_document = Account {
-            document_generation: Some(2),
+            model: account::Account {
+                document_generation: Some(2),
+                ..import.model
+            },
             ..import
         };
         assert_eq!(with_document.generation(), 3);
         assert_eq!(
-            at(&with_document, MarkInput::Missing, &[2]).verdict,
+            at(&with_document, MarkInput::Missing, &[2])
+                .decision
+                .verdict,
             failing(3, NoticeReason::MarkLost, false, true)
         );
         // Holding no chain, its document's; 0 while it holds neither.
         let staged = Account {
-            state: AccountState::StagedNoChain,
+            model: account::Account {
+                state: AccountState::StagedNoChain,
+                ..with_document.model
+            },
             ..with_document
         };
         assert_eq!(staged.generation(), 2);
         let empty = Account {
-            document_generation: None,
+            model: account::Account {
+                document_generation: None,
+                ..staged.model
+            },
             ..staged
         };
         assert_eq!(empty.generation(), 0);
@@ -1446,7 +1013,9 @@ mod tests {
             );
             // A fork past the mark by the stub at its `seq`.
             assert_eq!(
-                judged_with(row, mark(2, 5, 7), Some([8; 32]), &[2]).verdict,
+                judged_with(row, mark(2, 5, 7), Some([8; 32]), &[2])
+                    .decision
+                    .verdict,
                 failing(2, NoticeReason::Fork, true, abort)
             );
             // No notice to its left: `behind`.
@@ -1495,7 +1064,7 @@ mod tests {
         for mark in [MarkInput::Missing, MarkInput::NotAMark] {
             let judgement = judged(Row::StagedNoChain, mark, &[0]);
             assert_eq!(
-                judgement.verdict,
+                judgement.decision.verdict,
                 failing(0, NoticeReason::MarkLost, true, true)
             );
             assert_eq!(judgement.key, CURRENT);
@@ -1529,8 +1098,8 @@ mod tests {
     fn test_verdict_rule_notice_generation_is_the_higher() {
         // The account's generation above the mark's: the notice names the account's.
         let mut serving = account(Row::Serving).expect("account");
-        serving.state = AccountState::Serving(tip(5, 1, 1));
-        serving.document_generation = Some(5);
+        serving.model.state = AccountState::Serving(tip(5, 1, 1));
+        serving.model.document_generation = Some(5);
         let judgement = judge(&Inputs {
             account: Some(&serving),
             mark: &MarkInput::Missing,
@@ -1540,7 +1109,7 @@ mod tests {
             current_key: CURRENT,
         });
         assert_eq!(
-            judgement.verdict,
+            judgement.decision.verdict,
             failing(5, NoticeReason::MarkLost, false, false)
         );
         // The mark's above the account's.
@@ -1562,11 +1131,12 @@ mod tests {
                 retired: &[],
                 current_key: CURRENT,
             })
+            .decision
             .verdict
         };
-        staged.enrolled_generation = 2;
+        staged.model.enrolled_generation = 2;
         assert_eq!(at(&staged, mark(2, 12, 7)), bounded(2, false));
-        staged.enrolled_generation = 1;
+        staged.model.enrolled_generation = 1;
         assert_eq!(
             at(&staged, mark(2, 12, 7)),
             Verdict::Bounded {
@@ -1601,9 +1171,11 @@ mod tests {
 
     fn route_of(verdict: Verdict, class: RequestClass) -> Route {
         let judgement = Judgement {
-            erase_account_again: false,
-            verdict,
-            recovery_floor: BEHIND.generation,
+            decision: account::Judgement {
+                erase_account_again: false,
+                verdict,
+                recovery_floor: BEHIND.generation,
+            },
             key: MARK_KEY,
         };
         answer(&judgement, &class, CURRENT).route
@@ -1727,18 +1299,24 @@ mod tests {
         };
         let here = body("https://switch.example", DOC_KEY);
         let served = judged(Some(&here), Some((10, [1; 32])));
-        assert_eq!(served.state, AccountState::Serving(tip(2, 10, 1)));
+        assert_eq!(served.model.state, AccountState::Serving(tip(2, 10, 1)));
         assert_eq!(served.named_key, Some(DOC_KEY));
-        assert_eq!(served.document_generation, Some(2));
+        assert_eq!(served.model.document_generation, Some(2));
         let unheld = body("https://switch.example", [7; 32]);
         let elsewhere = body("https://other.example", DOC_KEY);
         for doc in [&unheld, &elsewhere] {
             let staged = judged(Some(doc), Some((10, [1; 32])));
-            assert_eq!(staged.state, AccountState::StagedImport(tip(2, 10, 1)));
+            assert_eq!(
+                staged.model.state,
+                AccountState::StagedImport(tip(2, 10, 1))
+            );
             assert_eq!(staged.named_key, None);
-            assert_eq!(judged(Some(doc), None).state, AccountState::StagedNoChain);
+            assert_eq!(
+                judged(Some(doc), None).model.state,
+                AccountState::StagedNoChain
+            );
         }
-        assert_eq!(judged(None, None).document_generation, None);
+        assert_eq!(judged(None, None).model.document_generation, None);
     }
 
     #[test]
@@ -2106,7 +1684,7 @@ mod tests {
     #[test]
     fn test_answer_not_hosted_key() {
         let judgement = judged(Row::None, MarkInput::Missing, &[]);
-        assert_eq!(judgement.verdict, NOT_HOSTED);
+        assert_eq!(judgement.decision.verdict, NOT_HOSTED);
         assert_key(&judgement, CURRENT);
         // Erased again: the account's document no longer counts.
         let judgement = judged(Row::ErasedAgain, MarkInput::Missing, &[]);
@@ -2117,7 +1695,7 @@ mod tests {
     fn test_answer_staged_key() {
         // No document names this service: the key in its mark.
         let judgement = judged(Row::StagedNoChain, mark(0, 0, 0), &[]);
-        assert_eq!(judgement.verdict, Verdict::Staged);
+        assert_eq!(judgement.decision.verdict, Verdict::Staged);
         assert_key(&judgement, MARK_KEY);
         let mut named = account(Row::StagedNoChain).expect("account");
         named.named_key = Some(DOC_KEY);
@@ -2136,17 +1714,20 @@ mod tests {
     fn test_answer_healthy_key() {
         // The key its newest identity.json names; while none names this service, the mark's.
         let judgement = judged(Row::Serving, mark(2, 10, 1), &[]);
-        assert_eq!(judgement.verdict, Verdict::Healthy);
+        assert_eq!(judgement.decision.verdict, Verdict::Healthy);
         assert_key(&judgement, DOC_KEY);
         let judgement = judged(Row::StagedImport, mark(2, 10, 1), &[]);
-        assert_eq!(judgement.verdict, Verdict::Healthy);
+        assert_eq!(judgement.decision.verdict, Verdict::Healthy);
         assert_key(&judgement, MARK_KEY);
     }
 
     #[test]
     fn test_answer_bounded_key() {
         let judgement = judged(Row::StagedNoChain, mark(2, 12, 7), &[]);
-        assert!(matches!(judgement.verdict, Verdict::Bounded { .. }));
+        assert!(matches!(
+            judgement.decision.verdict,
+            Verdict::Bounded { .. }
+        ));
         assert_key(&judgement, MARK_KEY);
     }
 
@@ -2154,7 +1735,10 @@ mod tests {
     fn test_answer_failing_key() {
         // The key in its mark.
         let judgement = judged(Row::Serving, mark(2, 12, 7), &[]);
-        assert!(matches!(judgement.verdict, Verdict::Failing { .. }));
+        assert!(matches!(
+            judgement.decision.verdict,
+            Verdict::Failing { .. }
+        ));
         assert_key(&judgement, MARK_KEY);
         // With the mark lost, the key its newest identity.json names.
         let judgement = judged(Row::Serving, MarkInput::Missing, &[]);
@@ -2167,7 +1751,7 @@ mod tests {
     #[test]
     fn test_answer_lost_key() {
         let judgement = judged(Row::None, mark(2, 12, 7), &[]);
-        assert!(matches!(judgement.verdict, Verdict::Lost { .. }));
+        assert!(matches!(judgement.decision.verdict, Verdict::Lost { .. }));
         assert_key(&judgement, MARK_KEY);
     }
 
@@ -2176,7 +1760,7 @@ mod tests {
         // The key its newest identity.json names where an account holds one naming this
         // service, else the current key.
         let judgement = judged(Row::Serving, MarkInput::StoreUnreadable, &[]);
-        assert_eq!(judgement.verdict, Verdict::Unknown);
+        assert_eq!(judgement.decision.verdict, Verdict::Unknown);
         assert_key(&judgement, DOC_KEY);
         assert_key(
             &judged(Row::StagedImport, MarkInput::StoreUnreadable, &[]),
@@ -2224,7 +1808,7 @@ mod tests {
             Row::StagedNoChain,
         ] {
             let mut account = account(row).expect("account");
-            account.document_generation = Some(3);
+            account.model.document_generation = Some(3);
             let judgement = judge(&Inputs {
                 account: Some(&account),
                 mark: &MarkInput::Missing,
@@ -2254,7 +1838,7 @@ mod tests {
     #[test]
     fn test_answer_recovery_lost_mark_uses_document_floor() {
         let mut account = account(Row::Serving).expect("account");
-        account.document_generation = Some(1);
+        account.model.document_generation = Some(1);
         let judgement = judge(&Inputs {
             account: Some(&account),
             mark: &MarkInput::Missing,

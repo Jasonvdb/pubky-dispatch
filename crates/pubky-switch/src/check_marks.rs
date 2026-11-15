@@ -323,7 +323,7 @@ fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Accou
         head.created_at_ms,
         body.as_ref(),
     );
-    let serving = matches!(account.state, AccountState::Serving(_));
+    let serving = matches!(account.model.state, AccountState::Serving(_));
     (account, serving)
 }
 
@@ -401,12 +401,12 @@ fn judge_line(
         service_key,
     )?;
     let Some(state) = state_of(
-        &judged.judgement.verdict,
-        judged.judgement.erase_account_again,
+        &judged.judgement.decision.verdict,
+        judged.judgement.decision.erase_account_again,
     ) else {
         return Ok(None);
     };
-    let notice = notice_of(&judged.judgement.verdict);
+    let notice = notice_of(&judged.judgement.decision.verdict);
     let mark_seq = match mark {
         MarkInput::Mark(mark) => Some(mark.seq),
         _ => None,
@@ -575,15 +575,17 @@ mod tests {
 
     fn serving(seq: u64, hash: u8) -> Account {
         Account {
-            state: AccountState::Serving(ChainTip {
-                generation: 1,
-                seq,
-                chain_hash: [hash; 32],
-            }),
-            created_at_ms: 10,
-            document_generation: Some(1),
+            model: crate::account::Account {
+                state: AccountState::Serving(ChainTip {
+                    generation: 1,
+                    seq,
+                    chain_hash: [hash; 32],
+                }),
+                created_at_ms: 10,
+                document_generation: Some(1),
+                enrolled_generation: 1,
+            },
             named_key: Some(KEY),
-            enrolled_generation: 1,
         }
     }
 
@@ -600,7 +602,10 @@ mod tests {
             retired: &[],
             current_key: KEY,
         });
-        state_of(&judgement.verdict, judgement.erase_account_again)
+        state_of(
+            &judgement.decision.verdict,
+            judgement.decision.erase_account_again,
+        )
     }
 
     #[test]

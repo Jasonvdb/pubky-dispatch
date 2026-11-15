@@ -183,14 +183,14 @@ pub(crate) fn retirable(
     judged: &Judged,
     mark: &MarkInput,
 ) -> Result<(u64, RecoveryNotice), Refusal> {
-    if judged.judgement.erase_account_again {
+    if judged.judgement.decision.erase_account_again {
         return Err(Refusal::ErasedAgain);
     }
     let mark = match mark {
         MarkInput::Mark(mark) => Some(mark),
         MarkInput::Missing | MarkInput::NotAMark | MarkInput::StoreUnreadable => None,
     };
-    let generation = match judged.judgement.verdict {
+    let generation = match judged.judgement.decision.verdict {
         Verdict::Unknown => return Err(Refusal::MarkStoreUnreadable),
         Verdict::NotHosted { .. } => return Err(Refusal::NotHosted),
         Verdict::Healthy => return Err(Refusal::Healthy),
@@ -199,7 +199,7 @@ pub(crate) fn retirable(
             let Some(account) = judged.account else {
                 return Err(Refusal::NotHosted);
             };
-            match account.state {
+            match account.model.state {
                 AccountState::Serving(_) | AccountState::Frozen(_) => {}
                 AccountState::StagedNoChain | AccountState::StagedImport(_) => {
                     return Err(Refusal::Staged);
@@ -212,7 +212,8 @@ pub(crate) fn retirable(
             _ => return Err(Refusal::NotHosted),
         },
     };
-    let notice = check_marks::notice_of(&judged.judgement.verdict).ok_or(Refusal::Healthy)?;
+    let notice =
+        check_marks::notice_of(&judged.judgement.decision.verdict).ok_or(Refusal::Healthy)?;
     Ok((generation, notice))
 }
 
@@ -282,7 +283,8 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
         retired.sort_unstable();
     }
     // The retirement changes only `permanent` (Switch wire 7.3, Table 1).
-    let notice = check_marks::notice_of(&judge(&retired)?.judgement.verdict).unwrap_or(notice);
+    let notice =
+        check_marks::notice_of(&judge(&retired)?.judgement.decision.verdict).unwrap_or(notice);
     Ok(Retired {
         account: options.identity.clone(),
         retired: generation,
@@ -315,11 +317,13 @@ mod tests {
 
     fn account(state: AccountState) -> Account {
         Account {
-            state,
-            created_at_ms: 10,
-            document_generation: Some(2),
+            model: crate::account::Account {
+                state,
+                created_at_ms: 10,
+                document_generation: Some(2),
+                enrolled_generation: 2,
+            },
             named_key: Some(KEY),
-            enrolled_generation: 2,
         }
     }
 

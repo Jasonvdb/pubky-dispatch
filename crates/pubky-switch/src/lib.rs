@@ -16,6 +16,7 @@
 //! The behaviour is specified by the Pubky Switch spec and wire format, in this repository's
 //! `spec/`.
 
+pub mod account;
 pub mod admin;
 pub mod changes;
 pub mod check_marks;

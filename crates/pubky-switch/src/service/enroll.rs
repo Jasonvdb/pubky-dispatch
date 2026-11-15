@@ -269,7 +269,7 @@ impl Service {
         .flatten()
         .fold(base_ms, |at, earlier| at.max(earlier.saturating_add(1)));
         let leftover = matches!(
-            judged.judgement.verdict,
+            judged.judgement.decision.verdict,
             Verdict::NotHosted { delete_mark: true }
         );
         if leftover && let Some(erased_at_ms) = judged.erasure_at_ms {

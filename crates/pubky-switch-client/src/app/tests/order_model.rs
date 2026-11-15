@@ -1709,6 +1709,25 @@ fn test_order_model_step_writing_another_protocols_record_is_refused() {
 }
 
 #[test]
+fn test_protocol_batch_collection_owner_survives_a_different_policy() {
+    on_a_thread(async {
+        let mut b = Bench::new(2, 100).await;
+        let mut collection = list_of("tasks");
+        collection.policy = list_of("chat").policy;
+        let target = RecordTarget::new(collection, b"different-policy");
+        let (_, write) = b.app.record_op(&target, Some(b"{}"), vec![]).await.unwrap();
+        let result = b
+            .app
+            .submit_batch(crate::app::OpBatch::for_protocol("chat").op(write))
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Refused(Refusal::Usage(_)))),
+            "a collection remains owned regardless of its supplied policy: {result:?}"
+        );
+    });
+}
+
+#[test]
 fn test_order_model_app_loaded_before_every_read_goes_on_past_a_protocol_that_is_behind() {
     // `tasks` fails a missed call and has an entry held behind it, so the cursor stays;
     // `chat` has more entries than one read of one-item pages takes. With the app loaded

@@ -5,6 +5,29 @@ use crate::app::admission::{LISTS_AT, LISTS_TOO_LARGE, deny_key};
 use crate::app::feed::DENY_GAP;
 use crate::store::{Fault as StoreFault, FaultStore};
 
+#[tokio::test]
+async fn test_protocol_gap_current_obligation_requires_every_registered_owner() {
+    let mut c = Box::pin(GapCase::new()).await;
+    let mut owed: crate::app::feed::OwedGap = c.app.reader().get(DENY_GAP).await.unwrap().unwrap();
+    owed.to.retain(|name| name == "tasks");
+    let mut tx = c.app.tx().unwrap();
+    tx.put(DENY_GAP, &owed).unwrap();
+    c.app.commit(tx).await.unwrap();
+    c.reload().await;
+    let result = c.app.receive(None).await;
+    if result.is_ok() {
+        assert!(!c.app.reader().exists(DENY_GAP).await.unwrap());
+        assert!(c.app.reader().exists(LISTS_AT).await.unwrap());
+        assert_eq!(c.baseline("tasks").await, (true, vec![c.denied]));
+        assert_eq!(c.baseline("chat").await, (true, vec![]));
+        assert!(c.app.lists_copy().await.unwrap().deny.contains(&c.denied));
+    }
+    assert!(
+        matches!(result, Err(AppError::Store(StoreError::Corrupt))),
+        "a current gap cannot complete after losing an owner: {result:?}"
+    );
+}
+
 struct GapCase {
     pair: Pair,
     app: App,
@@ -267,4 +290,54 @@ async fn test_protocol_gap_failed_replacement_restores_a_fresh_baseline() {
         c.complete(&[later]).await;
         assert!(!c.app.reader().exists(&deny_key(&c.denied)).await.unwrap());
     }
+}
+
+#[tokio::test]
+async fn test_protocol_gap_owner_set_is_checked_before_any_callback() {
+    for owners in [
+        vec![],
+        vec!["tasks"],
+        vec!["tasks", "tasks"],
+        vec!["tasks", "news"],
+        vec!["tasks", "chat", "tasks"],
+    ] {
+        let mut c = Box::pin(GapCase::new()).await;
+        let before = [
+            c.pair.tasks.gaps.lock().unwrap().len(),
+            c.pair.chat.gaps.lock().unwrap().len(),
+        ];
+        let mut owed: crate::app::feed::OwedGap =
+            c.app.reader().get(DENY_GAP).await.unwrap().unwrap();
+        owed.to = owners.into_iter().map(str::to_owned).collect();
+        let mut tx = c.app.tx().unwrap();
+        tx.put(DENY_GAP, &owed).unwrap();
+        c.app.commit(tx).await.unwrap();
+        for _ in 0..2 {
+            c.reload().await;
+            assert!(matches!(
+                c.app.receive(None).await,
+                Err(AppError::Store(StoreError::Corrupt))
+            ));
+            assert_eq!(
+                c.app
+                    .reader()
+                    .get::<crate::app::feed::OwedGap>(DENY_GAP)
+                    .await
+                    .unwrap(),
+                Some(owed.clone())
+            );
+            assert_eq!(c.pair.tasks.gaps.lock().unwrap().len(), before[0]);
+            assert_eq!(c.pair.chat.gaps.lock().unwrap().len(), before[1]);
+            assert_eq!(c.baseline("tasks").await, (true, vec![]));
+            assert_eq!(c.baseline("chat").await, (true, vec![]));
+        }
+    }
+    let mut valid = Box::pin(GapCase::new()).await;
+    *valid.pair.chat.failing_gap.lock().unwrap() = 1;
+    assert!(valid.app.receive(None).await.unwrap().stopped);
+    let owed: crate::app::feed::OwedGap = valid.app.reader().get(DENY_GAP).await.unwrap().unwrap();
+    assert_eq!(owed.to, valid.pair.set().names());
+    valid.reload().await;
+    let denied = valid.denied;
+    valid.complete(&[denied]).await;
 }

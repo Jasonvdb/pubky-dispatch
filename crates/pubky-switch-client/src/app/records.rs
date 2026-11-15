@@ -302,7 +302,7 @@ pub enum PolicyFamily {
 /// the read scope of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collection {
-    /// The collection name.
+    /// The collection name. Its registered owner is independent of the record policy.
     pub name: String,
     /// The fixed policy; with [`PolicyFamily::SubScopes`], the name scope's.
     pub policy: Policy,
@@ -1159,7 +1159,9 @@ impl App {
     }
 
     /// List `collection`'s current records at the switch, page by page (Switch wire
-    /// 7.4.9), and take each write that passes the checks and is newer.
+    /// 7.4.9), and take each write that passes the checks and is newer. Only policies
+    /// admitted by this supplied collection are taken; [`App::list_collections`] lists
+    /// the union of all registered readable policy members of each collection.
     ///
     /// The call is bounded: it asks for at most [`LISTING_PAGES_PER_READ`] pages and, once
     /// it asked for one, none past the call's time budget
@@ -1189,6 +1191,7 @@ impl App {
             let listed = self
                 .list_from(
                     collection,
+                    None,
                     after,
                     &mut pages,
                     Some((&mut progress, &key)),
@@ -1220,6 +1223,7 @@ impl App {
     async fn list_from(
         &mut self,
         collection: &Collection,
+        members: Option<&[Collection]>,
         mut after: Option<[u8; 32]>,
         pages: &mut u32,
         mut progress: Option<(&mut ListProgress, &str)>,
@@ -1251,7 +1255,21 @@ impl App {
                     let full = std::mem::replace(&mut tx, self.tx()?);
                     self.commit(full).await?;
                 }
-                self.take_view(view, Some((&view.key, collection)), &mut tx)
+                // An automatic listing has one cursor per collection ID, and judges
+                // each record against any registered readable member of that collection.
+                // An explicit listing keeps the caller's supplied policy (Switch spec 3.3).
+                let member = members
+                    .and_then(|members| {
+                        let op = SignedOp::peek(&view.op).ok()?;
+                        let OpKind::RecordPut(put) = &op.body().kind else {
+                            return None;
+                        };
+                        members.iter().find(|member| {
+                            member.name == collection.name && member.admits(&put.policy)
+                        })
+                    })
+                    .unwrap_or(collection);
+                self.take_view(view, Some((&view.key, member)), &mut tx)
                     .await?;
                 listed = listed.saturating_add(1);
             }
@@ -1397,7 +1415,8 @@ impl App {
         }
         let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
         for name in &listing {
-            for collection in &self.readable_collections(name) {
+            let collections = self.readable_collections(name);
+            for collection in &collections {
                 let id = collection.id(&self.state.meta.identity);
                 if progress.done.contains(&b64(&id)) {
                     continue;
@@ -1406,6 +1425,7 @@ impl App {
                 if let Listed::Paused(_) = self
                     .list_from(
                         collection,
+                        Some(&collections),
                         after,
                         pages,
                         Some((&mut progress, LIST_AT)),
@@ -1555,6 +1575,7 @@ impl App {
             if let Listed::Paused(_) = self
                 .list_from(
                     collection,
+                    Some(&collections),
                     after,
                     pages,
                     Some((&mut progress, LIST_AT)),
@@ -2271,18 +2292,24 @@ impl App {
         }))
     }
 
-    /// The protocol's collection a write names, by its collection ID and a policy of the
-    /// collection's family: the member it names.
     /// The registered protocol other than `name` that the record `put` writes belongs to
     /// ([`super::ProtocolSet::foreign_owner`]): by the collection of a registered protocol
     /// it names, or by its read scope.
     pub(crate) fn foreign_put(&self, name: &str, put: &RecordPut) -> Option<String> {
-        let collection = self.collection_of(put).map(|collection| collection.name);
+        // Ownership belongs to the collection ID even when the supplied policy is not
+        // one this protocol accepts for reading (Switch spec 3.3).
+        let collection = self
+            .protocols
+            .collections()
+            .into_iter()
+            .find(|collection| collection.id(&self.state.meta.identity) == put.collection)
+            .map(|collection| collection.name);
         self.protocols
             .foreign_owner(name, collection.as_deref(), &put.policy.read_scope)
             .map(str::to_owned)
     }
 
+    /// The collection member matching both the ID and an admitted policy.
     fn collection_of(&self, put: &RecordPut) -> Option<Collection> {
         let identity = self.state.meta.identity;
         self.protocols

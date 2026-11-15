@@ -88,7 +88,8 @@ fn scope_root(scope: &str) -> &str {
 }
 
 impl ProtocolSet {
-    /// The set of `protocols`, in this order.
+    /// The set of `protocols`, in this order. A protocol may give several policy members
+    /// of one collection; that collection name still belongs to only that protocol.
     ///
     /// # Errors
     ///
@@ -115,7 +116,7 @@ impl ProtocolSet {
         if self.protocols.is_empty() {
             return Err(Refusal::Usage("a protocol set needs a protocol".into()).into());
         }
-        let mut collections: Vec<String> = Vec::new();
+        let mut collections = std::collections::BTreeMap::new();
         for (at, registered) in self.protocols.iter().enumerate() {
             let name = &registered.name;
             if !is_protocol_name(name) {
@@ -125,14 +126,15 @@ impl ProtocolSet {
                 return Err(Refusal::Usage(format!("the protocol `{name}` is given twice")).into());
             }
             for collection in registered.protocol.collections() {
-                if collections.contains(&collection.name) {
+                if let Some(owner) = collections.insert(collection.name.clone(), name)
+                    && owner != name
+                {
                     return Err(Refusal::Usage(format!(
                         "the collection `{}` is given by two protocols",
                         collection.name
                     ))
                     .into());
                 }
-                collections.push(collection.name);
             }
         }
         Ok(())

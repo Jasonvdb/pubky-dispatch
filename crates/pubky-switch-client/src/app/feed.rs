@@ -3297,8 +3297,10 @@ impl App {
         let Some(owed) = self.reader().get::<OwedGap>(DENY_GAP).await? else {
             return Ok(false);
         };
-        // Every writer names at least one protocol: a gap owed to none is a corrupt store.
-        if owed.to.is_empty() {
+        // Every current gap is owed to every registered protocol, including after a
+        // partial pass. Validate the complete set before any callback (Switch spec 8.3).
+        let owners = self.protocols.names();
+        if owed.to.len() != owners.len() || owners.iter().any(|name| !owed.to.contains(name)) {
             return Err(AppError::Store(crate::error::StoreError::Corrupt));
         }
         // A gap goes to every protocol after everything at or before it: while one isn't

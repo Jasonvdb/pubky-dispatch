@@ -484,6 +484,62 @@ mod tests {
     use super::*;
     use crate::{Backend, run_here};
 
+    async fn collection_policy_owner(world: &World) -> FlowResult {
+        use pubky_switch_client::app::{AppError, Collection, OpBatch, RecordTarget, Refusal};
+        use pubky_switch_client::testing::ProtocolSpec;
+        use pubky_switch_core::ident::Policy;
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let protocols = ProtocolSet::new(
+            [TASKS, CHAT]
+                .into_iter()
+                .map(|name| {
+                    Arc::new(TestProtocol::new(ProtocolSpec {
+                        name: name.to_owned(),
+                        keyed_scopes: vec![name.to_owned()],
+                        accepts: vec![format!("{name}.item")],
+                        collections: vec![Collection::new(
+                            &format!("{name}.list"),
+                            Policy::new(name, &[name]),
+                        )],
+                        ..ProtocolSpec::default()
+                    })) as Arc<dyn pubky_switch_client::app::Protocol>
+                })
+                .collect(),
+        )?;
+        let mut wallet = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut signer,
+            "wallet",
+            protocols,
+        ))
+        .await?;
+        let target = RecordTarget::new(
+            Collection::new("tasks.list", Policy::new(CHAT, &[CHAT])),
+            b"different-policy",
+        );
+        let (_, write) = wallet.record_op(&target, Some(b"{}"), vec![]).await?;
+        match wallet
+            .submit_batch(OpBatch::for_protocol(CHAT).op(write))
+            .await
+        {
+            Err(AppError::Refused(Refusal::Usage(_))) => Ok(()),
+            other => Err(format!("foreign collection write was not refused: {other:?}").into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_collection_owner_uses_its_id_on_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, collection_policy_owner)).await;
+        let service = Box::pin(run_here(Backend::Service, collection_policy_owner)).await;
+        assert!(
+            scripted.is_ok() && service.is_ok(),
+            "scripted={scripted:?}; service={service:?}"
+        );
+    }
+
     async fn callback_batches(world: &World) -> FlowResult {
         let alice = world.identity("alice")?;
         world.add_switch(ORIGIN, &[&alice]).await?;

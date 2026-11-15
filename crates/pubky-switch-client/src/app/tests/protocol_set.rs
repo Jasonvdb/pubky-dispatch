@@ -4,11 +4,12 @@
 
 mod callback_batches;
 mod gap_completion;
+mod ownership;
 
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::scopes::Permission;
 use serde_json::json;
@@ -60,6 +61,8 @@ struct Named {
     retrying: Mutex<u32>,
     /// Its effects carry a conversation entry for the sender.
     with_ops: bool,
+    /// Raw operations returned by each receive step.
+    raw_ops: Mutex<Vec<(Vec<Condition>, OpKind)>>,
     /// It refuses every own certificate.
     refuse_cert: Mutex<bool>,
     /// Whether each restore step was handed a layer.
@@ -79,6 +82,26 @@ fn named(name: &str) -> Named {
         name: name.into(),
         ..Named::default()
     }
+}
+
+#[test]
+fn test_protocol_set_one_owner_can_register_collection_policy_members() {
+    let family = crate::app::Collection::with_sub_scopes(
+        "task_lists",
+        pubky_switch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let protocol = Arc::new(Named {
+        collections: vec![
+            family.sub_scope("alpha").unwrap(),
+            family.sub_scope("beta").unwrap(),
+        ],
+        ..named("tasks")
+    });
+    let result = ProtocolSet::new(vec![protocol]);
+    assert!(
+        result.is_ok(),
+        "one collection with two policies still has one owner: {result:?}"
+    );
 }
 
 fn count_down(counter: &Mutex<u32>) -> bool {
@@ -165,7 +188,7 @@ impl Protocol for Named {
                 value: self.name.clone().into_bytes(),
             }]
         };
-        let ops = if self.with_ops {
+        let mut ops = if self.with_ops {
             vec![(
                 Vec::new(),
                 OpKind::AllowPut {
@@ -176,6 +199,7 @@ impl Protocol for Named {
         } else {
             Vec::new()
         };
+        ops.extend(self.raw_ops.lock().unwrap().clone());
         Outcome::Apply(Effect { ops, local })
     }
 

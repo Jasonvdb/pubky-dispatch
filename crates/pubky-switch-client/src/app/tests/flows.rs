@@ -4316,6 +4316,157 @@ async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
 }
 
 #[tokio::test]
+async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let duties = refuse_next(&w, &mut app).await;
+    let mut app = w.load(app.app_id()).await;
+    let queued = app.events.clone();
+    for _ in 0..2 {
+        assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+        assert_eq!(app.events, queued);
+        assert_eq!(app.duty_handed, 0);
+    }
+    let ids: Vec<_> = duties.iter().filter_map(AppEvent::id).collect();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0].cmp_same_store(&ids[1]),
+        Some(std::cmp::Ordering::Less)
+    );
+    app.ack_events(ids[1]).await.unwrap();
+    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    let (seq, message) = w.note(app.app_id(), "after inspection");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq));
+    assert_eq!(
+        report
+            .events
+            .into_iter()
+            .filter(AppEvent::is_duty)
+            .collect::<Vec<_>>(),
+        duties
+    );
+    assert!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    app.ack_events(ids[0]).await.unwrap();
+    assert_eq!(
+        app.pending_duty_events().await.unwrap(),
+        vec![duties[1].clone()]
+    );
+    app.ack_events(ids[1]).await.unwrap();
+    assert!(app.pending_duty_events().await.unwrap().is_empty());
+    assert!(app.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn test_pending_duty_events_do_not_extend_prior_delivery() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let first = refuse_next(&w, &mut app).await;
+    let mut tx = app.tx().unwrap();
+    app.keep_duty(
+        &mut tx,
+        crate::app::events::Duty::KeptBatchDropped { batch_id: [7; 16] },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    assert_eq!(pending.len(), first.len() + 1);
+    app.ack_events(last_id(&pending)).await.unwrap();
+    assert_eq!(
+        app.pending_duty_events().await.unwrap(),
+        vec![pending.last().unwrap().clone()]
+    );
+    assert_eq!(app.take_events(), vec![pending.last().unwrap().clone()]);
+    app.ack_events(last_id(&pending)).await.unwrap();
+    assert!(app.pending_duty_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_pending_duty_events_reload_after_each_failed_commit() {
+    let mut failures = 0;
+    let mut unreported = false;
+    for n in 1..=8 {
+        for fault in [StoreFault::FailBefore(n), StoreFault::FailAfter(n)] {
+            let w = World::new();
+            let (app, seq, after) = refusing(&w).await;
+            let (mut app, _) = load_behind(&w, app, fault).await;
+            if app.receive(None).await.is_ok() {
+                continue;
+            }
+            failures += 1;
+            let handed = app.duty_handed;
+            let durable = w.load(app.app_id()).await;
+            let kept = durable.kept_duties().await.unwrap();
+            unreported |= !refused_events(&kept, seq).is_empty()
+                && refused_events(&app.events, seq).is_empty();
+            for _ in 0..2 {
+                assert_eq!(app.pending_duty_events().await.unwrap(), kept, "{fault:?}");
+                assert!(!app.reload, "{fault:?}: automatic reload completed");
+                assert_eq!(app.cursor(), durable.cursor(), "{fault:?}");
+                assert_eq!(app.duty_handed, handed, "{fault:?}");
+            }
+            let queued = app.events.clone();
+            let report = app.receive(None).await.unwrap();
+            for event in queued {
+                assert!(report.events.contains(&event), "{fault:?}: {event:?}");
+            }
+            for event in kept {
+                assert_eq!(
+                    report.events.iter().filter(|e| **e == event).count(),
+                    1,
+                    "{fault:?}"
+                );
+            }
+            assert!(app.cursor().seq >= after, "{fault:?}");
+        }
+    }
+    assert!(failures > 1);
+    assert!(
+        unreported,
+        "an applied commit left a durable duty unreported"
+    );
+}
+
+#[tokio::test]
+async fn test_pending_duty_events_read_errors_leave_delivery_intact() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let duties = refuse_next(&w, &mut app).await;
+    let (mut app, store) = load_behind(&w, app, StoreFault::None).await;
+    let queued = app.events.clone();
+    store.fail_scan(b"duty/", 0);
+    assert!(app.pending_duty_events().await.is_err());
+    assert_eq!(app.events, queued);
+    assert_eq!(app.duty_handed, 0);
+    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(app.duty_handed, 0);
+    assert_eq!(app.take_events(), duties);
+}
+
+#[tokio::test]
+async fn test_pending_duty_events_leave_explicit_delivery_available() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let duties = refuse_next(&w, &mut app).await;
+    let mut app = w.load(app.app_id()).await;
+    // Informational events have no durable ID and remain in the host's next report.
+    app.events.push(AppEvent::PushRemoved);
+    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(app.events.last(), Some(&AppEvent::PushRemoved));
+    assert_eq!(app.duty_handed, 0);
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+    assert_eq!(app.take_events(), vec![AppEvent::PushRemoved]);
+    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    app.ack_events(last_id(&duties)).await.unwrap();
+    assert!(app.pending_duty_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_duty_event_listed_after_a_load_can_be_acknowledged() {
     let w = World::new();
     let mut app = w.join("wallet").await;

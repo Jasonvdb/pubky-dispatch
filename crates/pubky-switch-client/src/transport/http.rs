@@ -230,17 +230,7 @@ impl HttpTransport {
         }
         let mut response = call.send().await.map_err(map_error)?;
         let status = response.status().as_u16();
-        // Every header is kept, one whose value isn't text included, with its bytes read
-        // lossily: a signed response header that doesn't read then fails the response, and a
-        // second copy of one is seen as a repeat, never dropped (Switch wire 7.1).
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(name, value)| Header {
-                name: name.as_str().to_owned(),
-                value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            })
-            .collect();
+        let headers = response_headers(status, response.headers())?;
         if response
             .content_length()
             .is_some_and(|len| len > self.max_response_bytes)
@@ -268,6 +258,40 @@ impl HttpTransport {
 /// port, with no user info. reqwest connects to an address literal without the resolver, so
 /// the literal is checked here as the parsed URL holds it; a spelling the two parsers read
 /// as different hosts is refused.
+/// The one conversion of an answer's HTTP header map into the transport's headers (Switch
+/// wire 7.1). A header the response signature decides on, `Switch-Service-Signature`,
+/// `Switch-Server-Time` or `Switch-Head`, is handed on exactly or not at all: one that comes
+/// more than once, or with a value that isn't printable ASCII, fails the answer as
+/// [`TransportError::UnreadableSignedHeader`], before any conversion could drop it. Any
+/// other header whose value isn't text is left out: nothing reads it.
+fn response_headers(
+    status: u16,
+    map: &reqwest::header::HeaderMap,
+) -> Result<Vec<Header>, TransportError> {
+    use pubky_switch_core::http::header;
+    let signed = [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD];
+    for name in signed {
+        let mut values = map.get_all(name).iter();
+        let readable = match (values.next(), values.next()) {
+            (None, _) => true,
+            (Some(value), None) => value.as_bytes().iter().all(|b| (0x20..=0x7e).contains(b)),
+            (Some(_), Some(_)) => false,
+        };
+        if !readable {
+            return Err(TransportError::UnreadableSignedHeader { status });
+        }
+    }
+    Ok(map
+        .iter()
+        .filter_map(|(name, value)| {
+            Some(Header {
+                name: name.as_str().to_owned(),
+                value: value.to_str().ok()?.to_owned(),
+            })
+        })
+        .collect())
+}
+
 fn checked_destination(
     origin: &str,
     url: &str,
@@ -545,33 +569,173 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn test_http_transport_keeps_a_response_header_that_isnt_text() {
-        // A server that answers every request once with a `Switch-Head` that isn't text,
-        // beside one that is.
+    /// A server on loopback that answers one request with `head`, the status line and
+    /// headers, then `body`; its origin.
+    async fn answering_once(head: Vec<u8>, body: &'static [u8]) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut read = [0u8; 4096];
+            let mut read = [0u8; 8192];
             let _ = socket.read(&mut read).await.unwrap();
-            let mut answer = b"HTTP/1.1 200 OK\r\nswitch-head: aGVhZA\r\nswitch-head: \xff\xfe\r\n".to_vec();
-            answer.extend_from_slice(b"content-length: 2\r\nconnection: close\r\n\r\n{}");
+            let mut answer = head;
+            answer.extend_from_slice(
+                format!(
+                    "content-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            answer.extend_from_slice(body);
             socket.write_all(&answer).await.unwrap();
         });
+        origin
+    }
+
+    #[test]
+    fn test_http_response_headers_are_converted_in_one_place() {
+        // The answer's HTTP header map is read once, by `response_headers`, which hands each
+        // signed header on exactly or fails the answer (Switch wire 7.1).
+        let source = include_str!("http.rs");
+        let code = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(code.matches(".headers()").count(), 1);
+        assert_eq!(
+            code.matches("response_headers(status, response.headers())")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_fails_signed_response_headers_it_cant_hand_on() {
+        // A header the response signature decides on that isn't printable ASCII, alone or
+        // as a second copy beside a valid one, fails the answer: no conversion drops it, and
+        // the valid copy is never taken alone (Switch wire 7.1).
         let transport =
             HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default())
                 .unwrap();
+        for extra in [
+            b"switch-head: \xff\xfe\r\n".as_slice(),
+            b"switch-server-time: 2026-01-01T00:00:00.000Z\r\nswitch-server-time: \xff\r\n",
+            b"switch-service-signature: c2ln\r\nswitch-service-signature: \xfe\r\n",
+            b"switch-head: aGVhZA\r\nswitch-head: aGVhZA\r\n",
+        ] {
+            let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+            head.extend_from_slice(extra);
+            let origin = answering_once(head, b"{}").await;
+            let error = transport.send(request(&origin)).await.unwrap_err();
+            assert_eq!(
+                error,
+                TransportError::UnreadableSignedHeader { status: 200 },
+                "{}",
+                String::from_utf8_lossy(extra)
+            );
+        }
+        // One copy of each, as text, is handed on; a header no signature covers that isn't
+        // text is left out.
+        let head = b"HTTP/1.1 503 Service Unavailable\r\nswitch-head: aGVhZA\r\nx-other: \xff\r\n"
+            .to_vec();
+        let origin = answering_once(head, b"{}").await;
         let response = transport.send(request(&origin)).await.unwrap();
-        let heads: Vec<&str> = response
-            .headers
-            .iter()
-            .filter(|header| header.name == "switch-head")
-            .map(|header| header.value.as_str())
-            .collect();
-        assert_eq!(heads, ["aGVhZA", "\u{fffd}\u{fffd}"]);
-        server.await.unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(response.header("switch-head"), Some("aGVhZA"));
+        assert!(response.header("x-other").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_signed_answer_with_an_unreadable_copy_fails_the_call() {
+        // An answer the service signed, with a second `Switch-Server-Time` that isn't text
+        // beside its own: the client fails it as a signature that doesn't verify, never
+        // takes the valid copy alone (Switch wire 7.1).
+        use crate::ClientError;
+        use crate::client::{Credentials, SentRequest, SwitchClient};
+        use pubky_switch_core::http::{ResponseParts, header, sign_response};
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let service = pubky_switch_core::keys::IdentityKey::from_secret([2; 32]);
+        let now = 1_767_225_600_000;
+        let client = |origin: &str| {
+            SwitchClient::new(
+                origin,
+                identity.public(),
+                Credentials::Signer {
+                    identity: identity.public(),
+                    key: Arc::new(pubky_switch_core::keys::IdentityKey::from_secret([1; 32])),
+                },
+                Some(service.public()),
+                Arc::new(
+                    HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default())
+                        .unwrap(),
+                ),
+                Arc::new(crate::clock::TestClock::new(now)),
+            )
+            .unwrap()
+        };
+        let path = format!("/v1/{}/apps", identity.id());
+        // The answer signed for the request the client will send, built the same way.
+        let answer = |origin: &str, extra: &[u8]| {
+            let signed = client(origin)
+                .sign_request("GET", &path, Vec::new(), None)
+                .unwrap();
+            let body = br#"{"code":"unavailable","message":"m"}"#;
+            let server_time = pubky_switch_core::time::rfc3339(now);
+            let signature = sign_response(
+                &service,
+                &ResponseParts {
+                    status: 503,
+                    request: SentRequest::of(&signed.request).received(true),
+                    server_time: &server_time,
+                    head: None,
+                    body,
+                },
+            );
+            let mut head = format!(
+                "HTTP/1.1 503 Service Unavailable\r\n{}: {}\r\n{}: {server_time}\r\n",
+                header::SERVICE_SIGNATURE,
+                pubky_switch_core::enc::b64(&signature),
+                header::SERVER_TIME,
+            )
+            .into_bytes();
+            head.extend_from_slice(extra);
+            head
+        };
+        for (extra, verifies) in [
+            (b"".as_slice(), true),
+            (b"switch-server-time: \xff\r\n".as_slice(), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let head = answer(&origin, extra);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut read = [0u8; 8192];
+                let _ = socket.read(&mut read).await.unwrap();
+                let body = br#"{"code":"unavailable","message":"m"}"#;
+                let mut bytes = head;
+                bytes.extend_from_slice(
+                    format!(
+                        "content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                bytes.extend_from_slice(body);
+                socket.write_all(&bytes).await.unwrap();
+            });
+            let error = client(&origin).apps().await.unwrap_err();
+            if verifies {
+                assert!(
+                    matches!(error, ClientError::Switch { status: 503, .. }),
+                    "{error:?}"
+                );
+            } else {
+                assert_eq!(error, ClientError::BadServiceSignature { status: 503 });
+            }
+        }
     }
 
     #[tokio::test]

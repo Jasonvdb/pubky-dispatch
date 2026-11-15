@@ -1300,14 +1300,21 @@ mod tests {
         assert_eq!(ReceivedHeaders::default().broken_rule(), None);
         assert_eq!(honest_headers().broken_rule(), None);
         assert_eq!(
-            of(&[(header::APP, b"a b~"), ("content-type", b""), ("x-other", b"\xff")])
-                .broken_rule(),
+            of(&[
+                (header::APP, b"a b~"),
+                ("content-type", b""),
+                ("x-other", b"\xff")
+            ])
+            .broken_rule(),
             None
         );
         // Repeated, empty, or not printable ASCII: refused, each with its own reason.
         for (pairs, reason) in [
             (
-                &[(header::TIMESTAMP, b"t".as_slice()), (header::TIMESTAMP, b"t")][..],
+                &[
+                    (header::TIMESTAMP, b"t".as_slice()),
+                    (header::TIMESTAMP, b"t"),
+                ][..],
                 "7.1: a signed request header sent more than once",
             ),
             (

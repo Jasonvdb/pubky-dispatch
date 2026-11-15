@@ -1,5 +1,404 @@
 {
   "description": "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent, and the method as sent; the timestamp is RFC 3339 UTC to the second. Each response names the request case it answers in request (null for an unsigned public read) and gives the request as the service received it in received_request: lp(method, path and query, body field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature)), the body field BLAKE3(body) once the body is read, each H empty when the header is absent and lp of its values when present, every H empty for the public read. Response signatures cover u64(status), BLAKE3 of the received request, the exact Switch-Server-Time text, the head field (empty without Switch-Head, BLAKE3 of its exact text with one) and BLAKE3(body).",
+  "received_cases": [
+    {
+      "body": "{\"code\":\"too_large\",\"message\":\"7.1: the body is over this call's cap of 4194304 bytes\"}",
+      "fields": [
+        {
+          "hex": "000000000000019d",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "b7a078ac2258816f2e067e295eeda5eea77ceb659e05ff0eb66b7cf338940218",
+          "name": "BLAKE3(received request)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30303a30332e3030305a",
+          "name": "server time"
+        },
+        {
+          "hex": "",
+          "name": "head field"
+        },
+        {
+          "hex": "de1ec531daf8b4e0575333bcae0a941e755cfc763fababaae23a8acfa0bef35f",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-server-time": "2026-01-01T00:00:03.000Z",
+        "switch-service-signature": "gkfLjJ8tqJpCCWurekuIcBEvrXhTg_8f8iILNELu67p2pgsTLTJzsmDPLa-1-KVtLL-k9s677WAe8-SyU4NvBA"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "a 413 too_large given before the body is read, over the empty body field",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "received": {
+        "body": "not read"
+      },
+      "received_request": {
+        "bytes_hex": "00000004504f53540000003c2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6f7073000000000000001568747470733a2f2f696e626f782e6578616d706c6500000038000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001e0000001a7738616d746d6e31336d36703562776e6d6a3977656a627134630000000000000000000000000000001800000014323032362d30312d30315430303a30303a30335a0000005a0000005663413139475f725244453766794a38523372656a31793961467171636e7a594e4a6a64476755622d354966337271367158757a466d44587863343951654a64765856454c565a3559694e67354f74534f424847774251",
+        "fields": [
+          {
+            "hex": "504f5354",
+            "name": "method"
+          },
+          {
+            "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6f7073",
+            "name": "path and query"
+          },
+          {
+            "hex": "",
+            "name": "body field"
+          },
+          {
+            "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+            "name": "switch origin"
+          },
+          {
+            "hex": "000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+            "name": "H(Switch-Identity)"
+          },
+          {
+            "hex": "0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+            "name": "H(Switch-App)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Cert)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Invite-Code)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Transfer)"
+          },
+          {
+            "hex": "00000014323032362d30312d30315430303a30303a30335a",
+            "name": "H(Switch-Timestamp)"
+          },
+          {
+            "hex": "0000005663413139475f725244453766794a38523372656a31793961467171636e7a594e4a6a64476755622d354966337271367158757a466d44587863343951654a64765856454c565a3559694e67354f74534f424847774251",
+            "name": "H(Switch-Signature)"
+          }
+        ]
+      },
+      "request": "own app: POST /ops of the batch at seq 7 and 8",
+      "signature": "gkfLjJ8tqJpCCWurekuIcBEvrXhTg_8f8iILNELu67p2pgsTLTJzsmDPLa-1-KVtLL-k9s677WAe8-SyU4NvBA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019d00000020b7a078ac2258816f2e067e295eeda5eea77ceb659e05ff0eb66b7cf33894021800000018323032362d30312d30315430303a30303a30332e3030305a0000000000000020de1ec531daf8b4e0575333bcae0a941e755cfc763fababaae23a8acfa0bef35f",
+      "signer": "service key",
+      "status": 413
+    },
+    {
+      "body": "{\"code\":\"bad_request\",\"message\":\"7.1: a signed request header with an empty value\"}",
+      "fields": [
+        {
+          "hex": "0000000000000190",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "ace86602dbd43f9b9525f134eca56b1879458390c67df6301652fc6209d50282",
+          "name": "BLAKE3(received request)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30353a30322e3030305a",
+          "name": "server time"
+        },
+        {
+          "hex": "",
+          "name": "head field"
+        },
+        {
+          "hex": "834d51a195b67d4ee93e63edbf39479210d885bb44130bbdf883624f94261f56",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-server-time": "2026-01-01T00:05:02.000Z",
+        "switch-service-signature": "QGAf1VoL-6cpZ_jyh1bUomBOX2pbRKhsaPKMOXZSQsF6E-_lfGXM4YRlfb3rQbhZXeazYEgI_DMV1LBJeI30CA"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "a signed request header present with an empty value, 400 bad_request",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "received": {
+        "headers": [
+          [
+            "switch-app",
+            "w8amtmn13m6p5bwnmj9wejbq4c"
+          ],
+          [
+            "switch-identity",
+            "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
+          ],
+          [
+            "switch-signature",
+            "IcopU_dGKgcb-CoR1r9YEmaDeWyi8kRnekAH6pM6G4AI6N2-36TiMH5oESs2-YThFXfTg4m2Q3VykIfAD5XvBw"
+          ],
+          [
+            "switch-timestamp",
+            "2026-01-01T00:05:02Z"
+          ],
+          [
+            "switch-invite-code",
+            ""
+          ]
+        ]
+      },
+      "received_request": {
+        "bytes_hex": "00000003474554000000512f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d31303000000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000001568747470733a2f2f696e626f782e6578616d706c6500000038000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001e0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463000000000000000400000000000000000000001800000014323032362d30312d30315430303a30353a30325a0000005a0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+        "fields": [
+          {
+            "hex": "474554",
+            "name": "method"
+          },
+          {
+            "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d313030",
+            "name": "path and query"
+          },
+          {
+            "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "name": "body field"
+          },
+          {
+            "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+            "name": "switch origin"
+          },
+          {
+            "hex": "000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+            "name": "H(Switch-Identity)"
+          },
+          {
+            "hex": "0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+            "name": "H(Switch-App)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Cert)"
+          },
+          {
+            "hex": "00000000",
+            "name": "H(Switch-Invite-Code)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Transfer)"
+          },
+          {
+            "hex": "00000014323032362d30312d30315430303a30353a30325a",
+            "name": "H(Switch-Timestamp)"
+          },
+          {
+            "hex": "0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+            "name": "H(Switch-Signature)"
+          }
+        ]
+      },
+      "request": "own app: feed read after 1:4",
+      "signature": "QGAf1VoL-6cpZ_jyh1bUomBOX2pbRKhsaPKMOXZSQsF6E-_lfGXM4YRlfb3rQbhZXeazYEgI_DMV1LBJeI30CA",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019000000020ace86602dbd43f9b9525f134eca56b1879458390c67df6301652fc6209d5028200000018323032362d30312d30315430303a30353a30322e3030305a0000000000000020834d51a195b67d4ee93e63edbf39479210d885bb44130bbdf883624f94261f56",
+      "signer": "service key",
+      "status": 400
+    },
+    {
+      "body": "{\"code\":\"bad_request\",\"message\":\"7.1: a signed request header sent more than once\"}",
+      "fields": [
+        {
+          "hex": "0000000000000190",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "f924a2ada9cc5b76c1cf7fa5757a8fdb6de44b6fc155e2871e92ed3dc3cc2947",
+          "name": "BLAKE3(received request)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30353a30322e3030305a",
+          "name": "server time"
+        },
+        {
+          "hex": "",
+          "name": "head field"
+        },
+        {
+          "hex": "e13128d7168661509aca713eff86848b7037e13d77030afd6583eda1f387df01",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-server-time": "2026-01-01T00:05:02.000Z",
+        "switch-service-signature": "4adusWvncnnfQXmWQaNXALvoNzThRGg9ePBMdELePtv_NE2s0I8npo9FB-wTpFhXmHDxuxeCNMukpy-GcoRDDQ"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "a signed request header sent twice, 400 bad_request",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "received": {
+        "headers": [
+          [
+            "switch-app",
+            "w8amtmn13m6p5bwnmj9wejbq4c"
+          ],
+          [
+            "switch-identity",
+            "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
+          ],
+          [
+            "switch-signature",
+            "IcopU_dGKgcb-CoR1r9YEmaDeWyi8kRnekAH6pM6G4AI6N2-36TiMH5oESs2-YThFXfTg4m2Q3VykIfAD5XvBw"
+          ],
+          [
+            "switch-timestamp",
+            "2026-01-01T00:05:02Z"
+          ],
+          [
+            "switch-timestamp",
+            "2026-01-01T00:05:02Z"
+          ]
+        ]
+      },
+      "received_request": {
+        "bytes_hex": "00000003474554000000512f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d31303000000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000001568747470733a2f2f696e626f782e6578616d706c6500000038000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001e0000001a7738616d746d6e31336d36703562776e6d6a3977656a627134630000000000000000000000000000003000000014323032362d30312d30315430303a30353a30325a00000014323032362d30312d30315430303a30353a30325a0000005a0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+        "fields": [
+          {
+            "hex": "474554",
+            "name": "method"
+          },
+          {
+            "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d313030",
+            "name": "path and query"
+          },
+          {
+            "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "name": "body field"
+          },
+          {
+            "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+            "name": "switch origin"
+          },
+          {
+            "hex": "000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+            "name": "H(Switch-Identity)"
+          },
+          {
+            "hex": "0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+            "name": "H(Switch-App)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Cert)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Invite-Code)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Transfer)"
+          },
+          {
+            "hex": "00000014323032362d30312d30315430303a30353a30325a00000014323032362d30312d30315430303a30353a30325a",
+            "name": "H(Switch-Timestamp)"
+          },
+          {
+            "hex": "0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+            "name": "H(Switch-Signature)"
+          }
+        ]
+      },
+      "request": "own app: feed read after 1:4",
+      "signature": "4adusWvncnnfQXmWQaNXALvoNzThRGg9ePBMdELePtv_NE2s0I8npo9FB-wTpFhXmHDxuxeCNMukpy-GcoRDDQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019000000020f924a2ada9cc5b76c1cf7fa5757a8fdb6de44b6fc155e2871e92ed3dc3cc294700000018323032362d30312d30315430303a30353a30322e3030305a0000000000000020e13128d7168661509aca713eff86848b7037e13d77030afd6583eda1f387df01",
+      "signer": "service key",
+      "status": 400
+    },
+    {
+      "body": "{\"code\":\"unavailable\",\"message\":\"7.6: a temporary failure\"}",
+      "fields": [
+        {
+          "hex": "00000000000001f7",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "2690f03c5ad414968813774beee063382c94dc003df8c0ccda2e8f93e693a71d",
+          "name": "BLAKE3(received request)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30353a30322e3030305a",
+          "name": "server time"
+        },
+        {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "head field"
+        },
+        {
+          "hex": "b9a4ab908080d43fcb55a9c91de0095f56e0cd37b5f30b51e330dfc5efcb4ce9",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-head": "",
+        "switch-server-time": "2026-01-01T00:05:02.000Z",
+        "switch-service-signature": "UKnh7ErWxhDBF3lCbKAVAVErBbp1sjwLfvcOKaOYrN78E8CpQCfIkSKskYhRwXA32l7erTv8F5fHwfeA8LbXCw"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "an answer with a present, empty Switch-Head, which no client takes",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "received": {},
+      "received_request": {
+        "bytes_hex": "00000003474554000000512f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d31303000000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000001568747470733a2f2f696e626f782e6578616d706c6500000038000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001e0000001a7738616d746d6e31336d36703562776e6d6a3977656a627134630000000000000000000000000000001800000014323032362d30312d30315430303a30353a30325a0000005a0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+        "fields": [
+          {
+            "hex": "474554",
+            "name": "method"
+          },
+          {
+            "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f666565643f61667465723d313a34266c696d69743d313030",
+            "name": "path and query"
+          },
+          {
+            "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "name": "body field"
+          },
+          {
+            "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+            "name": "switch origin"
+          },
+          {
+            "hex": "000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+            "name": "H(Switch-Identity)"
+          },
+          {
+            "hex": "0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+            "name": "H(Switch-App)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Cert)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Invite-Code)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Transfer)"
+          },
+          {
+            "hex": "00000014323032362d30312d30315430303a30353a30325a",
+            "name": "H(Switch-Timestamp)"
+          },
+          {
+            "hex": "0000005649636f70555f64474b6763622d436f5231723959456d614465577969386b526e656b414836704d3647344149364e322d333654694d48356f455373322d5954684658665467346d32513356796b496641443558764277",
+            "name": "H(Switch-Signature)"
+          }
+        ]
+      },
+      "request": "own app: feed read after 1:4",
+      "signature": "UKnh7ErWxhDBF3lCbKAVAVErBbp1sjwLfvcOKaOYrN78E8CpQCfIkSKskYhRwXA32l7erTv8F5fHwfeA8LbXCw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000001f7000000202690f03c5ad414968813774beee063382c94dc003df8c0ccda2e8f93e693a71d00000018323032362d30312d30315430303a30353a30322e3030305a00000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000020b9a4ab908080d43fcb55a9c91de0095f56e0cd37b5f30b51e330dfc5efcb4ce9",
+      "signer": "service key",
+      "status": 503
+    }
+  ],
   "requests": [
     {
       "body_b64": "",

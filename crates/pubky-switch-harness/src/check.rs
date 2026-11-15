@@ -1009,7 +1009,12 @@ mod tests {
 
     /// An answer to `request` that `service` signs over the empty body field, as one given
     /// before the body is read.
-    fn unread_answer(request: &Request, service: &IdentityKey, status: u16, body: &Value) -> Response {
+    fn unread_answer(
+        request: &Request,
+        service: &IdentityKey,
+        status: u16,
+        body: &Value,
+    ) -> Response {
         let body = serde_json::to_vec(body).unwrap();
         let signature = sign_response(
             service,
@@ -1041,7 +1046,11 @@ mod tests {
         deliver(&checker, 1, &service, &service, None).unwrap();
         let put = request("POST", "ops", &json!({ "ops": [] }));
         let error = |code: &str| json!({ "code": code, "message": "m" });
-        for (status, code) in [(413, "too_large"), (429, "rate_limited"), (404, "not_found")] {
+        for (status, code) in [
+            (413, "too_large"),
+            (429, "rate_limited"),
+            (404, "not_found"),
+        ] {
             let answer = unread_answer(&put, &service, status, &error(code));
             assert!(checker.signature(&put, &answer).is_ok(), "{code}");
         }

@@ -118,15 +118,14 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
     ) -> Result<(Enrollment, String), ApiError> {
-        let identity_text = request
-            .headers
-            .get(header::IDENTITY)
-            .and_then(|value| value.to_str().ok())
+        let headers = request.signed_headers();
+        let identity_text = headers
+            .text(header::IDENTITY)
             .ok_or_else(|| ApiError::bad_request("7.1: Switch-Identity is missing"))?
             .to_string();
         let identity = pubky_key(&identity_text)
             .map_err(|_| ApiError::bad_request("7.1: Switch-Identity isn't a Pubky ID"))?;
-        let claimed = decode_claim(&identity, &request.headers, base_ms)?;
+        let claimed = decode_claim(&identity, &headers, base_ms)?;
         if claimed.caller != Caller::Signer {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
@@ -332,7 +331,13 @@ impl Service {
         let committed_ms = txn.head().stamped_time_ms;
         let refused = |error: ApiError| (error, Some(committed_ms));
         let enrolled = self
-            .enroll_under_lock(&mut txn, enrollment, identity_text, enrollment_hash, base_ms)
+            .enroll_under_lock(
+                &mut txn,
+                enrollment,
+                identity_text,
+                enrollment_hash,
+                base_ms,
+            )
             .await
             .map_err(refused)?;
         txn.commit().await.map_err(|e| refused(store_error(&e)))?;

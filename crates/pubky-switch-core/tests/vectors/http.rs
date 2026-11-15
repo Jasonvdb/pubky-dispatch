@@ -387,6 +387,141 @@ fn response_signatures(keys: &Keys) {
     generated("http.json", &cases);
 }
 
+/// The request case `r` as `received` says the service received it (Switch wire 7.1): the
+/// body not read where it says `"body": "not read"`, and the headers it lists, each a
+/// `[name, value]` in the order received, in place of the case's own.
+fn received_as(r: &Value, received: &Value) -> Received {
+    let mut as_received = Received::of_request(r);
+    if received["body"] == "not read" {
+        as_received.body = BodyField::NotRead;
+    }
+    if let Some(headers) = received["headers"].as_array() {
+        as_received.headers = ReceivedHeaders::of(headers.iter().map(|pair| {
+            (
+                pair[0].as_str().unwrap(),
+                pair[1].as_str().unwrap().as_bytes(),
+            )
+        }));
+    }
+    as_received
+}
+
+/// The `[name, value]` pairs of the request case `r`'s headers, in the order the file
+/// writes them, with `extra` after them.
+fn header_pairs(r: &Value, extra: &[(&str, &str)]) -> Value {
+    let mut pairs: Vec<Value> = r["headers"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| serde_json::json!([name, value]))
+        .collect();
+    pairs.extend(
+        extra
+            .iter()
+            .map(|(name, value)| serde_json::json!([name, value])),
+    );
+    Value::Array(pairs)
+}
+
+/// The answers to a request as the service received it otherwise than it was sent, which
+/// `pubky-switch-core` writes (README "How the files were generated") with the fixed keys
+/// of `keys.json` in `received_cases`: a `413` given before the body was read, over the
+/// empty body field; the `400` of a signed header present with an empty value, and of one
+/// sent twice (Switch wire 7.1 "Each header once, as text"); and an answer that carries a
+/// present, empty `Switch-Head`, whose head field is `BLAKE3` of the empty text. Each is
+/// signed with the service key at the second its request was signed, and verifies for the
+/// request as received, never for the request case as sent.
+fn received_cases(keys: &Keys) {
+    let file = load("http.json");
+    let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
+    let request = |name: &str| {
+        arr(&file, "requests")
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no request {name}"))
+            .clone()
+    };
+    let batch = "own app: POST /ops of the batch at seq 7 and 8";
+    let feed = "own app: feed read after 1:4";
+    let feed_request = request(feed);
+    let timestamp = header(&feed_request, http::header::TIMESTAMP)
+        .unwrap()
+        .to_owned();
+    let error = |code: &str, message: &str| format!(r#"{{"code":"{code}","message":"{message}"}}"#);
+    let cases = [
+        (
+            "a 413 too_large given before the body is read, over the empty body field",
+            batch,
+            serde_json::json!({ "body": "not read" }),
+            413,
+            error(
+                "too_large",
+                "7.1: the body is over this call's cap of 4194304 bytes",
+            ),
+            None,
+        ),
+        (
+            "a signed request header present with an empty value, 400 bad_request",
+            feed,
+            serde_json::json!({ "headers": header_pairs(&feed_request, &[(http::header::INVITE_CODE, "")]) }),
+            400,
+            error(
+                "bad_request",
+                "7.1: a signed request header with an empty value",
+            ),
+            None,
+        ),
+        (
+            "a signed request header sent twice, 400 bad_request",
+            feed,
+            serde_json::json!({ "headers": header_pairs(&feed_request, &[(http::header::TIMESTAMP, &timestamp)]) }),
+            400,
+            error(
+                "bad_request",
+                "7.1: a signed request header sent more than once",
+            ),
+            None,
+        ),
+        (
+            "an answer with a present, empty Switch-Head, which no client takes",
+            feed,
+            serde_json::json!({}),
+            503,
+            error("unavailable", "7.6: a temporary failure"),
+            Some(""),
+        ),
+    ];
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(name, answers, received, status, body, head)| {
+            let r = request(answers);
+            let at = header(&r, http::header::TIMESTAMP).unwrap();
+            let server_time = format!("{}.000Z", at.trim_end_matches('Z'));
+            let mut headers = serde_json::json!({ "switch-server-time": server_time });
+            if let Some(head) = head {
+                headers[http::header::HEAD] = Value::String(head.into());
+            }
+            let case = serde_json::json!({
+                "body": body,
+                "headers": headers,
+                "label": labels::sig::HTTP_RESPONSE,
+                "name": name,
+                "public_key": pubky_switch_core::enc::b64(&keys.service_key(&alice_id)),
+                "received": received,
+                "request": answers,
+                "signer": "service key",
+                "status": status,
+            });
+            let as_received = received_as(&r, &case["received"]);
+            signed_for(keys, case, &as_received)
+        })
+        .collect();
+    generated(
+        "http.json",
+        &[(Place::Member("/received_cases"), Value::Array(cases))],
+    );
+}
+
 fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
     assert_eq!(names.len(), fields.len());
     names
@@ -668,7 +803,67 @@ fn test_vectors_http() {
     erasures(&keys);
     feed_page_cursors(&keys);
     response_signatures(&keys);
+    received_cases(&keys);
     let v = load("http.json");
+    // The answers to a request received otherwise than sent: each verifies for the request
+    // as received, never for the request case as sent (Switch wire 7.1).
+    let received = arr(&v, "received_cases");
+    assert_eq!(received.len(), 4);
+    for r in received {
+        let name = st(r, "name");
+        let sent = arr(&v, "requests")
+            .iter()
+            .find(|q| q["name"] == r["request"])
+            .unwrap();
+        let as_received = received_as(sent, &r["received"]);
+        let bytes = http::received_request(&as_received.request());
+        assert_eq!(
+            hex::encode(&bytes),
+            st(&r["received_request"], "bytes_hex"),
+            "{name}"
+        );
+        assert_eq!(
+            pubky_switch_core::enc::split_lp(&bytes).unwrap(),
+            fields_of(&r["received_request"]),
+            "{name}"
+        );
+        let signature =
+            http::decode_signature(header(r, http::header::SERVICE_SIGNATURE).unwrap()).unwrap();
+        let public = b64n::<32>(st(r, "public_key"));
+        let parts = parts_of(r, &as_received);
+        assert_eq!(http::response_fields(&parts), fields_of(r), "{name}");
+        http::verify_response(&public, &parts, &signature)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let honest = Received::of_request(sent);
+        let as_sent = parts_of(r, &honest);
+        let differs = bytes != http::received_request(&honest.request());
+        assert_eq!(
+            http::verify_response(&public, &as_sent, &signature).is_ok(),
+            !differs,
+            "{name}"
+        );
+    }
+    // The fields an independent implementation most often gets wrong: the empty body field,
+    // a header present with an empty value, a header sent twice, a present empty head.
+    let fields = |at: usize| fields_of(&received[at]["received_request"]);
+    assert!(fields(0)[2].is_empty(), "the empty body field");
+    assert_eq!(
+        fields(1)[7],
+        vec![0, 0, 0, 0],
+        "an empty Switch-Invite-Code"
+    );
+    assert_eq!(
+        pubky_switch_core::enc::split_lp(&fields(2)[9])
+            .unwrap()
+            .len(),
+        2,
+        "Switch-Timestamp twice"
+    );
+    assert_eq!(
+        fields_of(&received[3])[3],
+        pubky_switch_core::enc::hash(b"").to_vec(),
+        "the head field of an empty head"
+    );
     let mut transfer_requests = 0;
     for r in arr(&v, "requests") {
         let name = st(r, "name");

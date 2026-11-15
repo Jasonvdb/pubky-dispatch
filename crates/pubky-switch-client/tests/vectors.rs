@@ -467,6 +467,38 @@ fn account_of_key(keys: &Keys, public: &[u8; 32]) -> Option<[u8; 32]> {
 }
 
 #[test]
+fn test_vectors_http_received_cases_are_final_for_nothing() {
+    // An answer to the request as the service received it, otherwise than the client sent
+    // it, isn't the answer to what the client sent: a `413` over the empty body field is a
+    // failed call, final for nothing, and the rest fail as a signature that doesn't verify,
+    // an empty `Switch-Head` included (Switch wire 7.1).
+    let keys = keys();
+    let v = load("http.json");
+    let cases = arr(&v, "received_cases");
+    assert_eq!(cases.len(), 4);
+    for r in cases {
+        let name = st(r, "name");
+        let public = b32(st(r, "public_key"));
+        let account = account_of_key(&keys, &public).unwrap();
+        let sent = SentRequest::of(&request_answered(&v, r));
+        let checked = check_response(&public, &account, &sent, &response_of(r));
+        let status = u16::try_from(r["status"].as_u64().unwrap()).unwrap();
+        if r["received"]["body"] == "not read" {
+            assert!(
+                matches!(checked, Err(ClientError::BodyUnread { status: 413, .. })),
+                "{name}: {checked:?}"
+            );
+        } else {
+            assert_eq!(
+                checked,
+                Err(ClientError::BadServiceSignature { status }),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_vectors_http_responses_checked_with_the_pinned_key() {
     let keys = keys();
     let v = load("http.json");

@@ -107,6 +107,15 @@ pub enum TransportError {
     /// The request couldn't be built, for example a header value that isn't text.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// An answer came with a header the response signature decides on,
+    /// `Switch-Service-Signature`, `Switch-Server-Time` or `Switch-Head`, more than once or
+    /// with a value that isn't printable ASCII, which the transport can't hand on exactly:
+    /// the client takes it as an answer whose signature doesn't verify (Switch wire 7.1).
+    #[error("an answer whose signed headers don't read, status {status}")]
+    UnreadableSignedHeader {
+        /// The HTTP status.
+        status: u16,
+    },
     /// Any other failure.
     #[error("transport: {0}")]
     Other(String),

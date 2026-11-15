@@ -243,9 +243,10 @@ async fn test_response_binding_empty_or_unreadable_signed_header_is_refused() {
     }
     // A header no received request covers is no signed header.
     let mut other = copy_of(&honest);
-    other
-        .headers
-        .insert(HeaderName::from_static("x-other"), HeaderValue::from_static(""));
+    other.headers.insert(
+        HeaderName::from_static("x-other"),
+        HeaderValue::from_static(""),
+    );
     assert_eq!(replay.service.handle(other).await.status, 200);
     replay.db.drop_database().await.expect("drop");
 }
@@ -403,5 +404,133 @@ async fn test_response_binding_public_read_binds_no_header() {
             assert_eq!(answer.body, unsigned.body, "{id}");
         }
     }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A raw HTTP/1.1 exchange with the server at `address`: `request` with `headers`, each
+/// value its bytes as sent; the status, the response's headers with their bytes, the body.
+async fn raw_call(
+    address: std::net::SocketAddr,
+    request: &SwitchRequest,
+    headers: &[(String, Vec<u8>)],
+) -> (u16, Vec<(String, Vec<u8>)>, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut raw = format!(
+        "{} {} HTTP/1.1\r\nhost: switch.example\r\nconnection: close\r\ncontent-length: {}\r\n",
+        request.method,
+        request.path_and_query,
+        request.body.len()
+    )
+    .into_bytes();
+    for (name, value) in headers {
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(value);
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(&request.body);
+    let mut connection = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    connection.write_all(&raw).await.expect("send");
+    let mut answer = Vec::new();
+    connection.read_to_end(&mut answer).await.expect("read");
+    let split = answer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the end of the headers");
+    let head = &answer[..split];
+    let body = answer[split + 4..].to_vec();
+    let mut lines = head.split(|b| *b == b'\n');
+    let status_line = String::from_utf8_lossy(lines.next().expect("status line")).to_string();
+    let status = status_line
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status");
+    let headers = lines
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let at = line.iter().position(|b| *b == b':')?;
+            let name = String::from_utf8_lossy(&line[..at]).to_ascii_lowercase();
+            let value = line[at + 1..].trim_ascii().to_vec();
+            Some((name, value))
+        })
+        .filter(|(name, _)| name != "date")
+        .collect();
+    (status, headers, body)
+}
+
+/// `request`'s headers, each value its bytes, with `extra` after them.
+fn sent_headers(request: &SwitchRequest, extra: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
+    let mut headers: Vec<(String, Vec<u8>)> = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+        .collect();
+    headers.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.to_vec())),
+    );
+    headers
+}
+
+#[tokio::test]
+async fn test_response_binding_real_transport_refuses_signed_headers_it_cant_read() {
+    // Through the real transport: a signed request header whose value isn't printable ASCII,
+    // alone or as a second copy beside a valid one, is `400 bad_request` at routing, never
+    // read as absent or as the valid copy; the public read, which binds no header, gets the
+    // bare read's answer (Switch wire 7.1 "Each header once, as text").
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let service = replay.restarted_with(pubky_switch::limits::Limits::default());
+    let router = pubky_switch::http::router(std::sync::Arc::new(service), Default::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(pubky_switch::http::serve(listener, router, async {
+        let _ = stopped.await;
+    }));
+    let honest = honest_apps();
+    let (status, _, _) = raw_call(address, &honest, &sent_headers(&honest, &[])).await;
+    assert_eq!(status, 200, "the honest request");
+    for (name, value) in [
+        (header::APP, b"\xff\xfe".as_slice()),
+        (header::TIMESTAMP, b"\xff\xfe".as_slice()),
+        (header::SIGNATURE, b"\xff".as_slice()),
+    ] {
+        let (status, _, body) =
+            raw_call(address, &honest, &sent_headers(&honest, &[(name, value)])).await;
+        assert_eq!(status, 400, "{name}");
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["code"], "bad_request", "{name}");
+    }
+    let read = support::request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    let bare = raw_call(address, &read, &[]).await;
+    assert_eq!(bare.0, 200);
+    for (name, value) in [
+        (header::APP, b"\xff\xfe".as_slice()),
+        (header::TIMESTAMP, b"\xff".as_slice()),
+    ] {
+        let headers = [
+            (
+                header::TIMESTAMP.to_owned(),
+                b"2026-01-01T00:00:00Z".to_vec(),
+            ),
+            (name.to_owned(), value.to_vec()),
+        ];
+        assert_eq!(raw_call(address, &read, &headers).await, bare, "{name}");
+    }
+    let _ = stop.send(());
+    server.await.expect("server").expect("served");
     replay.db.drop_database().await.expect("drop");
 }

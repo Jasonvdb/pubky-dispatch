@@ -5,7 +5,7 @@
 //! for an answer the service can't tie to an account. Every answer is signed, made last,
 //! once the body is whole.
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue};
 use pubky_switch_core::{
     chain::SignedHead,
     enc::b64,
@@ -15,7 +15,7 @@ use pubky_switch_core::{
 
 use super::{Answer, Service};
 use crate::{
-    http::{Refusal, SwitchRequest, SwitchResponse, error::ApiError},
+    http::{Refusal, SignedHeaders, SwitchRequest, SwitchResponse, error::ApiError},
     keys::{ServiceSigner, sign_head},
     store::AccountTxn,
 };
@@ -37,14 +37,6 @@ pub(super) struct Received<'a> {
     headers: ReceivedHeaders,
 }
 
-/// The headers of `map` a received request covers, each value in the order received.
-fn received_headers(map: &HeaderMap) -> ReceivedHeaders {
-    ReceivedHeaders::of(
-        map.iter()
-            .map(|(name, value)| (name.as_str(), value.as_bytes())),
-    )
-}
-
 impl<'a> Received<'a> {
     /// A request the transport read whole, at the switch origin `origin`.
     pub(super) fn read(request: &'a SwitchRequest, origin: &'a str) -> Self {
@@ -53,7 +45,7 @@ impl<'a> Received<'a> {
             path_and_query: &request.path_and_query,
             origin,
             body: BodyField::read(&request.body),
-            headers: received_headers(&request.headers),
+            headers: request.signed_headers().received().clone(),
         }
     }
 
@@ -79,7 +71,7 @@ impl<'a> Received<'a> {
             path_and_query,
             origin,
             body,
-            headers: received_headers(headers),
+            headers: SignedHeaders::of(headers).received().clone(),
         }
     }
 
@@ -292,7 +284,7 @@ mod tests {
         let mut found = Vec::new();
         sources(&dir, &mut found);
         assert!(found.len() > 10, "the service's sources");
-        for (path, text) in found {
+        for (path, text) in &found {
             if path.ends_with("service/signed.rs") {
                 continue;
             }
@@ -300,6 +292,38 @@ mod tests {
                 assert!(
                     !text.contains(needle),
                     "{} signs a response outside signed.rs: {needle}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_signed_request_headers_are_read_only_through_signed_headers() {
+        // The signed request headers are read through `SignedHeaders`, which represents each
+        // value exactly, never from the HTTP header map, where a conversion could drop a
+        // value it can't read (Switch wire 7.1 "Each header once, as text"). Only the
+        // transport reads the map, for its own headers.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        sources(&dir, &mut found);
+        for (path, text) in found {
+            if path.ends_with("http/mod.rs") || path.ends_with("http/source.rs") {
+                continue;
+            }
+            let code = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or_default();
+            for needle in [
+                "headers.get(",
+                "headers.get_all(",
+                "headers.iter(",
+                "HeaderMap",
+            ] {
+                assert!(
+                    !code.contains(needle),
+                    "{} reads the HTTP header map: {needle}",
                     path.display()
                 );
             }

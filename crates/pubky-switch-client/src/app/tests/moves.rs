@@ -2165,6 +2165,34 @@ async fn signer_erases(w: &World) {
 }
 
 #[tokio::test]
+async fn test_public_read_not_hosted_is_asked_again_with_a_signed_read() {
+    // The public read binds no timestamp, so its `404` with `current: { "hosted": false }`
+    // verifies at any time, a replayed one included: the app takes the service's word only
+    // from a request it signed (Switch wire 7.1 "Identical requests"). While the account is
+    // served, a missing identity.json ends nothing; once it is erased, it does.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    w.switch.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let checked = app.check_for_move().await;
+    assert!(
+        matches!(&checked, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{checked:?}"
+    );
+    assert!(
+        app.state.gone.is_none(),
+        "not gone on the public read alone"
+    );
+    signer_erases(&w).await;
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
 async fn test_erased_account_signed_404_and_no_identity_is_gone_at_once() {
     // The signed `404` of an identity the switch doesn't host and a missing identity.json
     // together are an erasure, at once: the first read stops with `AccountGone` (Switch spec

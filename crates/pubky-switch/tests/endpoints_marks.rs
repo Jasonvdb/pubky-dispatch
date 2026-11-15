@@ -237,17 +237,34 @@ fn assert_notice(
 /// The answer carries no head, is signed at the time base with the service key and bound to
 /// `sent` (Switch wire 7.1, 7.3 under Table 2).
 fn assert_signed_without_head(replay: &Replay, answer: &SwitchResponse, sent: &Sent) {
+    assert_signed_without_head_at(replay, answer, sent, replay.time.peek().base_ms);
+}
+
+/// The answer carries no head, is signed at `time_ms` with the service key and bound to
+/// `sent` (Switch wire 7.1, 7.3 under Table 2).
+fn assert_signed_without_head_at(
+    replay: &Replay,
+    answer: &SwitchResponse,
+    sent: &Sent,
+    time_ms: u64,
+) {
     assert!(header_text(answer, header::HEAD).is_none(), "no head");
     let time = header_text(answer, header::SERVER_TIME).expect("server time");
     assert_eq!(
         parse_rfc3339(time).expect("time"),
-        replay.time.peek().base_ms,
-        "Switch-Server-Time is the time base"
+        time_ms,
+        "Switch-Server-Time"
     );
     assert!(
         signed_with(answer, &service_public(replay), sent),
         "signed with the service key"
     );
+}
+
+/// The last time the service committed for alice, which an answer that commits nothing
+/// carries (Switch wire 7.1 Timestamp).
+async fn last_committed(replay: &Replay) -> u64 {
+    u64::try_from(account_row(replay).await.1).expect("ms")
 }
 
 /// A lost mark: the file deleted, read afresh by a restarted service.
@@ -589,7 +606,9 @@ async fn test_marks_replaced_401_counts_as_a_failed_authentication() {
         (limited.status, code(&limited).as_str()),
         (429, "rate_limited")
     );
-    assert_signed_without_head(&replay, &limited, &sent);
+    // It commits nothing: at the last committed time (Switch wire 7.1 Timestamp).
+    let committed = last_committed(&replay).await;
+    assert_signed_without_head_at(&replay, &limited, &sent, committed);
     assert_eq!(service.mark_refusals(), 2, "the 429 is no notice");
     replay.db.drop_database().await.expect("drop");
 }
@@ -618,7 +637,9 @@ async fn test_marks_public_read_limit_stays_a_429() {
         (limited.status, code(&limited).as_str()),
         (429, "rate_limited")
     );
-    assert_signed_without_head(&replay, &limited, &sent);
+    // It commits nothing: at the last committed time (Switch wire 7.1 Timestamp).
+    let committed = last_committed(&replay).await;
+    assert_signed_without_head_at(&replay, &limited, &sent, committed);
     assert_eq!(service.mark_refusals(), 1);
     replay.db.drop_database().await.expect("drop");
 }
@@ -806,12 +827,15 @@ async fn test_marks_unreadable_store_answers_unavailable() {
         let sent = Sent::of(&request);
         let answer = service.handle(request).await;
         // The verdict is unknown: `503 unavailable`, without a head (Switch wire 7.3,
-        // Table 2).
+        // Table 2), which commits nothing: at the last committed time (Switch wire 7.1
+        // Timestamp).
         assert_eq!(
             (answer.status, code(&answer).as_str()),
             (503, "unavailable")
         );
-        assert_signed_without_head(&replay, &answer, &sent);
+        let committed = last_committed(&replay).await;
+        assert_ne!(committed, replay.time.peek().base_ms, "not the time base");
+        assert_signed_without_head_at(&replay, &answer, &sent, committed);
     }
     assert_eq!(service.mark_refusals(), 0, "no notice");
     replay.db.drop_database().await.expect("drop");
@@ -1076,7 +1100,10 @@ async fn test_marks_answers_that_commit_nothing_never_run_ahead_of_the_next_comm
     for (what, at) in &shown {
         assert_eq!(*at, last_committed, "{what}: the last committed time");
     }
-    assert_eq!(account_row(&replay).await.1, i64::try_from(last_committed).expect("ms"));
+    assert_eq!(
+        account_row(&replay).await.1,
+        i64::try_from(last_committed).expect("ms")
+    );
     // The wall clock back by two minutes: the next commit stamps the time base, earlier than
     // the time those answers would have shown had they carried the time of the moment, and
     // no earlier than any they showed.

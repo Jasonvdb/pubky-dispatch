@@ -1340,10 +1340,8 @@ impl Service {
                 let query = request.route.query.as_ref().map_err(|_| {
                     Refused::with_head(ApiError::bad_request("7.1: the query doesn't decode"))
                 })?;
-                let invite_code = request
-                    .headers
-                    .get(header::INVITE_CODE)
-                    .and_then(|value| value.to_str().ok());
+                let headers = request.signed_headers();
+                let invite_code = headers.text(header::INVITE_CODE);
                 return self
                     .append(
                         txn,
@@ -1395,10 +1393,8 @@ impl Service {
                         )));
                     }
                 };
-                let invite_code = request
-                    .headers
-                    .get(header::INVITE_CODE)
-                    .and_then(|value| value.to_str().ok());
+                let headers = request.signed_headers();
+                let invite_code = headers.text(header::INVITE_CODE);
                 return self
                     .directory(
                         txn,
@@ -1433,10 +1429,8 @@ impl Service {
                     })?
                     .as_ref()
                     .map_err(|error| Refused::with_head(error.clone()))?;
-                let invite_code = request
-                    .headers
-                    .get(header::INVITE_CODE)
-                    .and_then(|value| value.to_str().ok());
+                let headers = request.signed_headers();
+                let invite_code = headers.text(header::INVITE_CODE);
                 return self
                     .put_peers(
                         txn,
@@ -1719,7 +1713,7 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
     ) -> Result<Claimed, ApiError> {
-        let claimed = decode_claim(account, &request.headers, base_ms)?;
+        let claimed = decode_claim(account, &request.signed_headers(), base_ms)?;
         if claimed.caller == Caller::Signer {
             let target = RequestTarget {
                 method: &request.method,
@@ -1744,17 +1738,12 @@ impl Service {
     }
 
     fn record_failure(&self, request: &SwitchRequest, account: String) {
-        let claimed_identity = request
-            .headers
-            .get(header::IDENTITY)
-            .and_then(|value| value.to_str().ok())
+        let headers = request.signed_headers();
+        let claimed_identity = headers
+            .text(header::IDENTITY)
             .unwrap_or_default()
             .to_string();
-        let claimed_app = request
-            .headers
-            .get(header::APP)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
+        let claimed_app = headers.text(header::APP).map(str::to_string);
         let base_ms = self.time.peek().base_ms;
         self.failed_auth.record(
             request.source,

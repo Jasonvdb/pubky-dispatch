@@ -434,8 +434,25 @@ impl App {
                 // An answer the pinned key didn't sign is looked into as at a read: a try
                 // of the erasure wait counts here too (Switch spec 12.7).
                 // The service's signed word that it doesn't host the identity is looked into
-                // the same way (Switch spec 12.7 step 5).
-                Err(AppError::Switch(error)) if error.is_not_hosted() => {
+                // the same way (Switch spec 12.7 step 5), but only from an answer to a
+                // request the app signed: the public read binds no timestamp, so its `404`
+                // verifies at any time (Switch wire 7.1 "Identical requests"). A page of no
+                // items asks.
+                Err(AppError::Switch(public)) if public.is_not_hosted() => {
+                    let signed = self
+                        .client
+                        .feed(FeedQuery {
+                            after: None,
+                            limit: Some(0),
+                            wait: None,
+                        })
+                        .await;
+                    let error = match self.take(signed).await {
+                        Err(AppError::Switch(error)) if error.is_not_hosted() => error,
+                        // Hosted after all, or no word: the read fails as it came.
+                        Ok(_) => return Err(AppError::Switch(public)),
+                        Err(error) => return Err(error),
+                    };
                     self.reload_now().await?;
                     return match self.not_hosted().await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),

@@ -13,6 +13,7 @@ use pubky_switch_core::{
 };
 
 use crate::http::{
+    SignedHeaders,
     error::{ApiError, ErrorCode},
     route::Call,
 };
@@ -49,8 +50,8 @@ pub struct Claimed {
     pub timestamp_ms: u64,
 }
 
-fn header_text<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+fn header_text<'a>(headers: &'a SignedHeaders, name: &str) -> Option<&'a str> {
+    headers.text(name)
 }
 
 /// Decode what a request claims (Switch wire 7.2 Order): `Switch-Identity` (`400`),
@@ -59,7 +60,7 @@ fn header_text<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a
 /// signature verifies.
 pub fn decode_claim(
     account: &[u8; 32],
-    headers: &axum::http::HeaderMap,
+    headers: &SignedHeaders,
     base_ms: u64,
 ) -> Result<Claimed, ApiError> {
     let identity = header_text(headers, header::IDENTITY)
@@ -243,17 +244,33 @@ mod tests {
     fn test_rules_decode_claim_callers() {
         let alice = pubky_key(ALICE).expect("alice");
         let at = "2026-01-01T00:00:00Z";
-        let signer =
-            decode_claim(&alice, &headers(ALICE, None, &signature(), at), T0).expect("signer");
+        let signer = decode_claim(
+            &alice,
+            &SignedHeaders::of(&headers(ALICE, None, &signature(), at)),
+            T0,
+        )
+        .expect("signer");
         assert_eq!(signer.caller, Caller::Signer);
-        let own =
-            decode_claim(&alice, &headers(ALICE, Some("app"), &signature(), at), T0).expect("own");
+        let own = decode_claim(
+            &alice,
+            &SignedHeaders::of(&headers(ALICE, Some("app"), &signature(), at)),
+            T0,
+        )
+        .expect("own");
         assert_eq!(own.caller, Caller::OwnApp("app".into()));
-        let other =
-            decode_claim(&alice, &headers(BOB, Some("shop"), &signature(), at), T0).expect("other");
+        let other = decode_claim(
+            &alice,
+            &SignedHeaders::of(&headers(BOB, Some("shop"), &signature(), at)),
+            T0,
+        )
+        .expect("other");
         assert!(matches!(other.caller, Caller::OtherApp { .. }));
-        let refused =
-            decode_claim(&alice, &headers(BOB, None, &signature(), at), T0).expect_err("x");
+        let refused = decode_claim(
+            &alice,
+            &SignedHeaders::of(&headers(BOB, None, &signature(), at)),
+            T0,
+        )
+        .expect_err("x");
         assert_eq!(refused.code, ErrorCode::NotAdmitted);
     }
 
@@ -261,7 +278,11 @@ mod tests {
     fn test_rules_decode_claim_refusals_in_order() {
         let alice = pubky_key(ALICE).expect("alice");
         let at = "2026-01-01T00:00:00Z";
-        let code = |map: HeaderMap| decode_claim(&alice, &map, T0).expect_err("refused").code;
+        let code = |map: HeaderMap| {
+            decode_claim(&alice, &SignedHeaders::of(&map), T0)
+                .expect_err("refused")
+                .code
+        };
         assert_eq!(
             code(headers("not-a-key", None, &signature(), at)),
             ErrorCode::BadRequest

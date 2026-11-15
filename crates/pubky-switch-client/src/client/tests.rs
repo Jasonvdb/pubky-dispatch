@@ -1345,10 +1345,18 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
     };
     let notice = json!({ "generation": 1, "reason": "behind", "permanent": false });
     for (status, body, compared) in [
-        (200, json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
-                      "invite_codes": [] }), true),
+        (
+            200,
+            json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                      "invite_codes": [] }),
+            true,
+        ),
         (401, error("bad_signature", Value::Null), true),
-        (401, error("stale_timestamp", json!({ "server_time": rfc3339(NOW) })), true),
+        (
+            401,
+            error("stale_timestamp", json!({ "server_time": rfc3339(NOW) })),
+            true,
+        ),
         (403, error("not_current", Value::Null), true),
         (429, error("rate_limited", Value::Null), true),
         (503, error("unavailable", Value::Null), true),
@@ -1357,7 +1365,11 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
         (404, error("not_found", http::not_hosted_current()), false),
         (503, error("recovery_required", notice.clone()), false),
     ] {
-        let client = client_with(app(), Some(service_public()), fixed(service_key(), status, body.clone()));
+        let client = client_with(
+            app(),
+            Some(service_public()),
+            fixed(service_key(), status, body.clone()),
+        );
         let _ = client.allow().await;
         assert_eq!(
             client.latest_compared_time(),

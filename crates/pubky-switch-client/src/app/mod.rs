@@ -2876,12 +2876,12 @@ impl App {
         let compared = self.client.latest_compared_time()?;
         let key = self.state.meta.service_key;
         let held = self.state.service_time.filter(|held| held.key == key);
-        let alarm = held
-            .filter(|held| compared < held.highest_ms)
-            .map(|held| Alarm::ServiceTimeBackwards {
+        let alarm = held.filter(|held| compared < held.highest_ms).map(|held| {
+            Alarm::ServiceTimeBackwards {
                 highest: held.highest_ms,
                 signed: compared,
-            });
+            }
+        });
         let highest_ms = held.map_or(compared, |held| held.highest_ms.max(compared));
         // Only a time the latest call stamped measures the clock: the last committed time a
         // refusal carries may be days old on an idle account (Switch wire 7.1). Such a time

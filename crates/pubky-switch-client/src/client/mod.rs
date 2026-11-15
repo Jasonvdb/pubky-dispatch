@@ -34,7 +34,7 @@ use pubky_switch_core::time::{parse_rfc3339, rfc3339_seconds};
 use serde_json::Value;
 
 use crate::clock::Clock;
-use crate::error::ClientError;
+use crate::error::{ClientError, TransportError};
 use crate::transport::{Header, Request, Response, TimeoutClass, Transport};
 
 /// Who signs the requests (Switch wire 7.2).
@@ -617,6 +617,15 @@ impl SwitchClient {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Forget the latest call's times, before a call.
+    fn forget_latest(&self) {
+        self.set_latest(None);
+        *self
+            .latest_compared_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     fn set_latest(&self, time: Option<u64>) {
         *self
             .latest_server_time
@@ -865,7 +874,7 @@ impl SwitchClient {
             }
             None => return Err(ClientError::Unpinned),
         };
-        self.set_latest(None);
+        self.forget_latest();
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
         let checked = self.send_checked(signed, key, auth.success_key).await?;
@@ -889,7 +898,15 @@ impl SwitchClient {
         success_key: Option<[u8; 32]>,
     ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport.send(signed.request).await?;
+        let response = match self.transport.send(signed.request).await {
+            Ok(response) => response,
+            // Signed headers that don't read: as a signature that doesn't verify (Switch
+            // wire 7.1).
+            Err(TransportError::UnreadableSignedHeader { status }) => {
+                return Ok(Err(ClientError::BadServiceSignature { status }));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
@@ -911,14 +928,25 @@ impl SwitchClient {
         method: &str,
         path_and_query: &str,
     ) -> Result<CheckedResponse, ClientError> {
-        self.set_latest(None);
+        self.forget_latest();
         let auth = Auth {
             public: true,
             ..Auth::default()
         };
         let signed = self.build(method, path_and_query, Vec::new(), Body::Empty, auth)?;
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport.send(signed.request).await?;
+        let response = self
+            .transport
+            .send(signed.request)
+            .await
+            .map_err(|error| match error {
+                // Signed headers that don't read: as a signature that doesn't verify (Switch
+                // wire 7.1).
+                TransportError::UnreadableSignedHeader { status } => {
+                    ClientError::BadServiceSignature { status }
+                }
+                error => error.into(),
+            })?;
         let key =
             self.named_service_key(&response.body)
                 .ok_or(ClientError::BadServiceSignature {
@@ -950,7 +978,7 @@ impl SwitchClient {
     /// [`check_response`].
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
-        self.set_latest(None);
+        self.forget_latest();
         self.send_checked(signed, key, None).await?
     }
 

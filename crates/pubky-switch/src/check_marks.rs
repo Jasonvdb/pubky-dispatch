@@ -351,21 +351,21 @@ pub(crate) fn judge_identity(
     retired: &[u64],
     origin: &str,
     service_key: &[u8; 32],
-) -> Judged {
+) -> Result<Judged, MarkStoreError> {
     let judged = head.map(|head| account_of(head, origin, service_key));
     let judgement = verdict::judge(&Inputs {
         account: judged.as_ref().map(|(account, _)| account),
         mark,
         stub_at_mark,
-        erasure_at_ms: marks.erasure(identity),
+        erasure_at_ms: marks.erasure(identity)?,
         retired,
         current_key: *service_key,
     });
-    Judged {
+    Ok(Judged {
         judgement,
         account: judged.map(|(account, _)| account),
         serving: judged.is_some_and(|(_, serving)| serving),
-    }
+    })
 }
 
 /// The notice a verdict answers, where it gives one.
@@ -388,8 +388,8 @@ fn judge_line(
     marks: &MarkView,
     origin: &str,
     service_key: &[u8; 32],
-) -> Option<AccountReport> {
-    let retired = marks.retired(identity);
+) -> Result<Option<AccountReport>, MarkStoreError> {
+    let retired = marks.retired(identity)?;
     let judged = judge_identity(
         identity,
         head,
@@ -399,17 +399,19 @@ fn judge_line(
         &retired,
         origin,
         service_key,
-    );
-    let state = state_of(
+    )?;
+    let Some(state) = state_of(
         &judged.judgement.verdict,
         judged.judgement.erase_account_again,
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let notice = notice_of(&judged.judgement.verdict);
     let mark_seq = match mark {
         MarkInput::Mark(mark) => Some(mark.seq),
         _ => None,
     };
-    Some(AccountReport {
+    Ok(Some(AccountReport {
         account: identity.to_string(),
         hosted: head.is_some(),
         serving: judged.serving,
@@ -419,7 +421,7 @@ fn judge_line(
         retired,
         head_seq: head.and_then(|head| head.chain.map(|(seq, _)| seq)),
         mark_seq,
-    })
+    }))
 }
 
 /// One identity as the check reads it ([`read_identity`]).
@@ -496,7 +498,8 @@ async fn check(
                 continue;
             };
             let stub = stub_at(conn, head, mark).await?;
-            if let Some(line) = judge_line(id, Some(head), mark, stub, marks, origin, service_key) {
+            if let Some(line) = judge_line(id, Some(head), mark, stub, marks, origin, service_key)?
+            {
                 report.add(line, options.all);
             }
         }
@@ -517,7 +520,7 @@ async fn check(
             marks,
             origin,
             service_key,
-        ) {
+        )? {
             report.add(line, options.all);
         }
     }
@@ -641,6 +644,46 @@ mod tests {
                 needs_attention(state),
                 !matches!(state, MarkState::Healthy | MarkState::Staged),
                 "{state:?}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn test_check_marks_live_ledger_loss_is_not_a_clean_report() {
+        for (directory, name) in [("erasures", "alice"), ("retired", "alice.1")] {
+            let dir = tempfile::tempdir().expect("directory");
+            let store = crate::marks::MarkStore::open(dir.path()).expect("store");
+            store.record_erasure("alice", 100).await.expect("record");
+            store.retire("alice", 1).await.expect("retire");
+            let view = MarkView::open(dir.path()).expect("view");
+            assert!(
+                judge_line(
+                    "alice",
+                    None,
+                    &MarkInput::Missing,
+                    None,
+                    &view,
+                    "https://switch.example",
+                    &KEY
+                )
+                .expect("known absence")
+                .is_none()
+            );
+            std::fs::write(
+                dir.path().join("accounts").join(directory).join(name),
+                b"invalid",
+            )
+            .expect("corrupt");
+            assert!(
+                judge_line(
+                    "alice",
+                    None,
+                    &MarkInput::Missing,
+                    None,
+                    &view,
+                    "https://switch.example",
+                    &KEY
+                )
+                .is_err()
             );
         }
     }

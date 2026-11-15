@@ -251,7 +251,7 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
     let read = check_marks::read_identity(&mut conn, &view, &options.identity).await;
     let _ = sqlx::Connection::close(conn).await;
     let read = read?;
-    let mut retired = view.retired(&options.identity);
+    let mut retired = view.retired(&options.identity)?;
     let judge = |retired: &[u64]| {
         check_marks::judge_identity(
             &options.identity,
@@ -265,7 +265,7 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
         )
     };
     let (generation, notice) =
-        retirable(&judge(&retired), &read.mark).map_err(RetireError::Refused)?;
+        retirable(&judge(&retired)?, &read.mark).map_err(RetireError::Refused)?;
     if generation != options.generation {
         return Err(RetireError::Refused(Refusal::WrongGeneration {
             given: options.generation,
@@ -282,7 +282,7 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
         retired.sort_unstable();
     }
     // The retirement changes only `permanent` (Switch wire 7.3, Table 1).
-    let notice = check_marks::notice_of(&judge(&retired).judgement.verdict).unwrap_or(notice);
+    let notice = check_marks::notice_of(&judge(&retired)?.judgement.verdict).unwrap_or(notice);
     Ok(Retired {
         account: options.identity.clone(),
         retired: generation,

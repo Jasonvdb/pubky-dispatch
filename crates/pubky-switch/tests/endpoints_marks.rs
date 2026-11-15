@@ -1212,3 +1212,70 @@ async fn test_marks_failed_account_lookup_answers_unavailable_at_the_time_base()
     assert_eq!(answer.status, 200);
     replay.db.drop_database().await.expect("drop");
 }
+
+// A lost individual file is judged while the original store and service remain open.
+async fn live_record_loss(corrupt: bool, write: bool) {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let identity = alice_id();
+    let path = replay.key_dir().join("accounts/marks").join(&identity);
+    let held = replay.marks.read(&identity).await.expect("held mark");
+    assert!(matches!(held, MarkRead::Mark(_)));
+    let stamp = ms(&item_time(chain_item(&vectors("chain.json"), 3)));
+    replay.clock.set_wall_ms(stamp);
+    if corrupt {
+        std::fs::write(&path, b"not a mark").expect("corrupt");
+    } else {
+        std::fs::remove_file(&path).expect("remove");
+    }
+    let keys = vectors("keys.json");
+    let request = if write {
+        app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &format!("/v1/{identity}/ops"),
+            OpsRequest::new(&ops_at(&vectors("chain.json"), &[3, 4]), None).to_json(),
+            stamp,
+        )
+    } else {
+        signer_request("GET", &format!("/v1/{identity}/apps"), Vec::new(), stamp)
+    };
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    let read = replay.marks.read(&identity).await.expect("live mark");
+    let verified = signed_with(&answer, &service_public(&replay), &sent);
+    replay.db.drop_database().await.expect("drop");
+    let value: Value = serde_json::from_slice(&answer.body).expect("body");
+    assert_eq!(
+        (answer.status, value["code"].clone()),
+        (503, json!("recovery_required"))
+    );
+    assert_eq!(value["current"]["reason"], "mark_lost");
+    assert!(header_text(&answer, header::HEAD).is_none());
+    assert!(verified);
+    assert_eq!(
+        read,
+        if corrupt {
+            MarkRead::NotAMark
+        } else {
+            MarkRead::Missing
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_marks_live_missing_record_refuses_a_read() {
+    live_record_loss(false, false).await;
+}
+#[tokio::test]
+async fn test_marks_live_corrupt_record_refuses_a_read() {
+    live_record_loss(true, false).await;
+}
+#[tokio::test]
+async fn test_marks_live_missing_record_refuses_a_write() {
+    live_record_loss(false, true).await;
+}
+#[tokio::test]
+async fn test_marks_live_corrupt_record_refuses_a_write() {
+    live_record_loss(true, true).await;
+}

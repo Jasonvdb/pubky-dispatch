@@ -1559,6 +1559,48 @@ async fn test_feed_account_lock_is_held_through_signing() {
 #[tokio::test]
 async fn test_feed_snapshot_cannot_sign_for_another_account_creation() {
     change_before_feed_sign(FeedChange::EnrollAgain, false, true).await;
+    // Creation names the account independently of generation and chain tip (wire 7.3).
+    // Hold those fields equal so only the creation-time boundary can refuse the page.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let original = mark_of(&replay).await;
+    let pause = replay.service.pause_next_feed_sign();
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?limit=0", &at), async {
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("signing turn");
+        let created = original.created_at_ms + 1;
+        let mut txn = replay
+            .db
+            .store()
+            .begin(&alice_id())
+            .await
+            .expect("begin")
+            .expect("account");
+        sqlx::query("UPDATE accounts SET created_at_ms = $1 WHERE id = $2")
+            .bind(i64::try_from(created).expect("time"))
+            .bind(alice_id())
+            .execute(txn.conn())
+            .await
+            .expect("another creation");
+        txn.commit().await.expect("commit");
+        replay
+            .marks
+            .take(&alice_id(), original, original.key, created)
+            .await
+            .expect("matching mark");
+        let later = mark_of(&replay).await;
+        assert_eq!(later.head(), original.head());
+        assert_ne!(later.created_at_ms, original.created_at_ms);
+        pause.release();
+    });
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
 }
 
 #[tokio::test]

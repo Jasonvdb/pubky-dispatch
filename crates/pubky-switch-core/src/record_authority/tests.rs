@@ -671,6 +671,143 @@ fn test_origin_slot_constructed_invariants_and_caps() {
 }
 
 #[test]
+fn test_origin_slot_initialization_accepts_writer_order() {
+    let original = reference(7, 8, 5);
+    let cases = [
+        (Some(7), original, original, reference(7, 9, 11)),
+        (Some(7), original, reference(7, 9, 10), reference(7, 16, 11)),
+        (Some(7), original, reference(8, 1, 10), reference(8, 2, 11)),
+        (
+            None,
+            reference(6, 90, 5),
+            reference(7, 1, 10),
+            reference(7, 2, 11),
+        ),
+        (
+            Some(7),
+            original,
+            reference(MAX_INT, MAX_INT - 1, 10),
+            reference(MAX_INT, MAX_INT, 11),
+        ),
+    ];
+    for (birth, original, parent_acceptance, child_first) in cases {
+        let mut value = slot();
+        value.birth_generation = birth;
+        let known = known(&mut value);
+        known.original = original;
+        let ChildState::Initialized { initialization, .. } = &mut known.child else {
+            panic!("initialized fixture");
+        };
+        initialization.parent_acceptance = parent_acceptance;
+        initialization.child_first = child_first;
+        assert_eq!(
+            OriginSlot::from_bytes(&value.to_bytes().unwrap()).unwrap(),
+            value
+        );
+    }
+}
+
+#[test]
+fn test_origin_slot_initialization_rejects_impossible_applications() {
+    let original = reference(7, 8, 5);
+    let parent = reference(7, 9, 10);
+    let child_first = reference(7, 10, 11);
+    let cases = [
+        (
+            "same position distinct hashes",
+            original,
+            parent,
+            reference(7, 9, 11),
+            [8; 32],
+        ),
+        (
+            "child before parent",
+            original,
+            parent,
+            reference(7, 8, 11),
+            [8; 32],
+        ),
+        (
+            "child in later generation",
+            original,
+            parent,
+            reference(8, 10, 11),
+            [8; 32],
+        ),
+        (
+            "parent in later generation",
+            original,
+            reference(8, 9, 10),
+            child_first,
+            [8; 32],
+        ),
+        (
+            "pair exceeds batch bound",
+            original,
+            parent,
+            reference(7, 17, 11),
+            [8; 32],
+        ),
+        (
+            "original after acceptance",
+            reference(7, 10, 5),
+            parent,
+            child_first,
+            [8; 32],
+        ),
+        (
+            "original at acceptance with another hash",
+            reference(7, 9, 5),
+            parent,
+            child_first,
+            [8; 32],
+        ),
+        (
+            "initialization before original generation",
+            original,
+            reference(6, 9, 10),
+            reference(6, 10, 11),
+            [8; 32],
+        ),
+        ("child is parent", original, parent, child_first, [1; 32]),
+    ];
+    let mut accepted_reads = Vec::new();
+    let mut accepted_writes = Vec::new();
+    for (name, original, parent_acceptance, child_first, key) in cases {
+        // All replacements retain the exact slot shape and valid individual references.
+        let mut bytes = slot().to_bytes().unwrap();
+        bytes[145..193].copy_from_slice(&original.to_bytes().unwrap());
+        bytes[258..290].copy_from_slice(&key);
+        bytes[323..371].copy_from_slice(&parent_acceptance.to_bytes().unwrap());
+        bytes[371..419].copy_from_slice(&child_first.to_bytes().unwrap());
+        assert_eq!(bytes.len(), 517);
+        if OriginSlot::from_bytes(&bytes).is_ok() {
+            accepted_reads.push(name);
+        }
+        let mut value = slot();
+        let known = known(&mut value);
+        known.original = original;
+        let ChildState::Initialized {
+            declaration,
+            initialization,
+        } = &mut known.child
+        else {
+            panic!("initialized fixture");
+        };
+        declaration.key = key;
+        initialization.parent_acceptance = parent_acceptance;
+        initialization.child_first = child_first;
+        if value.to_bytes().is_ok() {
+            accepted_writes.push(name);
+        }
+    }
+    assert!(
+        accepted_reads.is_empty() && accepted_writes.is_empty(),
+        "accepted reads: {accepted_reads:?}; accepted writes: {accepted_writes:?}"
+    );
+}
+
+#[test]
 fn test_initial_value_fixed_digest_and_each_input() {
     let value = sealed();
     let digest = initial_value_hash(&value, "tasks").unwrap();

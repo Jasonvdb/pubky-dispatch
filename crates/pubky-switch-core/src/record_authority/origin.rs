@@ -24,6 +24,41 @@ pub struct Initialization {
     pub binding: [u8; 32],
 }
 
+impl Initialization {
+    // The retained pair comes from one atomic batch; these checks need no account state
+    // or certificate authority (Switch record origins 4, Switch wire 6.4).
+    fn check(
+        &self,
+        original: &ApplicationRef,
+        parent_key: &[u8; 32],
+        declaration: &ChildDeclaration,
+    ) -> Result<()> {
+        let parent = &self.parent_acceptance;
+        let child = &self.child_first;
+        let gap = child.seq.checked_sub(parent.seq);
+        if parent.generation != child.generation
+            || !gap.is_some_and(|n| n > 0 && n < crate::ops::MAX_BATCH_ENTRIES as u64)
+        {
+            return invalid(
+                "Switch record origins 4: initialization references are not in batch order",
+            );
+        }
+        let origin_position = (original.generation, original.seq);
+        let acceptance_position = (parent.generation, parent.seq);
+        if origin_position > acceptance_position
+            || (origin_position == acceptance_position && original != parent)
+        {
+            return invalid(
+                "Switch record origins 4: original does not precede or equal acceptance",
+            );
+        }
+        if &declaration.key == parent_key {
+            return invalid("Switch record origins 4: initialized child is its parent");
+        }
+        Ok(())
+    }
+}
+
 /// A standalone origin or its one declared child (Switch record origins 3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChildState {
@@ -103,7 +138,8 @@ impl OriginSlot {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for invalid scopes, references or a birth/original mismatch.
+    /// [`Error::Invalid`] for invalid scopes, references, initialization order or keys,
+    /// or a birth/original mismatch.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         if let Some(generation) = self.birth_generation {
             positive(generation)?;
@@ -154,6 +190,7 @@ impl OriginSlot {
                         declaration,
                         initialization,
                     } => {
+                        initialization.check(&known.original, &self.parent_key, declaration)?;
                         write_declaration(&mut out, declaration);
                         out.push(1);
                         out.extend_from_slice(&initialization.parent_acceptance.to_bytes()?);

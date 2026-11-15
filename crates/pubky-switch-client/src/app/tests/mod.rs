@@ -2,6 +2,7 @@
 //! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
 mod awaiting_key;
+mod consumed;
 mod feed_wait;
 mod flows;
 mod forget;

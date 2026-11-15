@@ -447,7 +447,7 @@ fn test_protected_scope_bounds_and_order() {
     }
     for scope in [
         String::new(),
-        "tásks".into(),
+        "t\u{e1}sks".into(),
         "Tasks".into(),
         "a:b:c".into(),
         "a".repeat(33),
@@ -652,7 +652,7 @@ fn test_origin_slot_constructed_invariants_and_caps() {
     let mut bad = slot();
     bad.parent_read_scope = None;
     assert!(bad.to_bytes().is_err());
-    for scope in [String::new(), max_scope() + "x", "tásks".into()] {
+    for scope in [String::new(), max_scope() + "x", "t\u{e1}sks".into()] {
         bad.parent_read_scope = Some(scope);
         assert!(bad.to_bytes().is_err());
     }

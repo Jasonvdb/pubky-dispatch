@@ -373,7 +373,7 @@ pub async fn erasure_outcome(
     world: &World,
     outcome: pubky_switch_client::testing::ErasureOutcome,
 ) -> FlowResult {
-    erasure_outcome_after_reply(world, outcome, false).await
+    Box::pin(erasure_outcome_after_reply(world, outcome, false)).await
 }
 
 /// An unavailable erasure answer is lost, then the signer restarts and retries.
@@ -385,7 +385,7 @@ pub async fn erasure_outcome_answer_lost(
     world: &World,
     outcome: pubky_switch_client::testing::ErasureOutcome,
 ) -> FlowResult {
-    erasure_outcome_after_reply(world, outcome, true).await
+    Box::pin(erasure_outcome_after_reply(world, outcome, true)).await
 }
 
 async fn erasure_outcome_after_reply(
@@ -398,17 +398,15 @@ async fn erasure_outcome_after_reply(
     world.add_switch(ORIGIN, &[&alice]).await?;
     let store = Arc::new(MemoryStore::new());
     let env = world.signer_env(&alice, store.clone())?;
-    let mut signer = Signer::create(env, world.keyring(&alice)?, ORIGIN).await?;
-    signer.resume().await?;
+    let mut signer = Box::pin(Signer::create(env, world.keyring(&alice)?, ORIGIN)).await?;
+    Box::pin(signer.resume()).await?;
     world.advance_ms(STEP_MS);
-    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (_wallet, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
     world.fail_next_erasure(ORIGIN, &alice, outcome).await?;
     if lose_reply {
         world.lose_answer("POST", "/erase");
     }
-    let first = signer
-        .close_account(UserConfirmed::shown_and_confirmed())
-        .await;
+    let first = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
     if first.is_ok() {
         return Err("an unfinished erasure answered success".into());
     }
@@ -439,7 +437,7 @@ async fn erasure_outcome_after_reply(
     drop(signer);
     let mut signer = Signer::open(world.signer_env(&alice, store)?, world.keyring(&alice)?).await?;
     world.advance_ms(STEP_MS);
-    let resumed = signer.resume().await;
+    let resumed = Box::pin(signer.resume()).await;
     world.outcome("the signer resumed the erasure", &ended(&resumed));
     resumed?;
     standing(
@@ -460,8 +458,8 @@ pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResu
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let created = world.now_ms();
-    let mut signer = enroll(world, &alice, ORIGIN).await?;
-    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let (_wallet, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
     let published = world.files().identity_doc(&alice.public());
     let doc = signer
         .identity_doc()?
@@ -492,9 +490,7 @@ pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResu
     if first.is_ok() {
         return Err("the external attempt answered success".into());
     }
-    let result = signer
-        .close_account(UserConfirmed::shown_and_confirmed())
-        .await;
+    let result = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
     world.outcome("unavailable before authorization", &ended(&result));
     if result.is_ok()
         || !matches!(signer.status(), SignerStatus::Signing)
@@ -505,9 +501,7 @@ pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResu
     // The authorizing caller can repeat its exact request; the local signer still
     // holds no unanswered erasure and takes the resulting 404 only as not hosted.
     client.erase(Some(created), Some(doc.hash())).await?;
-    let result = signer
-        .close_account(UserConfirmed::shown_and_confirmed())
-        .await;
+    let result = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
     if result.is_ok()
         || !matches!(signer.status(), SignerStatus::Signing)
         || published != world.files().identity_doc(&alice.public())

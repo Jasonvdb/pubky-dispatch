@@ -45,7 +45,7 @@ async fn test_http_response_unreadable_protected_headers_fail() {
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut input = [0; 4096];
-            socket.read(&mut input).unwrap();
+            assert!(socket.read(&mut input).unwrap() > 0);
             socket.write_all(&raw).unwrap();
         });
         let transport =

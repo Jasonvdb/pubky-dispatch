@@ -221,7 +221,7 @@ async fn notices(deny: bool, retry: bool) {
                     .protocol_get(&protocol.name, format!("missed/{seq}").as_bytes())
                     .await
                     .unwrap(),
-                Some(vec![1])
+                Some(b"1".to_vec())
             );
         }
     }

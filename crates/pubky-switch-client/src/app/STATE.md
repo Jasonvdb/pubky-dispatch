@@ -80,7 +80,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   answers `StoreError::Unknown` may have been applied: the reload after it reports every
   kept duty event no call reported yet. An acknowledgement removes only events handed to
   the host since the app was loaded, by `take_events`, a call's report or
-  `unacknowledged_events`.
+  `unacknowledged_events`. `pending_duty_events` inspects the same kept duties in ascending
+  ID order after any automatic reload owed by a failed commit, without handing them over,
+  consuming the next report or extending acknowledgement eligibility. It adds no stored
+  state. The host still handles every delivered duty through an ID before acknowledging it.
 - **Only the host's acknowledgement removes a duty event,** with one exception: the commit
   that takes an erased account back (`AccountBack`, Switch spec 12.7) removes the
   `AccountGone` events not yet acknowledged, which no longer hold. The app sets no cap on

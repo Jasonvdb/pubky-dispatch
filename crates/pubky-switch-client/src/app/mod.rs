@@ -2274,11 +2274,34 @@ impl App {
         Ok(u64::try_from(owed.len()).unwrap_or(u64::MAX))
     }
 
+    /// Inspect the duty events kept and not acknowledged yet, by ascending ID.
+    ///
+    /// After a failed commit, this first reloads the durable state and queues any duty
+    /// events still owed to the host, just as the next app call would. Inspection does
+    /// not hand events to the host, remove events from the next report or make their IDs
+    /// eligible for [`App::ack_events`]. Repeated inspections return the same events
+    /// until the kept duties change.
+    ///
+    /// A protocol can use this snapshot before acting on current state without consuming
+    /// the host's reports. The host still takes a call's report, [`App::take_events`] or
+    /// [`App::unacknowledged_events`], acts on every duty through an ID, and acknowledges
+    /// that ID only after its protocol has kept what those duties say. Inspection adds
+    /// no stored queue and imposes no retention limit (the `events` module, "Duty events").
+    ///
+    /// # Errors
+    ///
+    /// A failed store read or reload. An error hands no events to the host.
+    pub async fn pending_duty_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        self.ready_local().await?;
+        self.kept_duties().await
+    }
+
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
     /// lost its copy of the reports still has to act on. Nothing but [`App::ack_events`]
     /// shortens this list (`events` module, "Duty events"). Listing them hands them to the
     /// host, as [`App::take_events`] does, so an acknowledgement up to the last of them
-    /// removes them all.
+    /// removes them all. Use [`App::pending_duty_events`] to inspect without handing them
+    /// over or changing the next report.
     ///
     /// # Errors
     ///
@@ -2314,7 +2337,8 @@ impl App {
     /// so a host acknowledges after acting on every duty event it took up to that ID. An
     /// ID no event has yet acknowledges only those before it. IDs compare only within one
     /// store ([`EventId::cmp_same_store`]). Only events this app value handed to the host,
-    /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
+    /// by [`App::take_events`], [`App::unacknowledged_events`] or a call's report, are
+    /// removed. Inspection with [`App::pending_duty_events`] is not delivery: one kept but not yet taken,
     /// such as one queued after a reload, stays until it is taken and acknowledged.
     ///
     /// The host must call this once it has handed the events to its protocol and the

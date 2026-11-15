@@ -4376,7 +4376,7 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
         duties
     );
     assert!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap()
             .is_some()

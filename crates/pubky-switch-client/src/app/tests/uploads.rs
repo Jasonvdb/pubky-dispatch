@@ -1083,10 +1083,10 @@ async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag(
                     key: b"pause".to_vec(),
                     value: vec![1],
                 }];
-                assert!(app.protocol_commit(&writes).await.is_err());
+                assert!(app.protocol_commit("sample", &writes).await.is_err());
                 assert_eq!(app.pending_duty_events().await.unwrap(), kept);
                 assert!(!app.reload);
-                assert_eq!(app.protocol_get(b"pause").await.unwrap(), None);
+                assert_eq!(app.protocol_get("sample", b"pause").await.unwrap(), None);
                 assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
                 assert_eq!(app.duty_handed, 0);
                 let ids = divergent_ids(&kept, key);

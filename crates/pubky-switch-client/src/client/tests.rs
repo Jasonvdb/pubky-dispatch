@@ -1022,6 +1022,23 @@ fn public_read_switch(origin: &str, named: [u8; 32], signing: SigningKey) -> Arc
 }
 
 #[tokio::test]
+async fn test_public_read_unreadable_signed_header_fails_authentication() {
+    for pin in [None, Some(service_public())] {
+        for status in [200, 503] {
+            let transport = Arc::new(MockTransport::new());
+            transport.push_error(TransportError::UnreadableSignedHeader { status });
+            let client = client_with(app(), pin, transport);
+            assert_eq!(
+                client.public_identity().await.unwrap_err(),
+                ClientError::BadServiceSignature { status }
+            );
+            assert_eq!(client.pinned_key(), pin);
+            assert_eq!(client.last_server_time(), None);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_public_read_unpinned_pins_the_named_key() {
     let transport = public_read_switch(ORIGIN, service_public(), service_key());
     let client = client_with(app(), None, Arc::clone(&transport));

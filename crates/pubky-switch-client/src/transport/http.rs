@@ -253,6 +253,40 @@ impl HttpTransport {
     }
 }
 
+/// The one conversion of an answer's HTTP header map into the transport's headers (Switch
+/// wire 7.1). A header the response signature decides on, `Switch-Service-Signature`,
+/// `Switch-Server-Time` or `Switch-Head`, is handed on exactly or not at all: one that comes
+/// more than once, or with a value that isn't printable ASCII, fails the answer as
+/// [`TransportError::UnreadableSignedHeader`], before any conversion could drop it. Any
+/// other header whose value isn't text is left out: nothing reads it.
+fn response_headers(
+    status: u16,
+    map: &reqwest::header::HeaderMap,
+) -> Result<Vec<Header>, TransportError> {
+    use pubky_switch_core::http::header;
+    let signed = [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD];
+    for name in signed {
+        let mut values = map.get_all(name).iter();
+        let readable = match (values.next(), values.next()) {
+            (None, _) => true,
+            (Some(value), None) => value.as_bytes().iter().all(|b| (0x20..=0x7e).contains(b)),
+            (Some(_), Some(_)) => false,
+        };
+        if !readable {
+            return Err(TransportError::UnreadableSignedHeader { status });
+        }
+    }
+    Ok(map
+        .iter()
+        .filter_map(|(name, value)| {
+            Some(Header {
+                name: name.as_str().to_owned(),
+                value: value.to_str().ok()?.to_owned(),
+            })
+        })
+        .collect())
+}
+
 /// The URL a request goes to, checked (Switch wire 7.1, 8.2): the origin's text passes the
 /// core's check, and `url`, as reqwest's parser reads it, names the same scheme, host and
 /// port, with no user info. reqwest connects to an address literal without the resolver, so

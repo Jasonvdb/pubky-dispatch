@@ -290,8 +290,9 @@ pub struct CheckedResponse {
     pub body: Vec<u8>,
     /// `Switch-Server-Time`, the identity's service time, in Unix milliseconds.
     pub server_time_ms: u64,
-    /// `Switch-Head`, where present and verified with the service key; `None` for one that
-    /// doesn't read or verify as a head for the account (Switch wire 6.7, 7.1).
+    /// `Switch-Head`, where present and verified with the service key; `None` only when
+    /// absent. A present head that doesn't read or verify for the account fails the
+    /// response (Switch wire 6.7, 7.1).
     pub head: Option<SignedHead>,
 }
 

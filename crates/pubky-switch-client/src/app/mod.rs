@@ -650,28 +650,35 @@ pub struct App {
     /// Whether an owed call holds the read, as the last retry of `owed/` left it, and set as
     /// calls are owed. In memory only.
     owed_known: Option<bool>,
-    /// The protocols owed a call about a feed item at or before the cursor, as the last
-    /// retry of `owed/` left them, and as calls are owed: a call every registered protocol
-    /// owes stops the read, as with one protocol (`App::owe`). What each is told meanwhile
-    /// is decided by `owed_from` ([`App::may_tell`]). In memory only.
-    owing: BTreeSet<String>,
-    /// Where each protocol that owes something is first owed it: its first owed call or
-    /// owed listing, in feed order (`order` module). It is told nothing past it
-    /// ([`App::may_tell`]). Read from the store at each read's start and after the owed
-    /// calls are made, and set as calls and listings are owed. In memory only.
-    owed_from: std::collections::BTreeMap<String, order::FeedOrder>,
+    /// How far each protocol has been told, (generation, `seq`), as `told/<name>` keeps it
+    /// and as the read under way moved it (`order` module): a protocol is told nothing past
+    /// the item right after its position ([`App::may_tell`]).
+    told: order::Positions,
+    /// The positions as the store holds them, so a commit writes only those that moved.
+    told_kept: order::Positions,
+    /// Whether the positions were read from the store since the last reload.
+    told_loaded: bool,
+    /// Where the walk of the read under way stands, inside a page ([`App::may_tell`]). In
+    /// memory only.
+    walk: Option<order::Walk>,
+    /// The protocols something is kept for at the very item the walk handles: they aren't
+    /// told the item ([`App::may_tell`]). In memory only.
+    kept_here: BTreeSet<String>,
+    /// The protocols a listing is owed to (`list_due`), as the read's last listing step
+    /// left them: outside a page, they are told nothing before it ([`App::may_tell`]). In
+    /// memory only.
+    listing_names: BTreeSet<String>,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
-    /// The first owed call past the cursor, by its item's `seq` in the cursor's sequence,
-    /// which a move or a key change in place continues under the next generation, as a
-    /// restore in place carries it: the feed stops before any later item, so the call
-    /// goes in feed order, once. It may be any distance ahead: a restore in place from a
-    /// backup older than the store carries the calls the store owed past the backup's
-    /// cursor. Reading on up to it is safe: the feed hands each item before it, in order,
-    /// and passes its item without handing it, the call being that item's notice. Set at
-    /// each read's start. In memory only.
-    owed_ahead: Option<u64>,
+    /// The calls and listings kept past the cursor, by their item's `seq` in the cursor's
+    /// sequence, which a move or a key change in place continues under the next generation,
+    /// each with the protocols it names, as a restore in place carries a call: the feed
+    /// passes such an item without handing it, the kept form being that item's notice, and
+    /// the protocols it names stay before it, so each takes it in feed order, once, when a
+    /// read's start finds the cursor there. It may be any distance ahead. Set at each read's
+    /// start. In memory only.
+    kept_ahead: std::collections::BTreeMap<u64, order::KeptAhead>,
     /// The read (by [`App::receive`]'s count) the own directory was read in for a deny list
     /// change's writer, and whether it answered: once a read. In memory only.
     deny_directory_read: Option<(u64, bool)>,
@@ -715,6 +722,11 @@ pub struct App {
     /// The read under way made a listing before handing any item: it covers a gap ahead its
     /// first page shows (`feed.rs`). In memory only.
     listed_before_items: bool,
+    /// Whether a protocol's listing waits for a scope key while the read under way goes on
+    /// for the others, as its listing step left it. In memory only.
+    listing_waits: bool,
+    /// Whether the read under way made its listing for every protocol. In memory only.
+    listed_every: bool,
     /// How many times an owed reopening failed in the read under way ([`App::receive`]):
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
@@ -1034,10 +1046,14 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
-                owing: BTreeSet::new(),
-                owed_from: std::collections::BTreeMap::new(),
+                told: order::Positions::new(),
+                told_kept: order::Positions::new(),
+                told_loaded: false,
+                walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
-                owed_ahead: None,
+                kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
@@ -1056,6 +1072,8 @@ impl App {
                 held_cursor_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
+                listing_waits: false,
+                listed_every: false,
                 reopen_failures: 0,
             };
             app.update_keys_through();
@@ -1086,7 +1104,7 @@ impl App {
             tx.put(key::DEVICE, &app.state.device)?;
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
-            records::owe_listing(&mut tx, None)?;
+            records::owe_listing(&mut tx, &app.protocols.names())?;
             tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
@@ -1195,10 +1213,14 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
-                owing: BTreeSet::new(),
-                owed_from: std::collections::BTreeMap::new(),
+                told: order::Positions::new(),
+                told_kept: order::Positions::new(),
+                told_loaded: false,
+                walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
-                owed_ahead: None,
+                kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
@@ -1217,6 +1239,8 @@ impl App {
                 held_cursor_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
+                listing_waits: false,
+                listed_every: false,
                 reopen_failures: 0,
             };
             // Duty events not acknowledged before are delivered again (`events` module).
@@ -2089,10 +2113,14 @@ impl App {
                 directory_failed_ms: None,
                 events: Vec::new(),
                 owed_known: None,
-                owing: BTreeSet::new(),
-                owed_from: std::collections::BTreeMap::new(),
+                told: order::Positions::new(),
+                told_kept: order::Positions::new(),
+                told_loaded: false,
+                walk: None,
+                kept_here: BTreeSet::new(),
+                listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
-                owed_ahead: None,
+                kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
                 duty_queued: 0,
                 duty_handed: 0,
@@ -2111,6 +2139,8 @@ impl App {
                 held_cursor_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
+                listing_waits: false,
+                listed_every: false,
                 reopen_failures: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
@@ -2125,7 +2155,7 @@ impl App {
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
-                records::owe_listing(&mut tx, None)?;
+                records::owe_listing(&mut tx, &protocols_names)?;
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
@@ -2800,32 +2830,20 @@ impl App {
 
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
     /// reports, and reported once that commit is done (`events` module, "Duty events").
-    ///
-    /// Each is about the app's own handling of an item already handed, a receive step's
-    /// effect or a stored entry, or about something outside the feed: it is at
-    /// [`order::Place::Outside`].
     pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
         let to = self.duty_to(&duty);
-        self.keep_duty_for(tx, to, duty, order::Place::Outside)
+        self.keep_duty_for(tx, to, duty)
     }
 
-    /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does, raised at
-    /// `place` in the order the protocols are told things (Switch spec 8.3): one that a
-    /// protocol in `to` may not be told yet ([`App::may_tell`]) is never kept; the call
-    /// fails, and the commit with it, so no path tells a protocol a duty event past a call
-    /// it owes. The paths that raise one there hold the item before they get here.
+    /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does. One raised in
+    /// a read is kept inside a step the order rule admitted for those protocols, or is about
+    /// an entry stored at or before their positions (`order` module).
     pub(crate) fn keep_duty_for(
         &mut self,
         tx: &mut Tx,
         to: Vec<String>,
         duty: events::Duty,
-        place: order::Place,
     ) -> Result<(), AppError> {
-        if !to.iter().all(|name| self.may_tell(Some(name), place)) {
-            return Err(AppError::InvalidData(
-                "Switch spec 8.3: a duty event past a call its protocol owes".into(),
-            ));
-        }
         let n = self.state.next_duty;
         let next = n.checked_add(1).ok_or_else(corrupt)?;
         // A message's hold ends in the commit that tells it undelivered: its delivery is no
@@ -3302,9 +3320,7 @@ impl App {
             "p/",
             key::DUTY_PREFIX,
             key::OWED_PREFIX,
-            order::OWED_LISTING_PREFIX,
-            order::OWED_LISTING_AT_PREFIX,
-            order::GATE_HELD_PREFIX,
+            order::TOLD_PREFIX,
         ] {
             tx.delete_prefix(prefix)?;
         }
@@ -3414,6 +3430,7 @@ impl App {
     async fn ready_local(&mut self) -> Result<(), AppError> {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;
+        let told = self.reload || !self.told_loaded;
         if self.reload {
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
@@ -3427,6 +3444,9 @@ impl App {
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
+        }
+        if told {
+            self.load_told().await?;
         }
         Ok(())
     }

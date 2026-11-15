@@ -2,273 +2,335 @@
 //!
 //! Every notice a protocol can't take yet is kept in feed order, and the app tells that
 //! protocol nothing later until it takes it. With several protocols the rule holds per
-//! protocol: one that owes a re-send or missed-entries call, or a listing of its
-//! collections, is told nothing past the first of them, while the read goes on for the
-//! others. [`App::may_tell`] is the one place that rule is decided. Every way the read tells
-//! a protocol something asks it first:
+//! protocol, and one value per protocol decides it: how far that protocol has been told, in
+//! feed order (`told/<name>`, [`Told`]). A protocol is told an item only when its position
+//! has reached the item: everything the read covered before it was told to it. One that
+//! doesn't take an item stays right before it, and is told nothing later, while the read
+//! goes on for the others. [`App::may_tell`] is that one comparison, and every way the read
+//! tells a protocol something asks it:
 //!
-//! - a message entry, before its receive step (`apply`): held when told "not yet";
-//! - a re-send, missed-entries or deny list call, before it is made (`hand_call`): owed
-//!   behind the earlier call when told "not yet";
-//! - a deny list gap, before it is told (`tell_deny_gap_if_owed`): it waits, and the read
-//!   holds, while any protocol it goes to is told "not yet";
-//! - a record write, a listed view or a view read again, before it is judged, marked or
-//!   noted divergent for the protocol of its collection (`judge_write`): a feed write is
-//!   held when told "not yet", and a listing leaves the collection out and owes that
-//!   protocol a listing of its own;
-//! - a record an upload marked, before it is read again at a read's end
-//!   ([`App::may_reread`]): its mark stays, unread, while its protocol owes a call at or
-//!   before the cursor or anything before the upload, or holds an item the cursor hasn't
-//!   passed (`ghold/`), so it is read only after what comes before it;
-//! - a duty event, as it is kept (`keep_duty_for`): one the gate refuses fails the commit,
-//!   so no path keeps one past a call its protocol owes.
+//! - a message entry, before anything is done with it, its checks included
+//!   (`check_and_apply`): held, the cursor staying before it, for a protocol whose position
+//!   is behind it. So no entry is stored locally, dropped or found a duplicate for a
+//!   protocol that is behind;
+//! - a re-send, missed-entries or deny list call (`hand_call`): kept for the protocol
+//!   (`owed/`, naming it) when it is behind the item or fails the call. A deny list change
+//!   kept for a protocol stops the read there for every protocol, at that read and at each
+//!   later one that reaches its item, so the cursor never passes a deny list change a
+//!   protocol wasn't handed;
+//! - a deny list gap (`tell_deny_gap_if_owed`): told once every protocol is told through
+//!   its position; the read holds meanwhile;
+//! - a record write the feed shows (`judge_write`), for the protocol of its collection, or
+//!   for every protocol when the app can't place it: held like an entry;
+//! - a listing a feed item owes (`list_due`): made for a protocol once it is told through
+//!   everything before that item;
+//! - what isn't in feed order: an entry stored locally and tried again, a record an upload
+//!   marked and read again at a read's end, a record opened once its key comes. These reach
+//!   only a protocol that is with the read, told through everything it covered.
 //!
-//! The owed calls themselves are made in feed order by `retry_owed`, each protocol's
-//! listing among them, and a protocol's first one still owed is where it is held
-//! ([`App::owed_from`]).
+//! What the cursor passes without a protocol taking it is kept with the protocols it is
+//! still for: a call (`owed/`), a listing (`list_due`), the deny list gap (`dgap`). Those
+//! hold the content; the position holds the order. At the start of each read they are told
+//! in feed order ([`App::settle_told`], `retry_owed`), a protocol's listing before a call at
+//! the same item: the listing an item owes is not held by that item's own call, with one
+//! protocol or several. A kept call or listing past the cursor waits for the read to reach
+//! its item: the protocols it names stay right before it, aren't told the item, and are
+//! told what is kept at the start of the read after, whether or not the cursor got there.
+//! A protocol a listing is still owed to is told nothing that isn't in feed order either.
 //!
-//! Not in feed order, and told at once ([`Place::Outside`]): what the host or a protocol asks
-//! for with a call of its own (a read of a record, a listing it asks for, an own write's
-//! answer, a message it sends), what the outbox, a kept batch, a provider change or a
-//! restore reports, and what the app owes outside the feed and makes before the read hands
-//! anything: the listing a join, a restore or a certificate never shown on this app's feed
-//! owes, a provider loss's re-send question, and the opening of writes taken already once a
-//! key comes. A protocol that owes a call is told those at the point it was held at,
-//! before anything later.
+//! A read that stopped on its pages goes on from where it got (`feed_at`), unless a
+//! protocol is behind that with a feed item next: then it starts at that protocol's
+//! position, never before the cursor, so a protocol catches up in order before it is told
+//! anything further on. What the read meets again on the way is not handled twice: an entry
+//! by `seen/` and its processed pair, a call by `asked/` and the protocols its kept form
+//! names, a record write by its version.
+//!
+//! The position is written in the commit of what moves it: a page's, a kept call's, a
+//! listing's. One that lags behind what was committed, as after a crash between an effect's
+//! commit and its page's, only starts the next read further back.
+//!
+//! A view read for a listing, or read again after an upload, shows the record as it stands
+//! then, which may be later than the item that owed the read.
+//!
+//! Not in feed order, and told at once: what the host or a protocol asks for with a call
+//! of its own (a read of a record, a listing it asks for, an own write's answer, a message
+//! it sends), what the outbox, a kept batch, a provider change or a restore reports, the
+//! listing a join, a restore or a certificate taken owes (made for every protocol before a
+//! read hands anything), and a duty event about an entry stored locally: such an entry was
+//! stored when its protocol's position had reached it, so it lies in that protocol's past.
+//! A receive step and a protocol's batch write only that protocol's own records
+//! (`refuse_foreign_target`), so none of those changes what another protocol sees.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::feed::{Owed, owed_place};
-use super::state::{Tx, key};
+use super::state::Tx;
 use super::{App, AppError};
 
 /// Where an item stands in feed order, as [`App::feed_order`] gives it.
 pub(crate) type FeedOrder = (u8, u64, u64);
 
-/// `listo/<name>`: a listing of the collections of protocol `name`, owed to it at a feed
-/// position ([`OwedListing`]). A listing owed while it owed an earlier call left its
-/// collections out; it is made in feed order among its owed calls (`retry_owed`).
-pub(crate) const OWED_LISTING_PREFIX: &str = "listo/";
+/// `told/<name>`: how far protocol `name` has been told ([`Told`]).
+pub(crate) const TOLD_PREFIX: &str = "told/";
 
-/// `listop/<name>`: how far the listing owed to protocol `name` got, in the commit of each
-/// page it takes; deleted with it.
-pub(crate) const OWED_LISTING_AT_PREFIX: &str = "listop/";
-
-/// `ghold/<name>`: the furthest feed position, (generation, `seq`), of an item held for
-/// protocol `name` because it owed something before it, in the commit of the page that
-/// holds it; deleted in the commit of the page whose cursor passes it, every such item
-/// before it passed too (the cursor stays before a held item).
-pub(crate) const GATE_HELD_PREFIX: &str = "ghold/";
-
-fn gate_held_key(name: &str) -> String {
-    format!("{GATE_HELD_PREFIX}{name}")
+fn told_key(name: &str) -> String {
+    format!("{TOLD_PREFIX}{name}")
 }
 
-pub(crate) fn owed_listing_key(name: &str) -> String {
-    format!("{OWED_LISTING_PREFIX}{name}")
-}
-
-pub(crate) fn owed_listing_at_key(name: &str) -> String {
-    format!("{OWED_LISTING_AT_PREFIX}{name}")
-}
-
-/// A listing of one protocol's collections, owed to it at the feed item whose handling
-/// owed it (`generation`, `seq`). One a protocol is owed again while it holds one keeps
-/// the earlier position and starts over: made later, it reads the records as they stand
-/// then, and the protocol's later items follow it in feed order.
+/// How far a protocol has been told: everything the read covered at or before
+/// (`generation`, `seq`) that was for it. Absent for a protocol at the cursor, as after a
+/// join or a restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OwedListing {
+pub(crate) struct Told {
     pub(crate) generation: u64,
     pub(crate) seq: u64,
 }
 
-/// Where something the app would tell a protocol stands in the order it tells things.
+/// Where the read's walk of the feed stands, for [`App::may_tell`]: inside a page, it
+/// covered everything at or before this `seq` of the cursor's generation, and handles the
+/// item after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Place {
-    /// Not in feed order (the module docs list what): told at once.
-    Outside,
-    /// The feed item at this place, or what its handling owes, such as the listing a
-    /// `missed` item owes: told to a protocol that owes nothing before it. A call owed at
-    /// this very item is the item's own: a `missed` item's listing goes with it.
-    Item(FeedOrder),
-    /// Noted after the item at this place, such as a deny list gap at the cursor: told to a
-    /// protocol that owes nothing at or before it.
-    After(FeedOrder),
+pub(crate) struct Walk(pub(crate) u64);
+
+/// Something the cursor passed, or may pass, that is kept for the protocols it names
+/// until each takes it: a call (`owed/`) or the listing a feed item owes (`list_due`).
+#[derive(Clone, Debug)]
+pub(crate) struct Kept {
+    pub(crate) generation: u64,
+    pub(crate) seq: u64,
+    pub(crate) names: Vec<String>,
+    /// A call, whose item the walk doesn't handle again; not a listing.
+    pub(crate) call: bool,
+    /// A deny list change, which no protocol is handed anything past while it is kept.
+    pub(crate) deny: bool,
+}
+
+/// What is kept past the cursor at one `seq` of the cursor's sequence: the protocols it
+/// names, and whether a call is among it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KeptAhead {
+    pub(crate) names: Vec<String>,
+    pub(crate) call: bool,
+    /// A deny list change is among it: the read stops there for every protocol.
+    pub(crate) deny: bool,
 }
 
 impl App {
-    /// Whether the app may tell protocol `protocol` something at `place` now, or, for
-    /// `None`, something it can't place with one protocol (a record of a collection it
-    /// can't tell): every protocol then (Switch spec 8.3). "Not yet" means a protocol owes
-    /// a call or a listing before `place` ([`App::owed_from`]): the caller holds the item
-    /// for it, and it is told once that protocol takes what it owes, in feed order.
+    /// How far protocol `name` has been told, (generation, `seq`).
+    pub(crate) fn told(&self, name: &str) -> (u64, u64) {
+        self.told
+            .get(name)
+            .copied()
+            .unwrap_or((self.state.cursor.generation, self.state.cursor.seq))
+    }
+
+    fn told_order(&self, name: &str) -> FeedOrder {
+        let (generation, seq) = self.told(name);
+        self.feed_order(generation, seq)
+    }
+
+    /// The read's front: the furthest any protocol has been told through.
+    fn front(&self) -> FeedOrder {
+        let cursor = self.feed_order(self.state.cursor.generation, self.state.cursor.seq);
+        self.protocols
+            .iter()
+            .map(|registered| self.told_order(&registered.name))
+            .max()
+            .unwrap_or(cursor)
+    }
+
+    /// The position a protocol must be told through to be told something now: inside a
+    /// page, where the walk stands; otherwise the read's front.
+    fn walked(&self) -> FeedOrder {
+        match self.walk {
+            Some(Walk(seq)) => self.feed_order(self.state.cursor.generation, seq),
+            None => self.front(),
+        }
+    }
+
+    /// Whether the app may tell protocol `name` something now (Switch spec 8.3): it has
+    /// been told everything the read covered before it. Inside a page that is the item the
+    /// walk handles; outside one, something that isn't in feed order, which reaches only a
+    /// protocol that is with the read. "Not yet" means the caller holds or keeps the thing
+    /// for it.
     ///
-    /// With one protocol a call it fails stops the read, so this only ever holds what no
-    /// read reaches before the call is taken.
-    pub(crate) fn may_tell(&self, protocol: Option<&str>, place: Place) -> bool {
-        let allows = |name: &str| {
-            let first = self.owed_from.get(name);
-            match place {
-                Place::Outside => true,
-                Place::Item(at) => first.is_none_or(|first| at <= *first),
-                Place::After(at) => first.is_none_or(|first| at < *first),
-            }
-        };
+    /// Something kept for the protocol at the very item the walk handles, a call or a
+    /// listing, comes first: the protocol isn't told the item. And outside a page, a
+    /// protocol whose listing the read could not make yet is told nothing: the listing
+    /// comes before anything else.
+    ///
+    /// With one protocol this is false only once that protocol didn't take an item, and
+    /// the read stops there.
+    pub(crate) fn may_tell(&self, name: &str) -> bool {
+        if self.kept_here.contains(name) {
+            return false;
+        }
+        if self.walk.is_none() && self.listing_names.contains(name) {
+            return false;
+        }
+        self.told_order(name) >= self.walked()
+    }
+
+    /// [`App::may_tell`] for the protocol of a record's collection, or, for `None`, a
+    /// record the app can't place with one protocol: every protocol then.
+    pub(crate) fn may_tell_of(&self, protocol: Option<&str>) -> bool {
         match protocol {
-            Some(name) => allows(name),
+            Some(name) => self.may_tell(name),
             None => self
                 .protocols
                 .iter()
-                .all(|registered| allows(&registered.name)),
+                .all(|registered| self.may_tell(&registered.name)),
         }
     }
 
-    /// Read again from the store where each protocol is first owed something
-    /// ([`App::owed_from`]): its first owed call (`owed/`) or owed listing (`listo/`), in
-    /// feed order. Made at the start of each read, before anything is handed, and after the
-    /// owed calls are made.
-    pub(crate) async fn refresh_owed_from(&mut self) -> Result<(), AppError> {
-        let reader = self.reader();
-        let calls = reader.scan::<Owed>(key::OWED_PREFIX).await?;
-        let listings = reader.scan::<OwedListing>(OWED_LISTING_PREFIX).await?;
-        let mut from: BTreeMap<String, FeedOrder> = BTreeMap::new();
-        for (rest, owed) in calls {
-            let (generation, seq) = owed_place(&rest)?;
-            let at = self.feed_order(generation, seq);
-            for name in owed.to {
-                note_first(&mut from, name, at);
+    /// Whether any protocol may be told the next item: a page with none stops.
+    pub(crate) fn any_in_step(&self) -> bool {
+        self.protocols
+            .iter()
+            .any(|registered| self.may_tell(&registered.name))
+    }
+
+    /// The walk handled the item at `seq`: each protocol that was in step with it, or is
+    /// one of `run` (waiting only for the listing the item before owes), moves to `seq`,
+    /// but one of `left`, which didn't take it, stays right before it.
+    pub(crate) fn step_told(&mut self, seq: u64, left: &BTreeSet<String>, run: &BTreeSet<String>) {
+        let generation = self.state.cursor.generation;
+        let at = self.feed_order(generation, seq);
+        let names = self.protocols.names();
+        for name in names {
+            if !self.may_tell(&name) && !run.contains(&name) {
+                continue;
+            }
+            if left.contains(&name) {
+                self.told.insert(name, (generation, seq.saturating_sub(1)));
+            } else if self.told_order(&name) < at {
+                self.told.insert(name, (generation, seq));
             }
         }
-        for (name, listing) in listings {
-            let at = self.feed_order(listing.generation, listing.seq);
-            note_first(&mut from, name, at);
+        if self.walk.is_some() && self.walked() < at {
+            self.walk = Some(Walk(seq));
         }
-        self.owed_from = from;
-        Ok(())
     }
 
-    /// Protocol `name` is owed something at `at`, in the read's open writes.
-    pub(crate) fn note_owed(&mut self, name: &str, at: FeedOrder) {
-        note_first(&mut self.owed_from, name.to_owned(), at);
-    }
-
-    /// Owe protocol `name` a listing of its collections at (`generation`, `seq`), in `tx`:
-    /// a listing made while it owed an earlier call left them out. One it holds already
-    /// keeps the earlier position; either way the listing starts over.
-    pub(crate) async fn owe_listing_to(
-        &mut self,
-        name: &str,
-        generation: u64,
-        seq: u64,
-        tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        let at = self.feed_order(generation, seq);
-        let held: Option<OwedListing> = self.reader().get(&owed_listing_key(name)).await?;
-        let listing = match held {
-            Some(held) if self.feed_order(held.generation, held.seq) <= at => held,
-            _ => OwedListing { generation, seq },
-        };
-        tx.put(&owed_listing_key(name), &listing)?;
-        tx.delete(&owed_listing_at_key(name))?;
-        self.note_owed(name, self.feed_order(listing.generation, listing.seq));
-        Ok(())
-    }
-
-    /// Whether a record the `upload` transition at `at` marked may be read again now, at a
-    /// read's end, and told to `protocol` (every protocol for `None`): the view read is the
-    /// record as it stands then, so not while the protocol owes a call at or before the
-    /// cursor, nor anything before the upload, nor while an item held for it
-    /// (`ghold/<name>`) waits before the cursor (Switch spec 8.3). Once it takes what it
-    /// owes and the cursor passes what was held for it, the read after reads it.
-    pub(crate) async fn may_reread(
-        &self,
-        protocol: Option<&str>,
-        at: FeedOrder,
-    ) -> Result<bool, AppError> {
-        let cursor = self.feed_order(self.state.cursor.generation, self.state.cursor.seq);
-        if !self.may_tell(protocol, Place::After(cursor))
-            || !self.may_tell(protocol, Place::Item(at))
-        {
-            return Ok(false);
+    /// Protocol `name` took the kept thing at (`generation`, `seq`): it is told through it.
+    pub(crate) fn told_through(&mut self, name: &str, generation: u64, seq: u64) {
+        if self.told_order(name) < self.feed_order(generation, seq) {
+            self.told.insert(name.to_owned(), (generation, seq));
         }
-        let names = match protocol {
-            Some(name) => vec![name.to_owned()],
-            None => self.protocols.names(),
-        };
-        for name in names {
-            if self.reader().exists(&gate_held_key(&name)).await? {
-                return Ok(false);
+    }
+
+    /// Write, in `tx`, the positions that moved since they were last written (`told/`).
+    pub(crate) fn put_told(&mut self, tx: &mut Tx) -> Result<(), AppError> {
+        for (name, at) in &self.told {
+            if self.told_kept.get(name) == Some(at) {
+                continue;
             }
-        }
-        Ok(true)
-    }
-
-    /// Note, in `tx`, that the feed holds the item at (`generation`, `seq`) for `protocol`
-    /// (every protocol for one the app can't place) because it owes something before it
-    /// (`ghold/`).
-    pub(crate) async fn note_gate_held(
-        &self,
-        protocol: Option<&str>,
-        generation: u64,
-        seq: u64,
-        tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        let at = self.feed_order(generation, seq);
-        let names = match protocol {
-            Some(name) => vec![name.to_owned()],
-            None => self.protocols.names(),
-        };
-        for name in names {
-            let key = gate_held_key(&name);
-            let held: Option<(u64, u64)> = match tx.pending_get(&key)? {
-                Some(held) => held,
-                None => self.reader().get(&key).await?,
+            let told = Told {
+                generation: at.0,
+                seq: at.1,
             };
-            if held.is_none_or(|(g, s)| self.feed_order(g, s) < at) {
-                tx.put(&key, &(generation, seq))?;
-            }
+            tx.put(&told_key(name), &told)?;
         }
+        self.told_kept = self.told.clone();
         Ok(())
     }
 
-    /// Forget, in `tx`, the items held for a protocol that the cursor has passed
-    /// (`ghold/`): the commit of a page.
-    pub(crate) async fn forget_gate_held_passed(&self, tx: &mut Tx) -> Result<(), AppError> {
-        let cursor = self.feed_order(self.state.cursor.generation, self.state.cursor.seq);
-        for (name, (generation, seq)) in self.reader().scan::<(u64, u64)>(GATE_HELD_PREFIX).await? {
-            if tx.pending_state(&gate_held_key(&name)) != Some(true)
-                && self.feed_order(generation, seq) <= cursor
-            {
-                tx.delete(&gate_held_key(&name))?;
+    /// Read the positions from the store (`told/`), as a call that follows a reload does.
+    /// One of a protocol that isn't registered, or of a generation past the newest own
+    /// `identity.json` the app holds, which no read writes, is a corrupt store: taken as
+    /// it is, it would stand as the read's front, and no other protocol would ever be
+    /// level with it.
+    pub(crate) async fn load_told(&mut self) -> Result<(), AppError> {
+        let stored = self.reader().scan::<Told>(TOLD_PREFIX).await?;
+        let mut told = Positions::new();
+        for (name, at) in stored {
+            if !self.protocols.contains(&name) || self.feed_order(at.generation, at.seq).0 == 2 {
+                return Err(AppError::Store(crate::error::StoreError::Corrupt));
             }
+            told.insert(name, (at.generation, at.seq));
         }
+        self.told = told;
+        self.told_kept = self.told.clone();
+        self.walk = None;
+        self.kept_here.clear();
+        self.told_loaded = true;
         Ok(())
     }
 
-    /// The listings owed to single protocols (`listo/`), by protocol name.
-    pub(crate) async fn owed_listings(&self) -> Result<Vec<(String, OwedListing)>, AppError> {
-        self.reader().scan::<OwedListing>(OWED_LISTING_PREFIX).await
+    /// Set each protocol's position by what is kept for it, `kept` in feed order
+    /// ([`Kept`]): right before the first kept thing that names it, or, when that is past
+    /// the cursor, between the cursor and it; at the cursor or further when nothing names
+    /// it. Everything else for it at or before the cursor was told: the cursor never
+    /// passes an item a protocol didn't take unless the item is kept for it.
+    ///
+    /// The one place this is derived, at each read's start and as the kept things are
+    /// taken, so a restore, a provider change and a crash all leave it right.
+    pub(crate) fn settle_told(&mut self, kept: &[Kept]) {
+        let cursor = (self.state.cursor.generation, self.state.cursor.seq);
+        let cursor_at = self.feed_order(cursor.0, cursor.1);
+        for name in self.protocols.names() {
+            let held = self.told(&name);
+            let at_least = if self.feed_order(held.0, held.1) < cursor_at {
+                cursor
+            } else {
+                held
+            };
+            let first = kept
+                .iter()
+                .find(|kept| kept.names.contains(&name))
+                .map(|kept| (kept.generation, kept.seq.saturating_sub(1)));
+            let settled = match first {
+                Some(before)
+                    if self.feed_order(before.0, before.1)
+                        < self.feed_order(at_least.0, at_least.1) =>
+                {
+                    before
+                }
+                _ => at_least,
+            };
+            self.told.insert(name, settled);
+        }
+    }
+
+    /// The protocols that are stuck on a kept thing: one names them right after their
+    /// position. They can't move in the walk until a read's start tells it to them.
+    pub(crate) fn stuck_on(&self, kept: &[Kept]) -> BTreeSet<String> {
+        let mut stuck = BTreeSet::new();
+        for name in self.protocols.names() {
+            let (generation, seq) = self.told(&name);
+            let next = self.feed_order(generation, seq.saturating_add(1));
+            if kept.iter().any(|kept| {
+                kept.names.contains(&name) && self.feed_order(kept.generation, kept.seq) == next
+            }) {
+                stuck.insert(name);
+            }
+        }
+        stuck
+    }
+
+    /// Where the walk starts: at `from`, a `seq` of the cursor's generation, or at the
+    /// position of a protocol behind it that can move, never before the cursor.
+    pub(crate) fn walk_start(&self, from: u64, stuck: &BTreeSet<String>) -> u64 {
+        let cursor = self.state.cursor;
+        let cursor_at = self.feed_order(cursor.generation, cursor.seq);
+        let mut start = from;
+        for name in self.protocols.names() {
+            if stuck.contains(&name) {
+                continue;
+            }
+            let (generation, seq) = self.told(&name);
+            let at = self.feed_order(generation, seq);
+            // One behind the cursor waits for what is kept for it; one of another sequence
+            // has nothing to walk here.
+            if at < cursor_at || at.0 != cursor_at.0 {
+                continue;
+            }
+            start = start.min(seq.max(cursor.seq));
+        }
+        start
     }
 }
 
-fn note_first(from: &mut BTreeMap<String, FeedOrder>, name: String, at: FeedOrder) {
-    from.entry(name)
-        .and_modify(|first| *first = (*first).min(at))
-        .or_insert(at);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_order_note_first_keeps_the_earliest() {
-        let mut from = BTreeMap::new();
-        note_first(&mut from, "tasks".into(), (1, 0, 9));
-        note_first(&mut from, "tasks".into(), (1, 0, 4));
-        note_first(&mut from, "tasks".into(), (1, 0, 7));
-        assert_eq!(from.get("tasks"), Some(&(1, 0, 4)));
-    }
-}
+/// The in-memory positions, by protocol name.
+pub(crate) type Positions = BTreeMap<String, (u64, u64)>;

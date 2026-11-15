@@ -653,12 +653,17 @@ pub struct DenyListGap {
 ///   state alone.
 /// - **What carries no kind**, such as [`Protocol::resend_needed`], [`Protocol::missed`],
 ///   the deny list calls and [`Protocol::provider_lost`], is handed to every protocol, and
-///   each protocol's failure is owed to it alone. Until it takes a re-send or missed call
-///   it owes, or a listing of its collections owed to it, it is told nothing later: its
-///   entries and its records' writes wait, its later calls are owed, a listing leaves its
-///   collections out and owes it one of its own, made after its calls in feed order, and
-///   its records an upload marked wait unread; a deny list gap waits for every protocol;
-///   a call every protocol owes stops the read, as with one protocol.
+///   each protocol's failure is kept for it alone. A protocol is told things in feed order,
+///   each once: until it takes a re-send or missed call kept for it, it is told nothing
+///   later, while the read goes on for the others. Its entries and its records' writes
+///   wait, its later calls are kept for it, the listing a later item owes is made for it
+///   once it has taken what comes before, and its records an upload marked wait unread; a
+///   deny list change or gap waits for every protocol; with no protocol left in step the
+///   read stops, as with one protocol.
+/// - **Records**: a protocol's receive step, and a batch of its own, write only that
+///   protocol's records: a target in a collection another registered protocol gives, or
+///   under a scope whose root another owns, is refused ([`super::Refusal::Usage`]). So no
+///   protocol's step changes what another is told.
 /// - **Duty events** name the protocols they are for ([`super::App::ack_events_for`]): the
 ///   protocol of the kind, collection, stored entry or kept batch they name, every protocol
 ///   otherwise.
@@ -883,7 +888,7 @@ pub trait Protocol: Send + Sync {
     /// the writes of those that took it are committed with the gap still owed to every
     /// protocol, so a later read tells it to each again, with the list the copy is then
     /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a
-    /// protocol owes a call or a listing from at or before it.
+    /// call or a listing from at or before it is kept for a protocol.
     ///
     /// A gap may be told again at the same position, each time with the full list, which
     /// sets the same state: every gap noted is told to every protocol, one that took an

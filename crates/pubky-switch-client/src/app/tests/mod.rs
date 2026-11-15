@@ -10,6 +10,7 @@ mod held_reads;
 mod kept_status;
 mod moves;
 mod not_registered;
+mod order_model;
 mod own_record;
 mod parked;
 mod passed;

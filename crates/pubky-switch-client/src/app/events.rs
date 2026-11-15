@@ -526,9 +526,9 @@ pub enum AppEvent {
     /// A listing of the collections is owed and waits for a scope key the app lacks at the
     /// current data epoch: the read ended before the feed, handing nothing over, and the
     /// app asks for its full key bundle again at a bounded interval (Switch spec 3.5, 8.2).
-    /// The read after the key arrives lists, then reads the feed. Also when the listing
-    /// owed to one protocol alone waits so: that protocol is handed nothing meanwhile, and
-    /// the read goes on for the others.
+    /// The read after the key arrives lists, then reads the feed. Also when the listing of
+    /// one protocol waits so while another can go on: that protocol is handed nothing
+    /// meanwhile, and the read reads the feed for the others.
     ListingWaitsForKey,
     /// The own app was revoked or recorded as departed: it is no longer current. Queued
     /// once while the host hasn't taken it, however many steps of a call find it.

@@ -1354,12 +1354,7 @@ impl App {
         };
         self.end_kept_batch(id, pending, Ended::Dropped(reason), tx)?;
         let to = self.batch_owners(pending);
-        self.keep_duty_for(
-            tx,
-            to.clone(),
-            Duty::KeptBatchDropped { batch_id: *id },
-            super::order::Place::Outside,
-        )?;
+        self.keep_duty_for(tx, to.clone(), Duty::KeptBatchDropped { batch_id: *id })?;
         self.attempts_dropped(batch, to, tx)
     }
 
@@ -1380,7 +1375,6 @@ impl App {
                     claim_key: attempt.claim_key,
                     attempt_id: attempt.attempt_id,
                 },
-                super::order::Place::Outside,
             )?;
         }
         Ok(())

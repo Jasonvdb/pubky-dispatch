@@ -313,7 +313,7 @@ impl Signer {
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
-            // An answer the pinned key signed, which the account still exists to sign: the
+            // An answer the pinned key signed that does not confirm an erasure: the
             // erasure didn't land, and the next request is a first one again.
             Err(error @ (ClientError::Switch { .. } | ClientError::InvalidResponse(_))) => {
                 let flow = Flow::Erase {

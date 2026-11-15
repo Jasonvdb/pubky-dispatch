@@ -543,6 +543,30 @@ async fn test_marks_enrollment_after_an_erasure_makes_a_new_account() {
     assert_eq!(code(&error).1, ErrorCode::Staged);
 }
 
+#[tokio::test]
+async fn test_marks_failing_staged_import_can_be_erased() {
+    let alice = alice();
+    let staged = alice.switch().import_into([45; 32]);
+    let client = client_at(&alice, staged.transport(), alice.clock().now_ms());
+    client.pin(staged.service_key());
+    let created = staged.created();
+    let held = staged.identity_doc().unwrap();
+    let refused = client
+        .erase(Some(created), Some(held.hash()))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused).1, ErrorCode::Conflict);
+    assert!(!staged.erased());
+    staged.lose_mark();
+    client
+        .erase(Some(created), Some(held.hash()))
+        .await
+        .unwrap();
+    assert!(staged.erased());
+    assert_eq!(staged.mark(), None);
+    assert!(staged.erasure_record().is_some());
+}
+
 /// A transport that changes each request before the switch at `target` answers it, so
 /// the answer is the switch's, validly signed with its one key, for another request than
 /// the one the client sent.

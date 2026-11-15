@@ -3432,10 +3432,10 @@ async fn test_app_service_time_going_back_is_an_alarm() {
 #[tokio::test]
 async fn test_app_service_time_leaves_out_only_the_time_base_answers() {
     // Each answer verified with the pinned key counts in the comparison of service times,
-    // a refusal without the head included, but the answers at the time base: the notice,
-    // the not-hosted `404` and an answer given before the body was read. A service that
-    // shows an earlier time on any other is misbehaviour (Switch spec 10.1, wire 7.1
-    // Timestamp).
+    // a refusal without the head included, but those that count in none: the notice, every
+    // `503 unavailable`, the not-hosted `404` and an answer given before the body was read.
+    // A service that shows an earlier time on any other is misbehaviour (Switch spec 10.1,
+    // wire 7.1 Timestamp).
     let earlier = START + HOUR / 2;
     let after_a_read = || async {
         let w = World::new();
@@ -3468,25 +3468,43 @@ async fn test_app_service_time_leaves_out_only_the_time_base_answers() {
         code: ErrorCode::TooLarge,
     });
     not_an_alarm("before the body", app.receive(None).await);
-    // The `503` of a mark store that can't be read commits nothing: it carries the last
-    // time committed, no earlier than the one the app verified.
+    // The `503` of a mark store that can't be read.
     let (w, mut app) = after_a_read().await;
     w.switch.set_mark_store_unreadable(true);
     not_an_alarm("the store can't be read", app.receive(None).await);
-    // A `401`, answered before the request verified and without the head, at a time earlier
-    // than the app verified: the service went back.
+    // Any `503 unavailable`, at a time earlier than the app verified: a temporary failure
+    // tells nothing of the account's state, such as one when the account can't be looked
+    // up, at the time base.
     let (w, mut app) = after_a_read().await;
     w.switch.lock().stamped_ms = earlier;
     w.switch.fail_next(Fault::Error {
         path: "/feed".into(),
-        code: ErrorCode::BadSignature,
+        code: ErrorCode::Unavailable,
         current: json!(null),
     });
-    let error = app.receive(None).await.unwrap_err();
-    assert!(
-        matches!(error, AppError::Alarm(Alarm::ServiceTimeBackwards { .. })),
-        "{error:?}"
-    );
+    not_an_alarm("unavailable", app.receive(None).await);
+    // A `401`, answered before the request verified and without the head, a `429`, a `503
+    // staged` and a plain `404`, each at a time earlier than the app verified: the service
+    // went back.
+    for (code, current) in [
+        (ErrorCode::BadSignature, json!(null)),
+        (ErrorCode::RateLimited, json!(null)),
+        (ErrorCode::Staged, json!(null)),
+        (ErrorCode::NotFound, json!(null)),
+    ] {
+        let (w, mut app) = after_a_read().await;
+        w.switch.lock().stamped_ms = earlier;
+        w.switch.fail_next(Fault::Error {
+            path: "/feed".into(),
+            code,
+            current,
+        });
+        let error = app.receive(None).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Alarm(Alarm::ServiceTimeBackwards { .. })),
+            "{code:?}: {error:?}"
+        );
+    }
 }
 
 #[tokio::test]

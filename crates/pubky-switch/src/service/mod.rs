@@ -88,8 +88,9 @@ use crate::{
 };
 
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
-use self::signed::{Asked, Received, sign_answer};
+use self::signed::{AnswerTime, Asked, Received, sign_answer};
 use self::verdict::{RequestClass, Route};
+use pubky_switch_core::http::Uncompared;
 
 /// How many claims whose time has passed one request deletes at most (Switch wire 7.3
 /// step 4); the rest go with the next requests.
@@ -549,7 +550,11 @@ impl Service {
         if let Some(reason) = received.broken_header_rule()
             && request.route.call != Call::GetIdentity
         {
-            return self.service_error(asked, base_ms, &ApiError::bad_request(reason));
+            return self.service_error(
+                asked,
+                AnswerTime::Unbound(base_ms),
+                &ApiError::bad_request(reason),
+            );
         }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
@@ -557,56 +562,73 @@ impl Service {
         // Step 1: an unknown route, signed with the service key like every answer.
         let Some(account) = request.route.account.clone() else {
             let error = ApiError::not_found("no such route");
-            return self.service_error(asked, base_ms, &error);
+            return self.service_error(asked, AnswerTime::Unbound(base_ms), &error);
         };
         let call = &request.route.call;
         // Step 2: the account and its mark, judged together, before the lock (Switch wire
-        // 7.3, Table 1).
+        // 7.3, Table 1). A failure here is a `503 unavailable`, which counts in no comparison
+        // (Switch wire 7.1 Timestamp).
         let (found, judged) = match self.judge_at_step_two(&account).await {
             Ok(judged) => judged,
-            Err(error) => return self.service_error(asked, base_ms, &error),
+            Err(error) => {
+                let at = AnswerTime::TimeBase(base_ms, Uncompared::Unavailable);
+                return self.service_error(asked, at, &error);
+            }
         };
         let class = marking::class_of(&request);
         let routed = verdict::answer(&judged.judgement, &class, self.current_key());
         // The last time the service committed for the identity: the time an answer that
         // commits nothing carries, so none shows a time later than the next commit stamps,
-        // even after the time base went back. An identity without an account has none, and
-        // such an answer carries the time base (Switch wire 7.1 Timestamp, spec 10.1).
-        let committed_ms = found
-            .as_ref()
-            .map_or(base_ms, |found| found.stamped_time_ms);
+        // even after the time base went back. An identity without an account has none: every
+        // answer to it counts in no comparison and carries the time base (Switch wire 7.1
+        // Timestamp, spec 10.1).
+        let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
         // The identity's service time (step 3), which the checks before the lock that depend
         // on time take: the time base, or the last time it stamped where the time base is
         // earlier.
-        let service_ms = base_ms.max(committed_ms);
+        let service_ms = committed_ms.map_or(base_ms, |committed| base_ms.max(committed));
         if matches!(routed.route, Route::Notice(_)) {
             // The notice replaces every later answer, a `401` and a `403` before
-            // authentication included, but a `429` answered before it, which commits nothing
-            // and carries the last committed time; a request that would have been a `401`
-            // still counts against its source (Switch wire 7.1 Timestamp, 7.3 under Table 2,
-            // 9.4).
-            if let Some(limited) = self.limited_before_authentication(&account, &request, base_ms) {
-                return self.keyed_error(&routed.key, asked, committed_ms, &limited);
-            }
-            if *call != Call::GetIdentity {
-                let _ = self.pre_lock(&account, &request, base_ms, service_ms).await;
+            // authentication included, but a `429` answered before it at an account the
+            // service holds, which commits nothing and carries the last committed time; a
+            // request that would have been a `401` still counts against its source. At an
+            // identity without an account, which has no committed time, the notice answers
+            // in place of that `429` too, with no signature work (Switch wire 7.1 Timestamp,
+            // 7.3 under Table 2, 9.4).
+            let limited = self.limited_before_authentication(&account, &request, base_ms);
+            match (limited, committed_ms) {
+                (Some(limited), Some(committed_ms)) => {
+                    let at = AnswerTime::Account(committed_ms);
+                    return self.keyed_error(&routed.key, asked, at, &limited);
+                }
+                (Some(_), None) => {}
+                (None, _) if *call != Call::GetIdentity => {
+                    let _ = self.pre_lock(&account, &request, base_ms, service_ms).await;
+                }
+                (None, _) => {}
             }
         }
         if let Some(answer) = self.verdict_answer(&account, &routed, asked, base_ms, committed_ms) {
             return answer;
         }
-        if found.is_none() {
+        let Some(committed_ms) = committed_ms else {
             // An identity without an account that the verdict lets through: the erasure at
             // a lost identity (Switch wire 7.4.16, 7.3 Table 2).
             return self
                 .erase_without_account(&account, &request, &routed, base_ms, asked)
                 .await;
-        }
+        };
         // An answer before the account's lock commits nothing: signed with the verdict's key,
         // at the last time the service committed for the identity (Switch wire 7.1
         // Timestamp).
-        let refused_early =
-            |error: ApiError| self.keyed_error(&routed.key, asked, committed_ms, &error);
+        let refused_early = |error: ApiError| {
+            self.keyed_error(
+                &routed.key,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &error,
+            )
+        };
         // Everything that needs no account state comes before the lock: the limits that
         // apply before authentication, the headers and the signature (Switch wire 7.2).
         let PreLock {
@@ -670,7 +692,10 @@ impl Service {
                 Ok(Some(txn)) => txn,
                 // Erased between the lookup and the lock: as for an account the service
                 // doesn't host (Switch wire 7.4.16 Afterwards).
-                Ok(None) => return self.service_error(asked, base_ms, &marking::not_hosted()),
+                Ok(None) => {
+                    let at = AnswerTime::TimeBase(base_ms, Uncompared::NotHosted);
+                    return self.service_error(asked, at, &marking::not_hosted());
+                }
                 Err(error) => return refused_early(store_error(&error)),
             };
             self.at_account(
@@ -949,11 +974,21 @@ impl Service {
                 Ok(doc) => Some(doc),
                 Err(_) => {
                     tracing::error!("a held identity.json doesn't verify");
-                    return self.service_error(asked, committed_ms, &unavailable());
+                    return self.service_error(
+                        asked,
+                        AnswerTime::Account(committed_ms),
+                        &unavailable(),
+                    );
                 }
             },
             Ok(None) => None,
-            Err(error) => return self.service_error(asked, committed_ms, &store_error(&error)),
+            Err(error) => {
+                return self.service_error(
+                    asked,
+                    AnswerTime::Account(committed_ms),
+                    &store_error(&error),
+                );
+            }
         };
         // The verdict again, under the lock (Switch wire 7.3 step 2).
         let head = txn.head().clone();
@@ -969,17 +1004,22 @@ impl Service {
         {
             drop(txn);
             return match self.erase_again(&identity, erased_at_ms).await {
-                Ok(()) => self.service_error(asked, base_ms, &marking::not_hosted()),
-                Err(error) => self.service_error(asked, committed_ms, &error),
+                Ok(()) => self.service_error(
+                    asked,
+                    AnswerTime::TimeBase(base_ms, Uncompared::NotHosted),
+                    &marking::not_hosted(),
+                ),
+                Err(error) => self.service_error(asked, AnswerTime::Account(committed_ms), &error),
             };
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
-        if let Some(answer) = self.verdict_answer(&identity, &routed, asked, base_ms, committed_ms)
+        if let Some(answer) =
+            self.verdict_answer(&identity, &routed, asked, base_ms, Some(committed_ms))
         {
             return answer;
         }
         let Some(signer) = self.signer_of(&routed.key) else {
-            return self.service_error(asked, committed_ms, &unavailable());
+            return self.service_error(asked, AnswerTime::Account(committed_ms), &unavailable());
         };
         // Only an answer the verdict lets carry a head carries one (Switch wire 7.3 under
         // Table 2): the start of a generation carries its own.
@@ -991,7 +1031,12 @@ impl Service {
         // answer is signed at the time last committed.
         let failed = |txn: AccountTxn| {
             drop(txn);
-            Self::signed_error(&signer, asked, committed_ms, &unavailable())
+            Self::signed_error(
+                &signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            )
         };
         // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
         // the claims whose time has passed goes, by the time base (Switch wire 7.3), and the
@@ -1122,7 +1167,12 @@ impl Service {
         let committed = erase::to_the_end(commit).await.unwrap_or(Err(()));
         if committed.is_err() {
             // Nothing committed, the stamp included: the mark doesn't move.
-            return Self::signed_error(&signer, asked, committed_ms, &unavailable());
+            return Self::signed_error(
+                &signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            );
         }
         // The mark moves to the committed head, durably, before the answer is released; a
         // commit that held whose mark didn't move answers `503`, and its retry is answered as
@@ -1140,7 +1190,12 @@ impl Service {
                 .await
                 != marking::MarkMove::Done
         {
-            return Self::signed_error(&answer_signer, asked, time_ms, &unavailable());
+            return Self::signed_error(
+                &answer_signer,
+                asked,
+                AnswerTime::Account(time_ms),
+                &unavailable(),
+            );
         }
         let mut answer = answer;
         match answer.deferred.take() {
@@ -1160,18 +1215,14 @@ impl Service {
                 return match self.feed_page(&read).await {
                     Ok(page) => {
                         let (answer, time_ms) = page.answer();
-                        sign_answer(page.signer(), asked, time_ms, answer)
+                        sign_answer(page.signer(), asked, AnswerTime::Account(time_ms), answer)
                     }
                     // Signed when it answers, after the wait: the notice and the not-hosted
                     // `404` at the time base then, an unknown verdict's `503` at the last time
                     // the read saw committed (Switch wire 7.1 Timestamp).
-                    Err(feed::FeedStop::Verdict {
-                        key,
-                        error,
-                        committed_ms,
-                    }) => {
-                        let at_ms = committed_ms.unwrap_or_else(|| self.time.read().base_ms);
-                        self.keyed_error(&key, asked, at_ms, &error)
+                    Err(feed::FeedStop::Verdict { key, error, at }) => {
+                        let at = at.at(|| self.time.read().base_ms);
+                        self.keyed_error(&key, asked, at, &error)
                     }
                     Err(feed::FeedStop::Refused(refusal)) => {
                         // Every 401 counts against the network source (9.4).
@@ -1187,7 +1238,7 @@ impl Service {
                             (None, false) => (None, answer_signer),
                         };
                         let answer = Answer::error(&refusal.error).with_head(head);
-                        sign_answer(&signer, asked, refusal.time_ms, answer)
+                        sign_answer(&signer, asked, AnswerTime::Account(refusal.time_ms), answer)
                     }
                 };
             }
@@ -1195,7 +1246,7 @@ impl Service {
             Some(Deferred::Erase(_)) | None => {}
         }
         // The response signature is made last, over the whole body (Switch wire 7.1).
-        sign_answer(&answer_signer, asked, time_ms, answer)
+        sign_answer(&answer_signer, asked, AnswerTime::Account(time_ms), answer)
     }
     /// Steps 4 to 9 under the lock, under the verdict `judged` and its answer `routed`.
     // The request's verified callers and times, each from a different step of 7.3.
@@ -1766,7 +1817,13 @@ impl Handler for Service {
                 Refusal::TooLarge { cap, .. } => ApiError::body_too_large(*cap),
             };
             let received = Received::refused(&refusal, &self.origin);
-            self.service_error(received.asked(), base_ms, &error)
+            // An unknown route binds a request no client sends; a body over its cap is
+            // answered before the body is read (Switch wire 7.1 Timestamp).
+            let at = match refusal {
+                Refusal::UnknownRoute { .. } => AnswerTime::Unbound(base_ms),
+                Refusal::TooLarge { .. } => AnswerTime::TimeBase(base_ms, Uncompared::BodyUnread),
+            };
+            self.service_error(received.asked(), at, &error)
         })
     }
 }

@@ -697,7 +697,8 @@ impl Inner {
 
     /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): a move in progress refuses
     /// it (`409 conflict`): a frozen account that doesn't fail stop, whose export this switch
-    /// doesn't track, and a staged one holding an import. Then its binding to the account
+    /// doesn't track, and a staged one holding an import that can still be aborted. Then its
+    /// binding to the account
     /// ([`Inner::erasure_binding`]): the creation time, then the `identity.json` it follows.
     /// Every `409` carries `current.created`. Then the erasure's record is written, dated no
     /// earlier than the creation time it named, the account goes, and its mark with it: every
@@ -709,7 +710,7 @@ impl Inner {
             return refusal;
         }
         let fails_stop = self.notice().is_some();
-        if (self.frozen.is_some() && !fails_stop) || (self.staged && self.holds_import) {
+        if !fails_stop && (self.frozen.is_some() || (self.staged && self.holds_import)) {
             return bad(
                 ErrorCode::Conflict,
                 "a move is in progress",

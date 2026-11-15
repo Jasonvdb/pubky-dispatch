@@ -329,7 +329,7 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     if doc.generation() != before.generation() + 1
         || doc.body().recovery_from != Some(before.generation())
         || doc.version() <= before.version()
-        || delivered_under.as_deref() != Some("the account's service key of generation 2")
+        || delivered_under.as_deref() != Some("service key number 1")
         || enrolled_under.is_none()
         || enrolled_under != erased_key
     {

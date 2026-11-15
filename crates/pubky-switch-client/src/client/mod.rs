@@ -604,12 +604,14 @@ impl SwitchClient {
     /// The `Switch-Server-Time` of this client's latest call, where it counts in the
     /// comparison of service times that never go back (Switch spec 10.1, wire 7.1
     /// Timestamp): every answer checked with the pinned key, refusals included, but those
-    /// that carry the time base, `None` for them and for a call without a checked answer.
-    /// Those are the notice, `503 recovery_required` (7.6); the `404` with `current: {
-    /// "hosted": false }` of an identity the service doesn't host (7.3 step 2); and an answer
-    /// that verifies only with the empty body field, given before the body was read (7.1).
-    /// Every other answer carries a time the service stamped, or the last time it committed
-    /// for the identity, which no later answer goes behind.
+    /// that count in no comparison, `None` for them and for a call without a checked answer.
+    /// Those are told from the answer and the call alone ([`http::uncompared`]): every answer
+    /// to the enrollment, the erasure and the public read; an answer that verifies only with
+    /// the empty body field, given before the body was read (7.1); the notice, `503
+    /// recovery_required` (7.6); every `503 unavailable`; and the `404` with `current: {
+    /// "hosted": false }` of an identity the service doesn't host (7.3 step 2). Only these
+    /// may carry the time base; every other answer carries a time the service stamped, or the
+    /// last time it committed for the identity, which no later answer goes behind.
     pub(crate) fn latest_compared_time(&self) -> Option<u64> {
         *self
             .latest_compared_time
@@ -635,6 +637,7 @@ impl SwitchClient {
 
     fn note_server_time(
         &self,
+        sent: &SentRequest,
         checked: &Result<CheckedResponse, ClientError>,
         response: &Response,
     ) {
@@ -651,13 +654,34 @@ impl SwitchClient {
             Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => shown(),
             Err(_) => None,
         };
-        // Every checked answer but those at the time base (Switch wire 7.1 Timestamp).
+        // Every checked answer but those that count in no comparison, told from the answer
+        // and the call alone (Switch wire 7.1 Timestamp).
+        let uncompared = |body, code, current| {
+            http::uncompared(
+                &sent.method,
+                &sent.path_and_query,
+                body,
+                response.status,
+                code,
+                current,
+            )
+        };
+        let read = http::BodyField::Read(sent.body_hash);
         let compared = match checked {
-            Ok(answer) => Some(answer.server_time_ms),
-            Err(error @ ClientError::Switch { code, .. })
-                if *code != ErrorCode::RecoveryRequired && !error.is_not_hosted() =>
-            {
-                shown()
+            Ok(answer) => uncompared(read, None, None)
+                .is_none()
+                .then_some(answer.server_time_ms),
+            Err(ClientError::Switch { code, current, .. }) => {
+                uncompared(read, Some(*code), Some(current))
+                    .is_none()
+                    .then(shown)
+                    .flatten()
+            }
+            Err(ClientError::BodyUnread { code, .. }) => {
+                uncompared(http::BodyField::NotRead, Some(*code), None)
+                    .is_none()
+                    .then(shown)
+                    .flatten()
             }
             Err(_) => None,
         };
@@ -889,6 +913,19 @@ impl SwitchClient {
         self.send_checked(signed, key, auth.success_key).await?
     }
 
+    /// Receive an answer without losing a protected header (Switch wire 7.1).
+    async fn send_response(&self, request: Request) -> Result<Response, ClientError> {
+        self.transport
+            .send(request)
+            .await
+            .map_err(|error| match error {
+                TransportError::UnreadableSignedHeader { status } => {
+                    ClientError::BadServiceSignature { status }
+                }
+                error => error.into(),
+            })
+    }
+
     /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
     /// anything else with `key`. The outer error is the transport's.
     async fn send_checked(
@@ -898,21 +935,13 @@ impl SwitchClient {
         success_key: Option<[u8; 32]>,
     ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
         let sent = SentRequest::of(&signed.request);
-        let response = match self.transport.send(signed.request).await {
-            Ok(response) => response,
-            // Signed headers that don't read: as a signature that doesn't verify (Switch
-            // wire 7.1).
-            Err(TransportError::UnreadableSignedHeader { status }) => {
-                return Ok(Err(ClientError::BadServiceSignature { status }));
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let response = self.send_response(signed.request).await?;
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
         };
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&checked, &response);
+        self.note_server_time(&sent, &checked, &response);
         Ok(checked)
     }
 
@@ -935,25 +964,14 @@ impl SwitchClient {
         };
         let signed = self.build(method, path_and_query, Vec::new(), Body::Empty, auth)?;
         let sent = SentRequest::of(&signed.request);
-        let response = self
-            .transport
-            .send(signed.request)
-            .await
-            .map_err(|error| match error {
-                // Signed headers that don't read: as a signature that doesn't verify (Switch
-                // wire 7.1).
-                TransportError::UnreadableSignedHeader { status } => {
-                    ClientError::BadServiceSignature { status }
-                }
-                error => error.into(),
-            })?;
+        let response = self.send_response(signed.request).await?;
         let key =
             self.named_service_key(&response.body)
                 .ok_or(ClientError::BadServiceSignature {
                     status: response.status,
                 })?;
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&checked, &response);
+        self.note_server_time(&sent, &checked, &response);
         if checked.is_ok() {
             self.pin(key);
         }
@@ -980,10 +998,6 @@ impl SwitchClient {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
         self.send_checked(signed, key, None).await?
-    }
-
-    pub(crate) fn transport(&self) -> &dyn Transport {
-        self.transport.as_ref()
     }
 
     /// The App ID as a path segment.

@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use pubky_switch_core::{
-    http::{ERASED_BODY, parse_erase_body},
+    http::{ERASED_BODY, Uncompared, parse_erase_body},
     records::IdentityDoc,
     time::rfc3339,
 };
@@ -46,7 +46,7 @@ use serde_json::json;
 use super::{
     Answer, Deferred, PreLock, Service,
     marking::{self, Judged},
-    signed::{Asked, sign_answer},
+    signed::{AnswerTime, Asked, sign_answer},
     store_error,
     verdict::{self, Route},
 };
@@ -109,7 +109,12 @@ impl Service {
         // The erasure moves a mark: not while another process may hold the database.
         if !self.lock_is_fresh() {
             drop(txn);
-            return Self::signed_error(signer, asked, committed_ms, &unavailable());
+            return Self::signed_error(
+                signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            );
         }
         // The record first, durably, once the checks have passed (Table 3).
         let previous = match self.marks.record_erasure(&account, record_at).await {
@@ -117,7 +122,12 @@ impl Service {
             Err(failure) => {
                 tracing::error!(%failure, "recording an erasure");
                 drop(txn);
-                return Self::signed_error(signer, asked, committed_ms, &unavailable());
+                return Self::signed_error(
+                    signer,
+                    asked,
+                    AnswerTime::Account(committed_ms),
+                    &unavailable(),
+                );
             }
         };
         // The deletion, and the push keys' after it, run to their end in a task of their
@@ -145,7 +155,12 @@ impl Service {
             {
                 tracing::error!(%failure, "taking back an erasure's record");
             }
-            return Self::signed_error(signer, asked, committed_ms, &unavailable());
+            return Self::signed_error(
+                signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            );
         }
         // Then the mark: only one the record covers, never a later account's.
         if let Err(failure) = self.marks.delete_created_by(&account, record_at).await {
@@ -153,7 +168,7 @@ impl Service {
         }
         self.forget_account(&account);
         self.forget_aged_erasures().await;
-        sign_answer(signer, asked, time_ms, answer)
+        sign_answer(signer, asked, AnswerTime::Account(time_ms), answer)
     }
 
     /// The erasure at an identity without an account that the verdict lets through: a lost
@@ -168,9 +183,13 @@ impl Service {
         base_ms: u64,
         asked: Asked<'_>,
     ) -> SwitchResponse {
-        let refuse = |error: ApiError| self.keyed_error(&routed.key, asked, base_ms, &error);
+        // No account's state is shown by an answer to an erasure: each counts in no
+        // comparison of service times and carries the time base (Switch wire 7.1 Timestamp).
+        let at = AnswerTime::TimeBase(base_ms, Uncompared::Erasure);
+        let refuse = |error: ApiError| self.keyed_error(&routed.key, asked, at, &error);
         if request.route.call != Call::Erase {
-            return self.service_error(asked, base_ms, &marking::not_hosted());
+            let at = AnswerTime::TimeBase(base_ms, Uncompared::NotHosted);
+            return self.service_error(asked, at, &marking::not_hosted());
         }
         let PreLock { caller, .. } = match self.pre_lock(account, request, base_ms, base_ms).await {
             Ok(pre) => pre,
@@ -183,7 +202,7 @@ impl Service {
             ));
         }
         if routed.route != Route::EraseLost {
-            return self.service_error(asked, base_ms, &marking::not_hosted());
+            return self.service_error(asked, at, &marking::not_hosted());
         }
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         // No enrollment creates or takes over the account while the erasure holds the
@@ -207,7 +226,7 @@ impl Service {
         );
         match routed.route {
             Route::EraseLost => {}
-            Route::NotHosted => return self.service_error(asked, base_ms, &marking::not_hosted()),
+            Route::NotHosted => return self.service_error(asked, at, &marking::not_hosted()),
             _ => return refuse(unavailable()),
         }
         let created = match erasure_binding(request, None, &judged) {
@@ -227,9 +246,9 @@ impl Service {
         drop(lock);
         self.forget_account(account);
         let Some(signer) = self.signer_of(&routed.key) else {
-            return self.service_error(asked, base_ms, &unavailable());
+            return self.service_error(asked, at, &unavailable());
         };
-        sign_answer(&signer, asked, base_ms, Answer::ok(ERASED_BODY.to_vec()))
+        sign_answer(&signer, asked, at, Answer::ok(ERASED_BODY.to_vec()))
     }
 
     /// Delete every push key still owed deleting, and drop what is done (Switch wire 8.1).

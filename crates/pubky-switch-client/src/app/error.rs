@@ -251,7 +251,7 @@ pub enum AppError {
     /// A rule of the app layer refused the call.
     #[error("refused: {0}")]
     Refused(Refusal),
-    /// The switch answers as for an account it doesn't host, an error the account's key
+    /// The switch answers as for an account it doesn't host, an error the pinned service key
     /// didn't sign (an unsigned `404`), and the identity publishes no
     /// `identity.json`: the account may have been erased (Switch spec 12.7). Nothing
     /// authenticates an erasure, so the app waits: it takes the account as gone only once

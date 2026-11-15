@@ -985,6 +985,70 @@ pub fn not_hosted_current() -> serde_json::Value {
     serde_json::json!({ "hosted": false })
 }
 
+/// The classes of answer that count in no comparison of service times, the only answers
+/// to a request a client sends that the service signs at its time base (Switch wire 7.1
+/// Timestamp, spec 10.1). A client tells each from the answer and the call it made alone
+/// ([`uncompared`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uncompared {
+    /// Every answer to the enrollment, `POST /v1/enroll`, outside the comparison of the
+    /// account's committed times.
+    Enrollment,
+    /// Every answer to the erasure, `POST /v1/{id}/erase`, outside the comparison of the
+    /// account's committed times.
+    Erasure,
+    /// Every answer to the public read, `GET /v1/{id}/identity`, which binds no request, so
+    /// an earlier one may be sent again (Switch wire 7.4.15).
+    PublicRead,
+    /// An answer given before the body was read, which verifies only with the empty body
+    /// field.
+    BodyUnread,
+    /// The notice, `503 recovery_required` (Switch wire 7.6).
+    Notice,
+    /// Every `503 unavailable`: a temporary failure, which tells nothing of the account's
+    /// state.
+    Unavailable,
+    /// The `404` with `current: { "hosted": false }` of an identity the service doesn't host
+    /// (Switch wire 7.3 step 2).
+    NotHosted,
+}
+
+/// The class of an answer that counts in no comparison of service times, `None` for one
+/// that counts (Switch wire 7.1 Timestamp): by the request it answers, `method` and
+/// `path_and_query` as sent and the body field the answer verifies with, and by the answer's
+/// `status` and, for an error, its `code` and `current`.
+pub fn uncompared(
+    method: &str,
+    path_and_query: &str,
+    body: BodyField,
+    status: u16,
+    code: Option<ErrorCode>,
+    current: Option<&serde_json::Value>,
+) -> Option<Uncompared> {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let segments: Vec<&str> = path
+        .strip_prefix("/v1/")
+        .map(|rest| rest.split('/').collect())
+        .unwrap_or_default();
+    match (method, segments.as_slice()) {
+        ("POST", ["enroll"]) => return Some(Uncompared::Enrollment),
+        ("POST", [id, "erase"]) if !id.is_empty() => return Some(Uncompared::Erasure),
+        _ if is_public_read(method, path_and_query) => return Some(Uncompared::PublicRead),
+        _ => {}
+    }
+    if body == BodyField::NotRead {
+        return Some(Uncompared::BodyUnread);
+    }
+    match code {
+        Some(ErrorCode::RecoveryRequired) if status == 503 => Some(Uncompared::Notice),
+        Some(ErrorCode::Unavailable) if status == 503 => Some(Uncompared::Unavailable),
+        Some(ErrorCode::NotFound) if status == 404 && current == Some(&not_hosted_current()) => {
+            Some(Uncompared::NotHosted)
+        }
+        _ => None,
+    }
+}
+
 impl std::fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.status(), self.as_str())
@@ -1343,6 +1407,146 @@ mod tests {
             ),
         ] {
             assert_eq!(of(pairs).broken_rule(), Some(reason), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn test_uncompared_classes_are_told_from_the_answer_and_the_call() {
+        // Switch wire 7.1 Timestamp: exactly these count in no comparison of service times.
+        let read = BodyField::read(b"");
+        let not_hosted = not_hosted_current();
+        let hosted = serde_json::json!({ "hosted": true });
+        let notice = serde_json::json!({ "generation": 1, "reason": "behind", "permanent": false });
+        let uncompared = [
+            (
+                "POST",
+                "/v1/enroll",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::Enrollment,
+            ),
+            (
+                "POST",
+                "/v1/enroll",
+                read,
+                409,
+                Some(ErrorCode::Conflict),
+                None,
+                Uncompared::Enrollment,
+            ),
+            (
+                "POST",
+                "/v1/x/erase",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::Erasure,
+            ),
+            (
+                "POST",
+                "/v1/x/erase",
+                read,
+                429,
+                Some(ErrorCode::RateLimited),
+                None,
+                Uncompared::Erasure,
+            ),
+            (
+                "GET",
+                "/v1/x/identity",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::PublicRead,
+            ),
+            (
+                "GET",
+                "/v1/x/identity?a=1",
+                read,
+                429,
+                Some(ErrorCode::RateLimited),
+                None,
+                Uncompared::PublicRead,
+            ),
+            (
+                "POST",
+                "/v1/x/ops",
+                BodyField::NotRead,
+                413,
+                Some(ErrorCode::TooLarge),
+                None,
+                Uncompared::BodyUnread,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                503,
+                Some(ErrorCode::RecoveryRequired),
+                Some(&notice),
+                Uncompared::Notice,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                503,
+                Some(ErrorCode::Unavailable),
+                None,
+                Uncompared::Unavailable,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                404,
+                Some(ErrorCode::NotFound),
+                Some(&not_hosted),
+                Uncompared::NotHosted,
+            ),
+        ];
+        for (method, path, body, status, code, current, class) in uncompared {
+            assert_eq!(
+                super::uncompared(method, path, body, status, code, current),
+                Some(class),
+                "{method} {path} {status} {code:?}"
+            );
+        }
+        // Every other answer counts: a success, a refusal of the same status, a `404` with
+        // another `current`, and the calls next to those left out.
+        let compared = [
+            ("GET", "/v1/x/feed", 200, None, None),
+            ("POST", "/v1/x/ops", 429, Some(ErrorCode::RateLimited), None),
+            ("GET", "/v1/x/feed", 503, Some(ErrorCode::Staged), None),
+            ("GET", "/v1/x/feed", 404, Some(ErrorCode::NotFound), None),
+            (
+                "GET",
+                "/v1/x/feed",
+                404,
+                Some(ErrorCode::NotFound),
+                Some(&hosted),
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                401,
+                Some(ErrorCode::BadSignature),
+                None,
+            ),
+            ("PUT", "/v1/x/identity", 200, None, None),
+            ("GET", "/v1/x/erase", 404, Some(ErrorCode::NotFound), None),
+            ("POST", "/v1/x/enroll", 404, Some(ErrorCode::NotFound), None),
+        ];
+        for (method, path, status, code, current) in compared {
+            assert_eq!(
+                super::uncompared(method, path, read, status, code, current),
+                None,
+                "{method} {path} {status} {code:?}"
+            );
         }
     }
 

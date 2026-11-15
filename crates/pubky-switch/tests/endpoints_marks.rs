@@ -1119,3 +1119,96 @@ async fn test_marks_answers_that_commit_nothing_never_run_ahead_of_the_next_comm
     }
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_marks_lost_identity_over_its_source_limit_gets_the_notice() {
+    // An identity the service holds no account for has no committed time, so every answer
+    // to it counts in no comparison of service times: at a lost identity the notice, at the
+    // time base, answers in place of a `429` before authentication too, with no signature
+    // work (Switch wire 7.1 Timestamp, 7.3 under Table 2, 9.4).
+    let limits = Limits {
+        auth_failures_per_source_per_min: 1,
+        identity_reads_per_source_per_min: 1,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let head = ChainTip {
+        generation: 1,
+        seq: 2,
+        chain_hash: [7; 32],
+    };
+    replay
+        .marks
+        .write_anew(&alice_id(), head, service_public(&replay), time_of(1))
+        .await
+        .expect("mark");
+    let base = time_of(2) + 60_000;
+    replay.clock.set_wall_ms(base);
+    let source = "203.0.113.21";
+    let request = from_source(bad_signature(apps_read(base)), source);
+    let sent = Sent::of(&request);
+    let answer = replay.service.handle(request).await;
+    assert_notice(&replay, &answer, &sent, "behind", 1);
+    let claimed = (alice_id(), alice_id(), None);
+    assert_eq!(
+        replay
+            .service
+            .failed_authentications()
+            .claimed(&claimed, base),
+        1,
+        "the replaced 401 counted"
+    );
+    // The source's limit reached: the notice, not a `429`, and no signature checked.
+    for request in [
+        bad_signature(apps_read(base)),
+        apps_read(base),
+        public_read(),
+        public_read(),
+    ] {
+        let request = from_source(request, source);
+        let sent = Sent::of(&request);
+        let answer = replay.service.handle(request).await;
+        assert_notice(&replay, &answer, &sent, "behind", 1);
+    }
+    assert_eq!(
+        replay
+            .service
+            .failed_authentications()
+            .claimed(&claimed, base),
+        1,
+        "nothing verified past the limit"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_failed_account_lookup_answers_unavailable_at_the_time_base() {
+    // A database that fails when the account is looked up: a `503 unavailable` before any
+    // committed time is known, at the time base, which counts in no comparison of service
+    // times like every `503 unavailable` (Switch wire 7.1 Timestamp, 7.3 step 2).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (_, base) = served(&replay).await;
+    let committed = last_committed(&replay).await;
+    assert_ne!(
+        committed, base,
+        "the time base differs from the committed time"
+    );
+    sql(&replay, &["ALTER TABLE accounts RENAME TO accounts_away"]).await;
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = replay.service.handle(request).await;
+    sql(&replay, &["ALTER TABLE accounts_away RENAME TO accounts"]).await;
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert_signed_without_head_at(&replay, &answer, &sent, base);
+    // Looked up again, the account answers as before.
+    let answer = replay.service.handle(apps_read(base)).await;
+    assert_eq!(answer.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}

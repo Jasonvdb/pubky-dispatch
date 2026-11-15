@@ -11,14 +11,14 @@
 
 use pubky_switch_core::{
     chain::ChainTip,
-    http::{IdentityDelivery, NoticeReason, RecoveryNotice, not_hosted_current},
+    http::{IdentityDelivery, NoticeReason, RecoveryNotice, Uncompared, not_hosted_current},
     records::IdentityBody,
     sig::SignedDoc,
 };
 
 use super::{
     Service,
-    signed::Asked,
+    signed::{AnswerTime, Asked},
     verdict::{self, Account, Inputs, Judgement, MarkInput, MoveStep, RequestClass, Route},
 };
 use crate::{
@@ -345,22 +345,33 @@ impl Service {
     /// the verdict's key, without a head (Switch wire 7.1, 7.3); `None` for a request that
     /// goes on. The notice and the `404`, which count in no comparison of service times, are
     /// signed at the time base `base_ms`; the `503`, which commits nothing, at the last time
-    /// the service committed for the identity, `committed_ms` (Switch wire 7.1 Timestamp).
+    /// the service committed for the identity, `committed_ms`, or at the time base for an
+    /// identity without an account, since it counts in no comparison either (Switch wire 7.1
+    /// Timestamp).
     pub(super) fn verdict_answer(
         &self,
         identity: &str,
         answer: &verdict::Answer,
         asked: Asked<'_>,
         base_ms: u64,
-        committed_ms: u64,
+        committed_ms: Option<u64>,
     ) -> Option<SwitchResponse> {
-        let (error, at_ms) = match answer.route {
-            Route::NotHosted => (not_hosted(), base_ms),
+        let (error, at) = match answer.route {
+            Route::NotHosted => (
+                not_hosted(),
+                AnswerTime::TimeBase(base_ms, Uncompared::NotHosted),
+            ),
             Route::Unavailable => (
                 ApiError::unavailable("7.3: the mark store can't be read"),
-                committed_ms,
+                committed_ms.map_or(
+                    AnswerTime::TimeBase(base_ms, Uncompared::Unavailable),
+                    AnswerTime::Account,
+                ),
             ),
-            Route::Notice(notice) => (self.notice(identity, notice), base_ms),
+            Route::Notice(notice) => (
+                self.notice(identity, notice),
+                AnswerTime::TimeBase(base_ms, Uncompared::Notice),
+            ),
             Route::CreateAccount
             | Route::TakeOverMark
             | Route::Proceed { .. }
@@ -370,7 +381,7 @@ impl Service {
             | Route::Erase { .. }
             | Route::EraseLost => return None,
         };
-        Some(self.keyed_error(&answer.key, asked, at_ms, &error))
+        Some(self.keyed_error(&answer.key, asked, at, &error))
     }
 
     /// The notice `503 recovery_required` (Switch wire 7.6), counted and logged at its one

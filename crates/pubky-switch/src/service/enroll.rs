@@ -3,7 +3,7 @@
 use pubky_switch_core::{
     Error as CoreError,
     enc::pubky_key,
-    http::{self as wire_http, RequestTarget, header},
+    http::{self as wire_http, RequestTarget, Uncompared, header},
     records::{Enrollment, EnrollmentAnswer, IdentityDoc, Limits as AnnouncedLimits},
     sig::SignedDoc,
 };
@@ -11,7 +11,7 @@ use pubky_switch_core::{
 use super::{
     Answer, Service,
     rules::{Caller, decode_claim},
-    signed::{Asked, sign_answer},
+    signed::{AnswerTime, Asked, sign_answer},
     store_error,
     verdict::{self, RequestClass, Route, Verdict},
 };
@@ -80,7 +80,11 @@ impl Service {
         signature: Asked<'_>,
     ) -> SwitchResponse {
         let current = self.keys.current();
-        let refuse = |error: &ApiError| Self::signed_error(&current, signature, base_ms, error);
+        // No answer to an enrollment shows an account's state: each counts in no comparison
+        // of service times, and one given before the identity is looked up carries the time
+        // base (Switch wire 7.1 Timestamp).
+        let at_base = AnswerTime::TimeBase(base_ms, Uncompared::Enrollment);
+        let refuse = |error: &ApiError| Self::signed_error(&current, signature, at_base, error);
         let (enrollment, identity_text) = match self.check_enrollment(request, base_ms) {
             Ok(checked) => checked,
             Err(error) => return refuse(&error),
@@ -102,13 +106,19 @@ impl Service {
                     created,
                 );
                 match answer.to_json() {
-                    Ok(body) => sign_answer(&current, signature, time_ms, Answer::ok(body)),
+                    Ok(body) => sign_answer(
+                        &current,
+                        signature,
+                        AnswerTime::Account(time_ms),
+                        Answer::ok(body),
+                    ),
                     Err(_) => refuse(&ApiError::unavailable("7.6: a temporary failure")),
                 }
             }
             // At the last time the service committed for the identity, since the refusal
-            // commits nothing (Switch wire 7.1 Timestamp).
-            Err((error, time_ms)) => Self::signed_error(&current, signature, time_ms, &error),
+            // commits nothing, or the time base for an identity without an account (Switch
+            // wire 7.1 Timestamp).
+            Err((error, at)) => Self::signed_error(&current, signature, at, &error),
         }
     }
 
@@ -159,20 +169,21 @@ impl Service {
         enrollment: &Enrollment,
         identity_text: &str,
         base_ms: u64,
-    ) -> Result<Enrolled, (ApiError, u64)> {
+    ) -> Result<Enrolled, (ApiError, AnswerTime)> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let at_base = AnswerTime::TimeBase(base_ms, Uncompared::Enrollment);
         // An account that the first row of Table 1 erases again goes first, so the enrollment
         // makes a new account and answers nothing from the old one; a leftover mark goes too.
         let (found, judged) = self
             .judge_at_step_two(identity_text)
             .await
-            .map_err(|error| (error, base_ms))?;
+            .map_err(|error| (error, at_base))?;
         // The last time the service committed for the identity, or the time base where it
         // holds no account (Switch wire 7.1 Timestamp).
-        let committed_ms = found
+        let committed = found
             .as_ref()
-            .map_or(base_ms, |found| found.stamped_time_ms);
-        let at = |error: ApiError| (error, committed_ms);
+            .map_or(at_base, |found| AnswerTime::Account(found.stamped_time_ms));
+        let at = |error: ApiError| (error, committed);
         let enrollment_hash = enrollment
             .signed()
             .doc_hash()
@@ -201,7 +212,9 @@ impl Service {
         }
         self.enroll_at_account(enrollment, identity_text, enrollment_hash, base_ms)
             .await
-            .map_err(|(error, under_lock)| (error, under_lock.unwrap_or(committed_ms)))
+            .map_err(|(error, under_lock)| {
+                (error, under_lock.map_or(committed, AnswerTime::Account))
+            })
     }
 
     /// Create the identity's account (Switch wire 7.3, Table 3), all under the identity's

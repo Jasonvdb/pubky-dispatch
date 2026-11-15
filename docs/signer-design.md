@@ -160,7 +160,7 @@ Flow = Approve     { request_hash, cert, step }
      | Renew       { app, new_cert, reduction, rotates_epoch, step }
      | Revoke      { app, distrust_from, step }        // also completes a departure
      | Rotate      { epoch, step }                     // bare data-epoch rotation
-     | KeyChange   { pending_key, step }               // service key in place
+     | KeyChange   { service_key, step }               // service key in place
      | Move        { next, freeze, manifest, transfer, step }
      | Loss        { next, step }
      | Erase       { unpublished }                     // the Homeserver's files, then the switch

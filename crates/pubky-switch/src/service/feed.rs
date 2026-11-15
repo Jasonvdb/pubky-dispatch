@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use pubky_switch_core::{
     chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, SignedHead, ZERO_HASH},
+    http::Uncompared,
     ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
@@ -19,6 +20,7 @@ use super::{
     Answer, Service,
     batch::{Stop, VerifiedApp, check_own_app},
     marking::MarkMove,
+    signed::LaterTime,
     verdict::{self, RequestClass, Route},
 };
 use crate::{
@@ -139,9 +141,8 @@ pub(super) enum FeedStop {
         key: [u8; 32],
         /// The answer.
         error: Box<ApiError>,
-        /// The last time the read saw the service commit for the identity, where the answer
-        /// carries it; `None` for the time base.
-        committed_ms: Option<u64>,
+        /// The time it carries.
+        at: LaterTime,
     },
     /// An error answer.
     Refused(Box<PageRefusal>),
@@ -910,7 +911,7 @@ impl Service {
             return Err(FeedStop::Verdict {
                 key: super::PublicKeyBytes::public_key_bytes(&current),
                 error: Box::new(super::marking::not_hosted()),
-                committed_ms: None,
+                at: LaterTime::TimeBase(Uncompared::NotHosted),
             });
         }
         let signer = match routed.route {
@@ -921,14 +922,14 @@ impl Service {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(super::marking::not_hosted()),
-                    committed_ms: None,
+                    at: LaterTime::TimeBase(Uncompared::NotHosted),
                 });
             }
             Route::Notice(notice) => {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(self.notice(&read.account, notice)),
-                    committed_ms: None,
+                    at: LaterTime::TimeBase(Uncompared::Notice),
                 });
             }
             Route::Unavailable
@@ -943,7 +944,7 @@ impl Service {
                 return Err(FeedStop::Verdict {
                     key: routed.key,
                     error: Box::new(temporary()),
-                    committed_ms: Some(builder.time_ms.max(read.time_ms)),
+                    at: LaterTime::Committed(builder.time_ms.max(read.time_ms)),
                 });
             }
         };

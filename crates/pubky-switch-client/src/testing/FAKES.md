@@ -76,7 +76,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   judges the two before anything else, a stale timestamp and an own app's first-call `403`
   included: the notice, `503 recovery_required` with `current { generation, reason,
   permanent }`; the `404 not_found` with `current: { "hosted": false }`; and `503
-  unavailable` while the store can't be read; each with no head and the clock's time. The
+  unavailable` while the store can't be read; each with no head. The notice and the
+  not-hosted answer carry the clock's time; the unavailable answer carries the last
+  stamped time where the account is held, otherwise the clock's time (wire 7.1). The
   test controls: `restore_to` (the state behind the mark), `fork_mark`, `lose_mark`,
   `corrupt_mark`, `set_mark_store_unreadable`, `lose_account` (the mark without the account)
   and `retire`; `mark` and `erasure_record` read them. `roll_back_to` moves the mark back
@@ -439,14 +441,15 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   its answer with another key, such as a third key; **`Fault::ErrorSignedWith`** an
   error answer under another key, applying nothing.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` is `401
-  stale_timestamp` for a timestamp earlier than the creation time in the account's mark, or
-  the account's own where the mark is lost; then it checks the body's `identity_hash` names
-  the newest `identity.json` this switch holds, left out only where it holds none (`409
-  conflict` otherwise, whose `current.identity` is the copy held at an account that answers
-  the notice); the body's `service_key`, which the core's body still carries, isn't judged.
+  stale_timestamp` for a timestamp more than five minutes from the switch's time base;
+  then it checks the body's `created` names the account's creation time and
+  `identity_hash` names the newest `identity.json` this switch holds, left out only where
+  it holds none (`409 conflict` otherwise, carrying `current.created` and, at an account
+  that answers the notice, `current.identity`, the copy held).
   It refuses during a move (`409 conflict`): at a frozen account that doesn't fail stop,
   since this switch keeps no export to tell whether it was fetched, and at a staged one
-  holding an import (not one staged for a key change in place). It goes through at an
+  holding an import that can still be aborted (not one staged for a key change in place).
+  It goes through at an
   account that fails stop or is bounded, and at a lost identity whatever hash it names. An
   app's call is `403 permission_missing`. The erasure's record is written, the account and
   its mark go, all at once, and every call, the retry included, gets the `404` of an

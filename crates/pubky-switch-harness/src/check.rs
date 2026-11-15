@@ -86,8 +86,8 @@ fn start_of_a_sequence() -> BTreeMap<u64, Link> {
 /// An account the checker knows.
 struct Account {
     identity: [u8; 32],
-    /// How many service keys the run brought for the account so far.
-    brought: usize,
+    /// Keys in the order the run brought them, for stable names across generations.
+    keys: Vec<[u8; 32]>,
     /// The keys brought whose document no switch took yet, each with its number.
     named: Vec<(usize, [u8; 32])>,
     /// The generation whose document a switch took last, and the service key it names.
@@ -102,7 +102,7 @@ impl Account {
     fn new(identity: [u8; 32]) -> Self {
         Self {
             identity,
-            brought: 0,
+            keys: Vec::new(),
             named: Vec::new(),
             current: None,
             chain: start_of_a_sequence(),
@@ -115,25 +115,32 @@ impl Account {
         let held = self.current.is_some_and(|(_, current)| current == key)
             || self.named.iter().any(|(_, named)| *named == key);
         if !held {
-            self.brought = self.brought.saturating_add(1);
-            self.named.push((self.brought, key));
+            let number = match self.keys.iter().position(|known| *known == key) {
+                Some(index) => index + 1,
+                None => {
+                    self.keys.push(key);
+                    self.keys.len()
+                }
+            };
+            self.named.push((number, key));
         }
     }
 
-    /// The key `with` stands for, while the account holds it.
+    /// The key `with` verified with, even if another generation has since started.
     fn key_of(&self, with: SignedWith) -> Option<[u8; 32]> {
-        match with {
-            SignedWith::Generation(generation) => self
-                .current
-                .filter(|(current, _)| *current == generation)
-                .map(|(_, key)| key),
-            SignedWith::Brought(number) => self
-                .named
-                .iter()
-                .find(|(named, _)| *named == number)
-                .map(|(_, key)| *key),
-            SignedWith::SwitchKey => None,
-        }
+        let number = match with {
+            SignedWith::Generation(_, number) | SignedWith::Brought(number) => number,
+            SignedWith::SwitchKey => return None,
+        };
+        self.keys.get(number.checked_sub(1)?).copied()
+    }
+
+    fn key_number(&self, key: &[u8; 32]) -> Result<usize, String> {
+        self.keys
+            .iter()
+            .position(|known| known == key)
+            .map(|index| index + 1)
+            .ok_or_else(|| "the signing key has no name".to_owned())
     }
 
     /// A switch took `doc`: its generation's key is the one it names.
@@ -155,6 +162,7 @@ impl Account {
                 }
             }
             _ => {
+                self.bring(key);
                 self.current = Some((generation, key));
                 self.named.retain(|(_, named)| *named != key);
                 // A provider loss starts the sequence afresh (Switch wire 7.4.2); a rotation
@@ -188,8 +196,8 @@ impl std::fmt::Debug for Checker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedWith {
     /// The account's service key of this generation: the one the generation's
-    /// `identity.json` names, which a switch took.
-    Generation(u64),
+    /// `identity.json` names, which a switch took; and its stable key number.
+    Generation(u64, usize),
     /// A service key the run brought whose document no switch took yet: its number, from
     /// 1, in the order the run brought them for the account.
     Brought(usize),
@@ -200,13 +208,9 @@ pub enum SignedWith {
 impl std::fmt::Display for SignedWith {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SignedWith::Generation(generation) => {
-                write!(f, "the account's service key of generation {generation}")
+            SignedWith::Generation(_, number) | SignedWith::Brought(number) => {
+                write!(f, "service key number {number}")
             }
-            SignedWith::Brought(number) => write!(
-                f,
-                "the account's service key number {number}, its document not taken yet"
-            ),
             SignedWith::SwitchKey => write!(f, "the switch's key"),
         }
     }
@@ -374,12 +378,18 @@ impl Checker {
                     );
                 }
                 account.take(&doc)?;
-                return Ok(SignedWith::Generation(doc.generation()));
+                return Ok(SignedWith::Generation(
+                    doc.generation(),
+                    account.key_number(&doc.inbox().service_key)?,
+                ));
             }
             if let Some((generation, key)) = account.current
                 && verifies(&key)
             {
-                return Ok(SignedWith::Generation(generation));
+                return Ok(SignedWith::Generation(
+                    generation,
+                    account.key_number(&key)?,
+                ));
             }
             if let Some((number, _)) = account.named.iter().find(|(_, key)| verifies(key)) {
                 return Ok(SignedWith::Brought(*number));
@@ -526,7 +536,7 @@ impl Found<'_> {
                 "{at}: the head's signature doesn't verify with the key that signed the answer"
             ));
         }
-        if let Some(SignedWith::Generation(generation)) = self.signed
+        if let Some(SignedWith::Generation(generation, _)) = self.signed
             && head.generation != generation
         {
             self.violation(format!(
@@ -861,22 +871,46 @@ mod tests {
         assert_eq!(signs(&first), Ok(SignedWith::Brought(1)));
         assert_eq!(
             deliver(&checker, 1, &first, &first, None),
-            Ok(SignedWith::Generation(1))
+            Ok(SignedWith::Generation(1, 1))
         );
-        assert_eq!(signs(&first), Ok(SignedWith::Generation(1)));
+        assert_eq!(signs(&first), Ok(SignedWith::Generation(1, 1)));
         // The next generation's key, brought and not delivered: both sign for now.
         checker.account(&alice().id(), alice().public(), next.public());
         assert_eq!(signs(&next), Ok(SignedWith::Brought(2)));
-        assert_eq!(signs(&first), Ok(SignedWith::Generation(1)));
+        assert_eq!(signs(&first), Ok(SignedWith::Generation(1, 1)));
         assert_eq!(
             deliver(&checker, 2, &next, &next, Some(1)),
-            Ok(SignedWith::Generation(2))
+            Ok(SignedWith::Generation(2, 2))
         );
-        assert_eq!(signs(&next), Ok(SignedWith::Generation(2)));
+        assert_eq!(signs(&next), Ok(SignedWith::Generation(2, 2)));
         // The outgoing key is held no longer.
         assert!(signs(&first).is_err(), "the outgoing generation's key");
         // A switch's key, for no account the run knows, stays so.
         assert_eq!(signs(&key(42)), Ok(SignedWith::SwitchKey));
+    }
+
+    #[test]
+    fn test_signature_name_stays_the_same_across_recovery() {
+        let service = key(2);
+        let checker = checker(&service);
+        let get = request("GET", "apps", &json!(null));
+        let refused = answer(&get, &service, 403, &json!({ "code": "not_current" }));
+        let name = || {
+            let with = checker.signature(&get, &refused).unwrap();
+            with.to_string()
+        };
+        let enrolled = name();
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        assert_eq!(name(), enrolled);
+        deliver(&checker, 2, &service, &service, Some(1)).unwrap();
+        assert_eq!(name(), enrolled);
+        let next = key(3);
+        checker.account(&alice().id(), alice().public(), next.public());
+        deliver(&checker, 3, &next, &next, Some(2)).unwrap();
+        let with = checker
+            .signature(&get, &answer(&get, &next, 403, &json!({})))
+            .unwrap();
+        assert_ne!(with.to_string(), enrolled);
     }
 
     #[test]
@@ -889,7 +923,7 @@ mod tests {
         assert!(wrong.is_err_and(|error| error.contains("its document names")));
         assert_eq!(
             deliver(&checker, 1, &first, &first, None),
-            Ok(SignedWith::Generation(1))
+            Ok(SignedWith::Generation(1, 1))
         );
         // Another key for a generation whose document is taken.
         checker.account(&alice().id(), alice().public(), third.public());
@@ -898,7 +932,7 @@ mod tests {
         // A document of a generation before the account's.
         assert_eq!(
             deliver(&checker, 2, &next, &next, Some(1)),
-            Ok(SignedWith::Generation(2))
+            Ok(SignedWith::Generation(2, 2))
         );
         let earlier = deliver(&checker, 1, &next, &next, None);
         assert!(earlier.is_err_and(|error| error.contains("generation 1 was taken")));
@@ -906,7 +940,7 @@ mod tests {
         let put = request("PUT", "identity", &document(3, &third, Some(2)));
         assert_eq!(
             checker.signature(&put, &answer(&put, &next, 400, &json!({}))),
-            Ok(SignedWith::Generation(2))
+            Ok(SignedWith::Generation(2, 2))
         );
     }
 

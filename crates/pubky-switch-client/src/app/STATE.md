@@ -269,7 +269,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned
   `404` and no published `identity.json` at every try, counted at 5 tries at least 6 hours
-  apart by the app's clock, which `erasing` times. Any answer the account's key signs, or a
+  apart by the app's clock, which `erasing` times. Any answer the pinned service key signs, or a
   published `identity.json`, ends `erasing`. An erased account seen alive again, its
   `identity.json` published and listing the app, ends `gone`: its `push` setting is kept,
   no longer set, and the other devices' handles too; an app that isn't current drops both.

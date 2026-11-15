@@ -95,13 +95,17 @@ fn main() -> ExitCode {
 }
 
 fn retire_command(config: &Config, identity: &str, generation: u64) -> ExitCode {
+    use std::io::Write;
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("pubky-switch: retire: starting the runtime: {error}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "pubky-switch: retire: starting the runtime: {error}"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -114,7 +118,7 @@ fn retire_command(config: &Config, identity: &str, generation: u64) -> ExitCode 
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("pubky-switch: retire: {error}");
+            let _ = writeln!(std::io::stderr(), "pubky-switch: retire: {error}");
             ExitCode::FAILURE
         }
     }

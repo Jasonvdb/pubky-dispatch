@@ -525,7 +525,7 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     let refused = (
         Some("403".to_owned()),
         Some("text not_current".to_owned()),
-        Some("the account's service key of generation 1".to_owned()),
+        Some("service key number 1".to_owned()),
         Some("absent".to_owned()),
     );
     if held.as_ref() != Some(&refused) || world.held_reads() != 0 {

@@ -342,6 +342,22 @@ async fn test_enrollment_answer_signed_by_another_key_is_refused() {
 }
 
 #[tokio::test]
+async fn test_enrollment_unreadable_signed_header_fails_authentication() {
+    for pin in [None, Some(service_public())] {
+        for status in [200, 503] {
+            let transport = Arc::new(MockTransport::new());
+            transport.push_error(TransportError::UnreadableSignedHeader { status });
+            let client = client_with(signer(), pin, transport);
+            assert_eq!(
+                client.enroll(&enrollment([4; 16])).await.unwrap_err(),
+                ClientError::BadServiceSignature { status }
+            );
+            assert_eq!(client.pinned_key(), pin);
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_enrollment_answer_for_another_enrollment_is_refused() {
     let sent = enrollment([4; 16]);
     let other = enrollment([5; 16]);
@@ -1101,7 +1117,7 @@ fn delivery_switch(key: SigningKey) -> Arc<MockTransport> {
 }
 
 #[tokio::test]
-async fn test_put_identity_starting_a_generation_pins_the_pending_key() {
+async fn test_put_identity_starting_a_generation_pins_the_named_service_key() {
     let pending = SigningKey::from_bytes(&[6; 32]);
     let pending_public = pending.verifying_key().to_bytes();
     let transport = delivery_switch(pending);
@@ -1334,8 +1350,10 @@ async fn test_write_answer_proof_must_be_the_transition_written() {
 #[tokio::test]
 async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
     // Every answer checked with the pinned key counts in the comparison of service times,
-    // refusals without the head included, but the notice, the not-hosted `404` and an answer
-    // that verifies only with the empty body field (Switch wire 7.1 Timestamp, spec 10.1).
+    // refusals without the head included, but the notice, every `503 unavailable`, the
+    // not-hosted `404`, an answer that verifies only with the empty body field, and every
+    // answer to the enrollment, the erasure and the public read (Switch wire 7.1 Timestamp,
+    // spec 10.1).
     let error = |code: &str, current: Value| {
         let mut body = json!({ "code": code, "message": "m" });
         if !current.is_null() {
@@ -1359,7 +1377,9 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
         ),
         (403, error("not_current", Value::Null), true),
         (429, error("rate_limited", Value::Null), true),
-        (503, error("unavailable", Value::Null), true),
+        (503, error("staged", Value::Null), true),
+        (409, error("conflict", Value::Null), true),
+        (503, error("unavailable", Value::Null), false),
         (404, error("not_found", Value::Null), true),
         (404, error("not_found", json!({ "hosted": true })), true),
         (404, error("not_found", http::not_hosted_current()), false),
@@ -1407,6 +1427,52 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
         Err(ClientError::BodyUnread { status: 413, .. })
     ));
     assert_eq!(client.latest_compared_time(), None);
+    // Every answer to the public read, which binds no request, a success included; the
+    // same answer to a signed read counts.
+    let client = client_with(
+        app(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.public_identity().await;
+    assert_eq!(client.latest_compared_time(), None, "public read");
+    // Every answer to the erasure, a refusal and a success.
+    for (status, body) in [
+        (429, error("rate_limited", Value::Null)),
+        (409, error("conflict", json!({ "created": rfc3339(NOW) }))),
+        (200, json!({ "erased": true })),
+    ] {
+        let client = client_with(
+            signer(),
+            Some(service_public()),
+            fixed(service_key(), status, body.clone()),
+        );
+        let _ = client.erase(None, None).await;
+        assert_eq!(
+            client.latest_compared_time(),
+            None,
+            "erasure {status} {body}"
+        );
+    }
+    // The same refusal to a signed read counts.
+    let client = client_with(
+        signer(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.apps().await;
+    assert_eq!(client.latest_compared_time(), Some(NOW), "a signed read");
+    // An enrollment's answer: the latest call's times are forgotten, not kept from an
+    // earlier one.
+    let client = client_with(
+        signer(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.apps().await;
+    assert_eq!(client.latest_compared_time(), Some(NOW));
+    let _ = client.enroll(&enrollment([1; 16])).await;
+    assert_eq!(client.latest_compared_time(), None, "enrollment");
 }
 
 #[tokio::test]

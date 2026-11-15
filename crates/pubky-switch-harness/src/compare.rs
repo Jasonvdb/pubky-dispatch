@@ -438,7 +438,7 @@ mod tests {
                 &[("status", "400"), ("answer signed with", key)],
             )])
         };
-        let account = signed_with("the account's service key of generation 1");
+        let account = signed_with("service key number 1");
         let found = differences(&account, &signed_with("the switch's key"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].fact, "answer signed with");

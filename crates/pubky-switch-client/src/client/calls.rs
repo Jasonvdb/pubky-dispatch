@@ -166,6 +166,9 @@ impl SwitchClient {
     /// [`ClientError::Core`] for an answer that names another enrollment.
     pub async fn enroll(&self, enrollment: &Enrollment) -> Result<EnrollmentAnswer, ClientError> {
         self.signer_only()?;
+        // No answer to an enrollment counts in the comparison of service times, nor
+        // measures the clock (Switch wire 7.1 Timestamp).
+        self.forget_latest();
         if enrollment.body().identity != self.account() || enrollment.body().origin != self.origin()
         {
             return Err(ClientError::Usage(
@@ -181,7 +184,7 @@ impl SwitchClient {
         };
         let signed = self.build("POST", "/v1/enroll", body, Body::Json, auth)?;
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport().send(signed.request).await?;
+        let response = self.send_response(signed.request).await?;
         let status = response.status;
         if !(200..300).contains(&status) {
             // Errors are signed with the service key: a client that pinned it checks them,

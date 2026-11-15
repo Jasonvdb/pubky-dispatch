@@ -23,6 +23,32 @@ struct OrderedProtocol {
     held: AtomicBool,
     hold_receive: bool,
     deny_changes: AtomicUsize,
+    local_bytes: usize,
+}
+
+impl OrderedProtocol {
+    fn notice(&self, key: &[u8], value: u8) -> Vec<pubky_switch_client::app::LocalWrite> {
+        use pubky_switch_client::app::{
+            LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, local_writes_bytes,
+        };
+        if self.local_bytes == 0 {
+            return Vec::new();
+        }
+        let mut writes = vec![LocalWrite::Put {
+            key: key.to_vec(),
+            value: vec![value],
+        }];
+        let padding = b"padding".to_vec();
+        let bytes = self.local_bytes
+            - local_writes_bytes(&writes)
+            - 2 * (padding.len() + LOCAL_WRITE_OVERHEAD_BYTES);
+        writes.push(LocalWrite::Put {
+            key: padding.clone(),
+            value: vec![0; bytes],
+        });
+        writes.push(LocalWrite::Delete { key: padding });
+        writes
+    }
 }
 
 impl pubky_switch_client::app::Protocol for OrderedProtocol {
@@ -98,11 +124,19 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
 
     fn deny_list_changed(
         &self,
-        _: &pubky_switch_client::app::DenyListChange,
+        change: &pubky_switch_client::app::DenyListChange,
     ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
     {
         self.deny_changes.fetch_add(1, Ordering::Relaxed);
-        Ok(Vec::new())
+        Ok(self.notice(b"deny", u8::from(change.added)))
+    }
+
+    fn deny_list_gap(
+        &self,
+        _: &pubky_switch_client::app::DenyListGap,
+    ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+    {
+        Ok(self.notice(b"gap", 1))
     }
 }
 
@@ -349,12 +383,14 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
         held: AtomicBool::new(true),
         hold_receive: retry,
         deny_changes: AtomicUsize::new(0),
+        local_bytes: 0,
     });
     let chat = Arc::new(OrderedProtocol {
         inner: sample_protocol(CHAT),
         held: AtomicBool::new(false),
         hold_receive: retry,
         deny_changes: AtomicUsize::new(0),
+        local_bytes: 0,
     });
     let protocols = ProtocolSet::new(vec![tasks.clone(), chat.clone()])?;
     let mut wallet = Box::pin(joined_with_both(
@@ -448,6 +484,81 @@ mod tests {
     use super::*;
     use crate::{Backend, run_here};
 
+    async fn callback_batches(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let protocols: Vec<_> = [
+            TASKS, CHAT, "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+        ]
+        .into_iter()
+        .map(|name| {
+            Arc::new(OrderedProtocol {
+                inner: sample_protocol(name),
+                held: AtomicBool::new(false),
+                hold_receive: false,
+                deny_changes: AtomicUsize::new(0),
+                local_bytes: pubky_switch_client::app::MAX_STEP_LOCAL_BYTES,
+            })
+        })
+        .collect();
+        let set = ProtocolSet::new(
+            protocols
+                .iter()
+                .map(|p| p.clone() as Arc<dyn pubky_switch_client::app::Protocol>)
+                .collect(),
+        )?;
+        let mut wallet =
+            Box::pin(joined_with_both(world, &alice, &mut signer, "wallet", set)).await?;
+        let (tasks, chat) = both();
+        let mut manager = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut signer,
+            "manager",
+            set_of(&tasks, &chat)?,
+        ))
+        .await?;
+        manager.deny(&[83; 32]).await?;
+        wallet.receive(None).await?;
+        for protocol in protocols {
+            let name = pubky_switch_client::app::Protocol::name(protocol.as_ref());
+            for key in [b"gap".as_slice(), b"deny".as_slice()] {
+                if wallet.protocol_get(&name, key).await? != Some(vec![1]) {
+                    return Err("a valid callback did not commit its local writes".into());
+                }
+            }
+            if protocol.deny_changes.load(Ordering::Relaxed) != 1 {
+                return Err("a completed callback was handed again".into());
+            }
+        }
+        world.outcome(
+            "all valid callbacks completed",
+            &json!({"protocols": 9, "local_bytes": pubky_switch_client::app::MAX_STEP_LOCAL_BYTES}),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_callback_batches_run_on_the_calling_thread_at_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, callback_batches))
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(service) = Box::pin(run_here(Backend::Service, callback_batches))
+            .await
+            .unwrap()
+        else {
+            return;
+        };
+        let verdict = crate::compare::judge(
+            "protocol callback batches",
+            crate::compare::differences(&service, &scripted),
+            crate::allowed::ALLOWED,
+        );
+        assert!(verdict.agrees(), "{verdict}");
+    }
+
     async fn gap_replacement(world: &World) -> FlowResult {
         use pubky_switch_client::app::AppError;
         use pubky_switch_client::error::StoreError;
@@ -463,6 +574,7 @@ mod tests {
             held: AtomicBool::new(false),
             hold_receive: false,
             deny_changes: AtomicUsize::new(0),
+            local_bytes: 0,
         });
         let protocols = ProtocolSet::new(vec![tasks.clone(), sample_protocol(CHAT)])?;
         let store = Arc::new(FaultStore::new(Arc::new(MemoryStore::new()), Fault::None));

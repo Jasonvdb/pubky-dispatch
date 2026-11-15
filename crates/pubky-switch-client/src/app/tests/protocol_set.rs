@@ -2,6 +2,7 @@
 //! `chat`, each with its own kinds, scope root, local state, backup layer, owed calls and
 //! duty events.
 
+mod callback_batches;
 mod gap_completion;
 
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,12 @@ struct Named {
     gaps: Mutex<Vec<(u64, bool)>>,
     /// Whether each gap keeps its full baseline in protocol-local state.
     keep_gap: bool,
+    /// The byte count of each gap response, including temporary writes when nonzero.
+    gap_bytes: usize,
+    /// The byte count of each ordinary notice response, including temporary writes.
+    notice_bytes: usize,
+    /// The number of re-send callbacks taken.
+    resends: Mutex<usize>,
     /// How many of the next deny list gap calls fail.
     failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
@@ -79,6 +86,23 @@ fn count_down(counter: &Mutex<u32>) -> bool {
     let fails = *left > 0;
     *left = left.saturating_sub(1);
     fails
+}
+
+fn pad_local(mut writes: Vec<LocalWrite>, bytes: usize) -> Vec<LocalWrite> {
+    if bytes == 0 {
+        return writes;
+    }
+    let key = b"padding".to_vec();
+    let room = bytes
+        - crate::app::local_writes_bytes(&writes)
+        - 2 * (key.len() + crate::app::LOCAL_WRITE_OVERHEAD_BYTES);
+    writes.push(LocalWrite::Put {
+        key: key.clone(),
+        value: vec![0; room],
+    });
+    writes.push(LocalWrite::Delete { key });
+    assert_eq!(crate::app::local_writes_bytes(&writes), bytes);
+    writes
 }
 
 impl Protocol for Named {
@@ -156,7 +180,18 @@ impl Protocol for Named {
     }
 
     fn resend_needed(&self, _: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
-        Ok(Vec::new())
+        *self.resends.lock().unwrap() += 1;
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"resend".to_vec(),
+                    value: vec![1],
+                }]
+            },
+            self.notice_bytes,
+        ))
     }
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
@@ -170,10 +205,13 @@ impl Protocol for Named {
         } else {
             b"1".to_vec()
         };
-        Ok(vec![LocalWrite::Put {
-            key: format!("missed/{}", missed.seq).into_bytes(),
-            value,
-        }])
+        Ok(pad_local(
+            vec![LocalWrite::Put {
+                key: format!("missed/{}", missed.seq).into_bytes(),
+                value,
+            }],
+            self.notice_bytes,
+        ))
     }
 
     fn deny_list_changed(
@@ -184,7 +222,17 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.denies.lock().unwrap().push(change.pubky);
-        Ok(Vec::new())
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"deny".to_vec(),
+                    value: vec![u8::from(change.added)],
+                }]
+            },
+            self.notice_bytes,
+        ))
     }
 
     fn deny_list_gap(
@@ -195,14 +243,17 @@ impl Protocol for Named {
             return Err(StoreError::Unavailable.into());
         }
         self.gaps.lock().unwrap().push((gap.seq, gap.list_read));
-        Ok(if self.keep_gap {
-            vec![LocalWrite::Put {
-                key: b"gap".to_vec(),
-                value: serde_json::to_vec(&(gap.list_read, &gap.denied)).unwrap(),
-            }]
-        } else {
-            Vec::new()
-        })
+        Ok(pad_local(
+            if self.keep_gap {
+                vec![LocalWrite::Put {
+                    key: b"gap".to_vec(),
+                    value: serde_json::to_vec(&(gap.list_read, &gap.denied)).unwrap(),
+                }]
+            } else {
+                Vec::new()
+            },
+            self.gap_bytes,
+        ))
     }
 
     fn may_send(&self, message: &Message) -> bool {

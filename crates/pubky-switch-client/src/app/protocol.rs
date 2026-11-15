@@ -164,6 +164,10 @@ pub struct ReceivedMessage {
 ///   `k + v + 72`: at most 4 MiB. An applied effect's outcome
 ///   adds at most 7 cached record writes (each under 1.2 MiB with its proof and opened
 ///   value), under 13 MiB in all, below the 32 MiB batch size.
+/// - **Several protocols:** each callback commits separately with its remaining owners
+///   and progress. Valid responses do not have to fit together in one transaction. A
+///   shared deny barrier stays until every callback completes; an interrupted gap is
+///   told to all protocols again from one fresh list answer.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// The most bytes a [`Protocol::record_seen`] mark takes: 64 KiB, 85.6 KiB as stored in
@@ -873,16 +877,20 @@ pub trait Protocol: Send + Sync {
     /// whose writer the directory no longer lists, a join, a renewal that adds `lists.read`
     /// and every [`super::App::allow_list`]: whenever the app's copy of
     /// the lists is taken whole from a list read, every protocol is given that list as a
-    /// gap. It is told to every protocol in turn, and all their writes go in one commit:
-    /// when every protocol took it, that commit deletes the gap and marks the copy of the
+    /// gap. It is told to every protocol in turn, each response in a separate commit.
+    /// The gap stays owed to all until one complete pass takes the same answer. The
+    /// final callback's commit then deletes the gap and marks the copy of the
     /// lists unknown. The copy is then replaced from the same answer in a commit of its
     /// own, best effort. A failed replacement leaves the copy unknown after reload too;
     /// the next read owes a fresh gap, except while a whole copy that was too large waits
     /// for its retry time ([`super::App::allow_list`]). When one protocol fails,
-    /// the writes of those that took it are committed with the gap still owed to every
+    /// the writes of those that took it remain committed with the gap still owed to every
     /// protocol, so a later read tells it to each again, with the list the copy is then
     /// taken from, and the read holds meanwhile. A gap waits, and the read holds, while a
     /// call or a listing from at or before it is kept for a protocol.
+    /// A failed or uncertain commit interrupts the pass too: after reload every protocol
+    /// is told again from the list read for the next pass, including protocols whose
+    /// earlier writes committed. No partially completed pass establishes a baseline.
     ///
     /// A gap may be told again at the same position, each time with the full list, which
     /// sets the same state: every gap noted is told to every protocol, one that took an

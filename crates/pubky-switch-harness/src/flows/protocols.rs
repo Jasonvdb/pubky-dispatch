@@ -503,7 +503,6 @@ mod tests {
                             &format!("{name}.list"),
                             Policy::new(name, &[name]),
                         )],
-                        ..ProtocolSpec::default()
                     })) as Arc<dyn pubky_switch_client::app::Protocol>
                 })
                 .collect(),

@@ -263,6 +263,11 @@ mod tests {
                 "ReceivedHeaders",
                 "received_request(",
             ] {
+                // The one conversion of the header map, which the received request takes its
+                // headers from (`SignedHeaders`).
+                if needle == "ReceivedHeaders" && path.ends_with("http/mod.rs") {
+                    continue;
+                }
                 assert!(
                     !text.contains(needle),
                     "{} builds a received request outside signed.rs: {needle}",

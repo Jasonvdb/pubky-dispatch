@@ -296,14 +296,18 @@ async fn loopback_send(
     let request = signed(request(&origin, method, suffix, bytes));
     let expected = request.request.clone();
     let server_origin = origin.clone();
-    let server = tokio::spawn(async move {
+    let server = async move {
         let (socket, _) = listener.accept().await.unwrap();
         answer_socket(socket, server_origin, unread).await
-    });
+    };
     let transport =
         HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default()).unwrap();
-    let outcome = client(&origin, Arc::new(transport)).send(request).await;
-    let received = server.await.unwrap();
+    let client = client(&origin, Arc::new(transport));
+    let (outcome, received) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client.send(request), server)
+    })
+    .await
+    .expect("the loopback exchange finishes");
     assert_eq!(received.method, expected.method);
     assert_eq!(received.path_and_query, expected.path_and_query);
     assert_eq!(

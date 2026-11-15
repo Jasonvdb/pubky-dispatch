@@ -550,11 +550,14 @@ impl Service {
         if let Some(reason) = received.broken_header_rule()
             && request.route.call != Call::GetIdentity
         {
-            return self.service_error(
-                asked,
-                AnswerTime::Unbound(base_ms),
-                &ApiError::bad_request(reason),
-            );
+            // Enrollment and erasure exclude every answer from time comparison, even
+            // when the request breaks the header rule (Switch wire 7.1 Timestamp).
+            let at = match request.route.call {
+                Call::Enroll => AnswerTime::TimeBase(base_ms, Uncompared::Enrollment),
+                Call::Erase => AnswerTime::TimeBase(base_ms, Uncompared::Erasure),
+                _ => AnswerTime::Unbound(base_ms),
+            };
+            return self.service_error(asked, at, &ApiError::bad_request(reason));
         }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;

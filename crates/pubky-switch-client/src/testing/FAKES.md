@@ -449,9 +449,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   It refuses during a move (`409 conflict`): at a frozen account that doesn't fail stop,
   since this switch keeps no export to tell whether it was fetched, and at a staged one
   holding an import that can still be aborted (not one staged for a key change in place).
-  It goes through at an
-  account that fails stop or is bounded, and at a lost identity whatever hash it names. An
-  app's call is `403 permission_missing`. The erasure's record is written, the account and
+  At a failing or bounded staged account, an import still bars erasure when its mark is
+  missing or corrupt, or its generation is at or below the imported generation, even if
+  retired. A mark above that generation rules the abort out and permits erasure. Other
+  accounts that fail stop or are bounded permit erasure, as does a lost identity whatever
+  hash it names. An app's call is `403 permission_missing`. The erasure's record is written,
+  the account and
   its mark go, all at once, and every call, the retry included, gets the `404` of an
   identity the switch doesn't host, signed with the one key. `erased` tells a test it
   happened. App tests set `not_hosted_unpinned` to answer every call with that `404` under

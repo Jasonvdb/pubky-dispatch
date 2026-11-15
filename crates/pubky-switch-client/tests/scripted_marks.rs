@@ -544,27 +544,46 @@ async fn test_marks_enrollment_after_an_erasure_makes_a_new_account() {
 }
 
 #[tokio::test]
-async fn test_marks_failing_staged_import_can_be_erased() {
-    let alice = alice();
-    let staged = alice.switch().import_into([45; 32]);
-    let client = client_at(&alice, staged.transport(), alice.clock().now_ms());
-    client.pin(staged.service_key());
-    let created = staged.created();
-    let held = staged.identity_doc().unwrap();
-    let refused = client
-        .erase(Some(created), Some(held.hash()))
-        .await
-        .unwrap_err();
-    assert_eq!(code(&refused).1, ErrorCode::Conflict);
-    assert!(!staged.erased());
-    staged.lose_mark();
-    client
-        .erase(Some(created), Some(held.hash()))
-        .await
-        .unwrap();
-    assert!(staged.erased());
-    assert_eq!(staged.mark(), None);
-    assert!(staged.erasure_record().is_some());
+async fn test_marks_staged_import_refuses_erasure_while_abort_is_allowed() {
+    for change in [
+        ScriptedSwitch::lose_mark,
+        ScriptedSwitch::corrupt_mark,
+        ScriptedSwitch::fork_mark,
+        |switch: &ScriptedSwitch| switch.retire(1),
+    ] {
+        let alice = alice();
+        let staged = alice.switch().import_into([45; 32]);
+        let client = client_at(&alice, staged.transport(), alice.clock().now_ms());
+        client.pin(staged.service_key());
+        let created = staged.created();
+        let held = staged.identity_doc().unwrap();
+        for failed in [false, true] {
+            if failed {
+                change(&staged);
+            }
+            let mark = staged.mark();
+            let refused = client
+                .erase(Some(created), Some(held.hash()))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&refused).1, ErrorCode::Conflict);
+            assert_eq!(code(&refused).2, checked(created, None));
+            assert!(!staged.erased());
+            assert_eq!(staged.identity_doc().unwrap().hash(), held.hash());
+            assert_eq!(staged.mark(), mark);
+            assert_eq!(staged.erasure_record(), None);
+            staged.set_mark_store_unreadable(true);
+            let unavailable = client
+                .erase(Some(created), Some(held.hash()))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&unavailable).1, ErrorCode::Unavailable);
+            assert!(!staged.erased());
+            assert_eq!(staged.mark(), mark);
+            assert_eq!(staged.erasure_record(), None);
+            staged.set_mark_store_unreadable(false);
+        }
+    }
 }
 
 /// A transport that changes each request before the switch at `target` answers it, so

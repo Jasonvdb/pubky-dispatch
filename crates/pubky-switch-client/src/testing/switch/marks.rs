@@ -331,6 +331,22 @@ impl Inner {
         Some(self.respond_signed(&self.service, request, status, &body, at, None))
     }
 
+    /// A staged import bars erasure while its abort can go through (Switch wire 7.3,
+    /// Table 2). At a failing or bounded account only a mark above the generation imported
+    /// by `continue_into` rules the abort out; a lost mark always allows it.
+    pub(super) fn import_bars_erasure(&self) -> bool {
+        if !self.staged || !self.holds_import {
+            return false;
+        }
+        match self.judge() {
+            Verdict::Bounded(_) | Verdict::Failing(_) => self.marks.mark().is_none_or(|mark| {
+                self.continued_from
+                    .is_some_and(|generation| mark.generation <= generation)
+            }),
+            _ => true,
+        }
+    }
+
     /// `POST /erase` at a lost identity (Switch wire 7.4.16, 7.3 Tables 2 and 3): it goes
     /// through whatever `identity_hash` it names when it names the mark's creation time
     /// ([`Inner::erasure_binding`]); the record is written, then the mark deleted.

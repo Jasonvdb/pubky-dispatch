@@ -251,6 +251,59 @@ async fn test_response_binding_empty_or_unreadable_signed_header_is_refused() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// Enrollment and erasure exclude every answer from service-time comparison, including
+/// refusals before the account lookup (Switch wire 7.1 Timestamp).
+async fn malformed_headers_at(path: &str) {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let honest = signer_request("POST", path, b"{}".to_vec(), ms(&revoke_time()));
+    let sent = Sent::of(&honest);
+    let before = head_now(&replay).await;
+    for name in pubky_switch_core::http::RECEIVED_HEADERS {
+        for values in [
+            vec![
+                HeaderValue::from_static("one"),
+                HeaderValue::from_static("two"),
+            ],
+            vec![HeaderValue::from_static("")],
+            vec![HeaderValue::from_bytes(b"\xff").expect("value")],
+            vec![HeaderValue::from_static("a\tb")],
+        ] {
+            let mut malformed = copy_of(&honest);
+            malformed.headers.remove(name);
+            for value in values {
+                malformed
+                    .headers
+                    .append(HeaderName::from_static(name), value);
+            }
+            let received = Sent::of(&malformed);
+            let answer = replay.service.handle(malformed).await;
+            assert_eq!(code_of(&answer), (400, json!("bad_request")), "{name}");
+            assert!(header_text(&answer, header::HEAD).is_none(), "{name}");
+            assert!(
+                signed_with(&answer, &service_public(&replay), &received),
+                "{name}"
+            );
+            assert!(
+                !signed_with(&answer, &service_public(&replay), &sent),
+                "{name}"
+            );
+            assert_eq!(head_now(&replay).await, before, "{name}");
+        }
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_response_binding_enrollment_malformed_headers_are_refused() {
+    malformed_headers_at("/v1/enroll").await;
+}
+
+#[tokio::test]
+async fn test_response_binding_erasure_malformed_headers_are_refused() {
+    malformed_headers_at(&format!("/v1/{}/erase", alice_id())).await;
+}
+
 #[tokio::test]
 async fn test_response_binding_lower_case_method_is_an_unknown_route() {
     let Some(replay) = replay().await else { return };

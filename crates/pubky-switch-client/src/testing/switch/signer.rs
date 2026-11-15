@@ -710,7 +710,7 @@ impl Inner {
             return refusal;
         }
         let fails_stop = self.notice().is_some();
-        if !fails_stop && (self.frozen.is_some() || (self.staged && self.holds_import)) {
+        if (self.frozen.is_some() && !fails_stop) || self.import_bars_erasure() {
             return bad(
                 ErrorCode::Conflict,
                 "a move is in progress",
@@ -869,6 +869,94 @@ fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHand
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scripted_staged_import_erasure_follows_abort_eligibility() {
+        use super::super::marks::MarkSlot;
+        use crate::testing::{ProtocolSpec, Seeds, TestHomeserver, TestIdentity, TestSigner};
+
+        // Both staged rows of Table 1, with and without a retirement: a missing mark
+        // permits abort, as does a mark at or below the enrollment's generation.
+        // Only a higher mark rules abort out (Switch wire 7.3, Table 2).
+        for holds_chain in [false, true] {
+            for retired in [false, true] {
+                for mark_generation in [None, Some(0), Some(1), Some(2)] {
+                    let alice = TestSigner::new(
+                        TestIdentity::new(&Seeds::default(), "alice"),
+                        Arc::new(TestClock::new(crate::testing::START_MS)),
+                        Arc::new(TestHomeserver::new()),
+                        ProtocolSpec::default(),
+                    );
+                    alice.next_doc(|_| {}).unwrap();
+                    let target = alice.switch().import_into([45; 32]);
+                    let mut inner = target.lock();
+                    let held = inner.doc.as_ref().unwrap().hash();
+                    let created = inner.creation_time();
+                    if !holds_chain {
+                        inner.seq = 0;
+                    }
+                    let MarkSlot::At(mut mark) = inner.marks.slot else {
+                        panic!("the activated import has a mark");
+                    };
+                    if let Some(generation) = mark_generation {
+                        mark.generation = generation;
+                        if generation == 0 {
+                            mark.seq = 0;
+                            mark.chain_hash = pubky_switch_core::chain::ZERO_HASH;
+                        }
+                        inner.marks.slot = MarkSlot::At(mark);
+                    } else {
+                        inner.marks.slot = MarkSlot::Missing;
+                    }
+                    if retired {
+                        inner
+                            .marks
+                            .retired
+                            .insert(mark_generation.unwrap_or(1).max(1));
+                    }
+                    let before = inner.marks.slot;
+                    let request = crate::transport::Request {
+                        method: "POST".into(),
+                        origin: SWITCH_ORIGIN.into(),
+                        path_and_query: format!(
+                            "/v1/{}/erase",
+                            pubky_switch_core::enc::pubky_id(&inner.identity.public())
+                        ),
+                        headers: Vec::new(),
+                        body: json!({ "created": pubky_switch_core::time::rfc3339(created),
+                                      "identity_hash": b64(&held) })
+                        .to_string()
+                        .into_bytes(),
+                        timeout: crate::transport::TimeoutClass::default(),
+                    };
+                    let (status, body) = inner.erase_answer(&request);
+                    if mark_generation == Some(2) {
+                        assert_eq!(
+                            status, 200,
+                            "{holds_chain} {retired} {mark_generation:?}: {body}"
+                        );
+                        assert!(!inner.hosts());
+                        assert_eq!(inner.marks.slot, MarkSlot::Missing);
+                        assert!(inner.marks.erasure_at_ms.is_some());
+                    } else {
+                        assert_eq!(
+                            status, 409,
+                            "{holds_chain} {retired} {mark_generation:?}: {body}"
+                        );
+                        assert_eq!(body["code"], "conflict");
+                        assert_eq!(
+                            body["current"]["created"],
+                            pubky_switch_core::time::rfc3339(created)
+                        );
+                        assert!(inner.hosts());
+                        assert_eq!(inner.doc.as_ref().unwrap().hash(), held);
+                        assert_eq!(inner.marks.slot, before);
+                        assert_eq!(inner.marks.erasure_at_ms, None);
+                    }
+                }
+            }
+        }
+    }
 
     /// The scripted switch's answer to an enrollment of `identity`'s with `nonce`.
     fn enroll_at(

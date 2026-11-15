@@ -110,8 +110,8 @@ pub(super) enum AnswerTime {
     /// The time base, on an answer of the class named, which counts in no comparison.
     TimeBase(u64, Uncompared),
     /// The time base, on an answer that binds a request as it arrived when no client sends
-    /// such a request: an unknown route's `404` and the `400` of the header rule (7.1 "Each
-    /// header once, as text").
+    /// such a request: an unknown route's `404` and the `400` of the header rule outside
+    /// enrollment and erasure (7.1 "Each header once, as text", Timestamp).
     Unbound(u64),
 }
 
@@ -439,8 +439,8 @@ mod tests {
             }
             unbound += text.matches("AnswerTime::Unbound(").count();
         }
-        // The header rule's `400`, the unknown route's `404` routed by the service and by the
-        // transport.
+        // The header rule's `400` outside enrollment and erasure, the unknown route's
+        // `404` routed by the service and by the transport.
         assert_eq!(
             unbound, 3,
             "the answers that bind a request no client sends"

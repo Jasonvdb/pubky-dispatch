@@ -331,7 +331,7 @@ pub(crate) struct Inner {
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
     /// A staged account holding a cooperative move's import, not a key change in place: it
-    /// refuses an erasure until the move is aborted (Switch wire 7.4.16).
+    /// refuses an erasure while the move can be aborted (Switch wire 7.3, 7.4.16).
     pub(crate) holds_import: bool,
     /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
     pub(crate) recovery_declared_at: Option<u64>,

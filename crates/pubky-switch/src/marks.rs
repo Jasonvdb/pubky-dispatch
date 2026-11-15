@@ -1248,6 +1248,8 @@ impl Inner {
 pub struct MarkView {
     accounts: PathBuf,
     store_id: String,
+    /// Retirement is one-way within this store, including records observed after open.
+    retired: Mutex<HashMap<String, BTreeSet<u64>>>,
 }
 
 impl MarkView {
@@ -1259,9 +1261,13 @@ impl MarkView {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, MarkStoreError> {
         let accounts = root.as_ref().join("accounts");
         let store_id = read_store_id(&accounts)?;
-        read_retired(&accounts.join("retired"))?;
+        let retired = read_retired(&accounts.join("retired"))?;
         read_erasures(&accounts.join("erasures"))?;
-        Ok(Self { accounts, store_id })
+        Ok(Self {
+            accounts,
+            store_id,
+            retired: Mutex::new(retired),
+        })
     }
 
     /// The current erasure record for `identity`.
@@ -1272,7 +1278,9 @@ impl MarkView {
     pub fn erasure(&self, identity: &str) -> Result<Option<u64>, MarkStoreError> {
         let identity = valid_identity(identity)?;
         self.confirm_store()?;
-        read_erasure_file(&self.accounts.join("erasures").join(identity))
+        Ok(read_erasures(&self.accounts.join("erasures"))?
+            .get(&identity)
+            .copied())
     }
 
     fn confirm_store(&self) -> Result<(), MarkStoreError> {
@@ -1308,10 +1316,23 @@ impl MarkView {
     pub fn retired(&self, identity: &str) -> Result<Vec<u64>, MarkStoreError> {
         let identity = valid_identity(identity)?;
         self.confirm_store()?;
-        Ok(read_retired(&self.accounts.join("retired"))?
+        let mut observed = self.retired.lock();
+        let current = read_retired(&self.accounts.join("retired"))?;
+        if observed.iter().any(|(id, generations)| {
+            current
+                .get(id)
+                .is_none_or(|held| !generations.is_subset(held))
+        }) {
+            return Err(MarkStoreError::StoreUnreadable(
+                "an observed retirement disappeared".into(),
+            ));
+        }
+        let generations = current
             .get(&identity)
             .map(|generations| generations.iter().copied().collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        *observed = current;
+        Ok(generations)
     }
 
     /// Every identity with a mark file now, ascending.
@@ -3026,6 +3047,10 @@ mod tests {
         fs::write(dir.path().join("accounts/erasures/alice"), b"invalid").expect("corrupt");
         fs::write(dir.path().join("accounts/retired/alice.1"), b"invalid").expect("corrupt");
         assert!(view.erasure(ALICE).is_err());
+        assert!(
+            view.erasure(BOB).is_err(),
+            "an unreadable ledger is not an absent record"
+        );
         assert!(view.retired(ALICE).is_err());
     }
     #[tokio::test]
@@ -3075,5 +3100,31 @@ mod tests {
                 );
             }
         }
+    }
+    async fn view_loses_retirement(recorded_before_open: bool) {
+        let (dir, store) = open();
+        if recorded_before_open {
+            store.retire(ALICE, 1).await.expect("retire");
+        }
+        let view = MarkView::open(dir.path()).expect("view");
+        if !recorded_before_open {
+            store.retire(ALICE, 1).await.expect("retire");
+        }
+        assert_eq!(view.retired(ALICE).expect("observed"), vec![1]);
+        fs::remove_file(dir.path().join("accounts/retired/alice.1")).expect("lost retirement");
+        assert!(
+            view.retired(ALICE).is_err(),
+            "an observed retirement cannot disappear within this store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_view_remembers_initial_retirements() {
+        view_loses_retirement(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_marks_view_remembers_newly_read_retirements() {
+        view_loses_retirement(false).await;
     }
 }

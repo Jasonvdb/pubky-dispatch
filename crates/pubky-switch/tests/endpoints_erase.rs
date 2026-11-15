@@ -1393,6 +1393,7 @@ fn durable_record(replay: &Replay) -> Option<u64> {
     pubky_switch::marks::MarkView::open(replay.key_dir())
         .expect("mark store view")
         .erasure(&alice_id())
+        .expect("read erasure record")
 }
 
 #[tokio::test]

@@ -1667,6 +1667,116 @@ async fn test_body_over_its_cap_is_never_sent() {
     assert!(transport.last_request().is_none(), "nothing was sent");
 }
 
+fn raw_request(method: &str, path: &str, bytes: usize) -> SignedRequest {
+    sign_raw_request(Request {
+        method: method.into(),
+        origin: ORIGIN.into(),
+        path_and_query: path.into(),
+        headers: Vec::new(),
+        body: vec![0; bytes],
+        timeout: TimeoutClass::Ordinary,
+    })
+}
+
+fn sign_raw_request(mut request: Request) -> SignedRequest {
+    let headers = RequestHeaders {
+        timestamp: rfc3339(NOW),
+        identity: identity().id(),
+        ..RequestHeaders::default()
+    };
+    let target = RequestTarget {
+        method: &request.method,
+        origin: &request.origin,
+        path_and_query: &request.path_and_query,
+        body: &request.body,
+    };
+    let signature = http::sign_request(&identity(), &target, &headers);
+    http::verify_request(&identity().public(), &target, &headers, &signature).unwrap();
+    request.headers = vec![
+        Header::new(header::IDENTITY, &headers.identity),
+        Header::new(header::TIMESTAMP, &headers.timestamp),
+        Header::new(header::SIGNATURE, &b64(&signature)),
+    ];
+    SignedRequest {
+        request,
+        signature: Some(signature),
+    }
+}
+
+#[tokio::test]
+async fn test_raw_send_over_cap_is_never_sent() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(signer(), Some(service_public()), transport.clone());
+    let inbox = format!("/v1/{}/inbox", identity().id());
+    let public = format!("/v1/{}/identity", identity().id());
+    let mut results = Vec::new();
+    for (method, path, cap) in [
+        ("POST", inbox.as_str(), 65_536),
+        ("POST", "/v1/enroll", 256 << 10),
+        ("GET", public.as_str(), 0),
+    ] {
+        let request = raw_request(method, path, cap + 1);
+        results.push((client.send(request).await, cap));
+    }
+    assert!(transport.last_request().is_none(), "nothing was sent");
+    for (result, cap) in results {
+        assert_eq!(result.unwrap_err(), ClientError::BodyOverCap { cap });
+    }
+}
+
+#[tokio::test]
+async fn test_raw_send_mutated_request_uses_current_cap() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(signer(), Some(service_public()), transport.clone());
+    let inbox = format!("/v1/{}/inbox", identity().id());
+    let ops = format!("/v1/{}/ops", identity().id());
+    let public = format!("/v1/{}/identity", identity().id());
+    let mut body = client
+        .sign_request("POST", &inbox, vec![0; 65_536], None)
+        .unwrap()
+        .request;
+    body.body.push(0);
+    let mut route = client
+        .sign_request("POST", &ops, vec![0; 65_537], None)
+        .unwrap()
+        .request;
+    route.path_and_query = inbox;
+    let mut method = client
+        .sign_request("PUT", &public, vec![0; 1], None)
+        .unwrap()
+        .request;
+    method.method = "GET".into();
+    let mut results = Vec::new();
+    for (request, cap) in [(body, 65_536), (route, 65_536), (method, 0)] {
+        // The final bytes are signed again: rejection cannot depend on a stale signature.
+        results.push((client.send(sign_raw_request(request)).await, cap));
+    }
+    assert!(transport.last_request().is_none(), "nothing was sent");
+    for (result, cap) in results {
+        assert_eq!(result.unwrap_err(), ClientError::BodyOverCap { cap });
+    }
+}
+
+#[tokio::test]
+async fn test_raw_send_at_cap_reaches_transport() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(signer(), Some(service_public()), transport.clone());
+    let inbox = format!("/v1/{}/inbox", identity().id());
+    let public = format!("/v1/{}/identity", identity().id());
+    for (method, path, cap) in [
+        ("POST", inbox.as_str(), 65_536),
+        ("POST", "/v1/enroll", 256 << 10),
+        ("GET", public.as_str(), 0),
+    ] {
+        let signed = raw_request(method, path, cap);
+        let request = signed.request.clone();
+        let response = client.send(signed).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{}");
+        assert_eq!(transport.last_request(), Some(request));
+    }
+}
+
 #[test]
 fn test_response_malformed_time_preserves_binding_rejections() {
     let key = service_key();

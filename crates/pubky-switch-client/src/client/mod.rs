@@ -703,14 +703,7 @@ impl SwitchClient {
         auth: Auth<'_>,
     ) -> Result<SignedRequest, ClientError> {
         let method = method.to_ascii_uppercase();
-        // A body over its call's cap is never sent: the service answers it before reading the
-        // body, an answer final for nothing, while the same bytes are over the cap every time
-        // (Switch wire 7.1 Body caps).
-        if let Some(cap) = http::body_cap(&method, path_and_query)
-            && body.len() > cap
-        {
-            return Err(ClientError::BodyOverCap { cap });
-        }
+        check_body_cap(&method, path_and_query, &body)?;
         let mut headers = Vec::new();
         match content {
             Body::Empty => {}
@@ -841,6 +834,7 @@ impl SwitchClient {
 
     /// Receive an answer without losing a protected header (Switch wire 7.1).
     async fn send_response(&self, request: Request) -> Result<Response, ClientError> {
+        check_body_cap(&request.method, &request.path_and_query, &request.body)?;
         self.transport
             .send(request)
             .await
@@ -918,7 +912,8 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Unpinned`] without a pinned key, before anything is sent; otherwise as
+    /// [`ClientError::Unpinned`] without a pinned key, or [`ClientError::BodyOverCap`] if
+    /// the final request exceeds its call's cap, before anything is sent; otherwise as
     /// [`check_response`].
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
@@ -941,6 +936,18 @@ impl SwitchClient {
             ))
         }
     }
+}
+
+/// Refuse oversized bytes locally: the service's before-body refusal is final for nothing
+/// (Switch wire 7.1 Body caps). Check both before signing and before transport, since a
+/// public signed request can be assembled or changed by its caller.
+fn check_body_cap(method: &str, path: &str, body: &[u8]) -> Result<(), ClientError> {
+    if let Some(cap) = http::body_cap(method, path)
+        && body.len() > cap
+    {
+        return Err(ClientError::BodyOverCap { cap });
+    }
+    Ok(())
 }
 
 fn push_request_headers(headers: &mut Vec<Header>, request: &RequestHeaders) {

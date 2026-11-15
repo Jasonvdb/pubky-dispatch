@@ -1741,3 +1741,46 @@ async fn test_parked_completion_keeps_release_ended_and_existing_duties() {
         "retired release keeps its durable completion notice"
     );
 }
+
+#[tokio::test]
+async fn test_parked_completion_keeps_an_independently_uncertain_copy() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, mut message) = w.note(app.app_id(), "uncertain");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let original = restored.parked_entries().await.unwrap().pop().unwrap();
+    assert_eq!(original.reason, ParkReason::Uncertain);
+    w.clock.advance_ms(super::super::PROCESSED_RETENTION_MS + 1);
+    restored.receive(None).await.unwrap();
+    assert!(!processed(&restored, &message).await);
+    // A newly signed copy after pair retention is judged by the protocol's own state.
+    message.created_at_ms = w.clock.now_ms();
+    message
+        .body
+        .insert("text".into(), Value::from("a new copy"));
+    protocol.set(Mode::Local);
+    resend(&w, &restored, &message);
+    restored.receive(None).await.unwrap();
+    assert!(
+        processed(&restored, &message).await,
+        "the eligible new copy completed"
+    );
+    let kept = listed(&mut restored, original.stored_id).await;
+    assert_eq!(
+        kept,
+        Some(original),
+        "completion cannot resolve an independently uncertain effect"
+    );
+}

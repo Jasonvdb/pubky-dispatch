@@ -867,6 +867,16 @@ impl Service {
             Err(FeedStop::Verdict { key, error, at }) => {
                 return self.keyed_error(&key, asked, at.at(|| self.time.read().base_ms), &error);
             }
+            // No state is signed for a headless refusal. It can describe the new
+            // generation a held read woke to (Switch wire 7.4.4 "Long-poll").
+            Err(FeedStop::Refused(refusal)) if refusal.snapshot.is_none() && !refusal.head => {
+                return self.keyed_error(
+                    &read.key,
+                    asked,
+                    AnswerTime::Account(refusal.time_ms),
+                    &refusal.error,
+                );
+            }
             Err(FeedStop::Refused(refusal)) => Err(refusal),
             Ok(page) => Ok(page),
         };
@@ -874,10 +884,8 @@ impl Service {
         let mut txn = match self.store.begin(&read.account.id).await {
             Ok(Some(txn)) => txn,
             Ok(None) | Err(_) => {
-                return failed(AnswerTime::TimeBase(
-                    self.time.read().base_ms,
-                    Uncompared::Unavailable,
-                ));
+                let base_ms = self.time.read().base_ms;
+                return failed(AnswerTime::TimeBase(base_ms, Uncompared::Unavailable));
             }
         };
         let at = AnswerTime::Account(txn.head().stamped_time_ms);

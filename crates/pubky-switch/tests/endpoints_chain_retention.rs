@@ -1149,3 +1149,239 @@ async fn test_retention_a_page_with_no_items_carries_the_checkpoint() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A key store that observes head signatures made after its instance lock expired.
+struct ObservedKeys {
+    keys: std::sync::Arc<pubky_switch::keys::FileKeyStore>,
+    freshness: pubky_switch::store::LockFreshness,
+    stale_signatures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wait_after_proof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ObservedKeys {
+    fn observe(
+        &self,
+        signer: pubky_switch::keys::ServiceSigner,
+    ) -> pubky_switch::keys::ServiceSigner {
+        pubky_switch::keys::ServiceSigner::new(std::sync::Arc::new(ObservedSigner {
+            signer,
+            freshness: self.freshness.clone(),
+            stale_signatures: self.stale_signatures.clone(),
+            wait_after_proof: self.wait_after_proof.clone(),
+        }))
+    }
+}
+
+struct ObservedSigner {
+    signer: pubky_switch::keys::ServiceSigner,
+    freshness: pubky_switch::store::LockFreshness,
+    stale_signatures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wait_after_proof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl pubky_switch_core::signing::Signs for ObservedSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.signer.public_key()
+    }
+    fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
+        use pubky_switch_core::labels::sig::{HEAD, PROOF, SERVICE_OP};
+        if matches!(label, HEAD | PROOF | SERVICE_OP) && !self.freshness.is_fresh() {
+            self.stale_signatures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let signed = self.signer.sign_fields(label, fields);
+        if label == PROOF
+            && self
+                .wait_after_proof
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            while self.freshness.is_fresh() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        signed
+    }
+}
+
+impl pubky_switch::keys::KeyStore for ObservedKeys {
+    fn current(&self) -> pubky_switch::keys::ServiceSigner {
+        self.observe(self.keys.current())
+    }
+    fn signer_for(&self, public: &[u8; 32]) -> Option<pubky_switch::keys::ServiceSigner> {
+        self.keys
+            .signer_for(public)
+            .map(|signer| self.observe(signer))
+    }
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.keys.generate_as(id)
+    }
+    fn public_key<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
+        self.keys.public_key(id)
+    }
+    fn signer<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
+        self.keys.signer(id)
+    }
+    fn delete<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.keys.delete(id)
+    }
+}
+
+async fn expires_during_retention(revoke: bool) {
+    use pubky_switch::{
+        service::Service,
+        store::{LockFreshness, LockTiming},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    chain(&replay, 10, 6, AT).await;
+    cursors(&replay, ALL, head_seq(&replay).await).await;
+    let before = (retained(&replay).await, kept(&replay).await);
+    let freshness = LockFreshness::confirmed_ago(
+        Duration::ZERO,
+        LockTiming::checking_every(Duration::from_millis(250)),
+    );
+    let stale_signatures = Arc::new(AtomicUsize::new(0));
+    let keys = Arc::new(ObservedKeys {
+        keys: replay.keys.clone(),
+        freshness: freshness.clone(),
+        stale_signatures: stale_signatures.clone(),
+        wait_after_proof: Arc::default(),
+    });
+    let service = Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        keys,
+        replay.marks.clone(),
+        replay.time.clone(),
+        small(),
+    )
+    .with_lock_freshness(freshness.clone());
+    let pause = service.pause_next_checkpoint_sign();
+    let (method, path) = if revoke {
+        let keys = vectors("keys.json");
+        let wallet = app(&keys, "wallet")["app_id"].as_str().expect("app");
+        ("POST", format!("/v1/{}/apps/{wallet}/revoke", alice_id()))
+    } else {
+        ("GET", format!("/v1/{}/apps", alice_id()))
+    };
+    let (answer, ()) = tokio::join!(
+        service.handle(signer_request(method, &path, Vec::new(), ms(AT))),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), pause.reached())
+                .await
+                .expect("checkpoint turn");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while freshness.is_fresh() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("lock expired");
+            pause.release();
+        }
+    );
+    let after = (retained(&replay).await, kept(&replay).await);
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(answer.status, 503);
+    assert_eq!(before, after);
+    assert_eq!(
+        stale_signatures.load(Ordering::SeqCst),
+        0,
+        "no new state signature after expiry"
+    );
+}
+
+#[tokio::test]
+async fn test_retention_checks_lock_freshness_after_its_storage_reads() {
+    expires_during_retention(false).await;
+}
+
+#[tokio::test]
+async fn test_transition_checks_lock_freshness_after_retention() {
+    expires_during_retention(true).await;
+}
+
+#[tokio::test]
+async fn test_transition_proofs_check_lock_freshness_between_operations() {
+    use pubky_switch::{
+        service::Service,
+        store::{LockFreshness, LockTiming},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    let Some(replay) = registered(small(), false).await else {
+        return;
+    };
+    let before = (head_seq(&replay).await, kept(&replay).await);
+    let freshness = LockFreshness::confirmed_ago(
+        Duration::ZERO,
+        LockTiming::checking_every(Duration::from_millis(250)),
+    );
+    let stale_signatures = Arc::new(AtomicUsize::new(0));
+    let wait_after_proof = Arc::new(AtomicBool::new(true));
+    let keys = Arc::new(ObservedKeys {
+        keys: replay.keys.clone(),
+        freshness: freshness.clone(),
+        stale_signatures: stale_signatures.clone(),
+        wait_after_proof: wait_after_proof.clone(),
+    });
+    let service = Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        keys,
+        replay.marks.clone(),
+        replay.time.clone(),
+        small(),
+    )
+    .with_lock_freshness(freshness);
+    let path = format!("/v1/{}/ops", alice_id());
+    let keys = vectors("keys.json");
+    let body = OpsRequest::new(&batch(91, &[91, 92]), None).to_json();
+    let answer = service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &path,
+            body,
+            ms(AT),
+        ))
+        .await;
+    let after = (head_seq(&replay).await, kept(&replay).await);
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(answer.status, 503);
+    assert!(
+        !wait_after_proof.load(Ordering::SeqCst),
+        "the first proof was signed"
+    );
+    assert_eq!(before, after);
+    assert_eq!(
+        stale_signatures.load(Ordering::SeqCst),
+        0,
+        "no new proof signature after expiry"
+    );
+}

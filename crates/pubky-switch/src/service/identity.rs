@@ -2,7 +2,7 @@
 //! 7.4.15).
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, ProofState, ServiceTransition, TransitionProof, item_hash},
+    chain::{ItemType, ProofBody, ProofState, ServiceTransition, item_hash},
     enc::b64,
     http::IdentityDelivery,
     records::{
@@ -376,8 +376,7 @@ impl Service {
             recovery_from,
             at: time_ms,
         };
-        let identity = txn.head().identity_key;
-        let signed = transition.sign(signer, &identity).map_err(temporary)?;
+        let signed = self.sign_transition(txn, signer, &transition)?;
         let item_bytes = signed.doc_bytes().map_err(temporary)?;
         let hash = item_hash(ItemType::Service, &item_bytes);
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
@@ -410,7 +409,6 @@ impl Service {
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let failure = |_| ApiError::unavailable("7.6: a temporary failure");
-        let identity_key = txn.head().identity_key;
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let item_bytes = doc.signed().doc_bytes().map_err(failure)?;
         let hash = item_hash(ItemType::Identity, &item_bytes);
@@ -435,12 +433,8 @@ impl Service {
             generation: doc.generation(),
             data_epoch: doc.data_epoch(),
         };
-        let proof = TransitionProof::sign(
-            signer,
-            &identity_key,
-            ProofBody::new(stub, "identity".into(), &state),
-        )
-        .map_err(failure)?;
+        let proof =
+            self.sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?;
         txn.set_identity(&HeldIdentity {
             doc: doc.signed().clone(),
             proof: Some(proof.signed().clone()),

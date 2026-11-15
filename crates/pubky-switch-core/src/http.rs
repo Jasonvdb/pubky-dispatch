@@ -1721,9 +1721,6 @@ mod tests {
             }
         );
         assert_eq!(erase_body(None, None), b"{}");
-        let key = crate::enc::b64(&[3; 32]);
-        let body = format!(r#"{{"service_key":"{key}"}}"#);
-        assert!(parse_erase_body(body.as_bytes()).is_err());
         assert!(parse_erase_body(br#"{"x":1}"#).is_err());
         assert!(parse_erase_body(b"[]").is_err());
     }

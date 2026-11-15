@@ -239,6 +239,9 @@ struct Inner {
     /// before `store_id`, `marks`, `retired` and `erasures`. A caller that stops waiting can't release
     /// it early: the task runs to its end, so writes land in the order they were checked.
     writes: Mutex<()>,
+    /// A test waiting until a write reaches the serialized boundary.
+    #[cfg(test)]
+    write_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Fails directory syncs and tracks what a crash would undo, for tests.
     #[cfg(test)]
     faults: Arc<Mutex<Faults>>,
@@ -333,10 +336,11 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.write_sync(&identity, |held| match held {
+            inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Missing | MarkRead::NotAMark => {
                     Some(AccountMark::zero(key, created_at_ms))
                 }
@@ -362,10 +366,11 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.write_sync(&identity, |held| match held {
+            inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark) if mark == read => Some(AccountMark {
                     key,
                     created_at_ms,
@@ -393,10 +398,11 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.write_sync(&identity, |held| match held {
+            inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark) if mark.key != key && mark.created_at_ms == created_at_ms => {
                     Some(AccountMark { key, ..mark })
                 }
@@ -429,12 +435,14 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !is_head(&head) {
             return Err(MarkStoreError::InvalidHead);
         }
-        blocking(move || inner.advance_sync(&identity, head, key, created_at_ms)).await
+        blocking(move || inner.advance_sync(gate.as_ref(), &identity, head, key, created_at_ms))
+            .await
     }
 
     /// Write the mark anew at `head`, with `key` and `created_at_ms`, where the identity's
@@ -456,13 +464,14 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !is_head(&head) {
             return Err(MarkStoreError::InvalidHead);
         }
         blocking(move || {
-            inner.write_sync(&identity, |held| match held {
+            inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 // Read under the writes' lock, as the record is written.
                 MarkRead::Missing | MarkRead::NotAMark
                     if inner.erased_after(&identity, created_at_ms) =>
@@ -490,9 +499,15 @@ impl MarkStore {
     /// The store can't be read or the removal failed; [`MarkStoreError::InvalidIdentity`].
     pub async fn delete(&self, identity: &str) -> Result<(), MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.delete_sync(&identity, None).map(|_| ())).await
+        blocking(move || {
+            inner
+                .delete_sync(gate.as_ref(), &identity, None)
+                .map(|_| ())
+        })
+        .await
     }
 
     /// Delete the identity's mark, durably, only where it was created at or before `at_ms`
@@ -509,9 +524,10 @@ impl MarkStore {
         at_ms: u64,
     ) -> Result<bool, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.delete_sync(&identity, Some(at_ms))).await
+        blocking(move || inner.delete_sync(gate.as_ref(), &identity, Some(at_ms))).await
     }
 
     /// Record the retirement of `generation` for the identity, durably (Switch spec 6.5).
@@ -524,12 +540,13 @@ impl MarkStore {
     /// [`MarkStoreError::InvalidGeneration`] for generation 0 (Switch wire 7.3, Table 3).
     pub async fn retire(&self, identity: &str, generation: u64) -> Result<(), MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         if generation == 0 {
             return Err(MarkStoreError::InvalidGeneration);
         }
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.retire_sync(&identity, generation)).await
+        blocking(move || inner.retire_sync(gate.as_ref(), &identity, generation)).await
     }
 
     /// The identity's retired generations, ascending.
@@ -578,9 +595,10 @@ impl MarkStore {
         erased_at_ms: u64,
     ) -> Result<Option<u64>, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.record_erasure_sync(&identity, erased_at_ms)).await
+        blocking(move || inner.record_erasure_sync(gate.as_ref(), &identity, erased_at_ms)).await
     }
 
     /// Take back the record of an erasure at `erased_at_ms` whose deletion didn't commit
@@ -597,9 +615,13 @@ impl MarkStore {
         previous: Option<u64>,
     ) -> Result<(), MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.withdraw_erasure_sync(&identity, erased_at_ms, previous)).await
+        blocking(move || {
+            inner.withdraw_erasure_sync(gate.as_ref(), &identity, erased_at_ms, previous)
+        })
+        .await
     }
 
     /// The time of the erasure's record for `identity`, if any; none for an identity no file
@@ -652,8 +674,9 @@ impl MarkStore {
     /// The store can't be read or a removal failed.
     pub async fn forget_erasures_before(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
         self.check_gate()?;
+        let gate = self.gate.clone();
         let inner = self.inner.clone();
-        blocking(move || inner.forget_erasures_sync(before_ms)).await
+        blocking(move || inner.forget_erasures_sync(gate.as_ref(), before_ms)).await
     }
 }
 
@@ -666,6 +689,8 @@ impl Inner {
             retired: Mutex::new(HashMap::new()),
             erasures: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
+            #[cfg(test)]
+            write_waiting: Mutex::default(),
             #[cfg(test)]
             faults: Arc::default(),
         }
@@ -837,13 +862,22 @@ impl Inner {
         result
     }
 
-    /// Run `write` under `writes`, once the store can be read.
+    /// Run `write` under `writes`, once the store can be read and the instance lock is
+    /// still fresh after any wait for the blocking pool or this lock (Switch spec 6.5).
     fn writing<T>(
         &self,
+        gate: Option<&LockFreshness>,
         write: impl FnOnce(&str) -> Result<T, MarkStoreError>,
     ) -> Result<T, MarkStoreError> {
+        #[cfg(test)]
+        if let Some(waiting) = self.write_waiting.lock().take() {
+            let _ = waiting.send(());
+        }
         let _writes = self.writes.lock();
         let id = self.readable_locked()?;
+        if gate.is_some_and(|freshness| !freshness.is_fresh()) {
+            return Err(MarkStoreError::LockStale);
+        }
         let result = write(&id);
         self.forget_store_on(&result);
         result
@@ -892,10 +926,11 @@ impl Inner {
     /// Write what `next` makes of the mark held, if anything, durably, then hold it.
     fn write_sync(
         &self,
+        gate: Option<&LockFreshness>,
         identity: &str,
         next: impl FnOnce(MarkRead) -> Option<AccountMark>,
     ) -> Result<MarkWrite, MarkStoreError> {
-        self.writing(|id| {
+        self.writing(gate, |id| {
             let held = self.load_mark(identity, id)?;
             match next(held) {
                 Some(mark) => {
@@ -921,12 +956,13 @@ impl Inner {
 
     fn advance_sync(
         &self,
+        gate: Option<&LockFreshness>,
         identity: &str,
         head: ChainTip,
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
-        self.writing(|id| {
+        self.writing(gate, |id| {
             let mark = match self.load_mark(identity, id)? {
                 MarkRead::Mark(mark) => mark,
                 held => return Ok(Advance::NoMark(held)),
@@ -958,8 +994,13 @@ impl Inner {
         })
     }
 
-    fn delete_sync(&self, identity: &str, created_by: Option<u64>) -> Result<bool, MarkStoreError> {
-        self.writing(|id| {
+    fn delete_sync(
+        &self,
+        gate: Option<&LockFreshness>,
+        identity: &str,
+        created_by: Option<u64>,
+    ) -> Result<bool, MarkStoreError> {
+        self.writing(gate, |id| {
             let held = self.load_mark(identity, id)?;
             if let Some(at_ms) = created_by {
                 match held {
@@ -979,8 +1020,13 @@ impl Inner {
         })
     }
 
-    fn retire_sync(&self, identity: &str, generation: u64) -> Result<(), MarkStoreError> {
-        self.writing(|_| {
+    fn retire_sync(
+        &self,
+        gate: Option<&LockFreshness>,
+        identity: &str,
+        generation: u64,
+    ) -> Result<(), MarkStoreError> {
+        self.writing(gate, |_| {
             let held = self
                 .retired
                 .lock()
@@ -1004,10 +1050,11 @@ impl Inner {
     /// restore (Switch spec 6.5). Answers the time the store held before.
     fn record_erasure_sync(
         &self,
+        gate: Option<&LockFreshness>,
         identity: &str,
         erased_at_ms: u64,
     ) -> Result<Option<u64>, MarkStoreError> {
-        self.writing(|_| {
+        self.writing(gate, |_| {
             let path = self.erasures_dir().join(identity);
             let recorded = read_erasure_file(&path)?;
             // Memory takes the record first, so it holds at least what the files hold, also
@@ -1033,11 +1080,12 @@ impl Inner {
     /// durably, then in memory.
     fn withdraw_erasure_sync(
         &self,
+        gate: Option<&LockFreshness>,
         identity: &str,
         erased_at_ms: u64,
         previous: Option<u64>,
     ) -> Result<(), MarkStoreError> {
-        self.writing(|_| {
+        self.writing(gate, |_| {
             let path = self.erasures_dir().join(identity);
             // Memory holds what the files hold, and a record whose file's removal landed
             // without its directory sync: the retry syncs it.
@@ -1065,8 +1113,12 @@ impl Inner {
 
     /// Remove the records of erasures before `before_ms`, each removal durable before its
     /// entry leaves memory.
-    fn forget_erasures_sync(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
-        self.writing(|id| {
+    fn forget_erasures_sync(
+        &self,
+        gate: Option<&LockFreshness>,
+        before_ms: u64,
+    ) -> Result<usize, MarkStoreError> {
+        self.writing(gate, |id| {
             let aged: Vec<(String, u64)> = self
                 .erasures
                 .lock()
@@ -2345,6 +2397,135 @@ mod tests {
         let view = MarkView::open(dir.path()).expect("view");
         assert_eq!(view.erasure(ALICE), Some(1_000));
         assert_eq!(view.erasure(BOB), None);
+    }
+
+    async fn queued_writes(wait_on_mutex: bool) {
+        use crate::store::LockTiming;
+        use std::future::Future as _;
+        use std::task::Poll;
+
+        let mut failures = Vec::new();
+        for action in [
+            "create",
+            "take",
+            "set_key",
+            "advance",
+            "write_anew",
+            "delete",
+            "delete_created_by",
+            "retire",
+            "record_erasure",
+            "withdraw_erasure",
+            "forget_erasures",
+        ] {
+            let (_dir, open_store) = open();
+            let mark = with_mark(&open_store, ALICE, head(1, 4, 1)).await;
+            open_store.record_erasure(BOB, 1_000).await.expect("record");
+            let (started, reached) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let inner = open_store.inner.clone();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _guard = wait_on_mutex.then(|| inner.writes.lock());
+                let _ = started.send(());
+                let _ = wait.recv();
+            });
+            reached.await.expect("write blocked");
+            let freshness = LockFreshness::confirmed_ago(
+                std::time::Duration::ZERO,
+                LockTiming::checking_every(std::time::Duration::from_millis(250)),
+            );
+            let store = open_store.gated(freshness.clone());
+            let (waiting, at_mutex) = tokio::sync::oneshot::channel();
+            if wait_on_mutex {
+                *store.inner.write_waiting.lock() = Some(waiting);
+            }
+            let write = async {
+                match action {
+                    "create" => store.create_zero(BOB, KEY, 2_000).await.map(|_| ()),
+                    "take" => store.take(ALICE, mark, OTHER_KEY, 2_000).await.map(|_| ()),
+                    "set_key" => store.set_key(ALICE, OTHER_KEY, 100).await.map(|_| ()),
+                    "advance" => store
+                        .advance(ALICE, head(1, 5, 2), KEY, 100)
+                        .await
+                        .map(|_| ()),
+                    "write_anew" => store
+                        .write_anew(BOB, head(1, 5, 2), KEY, 2_000)
+                        .await
+                        .map(|_| ()),
+                    "delete" => store.delete(ALICE).await,
+                    "delete_created_by" => {
+                        store.delete_created_by(ALICE, u64::MAX).await.map(|_| ())
+                    }
+                    "retire" => store.retire(ALICE, 1).await,
+                    "record_erasure" => store.record_erasure(ALICE, 2_000).await.map(|_| ()),
+                    "withdraw_erasure" => store.withdraw_erasure(BOB, 1_000, None).await,
+                    "forget_erasures" => store.forget_erasures_before(u64::MAX).await.map(|_| ()),
+                    _ => unreachable!(),
+                }
+            };
+            tokio::pin!(write);
+            assert!(freshness.is_fresh());
+            std::future::poll_fn(|cx| {
+                assert!(write.as_mut().poll(cx).is_pending(), "write queued");
+                Poll::Ready(())
+            })
+            .await;
+            if wait_on_mutex {
+                at_mutex.await.expect("write reached the held mutex");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while freshness.is_fresh() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("freshness expired");
+            release.send(()).expect("release write");
+            occupied.await.expect("blocking task");
+            let result = write.await;
+            if !matches!(result, Err(MarkStoreError::LockStale)) {
+                failures.push(format!("{action}: {result:?}"));
+                continue;
+            }
+            assert_eq!(
+                open_store.read(ALICE).await.expect("mark"),
+                MarkRead::Mark(mark)
+            );
+            assert_eq!(open_store.read(BOB).await.expect("mark"), MarkRead::Missing);
+            assert!(
+                open_store
+                    .retired(ALICE)
+                    .await
+                    .expect("retirements")
+                    .is_empty()
+            );
+            assert_eq!(open_store.erasure(ALICE).await.expect("erasure"), None);
+            assert_eq!(open_store.erasure(BOB).await.expect("erasure"), Some(1_000));
+        }
+        assert!(
+            failures.is_empty(),
+            "writes after freshness expired: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn test_marks_queued_pool_writes_refuse_an_expired_instance_lock() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime")
+            .block_on(queued_writes(false));
+    }
+
+    #[test]
+    fn test_marks_queued_mutex_writes_refuse_an_expired_instance_lock() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .expect("runtime")
+            .block_on(queued_writes(true));
     }
 
     #[tokio::test]

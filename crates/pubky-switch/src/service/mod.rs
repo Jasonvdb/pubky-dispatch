@@ -56,7 +56,7 @@ pub(crate) mod verdict;
 mod webhooks;
 
 #[cfg(any(test, feature = "test-util"))]
-pub use marking::MarkMovePause;
+pub use marking::RequestPause;
 pub use push::Resolver;
 pub use recovery::AdmissionEnd;
 pub use webhooks::PushRound;
@@ -159,7 +159,16 @@ pub struct Service {
     /// A pause before the next mark move, for tests of what lands between a commit and
     /// its move.
     #[cfg(any(test, feature = "test-util"))]
-    mark_move_pause: parking_lot::Mutex<Option<MarkMovePause>>,
+    mark_move_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after a feed's mark move and before its final signing turn.
+    #[cfg(any(test, feature = "test-util"))]
+    feed_sign_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after a feed's final checks, with its account lock still held.
+    #[cfg(any(test, feature = "test-util"))]
+    feed_locked_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after retention's reads and before its checkpoint signature.
+    #[cfg(any(test, feature = "test-util"))]
+    checkpoint_sign_pause: parking_lot::Mutex<Option<RequestPause>>,
 }
 
 /// A source of entry IDs.
@@ -412,6 +421,12 @@ impl Service {
             relay_route: None,
             #[cfg(any(test, feature = "test-util"))]
             mark_move_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            feed_sign_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            feed_locked_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            checkpoint_sign_pause: parking_lot::Mutex::default(),
         }
     }
 
@@ -449,12 +464,39 @@ impl Service {
         self
     }
 
-    /// Pause the next mark move, after its commit, until [`MarkMovePause::release`], for
+    /// Pause the next mark move, after its commit, until [`RequestPause::release`], for
     /// tests of what lands between a commit and its move (Switch wire 7.3, "Moving it").
     #[cfg(any(test, feature = "test-util"))]
-    pub fn pause_next_mark_move(&self) -> MarkMovePause {
-        let pause = MarkMovePause::default();
+    pub fn pause_next_mark_move(&self) -> RequestPause {
+        let pause = RequestPause::default();
         *self.mark_move_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause the next feed answer after its mark move and before its final account lock,
+    /// for tests of erasure and generation changes before signing (Switch wire 7.3).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_feed_sign(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.feed_sign_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause the next feed after its final lifecycle checks, while it holds the account
+    /// lock, for tests that transitions cannot overtake its signatures (Switch wire 7.3).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_feed_sign_locked(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.feed_locked_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause the next checkpoint after retention's reads, for tests of an instance lock
+    /// that expires while a request waits for storage (Switch spec 6.5).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_checkpoint_sign(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.checkpoint_sign_pause.lock() = Some(pause.clone());
         pause
     }
 
@@ -1215,35 +1257,13 @@ impl Service {
                 Err(error) => answer = Answer::error(&error).with_head(fallback_head),
             },
             Some(Deferred::Feed(read)) => {
-                return match self.feed_page(&read).await {
-                    Ok(page) => {
-                        let (answer, time_ms) = page.answer();
-                        sign_answer(page.signer(), asked, AnswerTime::Account(time_ms), answer)
-                    }
-                    // Signed when it answers, after the wait: the notice and the not-hosted
-                    // `404` at the time base then, an unknown verdict's `503` at the last time
-                    // the read saw committed (Switch wire 7.1 Timestamp).
-                    Err(feed::FeedStop::Verdict { key, error, at }) => {
-                        let at = at.at(|| self.time.read().base_ms);
-                        self.keyed_error(&key, asked, at, &error)
-                    }
-                    Err(feed::FeedStop::Refused(refusal)) => {
-                        // Every 401 counts against the network source (9.4).
-                        if is_failed_authentication(refusal.error.code) {
-                            self.record_failure(request, identity.clone());
-                        }
-                        let refusal = *refusal;
-                        // A refusal decided from a snapshot is signed, head and answer, with
-                        // the key that snapshot's verdict gives.
-                        let (head, signer) = match (&refusal.snapshot, refusal.head) {
-                            (Some(snapshot), _) => (snapshot.sign(), snapshot.signer().clone()),
-                            (None, true) => (fallback_head, answer_signer),
-                            (None, false) => (None, answer_signer),
-                        };
-                        let answer = Answer::error(&refusal.error).with_head(head);
-                        sign_answer(&signer, asked, AnswerTime::Account(refusal.time_ms), answer)
-                    }
-                };
+                let result = self.feed_page(&read).await;
+                if let Err(feed::FeedStop::Refused(refusal)) = &result
+                    && is_failed_authentication(refusal.error.code)
+                {
+                    self.record_failure(request, identity.clone());
+                }
+                return self.feed_answer(&read, result, fallback_head, asked).await;
             }
             // An erasure was answered before the commit, above.
             Some(Deferred::Erase(_)) | None => {}
@@ -1509,8 +1529,7 @@ impl Service {
                 let head = txn.head().clone();
                 let answer = self
                     .feed(
-                        &head.id,
-                        head.identity_key,
+                        &head,
                         signer.public_key_bytes(),
                         writer.as_ref(),
                         &request.route.query,

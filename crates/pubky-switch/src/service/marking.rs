@@ -454,8 +454,7 @@ impl Service {
         {
             let pause = self.mark_move_pause.lock().take();
             if let Some(pause) = pause {
-                pause.reached.notify_one();
-                pause.release.notified().await;
+                pause.wait().await;
             }
         }
         for _ in 0..2 {
@@ -470,8 +469,17 @@ impl Service {
                 Ok(Advance::OtherAccount(_)) => return account_gone(),
                 Ok(Advance::NoMark(_)) => {
                     if !starts_generation {
-                        tracing::error!("a mark to move is gone");
-                        return MarkMove::Failed;
+                        let same_account = match self.store.lock_identity(identity).await {
+                            Ok(mut lock) => lock
+                                .account_created_at()
+                                .await
+                                .map(|created| created == Some(created_at_ms)),
+                            Err(error) => Err(error),
+                        };
+                        return match same_account {
+                            Ok(false) => account_gone(),
+                            Ok(true) | Err(_) => MarkMove::Failed,
+                        };
                     }
                     match self.write_anew(identity, tip, key, created_at_ms).await {
                         Some(MarkWrite::Written(_)) => return MarkMove::Done,
@@ -541,22 +549,27 @@ impl Service {
     }
 }
 
-/// A pause before a mark move, made by [`Service::pause_next_mark_move`].
+/// A request pause for tests of a concurrent account transition.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Debug, Default)]
-pub struct MarkMovePause {
+pub struct RequestPause {
     reached: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
-impl MarkMovePause {
-    /// Wait until a mark move reaches the pause, its commit durable.
+impl RequestPause {
+    pub(super) async fn wait(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+
+    /// Wait until the request reaches the pause.
     pub async fn reached(&self) {
         self.reached.notified().await;
     }
 
-    /// Let the paused move go on.
+    /// Let the paused request go on.
     pub fn release(&self) {
         self.release.notify_one();
     }

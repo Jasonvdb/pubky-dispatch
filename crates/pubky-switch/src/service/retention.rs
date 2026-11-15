@@ -208,6 +208,18 @@ impl Service {
                 })
         };
         if let Some(at) = at {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                let pause = self.checkpoint_sign_pause.lock().take();
+                if let Some(pause) = pause {
+                    pause.wait().await;
+                }
+            }
+            // The storage reads above may have outlived the last confirmed instance lock.
+            // Check at the signature itself, without an intervening await (Switch spec 6.5).
+            if !self.lock_is_fresh() {
+                return Ok(());
+            }
             let Some(signed) = sign_checkpoint(signer, &head.identity_key, &head.chain_tip(), &at)
             else {
                 return Ok(());

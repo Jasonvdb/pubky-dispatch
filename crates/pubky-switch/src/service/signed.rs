@@ -7,9 +7,10 @@
 
 use axum::http::{HeaderName, HeaderValue};
 use pubky_switch_core::{
-    chain::SignedHead,
+    chain::{ProofBody, ServiceTransition, SignedHead, TransitionProof},
     enc::b64,
     http::{self as wire_http, BodyField, ReceivedHeaders, ReceivedRequest, Uncompared, header},
+    sig::SignedDoc,
     time::rfc3339,
 };
 
@@ -323,6 +324,37 @@ impl Service {
         }
     }
 
+    /// Sign a service transition while its account is locked and the instance lock is
+    /// still confirmed (Switch spec 6.5; wire 7.3 step 10).
+    pub(super) fn sign_transition(
+        &self,
+        txn: &AccountTxn,
+        signer: &ServiceSigner,
+        transition: &ServiceTransition,
+    ) -> Result<SignedDoc, ApiError> {
+        if !self.lock_is_fresh() {
+            return Err(ApiError::unavailable("7.6: a temporary failure"));
+        }
+        transition
+            .sign(signer, &txn.head().identity_key)
+            .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))
+    }
+
+    /// Sign a transition proof under the same locks as the state it proves. Check again
+    /// after the caller's storage awaits (Switch spec 6.5; wire 7.3 step 10).
+    pub(super) fn sign_proof(
+        &self,
+        txn: &AccountTxn,
+        signer: &ServiceSigner,
+        body: ProofBody,
+    ) -> Result<TransitionProof, ApiError> {
+        if !self.lock_is_fresh() {
+            return Err(ApiError::unavailable("7.6: a temporary failure"));
+        }
+        TransitionProof::sign(signer, &txn.head().identity_key, body)
+            .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))
+    }
+
     /// Sign the head of the account's chain as it will be committed, for an answer to the
     /// signer or an own app, with `signer`, the key the verdict gives. Under the account's
     /// lock, before the commit, once the request has been judged there (Switch wire 7.3 step
@@ -579,13 +611,15 @@ mod tests {
         }
     }
 
-    /// Every place the service signs a head or a checkpoint, by file, with how many calls:
+    /// Every place the service signs state, by file, with how many calls:
     /// each checks the instance lock right before it signs (Switch spec 6.5). A new place is
     /// added here only with that check.
-    const SIGNING: [(&str, &str, usize); 3] = [
+    const SIGNING: [(&str, &str, usize); 5] = [
         ("signed.rs", "sign_head(", 1),
-        ("feed.rs", "sign_head(", 2),
+        ("feed.rs", "sign_head(", 1),
         ("retention.rs", "sign_checkpoint(", 1),
+        ("signed.rs", "TransitionProof::sign(", 1),
+        ("signed.rs", ".sign(signer,", 1),
     ];
 
     #[test]
@@ -614,7 +648,12 @@ mod tests {
                 .split("\n#[cfg(test)]\nmod tests")
                 .next()
                 .unwrap_or_default();
-            for call in ["sign_head(", "sign_checkpoint("] {
+            for call in [
+                "sign_head(",
+                "sign_checkpoint(",
+                "TransitionProof::sign(",
+                ".sign(signer,",
+            ] {
                 let found = code.matches(call).count();
                 let expected = SIGNING
                     .iter()

@@ -1335,3 +1335,276 @@ async fn test_feed_held_read_ends_when_its_connection_closes() {
     server.await.expect("server").expect("served");
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The normal lifecycle change that must not overtake a new signature for a feed snapshot.
+#[derive(Clone, Copy, Debug)]
+enum FeedChange {
+    Recover,
+    Erase,
+    EnrollAgain,
+    Advance,
+}
+
+fn held_identity() -> SignedDoc {
+    serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("identity")
+}
+
+async fn change_feed_account(replay: &Replay, change: FeedChange, at: &str) {
+    let original = mark_of(replay).await;
+    let held = held_identity();
+    let (path, data) = match change {
+        FeedChange::Advance => {
+            let keys = vectors("keys.json");
+            let executor = app(&keys, "executor")["app_id"].as_str().expect("app");
+            (
+                format!("/v1/{}/apps/{executor}/revoke", alice_id()),
+                Vec::new(),
+            )
+        }
+        FeedChange::Recover => {
+            let mut fields: pubky_switch_core::records::IdentityBody =
+                serde_json::from_slice(&held.body_bytes().expect("body")).expect("body");
+            fields.version += 1;
+            fields.generation = 2;
+            fields.recovery_from = Some(1);
+            fields.apps.clear();
+            let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+                &alice(&vectors("keys.json"))["secret_hex"],
+            ));
+            let recovery = pubky_switch_core::records::IdentityDoc::sign(&key, fields)
+                .expect("sign")
+                .signed()
+                .clone();
+            (
+                format!("/v1/{}/identity", alice_id()),
+                pubky_switch_core::http::IdentityDelivery {
+                    identity: recovery,
+                    prev: Some(held.doc_hash().expect("hash")),
+                }
+                .to_json(),
+            )
+        }
+        FeedChange::Erase | FeedChange::EnrollAgain => {
+            let mark = mark_of(replay).await;
+            (
+                format!("/v1/{}/erase", alice_id()),
+                pubky_switch_core::http::erase_body(
+                    Some(mark.created_at_ms),
+                    Some(&held.doc_hash().expect("hash")),
+                ),
+            )
+        }
+    };
+    let answer = replay
+        .service
+        .handle(signer_request(
+            if matches!(change, FeedChange::Recover) {
+                "PUT"
+            } else {
+                "POST"
+            },
+            &path,
+            data,
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{change:?}: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    match change {
+        FeedChange::Advance => {
+            let later = mark_of(replay).await;
+            assert_eq!(later.generation, original.generation);
+            assert!(later.seq > original.seq);
+        }
+        FeedChange::Recover => assert_eq!(mark_of(replay).await.generation, 2),
+        FeedChange::Erase | FeedChange::EnrollAgain => assert_eq!(
+            replay.marks.read(&alice_id()).await.expect("mark"),
+            MarkRead::Missing
+        ),
+    }
+    if matches!(change, FeedChange::EnrollAgain) {
+        serve_alice(replay).await;
+        let later = mark_of(replay).await;
+        assert!(later.created_at_ms > original.created_at_ms);
+        assert_eq!(later.generation, original.generation);
+    }
+}
+
+async fn subscribed(replay: &Replay) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while replay.service.changes().waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feed subscribed after its initial commit and mark");
+}
+
+async fn change_before_feed_sign(change: FeedChange, refusal: bool, after_mark: bool) {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        subscribed(&replay).await;
+        if refusal {
+            // The next snapshot refuses a reader revoked through the normal endpoint.
+            let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
+                .as_str()
+                .expect("app")
+                .to_string();
+            let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+            let revoked = replay
+                .service
+                .handle(signer_request("POST", &path, Vec::new(), ms(&at)))
+                .await;
+            assert_eq!(
+                revoked.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&revoked.body)
+            );
+        }
+        let pause = if after_mark {
+            replay.service.pause_next_feed_sign()
+        } else {
+            replay.service.pause_next_mark_move()
+        };
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("snapshot reached its final mark or signing turn");
+        change_feed_account(&replay, change, &at).await;
+        pause.release();
+    });
+    let head = header_text(&answer, header::HEAD).map(str::to_string);
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable")),
+        "{change:?}, refusal={refusal}, after_mark={after_mark}"
+    );
+    assert!(head.is_none(), "ended account/generation: {head:?}");
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_generation_overtaken_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Recover, false, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_erased_before_mark_move_has_no_head() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Erase, false, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_refusal_overtaken_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Recover, true, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_refusal_erased_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Erase, true, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_account_lock_is_held_through_signing() {
+    for change in [FeedChange::Recover, FeedChange::Erase] {
+        let Some(replay) = replay().await else { return };
+        replay_chain_through_revoke(&replay).await;
+        let at = revoke_time();
+        let pause = replay.service.pause_next_feed_sign_locked();
+        let (answer, overtook) = tokio::join!(read(&replay, "wallet", "?limit=0", &at), async {
+            tokio::time::timeout(Duration::from_secs(10), pause.reached())
+                .await
+                .expect("signing turn");
+            let transition = change_feed_account(&replay, change, &at);
+            tokio::pin!(transition);
+            let overtook = tokio::select! {
+                () = &mut transition => true,
+                () = tokio::time::sleep(Duration::from_millis(100)) => false,
+            };
+            pause.release();
+            if !overtook {
+                transition.await;
+            }
+            overtook
+        });
+        replay.db.drop_database().await.expect("drop");
+        assert!(!overtook, "transition overtook the signing lock");
+        // A head signed before the later transition may finish arriving afterwards.
+        assert_eq!(answer.status, 200);
+        assert_eq!(body(&answer)["head"]["generation"], 1);
+        assert_eq!(head_seq(&answer), Some(9));
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_cannot_sign_for_another_account_creation() {
+    change_before_feed_sign(FeedChange::EnrollAgain, false, true).await;
+}
+
+#[tokio::test]
+async fn test_feed_signing_checks_freshness_after_its_final_storage_reads() {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let freshness = LockFreshness::confirmed_ago(
+        Duration::ZERO,
+        LockTiming::checking_every(Duration::from_millis(250)),
+    );
+    let service = replay
+        .restarted_with(Limits::default())
+        .with_lock_freshness(freshness.clone());
+    let pause = service.pause_next_feed_sign_locked();
+    let path = format!("/v1/{}/feed?limit=0", alice_id());
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &path,
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let (answer, ()) = tokio::join!(service.handle(request), async {
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("signing turn");
+        while freshness.is_fresh() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pause.release();
+    });
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_cannot_sign_behind_a_later_committed_head() {
+    for refusal in [false, true] {
+        for after_mark in [false, true] {
+            change_before_feed_sign(FeedChange::Advance, refusal, after_mark).await;
+        }
+    }
+}

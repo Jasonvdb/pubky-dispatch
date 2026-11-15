@@ -15,8 +15,8 @@ use pubky_switch_core::envelope::Recipient;
 use pubky_switch_core::ident::Policy;
 use pubky_switch_core::keys::ReceiveKey;
 use pubky_switch_core::message::{Message, Sender};
-use pubky_switch_core::ops::OpKind;
-use pubky_switch_core::records::AppCert;
+use pubky_switch_core::ops::{KeyBundlePut, OpKind};
+use pubky_switch_core::records::{AppCert, seal_bundle_parts};
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Map, json};
 
@@ -1212,5 +1212,137 @@ fn test_order_model_one_protocol_reads_its_marks_in_a_read_that_ends_for_a_secon
         let marks = b.app.reader().scan_raw("rcread/").await.unwrap();
         assert!(marks.is_empty(), "the upload's mark was read");
         b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_one_protocol_failing_a_call_holds_the_read() {
+    // One protocol: an upload marks its record, and a re-send call after it fails. As
+    // long as it fails the call, no read goes on: the record marked is not read again,
+    // though the feed has nothing after the call. Once it takes the call, it is.
+    on_a_thread(async {
+        let mut b = Bench::new(1, 100).await;
+        b.upload("tasks");
+        b.model("tasks").failing.lock().unwrap().push(Call::Resend);
+        let resend = b.unopenable();
+        for _ in 0..3 {
+            let report = b.read().await;
+            assert!(report.stopped, "{report:?}");
+        }
+        assert_eq!(b.taken("tasks"), (vec![], Some(resend)));
+        let marks = b.app.reader().scan_raw("rcread/").await.unwrap();
+        assert!(!marks.is_empty(), "the upload's mark is read while the call fails");
+        b.model("tasks").failing.lock().unwrap().clear();
+        b.quiet(false).await;
+        let marks = b.app.reader().scan_raw("rcread/").await.unwrap();
+        assert!(marks.is_empty(), "the upload's mark was read");
+        b.finish().await;
+    });
+}
+
+/// Key bundle parts for the app of `cert`, through the current data epoch, stored at the
+/// switch as the signer stores them.
+fn store_parts_for(b: &Bench, cert: &AppCert) {
+    let names = b.names.clone();
+    let has_keys = move |scope: &str| names.iter().any(|name| scope_of(name) == scope);
+    let epoch = b.w.switch.identity_doc().unwrap().data_epoch();
+    for part in seal_bundle_parts(&b.w.alice, cert, 1, epoch, &has_keys).unwrap() {
+        b.w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: cert.app_id(),
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+}
+
+/// Whether the app holds the record at `key` with its value open.
+async fn opened(b: &Bench, key: &[u8; 32]) -> bool {
+    let held = b.app.shared_record(key).await.unwrap().unwrap();
+    held.content.value().is_some()
+}
+
+#[test]
+fn test_order_model_record_a_key_opens_waits_for_its_protocol_behind_the_read() {
+    // The app holds a record of `tasks` it can't open yet: the data epoch rose, and only
+    // the phone has the new keys. `tasks` then fails a re-send call `chat` goes past, and
+    // the app's key comes while `tasks` is behind: the record stays unopened until `tasks`
+    // takes the call and is with the read again.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 100).await;
+        b.w.next_doc(|body| body.data_epoch = 2);
+        let phone_cert = b.phone.cert().clone();
+        store_parts_for(&b, &phone_cert);
+        b.phone.receive(None).await.unwrap();
+        b.phone_writes("tasks").await;
+        b.quiet(false).await;
+        let w1 = b
+            .app
+            .record_key(&RecordTarget::new(list_of("tasks"), b"w1"))
+            .unwrap();
+        assert!(!opened(&b, &w1).await, "the app lacks the key");
+        b.model("tasks").failing.lock().unwrap().push(Call::Resend);
+        let resend = b.unopenable();
+        b.quiet(false).await;
+        assert_eq!(b.taken("tasks"), (vec![], Some(resend)));
+        let app_cert = b.app.cert().clone();
+        store_parts_for(&b, &app_cert);
+        b.entry("chat", "item");
+        b.quiet(false).await;
+        assert!(b.app.scope_key(2, "tasks").is_some(), "the key was taken");
+        assert!(
+            !opened(&b, &w1).await,
+            "the record of `tasks` opened while `tasks` fails its call"
+        );
+        b.model("tasks").failing.lock().unwrap().clear();
+        b.quiet(false).await;
+        assert!(opened(&b, &w1).await);
+        assert_eq!(b.taken("tasks").0, [resend]);
+        b.finish().await;
+    });
+}
+
+#[test]
+fn test_order_model_protocol_stuck_past_a_held_entry_lets_the_other_go_on() {
+    // An entry of `chat` from carol, who has no `identity.json` on the Homeserver, is held
+    // for its sender's check, so the cursor stays before it. `tasks` fails a re-send call
+    // after it: `tasks` can't move until a read's start tells it the call, so no read
+    // walks again from its position, and `chat` gets its thirty entries in reads of
+    // one-item pages that each go on from where the one before got.
+    on_a_thread(async {
+        let mut b = Bench::new(2, 1).await;
+        let carol = identity("carol");
+        let carol_key = IdentityKey::from_secret(carol.key().secret_bytes());
+        let carol_keys = carol.app_keys("x");
+        let now = b.w.clock.now_ms();
+        let carol_cert = cert_for(carol.key(), &carol_keys, now - 1000, &["chat"]);
+        let me = b.app.app_id();
+        b.tick();
+        b.w.switch
+            .send(
+                &carol_key,
+                &carol_keys,
+                &carol_cert,
+                "chat.item",
+                json!({ "text": "carol" }),
+                &[me],
+            )
+            .unwrap();
+        b.model("tasks").failing.lock().unwrap().push(Call::Resend);
+        let resend = b.unopenable();
+        let chat: Vec<u64> = (0..30).map(|_| b.entry("chat", "item")).collect();
+        let mut reads = 0;
+        while b.read().await.more {
+            reads += 1;
+            assert!(reads < 20, "the reads never get to the feed's end");
+        }
+        assert_eq!(b.taken("tasks"), (vec![], Some(resend)));
+        let took = b.taken("chat").0;
+        assert!(
+            took.ends_with(&chat),
+            "`chat` took its thirty entries: {took:?}"
+        );
     });
 }

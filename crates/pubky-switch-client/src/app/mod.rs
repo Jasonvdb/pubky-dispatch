@@ -657,9 +657,6 @@ pub struct App {
     /// Where the walk of the read under way stands, inside a page ([`App::may_tell`]). In
     /// memory only.
     walk: Option<order::Walk>,
-    /// The protocols something is kept for at the very item the walk handles: they aren't
-    /// told the item ([`App::may_tell`]). In memory only.
-    kept_here: BTreeSet<String>,
     /// The protocols a listing is owed to (`list_due`), as the read's last listing step
     /// left them: outside a page, they are told nothing before it ([`App::may_tell`]). In
     /// memory only.
@@ -1046,7 +1043,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
@@ -1213,7 +1209,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
@@ -2069,7 +2064,6 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                kept_here: BTreeSet::new(),
                 listing_names: BTreeSet::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),

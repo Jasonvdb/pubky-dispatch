@@ -34,8 +34,10 @@
 //! in feed order ([`App::settle_told`], `retry_owed`), a protocol's listing before a call at
 //! the same item: the listing an item owes is not held by that item's own call, with one
 //! protocol or several. A kept call or listing past the cursor waits for the read to reach
-//! its item: the protocols it names stay right before it, aren't told the item, and are
-//! told what is kept at the start of the read after, whether or not the cursor got there.
+//! its item: the protocols it names stay right before it, and are told what is kept at the
+//! start of the read after, whether or not the cursor got there. The item itself tells them
+//! nothing new: a kept call's item is passed whole, and an item a listing is kept at was
+//! handled for them when the read first met it (`asked/`, `seen/`, record versions).
 //! A protocol a listing is still owed to is told nothing that isn't in feed order either.
 //!
 //! A read that stopped on its pages goes on from where it got (`feed_at`), unless a
@@ -155,17 +157,12 @@ impl App {
     /// protocol that is with the read. "Not yet" means the caller holds or keeps the thing
     /// for it.
     ///
-    /// Something kept for the protocol at the very item the walk handles, a call or a
-    /// listing, comes first: the protocol isn't told the item. And outside a page, a
-    /// protocol whose listing the read could not make yet is told nothing: the listing
-    /// comes before anything else.
+    /// Outside a page, a protocol whose listing the read could not make yet is told
+    /// nothing: the listing comes before anything else.
     ///
     /// With one protocol this is false only once that protocol didn't take an item, and
     /// the read stops there.
     pub(crate) fn may_tell(&self, name: &str) -> bool {
-        if self.kept_here.contains(name) {
-            return false;
-        }
         if self.walk.is_none() && self.listing_names.contains(name) {
             return false;
         }
@@ -253,7 +250,6 @@ impl App {
         self.told = told;
         self.told_kept = self.told.clone();
         self.walk = None;
-        self.kept_here.clear();
         self.told_loaded = true;
         Ok(())
     }

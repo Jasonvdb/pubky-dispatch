@@ -1113,7 +1113,6 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked);
-        self.kept_here.clear();
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -1222,9 +1221,8 @@ impl App {
                     held_before = k < seq;
                 }
                 if k == seq {
-                    // What is kept for them at this item comes first: they aren't told the
-                    // item, and stay right before it.
-                    self.kept_here.extend(kept.names.iter().cloned());
+                    // What is kept for them at this item comes first: they stay right
+                    // before it.
                     read.left.extend(kept.names);
                     kept_call = kept.call;
                 } else {
@@ -1316,7 +1314,6 @@ impl App {
             }
             // Each protocol that took the item, or had nothing in it, moves to it; one that
             // didn't stays right before it (`order` module).
-            self.kept_here.clear();
             if step != Step::Stop {
                 self.step_told(seq, &read.left, &read.run);
             }
@@ -1336,7 +1333,6 @@ impl App {
                 list_through = Some(seq);
             }
         }
-        self.kept_here.clear();
         let through = list_through
             .or(budget_through)
             .unwrap_or(page.scanned_through);
@@ -3074,12 +3070,6 @@ impl App {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
         let mut owed_to = Vec::new();
         for registered in protocols {
-            // A listing kept for it at this very item: the item was handled for it when the
-            // read first met it, its call taken or kept then (a kept call makes the read
-            // pass the item whole).
-            if self.kept_here.contains(&registered.name) {
-                continue;
-            }
             // In step with the item, or waiting only for the listing the `missed` item
             // before it owes, which this one owes too.
             if !self.may_tell(&registered.name) && !read.run.contains(&registered.name) {

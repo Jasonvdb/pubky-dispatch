@@ -20,6 +20,8 @@ use crate::{FlowResult, World};
 
 #[cfg(test)]
 mod retained_authority;
+#[cfg(test)]
+mod zero_listing;
 
 struct OrderedProtocol {
     inner: Arc<TestProtocol>,

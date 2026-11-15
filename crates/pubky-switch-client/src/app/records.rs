@@ -1500,11 +1500,11 @@ impl App {
         })
     }
 
-    /// Note the protocols a listing is still owed to (`list_due`), after a read's listing
-    /// step: outside a page they are told nothing before it ([`App::may_tell`]).
-    pub(crate) async fn note_listing_names(&mut self) -> Result<(), AppError> {
+    /// Keep each outstanding listing and its position after a read's listing step:
+    /// it is a prerequisite even at sequence zero ([`App::may_tell`]).
+    pub(crate) async fn note_listing_due(&mut self) -> Result<(), AppError> {
         let due: ListDue = self.reader().get(LIST_DUE).await?.unwrap_or_default();
-        self.listing_names = due.to.into_iter().map(|(name, _)| name).collect();
+        self.listing_due = due;
         Ok(())
     }
 

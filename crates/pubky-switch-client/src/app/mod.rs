@@ -663,10 +663,10 @@ pub struct App {
     /// Where the walk of the read under way stands, inside a page ([`App::may_tell`]). In
     /// memory only.
     walk: Option<order::Walk>,
-    /// The protocols a listing is owed to (`list_due`), as the read's last listing step
-    /// left them: outside a page, they are told nothing before it ([`App::may_tell`]). In
-    /// memory only.
-    listing_names: BTreeSet<String>,
+    /// The collection prerequisites (`list_due`), as the read's last listing step left
+    /// them: each protocol waits at its listing's position, including sequence zero
+    /// ([`App::may_tell`]). In memory only.
+    listing_due: records::ListDue,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
@@ -1049,7 +1049,7 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                listing_names: BTreeSet::new(),
+                listing_due: records::ListDue::default(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -1215,7 +1215,7 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                listing_names: BTreeSet::new(),
+                listing_due: records::ListDue::default(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -2156,7 +2156,7 @@ impl App {
                 told_kept: order::Positions::new(),
                 told_loaded: false,
                 walk: None,
-                listing_names: BTreeSet::new(),
+                listing_due: records::ListDue::default(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,

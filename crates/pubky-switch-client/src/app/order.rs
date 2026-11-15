@@ -2,12 +2,12 @@
 //!
 //! Every notice a protocol can't take yet is kept in feed order, and the app tells that
 //! protocol nothing later until it takes it. With several protocols the rule holds per
-//! protocol, and one value per protocol decides it: how far that protocol has been told, in
-//! feed order (`told/<name>`, [`Told`]). A protocol is told an item only when its position
-//! has reached the item: everything the read covered before it was told to it. One that
-//! doesn't take an item stays right before it, and is told nothing later, while the read
-//! goes on for the others. [`App::may_tell`] is that one comparison, and every way the read
-//! tells a protocol something asks it:
+//! protocol. Its feed position (`told/<name>`, [`Told`]) and outstanding listing
+//! prerequisites determine what it may be told. A protocol is told an item only when
+//! its position has reached the item: everything the read covered before it was told
+//! to it. One that doesn't take an item stays right before it, and is told nothing later,
+//! while the read goes on for the others. [`App::may_tell`] checks the position and its
+//! listing prerequisites, and every way the read tells a protocol something asks it:
 //!
 //! - a message entry, before anything is done with it, its checks included
 //!   (`check_and_apply`): held, the cursor staying before it, for a protocol whose position
@@ -158,13 +158,19 @@ impl App {
     /// protocol that is with the read. "Not yet" means the caller holds or keeps the thing
     /// for it.
     ///
-    /// Outside a page, a protocol whose listing the read could not make yet is told
-    /// nothing: the listing comes before anything else.
+    /// A listing the read could not make is a prerequisite at its position, including
+    /// zero, which has no earlier numeric position. Nothing outside feed order reaches
+    /// that protocol either until its listing completes.
     ///
     /// With one protocol this is false only once that protocol didn't take an item, and
     /// the read stops there.
     pub(crate) fn may_tell(&self, name: &str) -> bool {
-        if self.walk.is_none() && self.listing_names.contains(name) {
+        if let Some(at) = self.listing_due.at(name)
+            && (self.walk.is_none()
+                || at.is_none_or(|(generation, seq)| {
+                    self.feed_order(generation, seq) <= self.walked()
+                }))
+        {
             return false;
         }
         self.told_order(name) >= self.walked()
@@ -300,15 +306,17 @@ impl App {
         }
     }
 
-    /// The protocols that are stuck on a kept thing: one names them right after their
-    /// position. They can't move in the walk until a read's start tells it to them.
+    /// The protocols whose next prerequisite is kept. Compare its preceding position,
+    /// including zero itself when it has no predecessor: it still must be taken before
+    /// the protocol can move in the walk (Switch spec 8.3).
     pub(crate) fn stuck_on(&self, kept: &[Kept]) -> BTreeSet<String> {
         let mut stuck = BTreeSet::new();
         for name in self.protocols.names() {
             let (generation, seq) = self.told(&name);
-            let next = self.feed_order(generation, seq.saturating_add(1));
+            let at = self.feed_order(generation, seq);
             if kept.iter().any(|kept| {
-                kept.names.contains(&name) && self.feed_order(kept.generation, kept.seq) == next
+                kept.names.contains(&name)
+                    && self.feed_order(kept.generation, kept.seq.saturating_sub(1)) == at
             }) {
                 stuck.insert(name);
             }

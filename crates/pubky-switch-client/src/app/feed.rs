@@ -805,7 +805,7 @@ impl App {
         let waits_for_key = listing == Listing::WaitsForKey;
         let unfinished = listing == Listing::Unfinished;
         let mut listed = listing == Listing::Listed;
-        self.note_listing_names().await?;
+        self.note_listing_due().await?;
         // A listing this read made for every protocol before any item covers a gap ahead
         // its first page shows.
         self.listed_before_items = listed && self.listed_every;
@@ -971,7 +971,7 @@ impl App {
                                 .list_collections_if_due(&mut pages, Some(budget))
                                 .await?;
                         }
-                        self.note_listing_names().await?;
+                        self.note_listing_due().await?;
                         if listing != Listing::WaitsForKey && self.listing_waits && !waits_told {
                             self.ask_again_while_a_listing_waits().await?;
                             self.events.push(AppEvent::ListingWaitsForKey);

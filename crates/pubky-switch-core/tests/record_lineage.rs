@@ -684,3 +684,53 @@ fn test_lineage_protected_statement_size_preserves_signed_body() {
         ));
     }
 }
+
+#[test]
+fn test_lineage_absent_incarnations_bind_known_origin() {
+    let current = descriptor_body();
+    let mut capsule = maximal();
+    capsule.truncated = false;
+    capsule.deletions[0].incarnation = Some(Incarnation::Absent(reference(1, 3)));
+    capsule.nodes.pop();
+    let mut rejected = Vec::new();
+    for (name, valid, path) in [
+        ("current", current, "/incarnation/ref"),
+        ("capsule", capsule, "/deletions/0/incarnation/ref"),
+    ] {
+        for recovered in [false, true] {
+            let mut valid = valid.clone();
+            valid.recovered = recovered;
+            let encoded = LineageDescriptor::new(valid.clone()).unwrap();
+            assert_eq!(LineageDescriptor::parse(encoded.bytes()).unwrap(), encoded);
+
+            let wrong = reference(1, 33);
+            let mut value: Value = serde_json::from_slice(encoded.bytes()).unwrap();
+            *value.pointer_mut(path).unwrap() =
+                serde_json::from_slice(&wrong.to_json().unwrap()).unwrap();
+            let reader_rejected = parse_value(&value).is_err();
+            let mut invalid = valid.clone();
+            if name == "current" {
+                invalid.incarnation = Some(Incarnation::Absent(wrong));
+            } else {
+                invalid.deletions[0].incarnation = Some(Incarnation::Absent(wrong));
+            }
+            let writer_rejected = LineageDescriptor::new(invalid).is_err();
+            rejected.push((name, recovered, writer_rejected, reader_rejected));
+
+            // An unavailable origin does not assert equality with the retained reference.
+            valid.origin = None;
+            valid.recovered = true;
+            let unavailable = LineageDescriptor::new(valid).unwrap();
+            assert_eq!(
+                LineageDescriptor::parse(unavailable.bytes()).unwrap(),
+                unavailable
+            );
+        }
+    }
+    assert!(
+        rejected
+            .iter()
+            .all(|(_, _, writer, reader)| *writer && *reader),
+        "{rejected:?}"
+    );
+}

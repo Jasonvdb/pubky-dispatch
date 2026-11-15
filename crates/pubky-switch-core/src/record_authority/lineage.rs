@@ -210,7 +210,8 @@ impl LineageDescriptorBody {
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] for invalid references/times, capsule order, duplicate
-    /// digests, excess counts or a digest count different from the required reference union.
+    /// digests, excess counts, a digest count different from the required reference union,
+    /// or an absent incarnation that differs from the known absence origin.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         if self.deletions.len() > MAX_DELETION_CAPSULES
             || self.nodes.len() > MAX_LINEAGE_NODES
@@ -222,6 +223,20 @@ impl LineageDescriptorBody {
             || self.nodes.len() != self.required_references().len()
         {
             return invalid("Switch record lineage 3: invalid capsule order or node set shape");
+        }
+        // An absent incarnation names the absence origin (Switch record lineage 2).
+        if let Some(origin) = self.origin {
+            for incarnation in std::iter::once(self.incarnation)
+                .chain(self.deletions.iter().map(|capsule| capsule.incarnation))
+            {
+                if let Some(Incarnation::Absent(reference)) = incarnation
+                    && reference != origin
+                {
+                    return invalid(
+                        "Switch record lineage 2: absent incarnation differs from known origin",
+                    );
+                }
+            }
         }
         let mut out = Obj::new();
         out.int("v", 1)

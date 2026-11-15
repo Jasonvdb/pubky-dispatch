@@ -396,6 +396,18 @@ returns, its incomplete bit is binding again; this cannot undo a legitimate
 forgetting or absence assertion made while it was excluded. Later recovered
 contradictory material remains unresolved under Section 6.
 
+The retained barrier also preserves the record-witness upload mode of wire
+7.4.14. An authenticated registered own app can upload its outstanding record,
+lineage and origin evidence to the active service after a clean move or key
+change, even though the original provider-loss generation has ended. The source
+boundary is the `recovery_from` of the barrier's retained signed identity
+document, not an assumed loss of the current generation. Such uploads retain
+recovered/unknown restrictions and receive current application references; they
+cannot rewrite the frozen imported snapshot or complete a witness by themselves.
+A staged/frozen service does not merge them, and a response from a mode that
+ignored record members cannot account for those records. Non-record upload
+stages and the completion/cursor rules remain separate.
+
 A subsequent provider loss starts a new barrier from that recovery document's
 current apps. No completion from the older position satisfies the new one.
 An export carries the barrier, its originating signed identity document and all

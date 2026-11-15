@@ -439,6 +439,12 @@ isolated child does not establish parent absence. Invalid unsigned assertions
 allocate nothing. Additional evidence may strengthen restrictive facts, not
 manufacture a clean origin.
 
+The existing upload endpoint continues to account for record witnesses after
+clean moves and key changes, under the carried barrier and authenticated active
+registration (wire 7.4.14; record lineage 7). Its retained signed source document
+fixes the lost-generation boundary. This record-only continuation does not
+reopen admission staging or the separate claim/list recovery modes.
+
 A current record with its complete required lineage/origin is one indivisible
 upload unit under the existing 16 MiB request cap. Pack whole units, fewer per
 call when necessary; each protected unit is at most 7,864,320 bytes before its

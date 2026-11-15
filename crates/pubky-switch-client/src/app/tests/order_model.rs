@@ -257,7 +257,7 @@ fn test_order_model_processed_pairs_can_be_forgotten_only_by_their_protocol() {
             );
             let result = cx.forget_processed(sender, msg_id);
             if allowed {
-                assert_eq!(result.unwrap(), true);
+                assert!(result.unwrap());
                 assert_eq!(cx.into_writes().forget.len(), 2);
             } else {
                 assert!(matches!(result, Err(AppError::Refused(Refusal::Usage(_)))));

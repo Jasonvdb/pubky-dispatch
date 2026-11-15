@@ -59,7 +59,7 @@ const PENDING_PREFIX: &str = "opq/";
 /// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
 pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
-// Withdrawing one delivery rewrites at most every retained batch, removes its message
+// Giving up one delivery rewrites at most every retained batch, removes its message
 // index, and may keep one outbox record for its record job, together with its duty.
 const _: () = assert!(
     MAX_KEPT_BATCHES_BYTES as u64 * 6 / 5 + crate::store::MAX_VALUE_BYTES + (1 << 20)
@@ -1343,15 +1343,11 @@ pub(crate) async fn kept_queued(
 }
 
 impl App {
-    /// Remove every retained copy of one withdrawn delivery with its message index.
+    /// End a delivery with its hold and every retained copy that could queue it again.
     /// The retained batches with their keys take at most 14.4 MiB, as
     /// [`MAX_KEPT_BATCHES_BYTES`] bounds them; with one outbox value and the duty's
     /// bookkeeping they fit one store commit (Switch spec 11).
-    pub(crate) async fn remove_kept_delivery(
-        &self,
-        msg_id: &str,
-        tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    pub(crate) async fn end_delivery(&self, msg_id: &str, tx: &mut Tx) -> Result<(), AppError> {
         for (id, mut pending) in self.kept_batches().await? {
             let before = pending.queued.len();
             pending.queued.retain(|item| item.msg_id() != msg_id);
@@ -1359,7 +1355,8 @@ impl App {
                 tx.put(&pending_key(&id), &pending)?;
             }
         }
-        super::kept::forget_delivery(tx, msg_id)
+        super::kept::forget_delivery(tx, msg_id)?;
+        super::send::end_message_hold(tx, msg_id)
     }
 
     /// End, in `tx`, the holds ([`App::hold_message`]) of the messages the kept batch

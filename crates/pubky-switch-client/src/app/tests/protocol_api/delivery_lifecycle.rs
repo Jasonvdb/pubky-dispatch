@@ -559,3 +559,721 @@ async fn test_withdraw_message_commits_retained_copies_with_its_notice() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn test_hold_message_rejects_a_substituted_cached_envelope() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p
+            .join_on(
+                &p.alice,
+                "wallet",
+                protocol.clone(),
+                Arc::clone(&store) as Arc<dyn StateStore>,
+            )
+            .await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let held = wallet.sign_message(Pair::note(&p.bob, "held")).unwrap();
+        wallet.queue_signed(held.clone()).await.unwrap();
+        p.bob.switch().fail_next(Fault::Unreachable {
+            path: "inbox".into(),
+            after: 0,
+        });
+        assert!(matches!(
+            wallet.flush_message(held.msg_id()).await.unwrap(),
+            Some(Delivery::Queued { .. })
+        ));
+        p.bob.switch().lock().faults.clear();
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+        wallet.hold_message("sample", held.msg_id()).await.unwrap();
+        let other = wallet.sign_message(Pair::note(&p.bob, "unheld")).unwrap();
+        wallet.queue_signed(other.clone()).await.unwrap();
+        let mut backup: Value =
+            serde_json::from_slice(&wallet.backup().await.unwrap().to_bytes().unwrap()).unwrap();
+        let cached = backup["outbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["msg_id"] == held.msg_id())
+            .unwrap()["sealed"]
+            .clone();
+        assert!(!cached.is_null());
+        let item = backup["outbox"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|item| item["msg_id"] == other.msg_id())
+            .unwrap();
+        item["sealed"] = cached;
+        let backup = AppBackup::from_bytes(&serde_json::to_vec(&backup).unwrap()).unwrap();
+        for target in [Arc::new(MemoryStore::new()), Arc::clone(&store)] {
+            let result = App::restore(
+                p.env(&p.alice, target as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                &backup,
+            )
+            .await;
+            match result {
+                Err(AppError::InvalidData(_)) => {}
+                Ok(mut restored) => {
+                    restored.flush_message(other.msg_id()).await.unwrap();
+                    shop.receive(None).await.unwrap();
+                    assert!(
+                        !protocol
+                            .seen()
+                            .iter()
+                            .any(|message| message.msg_id == held.msg_id()),
+                        "another outbox item's cache delivered a held message"
+                    );
+                    panic!("a substituted cached envelope was accepted");
+                }
+                other => panic!("unexpected restore result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            wallet.held_messages("sample").await.unwrap(),
+            [held.msg_id()]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retention() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let signed = wallet.sign_message(Pair::note(&p.bob, "expires")).unwrap();
+        let other = wallet
+            .sign_message(Pair::note(&p.carol, "retained"))
+            .unwrap();
+        let batch = OpBatch::for_protocol("sample")
+            .op(OpKind::AllowPut {
+                pubky: [8; 32],
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            })
+            .local(LocalWrite::Put {
+                key: b"kept".to_vec(),
+                value: vec![1],
+            })
+            .queue(signed.clone())
+            .queue(other.clone());
+        keep_unsent(&p, &mut wallet, batch, true).await;
+        wallet.queue_stored(signed.plaintext()).await.unwrap();
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap();
+        p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert!(wallet.outbox_record(signed.msg_id()).await.is_none());
+        assert!(wallet.held_messages("sample").await.unwrap().is_empty());
+        assert_eq!(
+            undelivered(
+                &wallet.pending_duty_events().await.unwrap(),
+                signed.msg_id()
+            ),
+            [false]
+        );
+        p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+        wallet.resume_batches().await.unwrap();
+        assert!(
+            wallet.delivery(signed.msg_id()).await.unwrap().is_none(),
+            "an expired delivery was recreated by its retained producer"
+        );
+        assert!(wallet.outbox_record(other.msg_id()).await.is_some());
+        assert_eq!(
+            wallet.protocol_get("sample", b"kept").await.unwrap(),
+            Some(vec![1])
+        );
+        assert_eq!(
+            undelivered(
+                &wallet.pending_duty_events().await.unwrap(),
+                signed.msg_id()
+            ),
+            [false]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_resend_rejects_a_mismatched_outbox_index_before_writing() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let first = wallet.sign_message(Pair::note(&p.bob, "held")).unwrap();
+        wallet.queue_signed(first.clone()).await.unwrap();
+        wallet.hold_message("sample", first.msg_id()).await.unwrap();
+        let second = wallet.sign_message(Pair::note(&p.bob, "accepted")).unwrap();
+        let second = second.clone().with_record(RecordJob {
+            target: RecordTarget::new(items(), &second.hash()),
+            tag: b"sent".to_vec(),
+        });
+        wallet.queue_signed(second.clone()).await.unwrap();
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 1,
+        });
+        assert!(matches!(
+            wallet.flush_message(second.msg_id()).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        p.alice.switch().lock().faults.clear();
+        let item = wallet.outbox_record(second.msg_id()).await.unwrap();
+        let mut tx = wallet.tx().unwrap();
+        tx.put(&format!("out/{}", first.msg_id()), &item).unwrap();
+        tx.delete(&format!("out/{}", second.msg_id())).unwrap();
+        wallet.commit(tx).await.unwrap();
+        assert!(matches!(
+            wallet.resend(first.msg_id()).await,
+            Err(AppError::Store(StoreError::Corrupt))
+        ));
+        assert!(
+            wallet.outbox_record(second.msg_id()).await.is_none(),
+            "resend wrote under an unvalidated cached identity before refusing its index"
+        );
+    })
+    .await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalDelivery {
+    Accepted,
+    Refused,
+    Undeliverable,
+    TooLarge,
+}
+
+async fn terminal_delivery_keeps_unrelated_work(terminal: TerminalDelivery) {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    if !matches!(terminal, TerminalDelivery::Undeliverable) {
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+    }
+    // Establish the conversation before keeping an unrelated unanswered operation.
+    wallet.send(Pair::note(&p.bob, "first")).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "finished")).unwrap();
+    let other = wallet
+        .sign_message(Pair::note(&p.carol, "retained"))
+        .unwrap();
+    for n in 0..2 {
+        let batch = OpBatch::for_protocol("sample")
+            .op(OpKind::AllowPut {
+                pubky: [8 + n; 32],
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            })
+            .local(LocalWrite::Put {
+                key: vec![n],
+                value: vec![n],
+            })
+            .queue(signed.clone())
+            .queue(other.clone());
+        keep_unsent(&p, &mut wallet, batch, n == 0).await;
+    }
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    wallet.hold_message("sample", other.msg_id()).await.unwrap();
+    match terminal {
+        TerminalDelivery::Refused => p.bob.switch().fail_next(Fault::Error {
+            path: "inbox".into(),
+            code: ErrorCode::TooLarge,
+            current: Value::Null,
+        }),
+        TerminalDelivery::TooLarge => {
+            store.refuse_puts_as_too_large(Some(format!("out/{}", signed.msg_id()).as_bytes()));
+        }
+        _ => {}
+    }
+    let result = wallet.flush_message(signed.msg_id()).await.unwrap();
+    match terminal {
+        TerminalDelivery::Accepted => assert!(matches!(result, Some(Delivery::Accepted { .. }))),
+        TerminalDelivery::Refused => assert!(matches!(result, Some(Delivery::Failed { .. }))),
+        TerminalDelivery::TooLarge => assert!(result.is_none()),
+        TerminalDelivery::Undeliverable => {
+            assert!(matches!(result, Some(Delivery::Queued { .. })));
+            wallet
+                .hold_message("sample", signed.msg_id())
+                .await
+                .unwrap();
+            p.clock.advance_ms(45 * DAY_MS);
+            assert!(
+                wallet
+                    .flush_message(signed.msg_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    let pending = wallet.kept_batches().await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending.iter().all(|(_, batch)| {
+            batch
+                .queued
+                .iter()
+                .all(|item| item.msg_id() != signed.msg_id())
+        }),
+        "{terminal:?} left a retained producer for the ended delivery"
+    );
+    assert!(pending.iter().all(|(_, batch)| {
+        batch
+            .queued
+            .iter()
+            .any(|item| item.msg_id() == other.msg_id())
+    }));
+    wallet.resume_batches().await.unwrap();
+    for n in 0..2 {
+        assert_eq!(
+            wallet.protocol_get("sample", &[n]).await.unwrap(),
+            Some(vec![n])
+        );
+    }
+    assert!(wallet.outbox_record(other.msg_id()).await.is_some());
+    assert_eq!(wallet.held_messages("sample").await.unwrap().len(), 1);
+    assert_eq!(
+        undelivered(
+            &wallet.pending_duty_events().await.unwrap(),
+            signed.msg_id()
+        ),
+        if matches!(
+            terminal,
+            TerminalDelivery::Undeliverable | TerminalDelivery::TooLarge
+        ) {
+            vec![false]
+        } else {
+            vec![]
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_acceptance_retires_all_retained_producers() {
+    Box::pin(terminal_delivery_keeps_unrelated_work(
+        TerminalDelivery::Accepted,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_refusal_retires_all_retained_producers() {
+    Box::pin(terminal_delivery_keeps_unrelated_work(
+        TerminalDelivery::Refused,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_undeliverable_retires_all_retained_producers() {
+    Box::pin(terminal_delivery_keeps_unrelated_work(
+        TerminalDelivery::Undeliverable,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_store_bound_retires_all_retained_producers() {
+    Box::pin(terminal_delivery_keeps_unrelated_work(
+        TerminalDelivery::TooLarge,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn test_resend_rejects_sent_identity_before_queueing() {
+    Box::pin(async {
+        for changed in ["index", "kind", "to", "plaintext"] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let first = wallet.sign_message(Pair::note(&p.bob, "other")).unwrap();
+            let second = wallet.sign_message(Pair::note(&p.bob, "accepted")).unwrap();
+            wallet.queue_signed(second.clone()).await.unwrap();
+            assert!(matches!(
+                wallet.flush_message(second.msg_id()).await.unwrap(),
+                Some(Delivery::Accepted { .. })
+            ));
+            let mut sent: Value = wallet
+                .reader()
+                .get(&format!("sent/{}", second.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            let msg_id = if changed == "index" {
+                first.msg_id()
+            } else {
+                second.msg_id()
+            };
+            match changed {
+                "index" => {}
+                "kind" => sent["kind"] = Value::String("retired.note".into()),
+                "to" => {
+                    sent["to"] =
+                        Value::String(pubky_switch_core::enc::b64(&p.carol.identity().public()))
+                }
+                "plaintext" => {
+                    sent["plaintext"] =
+                        Value::String(pubky_switch_core::enc::b64(&first.plaintext().encode()))
+                }
+                _ => unreachable!(),
+            }
+            let mut tx = wallet.tx().unwrap();
+            tx.put(&format!("sent/{msg_id}"), &sent).unwrap();
+            wallet.commit(tx).await.unwrap();
+            assert!(
+                matches!(
+                    wallet.resend(msg_id).await,
+                    Err(AppError::Store(StoreError::Corrupt))
+                ),
+                "{changed}"
+            );
+            assert!(
+                wallet.outbox_record(second.msg_id()).await.is_none(),
+                "{changed} queued before identity validation"
+            );
+            assert!(wallet.outbox_record(first.msg_id()).await.is_none());
+        }
+    })
+    .await;
+}
+
+async fn cached_outbox(p: &Pair, wallet: &mut App, signed: &SignedMessage) -> Value {
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        wallet.flush_message(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    p.bob.switch().lock().faults.clear();
+    let item: Value = wallet
+        .reader()
+        .get(&format!("out/{}", signed.msg_id()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!item["sealed"].is_null());
+    item
+}
+
+#[tokio::test]
+async fn test_hold_message_cached_restore_preserves_exact_retry_bytes() {
+    Box::pin(async {
+        for in_place in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(
+                    &p.alice,
+                    "wallet",
+                    protocol.clone(),
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                )
+                .await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let signed = wallet
+                .sign_message(Pair::note(&p.bob, "same bytes"))
+                .unwrap();
+            let cached = cached_outbox(&p, &mut wallet, &signed).await;
+            let expected = pubky_switch_core::enc::unb64(
+                cached["sealed"]["envelope"]["bytes"].as_str().unwrap(),
+            )
+            .unwrap();
+            wallet
+                .hold_message("sample", signed.msg_id())
+                .await
+                .unwrap();
+            let backup = wallet.backup().await.unwrap();
+            drop(wallet);
+            let target = if in_place {
+                store
+            } else {
+                Arc::new(MemoryStore::new())
+            };
+            let mut restored = App::restore(
+                p.env(&p.alice, target as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                &backup,
+            )
+            .await
+            .unwrap();
+            restored.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+            restored
+                .release_message("sample", signed.msg_id())
+                .await
+                .unwrap();
+            p.bob.switch().fail_next(Fault::Unreachable {
+                path: "inbox".into(),
+                after: 0,
+            });
+            restored.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.bob.switch().unreached_bodies().last(), Some(&expected));
+            p.bob.switch().lock().faults.clear();
+            assert!(matches!(
+                restored.flush_message(signed.msg_id()).await.unwrap(),
+                Some(Delivery::Accepted { .. })
+            ));
+            shop.receive(None).await.unwrap();
+            assert_eq!(
+                protocol
+                    .seen()
+                    .iter()
+                    .filter(|message| message.msg_id == signed.msg_id())
+                    .count(),
+                1
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_hold_message_cached_identity_is_checked_at_live_and_load_boundaries() {
+    Box::pin(async {
+        for path in ["load", "reload", "flush", "resend", "backup", "hold"] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(
+                    &p.alice,
+                    "wallet",
+                    protocol.clone(),
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                )
+                .await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let held = wallet.sign_message(Pair::note(&p.bob, "held")).unwrap();
+            let cached = cached_outbox(&p, &mut wallet, &held).await;
+            wallet.hold_message("sample", held.msg_id()).await.unwrap();
+            let other = wallet.sign_message(Pair::note(&p.bob, "unheld")).unwrap();
+            wallet.queue_signed(other.clone()).await.unwrap();
+            let mut item: Value = wallet
+                .reader()
+                .get(&format!("out/{}", other.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            item["sealed"] = cached["sealed"].clone();
+            let mut tx = wallet.tx().unwrap();
+            tx.put(&format!("out/{}", other.msg_id()), &item).unwrap();
+            wallet.commit(tx).await.unwrap();
+            let result = match path {
+                "load" => App::load(
+                    p.env(&p.alice, store as Arc<dyn StateStore>),
+                    protocol.clone(),
+                    config(),
+                    wallet.app_id(),
+                )
+                .await
+                .map(|_| ()),
+                "reload" => wallet.reload_now().await,
+                "flush" => wallet.flush_message(other.msg_id()).await.map(|_| ()),
+                "resend" => wallet.resend(other.msg_id()).await.map(|_| ()),
+                "backup" => wallet.backup().await.map(|_| ()),
+                "hold" => wallet
+                    .hold_message("sample", other.msg_id())
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(AppError::Store(StoreError::Corrupt))),
+                "{path}: {result:?}"
+            );
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_expired_resend_keeps_its_record_without_requeueing() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let signed = wallet.sign_message(Pair::note(&p.bob, "accepted")).unwrap();
+        let signed = signed.clone().with_record(RecordJob {
+            target: RecordTarget::new(items(), &signed.hash()),
+            tag: b"sent".to_vec(),
+        });
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 1,
+        });
+        assert!(matches!(
+            wallet.flush_message(signed.msg_id()).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        p.alice.switch().lock().faults.clear();
+        // Keep the accepted item's record job pending while its re-send is queued.
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+        p.bob.switch().fail_next(Fault::Unreachable {
+            path: "inbox".into(),
+            after: 0,
+        });
+        wallet.resend(signed.msg_id()).await.unwrap();
+        p.alice.switch().lock().faults.clear();
+        p.bob.switch().lock().faults.clear();
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap();
+        p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        let item = wallet.outbox_record(signed.msg_id()).await.unwrap();
+        assert!(!item.delivery_owed());
+        assert_eq!(
+            undelivered(
+                &wallet.pending_duty_events().await.unwrap(),
+                signed.msg_id()
+            ),
+            [true]
+        );
+        wallet
+            .resend_since(&p.bob.identity().public(), 0)
+            .await
+            .unwrap();
+        assert!(
+            !wallet
+                .outbox_record(signed.msg_id())
+                .await
+                .unwrap()
+                .delivery_owed(),
+            "an automatic resend recreated a delivery whose record job remained owed"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_lifecycle_expiry_commits_producers_with_its_notice() {
+    Box::pin(async {
+        for (fault, applied) in [
+            (StoreFault::FailBefore(1), false),
+            (StoreFault::FailAfter(1), true),
+        ] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let inner = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(
+                    &p.alice,
+                    "wallet",
+                    protocol.clone(),
+                    Arc::clone(&inner) as Arc<dyn StateStore>,
+                )
+                .await;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "expires")).unwrap();
+            let batch = OpBatch::for_protocol("sample")
+                .op(OpKind::AllowPut {
+                    pubky: [8; 32],
+                    kind: pubky_switch_core::ops::AllowKind::Conversation,
+                })
+                .local(LocalWrite::Put {
+                    key: b"kept".to_vec(),
+                    value: vec![1],
+                })
+                .queue(signed.clone());
+            keep_unsent(&p, &mut wallet, batch, true).await;
+            wallet.queue_stored(signed.plaintext()).await.unwrap();
+            wallet
+                .hold_message("sample", signed.msg_id())
+                .await
+                .unwrap();
+            let app_id = wallet.app_id();
+            p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+            drop(wallet);
+            let faulty = Arc::new(FaultStore::new(
+                Arc::clone(&inner) as Arc<dyn StateStore>,
+                fault,
+            ));
+            let mut wallet = App::load(
+                p.env(&p.alice, faulty as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                app_id,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                wallet.flush_message(signed.msg_id()).await,
+                Err(AppError::Store(_))
+            ));
+            drop(wallet);
+            let mut loaded = App::load(
+                p.env(&p.alice, inner as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                app_id,
+            )
+            .await
+            .unwrap();
+            let retained = loaded
+                .kept_batches()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, batch)| {
+                    batch
+                        .queued
+                        .iter()
+                        .any(|item| item.msg_id() == signed.msg_id())
+                });
+            assert_eq!(retained, !applied);
+            assert_eq!(
+                loaded.outbox_record(signed.msg_id()).await.is_some(),
+                !applied
+            );
+            assert_eq!(
+                !loaded.held_messages("sample").await.unwrap().is_empty(),
+                !applied
+            );
+            assert_eq!(
+                undelivered(
+                    &loaded.pending_duty_events().await.unwrap(),
+                    signed.msg_id()
+                ),
+                if applied { vec![false] } else { vec![] }
+            );
+        }
+    })
+    .await;
+}

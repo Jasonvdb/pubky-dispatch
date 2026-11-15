@@ -1493,9 +1493,7 @@ impl App {
             }
             send::put_message_hold(tx, msg_id)?;
         }
-        let now = self.now();
         for (msg_id, resend) in &backup.outbox_left_out {
-            send::note_given_up(tx, msg_id, now)?;
             self.keep_duty(
                 tx,
                 events::Duty::MessageUndelivered {
@@ -2926,6 +2924,9 @@ impl App {
         // longer owed (`App::hold_message`).
         if let events::Duty::MessageUndelivered { msg_id, .. } = &duty {
             send::end_message_hold(tx, msg_id)?;
+            // Retaining an accepted item's record job never queues its ended delivery
+            // again through the sent-message cache (Switch spec 11).
+            send::note_given_up(tx, msg_id, self.now())?;
         }
         let kept = events::KeptDuty { to, duty };
         tx.put(&key::duty(n), &kept)?;

@@ -491,8 +491,7 @@ pub struct OutboxReport {
 /// The envelope sealed for one try, and where.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Sealed {
-    #[serde(with = "serde_b64_vec")]
-    envelope: Vec<u8>,
+    envelope: pubky_switch_core::envelope::SealedEnvelope,
     apps_version: u64,
     origin: String,
     generation: u64,
@@ -601,35 +600,14 @@ impl OutboxItem {
         meta: &super::state::Meta,
         cert: &pubky_switch_core::records::AppCert,
     ) -> bool {
-        let Ok(plaintext) = self.plaintext() else {
-            return false;
-        };
-        if plaintext.sender_app_id() != meta.app_id
-            || plaintext
-                .verify_signature(&cert.signing_key(), &self.to)
-                .is_err()
-        {
-            return false;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(plaintext.json()) else {
-            return false;
-        };
-        let Some(body) = value.get("body").and_then(Value::as_object) else {
-            return false;
-        };
-        // These are this app's already-signed bytes. Retaining them reads only the
-        // common fields; their original protocol may no longer be registered.
-        let opaque: Vec<_> = body
-            .keys()
-            .map(|member| OpaqueMember { kind: None, member })
-            .collect();
-        Message::parse(plaintext.json(), &opaque).is_ok_and(|message| {
-            message.kind == self.kind
-                && message.msg_id == self.msg_id
-                && message.to == self.to
-                && message.from.identity == meta.identity
-                && message.from.app_id == meta.app_id
-        })
+        own_message(&self.plaintext, &self.to, meta, cert)
+            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+            && self.sealed.as_ref().is_none_or(|sealed| {
+                sealed
+                    .envelope
+                    .matches_plaintext(&self.plaintext)
+                    .unwrap_or(false)
+            })
     }
 
     fn complete(&self) -> bool {
@@ -807,6 +785,15 @@ struct SentStored {
 }
 
 impl SentStored {
+    fn is_own(
+        &self,
+        meta: &super::state::Meta,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> bool {
+        own_message(&self.plaintext, &self.to, meta, cert)
+            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+    }
+
     /// The re-sends' acceptance times, ascending.
     fn resent_ascending(&self) -> Vec<u64> {
         let mut times = self.resent.clone();
@@ -846,6 +833,34 @@ enum Tried {
     Failed(String),
 }
 
+/// Read this app's authenticated common message fields without requiring the original
+/// protocol to remain registered (Switch wire 5.1).
+fn own_message(
+    bytes: &[u8],
+    to: &[u8; 32],
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Option<Message> {
+    let plaintext = MessagePlaintext::decode(bytes).ok()?;
+    if plaintext.sender_app_id() != meta.app_id
+        || plaintext.verify_signature(&cert.signing_key(), to).is_err()
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(plaintext.json()).ok()?;
+    let body = value.get("body")?.as_object()?;
+    // Only the common fields are read from these already-authenticated bytes.
+    let opaque: Vec<_> = body
+        .keys()
+        .map(|member| OpaqueMember { kind: None, member })
+        .collect();
+    let message = Message::parse(plaintext.json(), &opaque).ok()?;
+    (message.to == *to
+        && message.from.identity == meta.identity
+        && message.from.app_id == meta.app_id)
+        .then_some(message)
+}
+
 fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
@@ -862,6 +877,11 @@ pub(crate) async fn validate_outbox(
             return Err(store_corrupt());
         }
     }
+    for (msg_id, sent) in reader.scan::<SentStored>(SENT_PREFIX).await? {
+        if msg_id != sent.msg_id || !sent.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
     for item in super::batch::kept_queued(reader).await? {
         if !item.is_own(meta, cert) {
             return Err(store_corrupt());
@@ -871,6 +891,26 @@ pub(crate) async fn validate_outbox(
 }
 
 impl App {
+    async fn read_outbox(&self, msg_id: &str) -> Result<Option<OutboxItem>, AppError> {
+        let item = self.reader().get::<OutboxItem>(&out_key(msg_id)).await?;
+        if item.as_ref().is_some_and(|item| {
+            item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
+        }) {
+            return Err(store_corrupt());
+        }
+        Ok(item)
+    }
+
+    async fn read_sent(&self, msg_id: &str) -> Result<Option<SentStored>, AppError> {
+        let sent = self.reader().get::<SentStored>(&sent_key(msg_id)).await?;
+        if sent.as_ref().is_some_and(|sent| {
+            sent.msg_id != msg_id || !sent.is_own(&self.state.meta, &self.state.cert)
+        }) {
+            return Err(store_corrupt());
+        }
+        Ok(sent)
+    }
+
     // ---------------------------------------------------------------------------------
     // Queueing
 
@@ -1262,8 +1302,7 @@ impl App {
                 Some(kept) => tx.put(&out_key(&msg_id), kept)?,
                 None => tx.delete(&out_key(&msg_id))?,
             }
-            self.remove_kept_delivery(&msg_id, &mut tx).await?;
-            note_given_up(&mut tx, &msg_id, now)?;
+            self.end_delivery(&msg_id, &mut tx).await?;
             self.keep_duty_for(&mut tx, to, duty)?;
             self.commit(tx).await?;
             withdrawn.push(msg_id);
@@ -1278,8 +1317,7 @@ impl App {
                     continue;
                 }
                 let mut tx = self.tx()?;
-                self.remove_kept_delivery(&msg_id, &mut tx).await?;
-                note_given_up(&mut tx, &msg_id, now)?;
+                self.end_delivery(&msg_id, &mut tx).await?;
                 let to = self.owners_of_kind(&item.kind);
                 self.keep_duty_for(
                     &mut tx,
@@ -1538,10 +1576,9 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             if !self.ask_resend_of_queued(msg_id).await? {
-                let sent: SentStored =
-                    self.reader().get(&sent_key(msg_id)).await?.ok_or_else(|| {
-                        AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
-                    })?;
+                let sent: SentStored = self.read_sent(msg_id).await?.ok_or_else(|| {
+                    AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
+                })?;
                 self.queue_resend(&sent).await?;
             }
             self.flush_item(msg_id).await?;
@@ -1555,7 +1592,7 @@ impl App {
     /// A message still in the outbox: one already accepted, whose other jobs are owed, is
     /// marked to be sealed and sent again. Returns whether it is in the outbox.
     async fn ask_resend_of_queued(&mut self, msg_id: &str) -> Result<bool, AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
         };
         if let Some(accepted) = item.accepted_at_ms
@@ -1625,7 +1662,10 @@ impl App {
         since_ms: u64,
     ) -> Result<(), AppError> {
         let mut queued = 0u64;
-        for (_, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+        for (msg_id, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+            if msg_id != sent.msg_id || !sent.is_own(&self.state.meta, &self.state.cert) {
+                return Err(store_corrupt());
+            }
             let last = sent
                 .resent
                 .iter()
@@ -1669,7 +1709,7 @@ impl App {
     ///
     /// A store failure.
     pub async fn delivery(&self, msg_id: &str) -> Result<Option<Delivery>, AppError> {
-        if let Some(item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? {
+        if let Some(item) = self.read_outbox(msg_id).await? {
             return Ok(Some(match (&item.failed, item.accepted_at_ms) {
                 (Some((reason, failed_at_ms)), _) => Delivery::Failed {
                     reason: reason.clone(),
@@ -1686,7 +1726,7 @@ impl App {
                 },
             }));
         }
-        if let Some(sent) = self.reader().get::<SentStored>(&sent_key(msg_id)).await? {
+        if let Some(sent) = self.read_sent(msg_id).await? {
             return Ok(Some(Delivery::Accepted {
                 accepted_at_ms: sent.first_ms,
             }));
@@ -1709,7 +1749,10 @@ impl App {
         until_ms: u64,
     ) -> Result<Vec<SentMessage>, AppError> {
         let mut out = Vec::new();
-        for (_, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+        for (msg_id, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+            if msg_id != sent.msg_id || !sent.is_own(&self.state.meta, &self.state.cert) {
+                return Err(store_corrupt());
+            }
             let within = std::iter::once(sent.first_ms)
                 .chain(sent.resent.iter().copied())
                 .any(|at| at >= from_ms && at <= until_ms);
@@ -1957,7 +2000,7 @@ impl App {
     /// message never accepted is deleted, plaintext and all; one accepted before keeps its
     /// record while its record job is owed, and only the re-send is given up.
     async fn give_up_too_large(&mut self, msg_id: &str) -> Result<(), AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(());
         };
         let resend =
@@ -1972,10 +2015,10 @@ impl App {
             let mut tx = self.tx()?;
             if gone {
                 tx.delete(&out_key(msg_id))?;
-                note_given_up(&mut tx, msg_id, self.now())?;
             } else {
                 tx.put(&out_key(msg_id), &item)?;
             }
+            self.end_delivery(msg_id, &mut tx).await?;
             let to = self.owners_of_kind(&item.kind);
             self.keep_duty_for(
                 &mut tx,
@@ -2000,12 +2043,9 @@ impl App {
     /// the delivery, and the record job. Each is a bounded call of its own, and a try once
     /// begun goes whole, so no job of a message waits behind another of its jobs.
     async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
         };
-        if item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert) {
-            return Err(store_corrupt());
-        }
         if item.failed.is_some() {
             return Ok(false);
         }
@@ -2034,9 +2074,9 @@ impl App {
                     Some(kept) => tx.put(&out_key(msg_id), kept)?,
                     None => {
                         tx.delete(&out_key(msg_id))?;
-                        note_given_up(&mut tx, msg_id, self.now())?;
                     }
                 }
+                self.end_delivery(msg_id, &mut tx).await?;
                 self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 return Ok(true);
@@ -2085,7 +2125,7 @@ impl App {
                     item.failed = Some((why, self.now()));
                     let mut tx = self.tx()?;
                     tx.put(&out_key(&item.msg_id), &item)?;
-                    end_message_hold(&mut tx, &item.msg_id)?;
+                    self.end_delivery(&item.msg_id, &mut tx).await?;
                     self.commit(tx).await?;
                 }
             }
@@ -2140,10 +2180,10 @@ impl App {
         let mut tx = self.tx()?;
         if gone {
             tx.delete(&out_key(&item.msg_id))?;
-            note_given_up(&mut tx, &item.msg_id, self.now())?;
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
+        self.end_delivery(&item.msg_id, &mut tx).await?;
         // A duty event for the protocol of the message's kind, kept in the commit that
         // gives the delivery up.
         let to = self.owners_of_kind(&item.kind);
@@ -2181,13 +2221,9 @@ impl App {
         item.clear_undeliverable();
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
-        // Delivered: the delivery's hold, if any, ends with it (`App::hold_message`).
-        end_message_hold(&mut tx, &item.msg_id)?;
-        let sent = match self
-            .reader()
-            .get::<SentStored>(&sent_key(&item.msg_id))
-            .await?
-        {
+        // No retained producer can recreate this completed delivery after retention.
+        self.end_delivery(&item.msg_id, &mut tx).await?;
+        let sent = match self.read_sent(&item.msg_id).await? {
             Some(mut sent) => {
                 if at != sent.first_ms && !sent.resent.contains(&at) {
                     sent.resent.push(at);
@@ -2448,14 +2484,18 @@ impl App {
             let result = if own {
                 let result = self
                     .client
-                    .append(sealed.envelope.clone(), sealed.apps_version, None)
+                    .append(
+                        sealed.envelope.as_bytes().to_vec(),
+                        sealed.apps_version,
+                        None,
+                    )
                     .await;
                 self.take(result).await
             } else {
                 let client = self.peer_client(&to, &doc)?;
                 client
                     .append(
-                        sealed.envelope.clone(),
+                        sealed.envelope.as_bytes().to_vec(),
                         sealed.apps_version,
                         invite.as_deref(),
                     )
@@ -2572,7 +2612,12 @@ impl App {
         let message = Message::parse(plaintext.json(), &opaque)?;
         let (routes, apps_version) = self.routes(&item.to, &message, invite).await?;
         let recipients: Vec<_> = routes.iter().map(|r: &Route| r.recipient).collect();
-        let envelope = plaintext.seal(&item.to, &recipients, item.notify)?;
+        let envelope = pubky_switch_core::envelope::seal_retained(
+            &item.to,
+            &recipients,
+            &plaintext.encode(),
+            item.notify,
+        )?;
         let doc = self.peer_identity(&item.to, false).await?;
         item.sealed = Some(Sealed {
             envelope,
@@ -2604,10 +2649,7 @@ impl App {
     /// The record job: the protocol builds the record's next value from what the app holds,
     /// written compare-and-swap.
     async fn record_job(&mut self, item: &OutboxItem, job: &KeptJob) -> Result<(), AppError> {
-        let kept = self
-            .reader()
-            .get::<SentStored>(&sent_key(&item.msg_id))
-            .await?;
+        let kept = self.read_sent(&item.msg_id).await?;
         let sent = SentMessage {
             to: item.to,
             kind: item.kind.clone(),
@@ -2760,7 +2802,17 @@ mod tests {
             invite_code: None,
             conversation: false,
             sealed: Some(Sealed {
-                envelope: vec![7],
+                envelope: pubky_switch_core::envelope::seal_retained(
+                    &[1; 32],
+                    &[pubky_switch_core::envelope::Recipient::new(
+                        pubky_switch_core::keys::ReceiveKey::generate(0)
+                            .unwrap()
+                            .public,
+                    )],
+                    &[],
+                    false,
+                )
+                .unwrap(),
                 apps_version: 1,
                 origin: "https://bob.example".into(),
                 generation: 1,

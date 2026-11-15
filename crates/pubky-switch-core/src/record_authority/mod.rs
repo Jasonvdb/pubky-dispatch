@@ -1,16 +1,25 @@
-//! Protected record encodings and origin statement authentication (Switch wire 6.9,
-//! record origins 1, 3 and 5).
+//! Record lineage metadata, protected encodings and statement authentication (Switch wire
+//! 6.9, record lineage 3 and record origins 1, 3 and 5).
 //!
 //! Parsing or authenticating these facts does not establish admission, absence, current
 //! initial authority, certificate standing, continuity or recovery completeness. A reader
 //! also needs the request-bound current response and the complete record lineage checks
 //! (Switch record lineage 4). These types do not perform account state transitions.
 
+mod lineage;
+mod lineage_statement;
 mod origin;
 mod policy;
 mod reference;
 mod statement;
 
+pub use lineage::{
+    CurrentApplication, DeletionCapsule, Incarnation, LineageDescriptor, LineageDescriptorBody,
+    MAX_DELETION_CAPSULES, MAX_LINEAGE_NODES, MAX_PROTECTED_DESCRIPTOR_BYTES,
+};
+pub use lineage_statement::{
+    LineageStatement, LineageStatementBody, MAX_PROTECTED_LINEAGE_STATEMENT_BYTES,
+};
 pub use origin::{
     ChildState, Initialization, KnownOrigin, MAX_ORIGIN_SLOT_BYTES, OriginSlot, OriginState,
     initial_value_hash,

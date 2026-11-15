@@ -1402,6 +1402,7 @@ impl App {
                 let outcome = protocol.receive(&message, &mut cx);
                 (outcome, cx.into_writes())
             };
+            let consume = matches!(outcome, Outcome::Consume);
             let mut effect = match outcome {
                 Outcome::Drop { reason } => {
                     self.note_processed(entry, &received, &[], read)?;
@@ -1421,6 +1422,7 @@ impl App {
                 // Passed, not processed: no processed pair, so a re-send is delivered again
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
+                Outcome::Consume => Effect::default(),
                 Outcome::AwaitKey { data_epoch } => {
                     match self.await_key(entry, &received, data_epoch, read).await? {
                         Some(step) => return Ok(step),
@@ -1429,7 +1431,7 @@ impl App {
                 }
                 Outcome::Apply(effect) => effect,
             };
-            if writes.not_now.is_some() {
+            if !consume && writes.not_now.is_some() {
                 // A write the effect needs can't be sealed yet, for want of the current data
                 // epoch's key: the entry waits for it as for `Outcome::AwaitKey` (Switch spec
                 // 3.5, 8.2).
@@ -1450,7 +1452,9 @@ impl App {
                 forget,
             } = writes;
             let forget: Vec<String> = forget.into_iter().collect();
-            effect.ops = ops.into_iter().chain(effect.ops).collect();
+            if !consume {
+                effect.ops = ops.into_iter().chain(effect.ops).collect();
+            }
             effect.local = local.into_iter().chain(effect.local).collect();
             // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
             // for"), its forgets with them: an effect over the bound is too large, stored and
@@ -1503,11 +1507,20 @@ impl App {
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
-                self.note_processed(entry, &received, &effect.local, read)?;
+                if consume {
+                    // The input goes with only the protocol's local decision. No processed
+                    // pair is kept and existing duties remain owed (Switch spec 11).
+                    read.tx.local(&effect.local)?;
+                    self.unpark(entry.stored, &mut read.tx)?;
+                } else {
+                    self.note_processed(entry, &received, &effect.local, read)?;
+                }
                 for key in &forget {
                     read.tx.delete(key)?;
                 }
-                self.received_event(entry, &received);
+                if !consume {
+                    self.received_event(entry, &received);
+                }
                 return Ok(Step::Pass);
             }
             let written = Written {

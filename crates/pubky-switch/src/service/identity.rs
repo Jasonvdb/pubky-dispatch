@@ -12,7 +12,7 @@ use pubky_switch_core::{
 };
 use serde_json::{Value, json};
 
-use super::{Answer, Service, marking::Judged, store_error};
+use super::{Answer, Service, marking::Judged, store_error, verdict};
 use crate::{
     http::{
         SwitchRequest,
@@ -234,15 +234,20 @@ impl Service {
         trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
-        let temporary = || ApiError::unavailable("7.6: a temporary failure");
-        let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        let refused = || match judged.judgement.verdict {
+            verdict::Verdict::Failing { notice, .. } | verdict::Verdict::Bounded { notice, .. } => {
+                self.notice(&txn.head().id, notice)
+            }
+            _ => ApiError::unavailable("7.6: a temporary failure"),
+        };
         let floor = judged
-            .account
-            .map_or(0, |account| account.generation())
-            .max(judged.mark().map_or(0, |mark| mark.generation));
-        if doc.generation() <= floor || recovery_from.checked_add(1) != Some(doc.generation()) {
-            return Err(temporary());
+            .judgement
+            .recovery_floor
+            .max(held.map_or(0, IdentityDoc::generation));
+        if !verdict::recovery_starts_above(floor, doc.generation(), doc.body().recovery_from) {
+            return Err(refused());
         }
+        let recovery_from = doc.body().recovery_from.ok_or_else(refused)?;
         // Exempt from the compare-and-swap of `prev` only: it still needs a higher version
         // than the one held, else `409 stale_identity` with that copy (Switch wire 3.3).
         if let Some(held) = held

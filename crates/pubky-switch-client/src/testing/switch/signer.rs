@@ -427,7 +427,10 @@ impl Inner {
         // 7.3, Table 2): it starts the account afresh, so it is judged as the first document
         // of the account it starts.
         let mut started_afresh = false;
-        if self.notice().is_some() {
+        if let Some(notice) = self.notice() {
+            if !self.starts_recovery(doc.generation(), doc.body().recovery_from) {
+                return Ok(super::marks::notice_answer(&notice));
+            }
             // Exempt from the compare-and-swap of `prev` only: it still needs a higher version
             // than the one held (Switch wire 3.3).
             if self
@@ -1429,5 +1432,110 @@ mod tests {
         let sig = pubky_switch_core::enc::b64(&[0u8; 64]);
         assert!(read_handover(&json!({ "envelopes": [], "sig": sig })).is_some());
         assert!(read_handover(&json!({ "envelopes": [], "sig": sig, "x": 1 })).is_none());
+    }
+
+    fn recovery_beside_earlier_chain(generation: u64) -> (Arc<ScriptedSwitch>, Vec<u8>) {
+        use pubky_switch_core::{
+            keys::IdentityKey,
+            records::{IdentityBody, IdentityPolicy, Inbox},
+        };
+        let identity = IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(&identity, [2; 32], Arc::new(TestClock::new(1_000)));
+        let mut inner = switch.lock();
+        let first = IdentityDoc::sign(
+            &identity,
+            IdentityBody::first(
+                identity.public(),
+                [3; 16],
+                Inbox::new(SWITCH_ORIGIN, inner.service.verifying_key().to_bytes()),
+                IdentityPolicy::default(),
+            ),
+        )
+        .unwrap();
+        let delivery = |doc: &IdentityDoc| {
+            IdentityDelivery {
+                identity: doc.signed().clone(),
+                prev: None,
+            }
+            .to_json()
+        };
+        assert_eq!(inner.put_identity(&delivery(&first)).unwrap().0, 200);
+        let mut newer = first.body().clone();
+        newer.version += 1;
+        newer.generation = 3;
+        newer.recovery_from = Some(2);
+        let newer = IdentityDoc::sign(&identity, newer).unwrap();
+        // A valid current document restored beside its earlier chain (Switch wire 7.3).
+        inner.doc = Some(newer.clone());
+        inner.marks.slot = super::super::marks::MarkSlot::Missing;
+        let mut candidate = newer.body().clone();
+        candidate.version += 1;
+        candidate.generation = generation;
+        candidate.recovery_from = Some(generation - 1);
+        let candidate = IdentityDoc::sign(&identity, candidate).unwrap();
+        drop(inner);
+        (switch, delivery(&candidate))
+    }
+
+    #[test]
+    fn test_scripted_recovery_route_uses_held_document_floor() {
+        for generation in [2, 3] {
+            let (switch, body) = recovery_beside_earlier_chain(generation);
+            let mut inner = switch.lock();
+            let request = crate::transport::Request {
+                method: "PUT".into(),
+                origin: SWITCH_ORIGIN.into(),
+                path_and_query: "/v1/alice/identity".into(),
+                headers: Vec::new(),
+                body,
+                timeout: crate::transport::TimeoutClass::default(),
+            };
+            let answer = inner.step_two(&request).expect("recovery notice");
+            let body: Value = serde_json::from_slice(&answer.body).unwrap();
+            assert_eq!(answer.status, 503);
+            assert_eq!(body["code"], "recovery_required");
+            assert_eq!(
+                body["current"],
+                json!({"generation":1,"reason":"mark_lost","permanent":false})
+            );
+            assert_eq!(inner.doc.as_ref().unwrap().generation(), 3);
+        }
+    }
+
+    #[test]
+    fn test_scripted_recovery_write_uses_held_document_floor() {
+        for generation in [2, 3] {
+            let (switch, body) = recovery_beside_earlier_chain(generation);
+            let mut inner = switch.lock();
+            let tip = inner.tip;
+            let (status, answer) = inner.put_identity(&body).unwrap();
+            assert_eq!(status, 503);
+            assert_eq!(answer["code"], "recovery_required");
+            assert_eq!(
+                answer["current"],
+                json!({"generation":1,"reason":"mark_lost","permanent":false})
+            );
+            assert_eq!(inner.doc.as_ref().unwrap().generation(), 3);
+            assert_eq!(inner.tip, tip);
+            assert_eq!(inner.marks.slot, super::super::marks::MarkSlot::Missing);
+        }
+    }
+
+    #[test]
+    fn test_scripted_recovery_above_held_document_remains_available() {
+        let (switch, body) = recovery_beside_earlier_chain(4);
+        let mut inner = switch.lock();
+        let request = crate::transport::Request {
+            method: "PUT".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: "/v1/alice/identity".into(),
+            headers: Vec::new(),
+            body: body.clone(),
+            timeout: crate::transport::TimeoutClass::default(),
+        };
+        assert!(inner.step_two(&request).is_none());
+        assert_eq!(inner.put_identity(&body).unwrap().0, 200);
+        assert_eq!(inner.doc.as_ref().unwrap().generation(), 4);
+        assert_eq!((inner.tip.generation, inner.tip.seq), (4, 2));
     }
 }

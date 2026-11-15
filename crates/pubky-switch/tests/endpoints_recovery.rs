@@ -121,6 +121,78 @@ async fn held(replay: &Replay) -> IdentityDoc {
     IdentityDoc::verify(&signed, &alice_key().public()).expect("verify")
 }
 
+/// A current signed document restored beside an earlier chain, whose mark is lost
+/// (Switch wire 7.3, Tables 1 and 2).
+async fn recovery_with_newer_document(candidate_generation: u64) {
+    let Some(replay) = replay().await else { return };
+    let (key, at) = serving_with_a_held_app(&replay).await;
+    let original = held(&replay).await;
+    let mut newer = original.body().clone();
+    newer.version += 1;
+    newer.generation = 3;
+    newer.recovery_from = Some(2);
+    let newer = IdentityDoc::sign(&alice_key(), newer).expect("signed document");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE accounts SET identity_doc = $2 WHERE id = $1")
+        .bind(alice_id())
+        .bind(serde_json::to_vec(newer.signed()).expect("document"))
+        .execute(&mut conn)
+        .await
+        .expect("restore newer document beside earlier chain");
+    conn.close().await.expect("close");
+    replay.marks.delete(&alice_id()).await.expect("mark lost");
+    let before_chain = chain(&replay).await;
+    let mut candidate = newer.body().clone();
+    candidate.version += 1;
+    candidate.generation = candidate_generation;
+    candidate.recovery_from = Some(candidate_generation - 1);
+    let candidate = IdentityDoc::sign(&alice_key(), candidate).expect("signed candidate");
+    replay.clock.set_wall_ms(at + 1_000);
+    let (answer, signature) = deliver(&replay, candidate.signed().clone(), None, at + 1_000).await;
+    assert!(signed_by(&answer, &key, &signature));
+    if candidate_generation <= newer.generation() {
+        assert!(
+            is_notice(&answer, 1, "mark_lost"),
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(held(&replay).await.hash(), newer.hash());
+        assert_eq!(chain(&replay).await, before_chain);
+        assert_eq!(
+            replay.marks.read(&alice_id()).await.expect("mark"),
+            MarkRead::Missing
+        );
+    } else {
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(held(&replay).await.hash(), candidate.hash());
+        let mark = mark_of(&replay).await;
+        assert_eq!((mark.generation, mark.seq), (4, 2));
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_start_below_held_document_gets_notice() {
+    Box::pin(recovery_with_newer_document(2)).await;
+}
+
+#[tokio::test]
+async fn test_recovery_start_equal_to_held_document_gets_notice() {
+    Box::pin(recovery_with_newer_document(3)).await;
+}
+
+#[tokio::test]
+async fn test_recovery_start_above_held_document_remains_available() {
+    Box::pin(recovery_with_newer_document(4)).await;
+}
+
 async fn scalar_i64(replay: &Replay, query: &str) -> i64 {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await

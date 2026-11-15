@@ -213,6 +213,10 @@ pub struct Judgement {
     pub erase_account_again: bool,
     /// The verdict.
     pub verdict: Verdict,
+    /// The held document's generation or the mark's, whichever is greater: a recovery
+    /// start must exceed it (Switch wire 7.3, Table 2). This is independent of the notice's
+    /// chain generation. Unused while the verdict is unknown.
+    pub recovery_floor: u64,
     /// The key the verdict's answers are signed with (Table 2, "Signed with"), but an
     /// enrollment's ([`answer`]).
     pub key: [u8; 32],
@@ -251,6 +255,7 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         return Judgement {
             erase_account_again: false,
             verdict: Verdict::Unknown,
+            recovery_floor: 0,
             key,
         };
     }
@@ -280,6 +285,10 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
     Judgement {
         erase_account_again,
         verdict,
+        recovery_floor: account
+            .and_then(|account| account.document_generation)
+            .unwrap_or(0)
+            .max(inputs.mark.mark().map_or(0, |mark| mark.generation)),
         key,
     }
 }
@@ -531,12 +540,12 @@ pub fn answer(judgement: &Judgement, class: &RequestClass, current_key: [u8; 32]
         | RequestClass::Erase => judgement.key,
     };
     Answer {
-        route: route(&judgement.verdict, class),
+        route: route(&judgement.verdict, class, judgement.recovery_floor),
         key,
     }
 }
 
-fn route(verdict: &Verdict, class: &RequestClass) -> Route {
+fn route(verdict: &Verdict, class: &RequestClass, recovery_floor: u64) -> Route {
     match *verdict {
         Verdict::NotHosted { .. } => match class {
             RequestClass::Enroll => Route::CreateAccount,
@@ -569,7 +578,7 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
             RequestClass::PutIdentity {
                 generation,
                 recovery_from,
-            } => start_or_notice(notice, generation, recovery_from),
+            } => start_or_notice(notice, recovery_floor, generation, recovery_from),
             RequestClass::Move(step) => match step {
                 MoveStep::ImportOrUpload => Route::Proceed { head: false },
                 MoveStep::Activate { clears_mark: true } => Route::Proceed { head: true },
@@ -592,7 +601,7 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
             RequestClass::PutIdentity {
                 generation,
                 recovery_from,
-            } => start_or_notice(notice, generation, recovery_from),
+            } => start_or_notice(notice, recovery_floor, generation, recovery_from),
             // The abort discards the import, signs no head and gives the discard answer.
             RequestClass::Move(MoveStep::Abort) if abort_allowed => Route::Proceed { head: false },
             RequestClass::Move(_) => Route::Notice(notice),
@@ -612,17 +621,25 @@ fn route(verdict: &Verdict, class: &RequestClass) -> Route {
     }
 }
 
-/// Only the start of a generation above both the held document's and the mark's (the
-/// notice's `generation`, Switch wire 7.6), with `recovery_from` its generation less one;
-/// any other delivery gets the notice.
-fn start_or_notice(notice: RecoveryNotice, generation: u64, recovery_from: Option<u64>) -> Route {
-    let starts = generation > notice.generation
-        && recovery_from.is_some_and(|from| generation.checked_sub(1) == Some(from));
-    if starts {
+/// Only a recovery above the held document and mark starts; any other delivery gets the
+/// unchanged notice (Switch wire 7.3, Table 2; 7.6).
+fn start_or_notice(
+    notice: RecoveryNotice,
+    recovery_floor: u64,
+    generation: u64,
+    recovery_from: Option<u64>,
+) -> Route {
+    if recovery_starts_above(recovery_floor, generation, recovery_from) {
         Route::StartAfresh
     } else {
         Route::Notice(notice)
     }
+}
+
+/// Whether a delivery starts a recovery above the held document and mark (Switch wire
+/// 7.3, Table 2), for routing and the final check before replacing account state.
+pub(super) fn recovery_starts_above(floor: u64, generation: u64, from: Option<u64>) -> bool {
+    generation > floor && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
 }
 
 /// Whether an activation at a bounded account clears its mark (Switch wire 7.3, Table 2):
@@ -1586,6 +1603,7 @@ mod tests {
         let judgement = Judgement {
             erase_account_again: false,
             verdict,
+            recovery_floor: BEHIND.generation,
             key: MARK_KEY,
         };
         answer(&judgement, &class, CURRENT).route
@@ -2195,5 +2213,63 @@ mod tests {
         // With the mark lost, only the retirement bounds it.
         assert!(activation_clears_mark(tip(1, 1, 1), None, None, &[]));
         assert!(!activation_clears_mark(tip(1, 1, 1), None, None, &[1]));
+    }
+
+    #[test]
+    fn test_answer_recovery_held_document_bounds_start() {
+        for row in [
+            Row::Serving,
+            Row::Frozen,
+            Row::StagedImport,
+            Row::StagedNoChain,
+        ] {
+            let mut account = account(row).expect("account");
+            account.document_generation = Some(3);
+            let judgement = judge(&Inputs {
+                account: Some(&account),
+                mark: &MarkInput::Missing,
+                stub_at_mark: None,
+                erasure_at_ms: None,
+                retired: &[],
+                current_key: CURRENT,
+            });
+            let notice = notice(account.generation(), NoticeReason::MarkLost, false);
+            assert_eq!(
+                answer(&judgement, &RequestClass::Ordinary, CURRENT).route,
+                Route::Notice(notice)
+            );
+            for generation in [2, 3] {
+                assert_eq!(
+                    answer(&judgement, &put(generation, Some(generation - 1)), CURRENT).route,
+                    Route::Notice(notice)
+                );
+            }
+            assert_eq!(
+                answer(&judgement, &put(4, Some(3)), CURRENT).route,
+                Route::StartAfresh
+            );
+        }
+    }
+
+    #[test]
+    fn test_answer_recovery_lost_mark_uses_document_floor() {
+        let mut account = account(Row::Serving).expect("account");
+        account.document_generation = Some(1);
+        let judgement = judge(&Inputs {
+            account: Some(&account),
+            mark: &MarkInput::Missing,
+            stub_at_mark: None,
+            erasure_at_ms: None,
+            retired: &[],
+            current_key: CURRENT,
+        });
+        assert_eq!(
+            answer(&judgement, &RequestClass::Ordinary, CURRENT).route,
+            Route::Notice(notice(2, NoticeReason::MarkLost, false))
+        );
+        assert_eq!(
+            answer(&judgement, &put(2, Some(1)), CURRENT).route,
+            Route::StartAfresh
+        );
     }
 }

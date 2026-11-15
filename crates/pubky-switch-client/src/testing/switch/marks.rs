@@ -151,15 +151,18 @@ fn class_of(request: &Request) -> Class {
     }
 }
 
-/// Only the start of a generation above both the held document's and the mark's (the
-/// notice's `generation`), with `recovery_from` its generation less one (Switch wire 7.3,
-/// Table 2).
-pub(crate) fn starts_above(notice: &RecoveryNotice, generation: u64, from: Option<u64>) -> bool {
-    generation > notice.generation
-        && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
-}
-
 impl Inner {
+    /// Only a recovery above both the held document and readable mark starts (Switch wire
+    /// 7.3, Table 2). The notice still names the chain generation where one is held (7.6).
+    pub(super) fn starts_recovery(&self, generation: u64, from: Option<u64>) -> bool {
+        let floor = self
+            .doc
+            .as_ref()
+            .map_or(0, |doc| doc.generation())
+            .max(self.marks.mark().map_or(0, |mark| mark.generation));
+        generation > floor && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
+    }
+
     /// Whether the switch holds an account for the identity.
     pub(crate) fn hosts(&self) -> bool {
         self.enrolled.is_some() && !self.not_hosted_unpinned
@@ -306,12 +309,12 @@ impl Inner {
                 return None;
             }
             (
-                Verdict::Bounded(notice) | Verdict::Failing(notice),
+                Verdict::Bounded(_) | Verdict::Failing(_),
                 Class::PutIdentity {
                     generation,
                     recovery_from,
                 },
-            ) if starts_above(&notice, generation, recovery_from) => return None,
+            ) if self.starts_recovery(generation, recovery_from) => return None,
             (Verdict::Bounded(_), Class::Upload) => return None,
             (Verdict::Bounded(_) | Verdict::Failing(_), Class::Erase) => return None,
             (Verdict::Lost(_), Class::Erase) => self.erase_lost(request),
@@ -524,7 +527,7 @@ pub(super) fn not_hosted() -> Answer {
 }
 
 /// The notice, `503 recovery_required` (Switch wire 7.6).
-fn notice_answer(notice: &RecoveryNotice) -> Answer {
+pub(super) fn notice_answer(notice: &RecoveryNotice) -> Answer {
     bad(
         ErrorCode::RecoveryRequired,
         "Switch wire 7.3: the account awaits a recovery",

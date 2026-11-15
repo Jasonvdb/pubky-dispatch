@@ -2905,3 +2905,5 @@ async fn test_protocol_set_marks_wait_for_what_was_held_before_them() {
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert_eq!(kinds(&p.chat).len(), 6, "handed once");
 }
+
+mod zero_listing;

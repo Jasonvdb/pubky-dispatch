@@ -624,6 +624,204 @@ fn nonce(seen: &Seen) -> String {
     webhook["nonce"].as_str().expect("nonce").to_string()
 }
 
+/// Register one handle through the service's signed request path.
+async fn register_relay(replay: &Replay, relay_url: &str) {
+    let start = json!({ "relay_url": relay_url, "handles": [] });
+    let key = put_push(replay, &start).await["push_key"].clone();
+    let set = json!({ "relay_url": relay_url, "handles": [H1], "push_key": key });
+    put_push(replay, &set).await;
+}
+
+fn fixed_resolution(addresses: Vec<IpAddr>) -> Resolver {
+    Arc::new(move |_host| {
+        let addresses = addresses.clone();
+        Box::pin(async move { Ok(addresses) })
+    })
+}
+
+#[tokio::test]
+async fn test_isolated_relays_deliver_to_explicit_loopback_routes() {
+    for (relay_url, override_resolver) in [
+        (RELAY, false),
+        (RELAY, true),
+        ("https://93.184.216.34/v1/hook", true),
+    ] {
+        let Some(mut setup) = setup().await else {
+            return;
+        };
+        let address = setup.relay.addr;
+        let routed = Arc::new(Mutex::new(Vec::new()));
+        let seen = routed.clone();
+        setup.replay.service = setup
+            .replay
+            .restarted_with(Limits::default())
+            .with_isolated_relays()
+            .with_relay_route(Arc::new(move |ip| {
+                seen.lock().expect("lock").push(ip);
+                Some(address)
+            }));
+        if override_resolver {
+            setup.replay.service = setup
+                .replay
+                .service
+                .with_resolver(fixed_resolution(vec![public_ip()]));
+        }
+        register_relay(&setup.replay, relay_url).await;
+        append(&setup.replay, 1, true).await;
+        assert_eq!(
+            setup.replay.service.deliver_pushes().await,
+            PushRound {
+                delivered: 1,
+                ..PushRound::default()
+            }
+        );
+        let expected = if override_resolver {
+            public_ip()
+        } else {
+            "192.0.2.1".parse().expect("address")
+        };
+        assert_eq!(*routed.lock().expect("lock"), vec![expected]);
+        let seen = setup.relay.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/v1/hook");
+        let stored = put_push(
+            &setup.replay,
+            &json!({"relay_url": relay_url, "handles": []}),
+        )
+        .await;
+        let signature = unb64(&seen[0].signature)
+            .expect("signature")
+            .try_into()
+            .expect("64 bytes");
+        assert!(
+            verify_webhook(
+                &key_of(&stored["push_key"]),
+                relay_url,
+                &seen[0].body,
+                &signature
+            )
+            .is_ok()
+        );
+        setup.replay.db.drop_database().await.expect("drop");
+    }
+}
+
+#[tokio::test]
+async fn test_isolated_relays_without_a_route_refuse_before_resolution() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    setup.replay.service = setup
+        .replay
+        .restarted_with(Limits::default())
+        .with_isolated_relays();
+    register_relay(&setup.replay, RELAY).await;
+    append(&setup.replay, 1, true).await;
+    let resolved = Arc::new(AtomicBool::new(false));
+    let called = resolved.clone();
+    setup.replay.service = setup.replay.service.with_resolver(Arc::new(move |_host| {
+        called.store(true, Ordering::SeqCst);
+        Box::pin(async { Err(std::io::Error::other("no relay route")) })
+    }));
+    assert_eq!(
+        setup.replay.service.deliver_pushes().await,
+        PushRound {
+            failed: 1,
+            ..PushRound::default()
+        }
+    );
+    assert!(
+        !resolved.load(Ordering::SeqCst),
+        "unrouted delivery resolved a host"
+    );
+    assert!(setup.relay.seen().is_empty());
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_isolated_relays_require_every_address_to_have_a_loopback_route() {
+    // An IPv4-mapped loopback socket remains on this machine but is not an IPv6
+    // loopback address. It exercises a refused destination without an external peer.
+    for destination in [
+        None,
+        Some("::ffff:127.0.0.1".parse::<IpAddr>().expect("address")),
+    ] {
+        let Some(mut setup) = setup().await else {
+            return;
+        };
+        let local = setup.relay.addr;
+        setup.replay.service = setup
+            .replay
+            .restarted_with(Limits::default())
+            .with_isolated_relays()
+            .with_resolver(fixed_resolution(vec![public_ip(), fast_ip()]))
+            .with_relay_route(Arc::new(move |ip| {
+                if ip == public_ip() {
+                    Some(local)
+                } else {
+                    destination.map(|ip| SocketAddr::new(ip, local.port()))
+                }
+            }));
+        register_relay(&setup.replay, RELAY).await;
+        append(&setup.replay, 1, true).await;
+        assert_eq!(
+            setup.replay.service.deliver_pushes().await,
+            PushRound {
+                failed: 1,
+                ..PushRound::default()
+            }
+        );
+        assert!(setup.relay.seen().is_empty());
+        setup.replay.db.drop_database().await.expect("drop");
+    }
+}
+
+#[tokio::test]
+async fn test_isolated_relays_retain_the_address_checks_outside_the_synthetic_destination() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    for (isolated, addresses) in [
+        (false, vec!["192.0.2.1"]),
+        (true, vec![]),
+        (true, vec!["192.0.2.2"]),
+        (true, vec!["127.0.0.1"]),
+        (true, vec!["10.1.2.3"]),
+        (true, vec!["192.0.2.1", "93.184.216.34"]),
+    ] {
+        setup.replay.service = setup.replay.restarted_with(Limits::default());
+        if isolated {
+            setup.replay.service = setup.replay.service.with_isolated_relays();
+        }
+        setup.replay.service = setup.replay.service.with_resolver(fixed_resolution(
+            addresses
+                .iter()
+                .map(|address| address.parse().expect("address"))
+                .collect(),
+        ));
+        let answer = setup
+            .replay
+            .service
+            .handle(app_request(
+                app(&vectors("keys.json"), "wallet"),
+                "PUT",
+                &format!("/v1/{}/push", alice_id()),
+                json!({"relay_url": RELAY, "handles": []})
+                    .to_string()
+                    .into_bytes(),
+                ms(&at()),
+            ))
+            .await;
+        assert_eq!(
+            answer.status, 400,
+            "isolated={isolated}, addresses={addresses:?}"
+        );
+        assert_eq!(body(&answer)["code"], "bad_request");
+    }
+    assert_eq!(registrations(&setup.replay).await, 0);
+    setup.replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_push_delivery_notify_append_queues_one_per_handle() {
     let Some(setup) = setup().await else {

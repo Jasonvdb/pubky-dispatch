@@ -318,7 +318,7 @@ pub async fn two_protocols(world: &World) -> FlowResult {
 ///
 /// When an earlier message sees the later deny, or an ordinary operation fails.
 pub async fn protocol_deny_barrier(world: &World) -> FlowResult {
-    ordered_deny(world, false).await
+    Box::pin(ordered_deny(world, false)).await
 }
 
 /// An entry already handed to a protocol may be retried after a later deny change,
@@ -328,7 +328,7 @@ pub async fn protocol_deny_barrier(world: &World) -> FlowResult {
 ///
 /// When a retry observes the earlier copy, or an ordinary operation fails.
 pub async fn protocol_retry_after_deny(world: &World) -> FlowResult {
-    ordered_deny(world, true).await
+    Box::pin(ordered_deny(world, true)).await
 }
 
 async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
@@ -357,25 +357,31 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
         deny_changes: AtomicUsize::new(0),
     });
     let protocols = ProtocolSet::new(vec![tasks.clone(), chat.clone()])?;
-    let mut wallet =
-        joined_with_both(world, &alice, &mut alice_signer, "wallet", protocols).await?;
+    let mut wallet = Box::pin(joined_with_both(
+        world,
+        &alice,
+        &mut alice_signer,
+        "wallet",
+        protocols,
+    ))
+    .await?;
     let (manager_tasks, manager_chat) = both();
-    let mut manager = joined_with_both(
+    let mut manager = Box::pin(joined_with_both(
         world,
         &alice,
         &mut alice_signer,
         "manager",
         set_of(&manager_tasks, &manager_chat)?,
-    )
+    ))
     .await?;
     let (shop_tasks, shop_chat) = both();
-    let mut shop = joined_with_both(
+    let mut shop = Box::pin(joined_with_both(
         world,
         &bob,
         &mut bob_signer,
         "shop",
         set_of(&shop_tasks, &shop_chat)?,
-    )
+    ))
     .await?;
     wallet.add_contact(&bob.public()).await?;
     wallet.receive(None).await?;
@@ -435,4 +441,22 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
         &json!({"tasks_blocked": retry, "chat_blocked": false}),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Backend, run_here};
+
+    #[tokio::test]
+    async fn test_protocol_deny_flows_run_on_the_calling_thread() {
+        for backend in [Backend::Scripted, Backend::Service] {
+            Box::pin(run_here(backend, protocol_deny_barrier))
+                .await
+                .unwrap();
+            Box::pin(run_here(backend, protocol_retry_after_deny))
+                .await
+                .unwrap();
+        }
+    }
 }

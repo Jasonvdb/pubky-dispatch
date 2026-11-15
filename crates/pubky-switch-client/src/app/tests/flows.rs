@@ -6139,7 +6139,7 @@ async fn restored_with_a_carried_deny_change(
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
     assert_eq!(
         reader.lists_copy().await.unwrap().deny.contains(&x),
-        denied_at_end
+        !denied_at_end
     );
     let seq = reader.cursor().seq;
     drop(reader);

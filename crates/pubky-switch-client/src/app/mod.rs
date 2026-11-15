@@ -1507,6 +1507,7 @@ impl App {
     /// the same `msg_id` and bytes.
     /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
+        send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?

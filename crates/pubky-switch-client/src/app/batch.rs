@@ -59,6 +59,13 @@ const PENDING_PREFIX: &str = "opq/";
 /// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
 pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
+// Withdrawing one delivery rewrites at most every retained batch, removes its message
+// index, and may keep one outbox record for its record job, together with its duty.
+const _: () = assert!(
+    MAX_KEPT_BATCHES_BYTES as u64 * 6 / 5 + crate::store::MAX_VALUE_BYTES + (1 << 20)
+        <= crate::store::MAX_BATCH_BYTES
+);
+
 // A batch's answer is settled in one commit: its local writes and queued messages (under
 // its stored size, itself under `MAX_KEPT_BATCHES_BYTES`), a cached record write with its
 // mark for each of its 8 operations at most, and the cursor, the chain view and the kept
@@ -1337,8 +1344,9 @@ pub(crate) async fn kept_queued(
 
 impl App {
     /// Remove every retained copy of one withdrawn delivery with its message index.
-    /// The retained batches are bounded together at 12 MiB; with an outbox value and
-    /// duty this fits one store commit (Switch spec 11).
+    /// The retained batches with their keys take at most 14.4 MiB, as
+    /// [`MAX_KEPT_BATCHES_BYTES`] bounds them; with one outbox value and the duty's
+    /// bookkeeping they fit one store commit (Switch spec 11).
     pub(crate) async fn remove_kept_delivery(
         &self,
         msg_id: &str,

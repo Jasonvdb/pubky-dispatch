@@ -601,18 +601,6 @@ impl OutboxItem {
         meta: &super::state::Meta,
         cert: &pubky_switch_core::records::AppCert,
     ) -> bool {
-        #[derive(Deserialize)]
-        struct SenderHead {
-            identity: String,
-            app_id: String,
-        }
-        #[derive(Deserialize)]
-        struct Head {
-            kind: String,
-            msg_id: String,
-            from: SenderHead,
-            to: String,
-        }
         let Ok(plaintext) = self.plaintext() else {
             return false;
         };
@@ -623,14 +611,24 @@ impl OutboxItem {
         {
             return false;
         }
-        serde_json::from_slice::<Head>(plaintext.json()).is_ok_and(|head| {
-            head.kind == self.kind
-                && head.msg_id == self.msg_id
-                && pubky_switch_core::enc::pubky_key(&head.to).is_ok_and(|to| to == self.to)
-                && pubky_switch_core::enc::pubky_key(&head.from.identity)
-                    .is_ok_and(|from| from == meta.identity)
-                && pubky_switch_core::enc::app_id_decode(&head.from.app_id)
-                    .is_ok_and(|from| from == meta.app_id)
+        let Ok(value) = serde_json::from_slice::<Value>(plaintext.json()) else {
+            return false;
+        };
+        let Some(body) = value.get("body").and_then(Value::as_object) else {
+            return false;
+        };
+        // These are this app's already-signed bytes. Retaining them reads only the
+        // common fields; their original protocol may no longer be registered.
+        let opaque: Vec<_> = body
+            .keys()
+            .map(|member| OpaqueMember { kind: None, member })
+            .collect();
+        Message::parse(plaintext.json(), &opaque).is_ok_and(|message| {
+            message.kind == self.kind
+                && message.msg_id == self.msg_id
+                && message.to == self.to
+                && message.from.identity == meta.identity
+                && message.from.app_id == meta.app_id
         })
     }
 
@@ -1152,8 +1150,23 @@ impl App {
     async fn owned_owed(&self, protocol: &str, msg_id: &str) -> Result<Option<String>, AppError> {
         self.check_registered(protocol)?;
         let reader = self.reader();
-        validate_outbox(&reader, &self.state.meta, &self.state.cert).await?;
+        if reader
+            .get::<OutboxItem>(&out_key(msg_id))
+            .await?
+            .is_some_and(|item| {
+                item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
+            })
+        {
+            return Err(store_corrupt());
+        }
         let kept = super::batch::kept_queued(&reader).await?;
+        if kept
+            .iter()
+            .filter(|item| item.msg_id == msg_id)
+            .any(|item| !item.is_own(&self.state.meta, &self.state.cert))
+        {
+            return Err(store_corrupt());
+        }
         let kind = owed_kind(&reader, msg_id, self.now(), &kept).await?;
         match kind {
             Some(kind) if !self.owns_kind(protocol, &kind) => Err(Refusal::Usage(format!(
@@ -1227,6 +1240,7 @@ impl App {
         &mut self,
         matches: impl Fn(&OutboxItem) -> bool,
     ) -> Result<Vec<String>, AppError> {
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let now = self.now();
         let mut items: Vec<OutboxItem> = self
             .reader()
@@ -1989,7 +2003,7 @@ impl App {
         let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
             return Ok(false);
         };
-        if !item.is_own(&self.state.meta, &self.state.cert) {
+        if item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert) {
             return Err(store_corrupt());
         }
         if item.failed.is_some() {

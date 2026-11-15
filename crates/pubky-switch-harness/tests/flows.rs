@@ -437,3 +437,43 @@ async fn served_calls(
     }
     Ok((failures, waiting))
 }
+
+#[tokio::test]
+async fn test_erasure_outcome_retries_at_both_backends() {
+    use pubky_switch_client::testing::ErasureOutcome;
+    let mut failures = Vec::new();
+    for backend in [Backend::Service, Backend::Scripted] {
+        for outcome in [
+            ErasureOutcome::Unresolved,
+            ErasureOutcome::UnresolvedAbsent,
+            ErasureOutcome::Committed,
+            ErasureOutcome::Rejected,
+        ] {
+            if let Err(error) = run(backend, async |world| {
+                flows::erasure_outcome(world, outcome).await
+            })
+            .await
+            {
+                failures.push(format!("{backend:?} {outcome:?}: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn test_erasure_lost_outcome_and_unrelated_unavailability_at_both_backends() {
+    use pubky_switch_client::testing::ErasureOutcome;
+    for backend in [Backend::Service, Backend::Scripted] {
+        for outcome in [ErasureOutcome::Unresolved, ErasureOutcome::Committed] {
+            run(backend, async |world| {
+                flows::erasure_outcome_answer_lost(world, outcome).await
+            })
+            .await
+            .expect("lost erasure outcome");
+        }
+        run(backend, flows::erasure_unavailable_before_authorization)
+            .await
+            .expect("unrelated unavailability");
+    }
+}

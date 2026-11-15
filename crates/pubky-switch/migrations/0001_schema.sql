@@ -616,3 +616,11 @@ CREATE TABLE chain_retention (
     CHECK ((dropped_seq IS NULL) = (dropped_chain_hash IS NULL)),
     CHECK (dropped_seq IS NULL OR dropped_seq <= checkpoint_seq)
 );
+
+-- Outcomes of external erasure attempts survive account deletion. Only the exact attempt
+-- token and binding can publish completed evidence outside database backups (wire 7.3).
+CREATE TABLE erasure_outcomes (
+    identity TEXT PRIMARY KEY,
+    attempt BYTEA NOT NULL CHECK (octet_length(attempt) BETWEEN 1 AND 4096),
+    committed BOOLEAN NOT NULL
+);

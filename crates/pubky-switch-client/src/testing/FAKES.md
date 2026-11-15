@@ -453,9 +453,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   missing or corrupt, or its generation is at or below the imported generation, even if
   retired. A mark above that generation rules the abort out and permits erasure. Other
   accounts that fail stop or are bounded permit erasure, as does a lost identity whatever
-  hash it names. An app's call is `403 permission_missing`. The erasure's record is written,
-  the account and
-  its mark go, all at once, and every call, the retry included, gets the `404` of an
+  hash it names. An app's call is `403 permission_missing`. The completed erasure record,
+  account deletion and mark deletion are atomic under the switch's mutex, and every call, the retry included, gets the `404` of an
   identity the switch doesn't host, signed with the one key. `erased` tells a test it
   happened. App tests set `not_hosted_unpinned` to answer every call with that `404` under
   another key, the `404` an app can't check. After an erasure `POST /v1/enroll` makes a new
@@ -463,6 +462,15 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   its kept App IDs included, which the new enrollment names again. That account serves from
   its first `identity.json`, at the next generation with `recovery_from` (Switch wire
   7.4.16), which starts its recovery.
+  `fail_next_erasure` retains an unresolved attempt with the account present or absent,
+  or a committed/rejected outcome whose cleanup has not run. Unresolved reads are headless
+  `503 unavailable`; an authenticated retry repeats the creation/document checks and may
+  complete the erasure. Committed evidence publishes completion before not-hosted answers;
+  rejected evidence withdraws the attempt. The pending retry checks the request's identity
+  signature in addition to its timestamp and caller. The harness runs these observable
+  outcomes and signer restarts against both models. This model has no physical PostgreSQL
+  COMMIT or filesystem directory-sync boundary; those failures, exact outcome receipt
+  binding, and crash/reload/database-restore ordering are exercised by the service's tests.
 - **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
   handle for every `notify` entry and sends it to the relay (8.2); the scripted switch
   neither sends nor records one, since a webhook goes to the relay, never to an app, so no

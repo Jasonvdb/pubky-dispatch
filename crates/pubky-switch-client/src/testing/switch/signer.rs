@@ -721,8 +721,11 @@ impl Inner {
             Ok(created) => created,
             Err(refusal) => return refusal,
         };
-        // The record first, then the deletion, then the mark (Switch wire 7.3, Table 3); all
-        // at once here.
+        if let Some(answer) = self.erasure_fault(created) {
+            return answer;
+        }
+        // Completed erasure evidence and deletion are atomic under this mutex (wire 7.3,
+        // Table 3). The service's intermediate durable attempts are described in FAKES.md.
         self.marks.erasure_at_ms = Some(self.now().max(created));
         self.drop_account();
         self.marks.slot = super::marks::MarkSlot::Missing;

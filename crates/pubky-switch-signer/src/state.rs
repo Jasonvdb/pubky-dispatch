@@ -690,7 +690,8 @@ pub(crate) enum Flow {
         /// The App IDs whose grant reminder this erasure raised: withdrawn if it ends without
         /// erasing the account.
         reminded: Vec<[u8; 16]>,
-        /// An erasure request went out and no answer came back: it may have landed, so the
+        /// An erasure request went out with no definitive application result: it may have
+        /// landed (including after signed unavailable), so the
         /// signed `404` of an identity the service doesn't host now means it did, and an
         /// unsigned `404` does once it has held for 24 hours (Switch wire 7.4.16).
         unanswered: bool,

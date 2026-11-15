@@ -6,12 +6,14 @@
 //! and the account's newest `identity.json`, left out only where the account holds none
 //! (`409 conflict` otherwise, carrying the creation time). Then the order is fixed (Switch
 //! wire 7.3, Table 3):
-//! 1. the erasure's record is written to the mark store, durably, dated no earlier than the
-//!    creation it erases;
+//! 1. the authenticated attempt is written to the mark store, durably, dated no earlier
+//!    than the creation it erases; it is not completed-erasure authority;
 //! 2. the account's row is deleted, and with it every row of its state, its apps' push keys
 //!    owed deleting in the same transaction (`erased_keys`), and committed; where the
-//!    deletion doesn't commit, the record is taken back and the answer is `503`;
-//! 3. the account's mark is deleted, and the owed push keys;
+//!    deletion doesn't commit, durable rejection evidence permits withdrawal and the
+//!    answer is `503`. An unknown outcome retains the attempt for a signer retry;
+//! 3. a matching committed receipt publishes the completed erasure outside database
+//!    backups; then the account's mark is deleted, and the owed push keys;
 //! 4. only then is the answer released, signed with the key the verdict gives, without a
 //!    head.
 //!
@@ -57,6 +59,7 @@ use crate::{
         route::Call,
     },
     keys::{KeyId, KeyStore, ServiceSigner},
+    marks::ErasureAttempt,
     store::{AccountTxn, Store},
 };
 
@@ -81,7 +84,10 @@ impl Service {
     ) -> Result<Answer, ApiError> {
         let created = erasure_binding(request, held, judged)?;
         let mut answer = Answer::ok(ERASED_BODY.to_vec());
-        answer.deferred = Some(Deferred::Erase(created));
+        answer.deferred = Some(Deferred::Erase {
+            created,
+            identity_hash: held.map(IdentityDoc::hash),
+        });
         Ok(answer)
     }
 
@@ -99,13 +105,15 @@ impl Service {
         mut answer: Answer,
     ) -> SwitchResponse {
         // Dated no earlier than the creation it erases (Switch wire 7.3, Table 3).
-        let record_at = match answer.deferred.take() {
-            Some(Deferred::Erase(created)) => time_ms.max(created),
-            _ => time_ms,
+        let (created_at_ms, record_at, identity_hash) = match answer.deferred.take() {
+            Some(Deferred::Erase {
+                created,
+                identity_hash,
+            }) => (created, time_ms.max(created), identity_hash),
+            _ => (txn.head().created_at_ms, time_ms, None),
         };
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let account = txn.head().id.clone();
-        let created_at_ms = txn.head().created_at_ms;
         // The erasure moves a mark: not while another process may hold the database.
         if !self.lock_is_fresh() {
             drop(txn);
@@ -116,12 +124,9 @@ impl Service {
                 &unavailable(),
             );
         }
-        // The record first, durably, once the checks have passed (Table 3).
-        let previous = match self.marks.record_erasure(&account, record_at).await {
-            Ok(previous) => previous,
-            Err(failure) => {
-                tracing::error!(%failure, "recording an erasure");
-                drop(txn);
+        let attempt = match ErasureAttempt::new(created_at_ms, record_at, identity_hash) {
+            Ok(attempt) => attempt,
+            Err(_) => {
                 return Self::signed_error(
                     signer,
                     asked,
@@ -130,51 +135,133 @@ impl Service {
                 );
             }
         };
-        // The deletion, and the push keys' after it, run to their end in a task of their
-        // own: a signer that hangs up between them leaves no key to the next sweep.
-        let (store, keys, marks, identity) = (
+        if let Err(failure) = self.marks.begin_erasure(&account, attempt.clone()).await {
+            tracing::error!(%failure, "recording an erasure attempt");
+            return Self::signed_error(
+                signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            );
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(outcome) = self.erasure_faults.take() {
+            if let Err(failure) = self.retain_erasure_outcome(txn, attempt, outcome).await {
+                tracing::error!(%failure, "retaining an erasure outcome");
+            }
+            return Self::signed_error(
+                signer,
+                asked,
+                AnswerTime::Account(committed_ms),
+                &unavailable(),
+            );
+        }
+        let (store, keys, marks, identity, freshness) = (
             self.store.clone(),
             self.keys.clone(),
             self.marks.clone(),
             account.clone(),
+            self.lock_freshness.clone(),
         );
         #[cfg(any(test, feature = "test-util"))]
         let pause = self.erase_failure_pause.lock().take();
         let erased = to_the_end(async move {
-            if let Err(failure) = txn.erase(time_ms).await {
+            if let Err(failure) = txn.erase_recorded(&attempt, freshness.as_ref()).await {
                 let (error, account) = failure.into_parts();
+                let fresh = || {
+                    freshness
+                        .as_ref()
+                        .is_none_or(crate::store::LockFreshness::is_fresh)
+                };
+                // A successful rollback or definitive COMMIT rejection proves non-application.
+                // Its receipt must itself commit before cleanup can release the account.
+                let rejected = account.is_some() || error.is_refused();
+                // Discard the entire failed request, including work before the deletion's
+                // savepoint. Only the outcome receipt belongs in the new transaction.
+                drop(account);
+                let rejected = if rejected && fresh() {
+                    match store.lock_identity(&identity).await {
+                        Ok(mut lock) if fresh() => {
+                            if marks
+                                .erasure_attempt(&identity)
+                                .await
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                != Some(&attempt)
+                            {
+                                false
+                            } else {
+                                match lock.erasure_outcome(&attempt).await {
+                                    Ok(Some(true)) => false,
+                                    Ok(_) if fresh() => lock
+                                        .reject_erasure(&attempt, freshness.as_ref())
+                                        .await
+                                        .is_ok(),
+                                    _ => false,
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                let cleanup_lock = if rejected {
+                    store.lock_identity(&identity).await.ok()
+                } else {
+                    None
+                };
                 #[cfg(any(test, feature = "test-util"))]
                 if let Some(pause) = pause {
                     pause.wait().await;
                 }
-                // A failed statement rolled back under the account lock. Keep it until
-                // its record is withdrawn, so a waiting request cannot finish this failed
-                // erasure. After an ambiguous commit, reacquire the identity lock and
-                // check for the same account before touching its record (Table 3).
-                let mut lock = None;
-                let withdraw = if account.is_some() {
-                    true
-                } else {
-                    lock = store.lock_identity(&identity).await.ok();
-                    match lock.as_mut() {
-                        Some(lock) => {
-                            lock.account_created_at().await.ok().flatten() == Some(created_at_ms)
-                        }
-                        None => false,
+                if let Some(lock) = cleanup_lock {
+                    match marks.clear_erasure_attempt(&identity, attempt).await {
+                        Ok(()) => forget_outcome(lock, freshness.as_ref()).await,
+                        Err(failure) => tracing::error!(%failure, "taking back an erasure attempt"),
                     }
-                };
-                if withdraw
-                    && let Err(failure) =
-                        marks.withdraw_erasure(&identity, record_at, previous).await
-                {
-                    tracing::error!(%failure, "taking back an erasure's record");
                 }
-                drop(account);
-                drop(lock);
-                return Err(error);
+                return Err(error.to_string());
+            }
+            // Reacquire after COMMIT: a concurrent request may already have completed the
+            // same receipt, but no request can turn an unresolved attempt into deletion.
+            let mut lock = store
+                .lock_identity(&identity)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pending = marks
+                .erasure_attempt(&identity)
+                .await
+                .map_err(|error| error.to_string())?;
+            if pending.as_ref() == Some(&attempt) {
+                if lock
+                    .erasure_outcome(&attempt)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    != Some(true)
+                {
+                    return Err("the deletion outcome is unresolved".to_string());
+                }
+                publish_outcome(&marks, &identity, attempt, true).await?;
+            } else if marks
+                .erasure(&identity)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none_or(|at| at < record_at)
+            {
+                return Err("the erasure has no completed record".to_string());
+            }
+            if marks
+                .erasure_attempt(&identity)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                forget_outcome(lock, freshness.as_ref()).await;
             }
             let _ = sweep_owed(store, keys).await;
-            Ok::<_, crate::store::StoreError>(())
+            Ok::<_, String>(())
         })
         .await;
         if !matches!(erased, Some(Ok(()))) {
@@ -195,6 +282,250 @@ impl Service {
         self.forget_account(&account);
         self.forget_aged_erasures().await;
         sign_answer(signer, asked, AnswerTime::Account(time_ms), answer)
+    }
+
+    /// Publish only an established outcome, under the identity lock. Absence alone says
+    /// nothing about a pending attempt after a restore or an unknown COMMIT answer.
+    pub(super) async fn reconcile_erasure(&self, identity: &str) -> Result<bool, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: an erasure outcome is unresolved");
+        if self
+            .marks
+            .erasure_attempt(identity)
+            .await
+            .map_err(|_| unavailable())?
+            .is_none()
+        {
+            return Ok(true);
+        }
+        let mut lock = self
+            .store
+            .lock_identity(identity)
+            .await
+            .map_err(|error| store_error(&error))?;
+        let Some(attempt) = self
+            .marks
+            .erasure_attempt(identity)
+            .await
+            .map_err(|_| unavailable())?
+        else {
+            return Ok(true);
+        };
+        // A completed external record survives losing the database receipt to a restore.
+        let completed = self
+            .marks
+            .erasure(identity)
+            .await
+            .map_err(|_| unavailable())?
+            .is_some_and(|at| at >= attempt.created_at_ms);
+        let outcome = if completed {
+            Some(true)
+        } else {
+            lock.erasure_outcome(&attempt)
+                .await
+                .map_err(|error| store_error(&error))?
+        };
+        if let Some(committed) = outcome {
+            publish_outcome(&self.marks, identity, attempt, committed)
+                .await
+                .map_err(|_| unavailable())?;
+            forget_outcome(lock, self.lock_freshness.as_ref()).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// A fresh signer may resolve an unknown attempt by authorizing deletion again.
+    /// Its current creation and document binding are checked under the identity lock;
+    /// an ordinary read never exercises this authority (wire 7.4.16).
+    pub(super) async fn retry_erasure(
+        &self,
+        identity: &str,
+        request: &SwitchRequest,
+        base_ms: u64,
+        asked: Asked<'_>,
+    ) -> SwitchResponse {
+        let at = AnswerTime::TimeBase(base_ms, Uncompared::Erasure);
+        let unavailable = || ApiError::unavailable("7.6: an erasure outcome is unresolved");
+        let refuse = |error: ApiError| self.service_error(asked, at, &error);
+        let found = match self.store.lookup(identity).await {
+            Ok(found) => found,
+            Err(error) => return refuse(store_error(&error)),
+        };
+        let service_ms = found
+            .as_ref()
+            .map_or(base_ms, |found| base_ms.max(found.stamped_time_ms));
+        let pre = match self.pre_lock(identity, request, base_ms, service_ms).await {
+            Ok(pre) => pre,
+            Err(error) => return refuse(error),
+        };
+        if !pre
+            .caller
+            .is_some_and(|caller| caller.caller == super::rules::Caller::Signer)
+        {
+            return refuse(ApiError::new(
+                ErrorCode::PermissionMissing,
+                "7.4.16: only the signer erases",
+            ));
+        }
+        let mut lock = match self.store.lock_identity(identity).await {
+            Ok(lock) => lock,
+            Err(error) => return refuse(store_error(&error)),
+        };
+        let attempt = match self.marks.erasure_attempt(identity).await {
+            Ok(Some(attempt)) => attempt,
+            _ => return refuse(unavailable()),
+        };
+        let inputs = match self.mark_inputs(identity).await.for_erasure(&attempt) {
+            Ok(inputs) => inputs,
+            Err(error) => return refuse(error),
+        };
+        let created = match lock.account_created_at().await {
+            Ok(created) => created,
+            Err(error) => return refuse(store_error(&error)),
+        };
+        if created.is_some() {
+            let mut txn = match lock.account().await {
+                Ok(Some(txn)) => txn,
+                Ok(None) => return refuse(unavailable()),
+                Err(error) => return refuse(store_error(&error)),
+            };
+            let held = match txn.held_identity().await {
+                Ok(Some(held)) => match IdentityDoc::verify(&held.doc, &txn.head().identity_key) {
+                    Ok(doc) => Some(doc),
+                    Err(_) => return refuse(unavailable()),
+                },
+                Ok(None) => None,
+                Err(error) => return refuse(store_error(&error)),
+            };
+            let head = txn.head().clone();
+            let account = self.account_input(
+                head.generation,
+                head.chain,
+                head.created_at_ms,
+                held.as_ref().map(IdentityDoc::body),
+            );
+            let judged = self.judge_with(identity, Some(account), inputs).await;
+            let routed = verdict::answer(
+                &judged.judgement,
+                &verdict::RequestClass::Erase,
+                self.current_key(),
+            );
+            if !matches!(routed.route, Route::Erase { .. }) || judged.judgement.erase_account_again
+            {
+                return refuse(unavailable());
+            }
+            let Some(signer) = self.signer_of(&routed.key) else {
+                return refuse(unavailable());
+            };
+            let time_ms = txn.stamp(base_ms);
+            let answer = match self.erase_answer(request, held.as_ref(), &judged, time_ms) {
+                Ok(answer) => answer,
+                Err(error) => return Self::signed_error(&signer, asked, at, &error),
+            };
+            return self
+                .finish_erasure(txn, &signer, asked, head.stamped_time_ms, time_ms, answer)
+                .await;
+        }
+        // This is new authenticated authorization at an absent account, not an inference
+        // about whether the earlier attempt committed. Preserve its exact binding.
+        let named = match parse_erase_body(&request.body) {
+            Ok(named) => named,
+            Err(error) => return refuse(ApiError::bad_request(error.to_string())),
+        };
+        if named.created != Some(attempt.created_at_ms)
+            || named.identity_hash != attempt.identity_hash
+        {
+            return refuse(
+                ApiError::new(
+                    ErrorCode::Conflict,
+                    "7.4.16: the erasure names another account or document",
+                )
+                .with_current(
+                    json!({ "created": rfc3339(attempt.created_at_ms), "identity": null }),
+                ),
+            );
+        }
+        let judged = self.judge_with(identity, None, inputs).await;
+        if matches!(judged.judgement.verdict, verdict::Verdict::Unknown) {
+            return refuse(unavailable());
+        }
+        if judged
+            .created_at_ms()
+            .is_some_and(|created| created != attempt.created_at_ms)
+        {
+            return refuse(
+                ApiError::new(
+                    ErrorCode::Conflict,
+                    "7.4.16: the account was created at another time",
+                )
+                .with_current(json!({ "created": judged.created_at_ms().map(rfc3339) })),
+            );
+        }
+        let routed = verdict::answer(
+            &judged.judgement,
+            &verdict::RequestClass::Erase,
+            self.current_key(),
+        );
+        let Some(signer) = self.signer_of(&routed.key) else {
+            return refuse(unavailable());
+        };
+        let renewed = match ErasureAttempt::new(
+            attempt.created_at_ms,
+            base_ms.max(attempt.erased_at_ms),
+            attempt.identity_hash,
+        ) {
+            Ok(renewed) => renewed,
+            Err(_) => return refuse(unavailable()),
+        };
+        if self
+            .marks
+            .begin_erasure(identity, renewed.clone())
+            .await
+            .is_err()
+            || publish_outcome(&self.marks, identity, renewed.clone(), true)
+                .await
+                .is_err()
+        {
+            return refuse(unavailable());
+        }
+        let _ = self
+            .marks
+            .delete_created_by(identity, renewed.erased_at_ms)
+            .await;
+        forget_outcome(lock, self.lock_freshness.as_ref()).await;
+        self.forget_account(identity);
+        sign_answer(&signer, asked, at, Answer::ok(ERASED_BODY.to_vec()))
+    }
+
+    /// Complete retained receipts and discard only receipts whose external attempt is
+    /// durably gone. A failed cleanup is retried at the next startup (wire 7.3 Table 3).
+    pub(super) async fn reconcile_erasure_outcomes(&self) {
+        let mut after = String::new();
+        loop {
+            let identities = match self.store.erasure_outcome_ids(&after).await {
+                Ok(ids) => ids,
+                Err(error) => {
+                    let _ = store_error(&error);
+                    return;
+                }
+            };
+            if identities.is_empty() {
+                return;
+            }
+            for identity in identities {
+                after.clone_from(&identity);
+                if !matches!(self.reconcile_erasure(&identity).await, Ok(true)) {
+                    continue;
+                }
+                let Ok(lock) = self.store.lock_identity(&identity).await else {
+                    continue;
+                };
+                if matches!(self.marks.erasure_attempt(&identity).await, Ok(None)) {
+                    forget_outcome(lock, self.lock_freshness.as_ref()).await;
+                }
+            }
+        }
     }
 
     /// The erasure at an identity without an account that the verdict lets through: a lost
@@ -620,5 +951,35 @@ impl std::fmt::Debug for OwedKeys {
         f.debug_struct("OwedKeys")
             .field("keys", &self.ids.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The identity lock serializes publication with all later erasure attempts (wire 7.3).
+async fn publish_outcome(
+    marks: &crate::marks::MarkStore,
+    identity: &str,
+    attempt: ErasureAttempt,
+    committed: bool,
+) -> Result<(), String> {
+    if committed {
+        marks
+            .record_erasure(identity, attempt.erased_at_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    marks
+        .clear_erasure_attempt(identity, attempt)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Receipts may go only after the external attempt's durable removal. A cleanup failure
+/// leaves the receipt available for the next startup, never changes deletion authority.
+async fn forget_outcome(
+    lock: crate::store::IdentityLock,
+    freshness: Option<&crate::store::LockFreshness>,
+) {
+    if let Err(failure) = lock.forget_erasure_outcome(freshness).await {
+        tracing::warn!(%failure, "removing a resolved erasure receipt");
     }
 }

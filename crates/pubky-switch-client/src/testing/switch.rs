@@ -37,8 +37,10 @@ use crate::error::TransportError;
 use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Transport};
 
 mod batch;
+mod erasure;
 mod inbox;
 mod marks;
+pub use erasure::ErasureOutcome;
 mod retention;
 mod shared;
 mod signer;
@@ -318,6 +320,7 @@ pub(crate) struct Inner {
     /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
     pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
+    next_erasure_outcome: Option<ErasureOutcome>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
     /// The signed freeze while the account is frozen (Switch spec 12.5).
@@ -466,6 +469,7 @@ impl Inner {
             dropped_through: 0,
             retention: Some(Retention::default()),
             faults: VecDeque::new(),
+            next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
             freeze_in_feed: true,
@@ -1236,7 +1240,6 @@ impl ScriptedSwitch {
         inner.seen_at_arrival = held;
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
-        inner.minute_sweep();
         if let Some(refused) = inner.refused_as_received(request) {
             return Ok(refused);
         }
@@ -1333,6 +1336,7 @@ impl ScriptedSwitch {
             }
             return Ok(answer);
         }
+        inner.minute_sweep();
         if enrollment {
             let (status, body) = inner
                 .enroll(request)
@@ -1405,6 +1409,13 @@ impl ScriptedSwitch {
         inner.seen(request);
         let (status, mut body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+        if status == 503 && path.ends_with("/erase") && inner.marks.attempt.is_some() {
+            inner.stamped_ms = stamped_before;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
+        }
         if lose {
             return Err(TransportError::Timeout);
         }

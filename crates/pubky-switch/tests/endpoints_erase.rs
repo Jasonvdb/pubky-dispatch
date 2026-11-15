@@ -586,7 +586,8 @@ async fn test_erase_every_account_table_cascades() {
     for table in &tables {
         assert!(
             reached.contains(table)
-                || ["erased_keys", "_sqlx_migrations"].contains(&table.as_str()),
+                || ["erased_keys", "erasure_outcomes", "_sqlx_migrations"]
+                    .contains(&table.as_str()),
             "{table} holds nothing of an account, or reaches accounts"
         );
     }
@@ -1284,13 +1285,24 @@ async fn test_erase_answer_waits_for_the_deletion_to_commit() {
                 !answered.load(Ordering::SeqCst),
                 "no answer before the commit"
             );
+            assert!(
+                replay
+                    .key_dir()
+                    .join("accounts/erasure-attempts")
+                    .join(alice_id())
+                    .exists(),
+                "the attempt first, durably"
+            );
             assert_eq!(
                 durable_record(&replay),
-                Some(ms(&at)),
-                "the record first, durably"
+                None,
+                "no completed authority before deletion"
             );
             assert!(
-                matches!(mark_of(&replay, &alice_id()).await, MarkRead::Mark(_)),
+                matches!(
+                    replay.marks.read(&alice_id()).await.expect("live mark"),
+                    MarkRead::Mark(_)
+                ),
                 "the mark after the commit"
             );
             assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
@@ -1367,7 +1379,7 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     set_time(&replay.clock, &at);
     let before = rows(&replay, &alice_id()).await;
     let mark = held_mark(&replay, &alice_id()).await;
-    let ledger = replay.key_dir().join("accounts").join("erasures");
+    let ledger = replay.key_dir().join("accounts").join("erasure-attempts");
     set_read_only(&ledger, true);
     let request = erasure(&replay, Some(&held_hash()), ms(&at)).await;
     let sent = signed_sent(&request);
@@ -1378,10 +1390,9 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     assert!(signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(rows(&replay, &alice_id()).await, before);
     assert_eq!(held_mark(&replay, &alice_id()).await, mark);
-    // The retry erases: its own `200` or, where the ledger kept the record in memory, the
-    // not-hosted `404` of an account its first request's record covers (Table 1, first row).
+    // A new authenticated retry performs the deletion; no completed record was published.
     let retry = erase_held(&replay, &at).await;
-    assert!(matches!(retry.status, 200 | 404), "{}", text(&retry));
+    assert_eq!(retry.status, 200, "{}", text(&retry));
     assert!(all_gone(&replay).await);
     // Either way the record is durable before the account goes.
     assert!(durable_record(&replay).is_some());
@@ -2578,4 +2589,541 @@ async fn test_erase_body_created_required_shape() {
         .await;
     assert_eq!(answer.status, 200, "{}", text(&answer));
     replay.db.drop_database().await.expect("drop");
+}
+
+/// Leave an actual authenticated attempt whose deletion and rejection receipt both fail.
+/// No completed record exists; a restart must keep this uncertainty (wire 7.3 Table 3).
+async fn unresolved_erasure(replay: &Replay) -> Vec<u8> {
+    unresolved_erasure_at(replay, false).await
+}
+
+async fn unresolved_erasure_at(replay: &Replay, at_commit: bool) -> Vec<u8> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    for statement in [
+        "CREATE FUNCTION refuse_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected receipt failure'; END $$",
+        if at_commit {
+            "CREATE CONSTRAINT TRIGGER refuse_attempt AFTER INSERT OR UPDATE ON erasure_outcomes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_attempt()"
+        } else {
+            "CREATE TRIGGER refuse_attempt BEFORE INSERT OR UPDATE ON erasure_outcomes FOR EACH ROW EXECUTE FUNCTION refuse_attempt()"
+        },
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    // The receipt write is part of the DELETE transaction. Its rejection rolls back all
+    // account rows, and rejecting the attempt cannot itself commit a receipt either.
+    let before = rows(replay, &alice_id()).await;
+    let answer = erase(replay, Some(&held_hash()), &revoke_time()).await;
+    assert_eq!(answer.status, 503);
+    assert_eq!(rows(replay, &alice_id()).await, before);
+    assert_eq!(durable_record(replay), None);
+    let attempt = std::fs::read(
+        replay
+            .key_dir()
+            .join("accounts/erasure-attempts")
+            .join(alice_id()),
+    )
+    .expect("durable attempt");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 0,
+        "no successful or rejected outcome was acknowledged"
+    );
+    sqlx::query("DROP TRIGGER refuse_attempt ON erasure_outcomes")
+        .execute(&mut conn)
+        .await
+        .expect("drop trigger");
+    conn.close().await.expect("close");
+    attempt
+}
+
+async fn apps_after_reload(replay: &Replay) -> SwitchResponse {
+    Box::pin(reopened(replay).handle(signer_request(
+        "GET",
+        &apps_path(),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await
+}
+
+#[tokio::test]
+async fn test_erase_unresolved_receipt_refuses_reads_and_authenticates_retry() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    unresolved_erasure(&replay).await;
+    let read = apps_after_reload(&replay).await;
+    assert_eq!(read.status, 503);
+    assert!(no_head(&read));
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("account")
+            .is_some()
+    );
+    let service = reopened(&replay);
+    let mut request = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    request.headers.remove(header::SIGNATURE);
+    assert_eq!(Box::pin(service.handle(request)).await.status, 401);
+    let created = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .expect("account")
+        .created_at_ms;
+    let wrong_creation = erasure_naming(Some(created + 1), Some(&held_hash()), ms(&revoke_time()));
+    assert_eq!(Box::pin(service.handle(wrong_creation)).await.status, 409);
+    let wrong = erasure(&replay, Some(&[6; 32]), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(service.handle(wrong)).await.status, 409);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("account")
+            .is_some()
+    );
+    let request = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(service.handle(request)).await.status, 200);
+    assert!(all_gone(&replay).await);
+    assert!(durable_record(&replay).is_some());
+    assert_eq!(apps_after_reload(&replay).await.status, 404);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_missing_receipt_never_infers_completion_from_absence() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let attempt = unresolved_erasure(&replay).await;
+    let binding: Value = serde_json::from_slice(&attempt).expect("attempt");
+    let created = binding["created_at_ms"].as_u64().expect("created");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("absent state without receipt");
+    conn.close().await.expect("close");
+    let read = apps_after_reload(&replay).await;
+    assert_eq!(read.status, 503, "absence is not a COMMIT receipt");
+    assert!(no_head(&read));
+    assert_eq!(durable_record(&replay), None);
+    let service = reopened(&replay);
+    let wrong = erasure_naming(Some(created), Some(&[6; 32]), ms(&revoke_time()));
+    assert_eq!(Box::pin(service.handle(wrong)).await.status, 409);
+    let retry = erasure_naming(Some(created), Some(&held_hash()), ms(&revoke_time()));
+    assert_eq!(Box::pin(service.handle(retry)).await.status, 200);
+    assert!(durable_record(&replay).is_some());
+    assert_eq!(apps_after_reload(&replay).await.status, 404);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_committed_receipt_completes_after_reload_and_survives_restore() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let attempt = unresolved_erasure(&replay).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE TEMP TABLE account_backup AS TABLE accounts")
+        .execute(&mut conn)
+        .await
+        .expect("backup");
+    sqlx::query("BEGIN")
+        .execute(&mut conn)
+        .await
+        .expect("begin");
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("delete");
+    sqlx::query(
+        "INSERT INTO erasure_outcomes (identity, attempt, committed) VALUES ($1, $2, true)",
+    )
+    .bind(alice_id())
+    .bind(&attempt)
+    .execute(&mut conn)
+    .await
+    .expect("receipt");
+    sqlx::query("COMMIT")
+        .execute(&mut conn)
+        .await
+        .expect("commit deletion and receipt");
+    assert_eq!(
+        durable_record(&replay),
+        None,
+        "crash before external completion"
+    );
+    assert_eq!(apps_after_reload(&replay).await.status, 404);
+    assert!(durable_record(&replay).is_some());
+    sqlx::query("DELETE FROM erasure_outcomes")
+        .execute(&mut conn)
+        .await
+        .expect("restore before receipt");
+    sqlx::query("INSERT INTO accounts SELECT * FROM account_backup")
+        .execute(&mut conn)
+        .await
+        .expect("restored account");
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("restored")
+            .is_some()
+    );
+    assert_eq!(
+        apps_after_reload(&replay).await.status,
+        404,
+        "completed external evidence covers the restore"
+    );
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("deleted again")
+            .is_none()
+    );
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_restore_before_completion_remains_unknown_with_account() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let attempt = unresolved_erasure(&replay).await;
+    let before = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("account")
+        .expect("present");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    // Restore the account row from before the committed deletion, losing its receipt.
+    sqlx::query("CREATE TEMP TABLE account_backup AS TABLE accounts")
+        .execute(&mut conn)
+        .await
+        .expect("backup");
+    sqlx::query("BEGIN")
+        .execute(&mut conn)
+        .await
+        .expect("begin");
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("delete");
+    sqlx::query(
+        "INSERT INTO erasure_outcomes (identity, attempt, committed) VALUES ($1, $2, true)",
+    )
+    .bind(alice_id())
+    .bind(&attempt)
+    .execute(&mut conn)
+    .await
+    .expect("receipt");
+    sqlx::query("COMMIT")
+        .execute(&mut conn)
+        .await
+        .expect("committed deletion and receipt");
+    sqlx::query("DELETE FROM erasure_outcomes")
+        .execute(&mut conn)
+        .await
+        .expect("restore loses receipt");
+    sqlx::query("INSERT INTO accounts SELECT * FROM account_backup")
+        .execute(&mut conn)
+        .await
+        .expect("restore account");
+    let read = apps_after_reload(&replay).await;
+    assert_eq!(read.status, 503);
+    assert!(no_head(&read));
+    assert_eq!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("restored")
+            .expect("present")
+            .created_at_ms,
+        before.created_at_ms
+    );
+    assert_eq!(durable_record(&replay), None);
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_completed_record_failure_withholds_absence_until_reload() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let ledger = replay.key_dir().join("accounts/erasures");
+    set_read_only(&ledger, true);
+    let response = erase(&replay, Some(&held_hash()), &revoke_time()).await;
+    assert_eq!(response.status, 503);
+    assert!(all_gone(&replay).await, "deletion and receipt committed");
+    assert_eq!(durable_record(&replay), None);
+    let read = apps_after_reload(&replay).await;
+    assert_eq!(read.status, 503, "no completed external authority yet");
+    assert!(no_head(&read));
+    set_read_only(&ledger, false);
+    assert_eq!(apps_after_reload(&replay).await.status, 404);
+    assert!(durable_record(&replay).is_some());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_unknown_commit_error_keeps_attempt_until_authenticated_retry() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let before = rows(&replay, &alice_id()).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    for statement in [
+        "CREATE FUNCTION unknown_erasure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '40003', MESSAGE = 'statement completion unknown'; END $$",
+        "CREATE CONSTRAINT TRIGGER unknown_erasure AFTER DELETE ON accounts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION unknown_erasure()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    assert_eq!(
+        erase(&replay, Some(&held_hash()), &revoke_time())
+            .await
+            .status,
+        503
+    );
+    assert_eq!(rows(&replay, &alice_id()).await, before);
+    assert_eq!(apps_after_reload(&replay).await.status, 503);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "unknown COMMIT is not a durable rejection");
+    sqlx::query("DROP TRIGGER unknown_erasure ON accounts")
+        .execute(&mut conn)
+        .await
+        .expect("drop");
+    let service = reopened(&replay);
+    let retry = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(service.handle(retry)).await.status, 200);
+    assert!(durable_record(&replay).is_some());
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_receipt_commit_failure_remains_unresolved_after_reload() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    unresolved_erasure_at(&replay, true).await;
+    assert_eq!(apps_after_reload(&replay).await.status, 503);
+    let service = reopened(&replay);
+    let request = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(service.handle(request)).await.status, 200);
+    assert!(all_gone(&replay).await);
+    assert!(durable_record(&replay).is_some());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_receipt_must_match_every_attempt_binding() {
+    for field in ["token", "created_at_ms", "erased_at_ms", "identity_hash"] {
+        let Some(replay) = replay().await else { return };
+        replay_chain_through_revoke(&replay).await;
+        let attempt = unresolved_erasure(&replay).await;
+        let original = String::from_utf8(attempt.clone()).expect("json");
+        let value: Value = serde_json::from_slice(&attempt).expect("attempt");
+        let next = match field {
+            "token" => json!("11".repeat(32)),
+            "identity_hash" => json!([8; 32].to_vec()),
+            _ => json!(value[field].as_u64().expect("time") + 1),
+        };
+        let wrong = original.replace(
+            &format!("\"{field}\":{}", value[field]),
+            &format!("\"{field}\":{next}"),
+        );
+        assert_ne!(wrong.as_bytes(), attempt);
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("connect");
+        sqlx::query(
+            "INSERT INTO erasure_outcomes (identity, attempt, committed) VALUES ($1, $2, true)",
+        )
+        .bind(alice_id())
+        .bind(wrong.into_bytes())
+        .execute(&mut conn)
+        .await
+        .expect("different receipt");
+        let read = apps_after_reload(&replay).await;
+        assert_eq!(read.status, 503, "{field}");
+        assert!(no_head(&read));
+        assert!(
+            replay
+                .db
+                .store()
+                .lookup(&alice_id())
+                .await
+                .expect("account")
+                .is_some(),
+            "{field}"
+        );
+        assert_eq!(durable_record(&replay), None);
+        conn.close().await.expect("close");
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
+#[tokio::test]
+async fn test_erase_resolved_receipt_cleanup_failure_retries_at_startup() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    for statement in [
+        "CREATE FUNCTION keep_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected cleanup failure'; END $$",
+        "CREATE TRIGGER keep_receipt BEFORE DELETE ON erasure_outcomes FOR EACH ROW EXECUTE FUNCTION keep_receipt()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    assert_eq!(
+        erase(&replay, Some(&held_hash()), &revoke_time())
+            .await
+            .status,
+        200
+    );
+    assert!(durable_record(&replay).is_some());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 1, "failed cleanup retains the receipt");
+    assert_eq!(apps_after_reload(&replay).await.status, 404);
+    sqlx::query("DROP TRIGGER keep_receipt ON erasure_outcomes")
+        .execute(&mut conn)
+        .await
+        .expect("drop");
+    let _service = Box::pin(reopened(&replay).started()).await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "startup discards only already-resolved evidence");
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn receipt_waits_past_freshness(rejected: bool) {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    for statement in [
+        "CREATE SEQUENCE receipt_writes",
+        "CREATE FUNCTION delay_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('receipt_writes') = 1 THEN PERFORM pg_sleep(3); END IF; RETURN NEW; END $$",
+        "CREATE TRIGGER delay_receipt BEFORE INSERT OR UPDATE ON erasure_outcomes FOR EACH ROW EXECUTE FUNCTION delay_receipt()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    if rejected {
+        for statement in [
+            "CREATE FUNCTION reject_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected deletion refusal'; END $$",
+            "CREATE TRIGGER reject_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION reject_delete()",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut conn)
+                .await
+                .expect("delete trigger");
+        }
+    }
+    let service = replay
+        .restarted_with(pubky_switch::limits::Limits::default())
+        .with_lock_freshness(LockFreshness::confirmed_ago(
+            Duration::ZERO,
+            LockTiming::checking_every(Duration::from_secs(1)),
+        ));
+    let request = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(service.handle(request)).await.status, 503);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("account")
+            .is_some(),
+        "stale commit cannot delete"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM erasure_outcomes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "stale receipt must not commit");
+    let writes: i64 = sqlx::query_scalar("SELECT last_value FROM receipt_writes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("write reached");
+    assert_eq!(writes, 1);
+    assert_eq!(
+        apps_after_reload(&replay).await.status,
+        503,
+        "unknown until a fresh signer retries"
+    );
+    if rejected {
+        sqlx::query("DROP TRIGGER reject_delete ON accounts")
+            .execute(&mut conn)
+            .await
+            .expect("drop");
+    }
+    let fresh = reopened(&replay);
+    let request = erasure(&replay, Some(&held_hash()), ms(&revoke_time())).await;
+    assert_eq!(Box::pin(fresh.handle(request)).await.status, 200);
+    assert!(durable_record(&replay).is_some());
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_freshness_checked_after_committed_receipt_write() {
+    Box::pin(receipt_waits_past_freshness(false)).await;
+}
+
+#[tokio::test]
+async fn test_erase_freshness_checked_after_rejected_receipt_write() {
+    Box::pin(receipt_waits_past_freshness(true)).await;
 }

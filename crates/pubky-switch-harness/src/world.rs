@@ -423,6 +423,40 @@ impl World {
         }
     }
 
+    /// Retain one authenticated erasure at a controlled outcome boundary in either backend.
+    ///
+    /// # Errors
+    ///
+    /// When the identity or service is not present in this world.
+    pub async fn fail_next_erasure(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        outcome: pubky_switch_client::testing::ErasureOutcome,
+    ) -> Result<(), HarnessError> {
+        use pubky_switch::service::ErasureOutcome as Real;
+        use pubky_switch_client::testing::ErasureOutcome as Scripted;
+        match self.backend {
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?
+                    .fail_next_erasure(outcome);
+                Ok(())
+            }
+            Backend::Service => {
+                self.change_service(origin, async |switch| {
+                    switch.fail_next_erasure(match outcome {
+                        Scripted::Unresolved => Real::Unresolved,
+                        Scripted::UnresolvedAbsent => Real::UnresolvedAbsent,
+                        Scripted::Committed => Real::Committed,
+                        Scripted::Rejected => Real::Rejected,
+                    });
+                    Ok(())
+                })
+                .await
+            }
+        }
+    }
+
     /// The transport every party of this world sends through: to the switch of the
     /// request's origin, recorded.
     pub fn transport(&self) -> Arc<dyn Transport> {

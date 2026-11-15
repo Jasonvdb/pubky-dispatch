@@ -191,6 +191,7 @@ pub struct RealSwitch {
     listening: Option<tokio::task::JoinHandle<()>>,
     /// The service's hub of waiting feed reads.
     changes: Arc<ChangeHub>,
+    erasure_faults: pubky_switch::service::ErasureFaults,
     /// The seed of the service key, for a key store opened again on the key directory.
     service_secret: [u8; 32],
     limits: Limits,
@@ -285,6 +286,7 @@ impl RealSwitch {
             database: Some(database),
             time,
             clock,
+            erasure_faults: service.erasure_faults(),
             transport: Arc::new(ServiceTransport::new(origin, service)),
             listening: Some(listening),
             changes,
@@ -333,8 +335,14 @@ impl RealSwitch {
         let (listening, changes) = listen(database.store(), &service).await?;
         self.listening = Some(listening);
         self.changes = changes;
+        self.erasure_faults = service.erasure_faults();
         self.transport.serve(service);
         Ok(())
+    }
+
+    /// Retain a controlled durable erasure outcome after its normal checks.
+    pub fn fail_next_erasure(&self, outcome: pubky_switch::service::ErasureOutcome) {
+        self.erasure_faults.next(outcome);
     }
 
     /// The mark `identity` has, which the change needs.

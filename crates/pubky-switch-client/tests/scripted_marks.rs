@@ -723,3 +723,59 @@ async fn test_one_key_earlier_answer_replayed_is_refused() {
     assert!(kept.lock().unwrap().is_some());
     refused(client.apps().await);
 }
+
+#[tokio::test]
+async fn test_scripted_erasure_pending_retry_checks_signature_creation_and_document() {
+    use pubky_switch_client::testing::ErasureOutcome;
+    for outcome in [ErasureOutcome::Unresolved, ErasureOutcome::UnresolvedAbsent] {
+        let signer = alice();
+        let switch = signer.switch();
+        let client = client(&signer);
+        let created = switch.created();
+        let hash = switch.identity_doc().unwrap().hash();
+        switch.fail_next_erasure(outcome);
+        assert_eq!(
+            code(&client.erase(Some(created), Some(hash)).await.unwrap_err()).1,
+            ErrorCode::Unavailable
+        );
+        for (created, hash) in [(created + 1, hash), (created, [9; 32])] {
+            assert_eq!(
+                code(&client.erase(Some(created), Some(hash)).await.unwrap_err()).1,
+                ErrorCode::Conflict
+            );
+        }
+        let bad = Request {
+            method: "POST".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: format!("/v1/{}/erase", signer.identity().key().id()),
+            headers: vec![
+                pubky_switch_client::transport::Header::new(
+                    pubky_switch_core::http::header::IDENTITY,
+                    &signer.identity().key().id(),
+                ),
+                pubky_switch_client::transport::Header::new(
+                    pubky_switch_core::http::header::TIMESTAMP,
+                    &pubky_switch_core::time::rfc3339(signer.clock().now_ms()),
+                ),
+                pubky_switch_client::transport::Header::new(
+                    pubky_switch_core::http::header::SIGNATURE,
+                    &pubky_switch_core::enc::b64(&[0; 64]),
+                ),
+            ],
+            body: pubky_switch_core::http::erase_body(Some(created), Some(&hash)),
+            timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        };
+        let answer = switch.handle(&bad).unwrap();
+        assert_eq!(answer.status, 401);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&answer.body).unwrap()["code"],
+            "bad_signature"
+        );
+        assert_eq!(
+            code(&client.apps().await.unwrap_err()).1,
+            ErrorCode::Unavailable
+        );
+        client.erase(Some(created), Some(hash)).await.unwrap();
+        assert!(client.apps().await.unwrap_err().is_not_hosted());
+    }
+}

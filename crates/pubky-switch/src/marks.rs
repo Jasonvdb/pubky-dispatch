@@ -5,7 +5,8 @@
 //! state a backup restores: the newest head it signed for the identity (generation, `seq`,
 //! chain hash), the service key the account is answered with, and the time the account was
 //! created. Beside the marks lie the retirements of generations, one-way, and the records of
-//! erasures (Switch wire 7.4.16). The three lie in one store, under one identity record, in
+//! erasures and their unresolved attempts (Switch wire 7.4.16). They lie in one store, under
+//! one identity record, in
 //! `accounts/` under the key store's directory, which no backup of the state restores:
 //!
 //! - `accounts/store-id`: the store's identity, 16 random bytes in hex, written with the
@@ -15,7 +16,9 @@
 //! - `accounts/marks/<identity>`: the identity's mark, in JSON.
 //! - `accounts/retired/<identity>.<generation>`: an empty file per retired generation.
 //! - `accounts/erasures/<identity>`: the time of the identity's latest erasure's record, in
-//!   Unix milliseconds, as decimal text.
+//!   Unix milliseconds, as decimal text. Only completed deletion is recorded here.
+//! - `accounts/erasure-attempts/<identity>`: the exact authenticated attempt, in JSON,
+//!   retained until its deletion outcome is durable. It authorizes no restored deletion.
 //!
 //! Every write is a temporary file, synced, renamed into place, then its directory synced,
 //! and is durable before its call returns. A write that fails after its rename landed and
@@ -30,6 +33,10 @@
 //! confirmed check is stale ([`MarkStore::gated`]): no mark is created, moved, taken, re-keyed
 //! or deleted, and no erasure's record written, while another process may hold the database
 //! (Switch spec 6.5).
+
+mod erasure;
+pub(crate) use erasure::ErasureAttempt;
+use erasure::{attempt_from_bytes, read_attempts};
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -58,7 +65,7 @@ const MAX_MARK_FILE: u64 = 4096;
 const MAX_ERASURE_FILE: u64 = 20;
 
 /// The store's directories under `accounts/`.
-const STORE_DIRS: [&str; 3] = ["marks", "retired", "erasures"];
+const STORE_DIRS: [&str; 4] = ["marks", "retired", "erasures", "erasure-attempts"];
 
 /// An identity's mark (Switch wire 7.3, "Accounts and marks").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +245,8 @@ struct Inner {
     retired: Mutex<HashMap<String, BTreeSet<u64>>>,
     /// Erasure records last read or written durably, checked against their live files.
     erasures: Mutex<HashMap<String, u64>>,
+    /// Authenticated erasures whose deletion outcome is not yet published.
+    attempts: Mutex<HashMap<String, ErasureAttempt>>,
     /// Renames and removals that landed but whose directory sync has not succeeded. Only
     /// these exact bytes may differ from the last durable value without being a lost or
     /// changed record. A successful sync publishes all changes it covers.
@@ -721,6 +730,7 @@ impl Inner {
             marks: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashMap::new()),
             erasures: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
             #[cfg(test)]
@@ -800,6 +810,17 @@ impl Inner {
                     }
                     None => {
                         erasures.remove(name);
+                    }
+                }
+            }
+            if dir == self.attempts_dir() {
+                let mut attempts = self.attempts.lock();
+                match attempt_from_bytes(bytes.as_deref())? {
+                    Some(attempt) => {
+                        attempts.insert(name.to_string(), attempt);
+                    }
+                    None => {
+                        attempts.remove(name);
                     }
                 }
             }
@@ -932,6 +953,7 @@ impl Inner {
             self.marks_dir(),
             self.retired_dir(),
             self.erasures_dir(),
+            self.attempts_dir(),
             accounts.clone(),
         ] {
             self.sync_dir(&dir).map_err(|error| {
@@ -944,6 +966,7 @@ impl Inner {
         let erasures = read_erasures(&self.erasures_dir())?;
         *self.retired.lock() = retired;
         *self.erasures.lock() = erasures;
+        *self.attempts.lock() = read_attempts(&self.attempts_dir())?;
         self.marks.lock().clear();
         *self.store_id.lock() = Some(id.clone());
         Ok(id)
@@ -956,6 +979,8 @@ impl Inner {
         let mut expected_erasures = self.erasures.lock().clone();
         let pending = self.pending.lock();
         let mut pending_erasure = false;
+        let mut expected_attempts = self.attempts.lock().clone();
+        let mut pending_attempt = false;
         for (path, bytes) in pending.iter() {
             let name = path
                 .file_name()
@@ -967,6 +992,16 @@ impl Inner {
                     .entry(identity)
                     .or_default()
                     .insert(generation);
+            } else if path.parent() == Some(self.attempts_dir().as_path()) {
+                pending_attempt = true;
+                match attempt_from_bytes(bytes.as_deref())? {
+                    Some(attempt) => {
+                        expected_attempts.insert(name.to_string(), attempt);
+                    }
+                    None => {
+                        expected_attempts.remove(name);
+                    }
+                }
             } else if path.parent() == Some(self.erasures_dir().as_path()) {
                 pending_erasure = true;
                 match erasure_from_bytes(bytes.as_deref())? {
@@ -982,10 +1017,14 @@ impl Inner {
         drop(pending);
         if read_retired(&self.retired_dir())? != expected_retired
             || read_erasures(&self.erasures_dir())? != expected_erasures
+            || read_attempts(&self.attempts_dir())? != expected_attempts
         {
             return Err(MarkStoreError::StoreUnreadable(
                 "a durable record changed".into(),
             ));
+        }
+        if pending_attempt {
+            self.sync_dir(&self.attempts_dir())?;
         }
         if pending_erasure {
             // An uncertain erasure intent is taken up only once this barrier succeeds.
@@ -1000,6 +1039,7 @@ impl Inner {
         let RecordScope::Identity(identity) = scope else {
             return self.confirm_all_records();
         };
+        self.confirm_attempt(identity)?;
         let path = self.erasures_dir().join(identity);
         let bytes = read_record_file(&path, MAX_ERASURE_FILE)?;
         let pending = self.pending.lock().get(&path).cloned();
@@ -1108,7 +1148,10 @@ impl Inner {
                 }
             }
         } else {
-            marks.insert(identity.to_string(), observed);
+            // An absent file for an arbitrary identity is no durable authority to retain.
+            if observed != MarkRead::Missing {
+                marks.insert(identity.to_string(), observed);
+            }
             observed
         };
         if let MarkRead::Mark(mark) = read {
@@ -1145,6 +1188,11 @@ impl Inner {
             match next(held) {
                 Some(mark) => {
                     self.retirement(identity, mark.generation)?;
+                    // A real write retains its prior durable absence until directory sync.
+                    self.marks
+                        .lock()
+                        .entry(identity.to_string())
+                        .or_insert(held);
                     self.put_mark(identity, mark)?;
                     Ok(MarkWrite::Written(mark))
                 }
@@ -1360,6 +1408,7 @@ impl MarkView {
         let store_id = read_store_id(&accounts)?;
         let retired = read_retired(&accounts.join("retired"))?;
         read_erasures(&accounts.join("erasures"))?;
+        read_attempts(&accounts.join("erasure-attempts"))?;
         Ok(Self {
             accounts,
             store_id,
@@ -1390,6 +1439,7 @@ impl MarkView {
             fs::read_dir(self.accounts.join(name))
                 .map_err(|error| MarkStoreError::StoreUnreadable(error.to_string()))?;
         }
+        read_attempts(&self.accounts.join("erasure-attempts"))?;
         Ok(())
     }
 
@@ -1402,6 +1452,11 @@ impl MarkView {
     pub fn read(&self, identity: &str) -> Result<MarkRead, MarkStoreError> {
         let identity = valid_identity(identity)?;
         self.confirm_store()?;
+        if read_attempts(&self.accounts.join("erasure-attempts"))?.contains_key(&identity) {
+            return Err(MarkStoreError::StoreUnreadable(
+                "an erasure outcome is unresolved".into(),
+            ));
+        }
         read_mark_file(&self.accounts.join("marks").join(identity))
     }
 
@@ -1439,7 +1494,11 @@ impl MarkView {
     /// The store can't be read.
     pub fn list(&self) -> Result<Vec<String>, MarkStoreError> {
         self.confirm_store()?;
-        list_marks(&self.accounts.join("marks"))
+        let mut identities = list_marks(&self.accounts.join("marks"))?;
+        identities.extend(read_attempts(&self.accounts.join("erasure-attempts"))?.into_keys());
+        identities.sort();
+        identities.dedup();
+        Ok(identities)
     }
 }
 
@@ -2770,10 +2829,17 @@ mod tests {
             "record_erasure",
             "withdraw_erasure",
             "forget_erasures",
+            "begin_erasure",
+            "clear_erasure_attempt",
         ] {
             let (_dir, open_store) = open();
             let mark = with_mark(&open_store, ALICE, head(1, 4, 1)).await;
             open_store.record_erasure(BOB, 1_000).await.expect("record");
+            let attempt = ErasureAttempt::new(100, 200, None).expect("attempt");
+            open_store
+                .begin_erasure(ALICE, attempt.clone())
+                .await
+                .expect("pending");
             let (started, reached) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
             let inner = open_store.inner.clone();
@@ -2813,6 +2879,10 @@ mod tests {
                     "record_erasure" => store.record_erasure(ALICE, 2_000).await.map(|_| ()),
                     "withdraw_erasure" => store.withdraw_erasure(BOB, 1_000, None).await,
                     "forget_erasures" => store.forget_erasures_before(u64::MAX).await.map(|_| ()),
+                    "begin_erasure" => store.begin_erasure(BOB, attempt.clone()).await,
+                    "clear_erasure_attempt" => {
+                        store.clear_erasure_attempt(ALICE, attempt.clone()).await
+                    }
                     _ => unreachable!(),
                 }
             };
@@ -2887,6 +2957,11 @@ mod tests {
         let (dir, open_store) = open();
         let mark = with_mark(&open_store, ALICE, head(1, 4, 1)).await;
         open_store.record_erasure(BOB, 1_000).await.expect("record");
+        let attempt = ErasureAttempt::new(100, 200, None).expect("attempt");
+        open_store
+            .begin_erasure(ALICE, attempt.clone())
+            .await
+            .expect("pending");
         let timing = LockTiming::checking_every(std::time::Duration::from_secs(5));
         let store = open_store.gated(LockFreshness::confirmed_ago(
             std::time::Duration::from_secs(15),
@@ -2919,6 +2994,12 @@ mod tests {
         stale(store.record_erasure(ALICE, 2_000).await.map(|_| ()));
         stale(store.withdraw_erasure(BOB, 1_000, None).await);
         stale(store.forget_erasures_before(u64::MAX).await.map(|_| ()));
+        stale(store.begin_erasure(BOB, attempt.clone()).await);
+        stale(store.clear_erasure_attempt(ALICE, attempt.clone()).await);
+        assert_eq!(
+            store.erasure_attempt(ALICE).await.expect("pending"),
+            Some(attempt)
+        );
         // Reads go on, and nothing changed.
         assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Mark(mark));
         assert_eq!(store.read(BOB).await.expect("read"), MarkRead::Missing);
@@ -3377,5 +3458,178 @@ mod tests {
     #[tokio::test]
     async fn test_marks_view_remembers_newly_read_retirements() {
         view_loses_retirement(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_marks_public_absent_identity_reads_keep_no_unbounded_cache() {
+        use crate::{
+            http::{Handler, SwitchRequest},
+            keys::FileKeyStore,
+            limits::Limits,
+            service::Service,
+            store::testing::test_database,
+            time::{ManualClock, TrustedTime, TrustedTimeConfig},
+        };
+        let db = test_database().await.expect("required database");
+        let (dir, marks) = open();
+        let keys = Arc::new(FileKeyStore::open(dir.path()).expect("keys"));
+        let time = Arc::new(TrustedTime::new(
+            TrustedTimeConfig::default(),
+            Arc::new(ManualClock::new(1000)),
+        ));
+        let service = Service::new(
+            "https://inbox.example".into(),
+            db.store().clone(),
+            keys,
+            marks.clone(),
+            time,
+            Limits::default(),
+        );
+        let known = with_mark(&marks, ALICE, head(1, 1, 1)).await;
+        let before = marks.inner.marks.lock().len();
+        for number in 0_u64..2048 {
+            let mut identity_key = [0_u8; 32];
+            identity_key[..8].copy_from_slice(&number.to_be_bytes());
+            let identity = pubky_switch_core::enc::pubky_id(&identity_key);
+            let path = format!("/v1/{identity}/identity");
+            let request = SwitchRequest {
+                route: crate::http::route::route("GET", &path).expect("route"),
+                method: "GET".into(),
+                path_and_query: path,
+                headers: Default::default(),
+                body: Default::default(),
+                source: Some(crate::http::source::NetworkSource::of(
+                    "192.0.2.1".parse().expect("ip"),
+                )),
+            };
+            let answer = service.handle(request).await;
+            assert_eq!(answer.status, 404);
+            let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("body");
+            assert_eq!(body["current"]["hosted"], false);
+        }
+        assert_eq!(
+            marks.read(ALICE).await.expect("positive control"),
+            MarkRead::Mark(known)
+        );
+        let after = marks.inner.marks.lock().len();
+        assert!(
+            after <= before + 16,
+            "2048 unsigned never-hosted identity reads grew retained mark observations from {before} to {after}"
+        );
+    }
+    #[tokio::test]
+    async fn test_marks_negative_reads_keep_known_durable_authority() {
+        let (dir, store) = open();
+        let held = with_mark(&store, ALICE, head(1, 8, 8)).await;
+        for number in 0..2048 {
+            assert_eq!(
+                store.read(&format!("absent{number}")).await.expect("read"),
+                MarkRead::Missing
+            );
+        }
+        assert_eq!(store.inner.marks.lock().len(), 1);
+        fs::remove_file(marks_dir(&dir).join(ALICE)).expect("lose known mark");
+        assert_eq!(store.read(ALICE).await.expect("lost"), MarkRead::Missing);
+        assert_eq!(
+            store.inner.marks.lock().get(ALICE),
+            Some(&MarkRead::Mark(held))
+        );
+        fs::write(
+            marks_dir(&dir).join(ALICE),
+            serde_json::to_vec(&mark_at(1, 2, 2, 100)).expect("json"),
+        )
+        .expect("rollback");
+        assert_eq!(
+            store.read(ALICE).await.expect("changed"),
+            MarkRead::NotAMark
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasure_attempt_sync_failure_cannot_become_completion() {
+        let (dir, store, faults) = open_faulty();
+        let attempt = ErasureAttempt::new(100, 200, Some([9; 32])).expect("attempt");
+        let ledger = dir.path().join("accounts/erasure-attempts");
+        faults.lock().fail_sync(&ledger, 2);
+        assert!(store.begin_erasure(ALICE, attempt.clone()).await.is_err());
+        assert!(store.erasure_attempt(ALICE).await.is_err());
+        let reopened = crash_and_reopen(&dir, &faults);
+        assert_eq!(
+            reopened
+                .erasure_attempt(ALICE)
+                .await
+                .expect("no durable attempt"),
+            None
+        );
+        assert_eq!(reopened.erasure(ALICE).await.expect("no completion"), None);
+        reopened
+            .begin_erasure(ALICE, attempt.clone())
+            .await
+            .expect("durable attempt");
+        let reopened = crash_and_reopen(&dir, &faults);
+        assert_eq!(
+            reopened
+                .erasure_attempt(ALICE)
+                .await
+                .expect("retained attempt"),
+            Some(attempt.clone())
+        );
+        assert_eq!(
+            reopened.erasure(ALICE).await.expect("still not complete"),
+            None
+        );
+        faults.lock().fail_sync(&ledger, 1);
+        assert!(
+            reopened
+                .clear_erasure_attempt(ALICE, attempt.clone())
+                .await
+                .is_err()
+        );
+        let reopened = crash_and_reopen(&dir, &faults);
+        assert_eq!(
+            reopened
+                .erasure_attempt(ALICE)
+                .await
+                .expect("unacknowledged removal"),
+            Some(attempt)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_erasure_attempt_live_authority_and_offline_unknown() {
+        for change in ["missing", "corrupt", "replaced"] {
+            let (dir, store) = open();
+            let attempt = ErasureAttempt::new(100, 200, None).expect("attempt");
+            store
+                .begin_erasure(ALICE, attempt.clone())
+                .await
+                .expect("attempt");
+            let view = MarkView::open(dir.path()).expect("view");
+            assert_eq!(view.list().expect("identities"), vec![ALICE.to_string()]);
+            assert!(
+                view.read(ALICE).is_err(),
+                "an unresolved attempt is not a healthy absent account"
+            );
+            let path = dir.path().join("accounts/erasure-attempts").join(ALICE);
+            match change {
+                "missing" => fs::remove_file(path).expect("remove"),
+                "corrupt" => fs::write(path, b"broken").expect("corrupt"),
+                _ => fs::write(
+                    path,
+                    ErasureAttempt::new(100, 201, None)
+                        .expect("another attempt")
+                        .bytes()
+                        .expect("bytes"),
+                )
+                .expect("replace"),
+            }
+            assert!(store.read(ALICE).await.is_err(), "{change}");
+            assert!(store.erasure_attempt(ALICE).await.is_err(), "{change}");
+            assert!(store.list().await.is_err(), "aggregate: {change}");
+            assert_eq!(
+                store.read(BOB).await.expect("unrelated identity"),
+                MarkRead::Missing
+            );
+        }
     }
 }

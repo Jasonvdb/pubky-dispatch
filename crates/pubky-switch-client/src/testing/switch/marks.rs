@@ -67,6 +67,7 @@ pub(crate) struct MarkStore {
     pub(crate) retired: BTreeSet<u64>,
     /// The time of the erasure's record for the identity, if there is one.
     pub(crate) erasure_at_ms: Option<u64>,
+    pub(super) attempt: Option<super::erasure::Attempt>,
 }
 
 impl MarkStore {
@@ -184,7 +185,7 @@ impl Inner {
     /// brings an erased account back.
     pub(crate) fn judge(&self) -> Verdict {
         let marks = &self.marks;
-        if marks.unreadable {
+        if marks.unreadable || marks.attempt.is_some() {
             return Verdict::Unknown;
         }
         if self.not_hosted_unpinned {
@@ -283,6 +284,9 @@ impl Inner {
     /// request goes on. Deletes an erasure's leftover mark, and answers the erasure at a lost
     /// identity, which no later step reaches.
     pub(super) fn step_two(&mut self, request: &Request) -> Option<Response> {
+        if let Some(answer) = self.pending_erasure(request) {
+            return Some(answer);
+        }
         let class = class_of(request);
         let verdict = self.judge();
         let unknown = matches!(verdict, Verdict::Unknown);

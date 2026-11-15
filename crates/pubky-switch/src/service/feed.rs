@@ -1027,6 +1027,9 @@ impl Service {
     async fn read_page(&self, read: &FeedRead) -> Result<Answered, FeedStop> {
         let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
         let inputs = self.mark_inputs(&read.account.id).await;
+        if inputs.has_pending_erasure() {
+            return Err(FeedStop::AccountChanged);
+        }
         let budget = usize::try_from(self.limits.max_page_bytes).unwrap_or(usize::MAX);
         let mut builder = PageBuilder::with(
             Reader::Checked {

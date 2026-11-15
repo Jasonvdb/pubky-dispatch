@@ -21,8 +21,8 @@
 //!    any read, ends the wait (Switch wire 7.4.16 "The signer's `404`", spec 12.7 step 5). A
 //!    `404` is never itself a lost answer: with no request in doubt it is an error, and the
 //!    mark goes back. No answer, or another answer the pinned key didn't sign, such as a
-//!    gateway's `503`, keeps the mark; only an answer the pinned key signed shows the account
-//!    still exists, and clears it.
+//!    gateway's `503`, keeps the mark. A signed `503 unavailable` also leaves the outcome
+//!    unknown; a definitive refusal clears the request in doubt.
 //!
 //! Every deletion and every request comes after a fresh check that this install still signs,
 //! since the flow may be resumed much later: every copy, as before a delivery
@@ -168,17 +168,6 @@ impl Signer {
                 return self.erased_after_doubt(reminded, self.erasure_wait()).await;
             }
         }
-        // Before the request: it may land, however its answer goes.
-        if !unanswered {
-            let flow = Flow::Erase {
-                unpublished,
-                reminded: reminded.clone(),
-                unanswered: true,
-                first_404_ms: None,
-                shown: self.erasure_shown(),
-            };
-            self.commit(self.state.clone(), Some(flow)).await?;
-        }
         self.send_erasure(unpublished, reminded, unanswered, true)
             .await
     }
@@ -199,6 +188,17 @@ impl Signer {
         // take-over, makes the switch refuse it, and so does a later account of the identity
         // there; a retry names the same (Switch wire 7.4.16).
         let (created, following) = self.erasure_names()?;
+        // Before every transmitted request, including one rebound by an authenticated
+        // conflict: its outcome may be unknown. The retained intent authorizes only this
+        // erasure, after unpublication and the copy/signing checks (wire 7.4.16).
+        let flow = Flow::Erase {
+            unpublished,
+            reminded: reminded.clone(),
+            unanswered: true,
+            first_404_ms: self.erasure_wait(),
+            shown: self.erasure_shown(),
+        };
+        self.commit(self.state.clone(), Some(flow)).await?;
         let answer = {
             let key = self.signing_key()?;
             let client = self.signing_client(&key)?;
@@ -236,6 +236,25 @@ impl Signer {
             // `502`, `503` or `504`, which can hide a forwarded request: the request may have
             // landed, and the mark stays.
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
+                Err(error.into())
+            }
+            // An unavailable response does not establish non-application. Retain the
+            // durable request so a completed deletion's later 404 can confirm it, or an
+            // unresolved attempt can be retried (Switch wire 7.3, 7.4.16).
+            Err(
+                error @ ClientError::Switch {
+                    code: ErrorCode::Unavailable,
+                    ..
+                },
+            ) => {
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded,
+                    unanswered: true,
+                    first_404_ms: None,
+                    shown: self.erasure_shown(),
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
             }
             // Every `409` to an erasure names the creation time it was checked against; without
@@ -313,9 +332,8 @@ impl Signer {
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
-            // An answer the pinned key signed that does not confirm an erasure: the
-            // erasure didn't land, and the next request is a first one again.
-            Err(error @ (ClientError::Switch { .. } | ClientError::InvalidResponse(_))) => {
+            // A well-formed definitive refusal: this request did not erase the account.
+            Err(error @ ClientError::Switch { .. }) => {
                 let flow = Flow::Erase {
                     unpublished,
                     reminded,
@@ -493,12 +511,31 @@ impl Signer {
                     .await
                     .map(|()| Checked::ErasedAlready)
             }
+            // Only a previously authorized request, after unpublication, may retry past
+            // an unavailable ownership read. It still checks every other copy and the
+            // signing gate; this grants no authority to delete Homeserver state.
+            Err(SignerError::Switch(error))
+                if error.code() == Some(ErrorCode::Unavailable)
+                    && matches!(
+                        self.flow,
+                        Some(Flow::Erase {
+                            unpublished: true,
+                            unanswered: true,
+                            ..
+                        })
+                    ) =>
+            {
+                self.copies_before_bound_erasure()
+                    .await
+                    .map(|()| Checked::Signing)
+            }
             // An account that answers the notice holds its copy back from `GET /apps` and
             // shows it in a `409` to the erasure instead (Switch wire 7.4.16): the other
             // copies are judged, and the step goes on.
-            Err(SignerError::Switch(error)) if answers_the_notice(&error) => {
-                self.copies_at_a_notice().await.map(|()| Checked::Signing)
-            }
+            Err(SignerError::Switch(error)) if answers_the_notice(&error) => self
+                .copies_before_bound_erasure()
+                .await
+                .map(|()| Checked::Signing),
             checked => checked.map(|()| Checked::Signing),
         };
         // An alarm or records behind keep the erasure in the commit that records them
@@ -531,7 +568,7 @@ impl Signer {
     /// step: this install is named, its records aren't behind, and neither the signer backup
     /// nor the Homeserver's `identity.json` shows another install or a newer version (Switch
     /// spec 4.3, wire 3.13).
-    async fn copies_at_a_notice(&mut self) -> Result<()> {
+    async fn copies_before_bound_erasure(&mut self) -> Result<()> {
         self.check_named()?;
         self.check_backup_copy().await?;
         if let Some(newest) = self.state.newest_doc()? {

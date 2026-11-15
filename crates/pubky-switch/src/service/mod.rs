@@ -37,6 +37,10 @@ mod connect;
 mod directory;
 mod enroll;
 mod erase;
+#[cfg(any(test, feature = "test-util"))]
+mod erasure_testing;
+#[cfg(any(test, feature = "test-util"))]
+pub use erasure_testing::{ErasureFaults, ErasureOutcome};
 mod feed;
 mod handover;
 mod identity;
@@ -172,6 +176,8 @@ pub struct Service {
     /// A pause before withdrawing an erasure whose deletion failed.
     #[cfg(any(test, feature = "test-util"))]
     erase_failure_pause: parking_lot::Mutex<Option<RequestPause>>,
+    #[cfg(any(test, feature = "test-util"))]
+    erasure_faults: ErasureFaults,
 }
 
 /// A source of entry IDs.
@@ -227,7 +233,10 @@ enum Deferred {
     Records(Box<records::RecordsRead>),
     /// The account's erasure (Switch wire 7.4.16): not a read, but done in place of the
     /// commit; with the creation time it names, in Unix milliseconds.
-    Erase(u64),
+    Erase {
+        created: u64,
+        identity_hash: Option<[u8; 32]>,
+    },
 }
 
 impl Answer {
@@ -332,6 +341,7 @@ impl Service {
     /// past `keys.backup_retention_days`.
     pub async fn started(self) -> Self {
         let _ = self.sweep_erased_keys().await;
+        self.reconcile_erasure_outcomes().await;
         let _ = self.erase_restored_accounts().await;
         self.delete_leftover_marks().await;
         self.forget_aged_erasures().await;
@@ -432,6 +442,8 @@ impl Service {
             checkpoint_sign_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
             erase_failure_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            erasure_faults: ErasureFaults::default(),
         }
     }
 
@@ -624,6 +636,19 @@ impl Service {
             return self.service_error(asked, AnswerTime::Unbound(base_ms), &error);
         };
         let call = &request.route.call;
+        if *call == Call::Erase {
+            match self.reconcile_erasure(&account).await {
+                Ok(false) => return self.retry_erasure(&account, &request, base_ms, asked).await,
+                Ok(true) => {}
+                Err(error) => {
+                    return self.service_error(
+                        asked,
+                        AnswerTime::TimeBase(base_ms, Uncompared::Erasure),
+                        &error,
+                    );
+                }
+            }
+        }
         // Step 2: the account and its mark, judged together, before the lock (Switch wire
         // 7.3, Table 1). A failure here is a `503 unavailable`, which counts in no comparison
         // (Switch wire 7.1 Timestamp).
@@ -1161,7 +1186,7 @@ impl Service {
                 Answer::error(&error).with_head(head)
             }
         };
-        if matches!(answer.deferred, Some(Deferred::Erase(_))) {
+        if matches!(answer.deferred, Some(Deferred::Erase { .. })) {
             return self
                 .finish_erasure(txn, &signer, asked, committed_ms, time_ms, answer)
                 .await;
@@ -1272,7 +1297,7 @@ impl Service {
                 return self.feed_answer(&read, result, fallback_head, asked).await;
             }
             // An erasure was answered before the commit, above.
-            Some(Deferred::Erase(_)) | None => {}
+            Some(Deferred::Erase { .. }) | None => {}
         }
         // The response signature is made last, over the whole body (Switch wire 7.1).
         sign_answer(&answer_signer, asked, AnswerTime::Account(time_ms), answer)

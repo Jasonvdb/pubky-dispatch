@@ -147,7 +147,9 @@ async fn test_erasure_wait_signed_error_to_the_check_ends_the_wait() {
         code: ErrorCode::Unavailable,
         current: serde_json::Value::Null,
     });
+    *world.homeserver.down.lock().unwrap() = true;
     signer.resume().await.unwrap_err();
+    *world.homeserver.down.lock().unwrap() = false;
     let status_after_signed = signer.status();
     intermediary.store(true, Ordering::SeqCst);
     world.clock.advance_ms(22 * H);
@@ -699,7 +701,7 @@ async fn test_erasure_wait_retry_404_after_a_signed_check_starts_a_fresh_wait() 
 #[tokio::test]
 async fn test_erasure_wait_signed_error_to_the_retry_ends_the_wait() {
     // T0: 404. T0+2h: signed check, the retry gets a signed 503: the wait is over, the
-    // mark cleared. T0+24h: 404 again: a fresh wait.
+    // request remains in doubt. T0+24h: 404 again starts a fresh wait.
     let world = World::new();
     let (mut signer, _, intermediary, _t0, _) = waiting_behind_an_intermediary(&world).await;
     world.clock.advance_ms(2 * H);
@@ -713,12 +715,15 @@ async fn test_erasure_wait_signed_error_to_the_retry_ends_the_wait() {
     assert_eq!(signer.status(), SignerStatus::Erasing);
     intermediary.store(true, Ordering::SeqCst);
     world.clock.advance_ms(22 * H);
-    // No request in doubt now: the 404 to the check is an error, not the wait.
-    signer.resume().await.unwrap_err();
-    assert!(!matches!(
+    let since_ms = world.clock.now_ms();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms })
+    );
+    assert_eq!(
         signer.status(),
-        SignerStatus::Erased | SignerStatus::ErasedUnconfirmed { .. }
-    ));
+        SignerStatus::ErasedUnconfirmed { since_ms }
+    );
 }
 
 #[tokio::test]

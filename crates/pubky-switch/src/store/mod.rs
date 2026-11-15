@@ -34,6 +34,7 @@ mod claim_codec;
 mod connect;
 mod documents;
 mod enrollments;
+mod erasure;
 mod feed;
 mod handover;
 pub mod heads;
@@ -248,6 +249,7 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// one (`XX`).
 fn refused_answer(error: bool, code: &str) -> bool {
     error
+        && code != "40003"
         && !["08", "57", "58", "XX"]
             .iter()
             .any(|class| code.starts_with(class))
@@ -879,7 +881,9 @@ mod tests {
         }
         // A lost connection, as PgBouncer answers one (`08P01`), a shutdown or an internal
         // error may follow a commit that landed, and so may a `FATAL` of any class.
-        for code in ["08P01", "08006", "57P01", "57014", "58030", "XX000"] {
+        for code in [
+            "08P01", "08006", "40003", "57P01", "57014", "58030", "XX000",
+        ] {
             assert!(!refused_answer(true, code), "{code}");
         }
         assert!(!refused_answer(false, "23505"));

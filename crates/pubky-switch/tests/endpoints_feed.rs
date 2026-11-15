@@ -1681,18 +1681,17 @@ async fn test_feed_waits_for_erasure_deletion() {
             let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&at)).await;
             tokio::join!(Box::pin(replay.service.handle(request)), async {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while replay
-                        .marks
-                        .erasure(&alice_id())
-                        .await
-                        .expect("erasure")
-                        .is_none()
+                    while !replay
+                        .key_dir()
+                        .join("accounts/erasure-attempts")
+                        .join(alice_id())
+                        .exists()
                     {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("erasure record written before deletion");
+                .expect("erasure attempt written before deletion");
                 let early = tokio::time::timeout(Duration::from_secs(2), async {
                     while !answered.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1899,7 +1898,7 @@ async fn test_feed_failed_erasure_record_does_not_erase_account() {
     use std::os::unix::fs::PermissionsExt;
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let erasures = replay.key_dir().join("accounts/erasures");
+    let erasures = replay.key_dir().join("accounts/erasure-attempts");
     let permissions = std::fs::metadata(&erasures)
         .expect("metadata")
         .permissions();
@@ -2056,4 +2055,221 @@ async fn test_feed_failed_deletion_keeps_the_lock_until_record_withdrawal() {
     assert_eq!(record, None);
     assert!(!early, "request passed the erasure before withdrawal");
     assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn test_feed_failed_deferred_deletion_keeps_the_lock_until_record_withdrawal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_account_delete AFTER DELETE ON accounts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let pause = replay.service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let answered = AtomicBool::new(false);
+    let (erased, (answer, early)) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        let request = signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(&revoke_time()),
+        );
+        tokio::join!(
+            async {
+                let answer = Box::pin(replay.service.handle(request)).await;
+                answered.store(true, Ordering::SeqCst);
+                answer
+            },
+            async {
+                let early = tokio::time::timeout(Duration::from_millis(500), async {
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok();
+                pause.release();
+                early
+            }
+        )
+    });
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = replay.marks.erasure(&alice_id()).await.expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(erased.status, 503);
+    assert!(
+        survived,
+        "a request must not complete an erasure whose failure is withdrawing its record"
+    );
+    assert_eq!(record, None);
+    assert!(!early, "request passed the erasure before withdrawal");
+    assert_eq!(answer.status, 200);
+}
+#[tokio::test]
+async fn test_feed_failed_deletion_with_expired_lock_preserves_account() {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE TRIGGER fail_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let service = replay
+        .restarted_with(pubky_switch::limits::Limits::default())
+        .with_lock_freshness(LockFreshness::confirmed_ago(
+            Duration::ZERO,
+            LockTiming::checking_every(Duration::from_secs(1)),
+        ));
+    let pause = service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let (erased, ()) = tokio::join!(Box::pin(service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        pause.release();
+    });
+    assert_eq!(erased.status, 503);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the database rejected the deletion"
+    );
+    let read = Box::pin(replay.service.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = replay.marks.erasure(&alice_id()).await.expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        survived,
+        "a failed erasure cannot become committed when the lock is fresh again; read status {}, record {:?}",
+        read.status, record
+    );
+    assert_eq!(record, None);
+    assert_eq!(read.status, 200);
+}
+#[tokio::test]
+async fn test_feed_failed_deletion_with_unwritable_record_preserves_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE TRIGGER fail_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let service = replay.restarted_with(pubky_switch::limits::Limits::default());
+    let erasures = replay.key_dir().join("accounts/erasure-attempts");
+    let permissions = std::fs::metadata(&erasures)
+        .expect("metadata")
+        .permissions();
+    let pause = service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let (erased, ()) = tokio::join!(Box::pin(service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        std::fs::set_permissions(&erasures, std::fs::Permissions::from_mode(0o500))
+            .expect("read only");
+        pause.release();
+    });
+    std::fs::set_permissions(&erasures, permissions).expect("writable");
+    assert_eq!(erased.status, 503);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the database rejected the deletion"
+    );
+    let reopened = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        replay.keys.clone(),
+        pubky_switch::marks::MarkStore::open(replay.key_dir()).expect("reopened marks"),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    let read = Box::pin(reopened.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = pubky_switch::marks::MarkView::open(replay.key_dir())
+        .expect("view")
+        .erasure(&alice_id())
+        .expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        survived,
+        "a failed erasure cannot become committed after the mark store becomes writable and reloads; read status {}, record {:?}",
+        read.status, record
+    );
+    assert_eq!(record, None);
+    assert_eq!(read.status, 200);
 }

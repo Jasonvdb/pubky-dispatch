@@ -38,6 +38,32 @@ const MARK_REFUSALS_LOGGED: usize = 1024;
 pub(super) struct MarkInputs {
     mark: MarkInput,
     erasure_at_ms: Option<u64>,
+    erasure: ErasureCheck,
+}
+
+/// A retry carries the exact authenticated attempt whose identity lock it holds.
+#[derive(Clone, Debug)]
+enum ErasureCheck {
+    Clear,
+    Pending(crate::marks::ErasureAttempt),
+    Retry(crate::marks::ErasureAttempt),
+}
+
+impl MarkInputs {
+    pub(super) fn has_pending_erasure(&self) -> bool {
+        matches!(self.erasure, ErasureCheck::Pending(_))
+    }
+
+    pub(super) fn for_erasure(
+        mut self,
+        attempt: &crate::marks::ErasureAttempt,
+    ) -> Result<Self, ApiError> {
+        if !matches!(&self.erasure, ErasureCheck::Pending(held) if held == attempt) {
+            return Err(ApiError::unavailable("7.6: the erasure attempt changed"));
+        }
+        self.erasure = ErasureCheck::Retry(attempt.clone());
+        Ok(self)
+    }
 }
 
 /// The verdict of an identity's account and mark, with what it was judged from.
@@ -171,9 +197,18 @@ impl Service {
                 None
             }
         };
+        let attempt = match self.marks.erasure_attempt(identity).await {
+            Ok(attempt) => attempt,
+            Err(MarkStoreError::InvalidIdentity) => None,
+            Err(_) => {
+                mark = MarkInput::StoreUnreadable;
+                None
+            }
+        };
         MarkInputs {
             mark,
             erasure_at_ms,
+            erasure: attempt.map_or(ErasureCheck::Clear, ErasureCheck::Pending),
         }
     }
 
@@ -198,7 +233,19 @@ impl Service {
         let MarkInputs {
             mut mark,
             erasure_at_ms,
+            erasure,
         } = inputs;
+        // The account read may have waited while deletion committed. Recheck the pending
+        // boundary afterwards so that an older "clear" observation proves no absence.
+        let current_attempt = self.marks.erasure_attempt(identity).await;
+        let clear = match (erasure, current_attempt) {
+            (ErasureCheck::Retry(expected), Ok(Some(current))) => current == expected,
+            (ErasureCheck::Clear, Ok(None) | Err(MarkStoreError::InvalidIdentity)) => true,
+            _ => false,
+        };
+        if !clear {
+            mark = MarkInput::StoreUnreadable;
+        }
         // Table 1 selects exactly one retirement: the mark's generation, or the
         // account's when the mark is lost. No unrelated generation affects this verdict.
         let generation = match &mark {
@@ -305,7 +352,13 @@ impl Service {
         &self,
         identity: &str,
     ) -> Result<(Option<crate::store::FoundAccount>, Judged), ApiError> {
-        let inputs = self.mark_inputs(identity).await;
+        let reconciled = self.reconcile_erasure(identity).await;
+        let mut inputs = self.mark_inputs(identity).await;
+        if reconciled.is_err() {
+            // Keep the account lookup and its committed time while refusing unresolved
+            // authority through the same verdict as every unreadable mark store.
+            inputs.mark = MarkInput::StoreUnreadable;
+        }
         let found = self
             .store
             .lookup(identity)

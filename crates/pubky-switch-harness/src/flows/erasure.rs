@@ -1,7 +1,10 @@
 //! The account's erasure, when the user stops using the Switch (Switch spec 12.7, Switch
 //! wire 7.4.16).
 
+use std::sync::Arc;
+
 use pubky_switch_client::app::{App, AppEvent};
+use pubky_switch_client::store::MemoryStore;
 use pubky_switch_signer::{Signer, SignerStatus, UserConfirmed};
 use serde_json::{Value, json};
 
@@ -357,5 +360,159 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
         "the signer signed on",
         &json!({ "version_steps": next.version() - doc.version(), "signer": status(&signer)? }),
     );
+    Ok(())
+}
+
+/// A signed unavailable answer preserves the erasure in progress. Reads expose only
+/// established outcomes; an unknown attempt is resolved by the signer's exact retry.
+///
+/// # Errors
+///
+/// When a retained outcome is misreported or the authorized retry cannot finish.
+pub async fn erasure_outcome(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+) -> FlowResult {
+    erasure_outcome_after_reply(world, outcome, false).await
+}
+
+/// An unavailable erasure answer is lost, then the signer restarts and retries.
+///
+/// # Errors
+///
+/// When the unresolved outcome or its exact retry is misreported.
+pub async fn erasure_outcome_answer_lost(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+) -> FlowResult {
+    erasure_outcome_after_reply(world, outcome, true).await
+}
+
+async fn erasure_outcome_after_reply(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+    lose_reply: bool,
+) -> FlowResult {
+    use pubky_switch_client::testing::ErasureOutcome;
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let mut signer = Signer::create(env, world.keyring(&alice)?, ORIGIN).await?;
+    signer.resume().await?;
+    world.advance_ms(STEP_MS);
+    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    world.fail_next_erasure(ORIGIN, &alice, outcome).await?;
+    if lose_reply {
+        world.lose_answer("POST", "/erase");
+    }
+    let first = signer
+        .close_account(UserConfirmed::shown_and_confirmed())
+        .await;
+    if first.is_ok() {
+        return Err("an unfinished erasure answered success".into());
+    }
+    world.outcome("the erasure is unavailable", &ended(&first));
+    let read = world
+        .request("GET", ORIGIN, &format!("/v1/{}/identity", alice.key().id()))
+        .await?;
+    let expected = match outcome {
+        ErasureOutcome::Unresolved | ErasureOutcome::UnresolvedAbsent => 503,
+        ErasureOutcome::Committed => 404,
+        ErasureOutcome::Rejected => 200,
+    };
+    if read.status != expected {
+        return Err(format!(
+            "pending erasure read: {} instead of {expected}",
+            read.status
+        )
+        .into());
+    }
+    if expected != 200 && read.header(pubky_switch_core::http::header::HEAD).is_some() {
+        return Err("an unresolved or erased account carried a head".into());
+    }
+    world.outcome(
+        "the retained outcome was read",
+        &json!({"status": read.status}),
+    );
+    // The pending operation must survive reopening the same durable signer state.
+    drop(signer);
+    let mut signer = Signer::open(world.signer_env(&alice, store)?, world.keyring(&alice)?).await?;
+    world.advance_ms(STEP_MS);
+    let resumed = signer.resume().await;
+    world.outcome("the signer resumed the erasure", &ended(&resumed));
+    resumed?;
+    standing(
+        &signer,
+        "erased",
+        matches!(signer.status(), SignerStatus::Erased),
+    )?;
+    Ok(())
+}
+
+/// An unrelated unavailable read grants no authority to unpublish or erase.
+///
+/// # Errors
+///
+/// When the signer deletes state without first establishing ownership.
+pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResult {
+    use pubky_switch_client::{Credentials, SwitchClient};
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let created = world.now_ms();
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let published = world.files().identity_doc(&alice.public());
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds its document")?;
+    let client = SwitchClient::new(
+        ORIGIN,
+        alice.public(),
+        Credentials::Signer {
+            identity: alice.public(),
+            key: Arc::new(pubky_switch_core::keys::IdentityKey::from_secret(
+                alice.key().secret_bytes(),
+            )),
+        },
+        Some(doc.inbox().service_key),
+        world.transport(),
+        world.clock().clone(),
+    )?;
+    // A request outside this signer's flow left uncertainty. It does not authorize
+    // this signer to delete Homeserver records or acquire an erasure intent from a 503.
+    world
+        .fail_next_erasure(
+            ORIGIN,
+            &alice,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        )
+        .await?;
+    let first = client.erase(Some(created), Some(doc.hash())).await;
+    if first.is_ok() {
+        return Err("the external attempt answered success".into());
+    }
+    let result = signer
+        .close_account(UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome("unavailable before authorization", &ended(&result));
+    if result.is_ok()
+        || !matches!(signer.status(), SignerStatus::Signing)
+        || published != world.files().identity_doc(&alice.public())
+    {
+        return Err("an unavailable ownership read authorized erasure".into());
+    }
+    // The authorizing caller can repeat its exact request; the local signer still
+    // holds no unanswered erasure and takes the resulting 404 only as not hosted.
+    client.erase(Some(created), Some(doc.hash())).await?;
+    let result = signer
+        .close_account(UserConfirmed::shown_and_confirmed())
+        .await;
+    if result.is_ok()
+        || !matches!(signer.status(), SignerStatus::Signing)
+        || published != world.files().identity_doc(&alice.public())
+    {
+        return Err("another caller's completed erasure authorized local deletion".into());
+    }
     Ok(())
 }

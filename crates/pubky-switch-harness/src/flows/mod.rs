@@ -57,7 +57,10 @@ pub use connect::{
 };
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
-pub use erasure::{erasure, erasure_answer_lost, erasure_enrolled_again};
+pub use erasure::{
+    erasure, erasure_answer_lost, erasure_enrolled_again, erasure_outcome,
+    erasure_outcome_answer_lost, erasure_unavailable_before_authorization,
+};
 pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
@@ -165,6 +168,45 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
+    }),
+    ("erasure, unresolved outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        ))
+    }),
+    ("erasure, absent unresolved outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::UnresolvedAbsent,
+        ))
+    }),
+    ("erasure, committed outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Committed,
+        ))
+    }),
+    ("erasure, rejected outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Rejected,
+        ))
+    }),
+    ("erasure, unavailable before authorization", |world| {
+        Box::pin(erasure_unavailable_before_authorization(world))
+    }),
+    ("erasure, unresolved answer lost", |world| {
+        Box::pin(erasure_outcome_answer_lost(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        ))
+    }),
+    ("erasure, committed answer lost", |world| {
+        Box::pin(erasure_outcome_answer_lost(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Committed,
+        ))
     }),
     ("erasure, enrolled again", |world| {
         Box::pin(erasure_enrolled_again(world))

@@ -308,15 +308,15 @@ async fn test_erasure_404_to_a_first_request_isnt_taken_as_done() {
 
 #[tokio::test]
 async fn test_erasure_aborted_after_a_signed_refusal() {
-    // The switch answered, signed, that it couldn't commit the deletion: the account still
-    // exists, so the user can abort. `identity.json` is published again, and the grant
+    // The switch definitively refused the request: the account still exists, so the user
+    // can abort. `identity.json` is published again, and the grant
     // reminder the erasure raised for the app, still listed, is withdrawn.
     let world = World::new();
     let (mut signer, _, _) = with_an_app(&world).await;
     let newest = signer.identity_doc().unwrap().unwrap();
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
-        code: ErrorCode::Unavailable,
+        code: ErrorCode::BadRequest,
         current: serde_json::Value::Null,
     });
     signer.close_account(confirmed()).await.unwrap_err();
@@ -466,7 +466,7 @@ async fn test_erasure_ended_keeps_a_removed_apps_reminder() {
         let code = if refused {
             ErrorCode::Conflict
         } else {
-            ErrorCode::Unavailable
+            ErrorCode::BadRequest
         };
         world.switch.fail_next(SwitchFault::Error {
             path: "/erase".into(),
@@ -892,12 +892,12 @@ async fn test_erasure_stops_at_a_copy_published_between_two_deletions() {
 }
 
 /// An erasure with the files gone and the reminders raised, and no request in doubt: its
-/// first request got a signed `503`.
+/// first request got a signed `400 bad_request`.
 async fn erasing_after_a_signed_failure(world: &World) -> (Signer, [u8; 16], Arc<MemoryStore>) {
     let (mut signer, id, store) = with_an_app(world).await;
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
-        code: ErrorCode::Unavailable,
+        code: ErrorCode::BadRequest,
         current: serde_json::Value::Null,
     });
     signer.close_account(confirmed()).await.unwrap_err();
@@ -2729,4 +2729,84 @@ async fn test_erasure_409_showing_another_installs_newer_copy_ends_it() {
     assert_ne!(signer.status(), SignerStatus::Erasing);
     assert!(!world.switch.erased());
     assert_eq!(erase_requests(&world), 1);
+}
+
+#[tokio::test]
+async fn test_erasure_malformed_success_keeps_authorized_request_after_restart() {
+    let world = World::new();
+    let (mut signer, _, store) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::LeaveOut {
+        path: "/erase".into(),
+        member: "erased".into(),
+    });
+    assert!(matches!(
+        signer.close_account(confirmed()).await,
+        Err(SignerError::Switch(
+            pubky_switch_client::ClientError::InvalidResponse(_)
+        ))
+    ));
+    assert!(world.switch.erased());
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert_eq!(erase_requests(&world), 1);
+}
+
+#[tokio::test]
+async fn test_erasure_unresolved_retry_preserves_body_after_restart() {
+    let world = World::new();
+    let (mut signer, _, store) = with_an_app(&world).await;
+    world
+        .switch
+        .fail_next_erasure(pubky_switch_client::testing::ErasureOutcome::Unresolved);
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(!world.switch.erased());
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    world.clock.advance_ms(2_000);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    let bodies: Vec<_> = world
+        .transport
+        .requests()
+        .iter()
+        .filter(|request| request.method == "POST" && request.path_and_query.ends_with("/erase"))
+        .map(|request| request.body.clone())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+#[tokio::test]
+async fn test_erasure_unresolved_retry_refuses_a_changed_identity_copy() {
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    world
+        .switch
+        .fail_next_erasure(pubky_switch_client::testing::ErasureOutcome::Unresolved);
+    signer.close_account(confirmed()).await.unwrap_err();
+    let other = world.other_install_version(&mark, [9; 16]);
+    world.switch.deliver_identity(&other).unwrap();
+    // The unavailable ownership read cannot authorize a different document's erasure.
+    signer.resume().await.unwrap_err();
+    assert!(!world.switch.erased());
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        other.signed()
+    );
+    assert_eq!(erase_requests(&world), 2);
 }

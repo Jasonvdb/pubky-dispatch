@@ -510,12 +510,41 @@ impl AccountTxn {
     /// request waiting on the account's changes wakes, and finds it gone. The push keys go
     /// after the commit: a key deleted first, by an erasure that then failed to commit, would
     /// leave a registration no key signs for.
-    pub async fn erase(mut self, erased_at: u64) -> Result<(), ErasureFailure> {
+    pub async fn erase(self, erased_at: u64) -> Result<(), ErasureFailure> {
+        self.erase_with_outcome(erased_at, None, None).await
+    }
+
+    /// Delete and record the exact external attempt in the same commit.
+    pub(crate) async fn erase_recorded(
+        self,
+        attempt: &crate::marks::ErasureAttempt,
+        freshness: Option<&super::LockFreshness>,
+    ) -> Result<(), ErasureFailure> {
+        self.erase_with_outcome(attempt.erased_at_ms, Some(attempt), freshness)
+            .await
+    }
+
+    async fn erase_with_outcome(
+        mut self,
+        erased_at: u64,
+        attempt: Option<&crate::marks::ErasureAttempt>,
+        freshness: Option<&super::LockFreshness>,
+    ) -> Result<(), ErasureFailure> {
         let savepoint = self.savepoint().await.map_err(|error| ErasureFailure {
             error,
             account: None,
         })?;
-        if let Err(error) = self.delete_account(erased_at).await {
+        let deleted = async {
+            super::erasure::require_fresh(freshness)?;
+            self.delete_account(erased_at).await?;
+            if let Some(attempt) = attempt {
+                super::erasure::record(&mut self.tx, &self.head.id, attempt, true).await?;
+                super::erasure::require_fresh(freshness)?;
+            }
+            Ok::<(), StoreError>(())
+        }
+        .await;
+        if let Err(error) = deleted {
             let account = self
                 .rollback_to(savepoint)
                 .await

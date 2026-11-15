@@ -34,7 +34,7 @@ use pubky_switch_core::time::{parse_rfc3339, rfc3339_seconds};
 use serde_json::Value;
 
 use crate::clock::Clock;
-use crate::error::ClientError;
+use crate::error::{ClientError, TransportError};
 use crate::transport::{Header, Request, Response, TimeoutClass, Transport};
 
 /// Who signs the requests (Switch wire 7.2).
@@ -291,8 +291,9 @@ pub struct CheckedResponse {
     pub body: Vec<u8>,
     /// `Switch-Server-Time`, the identity's service time, in Unix milliseconds.
     pub server_time_ms: u64,
-    /// `Switch-Head`, where present and verified with the service key; `None` for one that
-    /// doesn't read or verify as a head for the account (Switch wire 6.7, 7.1).
+    /// `Switch-Head`, where present and verified with the service key; `None` only when
+    /// absent. A present head that doesn't read or verify for the account fails the
+    /// response (Switch wire 6.7, 7.1).
     pub head: Option<SignedHead>,
 }
 
@@ -837,6 +838,19 @@ impl SwitchClient {
         self.send_checked(signed, key, auth.success_key).await?
     }
 
+    /// Receive an answer without losing a protected header (Switch wire 7.1).
+    async fn send_response(&self, request: Request) -> Result<Response, ClientError> {
+        self.transport
+            .send(request)
+            .await
+            .map_err(|error| match error {
+                TransportError::UnreadableSignedHeader { status } => {
+                    ClientError::BadServiceSignature { status }
+                }
+                error => error.into(),
+            })
+    }
+
     /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
     /// anything else with `key`. The outer error is the transport's.
     async fn send_checked(
@@ -846,7 +860,7 @@ impl SwitchClient {
         success_key: Option<[u8; 32]>,
     ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport.send(signed.request).await?;
+        let response = self.send_response(signed.request).await?;
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
@@ -875,7 +889,7 @@ impl SwitchClient {
         };
         let signed = self.build(method, path_and_query, Vec::new(), Body::Empty, auth)?;
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport.send(signed.request).await?;
+        let response = self.send_response(signed.request).await?;
         let key =
             self.named_service_key(&response.body)
                 .ok_or(ClientError::BadServiceSignature {
@@ -909,10 +923,6 @@ impl SwitchClient {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.set_latest(None);
         self.send_checked(signed, key, None).await?
-    }
-
-    pub(crate) fn transport(&self) -> &dyn Transport {
-        self.transport.as_ref()
     }
 
     /// The App ID as a path segment.

@@ -180,7 +180,7 @@ impl SwitchClient {
         };
         let signed = self.build("POST", "/v1/enroll", body, Body::Json, auth)?;
         let sent = SentRequest::of(&signed.request);
-        let response = self.transport().send(signed.request).await?;
+        let response = self.send_response(signed.request).await?;
         let status = response.status;
         if !(200..300).contains(&status) {
             // A serving account signs its errors with its key; anything else is the

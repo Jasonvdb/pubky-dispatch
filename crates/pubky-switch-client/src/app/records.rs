@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
-use super::order::Kept;
+use super::order::{Handover, Kept};
 use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
 use super::state::Tx;
 use super::{App, AppError, IdentityRefresh};
@@ -1392,9 +1392,7 @@ impl App {
             .filter(|(name, at)| match at {
                 None => true,
                 Some((generation, seq)) => {
-                    let (told_generation, told) = self.told(name);
-                    self.feed_order(told_generation, told)
-                        >= self.feed_order(*generation, seq.saturating_sub(1))
+                    self.ready_at(name, self.feed_order(*generation, *seq), Handover::Listing)
                 }
             })
             .collect();

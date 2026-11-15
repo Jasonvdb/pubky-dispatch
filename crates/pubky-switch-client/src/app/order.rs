@@ -3,8 +3,9 @@
 //! Every notice a protocol can't take yet is kept in feed order, and the app tells that
 //! protocol nothing later until it takes it. With several protocols the rule holds per
 //! protocol. Its feed position (`told/<name>`, [`Told`]) and outstanding listing
-//! prerequisites determine what it may be told. A protocol is told an item only when
-//! its position has reached the item: everything the read covered before it was told
+//! prerequisites determine what it may be told. Retained calls remain explicit
+//! prerequisites too, including at zero, which has no earlier numeric position. A protocol
+//! is told an item only when its position has reached the item: everything the read covered before it was told
 //! to it. One that doesn't take an item stays right before it, and is told nothing later,
 //! while the read goes on for the others. [`App::may_tell`] checks the position and its
 //! listing prerequisites, and every way the read tells a protocol something asks it:
@@ -19,7 +20,7 @@
 //!   later one that reaches its item, so the cursor never passes a deny list change a
 //!   protocol wasn't handed;
 //! - a deny list gap (`tell_deny_gap_if_owed`): told once every protocol is told through
-//!   its position; the read holds meanwhile;
+//!   its position and has completed every prerequisite there; the read holds meanwhile;
 //! - a record write the feed shows (`judge_write`), for the protocol of its collection, or
 //!   for every protocol when the app can't place it: held like an entry;
 //! - a listing a feed item owes (`list_due`): made for a protocol once it is told through
@@ -119,6 +120,17 @@ pub(crate) struct KeptAhead {
     pub(crate) deny: bool,
 }
 
+/// The callback's place among prerequisites at one feed position (Switch spec 8.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handover {
+    /// The listing precedes a call about the same item.
+    Listing,
+    /// A retained call follows its listing and all earlier calls.
+    Call,
+    /// Everything through the position precedes the next handover.
+    Through,
+}
+
 impl App {
     /// How far protocol `name` has been told, (generation, `seq`).
     pub(crate) fn told(&self, name: &str) -> (u64, u64) {
@@ -165,15 +177,43 @@ impl App {
     /// With one protocol this is false only once that protocol didn't take an item, and
     /// the read stops there.
     pub(crate) fn may_tell(&self, name: &str) -> bool {
-        if let Some(at) = self.listing_due.at(name)
-            && (self.walk.is_none()
-                || at.is_none_or(|(generation, seq)| {
-                    self.feed_order(generation, seq) <= self.walked()
-                }))
+        if self.walk.is_none() && self.listing_due.at(name).is_some() {
+            return false;
+        }
+        self.ready_at(name, self.walked(), Handover::Through)
+    }
+
+    /// One readiness rule for a listing, a retained call, or a handover after a
+    /// position. Pending prerequisites remain explicit: position zero has no earlier
+    /// numeric position with which to represent them (Switch spec 8.3).
+    pub(crate) fn ready_at(&self, name: &str, at: FeedOrder, handover: Handover) -> bool {
+        let through = match handover {
+            Handover::Listing | Handover::Call => (at.0, at.1, at.2.saturating_sub(1)),
+            Handover::Through => at,
+        };
+        if self.told_order(name) < through {
+            return false;
+        }
+        if handover != Handover::Listing
+            && self.listing_due.at(name).is_some_and(|listing| {
+                listing.is_none_or(|(generation, seq)| self.feed_order(generation, seq) <= at)
+            })
         {
             return false;
         }
-        self.told_order(name) >= self.walked()
+        !self.pending_calls.iter().any(|kept| {
+            let order = self.feed_order(kept.generation, kept.seq);
+            kept.names.iter().any(|owner| owner == name)
+                && (order < at || (handover == Handover::Through && order == at))
+        })
+    }
+
+    /// A new retained call becomes a prerequisite before the read can hand over the
+    /// next item, including a call kept at sequence zero (Switch spec 8.3).
+    pub(crate) fn note_pending_call(&mut self, call: Kept) {
+        self.pending_calls
+            .retain(|kept| (kept.generation, kept.seq) != (call.generation, call.seq));
+        self.pending_calls.push(call);
     }
 
     /// [`App::may_tell`] for the protocol of a record's collection, or, for `None`, a
@@ -267,6 +307,7 @@ impl App {
         self.told = told;
         self.told_kept = self.told.clone();
         self.walk = None;
+        self.pending_calls.clear();
         self.told_loaded = true;
         Ok(())
     }
@@ -280,6 +321,7 @@ impl App {
     /// The one place this is derived, at each read's start and as the kept things are
     /// taken, so a restore, a provider change and a crash all leave it right.
     pub(crate) fn settle_told(&mut self, kept: &[Kept]) {
+        self.pending_calls = kept.iter().filter(|item| item.call).cloned().collect();
         let cursor = (self.state.cursor.generation, self.state.cursor.seq);
         let cursor_at = self.feed_order(cursor.0, cursor.1);
         for name in self.protocols.names() {

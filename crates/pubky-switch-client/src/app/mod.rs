@@ -667,6 +667,9 @@ pub struct App {
     /// them: each protocol waits at its listing's position, including sequence zero
     /// ([`App::may_tell`]). In memory only.
     listing_due: records::ListDue,
+    /// Calls still owed to each protocol, derived from the retained queue and updated as
+    /// the read keeps a call. They remain prerequisites even at zero (`order` module).
+    pending_calls: Vec<order::Kept>,
     /// How many reads in a row stopped at an owed call or deny list gap the protocol didn't
     /// take ([`AppEvent::OwedCallHeld`]). In memory only.
     owed_held_reads: u32,
@@ -1050,6 +1053,7 @@ impl App {
                 told_loaded: false,
                 walk: None,
                 listing_due: records::ListDue::default(),
+                pending_calls: Vec::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -1216,6 +1220,7 @@ impl App {
                 told_loaded: false,
                 walk: None,
                 listing_due: records::ListDue::default(),
+                pending_calls: Vec::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,
@@ -2158,6 +2163,7 @@ impl App {
                 told_loaded: false,
                 walk: None,
                 listing_due: records::ListDue::default(),
+                pending_calls: Vec::new(),
                 owed_held_reads: 0,
                 kept_ahead: std::collections::BTreeMap::new(),
                 deny_directory_read: None,

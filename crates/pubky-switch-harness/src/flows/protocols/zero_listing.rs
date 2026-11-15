@@ -1,11 +1,72 @@
 use super::*;
 use crate::{Backend, run_here};
-use pubky_switch_client::app::Collection;
+use pubky_switch_client::app::{
+    Collection, DenyListGap, LocalWrite, MissedEntries, Outcome, Protocol, ReceiveContext,
+    ReceivedMessage, ResendNeeded, StoreFailure,
+};
 use pubky_switch_client::testing::ProtocolSpec;
 use pubky_switch_core::ident::Policy;
+use pubky_switch_core::message::Message;
+use pubky_switch_core::records::AppCert;
 use pubky_switch_signer::UserConfirmed;
+use std::sync::Mutex;
+
+struct ListedProtocol {
+    inner: Arc<TestProtocol>,
+    gaps: Mutex<Vec<(u64, u64)>>,
+}
+
+impl Protocol for ListedProtocol {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn has_keys(&self, scope: &str) -> bool {
+        self.inner.has_keys(scope)
+    }
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.inner.sent_between_own_apps(kind)
+    }
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.inner.check_scopes(message, sender, own)
+    }
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.inner.accepts(cert)
+    }
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.inner.check_body(message)
+    }
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        self.inner.receive(message, cx)
+    }
+    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.inner.resend_needed(needed)
+    }
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.inner.missed(missed)
+    }
+    fn collections(&self) -> Vec<Collection> {
+        self.inner.collections()
+    }
+    fn deny_list_gap(&self, gap: &DenyListGap) -> Result<Vec<LocalWrite>, StoreFailure> {
+        self.gaps.lock().unwrap().push((gap.generation, gap.seq));
+        Ok(Vec::new())
+    }
+}
 
 async fn listing_after_loss(world: &World) -> FlowResult {
+    Box::pin(listing_and_gap(world, false)).await
+}
+
+async fn gap_after_restore(world: &World) -> FlowResult {
+    Box::pin(listing_and_gap(world, true)).await
+}
+
+async fn listing_and_gap(world: &World, restore: bool) -> FlowResult {
     use crate::flows::recovery::{RECOVERY_ORIGIN, SENDERS_ORIGIN};
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
@@ -19,14 +80,19 @@ async fn listing_after_loss(world: &World) -> FlowResult {
         accepts: vec!["tasks.item".into()],
         collections: vec![Collection::new("task_lists", Policy::new(TASKS, &[TASKS]))],
     }));
+    let listed = Arc::new(ListedProtocol {
+        inner: tasks.clone(),
+        gaps: Mutex::new(Vec::new()),
+    });
     let chat = sample_protocol(CHAT);
+    let protocols = ProtocolSet::new(vec![listed.clone(), chat.clone()])?;
     let asking = Asking::for_scopes(world.app_keys(&alice, "wallet")?, &[TASKS, CHAT])?;
     let review = alice_signer.review(asking.request.signed(), &asking.auth)?;
     let approved = Box::pin(alice_signer.approve(review)).await?;
     Box::pin(alice_signer.claim_delivered(&approved.request)).await?;
     let mut wallet = Box::pin(App::join(
         world.app_env(Arc::new(MemoryStore::new())),
-        set_of(&tasks, &chat)?,
+        protocols.clone(),
         AppConfig::default(),
         asking.join_request(alice.public(), &approved)?,
     ))
@@ -72,6 +138,18 @@ async fn listing_after_loss(world: &World) -> FlowResult {
     assert_eq!(wallet.cursor().seq, 0);
     assert_eq!(wallet.own_identity().data_epoch(), 2);
     assert!(wallet.scope_key(2, TASKS).is_none());
+    if restore {
+        let backup = Box::pin(wallet.backup_layered()).await?;
+        wallet = Box::pin(App::restore(
+            world.app_env(Arc::new(MemoryStore::new())),
+            protocols,
+            AppConfig::default(),
+            &backup,
+        ))
+        .await?;
+        assert_eq!((wallet.cursor().generation, wallet.cursor().seq), (2, 0));
+        listed.gaps.lock().unwrap().clear();
+    }
     for kind in ["tasks.item", "chat.item"] {
         let (_, delivery) = shop
             .send(OutgoingMessage::new(
@@ -96,11 +174,22 @@ async fn listing_after_loss(world: &World) -> FlowResult {
         tasks.received().is_empty(),
         "a message preceded the required collection listing"
     );
-    assert_eq!(
-        chat.received().len(),
-        1,
-        "the independent protocol advances"
-    );
+    if restore {
+        assert!(
+            listed.gaps.lock().unwrap().is_empty(),
+            "the listing precedes the gap"
+        );
+        assert!(
+            chat.received().is_empty(),
+            "the shared gap precedes every message"
+        );
+    } else {
+        assert_eq!(
+            chat.received().len(),
+            1,
+            "the independent protocol advances"
+        );
+    }
     Box::pin(alice_signer.run_due()).await?;
     for _ in 0..4 {
         Box::pin(wallet.receive(None)).await?;
@@ -109,6 +198,9 @@ async fn listing_after_loss(world: &World) -> FlowResult {
     assert!(!wallet.listing_owed().await?);
     assert_eq!(tasks.received().len(), 1);
     assert_eq!(chat.received().len(), 1);
+    if restore {
+        assert_eq!(*listed.gaps.lock().unwrap(), [(2, 0)]);
+    }
     Ok(())
 }
 
@@ -126,6 +218,26 @@ async fn test_zero_position_listing_waits_and_resumes_at_scripted_switch() {
 async fn test_zero_position_listing_waits_and_resumes_at_service() {
     assert!(
         Box::pin(run_here(Backend::Service, listing_after_loss))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_zero_listing_gap_restore_waits_and_resumes_at_scripted_switch() {
+    assert!(
+        Box::pin(run_here(Backend::Scripted, gap_after_restore))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_zero_listing_gap_restore_waits_and_resumes_at_service() {
+    assert!(
+        Box::pin(run_here(Backend::Service, gap_after_restore))
             .await
             .unwrap()
             .is_some()

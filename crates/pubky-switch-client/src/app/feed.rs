@@ -81,7 +81,7 @@ use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
-use super::order::{Kept, Walk};
+use super::order::{Handover, Kept, Walk};
 use super::protocol::{
     DenyListChange, Effect, FeedPosition, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
@@ -794,9 +794,10 @@ impl App {
         let mut listing = self
             .list_collections_if_due(&mut pages, Some(budget))
             .await?;
-        if listing == Listing::WaitsForKey {
-            // The key a listing waits for comes in a key bundle part, which the feed would
-            // show only past this point: fetched here, then the listing tried once more.
+        if listing == Listing::WaitsForKey || self.listing_waits {
+            // A prerequisite can hold the feed even while another protocol's listing is
+            // ready. Fetch the key parts once here, then try the listing again: acquiring
+            // its key never depends on handing over an item past that prerequisite.
             self.fetch_key_parts().await?;
             listing = self
                 .list_collections_if_due(&mut pages, Some(budget))
@@ -822,9 +823,8 @@ impl App {
         // The read's listing waits for a scope key: no wait on the feed shows the key
         // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
         let mut key_wait = waits_for_key;
-        // One protocol's listing waits for a scope key while the read goes on for the
-        // others: the full key bundle is asked for again, as below, and the feed, which
-        // this read reads, shows the part that brings the key.
+        // One protocol's listing still waits after this read's key fetch while another
+        // can proceed. Keep the full-bundle request live at a bounded interval.
         let mut waits_told = false;
         if !waits_for_key && self.listing_waits {
             self.ask_again_while_a_listing_waits().await?;
@@ -3328,10 +3328,11 @@ impl App {
         // the gap waits, and the read holds for every protocol, as for a deny list change
         // one of them can't take yet (Switch spec 8.3).
         let through = self.feed_order(owed.generation, owed.seq);
-        if !owed.to.iter().all(|name| {
-            let (generation, seq) = self.told(name);
-            self.feed_order(generation, seq) >= through
-        }) {
+        if !owed
+            .to
+            .iter()
+            .all(|name| self.ready_at(name, through, Handover::Through))
+        {
             return Ok(true);
         }
         let (generation, seq) = (owed.generation, owed.seq);
@@ -3589,6 +3590,13 @@ impl App {
             self.owed_held_reads = 1;
         }
         read.left.extend(to.iter().cloned());
+        self.note_pending_call(Kept {
+            generation: self.state.cursor.generation,
+            seq,
+            names: to.clone(),
+            call: true,
+            deny: call.is_deny(),
+        });
         if call.is_deny() {
             read.held_after = true;
             self.owed_known = Some(true);
@@ -3727,18 +3735,9 @@ impl App {
             let at = format!("{}{rest}", key::OWED_PREFIX);
             // Whose turn it is: a protocol told through everything before the call's item,
             // and owed no listing at or before it, which goes first.
-            let before = self.feed_order(generation, seq.saturating_sub(1));
             let ready: Vec<String> = to
                 .iter()
-                .filter(|name| {
-                    let (told_generation, told) = self.told(name);
-                    let listing_first = due.at(name).is_some_and(|listing| {
-                        listing.is_none_or(|(generation, seq)| {
-                            self.feed_order(generation, seq) <= order
-                        })
-                    });
-                    self.feed_order(told_generation, told) >= before && !listing_first
-                })
+                .filter(|name| self.ready_at(name, order, Handover::Call))
                 .cloned()
                 .collect();
             // The cursor hasn't passed its item: once the call is gone, the read still

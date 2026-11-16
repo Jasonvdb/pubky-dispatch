@@ -355,9 +355,35 @@ the admission-staging wait: uploading contacts cannot complete record recovery.
 A **recovery barrier** is `{ "position": "generation:seq",
 "witnesses": [app-id], "complete": [app-id] }`, arrays sorted by decoded App ID,
 unique, and `complete` a subset of `witnesses`. `GET /recovery/records` is an own-app
-call returning `{ "record_recovery": barrier or null }`. It is available after
-a cooperative move too. It returns `null` only when no provider loss began this
-account's carried record history. A new app can read it after registration.
+call returning `{ "record_recovery": barrier or null,
+"record_recovery_source": signed identity document or null }`. Both members are
+required. They are both null only when no provider loss began this account's
+carried record history; otherwise both are present. The source is the exact
+signed identity document applied when the retained barrier began, even when the
+current identity document has advanced. Its identity, loss generation and fixed
+witness set must agree with the barrier. A new app can read it after registration,
+including after a cooperative move or key change.
+
+The authenticated answer attests that this source was applied to create the
+account's currently carried barrier. The service reads the source, barrier and
+answer head in the same account transaction, after the checks of wire 7.3. It
+retains the source with the accepted recovery transition; an identity document
+that was only published or submitted cannot supply it. Ordinary identity
+deliveries and feed pruning preserve it. Clean moves and key changes carry the
+same association, a subsequent provider loss replaces it with its newly applied
+source, and erasure removes it. A missing or inconsistent source is unavailable,
+never a no-loss history.
+
+An app may use this current-service answer to recover the original source when
+its local state or the old feed items are unavailable. It verifies the actual
+response for its current account and service, the identity-signed source and its
+barrier association, and reconciles the authenticated head with the chain it
+follows before accounting record work. A parsed answer, an observed future head
+or an identity signature alone does not establish this authority. An existing
+source at the same barrier must match exactly; it is not replaced by a different
+document with the same witness set. Restore still requires reconciliation and
+accounting of all retained work; neither the restored cursor nor a returned
+completion bit completes that local work.
 
 `cursor.set` may additionally carry
 `"records_complete": "generation:seq"`. It names the barrier position exactly,
@@ -379,7 +405,23 @@ record, quota failure, a kept unknown record effect or unaccounted refused
 material do not complete this work. A retained value successfully uploaded as
 unresolved is accounted for: it prevents absence while leaving readers held.
 The app durably keeps its outstanding work before sending and resumes it after
-restart. Restore cannot assert completion from the restored local cursor alone.
+restart. Only the exact per-input `accounted_records` acknowledgment of wire
+7.4.14 accounts an uploaded item; a change list, zero rejection count or ignored
+no-op is insufficient. Canonical supersession can discharge an obsolete value
+only after all of its required restrictive lineage/origin facts are represented.
+It does not require indefinite storage of obsolete bytes.
+
+A backup includes the whole immutable record evidence still held by the app,
+including outstanding work whose source record or discovery page was replaced.
+Snapshot and restore validate the complete bounded set; a read, validation or
+capacity failure refuses the operation rather than omitting a duty. An in-place
+restore also preserves outstanding evidence acquired after the backup, without
+substituting it for the restored protocol state. The evidence and restored app
+state commit atomically. Restore starts a new accounting run, invalidates old
+tickets and completion markers, and reconciles the current service before
+accounting for its retained work. An unknown commit outcome requires reloading the
+durable state. Restore cannot assert completion from the restored local cursor
+alone.
 All cursor writers, including deferred moves, suspend, batches, replay and
 recovery, obey this rule. Devices sharing an app's keys must share this durable
 state and cursor, as spec 3.1 requires.

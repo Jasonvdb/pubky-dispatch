@@ -212,6 +212,14 @@ impl Signer {
             Vec::new()
         };
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
+        if in_place {
+            if self.state.epoch_through > doc.data_epoch().saturating_add(1) {
+                return Err(Refusal::StaleBackup.into());
+            }
+            state.epoch_through = state.epoch_through.max(self.state.epoch_through);
+        }
+        // The first commit must also tell a restart to finish taking over (Switch wire 3.13).
+        state.owes_own_version = true;
         // In place, the revocations this install asked for stay as they were, with their
         // alerts; those only the backup names are added. Where both picked a time to distrust
         // an app from, the earlier wins: after a compromise it trusts less, and two installs

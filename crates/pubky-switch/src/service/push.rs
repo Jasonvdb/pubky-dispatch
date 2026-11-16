@@ -61,6 +61,10 @@ pub type Resolver = Arc<
         + Sync,
 >;
 
+/// The synthetic destination of explicitly isolated test relays.
+#[cfg(any(test, feature = "test-util"))]
+pub(super) const ISOLATED_RELAY_ADDRESS: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+
 /// The system resolver.
 pub(super) fn system_resolver() -> Resolver {
     Arc::new(|host: String| {
@@ -206,6 +210,19 @@ impl Service {
         prepared
     }
 
+    /// The public-address rule, with the one synthetic destination used by isolated
+    /// tests whose delivery requires an explicit loopback route (Switch wire 8.2).
+    pub(super) fn check_relay_addresses(
+        &self,
+        addresses: &[IpAddr],
+    ) -> pubky_switch_core::error::Result<()> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.isolated_relays && addresses == [ISOLATED_RELAY_ADDRESS] {
+            return Ok(());
+        }
+        check_addresses(addresses)
+    }
+
     /// The body's checks (Switch wire 8.1): the service sends pushes, the body reads, and
     /// the relay's host resolves only to public addresses (8.2).
     async fn check_push_body(&self, body: &[u8]) -> Result<PushBody, ApiError> {
@@ -224,7 +241,8 @@ impl Service {
                 .await
                 .map_err(|_| refused())?
                 .map_err(|_| refused())?;
-            check_addresses(&addresses).map_err(|_| refused())?;
+            self.check_relay_addresses(&addresses)
+                .map_err(|_| refused())?;
         }
         Ok(body)
     }

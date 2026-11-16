@@ -47,7 +47,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use pubky_switch_core::{
     enc::b64,
     http::{header, sign_webhook, webhook_body},
-    net::{UrlUse, check_addresses, check_url},
+    net::{UrlUse, check_url},
 };
 use tokio::time::Instant;
 
@@ -176,6 +176,32 @@ fn routed(
     let port = targets.first().map(SocketAddr::port);
     if port.is_none() || url.set_scheme("http").is_err() || url.set_port(port).is_err() {
         return Err(Failure::Connect);
+    }
+    Ok((url, targets, false))
+}
+
+/// An isolated test relay uses only literal loopback sockets, even when the original
+/// relay URL contains an IP literal. Every address must have an explicit local route.
+#[cfg(any(test, feature = "test-util"))]
+fn routed_loopback(
+    route: &RelayRoute,
+    mut url: reqwest::Url,
+    addresses: &[IpAddr],
+) -> Result<(reqwest::Url, Vec<SocketAddr>, bool), Failure> {
+    let targets: Vec<SocketAddr> = addresses
+        .iter()
+        .map(|ip| route(*ip))
+        .collect::<Option<_>>()
+        .ok_or(Failure::Refused)?;
+    if targets.iter().any(|target| !target.ip().is_loopback()) {
+        return Err(Failure::Refused);
+    }
+    let target = targets.first().ok_or(Failure::Refused)?;
+    if url.set_scheme("http").is_err()
+        || url.set_ip_host(target.ip()).is_err()
+        || url.set_port(Some(target.port())).is_err()
+    {
+        return Err(Failure::Refused);
     }
     Ok((url, targets, false))
 }
@@ -432,6 +458,10 @@ impl Service {
 
     /// POST the webhook to `relay_url`, connecting only to an address checked now.
     async fn post(&self, relay_url: &str, signature: &str, body: Vec<u8>) -> Result<(), Failure> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.isolated_relays && self.relay_route.is_none() {
+            return Err(Failure::Refused);
+        }
         let host = check_url(relay_url, &UrlUse::Relay)
             .map_err(|_| Failure::Refused)?
             .host;
@@ -442,7 +472,8 @@ impl Service {
                 .await
                 .map_err(|_| Failure::Unresolved)?,
         };
-        check_addresses(&addresses).map_err(|_| Failure::Refused)?;
+        self.check_relay_addresses(&addresses)
+            .map_err(|_| Failure::Refused)?;
         let url = reqwest::Url::parse(relay_url).map_err(|_| Failure::Refused)?;
         let targets: Vec<SocketAddr> = addresses
             .iter()
@@ -450,6 +481,7 @@ impl Service {
             .collect();
         #[cfg(any(test, feature = "test-util"))]
         let (url, targets, https_only) = match &self.relay_route {
+            Some(route) if self.isolated_relays => routed_loopback(route, url, &addresses)?,
             Some(route) => routed(route, url, &addresses)?,
             None => (url, targets, true),
         };

@@ -366,6 +366,48 @@ Every call is signed by an app, or by the identity key for signer operations. Th
 - **Switch origins:** an app or a service that connects to a switch origin it read from an `identity.json`, which the identity's owner chose, applies the classifier of Section 9: HTTPS only, port 443 unless the connecting side's operator allows another, every address after DNS resolution globally reachable, the connection made to the address checked, and redirects not followed. A service such as a merchant's server that reaches many switches should also connect through an egress proxy that applies the same rule.
 - **Every response** carries `Switch-Service-Signature`, which binds the status, the server time (`Switch-Server-Time`), the head it carries (`Switch-Head`) and the body to the exact request it answers, as the service received it: its method, path and query, body and request headers, the request's signature among them, with the path naming the account (Section 13.2). The service signs every response with its service key, the answer for an identity it doesn't host included. A client checks it with the service key it pinned for the account, from `identity.json` or, for the signer, from its enrollment answer, and acts on no answer it can't check: without a pinned key it sends nothing but an enrollment, authenticated account discovery under its first-use rules (account-binding Section 2), and the public read of `identity.json`, where it relies only on the document the identity key signed (`spec/wire-format.md` Sections 7.1 and 7.4.15). The key is the same for every generation the service serves, so a client also reads what an answer says about the account against the generation it follows: a head or a recovery notice of an earlier generation counts for nothing, unless the notice's reason is `mark_lost` (`spec/wire-format.md` Section 7.6); a chain stub or a transition proof of an earlier generation counts only where a rule takes it, by the generation its stub names and checked with the key listed for that generation, such as a record's kept proof (Section 4.3) or a kept batch's original proofs (Section 12.5); and a head, stub, proof or notice of a later generation sends the client to the identity's newest `identity.json` before it judges anything else (`spec/wire-format.md` Section 7.1). A key never shows a generation by itself: wherever a rule checks a signed thing with a key, it checks the generation that thing names too. Anything else an app relies on goes in the signed body. Responses to own apps and the signer also carry the newest signed head. Responses to apps of other identities carry no `seq` and no head, so counterparties don't learn the identity's activity.
 
+#### Local preparation of a protocol batch
+
+A registered protocol may bind its own bounded local preparation to the client's
+actual kept-batch ID before that batch can first be sent. After checking the
+operations, ownership and queued messages, signing the batch and checking that
+it can be kept, the client invokes a synchronous local-write builder with that
+ID. The builder returns only writes under the registered protocol's namespace.
+It is invoked at most once for this submission, never for a stored retry. The
+protocol binds its exact intended effect to the ID; another batch's completion
+must not overwrite or remove that preparation.
+
+The preparation writes, complete signed pending batch, creation order and
+indexes commit in one bounded local transaction. The existing protocol-local
+write limit and complete transaction limit apply. Before that commit succeeds,
+the client sends nothing from this new batch. A builder error, invalid local
+write, encoding failure, capacity refusal or known failed commit keeps and sends
+none of this new batch. Earlier durable work may still progress through the
+ordinary bounded oldest-first retry path; this guarantee concerns the new
+submission, not other work the client already owes. No new service call, wire
+field or independently replayed queue is introduced.
+
+An unknown or cancelled commit requires resolution under the client's exclusive
+store and reload rules before continuing. Preparation is not repeated to guess
+whether a pending batch was kept. Reload resumes the actual stored batch and
+its original ID. Ordinary retries, timestamp changes and permitted re-signing
+for an epoch or provider change preserve that ID and order. A re-signed wire
+batch may have a different signed batch ID under the existing rules, but remains
+linked to the same local preparation. The old local ID cannot be reported
+terminal while its replacement is still outstanding. No replacement is sent
+unless the existing retry rules authorize re-signing; preparation grants none.
+
+Preparation is separate from the batch's Applied-only local writes. Those
+writes may consume the protocol's preparation in the same transaction that
+records the actual applied result. A refusal or unresolved outcome leaves the
+protocol evidence available for its own resolution. Dropped status retains its
+existing reason and uncertainty: expiration or loss of a status is not proof of
+non-application. An absent or expired kept-batch status, including after restore,
+is unresolved and does not authorize automatic resubmission or an inference that
+nothing was sent. This does not expand backup coverage to pending batches or
+status history. Protocols preserve and validate their own preparation evidence
+with their existing layer state and recovery rules.
+
 ### 6.2 API (v1)
 
 | Call | Caller | Purpose |

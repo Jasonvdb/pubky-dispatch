@@ -275,7 +275,7 @@ impl Signer {
             .state
             .certs
             .iter()
-            .map(|cert| AppCert::verify(cert, &identity))
+            .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let knows = |scope: &str| self.env.protocols.knows_scope(scope);
         let view = SignerView {
@@ -438,7 +438,7 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`SignerError::InvalidData`] when the stored newest document no longer verifies.
+    /// [`SignerError::StoredData`] when the stored newest document no longer verifies.
     pub fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>> {
         self.check_owned_state()?;
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
@@ -469,15 +469,14 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`SignerError::InvalidData`] when a stored certificate no longer verifies.
+    /// [`SignerError::StoredData`] when a stored certificate no longer verifies.
     pub fn certificates(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
-        Ok(self
-            .state
+        self.state
             .certs
             .iter()
-            .map(|cert| AppCert::verify(cert, &identity))
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
+            .collect::<std::result::Result<Vec<_>, _>>()
     }
 
     /// The host delivered the claim of `request` and approved its grant: the signer drops

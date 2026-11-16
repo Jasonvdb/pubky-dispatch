@@ -39,7 +39,7 @@ async fn test_signer_enrollment_delivers_then_publishes_the_first_version() {
     assert_eq!(doc.inbox().service_key, world.switch.service_key());
     assert_eq!(doc.body().signer, signer.install_id());
     // Delivered, then published: both copies are the signer's high-water mark.
-    let high = signer.high_water().unwrap();
+    let high = signer.high_water().unwrap().unwrap();
     assert_eq!((high.version, high.doc_hash), (1, doc.hash()));
     assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
     assert_eq!(world.published().unwrap().signed(), doc.signed());
@@ -92,13 +92,13 @@ async fn test_signer_open_keeps_the_install_and_the_high_water_mark() {
     let world = World::new();
     let (signer, store) = world.enrolled().await;
     let install = signer.install_id();
-    let high = signer.high_water();
+    let high = signer.high_water().unwrap();
     drop(signer);
     let opened = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
     assert_eq!(opened.install_id(), install);
-    assert_eq!(opened.high_water(), high);
+    assert_eq!(opened.high_water().unwrap(), high);
     assert_eq!(opened.status(), SignerStatus::Signing);
 }
 
@@ -111,7 +111,10 @@ async fn test_signer_new_version_builds_on_the_newest() {
     assert_eq!(second.version(), 2);
     assert_eq!(second.body().record_max_age, Some(2_592_000));
     assert_eq!(second.body().signer, signer.install_id());
-    assert_eq!(signer.high_water().unwrap().doc_hash, second.hash());
+    assert_eq!(
+        signer.high_water().unwrap().unwrap().doc_hash,
+        second.hash()
+    );
     assert_eq!(
         world.switch.identity_doc().unwrap().signed(),
         second.signed()
@@ -134,7 +137,7 @@ async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
     // Nothing reached the switch: the backup comes first (Switch wire 3.13).
     assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
     assert_eq!(world.distinct_requests("PUT", "/identity"), 1);
-    assert_eq!(signer.high_water().unwrap().version, 1);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 1);
     // Once the Homeserver takes writes again, the same version goes out.
     *world.homeserver.failing_puts.lock().unwrap() = false;
     signer.resume().await.unwrap();
@@ -171,7 +174,7 @@ async fn test_signer_a_newer_version_by_another_install_stops_signing() {
             .contains(&Alert::ManagedByOtherInstall { install: other })
     );
     // The newer copy is adopted as the high-water mark, and this install signs nothing more.
-    assert_eq!(signer.high_water().unwrap().version, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 2);
     let error = signer
         .set_connect_requests(Default::default())
         .await
@@ -216,7 +219,7 @@ async fn test_signer_own_earlier_backup_doesnt_stop_signing() {
     // The backup of version 1 names this install: the next version goes out.
     signer.set_record_max_age(Some(86_400)).await.unwrap();
     signer.set_record_max_age(None).await.unwrap();
-    assert_eq!(signer.high_water().unwrap().version, 3);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 3);
 }
 
 #[tokio::test]
@@ -250,7 +253,7 @@ async fn test_signer_an_older_copy_at_the_switch_is_a_rollback_alarm() {
     assert_eq!(error, SignerError::Alarm(alert.clone()));
     assert!(signer.alerts().contains(&alert));
     // The high-water mark doesn't go back.
-    assert_eq!(signer.high_water().unwrap().version, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 2);
 }
 
 #[tokio::test]
@@ -272,7 +275,10 @@ async fn test_signer_another_body_at_the_high_water_version_is_equivocation() {
         version: 2,
     };
     assert_eq!(error, SignerError::Alarm(alert.clone()));
-    assert_eq!(signer.high_water().unwrap().doc_hash, second.hash());
+    assert_eq!(
+        signer.high_water().unwrap().unwrap().doc_hash,
+        second.hash()
+    );
 }
 
 #[tokio::test]
@@ -964,7 +970,7 @@ async fn test_signer_a_homeserver_copy_at_a_higher_generation_but_lower_version_
     );
     let changed = signer.set_record_max_age(Some(3_600)).await.unwrap();
     assert_eq!(changed.version(), 3);
-    assert_eq!(signer.high_water().unwrap().version, 3);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 3);
     assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Signing);
     assert_eq!(world.published().unwrap().signed(), changed.signed());
 }

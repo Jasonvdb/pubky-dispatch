@@ -10,18 +10,20 @@
 //! holds the hand-over as the switch served it, sealed to the new signer's bundle key, until
 //! the secret it carries is in the vault (Switch wire 3.12).
 
+use pubky_switch_client::client::Batch;
 use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
+use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AppCert, DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup,
-    SignerHandover, StoredPart,
+    AppCert, DEFAULT_CERT_LIFETIME_MS, Enrollment, IdentityDoc, IdentityPolicy, Limits,
+    SignerBackup, SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use crate::alert::Alert;
-use crate::error::{Result, SignerError};
+use crate::error::{RecordsFault, Result, SignerError, SignerRecord};
 
 /// The version of the records' layout.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -498,17 +500,16 @@ impl SignerState {
     /// certificates it references: a version that wasn't delivered leaves none of its own
     /// behind, nor counts as a renewal the app left untaken. A declared recovery's base
     /// counts as the newest version too, since the recovery's version is built on it.
-    pub(crate) fn prune_unreferenced(&mut self) {
+    pub(crate) fn prune_unreferenced(&mut self) -> Result<()> {
         let identity = self.identity;
         let docs: Vec<IdentityDoc> = self
-            .newest_doc()
-            .ok()
-            .flatten()
+            .newest_doc()?
             .into_iter()
             .chain(
                 self.recovery_base
                     .as_ref()
-                    .and_then(|base| IdentityDoc::verify(base, &identity).ok()),
+                    .map(|base| stored_identity(base, &identity))
+                    .transpose()?,
             )
             .collect();
         let referenced = |hash: &[u8; 32]| {
@@ -517,13 +518,18 @@ impl SignerState {
                     || doc.body().renewed.iter().any(|r| &r.cert == hash)
             })
         };
-        self.certs
-            .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
+        self.certs = self
+            .certificates()?
+            .into_iter()
+            .filter(|cert| referenced(&cert.hash()))
+            .map(|cert| cert.signed().clone())
+            .collect();
         self.untaken_renewals.retain(|(_, cert)| referenced(cert));
         self.claims.retain(|claim| {
             docs.iter()
                 .any(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
         });
+        Ok(())
     }
 
     /// The `distrust_from` the user picked for each revocation asked for, which the records
@@ -598,9 +604,35 @@ impl SignerState {
     pub(crate) fn newest_doc(&self) -> Result<Option<IdentityDoc>> {
         self.newest
             .as_ref()
-            .map(|n| IdentityDoc::verify(&n.doc, &self.identity))
+            .map(|n| stored_identity(&n.doc, &self.identity))
             .transpose()
-            .map_err(SignerError::from)
+    }
+
+    pub(crate) fn certificates(&self) -> Result<Vec<AppCert>> {
+        self.certs
+            .iter()
+            .map(|cert| AppCert::verify(cert, &self.identity).map_err(SignerError::StoredData))
+            .collect()
+    }
+
+    /// Check the signed copies independently of the service and of caller-supplied keys.
+    fn check_copies(&self) -> Result<()> {
+        self.newest_doc()?;
+        self.certificates()?;
+        if let Some(base) = &self.recovery_base {
+            stored_identity(base, &self.identity)?;
+        }
+        if let Some(handing) = &self.handing_over {
+            stored_identity(&handing.doc, &self.identity)?;
+            handing
+                .handover
+                .verify(&self.identity, &handing.to_app)
+                .map_err(SignerError::StoredData)?;
+            if let Some(take_back) = &handing.take_back {
+                stored_identity(&take_back.doc, &self.identity)?;
+            }
+        }
+        Ok(())
     }
 
     /// Add `alert` unless it is held already.
@@ -717,6 +749,46 @@ pub(crate) enum Flow {
     },
 }
 
+impl Flow {
+    fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
+        match self {
+            Self::Enroll {
+                origin, enrollment, ..
+            }
+            | Self::Recover { origin, enrollment } => {
+                Enrollment::verify(enrollment, identity, origin)
+                    .map_err(SignerError::StoredData)?;
+            }
+            Self::Renew { batches, doc, .. } => {
+                stored_identity(doc, identity)?;
+                for batch in batches {
+                    batch.read(identity)?;
+                }
+            }
+            Self::TakingOver {
+                handover,
+                app_id,
+                delivery,
+            } => {
+                handover
+                    .verify(identity, app_id)
+                    .map_err(SignerError::StoredData)?;
+                if let Some(delivery) = delivery {
+                    stored_identity(&delivery.doc, identity)?;
+                }
+            }
+            Self::Deliver { doc, backup, .. } => {
+                stored_identity(doc, identity)?;
+                if let Some(backup) = backup {
+                    backup.verify(identity).map_err(SignerError::StoredData)?;
+                }
+            }
+            Self::Erase { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 /// One signed batch of a renewal or an epoch's completion, and the key bundle parts it stores.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RenewBatch {
@@ -724,6 +796,30 @@ pub(crate) struct RenewBatch {
     pub(crate) bytes: Bytes,
     /// The key bundle parts it stores (Switch wire 3.5).
     pub(crate) parts: Vec<StoredPart>,
+}
+
+impl RenewBatch {
+    /// Read and authenticate the exact operations this signer kept before sending them.
+    pub(crate) fn read(&self, identity: &[u8; 32]) -> Result<Batch> {
+        let batch = Batch::from_body(self.bytes.0.clone()).map_err(|_| {
+            SignerError::StoredData(pubky_switch_core::Error::Invalid(
+                "stored renewal batch does not parse".into(),
+            ))
+        })?;
+        for op in batch.ops() {
+            SignedOp::verify(op.signed(), identity, identity, None).map_err(|_| {
+                SignerError::StoredData(pubky_switch_core::Error::Invalid(
+                    "stored renewal operation does not verify for the signer".into(),
+                ))
+            })?;
+        }
+        Ok(batch)
+    }
+}
+
+/// Verify an identity document read from the signer's own state or flow.
+pub(crate) fn stored_identity(signed: &SignedDoc, identity: &[u8; 32]) -> Result<IdentityDoc> {
+    IdentityDoc::verify(signed, identity).map_err(SignerError::StoredData)
 }
 
 /// Bytes kept as they were signed, stored in base64url.
@@ -739,9 +835,7 @@ pub(crate) async fn delete(store: &mut OwnedStoreHandle, identity: &[u8; 32]) ->
     let ns = signer_namespace(identity);
     let mut batch = WriteBatch::new();
     for key in [STATE_KEY, FLOW_KEY] {
-        batch
-            .delete(&ns, key)
-            .map_err(|e| SignerError::Records(e.to_string()))?;
+        batch.delete(&ns, key).map_err(RecordsFault::WriteRefused)?;
     }
     store.commit(batch).await?;
     Ok(())
@@ -761,22 +855,30 @@ pub(crate) async fn load(
     identity: &[u8; 32],
 ) -> Result<Option<(SignerState, Option<Flow>)>> {
     if store.namespace() != signer_namespace(identity) {
-        return Err(SignerError::Records("another store namespace".into()));
+        return Err(RecordsFault::Invariant("another store namespace").into());
     }
-    let Some(bytes) = store.get(STATE_KEY).await? else {
+    let bytes = store.get(STATE_KEY).await?;
+    let flow = store.get(FLOW_KEY).await?;
+    let Some(bytes) = bytes else {
+        if flow.is_some() {
+            return Err(RecordsFault::Incomplete.into());
+        }
         return Ok(None);
     };
-    let state: SignerState = decode(&bytes)?;
-    if state.v != SCHEMA_VERSION || &state.identity != identity {
-        return Err(SignerError::Records(
-            "another layout version or identity".into(),
-        ));
+    let state: SignerState = decode(&bytes, SignerRecord::State)?;
+    if state.v != SCHEMA_VERSION {
+        return Err(RecordsFault::InvalidHeader.into());
     }
-    let flow = store
-        .get(FLOW_KEY)
-        .await?
-        .map(|bytes| decode(&bytes))
+    if &state.identity != identity {
+        return Err(RecordsFault::OtherIdentity.into());
+    }
+    let flow = flow
+        .map(|bytes| decode(&bytes, SignerRecord::Flow))
         .transpose()?;
+    state.check_copies()?;
+    if let Some(flow) = &flow {
+        Flow::check_copies(flow, identity)?;
+    }
     Ok(Some((state, flow)))
 }
 
@@ -786,32 +888,46 @@ pub(crate) async fn save(
     state: &SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {
+    state.check_copies().map_err(|_| {
+        RecordsFault::Invariant("the state to write contains an invalid signed copy")
+    })?;
+    if let Some(flow) = flow {
+        flow.check_copies(&state.identity).map_err(|_| {
+            RecordsFault::Invariant("the flow to write contains an invalid signed copy")
+        })?;
+    }
     let ns = signer_namespace(&state.identity);
     let mut batch = WriteBatch::new();
     batch
         .put(&ns, STATE_KEY, encode(state)?)
-        .map_err(|e| SignerError::Records(e.to_string()))?;
+        .map_err(RecordsFault::WriteRefused)?;
     match flow {
         Some(flow) => batch
             .put(&ns, FLOW_KEY, encode(flow)?)
-            .map_err(|e| SignerError::Records(e.to_string()))?,
+            .map_err(RecordsFault::WriteRefused)?,
         None => batch
             .delete(&ns, FLOW_KEY)
-            .map_err(|e| SignerError::Records(e.to_string()))?,
+            .map_err(RecordsFault::WriteRefused)?,
     };
     store.commit(batch).await?;
     Ok(())
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| SignerError::Records(e.to_string()))
+    serde_json::to_vec(value).map_err(|_| RecordsFault::Encode.into())
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
+fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], record: SignerRecord) -> Result<T> {
     // The decoder's message can quote the stored value, which may hold signed records:
     // only the position is kept.
-    serde_json::from_slice(bytes)
-        .map_err(|e| SignerError::Records(format!("at line {} column {}", e.line(), e.column())))
+    serde_json::from_slice(bytes).map_err(|e| {
+        RecordsFault::Undecodable {
+            record,
+            line: e.line(),
+            column: e.column(),
+        }
+        .into()
+    })
 }
 
 #[cfg(test)]
@@ -826,7 +942,7 @@ mod tests {
             "a new identity's records start unpublished"
         );
         assert_eq!(state.cert_lifetime_ms, DEFAULT_CERT_LIFETIME_MS);
-        let read: SignerState = decode(&encode(&state).unwrap()).unwrap();
+        let read: SignerState = decode(&encode(&state).unwrap(), SignerRecord::State).unwrap();
         assert_eq!(read, state);
     }
 

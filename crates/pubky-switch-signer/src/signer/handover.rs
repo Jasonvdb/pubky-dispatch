@@ -55,7 +55,7 @@ use pubky_switch_core::records::{AppCert, IdentityDoc, SIGNER_BACKUP_PATH, abort
 use super::revocation::UserConfirmed;
 use super::{Signer, gate};
 use crate::alert::Alert;
-use crate::error::{Refusal, Result, SignerError};
+use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::state::{DeliverStep, Flow, HandOverSent, HandingOver, TakeBack};
 
 /// What an abort of a hand-over came to (Switch wire 3.12).
@@ -114,7 +114,7 @@ impl Signer {
         // `ready` checked that the switch holds the newest version, and that this install
         // signed it.
         let newest = self.state.newest.clone().ok_or(Refusal::NotSetUp)?;
-        let doc = IdentityDoc::verify(&newest.doc, &identity)?;
+        let doc = crate::state::stored_identity(&newest.doc, &identity)?;
         if doc.body().signer != self.state.install {
             return Err(SignerError::NotNamed {
                 install: doc.body().signer,
@@ -140,12 +140,15 @@ impl Signer {
             .state
             .certs
             .iter()
-            .map(|cert| AppCert::verify(cert, &identity))
+            .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let cert = issued
-            .iter()
-            .find(|cert| cert.hash() == cert_hash)
-            .ok_or_else(|| SignerError::Records("the target's certificate isn't held".into()))?;
+        let cert =
+            issued
+                .iter()
+                .find(|cert| cert.hash() == cert_hash)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the target's certificate isn't held",
+                )))?;
         let limits = self.service()?.limits;
         let handover = {
             let key = self.signing_key()?;
@@ -199,7 +202,7 @@ impl Signer {
                 }
                 other => drop(other?),
             }
-            let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
+            let handed = crate::state::stored_identity(&handing.doc, &self.state.identity)?;
             let (body, prev) = abort_body(&handed)?;
             let doc = {
                 let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
@@ -227,10 +230,10 @@ impl Signer {
         // publication that failed is the next run's.
         let won = self.state.handing_over.is_none()
             && abort.is_some()
-            && self.high_water().map(|h| h.doc_hash) == abort;
+            && self.high_water()?.map(|h| h.doc_hash) == abort;
         match result {
             _ if won => Ok(AbortOutcome::Aborted {
-                version: self.high_water().map_or(0, |h| h.version),
+                version: self.high_water()?.map_or(0, |h| h.version),
             }),
             Ok(()) => Err(Refusal::HandingOver {
                 to_app: handing.to_app,
@@ -298,13 +301,11 @@ impl Signer {
     /// one handed over: newer than it, at no lower generation, naming another install, and
     /// neither this install's abort nor its take-back, documents compared whole (Switch wire
     /// 3.12). Alone it proves nothing; [`Signer::succeeded`] looks for the backup too.
-    pub(super) fn succeeded_by(&self, copy: &IdentityDoc) -> bool {
+    pub(super) fn succeeded_by(&self, copy: &IdentityDoc) -> Result<bool> {
         let Some(handing) = &self.state.handing_over else {
-            return false;
+            return Ok(false);
         };
-        let Ok(handed) = IdentityDoc::verify(&handing.doc, &self.state.identity) else {
-            return false;
-        };
+        let handed = crate::state::stored_identity(&handing.doc, &self.state.identity)?;
         let own: Vec<[u8; 32]> = handing
             .abort
             .into_iter()
@@ -312,28 +313,32 @@ impl Signer {
                 handing
                     .take_back
                     .as_ref()
-                    .and_then(|t| t.doc.doc_hash().ok()),
+                    .map(|t| crate::state::stored_identity(&t.doc, &self.state.identity))
+                    .transpose()?
+                    .map(|doc| doc.hash()),
             )
             .collect();
-        copy.generation() >= handed.generation()
+        Ok(copy.generation() >= handed.generation()
             && copy.body().signer != self.state.install
-            && succeeded(&handed, &own, copy.version(), &copy.hash())
+            && succeeded(&handed, &own, copy.version(), &copy.hash()))
     }
 
     /// Whether `copy`, from the switch, is this install's own abort or take-back: that
     /// delivery won, its answer lost (Switch wire 3.12).
-    pub(super) fn own_hand_over_delivery(&self, copy: &IdentityDoc) -> Option<[u8; 32]> {
-        let handing = self.state.handing_over.as_ref()?;
+    pub(super) fn own_hand_over_delivery(&self, copy: &IdentityDoc) -> Result<Option<[u8; 32]>> {
+        let Some(handing) = &self.state.handing_over else {
+            return Ok(None);
+        };
         if handing.abort == Some(copy.hash()) {
-            return IdentityDoc::verify(&handing.doc, &self.state.identity)
-                .ok()
-                .map(|handed| handed.hash());
+            return Ok(Some(
+                crate::state::stored_identity(&handing.doc, &self.state.identity)?.hash(),
+            ));
         }
-        handing
+        Ok(handing
             .take_back
             .as_ref()
             .filter(|t| &t.doc == copy.signed())
-            .map(|t| t.prev)
+            .map(|t| t.prev))
     }
 
     /// The switch's `copy` names another install past the version handed over. The key goes
@@ -365,7 +370,7 @@ impl Signer {
         let Some(handing) = &self.state.handing_over else {
             return Ok(false);
         };
-        let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
+        let handed = crate::state::stored_identity(&handing.doc, &self.state.identity)?;
         let Some(bytes) = self
             .env
             .homeserver
@@ -404,7 +409,7 @@ impl Signer {
             return Err(Refusal::NothingToTakeBack.into());
         };
         if handing.take_back.is_none() || self.flow.is_none() {
-            let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
+            let handed = crate::state::stored_identity(&handing.doc, &self.state.identity)?;
             let held = self.service_client()?.apps().await?.identity;
             let copy = held
                 .map(|signed| IdentityDoc::verify(&signed, &self.state.identity))
@@ -430,9 +435,9 @@ impl Signer {
                         .version()
                         .max(self.state.signed_through)
                         .checked_add(1)
-                        .ok_or_else(|| {
-                            SignerError::Records("the version can't go higher".into())
-                        })?;
+                        .ok_or(SignerError::Records(RecordsFault::Invariant(
+                            "the version can't go higher",
+                        )))?;
                     body.signer = self.state.install;
                     let doc = {
                         let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
@@ -445,7 +450,8 @@ impl Signer {
                     }
                 }
             };
-            let version = IdentityDoc::verify(&take_back.doc, &self.state.identity)?.version();
+            let version =
+                crate::state::stored_identity(&take_back.doc, &self.state.identity)?.version();
             let mut state = self.state.clone();
             state.signed_through = state.signed_through.max(version);
             // It races the new signer, so its backup is written once it has won (Switch wire
@@ -474,7 +480,7 @@ impl Signer {
             .filter(|_| self.state.handing_over.is_none())
             .filter(|doc| self.state.newest.as_ref().is_some_and(|n| &n.doc == *doc));
         match (won, result) {
-            (Some(doc), _) => Ok(IdentityDoc::verify(doc, &self.state.identity)?),
+            (Some(doc), _) => Ok(crate::state::stored_identity(doc, &self.state.identity)?),
             (None, Err(error)) => Err(error),
             (None, Ok(())) => Err(Refusal::NothingToTakeBack.into()),
         }

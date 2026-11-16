@@ -423,7 +423,7 @@ impl Signer {
             };
             Some(copy)
         };
-        match self.judge_copy(copy.as_ref()) {
+        match self.judge_copy(copy.as_ref())? {
             Ok(Verdict::AtMark) | Err(Alert::Rollback { .. }) => {}
             Ok(Verdict::Newer) if copy.is_none() => {}
             Ok(Verdict::Newer) => {

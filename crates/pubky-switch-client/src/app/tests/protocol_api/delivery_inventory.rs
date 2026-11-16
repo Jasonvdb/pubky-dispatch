@@ -2108,3 +2108,279 @@ async fn test_queued_messages_keeps_a_producer_after_the_latest_end_expires() {
     })
     .await;
 }
+
+fn known_batch_key(id: &str) -> Vec<u8> {
+    format!("batch/{id}").into_bytes()
+}
+
+fn known_batch(delivery: &crate::app::DeliveryView<'_>) -> [u8; 16] {
+    delivery
+        .local()
+        .local_get(&known_batch_key(&delivery.message().msg_id))
+        .unwrap()
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+async fn remember_batch(app: &mut App, signed: &SignedMessage, id: [u8; 16]) {
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: known_batch_key(signed.msg_id()),
+            value: id.to_vec(),
+        }],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_delivery_view_known_batch_changes_before_append() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p
+            .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+            .await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let signed = wallet
+            .sign_message(Pair::note(&p.bob, "kept permission"))
+            .unwrap();
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        kept_with(&p, &mut wallet, &signed).await;
+        let id = wallet.kept_batches().await.unwrap()[0].0;
+        remember_batch(&mut wallet, &signed, id).await;
+        *protocol.delivery_check.lock().unwrap() = Some(Arc::new(|delivery| {
+            match delivery.kept_batch(known_batch(delivery)) {
+                Ok(status) => Ok(matches!(
+                    status,
+                    Some(crate::app::KeptBatchStatus::Kept { .. })
+                )),
+                Err(error) => match crate::app::StoreFailure::try_from(error) {
+                    Ok(error) => Err(error),
+                    Err(_) => Ok(false),
+                },
+            }
+        }));
+        assert!(matches!(
+            wallet.kept_batch(id).await.unwrap(),
+            Some(crate::app::KeptBatchStatus::Kept { .. })
+        ));
+        let before = wallet.reader().scan_raw("").await.unwrap();
+        let routed = p.router.log();
+        assert!(listed_origin(&wallet, &signed).await.may_send);
+        assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+        assert_eq!(p.router.log(), routed);
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert!(matches!(
+            wallet.kept_batch(id).await.unwrap(),
+            Some(crate::app::KeptBatchStatus::Applied { .. })
+        ));
+        assert_eq!(
+            p.bob.switch().entries_from(&p.alice.identity().public()),
+            0,
+            "settlement ends the known-batch permission before append"
+        );
+        assert!(!listed_origin(&wallet, &signed).await.may_send);
+        let app_id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), app_id)
+            .await
+            .unwrap();
+        assert!(!listed_origin(&wallet, &signed).await.may_send);
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_status_matches_current_metadata_and_retention() {
+    Box::pin(async {
+        for refused in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "status")).unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observed_by_gate = observed.clone();
+            *protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+                observed_by_gate
+                    .lock()
+                    .unwrap()
+                    .push(delivery.kept_batch(known_batch(delivery)));
+                Ok(false)
+            }));
+            // The queued message has a local batch reference before any delivery decision.
+            remember_batch(&mut wallet, &signed, [0; 16]).await;
+            p.alice.switch().fail_next(Fault::Unreachable {
+                path: "ops".into(),
+                after: 0,
+            });
+            let mut batch = OpBatch::new().op(OpKind::AllowPut {
+                pubky: [9; 32],
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            });
+            if refused {
+                batch = batch.when(Condition::RecordVersion {
+                    key: [8; 32],
+                    version: RecordVersion::new(1, 99),
+                });
+            }
+            let id = wallet
+                .submit_batch(batch)
+                .await
+                .unwrap_err()
+                .kept_batch()
+                .unwrap();
+            remember_batch(&mut wallet, &signed, id).await;
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            let routed = p.router.log();
+            assert!(!listed_origin(&wallet, &signed).await.may_send);
+            let status = observed.lock().unwrap().pop().unwrap().unwrap();
+            assert_eq!(status, wallet.kept_batch(id).await.unwrap());
+            assert!(matches!(
+                status,
+                Some(crate::app::KeptBatchStatus::Kept { .. })
+            ));
+            assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+            assert_eq!(p.router.log(), routed);
+            wallet.receive(None).await.unwrap();
+            assert!(!listed_origin(&wallet, &signed).await.may_send);
+            let status = observed.lock().unwrap().pop().unwrap().unwrap();
+            assert_eq!(status, wallet.kept_batch(id).await.unwrap());
+            assert_eq!(
+                matches!(status, Some(crate::app::KeptBatchStatus::Dropped { .. })),
+                refused
+            );
+            assert_eq!(
+                matches!(status, Some(crate::app::KeptBatchStatus::Applied { .. })),
+                !refused
+            );
+            let ended = p.clock.now_ms();
+            let clock = p.clock.clone();
+            let expected = status.clone();
+            *protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+                assert_eq!(delivery.kept_batch(id).unwrap(), expected);
+                clock.set_ms(ended + SENT_RETENTION_MS - 1);
+                assert_eq!(delivery.kept_batch(id).unwrap(), expected);
+                clock.set_ms(ended + SENT_RETENTION_MS);
+                assert_eq!(
+                    delivery.kept_batch(id).unwrap(),
+                    None,
+                    "the exact boundary expires"
+                );
+                clock.set_ms(ended);
+                assert_eq!(
+                    delivery.kept_batch(id).unwrap(),
+                    expected,
+                    "reads do not prune ended metadata"
+                );
+                assert_eq!(delivery.kept_batch([0; 16]).unwrap(), None);
+                Ok(false)
+            }));
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            let routed = p.router.log();
+            assert!(!listed_origin(&wallet, &signed).await.may_send);
+            assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+            assert_eq!(p.router.log(), routed);
+            assert_eq!(wallet.kept_batch(id).await.unwrap(), status);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_clock_samples_each_call() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let signed = wallet.sign_message(Pair::note(&p.bob, "clock")).unwrap();
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        let clock = p.clock.clone();
+        *protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+            let start = clock.now_ms();
+            assert_eq!(delivery.now_ms(), start);
+            clock.set_ms(start + 123);
+            assert_eq!(
+                delivery.now_ms(),
+                start + 123,
+                "same view reads an advanced host clock"
+            );
+            clock.set_ms(start - 123);
+            assert_eq!(
+                delivery.now_ms(),
+                start - 123,
+                "same view reads a regressed host clock"
+            );
+            clock.set_ms(start);
+            Ok(false)
+        }));
+        let before = wallet.reader().scan_raw("").await.unwrap();
+        let routed = p.router.log();
+        assert!(!listed_origin(&wallet, &signed).await.may_send);
+        assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+        assert_eq!(p.router.log(), routed);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_status_errors_match_app_and_hold() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p.join_on(&p.alice, "wallet", protocol.clone(), store.clone()).await;
+        let signed = wallet.sign_message(Pair::note(&p.bob, "unreadable status")).unwrap();
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        let id = [99; 16];
+        remember_batch(&mut wallet, &signed, id).await;
+        let key = format!("kb/{}", pubky_switch_core::enc::b64(&id));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_by_gate = observed.clone();
+        *protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+            let result = delivery.kept_batch(known_batch(delivery));
+            observed_by_gate.lock().unwrap().push(format!("{result:?}"));
+            match result {
+                Ok(status) => Ok(matches!(status, Some(crate::app::KeptBatchStatus::Kept { .. }))),
+                Err(error) => match crate::app::StoreFailure::try_from(error) {
+                    Ok(error) => Err(error),
+                    Err(_) => Ok(false),
+                },
+            }
+        }));
+        let app_id = wallet.app_id();
+        drop(wallet);
+        let fault = Arc::new(DeliveryReadFault {
+            inner: store.clone(), key: key.as_bytes().to_vec(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let wallet = App::load(p.env(&p.alice, fault.clone()), protocol, config(), app_id).await.unwrap();
+        for unavailable in [false, true] {
+            if !unavailable {
+                let mut writes = crate::store::WriteBatch::new();
+                writes.put(&wallet.ns, key.as_bytes(), b"not state JSON").unwrap();
+                store.commit(writes).unwrap();
+            }
+            fault.fail.store(unavailable, std::sync::atomic::Ordering::SeqCst);
+            let expected = wallet.kept_batch(id).await;
+            assert!(matches!(&expected, Err(AppError::Store(error)) if *error == if unavailable { StoreError::Unavailable } else { StoreError::Corrupt }), "{expected:?}");
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            let routed = p.router.log();
+            assert!(!listed_origin(&wallet, &signed).await.may_send);
+            assert_eq!(observed.lock().unwrap().pop().unwrap(), format!("{expected:?}"));
+            assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+            assert_eq!(p.router.log(), routed);
+        }
+    }).await;
+}

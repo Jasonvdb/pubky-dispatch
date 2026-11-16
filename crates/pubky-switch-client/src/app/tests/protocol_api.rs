@@ -81,6 +81,9 @@ struct Seen {
     condition: Option<Condition>,
 }
 
+type DeliveryCheck =
+    dyn Fn(&crate::app::DeliveryView<'_>) -> Result<bool, crate::app::StoreFailure> + Send + Sync;
+
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
 struct ApiProtocol {
     items: ItemsProtocol,
@@ -95,6 +98,7 @@ struct ApiProtocol {
     blocked_origin: Mutex<Option<crate::app::DeliveryOrigin>>,
     send_origins: Mutex<Vec<(String, crate::app::DeliveryOrigin)>>,
     require_send_fact: std::sync::atomic::AtomicBool,
+    delivery_check: Mutex<Option<Arc<DeliveryCheck>>>,
 }
 
 impl ApiProtocol {
@@ -109,6 +113,7 @@ impl ApiProtocol {
             blocked_origin: Mutex::new(None),
             send_origins: Mutex::new(Vec::new()),
             require_send_fact: std::sync::atomic::AtomicBool::new(false),
+            delivery_check: Mutex::new(None),
         })
     }
 
@@ -138,6 +143,12 @@ impl Protocol for ApiProtocol {
             .require_send_fact
             .load(std::sync::atomic::Ordering::SeqCst)
             && !delivery_inventory::has_delivery_fact(delivery)?
+        {
+            return Ok(false);
+        }
+        let check = self.delivery_check.lock().unwrap().clone();
+        if let Some(check) = check
+            && !check(delivery)?
         {
             return Ok(false);
         }

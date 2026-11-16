@@ -1348,3 +1348,109 @@ async fn test_records_confirmed_restore_reconciles_a_lost_delivery_answer() {
     assert_eq!(world.backup().identity_doc().signed(), accepted.signed());
     world.assert_no_version_sent_twice();
 }
+
+#[tokio::test]
+async fn test_records_confirmed_restore_keeps_backup_revocation_alert() {
+    use pubky_switch_signer::Alert;
+    let world = World::new();
+    let (mut first, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut first, &app).await;
+    drop(first);
+    let original = snapshot(&world, &store);
+    let mut other = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        UserConfirmed::shown_and_confirmed(),
+    )
+    .await
+    .unwrap();
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    other
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    other.set_record_max_age(Some(9)).await.unwrap();
+    drop(other);
+    replace(&world, &store, &damaged_certificate(&original));
+    let mut signer =
+        Signer::restore_over_unusable(world.env(store), world.keyring(), discard_confirmed())
+            .await
+            .unwrap();
+    assert!(signer.alerts().contains(&Alert::RevocationPending {
+        app_id: id,
+        at_switch: false
+    }));
+    assert!(signer.complete_removals().await.unwrap());
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+    assert!(world.switch.app(&id).revoked_at.is_some());
+}
+
+#[tokio::test]
+async fn test_records_confirmed_restore_keeps_backup_epoch_warning() {
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::{
+        Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords, StoredPart,
+    };
+    use pubky_switch_signer::Alert;
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_sync"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let doc = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let original = snapshot(&world, &store);
+    let id = app.keys.app_id_bytes();
+    let cert = world.switch.app(&id).cert.unwrap();
+    // The kept local pair is real; the sealed backup exaggerates the epoch of sent keys.
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        doc.clone(),
+        &[],
+        &[cert],
+        Limits::default(),
+        &[StoredPart {
+            app_id: id,
+            first_epoch: 2,
+            last_epoch: 41,
+            cert: doc.listed_cert(&id).unwrap(),
+        }],
+        None,
+    )
+    .unwrap();
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap(),
+    );
+    replace(&world, &store, &damaged_certificate(&original));
+    let mut signer =
+        Signer::restore_over_unusable(world.env(store), world.keyring(), discard_confirmed())
+            .await
+            .unwrap();
+    assert!(signer.alerts().contains(&Alert::EpochFloorBounded {
+        claimed: 41,
+        kept: 2
+    }));
+    let next = signer
+        .renew(
+            id,
+            CertChange {
+                scopes: Some(vec!["notes_sync".into()]),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.data_epoch(), 3);
+}

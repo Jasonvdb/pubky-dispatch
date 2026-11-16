@@ -436,7 +436,9 @@ impl Signer {
             }
         }
         if let Some(kept) = kept {
-            state.alerts = restored_alerts(kept);
+            for alert in restored_alerts(kept) {
+                state.alert(alert);
+            }
         }
         // The first commit must also tell a restart to finish taking over (Switch wire 3.13).
         state.owes_own_version = true;

@@ -206,9 +206,9 @@ pub(crate) struct Auth<'a> {
     /// The signing time to send instead of the clock's: the `current.server_time` of a
     /// `401 stale_timestamp`, for its one retry (Switch wire 7.1).
     pub(crate) timestamp_ms: Option<u64>,
-    /// The key that signs a `2xx` answer instead of the pinned one: the pending key named by
-    /// a delivery that starts a generation (Switch wire 7.4.2). Other statuses are still
-    /// checked with the pinned key.
+    /// The key that signs a `2xx` answer instead of the pinned one: the new key a delivery
+    /// names that starts a generation after a service key change (Switch wire 7.4.2, spec
+    /// 12.5). Other statuses are still checked with the pinned key.
     pub(crate) success_key: Option<[u8; 32]>,
     /// How long the call may take ([`TimeoutClass`]), which goes to the transport with
     /// the request.
@@ -226,13 +226,12 @@ pub(crate) enum Body {
     Octets,
 }
 
-/// A signed request, with its signature.
+/// A request this client built, signed in its `Switch-Signature` header but for the
+/// unauthenticated public read, to send with [`SwitchClient::send`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedRequest {
     /// The request.
     pub request: Request,
-    /// The 64 bytes of its `Switch-Signature`; `None` for the unauthenticated public read.
-    pub signature: Option<[u8; 64]>,
 }
 
 /// The request the client sent, as the service receives it, which a response signature
@@ -468,6 +467,42 @@ fn stale_timestamp_hint(checked: &Result<CheckedResponse, ClientError>) -> Optio
     }
 }
 
+/// Comparable answers from one call, including its automatic timestamp retry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComparedTimes {
+    pub(crate) first: u64,
+    pub(crate) highest: u64,
+    pub(crate) backwards: Option<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct CallTimes {
+    latest: Option<u64>,
+    compared: Option<ComparedTimes>,
+}
+
+impl CallTimes {
+    fn observe(&mut self, time: Option<u64>) {
+        self.latest = time;
+        let Some(time) = time else { return };
+        match &mut self.compared {
+            Some(held) => {
+                if time < held.highest && held.backwards.is_none() {
+                    held.backwards = Some((held.highest, time));
+                }
+                held.highest = held.highest.max(time);
+            }
+            None => {
+                self.compared = Some(ComparedTimes {
+                    first: time,
+                    highest: time,
+                    backwards: None,
+                })
+            }
+        }
+    }
+}
+
 /// Whether a text is safe as a header value and a path segment: visible ASCII without the
 /// characters a path or query gives meaning to.
 fn is_token(text: &str) -> bool {
@@ -485,6 +520,7 @@ pub struct SwitchClient {
     pinned: Mutex<Option<[u8; 32]>>,
     last_server_time: Mutex<Option<u64>>,
     latest_server_time: Mutex<Option<u64>>,
+    call_times: Mutex<CallTimes>,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
 }
@@ -539,6 +575,7 @@ impl SwitchClient {
             pinned: Mutex::new(pinned_key),
             last_server_time: Mutex::new(None),
             latest_server_time: Mutex::new(None),
+            call_times: Mutex::new(CallTimes::default()),
             transport,
             clock,
         })
@@ -602,6 +639,42 @@ impl SwitchClient {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The `Switch-Server-Time` of this client's latest call, where it counts in the
+    /// comparison of service times that never go back (Switch spec 10.1, wire 7.1
+    /// Timestamp): every answer checked with the pinned key, refusals included, but those
+    /// that count in no comparison, `None` for them and for a call without a checked answer.
+    /// Those are told from the answer and the call alone ([`http::uncompared`]): every answer
+    /// to the enrollment, the erasure and the public read; an answer that verifies only with
+    /// the empty body field, given before the body was read (7.1); the notice, `503
+    /// recovery_required` (7.6); every `503 unavailable`; and the `404` with `current: {
+    /// "hosted": false }` of an identity the service doesn't host (7.3 step 2). Only these
+    /// may carry the time base; every other answer carries a time the service stamped, or the
+    /// last time it committed for the identity, which no later answer goes behind.
+    pub(crate) fn latest_compared_time(&self) -> Option<u64> {
+        self.call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .latest
+    }
+
+    /// All comparable answers of the call, even if its retry answered an excluded class
+    /// or failed to return a verified answer.
+    pub(crate) fn compared_times(&self) -> Option<ComparedTimes> {
+        self.call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .compared
+    }
+
+    /// Forget the latest call's times, before a call.
+    fn forget_latest(&self) {
+        self.set_latest(None);
+        *self
+            .call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = CallTimes::default();
+    }
+
     fn set_latest(&self, time: Option<u64>) {
         *self
             .latest_server_time
@@ -611,19 +684,58 @@ impl SwitchClient {
 
     fn note_server_time(
         &self,
+        sent: &SentRequest,
         checked: &Result<CheckedResponse, ClientError>,
         response: &Response,
     ) {
+        let shown = || {
+            response
+                .header(header::SERVER_TIME)
+                .and_then(|text| parse_rfc3339(text).ok())
+        };
         let time = match checked {
             Ok(answer) => Some(answer.server_time_ms),
             // An error answer verified with the pinned key carries the stamped time only once
             // the request verified, which its head shows; a head it carries verified as the
             // account's, or the answer would have failed (Switch wire 7.1).
-            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => response
-                .header(header::SERVER_TIME)
-                .and_then(|text| parse_rfc3339(text).ok()),
+            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => shown(),
             Err(_) => None,
         };
+        // Every checked answer but those that count in no comparison, told from the answer
+        // and the call alone (Switch wire 7.1 Timestamp).
+        let uncompared = |body, code, current| {
+            http::uncompared(
+                &sent.method,
+                &sent.path_and_query,
+                body,
+                response.status,
+                code,
+                current,
+            )
+        };
+        let read = http::BodyField::Read(sent.body_hash);
+        let compared = match checked {
+            Ok(answer) => uncompared(read, None, None)
+                .is_none()
+                .then_some(answer.server_time_ms),
+            Err(ClientError::Switch { code, current, .. }) => {
+                uncompared(read, Some(*code), Some(current))
+                    .is_none()
+                    .then(shown)
+                    .flatten()
+            }
+            Err(ClientError::BodyUnread { code, .. }) => {
+                uncompared(http::BodyField::NotRead, Some(*code), None)
+                    .is_none()
+                    .then(shown)
+                    .flatten()
+            }
+            Err(_) => None,
+        };
+        self.call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(compared);
         self.set_latest(time);
         if let Some(time) = time {
             *self
@@ -669,7 +781,8 @@ impl SwitchClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Usage`] for an invite code that isn't a token.
+    /// [`ClientError::Usage`] for an invite code that isn't a token, or a request header
+    /// the service would refuse at routing (Switch wire 7.1 "Each header once, as text").
     pub fn sign_request(
         &self,
         method: &str,
@@ -720,7 +833,6 @@ impl SwitchClient {
                     body,
                     timeout: auth.timeout,
                 },
-                signature: None,
             });
         }
         if let Some(code) = auth.invite_code
@@ -785,6 +897,16 @@ impl SwitchClient {
         };
         headers.push(Header::new(header::TIMESTAMP, &timestamp));
         headers.push(Header::new(header::SIGNATURE, &b64(&signature)));
+        // Nothing the service refuses at routing is sent: each signed header once, with a
+        // printable value, never empty (Switch wire 7.1 "Each header once, as text").
+        let received = http::ReceivedHeaders::of(
+            headers
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_bytes())),
+        );
+        if let Some(reason) = received.broken_rule() {
+            return Err(ClientError::Usage(format!("Switch wire {reason}")));
+        }
         Ok(SignedRequest {
             request: Request {
                 method,
@@ -794,7 +916,6 @@ impl SwitchClient {
                 body,
                 timeout: auth.timeout,
             },
-            signature: Some(signature),
         })
     }
 
@@ -817,7 +938,7 @@ impl SwitchClient {
             }
             None => return Err(ClientError::Unpinned),
         };
-        self.set_latest(None);
+        self.forget_latest();
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
         let checked = self.send_checked(signed, key, auth.success_key).await?;
@@ -861,7 +982,7 @@ impl SwitchClient {
             _ => key,
         };
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&checked, &response);
+        self.note_server_time(&sent, &checked, &response);
         Ok(checked)
     }
 
@@ -877,7 +998,7 @@ impl SwitchClient {
         method: &str,
         path_and_query: &str,
     ) -> Result<CheckedResponse, ClientError> {
-        self.set_latest(None);
+        self.forget_latest();
         let auth = Auth {
             public: true,
             ..Auth::default()
@@ -891,7 +1012,7 @@ impl SwitchClient {
                     status: response.status,
                 })?;
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&checked, &response);
+        self.note_server_time(&sent, &checked, &response);
         if checked.is_ok() {
             self.pin(key);
         }
@@ -917,7 +1038,7 @@ impl SwitchClient {
     /// [`check_response`].
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
-        self.set_latest(None);
+        self.forget_latest();
         self.send_checked(signed, key, None).await?
     }
 

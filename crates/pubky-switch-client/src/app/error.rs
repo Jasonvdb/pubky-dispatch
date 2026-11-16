@@ -251,8 +251,8 @@ pub enum AppError {
     /// A rule of the app layer refused the call.
     #[error("refused: {0}")]
     Refused(Refusal),
-    /// The switch answers as for an account it doesn't host, an error its operator signed
-    /// and the account's key didn't (an unsigned `404`), and the identity publishes no
+    /// The switch answers as for an account it doesn't host, an error the pinned service key
+    /// didn't sign (an unsigned `404`), and the identity publishes no
     /// `identity.json`: the account may have been erased (Switch spec 12.7). Nothing
     /// authenticates an erasure, so the app waits: it takes the account as gone only once
     /// both hold at 5 tries at least 6 hours apart over 24 hours by its clock, then stops
@@ -483,7 +483,8 @@ pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
         | Retry::AtNextService
         | Retry::AfterRetryAfter
         | Retry::WhenLimitFrees
-        | Retry::Yes => None,
+        | Retry::Yes
+        | Retry::HeldForNextGeneration => None,
     }
 }
 

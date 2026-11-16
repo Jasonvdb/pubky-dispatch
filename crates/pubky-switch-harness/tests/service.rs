@@ -21,7 +21,7 @@ const ORIGIN: &str = "https://switch.example";
 
 /// A service with no account, or `None` when no test database is configured.
 async fn switch(clock: Arc<TestClock>) -> Option<RealSwitch> {
-    RealSwitch::start(ORIGIN, clock, vec![[1; 32]], [2; 32], Limits::default())
+    RealSwitch::start(ORIGIN, clock, [1; 32], Limits::default())
         .await
         .expect("a service")
 }
@@ -54,7 +54,7 @@ async fn test_service_transport_takes_the_services_own_path() {
         transport.send(request(method, origin, path, body))
     };
 
-    // No such route: the operator's signed `404` (Switch wire 7.3 step 1).
+    // No such route: the `404` signed with the service key (Switch wire 7.3 step 1).
     let answer = ask("GET", ORIGIN, "/v1/someone/nowhere", Vec::new())
         .await
         .expect("an answer");
@@ -101,8 +101,8 @@ async fn test_service_transport_takes_the_services_own_path() {
     assert!(!database_exists(&name).await, "{name} was left behind");
 }
 
-/// A request the service's storage fails: the service answers `503 unavailable` under the
-/// operator key, and its log, which a run keeps, says that it was the database.
+/// A request the service's storage fails: the service answers `503 unavailable` under its
+/// service key, and its log, which a run keeps, says that it was the database.
 #[tokio::test]
 async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
     let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {

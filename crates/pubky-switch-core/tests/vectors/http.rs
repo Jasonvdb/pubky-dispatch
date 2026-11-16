@@ -5,7 +5,9 @@ use pubky_switch_core::http::{
     self, BodyField, ReceivedHeaders, ReceivedRequest, RequestHeaders, RequestTarget,
     TransferHeaders,
 };
-use pubky_switch_core::records::{Enrollment, EnrollmentAnswer, IdentityDoc, SignerHandover};
+use pubky_switch_core::records::{
+    Enrollment, EnrollmentAnswer, IdentityDoc, Limits, SignerHandover,
+};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::{labels, sig};
 use serde_json::Value;
@@ -71,21 +73,20 @@ const ORIGIN: &str = "https://inbox.example";
 
 /// The responses to an unsigned public read (Switch wire 7.4.15), which no request case
 /// gives: each answers `GET /v1/{id}/identity` with no header, read whole, at the account
-/// whose service key signs it, or, for the operator-signed `404` ([`OPERATOR_404`]), at bob,
-/// whom that service doesn't host.
+/// whose service key signs it, or, for the not-hosted `404` ([`NOT_HOSTED`]), at bob, whom
+/// that service doesn't host (Switch wire 7.3 step 2).
 const UNSIGNED_READS: [(&str, bool); 3] = [
     ("anyone: the public identity.json read", false),
     (
         "anyone: a frozen service's public identity.json read",
         false,
     ),
-    (OPERATOR_404, true),
+    (NOT_HOSTED, true),
 ];
 
-/// The `404 not_found` to an unsigned request for an account the service doesn't host, which
-/// the operator key signs.
-const OPERATOR_404: &str =
-    "no signature on the request, unknown account: operator key, the public read binding no header";
+/// The `404 not_found` to an unsigned read of an identity the service doesn't host (Switch
+/// wire 7.3 step 2, 7.6), signed with the service key, the public read binding no header.
+const NOT_HOSTED: &str = "anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head";
 
 /// A request as the service received it (Switch wire 7.1), owned.
 pub struct Received {
@@ -333,34 +334,40 @@ fn answered_requests(keys: &Keys) {
 /// Every response's signature over its status, the request it answers as the service
 /// received it, the server time, the head field and the body (Switch wire 7.1), which
 /// `pubky-switch-core` writes (README "How the files were generated"), with the fixed keys
-/// of `keys.json` and the operator key; among them the operator-signed `404`
-/// ([`OPERATOR_404`]), to an unsigned `GET` of bob's `identity.json`.
+/// of `keys.json`; among them the not-hosted `404` ([`NOT_HOSTED`]), to an unsigned `GET`
+/// of bob's `identity.json`, its `current` `{ "hosted": false }`, signed with the service
+/// key that signs alice's answers.
 fn response_signatures(keys: &Keys) {
     let file = load("http.json");
-    let unknown_at = arr(&file, "responses")
+    let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
+    let not_hosted_at = arr(&file, "responses")
         .iter()
-        .position(|c| c["name"] == OPERATOR_404)
+        .position(|c| c["status"] == 404 && c["request"].is_null())
         .unwrap();
-    let held = &arr(&file, "responses")[unknown_at];
-    let unknown = serde_json::json!({
-        "body": r#"{"code":"not_found","message":"no such account"}"#,
+    let held = &arr(&file, "responses")[not_hosted_at];
+    let body = format!(
+        r#"{{"code":"not_found","message":"no such account","current":{}}}"#,
+        http::not_hosted_current()
+    );
+    let not_hosted = serde_json::json!({
+        "body": body,
         "headers": {
             "switch-server-time": header(held, http::header::SERVER_TIME).unwrap(),
         },
         "label": labels::sig::HTTP_RESPONSE,
-        "name": OPERATOR_404,
-        "public_key": pubky_switch_core::enc::b64(&keys.operator),
+        "name": NOT_HOSTED,
+        "public_key": pubky_switch_core::enc::b64(&keys.service_key(&alice_id)),
         "request": null,
         "signer": "service key",
         "status": 404,
     });
-    let pointer = format!("/responses/{unknown_at}");
-    let unknown = signed_case(keys, &file, unknown);
+    let pointer = format!("/responses/{not_hosted_at}");
+    let not_hosted = signed_case(keys, &file, not_hosted);
     let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent, and the method as sent; the timestamp is RFC 3339 UTC to the second. Each response names the request case it answers in request (null for an unsigned public read) and gives the request as the service received it in received_request: lp(method, path and query, body field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature)), the body field BLAKE3(body) once the body is read, each H empty when the header is absent and lp of its values when present, every H empty for the public read. Response signatures cover u64(status), BLAKE3 of the received request, the exact Switch-Server-Time text, the head field (empty without Switch-Head, BLAKE3 of its exact text with one) and BLAKE3(body).";
     generated(
         "http.json",
         &[
-            (Place::Element(&pointer), unknown),
+            (Place::Element(&pointer), not_hosted),
             (
                 Place::Member("/description"),
                 Value::String(description.into()),
@@ -380,6 +387,141 @@ fn response_signatures(keys: &Keys) {
     generated("http.json", &cases);
 }
 
+/// The request case `r` as `received` says the service received it (Switch wire 7.1): the
+/// body not read where it says `"body": "not read"`, and the headers it lists, each a
+/// `[name, value]` in the order received, in place of the case's own.
+fn received_as(r: &Value, received: &Value) -> Received {
+    let mut as_received = Received::of_request(r);
+    if received["body"] == "not read" {
+        as_received.body = BodyField::NotRead;
+    }
+    if let Some(headers) = received["headers"].as_array() {
+        as_received.headers = ReceivedHeaders::of(headers.iter().map(|pair| {
+            (
+                pair[0].as_str().unwrap(),
+                pair[1].as_str().unwrap().as_bytes(),
+            )
+        }));
+    }
+    as_received
+}
+
+/// The `[name, value]` pairs of the request case `r`'s headers, in the order the file
+/// writes them, with `extra` after them.
+fn header_pairs(r: &Value, extra: &[(&str, &str)]) -> Value {
+    let mut pairs: Vec<Value> = r["headers"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| serde_json::json!([name, value]))
+        .collect();
+    pairs.extend(
+        extra
+            .iter()
+            .map(|(name, value)| serde_json::json!([name, value])),
+    );
+    Value::Array(pairs)
+}
+
+/// The answers to a request as the service received it otherwise than it was sent, which
+/// `pubky-switch-core` writes (README "How the files were generated") with the fixed keys
+/// of `keys.json` in `received_cases`: a `413` given before the body was read, over the
+/// empty body field; the `400` of a signed header present with an empty value, and of one
+/// sent twice (Switch wire 7.1 "Each header once, as text"); and an answer that carries a
+/// present, empty `Switch-Head`, whose head field is `BLAKE3` of the empty text. Each is
+/// signed with the service key at the second its request was signed, and verifies for the
+/// request as received, never for the request case as sent.
+fn received_cases(keys: &Keys) {
+    let file = load("http.json");
+    let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
+    let request = |name: &str| {
+        arr(&file, "requests")
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no request {name}"))
+            .clone()
+    };
+    let batch = "own app: POST /ops of the batch at seq 7 and 8";
+    let feed = "own app: feed read after 1:4";
+    let feed_request = request(feed);
+    let timestamp = header(&feed_request, http::header::TIMESTAMP)
+        .unwrap()
+        .to_owned();
+    let error = |code: &str, message: &str| format!(r#"{{"code":"{code}","message":"{message}"}}"#);
+    let cases = [
+        (
+            "a 413 too_large given before the body is read, over the empty body field",
+            batch,
+            serde_json::json!({ "body": "not read" }),
+            413,
+            error(
+                "too_large",
+                "7.1: the body is over this call's cap of 4194304 bytes",
+            ),
+            None,
+        ),
+        (
+            "a signed request header present with an empty value, 400 bad_request",
+            feed,
+            serde_json::json!({ "headers": header_pairs(&feed_request, &[(http::header::INVITE_CODE, "")]) }),
+            400,
+            error(
+                "bad_request",
+                "7.1: a signed request header with an empty value",
+            ),
+            None,
+        ),
+        (
+            "a signed request header sent twice, 400 bad_request",
+            feed,
+            serde_json::json!({ "headers": header_pairs(&feed_request, &[(http::header::TIMESTAMP, &timestamp)]) }),
+            400,
+            error(
+                "bad_request",
+                "7.1: a signed request header sent more than once",
+            ),
+            None,
+        ),
+        (
+            "an answer with a present, empty Switch-Head, which no client takes",
+            feed,
+            serde_json::json!({}),
+            503,
+            error("unavailable", "7.6: a temporary failure"),
+            Some(""),
+        ),
+    ];
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(name, answers, received, status, body, head)| {
+            let r = request(answers);
+            let at = header(&r, http::header::TIMESTAMP).unwrap();
+            let server_time = format!("{}.000Z", at.trim_end_matches('Z'));
+            let mut headers = serde_json::json!({ "switch-server-time": server_time });
+            if let Some(head) = head {
+                headers[http::header::HEAD] = Value::String(head.into());
+            }
+            let case = serde_json::json!({
+                "body": body,
+                "headers": headers,
+                "label": labels::sig::HTTP_RESPONSE,
+                "name": name,
+                "public_key": pubky_switch_core::enc::b64(&keys.service_key(&alice_id)),
+                "received": received,
+                "request": answers,
+                "signer": "service key",
+                "status": status,
+            });
+            let as_received = received_as(&r, &case["received"]);
+            signed_for(keys, case, &as_received)
+        })
+        .collect();
+    generated(
+        "http.json",
+        &[(Place::Member("/received_cases"), Value::Array(cases))],
+    );
+}
+
 fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
     assert_eq!(names.len(), fields.len());
     names
@@ -389,48 +531,139 @@ fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
         .collect()
 }
 
-/// The erasures naming the `identity.json` they follow (Switch wire 7.4.16), which
-/// `pubky-switch-core` generates (README "How the files were generated"): one naming the hash
-/// of alice's version 3, the version her account holds, answered `{"erased":true}`, and one
-/// naming her version 1, refused `409 conflict`. Each is signed with her identity key, and
-/// each answer with her account's fixed service key, without a head.
-fn conditional_erasures(keys: &Keys) {
+/// The enrollment, as `http.json`'s request carries it.
+fn vector_enrollment(file: &Value, alice: &[u8; 32]) -> Enrollment {
+    let request = arr(file, "requests")
+        .iter()
+        .find(|r| st(r, "path") == "/v1/enroll")
+        .unwrap();
+    let value: Value = serde_json::from_slice(&b64(st(request, "body_b64"))).unwrap();
+    let signed: SignedDoc = serde_json::from_value(value["enrollment"].clone()).unwrap();
+    Enrollment::verify(&signed, alice, st(request, "origin")).unwrap()
+}
+
+/// The position of the enrollment answer in `http.json`'s responses.
+fn enrollment_answer_at(file: &Value) -> usize {
+    arr(file, "responses")
+        .iter()
+        .position(|c| st(c, "name").starts_with("signer: enrollment answer"))
+        .unwrap()
+}
+
+/// The account's creation time (Switch wire 3.7, 7.3): the time the enrollment that created
+/// it was answered at, which its answer names in `created`.
+fn created_of(file: &Value) -> u64 {
+    let answer = &arr(file, "responses")[enrollment_answer_at(file)];
+    pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
+        .unwrap()
+}
+
+/// The enrollment answer (Switch wire 3.7), which `pubky-switch-core` writes (README "How
+/// the files were generated"): the answer to the enrollment of the file, with its service
+/// key and limits, naming in `created` the time it was answered at, when the account was
+/// created; signed with the service key, under the name that says so.
+fn enrollment_answer(keys: &Keys) {
+    let file = load("http.json");
+    let alice = keys.identity("alice");
+    let enrollment = vector_enrollment(&file, &alice);
+    let at = enrollment_answer_at(&file);
+    let held = arr(&file, "responses")[at].clone();
+    let body: Value = serde_json::from_str(st(&held, "body")).unwrap();
+    let limits: Limits = serde_json::from_value(body["limits"].clone()).unwrap();
+    let alice_id = pubky_switch_core::enc::pubky_id(&alice);
+    let answer = EnrollmentAnswer::new(
+        &enrollment,
+        keys.service_key(&alice_id),
+        limits,
+        created_of(&file),
+    );
+    let mut case = held;
+    case["name"] = Value::String("signer: enrollment answer, signed with the service key".into());
+    case["body"] = Value::String(String::from_utf8(answer.to_json().unwrap()).unwrap());
+    let case = signed_case(keys, &file, case);
+    let pointer = format!("/responses/{at}");
+    generated("http.json", &[(Place::Element(&pointer), case)]);
+}
+
+/// The erasures (Switch wire 7.4.16), which `pubky-switch-core` writes (README "How the files
+/// were generated"), each naming the account's creation time, the `created` of its
+/// enrollment answer: one at alice's account before its first delivery, which holds no
+/// `identity.json`, so it names none; one naming the hash of her version 3, the version her
+/// account holds; both answered `{"erased":true}`; and one naming her version 1, refused `409
+/// conflict` with `current.created`, the creation time it was checked against. Each is
+/// signed with her identity key, and each answer with the service key, without a head, over
+/// the request as the service received it. They take the places of the erasure requests and
+/// answers in the file, in order.
+fn erasures(keys: &Keys) {
     use pubky_switch_core::enc;
+    let file = load("http.json");
     let alice = keys.identity("alice");
     let alice_id = enc::pubky_id(&alice);
     let identity = ed25519_dalek::SigningKey::from_bytes(&keys.identity_secrets[&alice]);
     let service = keys.service_key(&alice_id);
-    let origin = ORIGIN;
+    let created = created_of(&file);
     let timestamp = "2026-01-01T00:07:00Z";
     let server_time = "2026-01-01T00:07:00.030Z";
-    let refused: &[u8] =
-        br#"{"code":"conflict","message":"7.4.16: the account holds another identity.json"}"#;
+    let refused = format!(
+        r#"{{"code":"conflict","message":"7.4.16: the account holds another identity.json","current":{{"created":"{}"}}}}"#,
+        pubky_switch_core::time::rfc3339(created)
+    );
     let cases = [
         (
-            "signer: account erasure, naming the account's service key and the identity.json it follows",
-            "alice identity.json",
+            "signer: account erasure, naming the account's creation time",
+            None,
             200,
             http::ERASED_BODY,
-            "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+            "signer: account erasure answer, signed with the service key, no head",
+        ),
+        (
+            "signer: account erasure, naming the account's creation time and the identity.json it follows",
+            Some("alice identity.json"),
+            200,
+            http::ERASED_BODY,
+            "signer: account erasure answer to the request naming its identity.json, signed with the service key, no head",
         ),
         (
             "signer: account erasure naming an identity.json the account doesn't hold",
-            "alice identity.json, first delivery (version 1)",
+            Some("alice identity.json, first delivery (version 1)"),
             409,
-            refused,
-            "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+            refused.as_bytes(),
+            "signer: account erasure refused, the account holds another identity.json, 409 conflict with current.created, no head",
         ),
     ];
+    let erasure = |c: &Value| st(c, "path").ends_with("/erase");
+    let requests_at: Vec<usize> = (0..arr(&file, "requests").len())
+        .filter(|i| erasure(&arr(&file, "requests")[*i]))
+        .collect();
+    let responses_at: Vec<usize> = (0..arr(&file, "responses").len())
+        .filter(|i| {
+            let case = &arr(&file, "responses")[*i];
+            st(case, "name").starts_with("signer: account erasure")
+        })
+        .collect();
+    assert_eq!((requests_at.len(), responses_at.len()), (3, 3));
+    let pointers: Vec<(String, String)> = requests_at
+        .iter()
+        .zip(&responses_at)
+        .map(|(request, response)| {
+            (
+                format!("/requests/{request}"),
+                format!("/responses/{response}"),
+            )
+        })
+        .collect();
     let mut generated_cases = Vec::new();
-    for (name, document_name, status, answer, answer_name) in cases {
-        let hash = document(document_name).doc_hash().unwrap();
-        let body = http::erase_body(&service, Some(&hash));
+    for ((name, document_name, status, answer, answer_name), (request_at, response_at)) in
+        cases.into_iter().zip(&pointers)
+    {
+        let hash = document_name.map(|name| document(name).doc_hash().unwrap());
+        let body = http::erase_body(Some(created), hash.as_ref());
         let path = format!("/v1/{alice_id}/erase");
         let target = RequestTarget {
             method: "POST",
             path_and_query: &path,
             body: &body,
-            origin,
+            origin: ORIGIN,
         };
         let headers = RequestHeaders {
             timestamp: timestamp.to_owned(),
@@ -439,7 +672,7 @@ fn conditional_erasures(keys: &Keys) {
         };
         let request = request_case(name, &identity, &target, &headers);
         let received = Received::of_request(&request);
-        generated_cases.push((Place::Case("/requests"), request));
+        generated_cases.push((Place::Element(request_at), request));
         let answer = serde_json::json!({
             "body": std::str::from_utf8(answer).unwrap(),
             "headers": { "switch-server-time": server_time },
@@ -451,7 +684,7 @@ fn conditional_erasures(keys: &Keys) {
             "status": status,
         });
         generated_cases.push((
-            Place::Case("/responses"),
+            Place::Element(response_at),
             signed_for(keys, answer, &received),
         ));
     }
@@ -566,10 +799,71 @@ fn feed_page_cursors(keys: &Keys) {
 fn test_vectors_http() {
     let keys = keys();
     answered_requests(&keys);
-    conditional_erasures(&keys);
+    enrollment_answer(&keys);
+    erasures(&keys);
     feed_page_cursors(&keys);
     response_signatures(&keys);
+    received_cases(&keys);
     let v = load("http.json");
+    // The answers to a request received otherwise than sent: each verifies for the request
+    // as received, never for the request case as sent (Switch wire 7.1).
+    let received = arr(&v, "received_cases");
+    assert_eq!(received.len(), 4);
+    for r in received {
+        let name = st(r, "name");
+        let sent = arr(&v, "requests")
+            .iter()
+            .find(|q| q["name"] == r["request"])
+            .unwrap();
+        let as_received = received_as(sent, &r["received"]);
+        let bytes = http::received_request(&as_received.request());
+        assert_eq!(
+            hex::encode(&bytes),
+            st(&r["received_request"], "bytes_hex"),
+            "{name}"
+        );
+        assert_eq!(
+            pubky_switch_core::enc::split_lp(&bytes).unwrap(),
+            fields_of(&r["received_request"]),
+            "{name}"
+        );
+        let signature =
+            http::decode_signature(header(r, http::header::SERVICE_SIGNATURE).unwrap()).unwrap();
+        let public = b64n::<32>(st(r, "public_key"));
+        let parts = parts_of(r, &as_received);
+        assert_eq!(http::response_fields(&parts), fields_of(r), "{name}");
+        http::verify_response(&public, &parts, &signature)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let honest = Received::of_request(sent);
+        let as_sent = parts_of(r, &honest);
+        let differs = bytes != http::received_request(&honest.request());
+        assert_eq!(
+            http::verify_response(&public, &as_sent, &signature).is_ok(),
+            !differs,
+            "{name}"
+        );
+    }
+    // The fields an independent implementation most often gets wrong: the empty body field,
+    // a header present with an empty value, a header sent twice, a present empty head.
+    let fields = |at: usize| fields_of(&received[at]["received_request"]);
+    assert!(fields(0)[2].is_empty(), "the empty body field");
+    assert_eq!(
+        fields(1)[7],
+        vec![0, 0, 0, 0],
+        "an empty Switch-Invite-Code"
+    );
+    assert_eq!(
+        pubky_switch_core::enc::split_lp(&fields(2)[9])
+            .unwrap()
+            .len(),
+        2,
+        "Switch-Timestamp twice"
+    );
+    assert_eq!(
+        fields_of(&received[3])[3],
+        pubky_switch_core::enc::hash(b"").to_vec(),
+        "the head field of an empty head"
+    );
     let mut transfer_requests = 0;
     for r in arr(&v, "requests") {
         let name = st(r, "name");
@@ -664,7 +958,7 @@ fn test_vectors_http() {
 
     // What the bodies carry, read through the records' API.
     let alice = keys.identity("alice");
-    let alice_id = pubky_switch_core::enc::pubky_id(&alice);
+    let created = created_of(&v);
     let mut enrollment = None;
     for r in arr(&v, "requests") {
         let name = st(r, "name");
@@ -709,11 +1003,13 @@ fn test_vectors_http() {
                     .is_err()
             );
         } else if call.ends_with("/erase") {
+            // Each names the account's creation time, the one its enrollment answer gives
+            // (Switch wire 7.4.16, 3.7).
             let parsed = http::parse_erase_body(&body).unwrap();
-            assert_eq!(parsed.service_key, keys.service_key(&alice_id), "{name}");
-            // The body as written, the hash, when named, after the key.
+            assert_eq!(parsed.created, Some(created), "{name}");
+            // The body as written, the hash, when named, after the time.
             assert_eq!(
-                http::erase_body(&parsed.service_key, parsed.identity_hash.as_ref()),
+                http::erase_body(parsed.created, parsed.identity_hash.as_ref()),
                 body,
                 "{name}"
             );
@@ -847,17 +1143,7 @@ fn test_vectors_http() {
                 "{name}"
             );
         }
-        // Signed by the account's service key, except the answer to a request the service
-        // can't tie to an account, which the operator key signs, no account's key.
-        if r["request"].is_null() && status == 404 {
-            assert_eq!(name, OPERATOR_404);
-            assert_eq!(public, keys.operator, "{name}: the operator key");
-            assert!(
-                !keys.service.values().any(|k| *k == public),
-                "{name}: no account's key"
-            );
-            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
-        }
+        // Signed by the service key, for an account it hosts and for one it doesn't.
         assert!(
             reproduce(
                 &keys,
@@ -868,6 +1154,11 @@ fn test_vectors_http() {
             ),
             "{name}: no fixed key for the service"
         );
+        if name == NOT_HOSTED {
+            let parsed: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(parsed["current"], http::not_hosted_current(), "{name}");
+            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
+        }
         if name.starts_with("signer: enrollment answer") {
             let answer = EnrollmentAnswer::from_json(body).unwrap();
             answer
@@ -877,6 +1168,18 @@ fn test_vectors_http() {
                 answer.to_json().unwrap(),
                 body,
                 "{name}: the answer as written"
+            );
+            // The account's creation time, the time it was answered at (Switch wire 3.7).
+            assert_eq!(answer.created, created, "{name}");
+        }
+        if name.starts_with("signer: account erasure refused") {
+            // Every `409` to an erasure carries the creation time it was checked against
+            // (Switch wire 7.4.16).
+            let parsed: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(
+                parsed["current"]["created"],
+                pubky_switch_core::time::rfc3339(created),
+                "{name}"
             );
         }
         if name.starts_with("own app: the hand-over the switch stores") {

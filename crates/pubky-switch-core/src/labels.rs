@@ -52,7 +52,7 @@ pub mod sig {
     pub const MSG: &str = "pubky-switch/v1/msg";
     /// Request to the switch, signed by an app or the identity key (Switch wire 7.1).
     pub const HTTP: &str = "pubky-switch/v1/http";
-    /// Response from the switch, signed by the service or operator key (Switch wire 7.1).
+    /// Response from the switch, signed with the service key (Switch wire 7.1).
     pub const HTTP_RESPONSE: &str = "pubky-switch/v1/http-response";
     /// Operation, signed by its writer (Switch wire 6.1).
     pub const OP: &str = "pubky-switch/v1/op";

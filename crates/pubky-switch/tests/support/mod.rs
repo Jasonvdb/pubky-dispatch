@@ -10,8 +10,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use pubky_switch::{
     http::Handler,
     http::{SwitchRequest, SwitchResponse, route::route},
-    keys::{FileKeyStore, FixedKeys},
+    keys::{FileKeyStore, KeyStore},
     limits::Limits,
+    marks::MarkStore,
     service::Service,
     store::{
         DatabaseConfig,
@@ -27,9 +28,6 @@ use pubky_switch_core::{
     time::{parse_rfc3339, rfc3339_seconds},
 };
 use serde_json::Value;
-
-/// The seed label of the vectors' operator key.
-const OPERATOR_SEED_LABEL: &str = "service/operator";
 
 pub const ORIGIN: &str = "https://inbox.example";
 
@@ -59,12 +57,18 @@ pub struct Replay {
     pub db: TestDatabase,
     pub clock: Arc<ManualClock>,
     pub service: Service,
-    pub keys: Arc<FixedKeys>,
+    pub keys: Arc<FileKeyStore>,
+    pub marks: MarkStore,
     pub time: Arc<TrustedTime>,
     _key_dir: tempfile::TempDir,
 }
 
 impl Replay {
+    /// The key store's directory, where the service key, the ledger and the marks lie.
+    pub fn key_dir(&self) -> &std::path::Path {
+        self._key_dir.path()
+    }
+
     /// Another service on the same database, keys and clock, with `limits`, as after the
     /// operator changes its configuration.
     pub fn restarted_with(&self, limits: Limits) -> Service {
@@ -72,6 +76,7 @@ impl Replay {
             ORIGIN.into(),
             self.db.store().clone(),
             self.keys.clone(),
+            self.marks.clone(),
             self.time.clone(),
             limits,
         )
@@ -89,6 +94,7 @@ impl Replay {
             ORIGIN.into(),
             self.db.store().clone(),
             self.keys.clone(),
+            self.marks.clone(),
             Arc::new(TrustedTime::new(
                 TrustedTimeConfig::default(),
                 self.clock.clone(),
@@ -116,7 +122,7 @@ pub async fn replay_with_time(limits: Limits, time_required: bool) -> Option<Rep
 /// bob's switch origin in the vectors.
 pub const BOB_ORIGIN: &str = "https://inbox.bob.example";
 
-/// A service at `origin` whose new accounts take the vectors' service key of
+/// A service at `origin` whose service key is the vectors' service key of
 /// `service_label`, on a fresh test database.
 pub async fn replay_at(
     origin: &str,
@@ -156,16 +162,12 @@ fn replay_on(
         .iter()
         .find(|key| key["seed_label"] == service_label)
         .expect("the service key");
-    // The vectors' operator key: the seed of label `service/operator`, by the seed rule of
-    // `spec/vectors/README.md`.
-    let operator = seed(OPERATOR_SEED_LABEL);
     let key_dir = tempfile::tempdir().expect("key dir");
-    let store = FileKeyStore::open(key_dir.path()).expect("key store");
-    let keys = Arc::new(FixedKeys::new(
-        store,
-        vec![hex32(&service["secret_hex"])],
-        Some(operator),
-    ));
+    let keys = Arc::new(
+        FileKeyStore::open_with_service_seed(key_dir.path(), hex32(&service["secret_hex"]))
+            .expect("key store"),
+    );
+    let marks = MarkStore::open(key_dir.path()).expect("mark store");
     let clock = Arc::new(ManualClock::new(0));
     let time = Arc::new(TrustedTime::new(
         TrustedTimeConfig {
@@ -178,6 +180,7 @@ fn replay_on(
         origin.into(),
         db.store().clone(),
         keys.clone(),
+        marks.clone(),
         time.clone(),
         limits,
     );
@@ -186,15 +189,16 @@ fn replay_on(
         clock,
         service,
         keys,
+        marks,
         time,
         _key_dir: key_dir,
     }
 }
 
 /// bob's account at a switch made by `replay_at(BOB_ORIGIN, "service/bob", ..)`, serving,
-/// with his `identity.json` version 1 (`documents.json` "bob identity.json"): his Pubky ID.
+/// with his `identity.json` version 1 (`documents.json` "bob identity.json") and his mark at
+/// (0, 0): his Pubky ID.
 pub async fn serve_bob(replay: &Replay) -> String {
-    use pubky_switch::keys::KeyStore;
     let keys = vectors("keys.json");
     let bob = keys["identities"]
         .as_array()
@@ -203,7 +207,6 @@ pub async fn serve_bob(replay: &Replay) -> String {
         .find(|identity| identity["name"] == "bob")
         .expect("bob");
     let id = bob["pubky_id"].as_str().expect("id").to_string();
-    let key = replay.keys.generate().await.expect("key");
     let doc: pubky_switch_core::sig::SignedDoc = serde_json::from_value(
         named(&vectors("documents.json")["documents"], "bob identity.json")["signed"].clone(),
     )
@@ -215,7 +218,6 @@ pub async fn serve_bob(replay: &Replay) -> String {
             id: id.clone(),
             identity_key: hex32(&bob["public_hex"]),
             generation: 1,
-            service_key: key.id,
             created_at_ms: 0,
             limits: pubky_switch_core::records::Limits::default(),
             identity_doc: Some(doc),
@@ -224,6 +226,11 @@ pub async fn serve_bob(replay: &Replay) -> String {
         })
         .await
         .expect("bob's account");
+    replay
+        .marks
+        .create_zero(&id, service_public(replay), 0)
+        .await
+        .expect("bob's mark");
     id
 }
 
@@ -389,9 +396,32 @@ impl Sent {
         }
     }
 
+    /// A request with no header and an empty body, read whole, at a path no route takes.
+    pub fn unrouted(method: &str, path_and_query: &str) -> Self {
+        Sent {
+            method: method.to_owned(),
+            path_and_query: path_and_query.to_owned(),
+            body: wire_http::BodyField::read(b""),
+            origin: ORIGIN.to_owned(),
+            headers: wire_http::ReceivedHeaders::default(),
+        }
+    }
+
     /// The same request with its body not read, as a refusal before the body binds it.
     pub fn unread(mut self) -> Self {
         self.body = wire_http::BodyField::NotRead;
+        self
+    }
+
+    /// The same request at `path_and_query`.
+    pub fn at_path(mut self, path_and_query: String) -> Self {
+        self.path_and_query = path_and_query;
+        self
+    }
+
+    /// The same request with `method`.
+    pub fn with_method(mut self, method: &str) -> Self {
+        self.method = method.to_owned();
         self
     }
 
@@ -578,7 +608,7 @@ pub async fn serve_alice(replay: &Replay) {
     let alice_id = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
     let enrolled = named(
         &http["responses"],
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     set_time(
         &replay.clock,
@@ -767,12 +797,19 @@ pub async fn replay_chain_through_revoke(replay: &Replay) {
     assert_eq!(answer.status, 200, "revoked");
 }
 
-/// The public key of the vectors' operator key, which signs answers the service can't tie
-/// to an account.
-pub fn operator_public() -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(&seed(OPERATOR_SEED_LABEL))
-        .verifying_key()
-        .to_bytes()
+/// The public key of `replay`'s service key, which signs every answer (Switch wire 7.1).
+pub fn service_public(replay: &Replay) -> [u8; 32] {
+    use pubky_switch_core::signing::Signs;
+    replay.keys.current().public_key()
+}
+
+/// The creation time of the mark `replay` holds for `id`, which a test's own move of the
+/// mark names (`MarkStore::advance`).
+pub async fn mark_created_at(replay: &Replay, id: &str) -> u64 {
+    match replay.marks.read(id).await.expect("read the mark") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.created_at_ms,
+        other => panic!("no mark to move: {other:?}"),
+    }
 }
 
 /// Wake requests waiting on an account's changes, as the service's listener does, until
@@ -1195,4 +1232,42 @@ pub async fn sql_on(replay: &Replay, account: &str, sql: &str) -> u64 {
         .rows_affected();
     conn.close().await.expect("close");
     changed
+}
+
+// --- An account's creation time (Switch wire 3.7, 7.4.16) ---
+
+/// The creation time of `account` that its enrollment answer names and an erasure names
+/// again (Switch wire 3.7, 7.4.16): the mark's, as its file is now, or the account's own
+/// where the mark is lost; `None` where there is neither.
+pub async fn creation_time(replay: &Replay, account: &str) -> Option<u64> {
+    let marked = pubky_switch::marks::MarkView::open(replay.key_dir())
+        .ok()
+        .and_then(|view| view.read(account).ok());
+    if let Some(pubky_switch::marks::MarkRead::Mark(mark)) = marked {
+        return Some(mark.created_at_ms);
+    }
+    replay
+        .db
+        .store()
+        .lookup(account)
+        .await
+        .expect("lookup")
+        .map(|found| found.created_at_ms)
+}
+
+/// The signer's erasure of `account` signed at `at_ms`, naming the account's creation time
+/// as [`creation_time`] gives it and `identity_hash` (Switch wire 7.4.16).
+pub async fn erasure_of(
+    replay: &Replay,
+    account: &str,
+    identity_hash: Option<&[u8; 32]>,
+    at_ms: u64,
+) -> SwitchRequest {
+    let created = creation_time(replay, account).await;
+    signer_request(
+        "POST",
+        &format!("/v1/{account}/erase"),
+        wire_http::erase_body(created, identity_hash),
+        at_ms,
+    )
 }

@@ -277,7 +277,7 @@ async fn test_unpinned_client_sends_nothing() {
 #[tokio::test]
 async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
     let enrollment = enrollment([4; 16]);
-    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
     let body = answer.to_json().unwrap();
     let key = service_key();
     let transport = Arc::new(MockTransport::with_handler(move |request| {
@@ -291,12 +291,14 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
     assert_eq!(sent.path_and_query, "/v1/enroll");
     assert!(sent.header(header::APP).is_none());
 
-    // A client that holds a key keeps it: the answer may name a pending key.
+    // A client that holds a key keeps it: after a service key change the answer names the
+    // new key, pinned only once the delivery naming it is accepted.
     let pending = SigningKey::from_bytes(&[6; 32]);
     let answer = EnrollmentAnswer::new(
         &enrollment,
         pending.verifying_key().to_bytes(),
         Limits::default(),
+        0,
     );
     let body = answer.to_json().unwrap();
     let transport = Arc::new(MockTransport::with_handler(move |request| {
@@ -310,7 +312,7 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
 #[tokio::test]
 async fn test_enrollment_answer_signed_by_another_key_is_refused() {
     let enrollment = enrollment([4; 16]);
-    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
     let other = SigningKey::from_bytes(&[6; 32]);
     let body = answer.to_json().unwrap();
     let forged = Arc::new(MockTransport::with_handler(move |request| {
@@ -322,7 +324,8 @@ async fn test_enrollment_answer_signed_by_another_key_is_refused() {
         ClientError::BadServiceSignature { status: 200 }
     );
     assert_eq!(client.pinned_key(), None);
-    // An operator-signed error before the account exists is unauthenticated.
+    // An error to an enrollment, before the client has pinned a key, is unauthenticated:
+    // only the enrollment answer names the key to pin.
     let client = client_with(
         signer(),
         None,
@@ -358,7 +361,7 @@ async fn test_enrollment_unreadable_signed_header_fails_authentication() {
 async fn test_enrollment_answer_for_another_enrollment_is_refused() {
     let sent = enrollment([4; 16]);
     let other = enrollment([5; 16]);
-    let answer = EnrollmentAnswer::new(&other, service_public(), Limits::default());
+    let answer = EnrollmentAnswer::new(&other, service_public(), Limits::default(), 0);
     let transport = fixed(
         service_key(),
         200,
@@ -886,11 +889,31 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     let cert = request.request.header(header::CERT).unwrap();
     assert_eq!(cert, cert_of(&identity(), &app_keys()).signed().compact());
     assert_eq!(request.request.header(header::INVITE_CODE), Some(code));
-    // An invite code that isn't a token isn't sent.
-    assert!(matches!(
-        foreign.sign_request("GET", "/v1/x/directory", Vec::new(), Some("a b")),
-        Err(ClientError::Usage(_))
-    ));
+    // An invite code that isn't a token isn't sent, an empty one included, which the service
+    // would refuse at routing (Switch wire 7.1 "Each header once, as text").
+    for code in ["a b", ""] {
+        assert!(
+            matches!(
+                foreign.sign_request("GET", "/v1/x/directory", Vec::new(), Some(code)),
+                Err(ClientError::Usage(_))
+            ),
+            "{code:?}"
+        );
+    }
+    // Every request it builds keeps the header rule the service checks at routing.
+    for (client, code) in [(&own, None), (&foreign, Some(code))] {
+        let request = client
+            .sign_request("POST", "/v1/x/ops", b"{}".to_vec(), code)
+            .unwrap()
+            .request;
+        let received = http::ReceivedHeaders::of(
+            request
+                .headers
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_bytes())),
+        );
+        assert_eq!(received.broken_rule(), None);
+    }
     // Operations are written only at the caller's own account.
     assert!(foreign.sign_batch(1, two_lists(), None).is_err());
 }
@@ -941,7 +964,8 @@ fn test_signer_requests_credential_signs_a_request_that_verifies() {
     let signed = requests
         .sign_request("GET", "/v1/x/apps", Vec::new(), None)
         .unwrap();
-    let signature = signed.signature.unwrap();
+    let signature =
+        http::decode_signature(signed.request.header(header::SIGNATURE).unwrap()).unwrap();
     let target = http::RequestTarget {
         method: "GET",
         path_and_query: "/v1/x/apps",
@@ -1110,7 +1134,7 @@ fn delivery_switch(key: SigningKey) -> Arc<MockTransport> {
 }
 
 #[tokio::test]
-async fn test_put_identity_starting_a_generation_pins_the_pending_key() {
+async fn test_put_identity_starting_a_generation_pins_the_named_service_key() {
     let pending = SigningKey::from_bytes(&[6; 32]);
     let pending_public = pending.verifying_key().to_bytes();
     let transport = delivery_switch(pending);
@@ -1140,7 +1164,7 @@ async fn test_put_identity_starting_a_generation_keeps_the_pin_on_errors() {
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Conflict));
     assert_eq!(client.pinned_key(), Some(service_public()));
-    // A refusal signed with the pending key doesn't verify.
+    // A refusal signed with the new key doesn't verify: it is checked with the pinned one.
     let refusal = fixed(
         pending.clone(),
         409,
@@ -1238,20 +1262,21 @@ async fn test_public_read_sends_no_switch_header() {
 }
 
 #[tokio::test]
-async fn test_operator_signed_404_reads_as_unauthenticated() {
-    // A key no client knows signs answers for accounts the service doesn't host.
-    let operator = SigningKey::from_bytes(&[42; 32]);
+async fn test_client_404_signed_with_an_unpinned_key_reads_as_unauthenticated() {
+    // A `404` signed with a key the client doesn't pin, an intermediary's or another
+    // switch's, is no answer of its switch.
+    let other = SigningKey::from_bytes(&[42; 32]);
     let client = client_with(
         signer(),
         Some(service_public()),
         fixed(
-            operator,
+            other,
             404,
             json!({ "code": "not_found", "message": "no such account" }),
         ),
     );
     assert_eq!(
-        client.erase(None).await.unwrap_err(),
+        client.erase(None, None).await.unwrap_err(),
         ClientError::BadServiceSignature { status: 404 }
     );
 }
@@ -1262,7 +1287,7 @@ async fn test_signer_and_app_calls_refuse_the_other_caller() {
     let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
     assert!(matches!(client.apps().await, Err(ClientError::Usage(_))));
     assert!(matches!(
-        client.erase(None).await,
+        client.erase(None, None).await,
         Err(ClientError::Usage(_))
     ));
     let client = client_with(signer(), Some(service_public()), Arc::clone(&transport));
@@ -1337,6 +1362,134 @@ async fn test_write_answer_proof_must_be_the_transition_written() {
         client.leave().await.unwrap_err(),
         ClientError::Chain(_)
     ));
+}
+
+#[tokio::test]
+async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
+    // Every answer checked with the pinned key counts in the comparison of service times,
+    // refusals without the head included, but the notice, every `503 unavailable`, the
+    // not-hosted `404`, an answer that verifies only with the empty body field, and every
+    // answer to the enrollment, the erasure and the public read (Switch wire 7.1 Timestamp,
+    // spec 10.1).
+    let error = |code: &str, current: Value| {
+        let mut body = json!({ "code": code, "message": "m" });
+        if !current.is_null() {
+            body["current"] = current;
+        }
+        body
+    };
+    let notice = json!({ "generation": 1, "reason": "behind", "permanent": false });
+    for (status, body, compared) in [
+        (
+            200,
+            json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                      "invite_codes": [] }),
+            true,
+        ),
+        (401, error("bad_signature", Value::Null), true),
+        (
+            401,
+            error("stale_timestamp", json!({ "server_time": rfc3339(NOW) })),
+            true,
+        ),
+        (403, error("not_current", Value::Null), true),
+        (429, error("rate_limited", Value::Null), true),
+        (503, error("staged", Value::Null), true),
+        (409, error("conflict", Value::Null), true),
+        (503, error("unavailable", Value::Null), false),
+        (404, error("not_found", Value::Null), true),
+        (404, error("not_found", json!({ "hosted": true })), true),
+        (404, error("not_found", http::not_hosted_current()), false),
+        (503, error("recovery_required", notice.clone()), false),
+    ] {
+        let client = client_with(
+            app(),
+            Some(service_public()),
+            fixed(service_key(), status, body.clone()),
+        );
+        let _ = client.allow().await;
+        assert_eq!(
+            client.latest_compared_time(),
+            compared.then_some(NOW),
+            "{status} {body}"
+        );
+    }
+    // Given before the body was read: a `413`, which verifies only with the empty body field.
+    let key = service_key();
+    let unread = Arc::new(MockTransport::with_handler(move |request| {
+        let body = error("too_large", Value::Null).to_string().into_bytes();
+        let server_time = rfc3339(NOW);
+        let signature = sign_response(
+            &key,
+            &http::ResponseParts {
+                status: 413,
+                request: SentRequest::of(request).received(false),
+                server_time: &server_time,
+                head: None,
+                body: &body,
+            },
+        );
+        Ok(Response {
+            status: 413,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, &server_time),
+            ],
+            body,
+        })
+    }));
+    let client = client_with(app(), Some(service_public()), unread);
+    assert!(matches!(
+        client.allow().await,
+        Err(ClientError::BodyUnread { status: 413, .. })
+    ));
+    assert_eq!(client.latest_compared_time(), None);
+    // Every answer to the public read, which binds no request, a success included; the
+    // same answer to a signed read counts.
+    let client = client_with(
+        app(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.public_identity().await;
+    assert_eq!(client.latest_compared_time(), None, "public read");
+    // Every answer to the erasure, a refusal and a success.
+    for (status, body) in [
+        (429, error("rate_limited", Value::Null)),
+        (409, error("conflict", json!({ "created": rfc3339(NOW) }))),
+        (200, json!({ "erased": true })),
+    ] {
+        let client = client_with(
+            signer(),
+            Some(service_public()),
+            fixed(service_key(), status, body.clone()),
+        );
+        let _ = client.erase(None, None).await;
+        assert_eq!(
+            client.latest_compared_time(),
+            None,
+            "erasure {status} {body}"
+        );
+    }
+    // The same refusal to a signed read counts.
+    let client = client_with(
+        signer(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.apps().await;
+    assert_eq!(client.latest_compared_time(), Some(NOW), "a signed read");
+    // An enrollment's answer: the latest call's times are forgotten, not kept from an
+    // earlier one.
+    let client = client_with(
+        signer(),
+        Some(service_public()),
+        fixed(service_key(), 429, error("rate_limited", Value::Null)),
+    );
+    let _ = client.apps().await;
+    assert_eq!(client.latest_compared_time(), Some(NOW));
+    let _ = client.enroll(&enrollment([1; 16])).await;
+    assert_eq!(client.latest_compared_time(), None, "enrollment");
 }
 
 #[tokio::test]
@@ -1697,10 +1850,7 @@ fn sign_raw_request(mut request: Request) -> SignedRequest {
         Header::new(header::TIMESTAMP, &headers.timestamp),
         Header::new(header::SIGNATURE, &b64(&signature)),
     ];
-    SignedRequest {
-        request,
-        signature: Some(signature),
-    }
+    SignedRequest { request }
 }
 
 #[tokio::test]

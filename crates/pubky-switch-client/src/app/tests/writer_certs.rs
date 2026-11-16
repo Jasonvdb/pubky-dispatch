@@ -247,7 +247,7 @@ async fn test_writer_cert_left_out_entries_are_in_the_recovery_report() {
         2,
         Some(1),
     );
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     let mut app = App::load(
         router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
         w.protocol.clone(),

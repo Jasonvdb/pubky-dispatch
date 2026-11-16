@@ -37,7 +37,10 @@ use crate::error::TransportError;
 use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Transport};
 
 mod batch;
+mod erasure;
 mod inbox;
+mod marks;
+pub use erasure::ErasureOutcome;
 mod retention;
 mod shared;
 mod signer;
@@ -263,8 +266,8 @@ pub enum Fault {
     },
     /// Apply an own app's or the signer's request, then sign the answer with the key
     /// `secret` makes instead of the account's, with no head, as a hostile or faulty
-    /// service would. An enrollment, a staged or erased account's refusal and a `401
-    /// stale_timestamp` are answered as without it, and use it up.
+    /// service would. An enrollment, a staged account's refusal, the answers of Switch wire
+    /// 7.3 step 2 and a `401 stale_timestamp` are answered as without it, and use it up.
     SignWith {
         /// A part of the request's path and query.
         path: String,
@@ -317,6 +320,7 @@ pub(crate) struct Inner {
     /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
     pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
+    next_erasure_outcome: Option<ErasureOutcome>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
     /// The signed freeze while the account is frozen (Switch spec 12.5).
@@ -325,14 +329,12 @@ pub(crate) struct Inner {
     pub(crate) freeze_in_feed: bool,
     /// A staged account: everything but uploads answers `503 staged`.
     pub(crate) staged: bool,
-    /// An erased account: every answer is the operator's `404`.
-    pub(crate) erased: bool,
     /// The generation a recovery started from, at a recovering account.
     pub(crate) recovery_from: Option<u64>,
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
     /// A staged account holding a cooperative move's import, not a key change in place: it
-    /// refuses an erasure until the move is aborted (Switch wire 7.4.16).
+    /// refuses an erasure while the move can be aborted (Switch wire 7.3, 7.4.16).
     pub(crate) holds_import: bool,
     /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
     pub(crate) recovery_declared_at: Option<u64>,
@@ -425,12 +427,20 @@ pub(crate) struct Inner {
     pub(crate) stamped_ms: u64,
     /// The stored signer hand-over (Switch wire 7.4.17): its target and the `PUT` body.
     pub(crate) handover: Option<([u8; 16], Value)>,
-    /// The pending key a serving account's enrollments were answered with, for the next
-    /// generation, and the App IDs those enrollments named (Switch wire 3.7).
-    pub(crate) pending: Option<(SigningKey, Vec<[u8; 16]>)>,
-    /// The key the answer being built is signed with, when it isn't the account's: an
-    /// enrollment answered with the pending key (Switch wire 7.4.1).
-    pub(crate) answer_key: Option<SigningKey>,
+    /// The App IDs that enrollments answered at a serving account since its generation
+    /// began named: they join the App IDs to refuse at the next generation's start (Switch
+    /// wire 3.7).
+    pub(crate) held_app_ids: Vec<[u8; 16]>,
+    /// While set, the switch answers every request with the `404` of an identity it doesn't
+    /// host signed with another key than its own, keeping the account and its mark: the
+    /// `404` an app can't check, an intermediary's or the service's under a key it changed
+    /// to (Switch wire 7.4.16, spec 12.5), for tests of an erasure the app can't confirm.
+    pub(crate) not_hosted_unpinned: bool,
+    /// The identity's mark, its retirements and its erasure's record, apart from the
+    /// account's state (Switch wire 7.3, "Accounts and marks").
+    pub(crate) marks: marks::MarkStore,
+    /// When the account was created.
+    pub(crate) created_at_ms: u64,
 }
 
 impl Inner {
@@ -459,11 +469,11 @@ impl Inner {
             dropped_through: 0,
             retention: Some(Retention::default()),
             faults: VecDeque::new(),
+            next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
             freeze_in_feed: true,
             staged: false,
-            erased: false,
             recovery_from: None,
             continued_from: None,
             holds_import: false,
@@ -503,8 +513,10 @@ impl Inner {
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
             handover: None,
-            pending: None,
-            answer_key: None,
+            held_app_ids: Vec::new(),
+            not_hosted_unpinned: false,
+            marks: marks::MarkStore::default(),
+            created_at_ms: stamped_ms,
         }
     }
 }
@@ -534,34 +546,52 @@ impl Transport for Holding {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let Some(held) = self.0.waiting_read(&request) else {
-                return self.0.handle(&request);
+                // A request answered while reads are held lets the reads it woke answer
+                // first, as the service's woken reads go out while the request's own answer
+                // is still on its way (Switch wire 7.4.4).
+                let woke = self.0.held_reads() > 0;
+                let answer = self.0.handle(&request);
+                if woke {
+                    YieldOnce(false).await;
+                }
+                return answer;
             };
-            let key = held.key;
             held.await;
-            // A read held while the account's service key changed, as at a recovery in
-            // place, is answered `503 unavailable` with the operator key and no head: the
-            // key it was read under signs nothing more (Switch wire 7.4.4).
-            if let Some(answer) = self.0.key_changed_since(key, &request) {
-                return Ok(answer);
-            }
             // Answered as the account stands now: a reader revoked or departed while its
-            // read was held is refused, and an account erased meanwhile is one the switch
-            // doesn't host, as at the service (Switch wire 7.4.4, 7.4.16).
+            // read was held is refused, an account erased meanwhile is one the switch
+            // doesn't host, and one whose generation changed in place answers at the new
+            // generation, as at the service (Switch wire 7.4.4, 7.4.16).
             self.0.answer(&request, true)
         })
     }
 }
 
+/// Pending once, waking itself, then ready: lets the tasks already woken run first.
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
 /// A feed read the switch holds, admitted when it arrived: ready once the feed has
-/// something to show its app, its wait has passed, the account is gone, or its service key
-/// changed. A departure of its app shows it the departure's chain item, so it is ready then
+/// something to show its app, its wait has passed, the account is gone, or its generation
+/// changed in place. A departure of its app shows it the departure's chain item, so it is ready then
 /// too. The switch's lock is held only while it looks, never across the wait.
 struct Held<'a> {
     switch: &'a ScriptedSwitch,
     /// Its number among the reads the switch held.
     id: u64,
-    /// The account's service key when the read arrived.
-    key: [u8; 32],
+    /// The account's generation when the read arrived.
+    generation: u64,
     app: [u8; 16],
     /// The certificate the app was current with when the read arrived.
     cert: AppCert,
@@ -575,9 +605,8 @@ impl Future for Held<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.switch.lock();
         if inner.now() >= self.until_ms
-            || inner.erased
-            || inner.enrolled.is_none()
-            || inner.service.verifying_key().to_bytes() != self.key
+            || !inner.hosts()
+            || inner.tip.generation != self.generation
             || inner.shows_after(self.app, &self.cert, self.after)
         {
             return Poll::Ready(());
@@ -754,13 +783,16 @@ impl ScriptedSwitch {
             seq: 0,
             chain_hash: ZERO_HASH,
         };
+        let mut inner = Inner::fresh(
+            clone_key(identity),
+            SigningKey::from_bytes(&service_secret),
+            clock,
+            tip,
+        );
+        // An account serving at its state, its mark there (Switch wire 7.3).
+        inner.mark_at_state();
         Arc::new(Self {
-            inner: Mutex::new(Inner::fresh(
-                clone_key(identity),
-                SigningKey::from_bytes(&service_secret),
-                clock,
-                tip,
-            )),
+            inner: Mutex::new(inner),
         })
     }
 
@@ -873,6 +905,9 @@ impl ScriptedSwitch {
                 .and_then(|signed| Freeze::verify(signed, &inner.identity.public()).ok())
                 .map_or_else(|| inner.origin.clone(), |freeze| freeze.next().url.clone()),
         };
+        // The import is activated: the mark is at its head, under this switch's key (Switch
+        // wire 7.3, Table 3).
+        next.mark_at_state();
         Arc::new(Self {
             inner: Mutex::new(next),
         })
@@ -1148,34 +1183,17 @@ impl ScriptedSwitch {
         let until_ms = inner.now().saturating_add(wait_s.saturating_mul(1000));
         inner.held_ids += 1;
         let id = inner.held_ids;
-        let key = inner.service.verifying_key().to_bytes();
+        let generation = inner.tip.generation;
         drop(inner);
         Some(Held {
             switch: self,
             id,
-            key,
+            generation,
             app,
             cert,
             after,
             until_ms,
         })
-    }
-
-    /// The answer to a held read whose account's service key is no longer `key`: `503
-    /// unavailable` with the operator key, with no head (Switch wire 7.4.4); `None` while
-    /// the key is the same.
-    fn key_changed_since(&self, key: [u8; 32], request: &Request) -> Option<Response> {
-        let inner = self.lock();
-        if inner.service.verifying_key().to_bytes() == key {
-            return None;
-        }
-        let (status, body) = bad(
-            ErrorCode::Unavailable,
-            "7.6: a temporary failure",
-            Value::Null,
-        );
-        let operator = SigningKey::from_bytes(&[42; 32]);
-        Some(inner.respond_with(&operator, request, status, &body))
     }
 
     /// Keep the chain by `retention`, or, with `None`, keep every stub and sign no checkpoint
@@ -1209,11 +1227,19 @@ impl ScriptedSwitch {
     /// [`ScriptedSwitch::handle`]; `held` for a feed read the switch held, whose app was
     /// seen when the read arrived and isn't seen again.
     fn answer(&self, request: &Request, held: bool) -> Result<Response, TransportError> {
+        let answer = self.answer_unsettled(request, held);
+        // What the request committed is durable at once here, and the mark moves to it
+        // before the answer goes out, lost or not (Switch wire 7.3 step 10).
+        self.lock().settle_mark();
+        answer
+    }
+
+    /// [`ScriptedSwitch::answer`], the mark not yet moved.
+    fn answer_unsettled(&self, request: &Request, held: bool) -> Result<Response, TransportError> {
         let mut inner = self.lock();
         inner.seen_at_arrival = held;
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
-        inner.minute_sweep();
         if let Some(refused) = inner.refused_as_received(request) {
             return Ok(refused);
         }
@@ -1253,16 +1279,12 @@ impl ScriptedSwitch {
                     if status != 401 {
                         inner.seen(request);
                     }
-                    // A `401` is answered before the request verifies, so before the lock:
-                    // with the last stamped time and no head (Switch wire 7.1).
+                    // A `401` is answered before the request verifies, so before the lock: it
+                    // commits nothing, so it carries the last time stamped, and no head
+                    // (Switch wire 7.1).
                     if status == 401 {
                         let at = inner.stamped_ms;
                         return Ok(inner.respond_at(&inner.service, request, status, &body, at));
-                    }
-                    // An enrollment's errors are the operator's (Switch wire 7.4.1).
-                    if request.method == "POST" && path == "/v1/enroll" {
-                        let operator = SigningKey::from_bytes(&[42; 32]);
-                        return Ok(inner.respond_with(&operator, request, status, &body));
                     }
                     return Ok(inner.respond(request, status, &body));
                 }
@@ -1300,7 +1322,31 @@ impl ScriptedSwitch {
                 None => {}
             }
         }
-        let public = pubky_switch_core::http::is_public_read(&request.method, &path);
+        let enrollment = request.method == "POST" && path == "/v1/enroll";
+        // Its timestamp is checked first, as every request's (Switch wire 7.1): a stale
+        // enrollment is refused whatever the switch holds for it.
+        if enrollment && let Some(answer) = inner.stale_enrollment(request) {
+            return Ok(answer);
+        }
+        // Step 2: the account and its mark judged together, whose notice, `404` or `503`
+        // replaces every later answer (Switch wire 7.3, Tables 1 and 2).
+        if let Some(answer) = inner.step_two(request) {
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(answer);
+        }
+        inner.minute_sweep();
+        if enrollment {
+            let (status, body) = inner
+                .enroll(request)
+                .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            // Signed with the one key it names, its errors too (Switch wire 7.4.1).
+            return Ok(inner.respond(request, status, &body));
+        }
         let finish = |inner: &Inner, (status, mut body): Answer| {
             if lose {
                 return Err(TransportError::Timeout);
@@ -1315,43 +1361,16 @@ impl ScriptedSwitch {
                 let key = SigningKey::from_bytes(&secret);
                 return Ok(inner.respond_with(&key, request, status, &body));
             }
-            if public && (inner.erased || inner.enrolled.is_none()) {
-                let operator = SigningKey::from_bytes(&[42; 32]);
-                return Ok(inner.respond_with(&operator, request, status, &body));
-            }
             Ok(inner.respond(request, status, &body))
         };
         // Public identity reads decide nothing by a caller header, including its time,
-        // app and identity. Faults remain explicit (Switch wire 7.1, 7.4.15).
-        if public {
+        // app and identity. Account notices still precede the route (Switch wire 7.1,
+        // 7.3 step 2, 7.4.15).
+        if pubky_switch_core::http::is_public_read(&request.method, &path) {
             let answer = inner
                 .gate(&request.method, &path)
                 .unwrap_or_else(|| inner.identity_answer());
             return finish(&inner, answer);
-        }
-        if request.method == "POST" && path == "/v1/enroll" {
-            // Its timestamp is checked first, as every request's (Switch wire 7.1): a stale
-            // enrollment is refused whatever the switch holds for it.
-            if let Some(answer) = inner.stale_enrollment(request) {
-                return Ok(answer);
-            }
-            let (status, body) = inner
-                .enroll(request)
-                .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
-            // Taken whatever happens to the answer, so it never signs a later one.
-            let key = inner.answer_key.take();
-            if lose {
-                return Err(TransportError::Timeout);
-            }
-            // Its errors are the operator's, as at the service (Switch wire 7.4.1).
-            if status != 200 {
-                let operator = SigningKey::from_bytes(&[42; 32]);
-                return Ok(inner.respond_with(&operator, request, status, &body));
-            }
-            if let Some(key) = key {
-                return Ok(inner.respond_with(&key, request, status, &body));
-            }
-            return Ok(inner.respond(request, status, &body));
         }
         let stamped_before = inner.stamped_ms;
         if let Some(answer) = inner.stale_timestamp(request) {
@@ -1364,13 +1383,13 @@ impl ScriptedSwitch {
         let account = inner.identity.public();
         // An own app the switch holds no record for, at any call but a batch that carries
         // its `app.put` (or doesn't parse, which the batch's checks refuse first): no key
-        // verifies the request, so authentication refuses it,
-        // whatever the route and before the account's lock, the staged and frozen answers
-        // included, as the service does: `403 not_current`, no head, the last committed
-        // time, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
-        // own app's first call", 7.3 steps 5 to 8).
+        // verifies the request, so authentication refuses it, whatever the route and before
+        // the account's lock, the staged and frozen answers included, as the service does:
+        // `403 not_current`, no head, the last time stamped, since it commits nothing, and
+        // the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An own app's
+        // first call", 7.3 steps 5 to 8).
         if let Some(app) = caller
-            && !(inner.erased || inner.enrolled.is_none())
+            && inner.hosts()
             && inbox::Sender::foreign(request, &account).is_none()
             && !(request.method == "POST" && rest == "ops" && carries_app_put(&request.body, &app))
             && inner
@@ -1384,7 +1403,7 @@ impl ScriptedSwitch {
             }
             let (status, body) = bad(
                 ErrorCode::NotCurrent,
-                "Switch wire 7.2: an own app's first call carries its app.put",
+                "7.2: an own app's first call carries its app.put",
                 json!(null),
             );
             return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
@@ -1392,11 +1411,6 @@ impl ScriptedSwitch {
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             // A staged account's refusal comes after authentication: the app was seen.
             inner.seen(request);
-            if inner.erased || inner.enrolled.is_none() {
-                // Switch wire 7.4.16: signed with the operator key.
-                let operator = SigningKey::from_bytes(&[42; 32]);
-                return Ok(inner.respond_with(&operator, request, status, &body));
-            }
             return Ok(inner.respond(request, status, &body));
         }
         if let Some(sender) = inbox::Sender::foreign(request, &account) {
@@ -1418,9 +1432,16 @@ impl ScriptedSwitch {
         };
         // An own app's request: its last-seen time, also for the request that registered it.
         inner.seen(request);
-        let answer =
+        let (status, body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
-        finish(&inner, answer)
+        if status == 503 && path.ends_with("/erase") && inner.marks.attempt.is_some() {
+            inner.stamped_ms = stamped_before;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
+        }
+        finish(&inner, (status, body))
     }
 
     /// Deliver an own `identity.json` (the signer's `PUT /identity`): an `identity` chain
@@ -1553,10 +1574,10 @@ impl ScriptedSwitch {
         self.lock().keep_passed = true;
     }
 
-    /// Set the cursor the switch holds for `app`, as another instance of the app moving it
-    /// would (Switch spec 8.3).
+    /// Move the cursor the switch holds for `app` forward to `seq`, as another instance of
+    /// the app moving it would, by a move's rules (Switch spec 8.3, wire 6.2).
     pub fn set_held_cursor(&self, app: &[u8; 16], seq: u64) {
-        self.lock().apps.entry(*app).or_default().cursor = seq;
+        self.lock().move_held_cursor(*app, seq);
     }
 
     /// Set the inbox quota (Switch wire 9.2 `quota_bytes`), which an enrollment announces
@@ -1702,13 +1723,14 @@ impl ScriptedSwitch {
         if status != 200 {
             return Err(ScriptError::Refused { status, body });
         }
+        inner.settle_mark();
         Ok(inner.seq)
     }
 
-    /// Recover the account in place, as a signer that enrolled here again and was answered
-    /// `pending` does by delivering `doc`, the next generation naming that key, on `prev`:
-    /// through the switch's own `PUT /identity` (Switch spec 12.6 step 1, wire 3.3). For
-    /// tests of what a recovery in place does to the apps.
+    /// Recover the account in place, as a signer that enrolled here again does by
+    /// delivering `doc`, the next generation naming this switch's key with `recovery_from`,
+    /// on `prev`: through the switch's own `PUT /identity` (Switch spec 12.6 step 1, wire
+    /// 3.3). For tests of what a recovery in place does to the apps.
     ///
     /// # Errors
     ///
@@ -1716,12 +1738,10 @@ impl ScriptedSwitch {
     #[cfg(test)]
     pub(crate) fn recover_in_place(
         &self,
-        pending: SigningKey,
         doc: &IdentityDoc,
         prev: [u8; 32],
     ) -> Result<(), ScriptError> {
         let mut inner = self.lock();
-        inner.pending = Some((pending, Vec::new()));
         let delivery = pubky_switch_core::http::IdentityDelivery {
             identity: doc.signed().clone(),
             prev: Some(prev),
@@ -1769,13 +1789,6 @@ impl ScriptedSwitch {
             return Err(ScriptError::Refused { status, body });
         }
         Ok(())
-    }
-
-    /// Set `app`'s cursor to `seq` directly, with none of a move's rules: the state a switch
-    /// left from before it dropped parts at cursor moves. For tests.
-    #[cfg(test)]
-    pub(crate) fn set_cursor_unchecked(&self, app: [u8; 16], seq: u64) {
-        self.lock().apps.entry(app).or_default().cursor = seq;
     }
 
     /// `app`'s `keys_through` as `GET /apps` shows it (Switch wire 7.4.12). For tests.
@@ -1867,16 +1880,19 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
-    /// Roll the chain back to `seq`: everything after it is gone, and the tip is as it was.
+    /// Roll the chain back to `seq`, the mark with it, as a faulty service that signs behind
+    /// the heads it gave out: everything after it is gone, and the tip is as it was. For
+    /// tests of what an app catches itself; [`ScriptedSwitch::restore_to`] keeps the mark.
     #[cfg(test)]
     pub(crate) fn roll_back_to(&self, seq: u64) {
+        self.restore_to(seq);
         let mut inner = self.lock();
-        inner.items.retain(|item| item.seq() <= seq);
-        if let Some(tip) = inner.tips.iter().rev().find(|tip| tip.seq <= seq).copied() {
-            inner.tip = tip;
+        let tip = inner.tip;
+        if let marks::MarkSlot::At(mark) = &mut inner.marks.slot {
+            mark.generation = tip.generation;
+            mark.seq = tip.seq;
+            mark.chain_hash = tip.chain_hash;
         }
-        inner.tips.retain(|t| t.seq <= seq);
-        inner.seq = seq;
     }
 
     /// Every operation applied, in order.
@@ -1956,7 +1972,7 @@ impl Inner {
         let Some(retention) = self.retention else {
             return;
         };
-        if self.frozen.is_some() || self.staged || self.erased || self.enrolled.is_none() {
+        if self.frozen.is_some() || self.staged || !self.hosts() {
             return;
         }
         if self.doc.is_none() {
@@ -2086,7 +2102,7 @@ impl Inner {
         SignedHead::sign(&self.service, &self.identity.public(), &self.tip)
     }
 
-    /// An answer under the account's key. One to an own app or the signer carries the head
+    /// An answer under the switch's one key. One to an own app or the signer carries the head
     /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
     /// answered before that, nor to an enrollment or an erasure (Switch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
@@ -2112,10 +2128,11 @@ impl Inner {
     /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
     /// holds, is `401 stale_timestamp` (Switch wire 7.1, 7.6): `current.server_time` is the
     /// time base, for the retry's timestamp, and `Switch-Server-Time` the last time stamped,
-    /// which the refusal, answered before the account's lock, doesn't move. A request that
-    /// passes stamps the time. A missing or unparsable timestamp isn't checked.
+    /// since the refusal, answered before the account's lock, commits nothing (Switch wire
+    /// 7.1 Timestamp). A request that passes stamps the time. A missing or unparsable
+    /// timestamp isn't checked.
     fn stale_timestamp(&mut self, request: &Request) -> Option<Response> {
-        if self.erased || self.enrolled.is_none() {
+        if !self.hosts() {
             return None;
         }
         let now = self.now();
@@ -2136,10 +2153,9 @@ impl Inner {
     }
 
     /// An enrollment whose `Switch-Timestamp` is more than 5 minutes from the time base is
-    /// `401 stale_timestamp` (Switch wire 7.1), at an account the switch holds or not, and
-    /// whatever became of the key its answer named: the refusal comes before the enrollment
-    /// is looked at. It is the operator's, as an enrollment's other errors are (Switch wire
-    /// 7.4.1), and stamps nothing.
+    /// `401 stale_timestamp` (Switch wire 7.1), at an account the switch holds or not: the
+    /// refusal comes before the enrollment is looked at. It is signed with the one key, as an
+    /// enrollment's other errors are (Switch wire 7.4.1), with no head, and stamps nothing.
     fn stale_enrollment(&self, request: &Request) -> Option<Response> {
         let now = self.now();
         let stale = request
@@ -2154,8 +2170,7 @@ impl Inner {
             "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
             json!({ "server_time": rfc3339(now) }),
         );
-        let operator = SigningKey::from_bytes(&[42; 32]);
-        Some(self.respond_with(&operator, request, status, &body))
+        Some(self.respond_with(&self.service, request, status, &body))
     }
 
     fn respond_with(
@@ -2196,12 +2211,12 @@ impl Inner {
     }
 
     /// The refusals the service gives a request as it arrives, before anything else, signed
-    /// with the operator key and without a head, as the service signs them: a body over its
+    /// with the service key and without a head, as the service signs them: a body over its
     /// call's cap, `413 too_large` over the empty body field, since the body isn't read; a
-    /// signed request header sent more than once, `400 bad_request`, but at the public read,
-    /// which uses none (Switch wire 7.1).
+    /// signed request header sent more than once, or present with a value empty or not
+    /// printable ASCII, `400 bad_request`, but at the public read, which uses none (Switch
+    /// wire 7.1 "Each header once, as text").
     fn refused_as_received(&self, request: &Request) -> Option<Response> {
-        let operator = SigningKey::from_bytes(&[42; 32]);
         let at = self.now();
         if let Some(cap) =
             pubky_switch_core::http::body_cap(&request.method, &request.path_and_query)
@@ -2212,27 +2227,31 @@ impl Inner {
                 "Switch wire 7.1: the body is over its call's cap",
                 Value::Null,
             );
-            return Some(self.respond_bound(&operator, request, status, &body, at, None, false));
+            return Some(self.respond_bound(
+                &self.service,
+                request,
+                status,
+                &body,
+                at,
+                None,
+                false,
+            ));
         }
-        let repeated = pubky_switch_core::http::RECEIVED_HEADERS
-            .iter()
-            .any(|name| {
-                request
-                    .headers
-                    .iter()
-                    .filter(|header| header.name.eq_ignore_ascii_case(name))
-                    .count()
-                    > 1
-            });
-        if repeated
+        let received = pubky_switch_core::http::ReceivedHeaders::of(
+            request
+                .headers
+                .iter()
+                .map(|header| (header.name.as_str(), header.value.as_bytes())),
+        );
+        if let Some(reason) = received.broken_rule()
             && !pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
         {
             let (status, body) = bad(
                 ErrorCode::BadRequest,
-                "Switch wire 7.1: a signed request header sent more than once",
+                &format!("Switch wire {reason}"),
                 Value::Null,
             );
-            return Some(self.respond_bound(&operator, request, status, &body, at, None, true));
+            return Some(self.respond_bound(&self.service, request, status, &body, at, None, true));
         }
         None
     }
@@ -2392,8 +2411,8 @@ impl Inner {
     /// delivery that makes it serve and the erasure), and a
     /// frozen account's `410 moved` for writes.
     fn gate(&self, method: &str, path: &str) -> Option<Answer> {
-        if self.erased || self.enrolled.is_none() {
-            return Some(bad(ErrorCode::NotFound, "no such account", json!(null)));
+        if !self.hosts() {
+            return Some(marks::not_hosted());
         }
         let upload = method == "POST" && path.contains("recovery/upload");
         // A staged account takes the delivery that makes it serve (Switch wire 7.3 step 7).
@@ -2424,7 +2443,7 @@ impl Inner {
                 ("GET", "apps") => self.apps_answer(),
                 ("PUT", "handover") => self.put_handover(&request.body),
                 ("GET", "handover") => self.handover_answer(None),
-                ("POST", "erase") => self.erase_answer(&request.body),
+                ("POST", "erase") => self.erase_answer(request),
                 ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
                     self.revoke_answer(r)?
                 }

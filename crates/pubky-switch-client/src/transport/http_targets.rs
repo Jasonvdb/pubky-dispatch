@@ -62,10 +62,7 @@ fn signed(mut request: Request) -> SignedRequest {
         Header::new(header::TIMESTAMP, &headers.timestamp),
         Header::new(header::SIGNATURE, &b64(&signature)),
     ];
-    SignedRequest {
-        request,
-        signature: Some(signature),
-    }
+    SignedRequest { request }
 }
 
 fn request(origin: &str, method: &str, suffix: &str, bytes: usize) -> Request {

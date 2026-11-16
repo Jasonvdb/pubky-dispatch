@@ -274,6 +274,26 @@ impl ReceivedHeaders {
             .and_then(|at| self.values.get(at))
             .map_or(&[], Vec::as_slice)
     }
+
+    /// The header rule these headers break, as the reason of its `400 bad_request`, or
+    /// `None` (Switch wire 7.1 "Each header once, as text"): a signed request header sent more
+    /// than once, or present with a value that is empty or isn't printable ASCII (bytes 0x20
+    /// to 0x7E). The service never acts on signed values it would have to choose between, or
+    /// on one it would read otherwise than its answer binds it. The public read, which uses
+    /// none of these headers, is exempt; the caller decides that by the call.
+    pub fn broken_rule(&self) -> Option<&'static str> {
+        if self.values.iter().any(|values| values.len() > 1) {
+            return Some("7.1: a signed request header sent more than once");
+        }
+        let mut values = self.values.iter().flatten();
+        if values.clone().any(Vec::is_empty) {
+            return Some("7.1: a signed request header with an empty value");
+        }
+        if values.any(|value| !value.iter().all(|byte| (0x20..=0x7e).contains(byte))) {
+            return Some("7.1: a signed request header whose value isn't printable ASCII");
+        }
+        None
+    }
 }
 
 /// The request a response answers, exactly as the service received it (Switch wire 7.1).
@@ -516,55 +536,56 @@ pub const ERASED_BODY: &[u8] = br#"{"erased":true}"#;
 /// The body of `POST /v1/{id}/erase` (Switch wire 7.4.16).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EraseBody {
-    /// The account's service key, the one the signer pinned.
-    pub service_key: [u8; 32],
-    /// The document hash of the newest `identity.json` the signer holds, its mark: the
-    /// erasure is refused when the account holds another. Absent when the signer delivered
-    /// nothing to this account.
+    /// The account's creation time, in Unix milliseconds, as its enrollment answer named it:
+    /// the erasure is refused when the account was created at another time. Absent where the
+    /// signer holds none; the refusal names it.
+    pub created: Option<u64>,
+    /// The document hash of the newest `identity.json` the account holds: the erasure is
+    /// refused when the account holds another, or none. Absent only for an account that
+    /// holds no `identity.json`.
     pub identity_hash: Option<[u8; 32]>,
 }
 
-/// Read the body of `POST /v1/{id}/erase`: `{ "service_key": b64(32), "identity_hash":
-/// b64(32) }`, the hash optional (Switch wire 7.4.16).
+/// Read the body of `POST /v1/{id}/erase`: `{ "created": time, "identity_hash": b64(32) }`,
+/// both optional in shape (Switch wire 7.4.16). A member that is `null` reads as missing
+/// (Switch wire 1.1 "Absent and null"), so the erasure's binding refuses it as it refuses a
+/// missing one.
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] (`400 bad_request`) for any other member, or a key or hash that isn't
-/// `b64(32)`.
+/// [`Error::Invalid`] (`400 bad_request`) for any other member, a `created` that isn't a
+/// time (Switch wire 1.6), or a hash that isn't `b64(32)`.
 pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
     let value: serde_json::Value = crate::json::parse_json(body)?;
-    crate::json::reject_unknown_members(
-        &value,
-        &["service_key", "identity_hash"],
-        "the erasure body",
-    )?;
-    let service_key = match value.get("service_key") {
-        Some(serde_json::Value::String(text)) => unb64_array::<32>(text)?,
-        _ => return invalid("Switch wire 7.4.16: the erasure body names `service_key`"),
+    crate::json::reject_unknown_members(&value, &["created", "identity_hash"], "the erasure body")?;
+    let created = match value.get("created") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(crate::time::parse_rfc3339(text)?),
+        Some(_) => return invalid("Switch wire 7.4.16: `created` is a time"),
     };
     let identity_hash = match value.get("identity_hash") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
         Some(_) => return invalid("Switch wire 7.4.16: `identity_hash` is b64(32)"),
     };
     Ok(EraseBody {
-        service_key,
+        created,
         identity_hash,
     })
 }
 
-/// Write the body of `POST /v1/{id}/erase` (Switch wire 7.4.16): the service key, then the
-/// hash of the `identity.json` the erasure follows, when given.
-pub fn erase_body(service_key: &[u8; 32], identity_hash: Option<&[u8; 32]>) -> Vec<u8> {
-    let key = crate::enc::b64(service_key);
-    match identity_hash {
-        Some(hash) => format!(
-            "{{\"service_key\":\"{key}\",\"identity_hash\":\"{}\"}}",
-            crate::enc::b64(hash)
-        ),
-        None => format!("{{\"service_key\":\"{key}\"}}"),
+/// The body of `POST /v1/{id}/erase` naming `created`, the account's creation time from its
+/// enrollment answer, and `identity_hash`, the document hash of the newest `identity.json`
+/// the account holds, each left out when `None` (Switch wire 7.4.16).
+pub fn erase_body(created: Option<u64>, identity_hash: Option<&[u8; 32]>) -> Vec<u8> {
+    let mut members = Vec::new();
+    if let Some(created) = created {
+        members.push(format!("\"created\":\"{}\"", crate::time::rfc3339(created)));
     }
-    .into_bytes()
+    if let Some(hash) = identity_hash {
+        members.push(format!("\"identity_hash\":\"{}\"", crate::enc::b64(hash)));
+    }
+    format!("{{{}}}", members.join(",")).into_bytes()
 }
 
 /// The most handles one push registration holds, one per device (Switch wire 8.1).
@@ -757,6 +778,9 @@ pub enum ErrorCode {
     Staged,
     /// `503`: a temporary failure.
     Unavailable,
+    /// `503`: the account awaits a recovery; its `current` is a [`RecoveryNotice`] (Switch
+    /// wire 7.3, 7.6).
+    RecoveryRequired,
 }
 
 /// Whether the same request may succeed later (the Retry column of Switch spec 6.4).
@@ -784,11 +808,14 @@ pub enum Retry {
     WhenLimitFrees,
     /// Yes, unchanged.
     Yes,
+    /// Held for the next generation: neither sent again to this generation nor final
+    /// (Switch wire 7.6, Switch spec 6.4).
+    HeldForNextGeneration,
 }
 
 impl ErrorCode {
     /// Every code, in the order of the table.
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         ErrorCode::BadRequest,
         ErrorCode::BadSignature,
         ErrorCode::StaleTimestamp,
@@ -809,6 +836,7 @@ impl ErrorCode {
         ErrorCode::QuotaExceeded,
         ErrorCode::Staged,
         ErrorCode::Unavailable,
+        ErrorCode::RecoveryRequired,
     ];
 
     /// The `code` text.
@@ -834,6 +862,7 @@ impl ErrorCode {
             ErrorCode::QuotaExceeded => "quota_exceeded",
             ErrorCode::Staged => "staged",
             ErrorCode::Unavailable => "unavailable",
+            ErrorCode::RecoveryRequired => "recovery_required",
         }
     }
 
@@ -863,7 +892,7 @@ impl ErrorCode {
             ErrorCode::Moved => 410,
             ErrorCode::TooLarge => 413,
             ErrorCode::RateLimited | ErrorCode::QuotaExceeded => 429,
-            ErrorCode::Staged | ErrorCode::Unavailable => 503,
+            ErrorCode::Staged | ErrorCode::Unavailable | ErrorCode::RecoveryRequired => 503,
         }
     }
 
@@ -889,6 +918,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => Retry::AfterRetryAfter,
             ErrorCode::QuotaExceeded => Retry::WhenLimitFrees,
             ErrorCode::Staged | ErrorCode::Unavailable => Retry::Yes,
+            ErrorCode::RecoveryRequired => Retry::HeldForNextGeneration,
         }
     }
 
@@ -896,6 +926,70 @@ impl ErrorCode {
     /// answer and `409 identity_needed` do, other errors don't (Switch wire 7.1).
     pub fn carries_known_version(self) -> bool {
         self == ErrorCode::IdentityNeeded
+    }
+}
+
+/// The classes of answer that count in no comparison of service times, the only answers
+/// to a request a client sends that the service signs at its time base (Switch wire 7.1
+/// Timestamp, spec 10.1). A client tells each from the answer and the call it made alone
+/// ([`uncompared`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uncompared {
+    /// Every answer to the enrollment, `POST /v1/enroll`, outside the comparison of the
+    /// account's committed times.
+    Enrollment,
+    /// Every answer to the erasure, `POST /v1/{id}/erase`, outside the comparison of the
+    /// account's committed times.
+    Erasure,
+    /// Every answer to the public read, `GET /v1/{id}/identity`, which binds no request, so
+    /// an earlier one may be sent again (Switch wire 7.4.15).
+    PublicRead,
+    /// An answer given before the body was read, which verifies only with the empty body
+    /// field.
+    BodyUnread,
+    /// The notice, `503 recovery_required` (Switch wire 7.6).
+    Notice,
+    /// Every `503 unavailable`: a temporary failure, which tells nothing of the account's
+    /// state.
+    Unavailable,
+    /// The `404` with `current: { "hosted": false }` of an identity the service doesn't host
+    /// (Switch wire 7.3 step 2).
+    NotHosted,
+}
+
+/// The class of an answer that counts in no comparison of service times, `None` for one
+/// that counts (Switch wire 7.1 Timestamp): by the request it answers, `method` and
+/// `path_and_query` as sent and the body field the answer verifies with, and by the answer's
+/// `status` and, for an error, its `code` and `current`.
+pub fn uncompared(
+    method: &str,
+    path_and_query: &str,
+    body: BodyField,
+    status: u16,
+    code: Option<ErrorCode>,
+    current: Option<&serde_json::Value>,
+) -> Option<Uncompared> {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let segments: Vec<&str> = path
+        .strip_prefix("/v1/")
+        .map(|rest| rest.split('/').collect())
+        .unwrap_or_default();
+    match (method, segments.as_slice()) {
+        ("POST", ["enroll"]) => return Some(Uncompared::Enrollment),
+        ("POST", [id, "erase"]) if !id.is_empty() => return Some(Uncompared::Erasure),
+        _ if is_public_read(method, path_and_query) => return Some(Uncompared::PublicRead),
+        _ => {}
+    }
+    if body == BodyField::NotRead {
+        return Some(Uncompared::BodyUnread);
+    }
+    match code {
+        Some(ErrorCode::RecoveryRequired) if status == 503 => Some(Uncompared::Notice),
+        Some(ErrorCode::Unavailable) if status == 503 => Some(Uncompared::Unavailable),
+        Some(ErrorCode::NotFound) if status == 404 && current == Some(&not_hosted_current()) => {
+            Some(Uncompared::NotHosted)
+        }
+        _ => None,
     }
 }
 
@@ -1053,6 +1147,53 @@ mod tests {
             body,
             origin: "https://switch.example",
         }
+    }
+
+    #[test]
+    fn test_recovery_notice_reads_its_members() {
+        let notice = RecoveryNotice::from_current(&serde_json::json!({
+            "generation": 3, "reason": "mark_lost", "permanent": false
+        }))
+        .unwrap();
+        assert_eq!(
+            notice,
+            RecoveryNotice {
+                generation: 3,
+                reason: NoticeReason::MarkLost,
+                permanent: false
+            }
+        );
+        assert_eq!(
+            RecoveryNotice::from_current(&notice.to_current()).unwrap(),
+            notice
+        );
+        // An unknown member is ignored (Switch wire 1.1).
+        assert_eq!(
+            RecoveryNotice::from_current(&serde_json::json!({
+                "generation": 3, "reason": "mark_lost", "permanent": false, "x": 1
+            }))
+            .unwrap(),
+            notice
+        );
+        // A malformed notice: a member missing, an unknown `reason`, a wrong type.
+        for bad in [
+            serde_json::json!({ "generation": 3, "reason": "behind" }),
+            serde_json::json!({ "generation": 3, "reason": "lost", "permanent": false }),
+            serde_json::json!({ "generation": "3", "reason": "fork", "permanent": false }),
+            serde_json::json!({ "generation": 3, "reason": "fork", "permanent": "no" }),
+        ] {
+            assert!(RecoveryNotice::from_current(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(ErrorCode::RecoveryRequired.status(), 503);
+        assert_eq!(
+            ErrorCode::parse("recovery_required"),
+            Some(ErrorCode::RecoveryRequired)
+        );
+        assert_eq!(
+            ErrorCode::RecoveryRequired.retry(),
+            Retry::HeldForNextGeneration
+        );
+        assert_eq!(not_hosted_current(), serde_json::json!({ "hosted": false }));
     }
 
     #[test]
@@ -1286,6 +1427,199 @@ mod tests {
     }
 
     #[test]
+    fn test_received_headers_broken_rule() {
+        let of = |pairs: &[(&str, &[u8])]| ReceivedHeaders::of(pairs.iter().copied());
+        // Absent, once, and headers a received request doesn't cover break nothing.
+        assert_eq!(ReceivedHeaders::default().broken_rule(), None);
+        assert_eq!(honest_headers().broken_rule(), None);
+        assert_eq!(
+            of(&[
+                (header::APP, b"a b~"),
+                ("content-type", b""),
+                ("x-other", b"\xff")
+            ])
+            .broken_rule(),
+            None
+        );
+        // Repeated, empty, or not printable ASCII: refused, each with its own reason.
+        for (pairs, reason) in [
+            (
+                &[
+                    (header::TIMESTAMP, b"t".as_slice()),
+                    (header::TIMESTAMP, b"t"),
+                ][..],
+                "7.1: a signed request header sent more than once",
+            ),
+            (
+                &[(header::APP, b"a".as_slice()), ("Switch-App", b"b")][..],
+                "7.1: a signed request header sent more than once",
+            ),
+            (
+                &[(header::INVITE_CODE, b"".as_slice())][..],
+                "7.1: a signed request header with an empty value",
+            ),
+            (
+                &[(header::TRANSFER, b"".as_slice())][..],
+                "7.1: a signed request header with an empty value",
+            ),
+            (
+                &[(header::APP, b"\xff\xfe".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+            (
+                &[(header::CERT, b"a\tb".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+            (
+                &[(header::SIGNATURE, b"a\x7f".as_slice())][..],
+                "7.1: a signed request header whose value isn't printable ASCII",
+            ),
+        ] {
+            assert_eq!(of(pairs).broken_rule(), Some(reason), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn test_uncompared_classes_are_told_from_the_answer_and_the_call() {
+        // Switch wire 7.1 Timestamp: exactly these count in no comparison of service times.
+        let read = BodyField::read(b"");
+        let not_hosted = not_hosted_current();
+        let hosted = serde_json::json!({ "hosted": true });
+        let notice = serde_json::json!({ "generation": 1, "reason": "behind", "permanent": false });
+        let uncompared = [
+            (
+                "POST",
+                "/v1/enroll",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::Enrollment,
+            ),
+            (
+                "POST",
+                "/v1/enroll",
+                read,
+                409,
+                Some(ErrorCode::Conflict),
+                None,
+                Uncompared::Enrollment,
+            ),
+            (
+                "POST",
+                "/v1/x/erase",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::Erasure,
+            ),
+            (
+                "POST",
+                "/v1/x/erase",
+                read,
+                429,
+                Some(ErrorCode::RateLimited),
+                None,
+                Uncompared::Erasure,
+            ),
+            (
+                "GET",
+                "/v1/x/identity",
+                read,
+                200,
+                None,
+                None,
+                Uncompared::PublicRead,
+            ),
+            (
+                "GET",
+                "/v1/x/identity?a=1",
+                read,
+                429,
+                Some(ErrorCode::RateLimited),
+                None,
+                Uncompared::PublicRead,
+            ),
+            (
+                "POST",
+                "/v1/x/ops",
+                BodyField::NotRead,
+                413,
+                Some(ErrorCode::TooLarge),
+                None,
+                Uncompared::BodyUnread,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                503,
+                Some(ErrorCode::RecoveryRequired),
+                Some(&notice),
+                Uncompared::Notice,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                503,
+                Some(ErrorCode::Unavailable),
+                None,
+                Uncompared::Unavailable,
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                read,
+                404,
+                Some(ErrorCode::NotFound),
+                Some(&not_hosted),
+                Uncompared::NotHosted,
+            ),
+        ];
+        for (method, path, body, status, code, current, class) in uncompared {
+            assert_eq!(
+                super::uncompared(method, path, body, status, code, current),
+                Some(class),
+                "{method} {path} {status} {code:?}"
+            );
+        }
+        // Every other answer counts: a success, a refusal of the same status, a `404` with
+        // another `current`, and the calls next to those left out.
+        let compared = [
+            ("GET", "/v1/x/feed", 200, None, None),
+            ("POST", "/v1/x/ops", 429, Some(ErrorCode::RateLimited), None),
+            ("GET", "/v1/x/feed", 503, Some(ErrorCode::Staged), None),
+            ("GET", "/v1/x/feed", 404, Some(ErrorCode::NotFound), None),
+            (
+                "GET",
+                "/v1/x/feed",
+                404,
+                Some(ErrorCode::NotFound),
+                Some(&hosted),
+            ),
+            (
+                "GET",
+                "/v1/x/feed",
+                401,
+                Some(ErrorCode::BadSignature),
+                None,
+            ),
+            ("PUT", "/v1/x/identity", 200, None, None),
+            ("GET", "/v1/x/erase", 404, Some(ErrorCode::NotFound), None),
+            ("POST", "/v1/x/enroll", 404, Some(ErrorCode::NotFound), None),
+        ];
+        for (method, path, status, code, current) in compared {
+            assert_eq!(
+                super::uncompared(method, path, read, status, code, current),
+                None,
+                "{method} {path} {status} {code:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_public_read_binds_no_header() {
         let headers = honest_headers();
         let read = ReceivedRequest {
@@ -1448,33 +1782,63 @@ mod tests {
 
     #[test]
     fn test_erase_body_refuses_other_members() {
-        let key = [3; 32];
         assert_eq!(
-            parse_erase_body(&erase_body(&key, None)).unwrap(),
+            parse_erase_body(&erase_body(None, None)).unwrap(),
             EraseBody {
-                service_key: key,
+                created: None,
                 identity_hash: None
             }
         );
-        assert!(parse_erase_body(br#"{"service_key":"AA","x":1}"#).is_err());
-        assert!(parse_erase_body(b"{}").is_err());
+        assert_eq!(erase_body(None, None), b"{}");
+        assert!(parse_erase_body(br#"{"x":1}"#).is_err());
+        assert!(parse_erase_body(b"[]").is_err());
     }
 
     #[test]
-    fn test_erase_body_carries_the_identity_hash() {
-        let (key, hash) = ([3; 32], [4; 32]);
+    fn test_erase_body_null_member_reads_as_missing() {
+        // `null` is a missing member (Switch wire 1.1 "Absent and null"): the binding then
+        // answers the `409` a missing member gets, never a `400`.
         assert_eq!(
-            parse_erase_body(&erase_body(&key, Some(&hash))).unwrap(),
+            parse_erase_body(br#"{"created":null,"identity_hash":null}"#).unwrap(),
             EraseBody {
-                service_key: key,
+                created: None,
+                identity_hash: None
+            }
+        );
+        let hash = crate::enc::b64(&[4; 32]);
+        let body = format!(r#"{{"created":null,"identity_hash":"{hash}"}}"#);
+        assert_eq!(
+            parse_erase_body(body.as_bytes()).unwrap(),
+            EraseBody {
+                created: None,
+                identity_hash: Some([4; 32])
+            }
+        );
+    }
+
+    #[test]
+    fn test_erase_body_carries_the_creation_time_and_the_identity_hash() {
+        let (created, hash) = (1_767_225_600_123, [4; 32]);
+        let body = erase_body(Some(created), Some(&hash));
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"created":"2026-01-01T00:00:00.123Z","identity_hash":"{}"}}"#,
+                crate::enc::b64(&hash)
+            )
+            .into_bytes()
+        );
+        assert_eq!(
+            parse_erase_body(&body).unwrap(),
+            EraseBody {
+                created: Some(created),
                 identity_hash: Some(hash)
             }
         );
-        let text = crate::enc::b64(&key);
-        let body = format!(r#"{{"service_key":"{text}","identity_hash":7}}"#);
-        assert!(parse_erase_body(body.as_bytes()).is_err());
-        let body = format!(r#"{{"service_key":"{text}","identity_hash":"AA"}}"#);
-        assert!(parse_erase_body(body.as_bytes()).is_err());
+        assert!(parse_erase_body(br#"{"identity_hash":7}"#).is_err());
+        assert!(parse_erase_body(br#"{"identity_hash":"AA"}"#).is_err());
+        assert!(parse_erase_body(br#"{"created":"yesterday"}"#).is_err());
+        assert!(parse_erase_body(br#"{"created":1767225600123}"#).is_err());
     }
 
     #[test]

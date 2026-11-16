@@ -23,6 +23,7 @@ mod join;
 mod lagging;
 mod lists;
 mod messaging;
+mod notice;
 mod own_record;
 mod pages;
 mod push;
@@ -56,7 +57,10 @@ pub use connect::{
 };
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
-pub use erasure::{erasure, erasure_answer_lost, erasure_enrolled_again};
+pub use erasure::{
+    erasure, erasure_answer_lost, erasure_enrolled_again, erasure_outcome,
+    erasure_outcome_answer_lost, erasure_unavailable_before_authorization,
+};
 pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
@@ -67,6 +71,9 @@ pub use join::join;
 pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use notice::{
+    notice_account_lost, notice_behind, notice_fork, notice_mark_lost, notice_retired,
+};
 pub use own_record::own_record;
 pub use pages::pages;
 pub use push::push_registration;
@@ -161,6 +168,45 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
+    }),
+    ("erasure, unresolved outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        ))
+    }),
+    ("erasure, absent unresolved outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::UnresolvedAbsent,
+        ))
+    }),
+    ("erasure, committed outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Committed,
+        ))
+    }),
+    ("erasure, rejected outcome", |world| {
+        Box::pin(erasure_outcome(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Rejected,
+        ))
+    }),
+    ("erasure, unavailable before authorization", |world| {
+        Box::pin(erasure_unavailable_before_authorization(world))
+    }),
+    ("erasure, unresolved answer lost", |world| {
+        Box::pin(erasure_outcome_answer_lost(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        ))
+    }),
+    ("erasure, committed answer lost", |world| {
+        Box::pin(erasure_outcome_answer_lost(
+            world,
+            pubky_switch_client::testing::ErasureOutcome::Committed,
+        ))
     }),
     ("erasure, enrolled again", |world| {
         Box::pin(erasure_enrolled_again(world))
@@ -301,6 +347,21 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("recovery upload, refused", |world| {
         Box::pin(recovery_upload_refused(world))
+    }),
+    ("recovery notice, a restore behind the mark", |world| {
+        Box::pin(notice_behind(world))
+    }),
+    ("recovery notice, the mark lost", |world| {
+        Box::pin(notice_mark_lost(world))
+    }),
+    ("recovery notice, a fork", |world| {
+        Box::pin(notice_fork(world))
+    }),
+    ("recovery notice, the account lost", |world| {
+        Box::pin(notice_account_lost(world))
+    }),
+    ("recovery notice, the generation retired", |world| {
+        Box::pin(notice_retired(world))
     }),
     (
         "recovery upload, the hour's slots used before the loss",

@@ -762,7 +762,7 @@ async fn test_testing_held_read_of_a_departed_app_is_refused() {
 }
 
 #[tokio::test]
-async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
+async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
     let s = Setup::new();
     let switch = s.alice.switch();
     let (_app, request) = held_read(&s).await;
@@ -775,19 +775,25 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
-        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        body: pubky_switch_core::http::erase_body(
+            Some(switch.created()),
+            switch.identity_doc().map(|doc| doc.hash()).as_ref(),
+        ),
         timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     let erased = switch.transport().send(erase).await.unwrap();
     assert_eq!(erased.status, 200);
     assert_eq!(switch.held_reads(), 0, "the erasure woke the read");
-    // The held read is answered as for an account the switch doesn't host: the operator's
-    // `404`, never a page under the erased account's key.
+    // The held read is answered as for an account the switch doesn't host: the `404` with
+    // `current: { "hosted": false }`, never a page of the erased account (Switch wire 7.3
+    // step 2).
     let answer = poll_once(&mut read).expect("answered");
     assert_eq!(
         (answer.status, code_of(&answer).as_str()),
         (404, "not_found")
     );
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(body["current"], json!({ "hosted": false }));
     assert!(
         answer.header("switch-head").is_none(),
         "no head of the erased account"
@@ -811,15 +817,9 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         )
         .is_ok()
     };
-    assert!(
-        !verifies(&switch.service_key()),
-        "signed with the erased account's key"
-    );
-    // The scripted switch's operator key.
-    let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
-        .verifying_key()
-        .to_bytes();
-    assert!(verifies(&operator), "signed with the operator key");
+    // Signed with the switch's one key, bound to the read's method and path (Switch wire
+    // 7.1).
+    assert!(verifies(&switch.service_key()), "signed with the one key");
 }
 
 /// A feed read by `app` after `seq`, with `wait`.
@@ -924,13 +924,16 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         (answer.status, code_of(&answer).as_str()),
         (403, "not_current")
     );
-    // An account erased before the read: the operator's `404` at once.
+    // An account erased before the read: the not-hosted `404` at once.
     let erase = Request {
         method: "POST".into(),
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
         headers: Vec::new(),
-        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+        body: pubky_switch_core::http::erase_body(
+            Some(switch.created()),
+            switch.identity_doc().map(|doc| doc.hash()).as_ref(),
+        ),
         timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
     assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
@@ -1045,22 +1048,20 @@ async fn test_testing_held_read_given_up_is_held_no_more() {
 #[tokio::test]
 async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
     // As at the service: a body over its call's cap is `413 too_large` over the empty body
-    // field, and a signed request header sent twice is `400 bad_request`, both the
-    // operator's, without a head (Switch wire 7.1).
+    // field, and a signed request header sent twice, or with an empty or non-ASCII value, is
+    // `400 bad_request`, both signed with the service key, without a head (Switch wire 7.1).
     use pubky_switch_client::client::SentRequest;
     let s = Setup::new();
     let switch = s.alice.switch();
     let id = s.alice.identity().key().id();
-    let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
-        .verifying_key()
-        .to_bytes();
+    let service = switch.service_key();
     let verifies = |request: &Request, answer: &Response, body_read: bool| {
         let signature = answer
             .header("switch-service-signature")
             .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
             .expect("a signature");
         pubky_switch_core::http::verify_response(
-            &operator,
+            &service,
             &pubky_switch_core::http::ResponseParts {
                 status: answer.status,
                 request: SentRequest::of(request).received(body_read),
@@ -1105,6 +1106,36 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         (400, "bad_request")
     );
     assert!(verifies(&repeated, &answer, true));
+    // A signed header present with an empty value, or one that isn't printable ASCII, is
+    // refused the same way; a header no received request covers isn't looked at.
+    for (name, value) in [
+        ("switch-invite-code", ""),
+        ("switch-app", "\u{e9}"),
+        ("x-other", ""),
+    ] {
+        let odd = Request {
+            headers: vec![Header::new(name, value)],
+            ..repeated.clone()
+        };
+        let answer = switch.transport().send(odd.clone()).await.unwrap();
+        if name == "x-other" {
+            assert_ne!(answer.status, 400, "{name}");
+            continue;
+        }
+        assert_eq!(
+            (answer.status, code_of(&answer).as_str()),
+            (400, "bad_request"),
+            "{name}"
+        );
+        assert!(verifies(&odd, &answer, true), "{name}");
+        // The public read uses no header, so it is answered as any public read.
+        let read = Request {
+            path_and_query: format!("/v1/{id}/identity"),
+            ..odd
+        };
+        let answer = switch.transport().send(read).await.unwrap();
+        assert_ne!(answer.status, 400, "{name}");
+    }
     // The public read uses no header, so it is answered as any public read.
     let read = Request {
         path_and_query: format!("/v1/{id}/identity"),

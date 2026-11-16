@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use pubky_switch::{
     changes::{ChangeHub, ChangeListener},
-    keys::{FileKeyStore, KeyStore},
     store::{NewAccount, testing::test_database},
 };
 use tokio::sync::{oneshot, watch};
@@ -29,16 +28,12 @@ async fn test_changes_committed_change_wakes_its_account_only() {
     let Some(db) = test_database().await else {
         return;
     };
-    let key_dir = tempfile::tempdir().expect("key dir");
-    let keys = FileKeyStore::open(key_dir.path()).expect("keys");
     for id in [ID_A, ID_B] {
-        let key = keys.generate().await.expect("key");
         db.store()
             .create_account(&NewAccount {
                 id: id.into(),
                 identity_key: [1; 32],
                 generation: 1,
-                service_key: key.id,
                 created_at_ms: 0,
                 limits: pubky_switch_core::records::Limits::default(),
                 identity_doc: None,

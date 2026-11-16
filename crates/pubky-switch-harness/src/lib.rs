@@ -147,8 +147,13 @@ pub async fn run(
     on_flow_stack(async || run_here(backend, &flow).await)?
 }
 
-/// [`run`], on the calling thread.
-async fn run_here(
+/// Run a flow on the calling thread, with the same checks and cleanup as [`run`].
+/// The caller supplies the runtime and chooses the thread's stack size.
+///
+/// # Errors
+///
+/// When the world cannot be set up, the flow fails, or the service reports a failure.
+pub async fn run_here(
     backend: Backend,
     flow: impl AsyncFn(&World) -> FlowResult,
 ) -> Result<Option<Trace>, HarnessError> {
@@ -158,7 +163,9 @@ async fn run_here(
     let Some(world) = World::start(backend)? else {
         return Ok(None);
     };
-    let outcome = flow(&world).await.map_err(|error| error.to_string());
+    let outcome = Box::pin(flow(&world))
+        .await
+        .map_err(|error| error.to_string());
     let trace = world.trace();
     let closed = world.close().await;
     drop(keeping);

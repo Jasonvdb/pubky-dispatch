@@ -147,10 +147,10 @@ pub enum ClientError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     /// The response signature didn't verify with the pinned service key, or the response
-    /// carried none, so nothing in it was used (Switch wire 7.1). An answer the service
-    /// signs with its operator key, such as the `404` for an account it doesn't host, comes
-    /// back this way: the status is kept, as a signer that erased an account reads that
-    /// `404` (Switch wire 7.4.16).
+    /// carried none, so nothing in it was used (Switch wire 7.1). An intermediary's answer,
+    /// or the service's own under a key it changed to (Switch spec 12.5), comes back this
+    /// way: the status is kept, as a signer whose erasure is in doubt counts such a `404`
+    /// (Switch wire 7.4.16 "The signer's `404`").
     #[error("the response signature didn't verify (status {status})")]
     BadServiceSignature {
         /// The response's HTTP status, unauthenticated.
@@ -217,6 +217,22 @@ impl ClientError {
             _ => None,
         }
     }
+
+    /// Whether this is the service's word that it doesn't host the identity: `404
+    /// not_found` with `current: { "hosted": false }`, checked with the pinned service key,
+    /// which the service gives only for an account it doesn't hold, one never enrolled there
+    /// or one erased (Switch wire 7.3 step 2, 7.4.16 "Afterwards").
+    pub fn is_not_hosted(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Switch {
+                status: 404,
+                code: ErrorCode::NotFound,
+                current,
+                ..
+            } if *current == pubky_switch_core::http::not_hosted_current()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +252,23 @@ mod tests {
         assert_eq!(error.retry(), Some(Retry::AfterRetryAfter));
         assert_eq!(error.code(), Some(ErrorCode::RateLimited));
         assert_eq!(error.to_string(), "429 rate_limited: too many requests");
+    }
+
+    #[test]
+    fn test_client_error_not_hosted_is_only_the_signed_404() {
+        let not_found = |current: serde_json::Value| ClientError::Switch {
+            status: 404,
+            code: ErrorCode::NotFound,
+            message: "not found".into(),
+            current,
+            known_version: None,
+            retry_after: None,
+        };
+        assert!(not_found(pubky_switch_core::http::not_hosted_current()).is_not_hosted());
+        // The `404` of a missing object at a hosted account, and one nobody can check, aren't.
+        assert!(!not_found(serde_json::Value::Null).is_not_hosted());
+        assert!(!not_found(serde_json::json!({ "hosted": true })).is_not_hosted());
+        assert!(!ClientError::BadServiceSignature { status: 404 }.is_not_hosted());
     }
 
     #[test]

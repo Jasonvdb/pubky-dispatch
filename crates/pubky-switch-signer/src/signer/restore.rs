@@ -7,12 +7,13 @@
 //!   (`prev`), as when the signer stopped between writing the backup and delivering: that
 //!   version is then delivered first. A switch with no copy counts only under a backup of the
 //!   account's first version, or of a recovery's version. A recovery declared in place, at
-//!   the service that served the lost generation, names the pending key, while that service
-//!   answers under the key it served with until it takes the version: an answer the pending
-//!   key didn't sign is read again under the key the Homeserver's copy of the lost generation
-//!   names, at that origin and below the backup's version, and under no other key. There its
-//!   copy of the lost generation, or a signed `503 unavailable`, counts as no copy. Any other
-//!   copy makes the backup stale, and the restore is refused;
+//!   the service that served the lost generation, names that service's one key again, and
+//!   every answer there is checked with it; after a service key change, an answer the key
+//!   the version names didn't sign is read again under the key the Homeserver's copy of the
+//!   lost generation names, at that origin and below the backup's version, and under no
+//!   other key. Either way its copy of the lost generation below the backup's version, or a
+//!   signed `503 recovery_required` naming the lost generation or the backup's, counts as no
+//!   copy. Any other copy makes the backup stale, and the restore is refused;
 //! - the Homeserver's copy is neither newer than the backup's version nor another document at
 //!   it.
 //!
@@ -139,6 +140,7 @@ impl Signer {
             origin: doc.inbox().url.clone(),
             service_key: doc.inbox().service_key,
             limits: view.limits,
+            created: None,
         };
         let target = Target {
             origin: &service.origin,
@@ -162,9 +164,17 @@ impl Signer {
                 }
                 | ClientError::Transport(_),
             ) if is_recovery(&view) => no_copy(),
-            // A recovery declared at the service that served the lost generation names the
-            // pending key its enrollment answered, and that service answers under the key it
-            // served with until it takes the version (Switch wire 3.13, 7.4.1, 7.4.2).
+            // In place, before the service takes the version, its notice for the lost
+            // generation or the version's counts as no copy (Switch wire 3.13).
+            Err(ClientError::Switch {
+                code: ErrorCode::RecoveryRequired,
+                current,
+                ..
+            }) if notice_before_the_recovery(&view, &current) => no_copy(),
+            // A recovery declared at the service that served the lost generation, after that
+            // service changed its key (Switch spec 12.5): the version names the new key, and
+            // the service answers under the key it served with until it takes the version
+            // (Switch wire 3.13, 7.4.1, 7.4.2).
             Err(error @ ClientError::BadServiceSignature { .. }) if is_recovery(&view) => {
                 match self.serving_key_in_place(&view).await? {
                     Some(key) => {
@@ -176,6 +186,9 @@ impl Signer {
             }
             Err(error) => return Err(error.into()),
         };
+        // In place, the service still serves the lost generation until it takes the version:
+        // its copy of that generation counts as no copy (Switch wire 3.13).
+        let answer = without_the_lost_copy(&view, answer, &identity);
         let first = self
             .check_restore(&view, answer.identity.as_ref(), in_place)
             .await?;
@@ -244,9 +257,9 @@ impl Signer {
             {
                 state.recovery_services.push(service);
             }
-            // In place, the service answers under the key it served the lost generation with
-            // until it takes the version: that key is pinned for it meanwhile (Switch wire
-            // 3.13, 7.4.2).
+            // In place after a service key change, the service answers under the key it
+            // served the lost generation with until it takes the version: that key is pinned
+            // for it meanwhile (Switch wire 3.13, 7.4.2).
             state.recovery_serving = serving.and_then(|key| {
                 state.service.clone().map(|service| Service {
                     service_key: key,
@@ -437,10 +450,11 @@ impl Signer {
     }
 
     /// `GET /apps` read again under `serving`, the key the recovery's service served the
-    /// lost generation with (Switch wire 3.13): its copy of the lost generation, below the
-    /// backup's version, and a signed `503 unavailable`, as a lost service answers, show no
-    /// copy, and the restore is that recovery in progress again. Another copy is judged as
-    /// every switch's copy is, and refuses the restore.
+    /// lost generation with before it changed its key (Switch wire 3.13): its copy of the
+    /// lost generation, below the backup's version, and a signed `503 recovery_required`
+    /// naming the lost generation or the backup's show no copy, and the restore is that
+    /// recovery in progress again. Another copy is judged as every switch's copy is, and
+    /// refuses the restore.
     async fn apps_under_serving_key(
         &self,
         view: &BackupView,
@@ -454,29 +468,18 @@ impl Signer {
             pinned: Some(serving),
             identity,
         };
-        let mut answer = match RequestClient::new(&self.env, &target, &self.keyring)?
+        match RequestClient::new(&self.env, &target, &self.keyring)?
             .apps()
             .await
         {
-            Ok(answer) => answer,
+            Ok(answer) => Ok(without_the_lost_copy(view, answer, &identity)),
             Err(ClientError::Switch {
-                code: ErrorCode::Unavailable,
+                code: ErrorCode::RecoveryRequired,
+                current,
                 ..
-            }) => return Ok(no_copy()),
-            Err(error) => return Err(error.into()),
-        };
-        let lost_copy = answer
-            .identity
-            .as_ref()
-            .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
-            .is_some_and(|copy| {
-                Some(copy.generation()) == doc.body().recovery_from
-                    && copy.version() < doc.version()
-            });
-        if lost_copy {
-            answer.identity = None;
+            }) if notice_before_the_recovery(view, &current) => Ok(no_copy()),
+            Err(error) => Err(error.into()),
         }
-        Ok(answer)
     }
 
     /// The checks a restore passes before it takes the backup's records (Switch wire 3.13
@@ -673,6 +676,43 @@ fn no_copy() -> AppsAnswer {
         identity: None,
         server_time: 0,
     }
+}
+
+/// `answer` with its copy left out when, under a backup of a recovery's version, that copy is
+/// the lost generation's, at the origin the version names and below its version: the service
+/// still serving there until it takes the version, a recovery in place (Switch wire 3.13).
+fn without_the_lost_copy(
+    view: &BackupView,
+    mut answer: AppsAnswer,
+    identity: &[u8; 32],
+) -> AppsAnswer {
+    let doc = &view.identity_doc;
+    let lost_copy = is_recovery(view)
+        && answer
+            .identity
+            .as_ref()
+            .and_then(|signed| IdentityDoc::verify(signed, identity).ok())
+            .is_some_and(|copy| {
+                Some(copy.generation()) == doc.body().recovery_from
+                    && copy.version() < doc.version()
+                    && copy.inbox().url == doc.inbox().url
+            });
+    if lost_copy {
+        answer.identity = None;
+    }
+    answer
+}
+
+/// Whether a signed `503 recovery_required`'s `current` names the lost generation or the
+/// version's, under a backup of a recovery's version: the service before it takes the version
+/// (Switch wire 3.13, 7.6).
+fn notice_before_the_recovery(view: &BackupView, current: &serde_json::Value) -> bool {
+    let doc = &view.identity_doc;
+    is_recovery(view)
+        && pubky_switch_core::http::RecoveryNotice::from_current(current).is_ok_and(|notice| {
+            Some(notice.generation) == doc.body().recovery_from
+                || notice.generation == doc.generation()
+        })
 }
 
 /// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the

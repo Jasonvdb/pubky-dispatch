@@ -103,8 +103,9 @@ fn cursor_of(state: &OpsState, target: &[u8; 16]) -> u64 {
 
 /// Drop `target`'s key bundle parts its cursor has passed and its `keys_through` covers, the
 /// app holding their keys, unless `full`, a full-bundle request in force (Switch wire 6.2): at a
-/// `key_bundle.put` and at a `cursor.set`. A part passed before the gap below it was filled
-/// isn't covered yet, and goes at a later move once it is.
+/// `cursor.set`, the one writer that moves a cursor, passes a part or ends a request's force.
+/// A part passed before the gap below it was filled isn't covered yet, and goes at a later
+/// move once it is.
 fn drop_passed_parts(state: &mut OpsState, target: &[u8; 16], full: bool) {
     let Some(parts) = state.parts.get(target) else {
         return;
@@ -485,14 +486,11 @@ fn key_bundle_put(
                     seq: part.seq,
                 })
                 .collect();
-            // Unless a full-bundle request is in force, the parts the target's cursor has
-            // passed and that its `keys_through` covers go: it holds their keys (Switch wire
-            // 6.2). A request is in force from the `POST /keys` until the target's cursor has
-            // passed the part that completed it, or the part that replaced that one: until then
-            // the app hasn't read the parts it asked for, which may include ones it passed
-            // before a restore. It is judged as it was before this part, so a request this
-            // part completes keeps them at this put, and this part's `seq` keeps it in force
-            // after. The part just stored is past every cursor, so it stays.
+            // A full-bundle request is in force from the `POST /keys` until the target's
+            // cursor has passed the part that completed it, or the part that replaced that
+            // one: until then the app hasn't read the parts it asked for, which may include
+            // ones it passed before a restore (Switch wire 6.2). It is judged as it was before
+            // this part, so this part's `seq` keeps a request it completes in force after.
             let full = state
                 .apps
                 .get(&target)
@@ -515,7 +513,12 @@ fn key_bundle_put(
             {
                 app.full_completed = Some(seq);
             }
-            drop_passed_parts(state, &target, full);
+            // No stored part goes here but those this one replaces (Switch wire 6.2): the
+            // part just stored is past every cursor, and a part the target's cursor has passed
+            // and its `keys_through` covers went at the `cursor.set` that passed it, or at the
+            // one that ended a request's force ([`set_cursor`]); `cursor.set` is the one
+            // writer that moves a cursor, and `keys_through` rises only as a cursor passes
+            // parts.
             seq
         }
     };

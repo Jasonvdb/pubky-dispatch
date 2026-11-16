@@ -15,10 +15,11 @@ use pubky_switch::{
     changes::ChangeListener,
     http::Handler,
     http::SwitchResponse,
-    keys::{KeyId, KeyStore, Mark},
     limits::Limits,
+    marks::{AccountMark, MarkRead},
 };
 use pubky_switch_core::{
+    chain::ChainTip,
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
     http::header,
@@ -245,8 +246,9 @@ async fn test_feed_page_with_no_items_beyond_the_head_and_of_another_sequence() 
 
 #[tokio::test]
 async fn test_feed_page_with_no_items_fails_stop_behind_the_mark() {
-    // A state behind its key's mark answers a page with no items as it answers any call:
-    // `503`, with no head (Switch wire 7.3 step 10).
+    // A state behind the account's mark answers a page with no items as it answers any
+    // call: the notice, `503 recovery_required` with the reason `behind`, with no head
+    // (Switch wire 7.3, Tables 1 and 2).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
@@ -264,8 +266,9 @@ async fn test_feed_page_with_no_items_fails_stop_behind_the_mark() {
     let answer = read(&replay, "wallet", "?limit=0", &revoke_time()).await;
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
-        (503, json!("unavailable"))
+        (503, json!("recovery_required"))
     );
+    assert_eq!(body(&answer)["current"]["reason"], json!("behind"));
     assert!(
         header_text(&answer, header::HEAD).is_none(),
         "no head behind the mark"
@@ -651,9 +654,8 @@ async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
         (403, json!("not_current"))
     );
     // Its head is the one the page was read at, the revocation's, past the one its request
-    // committed (Switch wire 7.1), and the key's mark covers it (7.3 step 10).
-    let key = service_key(&replay).await;
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    // committed (Switch wire 7.1), and the account's mark covers it (7.3 step 10).
+    let mark = mark_of(&replay).await;
     assert_eq!(head_seq(&answer), Some(11));
     assert!(mark.seq >= 11);
     let fresh = read(&replay, "wallet", "?after=1:11", at).await;
@@ -726,16 +728,24 @@ async fn test_feed_refuses_an_app_of_another_identity() {
     replay.db.drop_database().await.expect("drop");
 }
 
-async fn service_key(replay: &Replay) -> KeyId {
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
-        .bind(alice_id())
-        .fetch_one(&mut conn)
-        .await
-        .expect("key");
-    KeyId::parse(&id).expect("key id")
+/// Wait until a long-poll waits on the account, its page read after the lock.
+async fn until_held(replay: &Replay) {
+    let changes = replay.service.changes();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while changes.waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read is held");
+}
+
+/// alice's mark.
+async fn mark_of(replay: &Replay) -> AccountMark {
+    match replay.marks.read(&alice_id()).await.expect("mark store") {
+        MarkRead::Mark(mark) => mark,
+        other => panic!("no mark: {other:?}"),
+    }
 }
 
 async fn sql(replay: &Replay, statement: &str) {
@@ -753,9 +763,10 @@ async fn sql(replay: &Replay, statement: &str) {
 async fn test_feed_moves_the_mark_to_the_head_it_shows() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
+    assert_eq!(mark_of(&replay).await.seq, 9);
     // A head committed meanwhile by a request that hasn't moved the mark yet: the page
-    // shows it, so the mark moves to it before the answer goes out.
+    // shows it, so the mark moves to it before the answer goes out (Switch wire 7.3 step
+    // 10).
     let at = revoke_time();
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -773,45 +784,80 @@ async fn test_feed_moves_the_mark_to_the_head_it_shows() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(body(&answer)["head"]["seq"], 10);
+    assert_eq!(head_seq(&answer), Some(10));
     assert_eq!(
-        replay.keys.mark(&key).await.expect("mark"),
-        Some(Mark {
+        mark_of(&replay).await.head(),
+        ChainTip {
             generation: 1,
             seq: 10,
             chain_hash: [0xab; 32],
-        })
+        }
     );
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_feed_refuses_a_head_behind_the_mark() {
+async fn test_feed_long_poll_behind_the_mark_answers_the_notice() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
-    // The key signed a head beyond the state the page reads: the page is refused with the
-    // mark's 503, which carries no head.
+    // A head beyond the state the page reads is signed meanwhile: the page read at the end
+    // of the wait is judged again, from a mark read before its snapshot, and answers the
+    // notice, signed with the key in the mark, without a head (Switch wire 7.3, Tables 1
+    // and 2).
     let at = revoke_time();
-    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let mark = Mark {
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:9&wait=1", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let sent = Sent::of(&request);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        until_held(&replay).await;
+        let ahead = ChainTip {
             generation: 1,
             seq: 50,
             chain_hash: [0xcd; 32],
         };
-        replay.keys.advance_mark(&key, mark).await.expect("mark");
+        replay
+            .marks
+            .advance(
+                &alice_id(),
+                ahead,
+                service_public(&replay),
+                mark_created_at(&replay, &alice_id()).await,
+            )
+            .await
+            .expect("mark");
+        // Time passes during the wait.
+        replay.clock.set_wall_ms(ms(&at) + 30_000);
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
-        (503, json!("unavailable"))
+        (503, json!("recovery_required"))
     );
+    assert_eq!(body(&answer)["current"]["reason"], json!("behind"));
+    // Signed when it answers, at the time base then, not at the request's start (Switch
+    // wire 7.1 Timestamp, 7.6).
+    let time = header_text(&answer, header::SERVER_TIME).expect("server time");
+    assert_eq!(
+        pubky_switch_core::time::parse_rfc3339(time).expect("time"),
+        replay.time.peek().base_ms
+    );
+    assert_eq!(replay.time.peek().base_ms, ms(&at) + 30_000);
     assert!(header_text(&answer, header::HEAD).is_none());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(replay.service.mark_refusals(), 1);
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
+async fn test_feed_long_poll_of_an_account_erased_meanwhile_is_not_hosted() {
+    // The page read at the end of the wait is judged again: the account is gone, so the
+    // read answers the not-hosted `404`, signed with the service key, without a head
+    // (Switch wire 7.4.16 Afterwards, 7.3 step 2).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
@@ -825,30 +871,21 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
     );
     let sent = Sent::of(&request);
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // The signer erases the account (Switch wire 7.4.16).
-        let key = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
-        let service = keys["service_keys"]
-            .as_array()
-            .expect("service keys")
-            .iter()
-            .find(|s| s["account"] == key.as_str())
-            .expect("alice's service key")["public"]
-            .as_str()
-            .expect("public")
-            .to_string();
-        let service: [u8; 32] = pubky_switch_core::enc::unb64(&service)
-            .expect("key")
-            .try_into()
-            .expect("32 bytes");
+        until_held(&replay).await;
+        // The signer erases the account, naming its newest identity.json (Switch wire
+        // 7.4.16).
+        let held: SignedDoc = serde_json::from_value(
+            named(
+                &vectors("documents.json")["documents"],
+                "alice identity.json",
+            )["signed"]
+                .clone(),
+        )
+        .expect("version 3");
+        let held = held.doc_hash().expect("hash");
         let erased = replay
             .service
-            .handle(signer_request(
-                "POST",
-                &format!("/v1/{}/erase", alice_id()),
-                pubky_switch_core::http::erase_body(&service, None),
-                ms(&at),
-            ))
+            .handle(erasure_of(&replay, &alice_id(), Some(&held), ms(&at)).await)
             .await;
         assert_eq!(
             erased.status,
@@ -861,9 +898,9 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
         (answer.status, body(&answer)["code"].clone()),
         (404, json!("not_found"))
     );
+    assert_eq!(body(&answer)["current"], json!({ "hosted": false }));
     assert!(header_text(&answer, header::HEAD).is_none());
-    // Signed with the operator key, as for an account the service doesn't hold.
-    assert!(signed_with(&answer, &operator_public(), &sent));
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -877,7 +914,6 @@ fn head_seq(answer: &SwitchResponse) -> Option<u64> {
 async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
     // A second after the revocation, so the read stamps a time of its own.
     let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
     set_time(&replay.clock, &at);
@@ -911,7 +947,7 @@ async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
     );
     // The snapshot's head, at 10, past the request's own 9 (Switch wire 7.1), the mark moved
     // to it first (7.3 step 10).
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    let mark = mark_of(&replay).await;
     assert_eq!(head_seq(&answer), Some(10));
     assert!(mark.seq >= 10);
     assert_eq!(
@@ -1179,104 +1215,27 @@ async fn stamped_time(replay: &Replay) -> i64 {
         .expect("stamp")
 }
 
-/// A key store whose `advance_mark` fails while armed.
-struct MarkStuck {
-    inner: std::sync::Arc<pubky_switch::keys::FixedKeys>,
-    armed: std::sync::atomic::AtomicBool,
-    /// The marks moved while it wasn't armed.
-    moved: std::sync::atomic::AtomicUsize,
-}
-
-impl KeyStore for MarkStuck {
-    fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
-        self.inner.generate()
-    }
-    fn generate_as<'a>(
-        &'a self,
-        id: &'a KeyId,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
-        self.inner.generate_as(id)
-    }
-    fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
-        self.inner.public_key(id)
-    }
-    fn signer<'a>(
-        &'a self,
-        id: &'a KeyId,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
-        self.inner.signer(id)
-    }
-    fn operator(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceSigner> {
-        self.inner.operator()
-    }
-    fn mark<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, Option<Mark>> {
-        self.inner.mark(id)
-    }
-    fn advance_mark<'a>(
-        &'a self,
-        id: &'a KeyId,
-        head: Mark,
-    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::MarkCheck> {
-        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Box::pin(async {
-                Err(pubky_switch::keys::KeyStoreError::Corrupt("stuck".into()))
-            });
-        }
-        let moving = self.inner.advance_mark(id, head);
-        Box::pin(async move {
-            let moved = moving.await;
-            self.moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            moved
-        })
-    }
-    fn delete<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, ()> {
-        self.inner.delete(id)
-    }
-    fn record_erasure<'a>(
-        &'a self,
-        identity: &'a str,
-        erased_at_ms: u64,
-    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
-        self.inner.record_erasure(identity, erased_at_ms)
-    }
-    fn erasure<'a>(&'a self, identity: &'a str) -> pubky_switch::keys::KeyFuture<'a, Option<u64>> {
-        self.inner.erasure(identity)
-    }
-
-    fn erasures(&self) -> pubky_switch::keys::KeyFuture<'_, Vec<(String, u64)>> {
-        self.inner.erasures()
-    }
-
-    fn forget_erasures_before(&self, before_ms: u64) -> pubky_switch::keys::KeyFuture<'_, usize> {
-        self.inner.forget_erasures_before(before_ms)
-    }
+/// Make alice's mark unable to move, or able again: the mark store's directory of marks
+/// read-only, or writable.
+fn marks_writable(replay: &Replay, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = replay.key_dir().join("accounts").join("marks");
+    let mode = if writable { 0o700 } else { 0o500 };
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
 #[tokio::test]
 async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
-    // As in the expiry test, a held read is refused from a later snapshot; but the key's
-    // mark can't move to that snapshot's head, so the refusal carries the head the request
+    // As in the expiry test, a held read is refused from a later snapshot; but the mark
+    // can't move to that snapshot's head, so the refusal carries the head the request
     // committed, which the mark covers, never the snapshot's (Switch wire 7.3 step 10).
-    // The key store sticks only once the read's own commit has moved the mark: stuck
-    // between the commit and that move, the read would answer the temporary `503`, which
-    // is right for a key store that fails there, and not what this test is about.
-    let Some(mut replay) = replay().await else {
+    // The mark sticks only once the read's own commit is in: stuck before it, the read
+    // would answer the temporary `503`, which is right for a mark store that fails there,
+    // and not what this test is about.
+    let Some(replay) = replay().await else {
         return;
     };
     replay_chain_through_revoke(&replay).await;
-    let key = service_key(&replay).await;
-    let stuck = std::sync::Arc::new(MarkStuck {
-        inner: replay.keys.clone(),
-        armed: std::sync::atomic::AtomicBool::new(false),
-        moved: std::sync::atomic::AtomicUsize::new(0),
-    });
-    replay.service = pubky_switch::service::Service::new(
-        ORIGIN.into(),
-        replay.db.store().clone(),
-        stuck.clone(),
-        replay.time.clone(),
-        Limits::default(),
-    );
     let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
     set_time(&replay.clock, &at);
     let read_ms = i64::try_from(ms(&at)).expect("time");
@@ -1286,16 +1245,14 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
     let (stop, task) = listen(&replay).await;
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=25", &at), async {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while stamped_time(&replay).await != read_ms
-            || stuck.moved.load(std::sync::atomic::Ordering::SeqCst) == 0
-        {
+        while stamped_time(&replay).await != read_ms {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the read never committed its stamp and moved the mark"
+                "the read never committed its stamp"
             );
             tokio::task::yield_now().await;
         }
-        stuck.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        marks_writable(&replay, false);
         sql(
             &replay,
             &format!(
@@ -1311,6 +1268,7 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
         )
         .await;
     });
+    marks_writable(&replay, true);
     let _ = stop.send(());
     task.await.expect("listener");
     assert_eq!(
@@ -1318,8 +1276,8 @@ async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
         (403, json!("cert_expired"))
     );
     assert_eq!(head_seq(&answer), Some(9));
-    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
-    assert!(mark.seq < 10, "the mark didn't move: {mark:?}");
+    let mark = mark_of(&replay).await;
+    assert_eq!(mark.seq, 9, "the mark didn't move: {mark:?}");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1376,4 +1334,942 @@ async fn test_feed_held_read_ends_when_its_connection_closes() {
     let _ = stop.send(());
     server.await.expect("server").expect("served");
     replay.db.drop_database().await.expect("drop");
+}
+
+/// The normal lifecycle change that must not overtake a new signature for a feed snapshot.
+#[derive(Clone, Copy, Debug)]
+enum FeedChange {
+    Recover,
+    Erase,
+    EnrollAgain,
+    Advance,
+}
+
+fn held_identity() -> SignedDoc {
+    serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("identity")
+}
+
+async fn change_feed_account(replay: &Replay, change: FeedChange, at: &str) {
+    let original = mark_of(replay).await;
+    let held = held_identity();
+    let (path, data) = match change {
+        FeedChange::Advance => {
+            let keys = vectors("keys.json");
+            let executor = app(&keys, "executor")["app_id"].as_str().expect("app");
+            (
+                format!("/v1/{}/apps/{executor}/revoke", alice_id()),
+                Vec::new(),
+            )
+        }
+        FeedChange::Recover => {
+            let mut fields: pubky_switch_core::records::IdentityBody =
+                serde_json::from_slice(&held.body_bytes().expect("body")).expect("body");
+            fields.version += 1;
+            fields.generation = 2;
+            fields.recovery_from = Some(1);
+            fields.apps.clear();
+            let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+                &alice(&vectors("keys.json"))["secret_hex"],
+            ));
+            let recovery = pubky_switch_core::records::IdentityDoc::sign(&key, fields)
+                .expect("sign")
+                .signed()
+                .clone();
+            (
+                format!("/v1/{}/identity", alice_id()),
+                pubky_switch_core::http::IdentityDelivery {
+                    identity: recovery,
+                    prev: Some(held.doc_hash().expect("hash")),
+                }
+                .to_json(),
+            )
+        }
+        FeedChange::Erase | FeedChange::EnrollAgain => {
+            let mark = mark_of(replay).await;
+            (
+                format!("/v1/{}/erase", alice_id()),
+                pubky_switch_core::http::erase_body(
+                    Some(mark.created_at_ms),
+                    Some(&held.doc_hash().expect("hash")),
+                ),
+            )
+        }
+    };
+    let answer = replay
+        .service
+        .handle(signer_request(
+            if matches!(change, FeedChange::Recover) {
+                "PUT"
+            } else {
+                "POST"
+            },
+            &path,
+            data,
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{change:?}: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    match change {
+        FeedChange::Advance => {
+            let later = mark_of(replay).await;
+            assert_eq!(later.generation, original.generation);
+            assert!(later.seq > original.seq);
+        }
+        FeedChange::Recover => assert_eq!(mark_of(replay).await.generation, 2),
+        FeedChange::Erase | FeedChange::EnrollAgain => assert_eq!(
+            replay.marks.read(&alice_id()).await.expect("mark"),
+            MarkRead::Missing
+        ),
+    }
+    if matches!(change, FeedChange::EnrollAgain) {
+        serve_alice(replay).await;
+        let later = mark_of(replay).await;
+        assert!(later.created_at_ms > original.created_at_ms);
+        assert_eq!(later.generation, original.generation);
+    }
+}
+
+async fn subscribed(replay: &Replay) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while replay.service.changes().waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feed subscribed after its initial commit and mark");
+}
+
+async fn change_before_feed_sign(change: FeedChange, refusal: bool, after_mark: bool) {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        subscribed(&replay).await;
+        if refusal {
+            // The next snapshot refuses a reader revoked through the normal endpoint.
+            let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
+                .as_str()
+                .expect("app")
+                .to_string();
+            let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+            let revoked = replay
+                .service
+                .handle(signer_request("POST", &path, Vec::new(), ms(&at)))
+                .await;
+            assert_eq!(
+                revoked.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&revoked.body)
+            );
+        }
+        let pause = if after_mark {
+            replay.service.pause_next_feed_sign()
+        } else {
+            replay.service.pause_next_mark_move()
+        };
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("snapshot reached its final mark or signing turn");
+        change_feed_account(&replay, change, &at).await;
+        pause.release();
+    });
+    let head = header_text(&answer, header::HEAD).map(str::to_string);
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable")),
+        "{change:?}, refusal={refusal}, after_mark={after_mark}"
+    );
+    assert!(head.is_none(), "ended account/generation: {head:?}");
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_generation_overtaken_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Recover, false, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_erased_before_mark_move_has_no_head() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Erase, false, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_refusal_overtaken_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Recover, true, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_refusal_erased_before_signing() {
+    for after_mark in [false, true] {
+        change_before_feed_sign(FeedChange::Erase, true, after_mark).await;
+    }
+}
+
+#[tokio::test]
+async fn test_feed_account_lock_is_held_through_signing() {
+    for change in [FeedChange::Recover, FeedChange::Erase] {
+        let Some(replay) = replay().await else { return };
+        replay_chain_through_revoke(&replay).await;
+        let at = revoke_time();
+        let pause = replay.service.pause_next_feed_sign_locked();
+        let (answer, overtook) = tokio::join!(read(&replay, "wallet", "?limit=0", &at), async {
+            tokio::time::timeout(Duration::from_secs(10), pause.reached())
+                .await
+                .expect("signing turn");
+            let transition = change_feed_account(&replay, change, &at);
+            tokio::pin!(transition);
+            let overtook = tokio::select! {
+                () = &mut transition => true,
+                () = tokio::time::sleep(Duration::from_millis(100)) => false,
+            };
+            pause.release();
+            if !overtook {
+                transition.await;
+            }
+            overtook
+        });
+        replay.db.drop_database().await.expect("drop");
+        assert!(!overtook, "transition overtook the signing lock");
+        // A head signed before the later transition may finish arriving afterwards.
+        assert_eq!(answer.status, 200);
+        assert_eq!(body(&answer)["head"]["generation"], 1);
+        assert_eq!(head_seq(&answer), Some(9));
+    }
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_cannot_sign_for_another_account_creation() {
+    change_before_feed_sign(FeedChange::EnrollAgain, false, true).await;
+    // Creation names the account independently of generation and chain tip (wire 7.3).
+    // Hold those fields equal so only the creation-time boundary can refuse the page.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let original = mark_of(&replay).await;
+    let pause = replay.service.pause_next_feed_sign();
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?limit=0", &at), async {
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("signing turn");
+        let created = original.created_at_ms + 1;
+        let mut txn = replay
+            .db
+            .store()
+            .begin(&alice_id())
+            .await
+            .expect("begin")
+            .expect("account");
+        sqlx::query("UPDATE accounts SET created_at_ms = $1 WHERE id = $2")
+            .bind(i64::try_from(created).expect("time"))
+            .bind(alice_id())
+            .execute(txn.conn())
+            .await
+            .expect("another creation");
+        txn.commit().await.expect("commit");
+        replay
+            .marks
+            .take(&alice_id(), original, original.key, created)
+            .await
+            .expect("matching mark");
+        let later = mark_of(&replay).await;
+        assert_eq!(later.head(), original.head());
+        assert_ne!(later.created_at_ms, original.created_at_ms);
+        pause.release();
+    });
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+}
+
+#[tokio::test]
+async fn test_feed_signing_checks_freshness_after_its_final_storage_reads() {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let freshness = LockFreshness::confirmed_ago(
+        Duration::ZERO,
+        LockTiming::checking_every(Duration::from_millis(250)),
+    );
+    let service = replay
+        .restarted_with(Limits::default())
+        .with_lock_freshness(freshness.clone());
+    let pause = service.pause_next_feed_sign_locked();
+    let path = format!("/v1/{}/feed?limit=0", alice_id());
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &path,
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let (answer, ()) = tokio::join!(service.handle(request), async {
+        tokio::time::timeout(Duration::from_secs(10), pause.reached())
+            .await
+            .expect("signing turn");
+        while freshness.is_fresh() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pause.release();
+    });
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+}
+
+#[tokio::test]
+async fn test_feed_snapshot_cannot_sign_behind_a_later_committed_head() {
+    for refusal in [false, true] {
+        for after_mark in [false, true] {
+            change_before_feed_sign(FeedChange::Advance, refusal, after_mark).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_feed_waits_for_erasure_deletion() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let mut blocker = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("SELECT pg_advisory_lock(774123)")
+        .execute(&mut blocker)
+        .await
+        .expect("lock");
+    sqlx::query("CREATE FUNCTION block_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(774123); RAISE EXCEPTION 'injected deletion failure'; END $$")
+        .execute(&mut blocker).await.expect("function");
+    sqlx::query("CREATE TRIGGER block_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION block_account_delete()")
+        .execute(&mut blocker).await.expect("trigger");
+    let answered = AtomicBool::new(false);
+    let (feed, (erased, early)) = tokio::join!(
+        async {
+            let response = Box::pin(read(&replay, "wallet", "?after=1:9&wait=1", &at)).await;
+            answered.store(true, Ordering::SeqCst);
+            response
+        },
+        async {
+            until_held(&replay).await;
+            let held = held_identity().doc_hash().expect("hash");
+            let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&at)).await;
+            tokio::join!(Box::pin(replay.service.handle(request)), async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !replay
+                        .key_dir()
+                        .join("accounts/erasure-attempts")
+                        .join(alice_id())
+                        .exists()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("erasure attempt written before deletion");
+                let early = tokio::time::timeout(Duration::from_secs(2), async {
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                sqlx::query("SELECT pg_advisory_unlock(774123)")
+                    .execute(&mut blocker)
+                    .await
+                    .expect("unlock");
+                early
+            })
+        }
+    );
+    assert_eq!(erased.status, 503, "deletion failed");
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some(),
+        "account survives"
+    );
+    assert!(
+        replay
+            .marks
+            .erasure(&alice_id())
+            .await
+            .expect("erasure")
+            .is_none(),
+        "failed deletion withdrew record"
+    );
+    blocker.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        !early,
+        "feed answered before erasure committed: {} {}",
+        feed.status,
+        String::from_utf8_lossy(&feed.body)
+    );
+}
+
+#[tokio::test]
+async fn test_feed_live_mark_store_loss_refuses_cached_account() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    std::fs::remove_file(replay.key_dir().join("accounts/store-id")).expect("lose store identity");
+    let path = format!("/v1/{}/apps", alice_id());
+    let request = signer_request("GET", &path, Vec::new(), ms(&revoke_time()));
+    let sent = Sent::of(&request);
+    let response = Box::pin(replay.service.handle(request)).await;
+    assert!(signed_with(&response, &service_public(&replay), &sent));
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        response.status,
+        503,
+        "cached account signed after store loss: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(header_text(&response, header::HEAD).is_none());
+}
+
+async fn until_account_lock_waits(replay: &Replay) {
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'advisory')")
+                .fetch_one(&mut connection).await.expect("waiting");
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("request passed lookup and waits for identity lock");
+    connection.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_feed_account_erased_again_uses_remaining_mark_verdict() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let old = mark_of(&replay).await;
+    let erased_at = old.created_at_ms + 1;
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let (answer, ()) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        until_account_lock_waits(&replay).await;
+        replay
+            .marks
+            .record_erasure(&alice_id(), erased_at)
+            .await
+            .expect("erased older account");
+        replay
+            .marks
+            .take(&alice_id(), old, old.key, erased_at + 1)
+            .await
+            .expect("later account's mark");
+        txn.commit().await.expect("release lock");
+    });
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_none(),
+        "restored old account erased again"
+    );
+    assert!(
+        mark_of(&replay).await.created_at_ms > erased_at,
+        "later mark stays"
+    );
+    let retry = Box::pin(replay.service.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        retry.status,
+        503,
+        "new request sees lost account: {}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    assert_eq!(
+        answer.status,
+        503,
+        "locked path ignores remaining lost mark: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(body(&answer)["code"], "recovery_required");
+    assert_eq!(body(&answer)["current"]["reason"], "behind");
+    assert_eq!(body(&answer), body(&retry));
+    assert!(header_text(&answer, header::HEAD).is_none());
+}
+
+#[tokio::test]
+async fn test_feed_account_lost_between_lookup_and_lock_uses_mark() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let (answer, ()) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        until_account_lock_waits(&replay).await;
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .execute(txn.conn())
+            .await
+            .expect("lost account state");
+        txn.commit().await.expect("release lock");
+    });
+    let retry = Box::pin(replay.service.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(retry.status, 503, "new request sees lost account");
+    assert_eq!(
+        answer.status,
+        503,
+        "begin(None) skips mark verdict: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(body(&answer)["code"], "recovery_required");
+    assert_eq!(body(&answer)["current"]["reason"], "behind");
+    assert_eq!(body(&answer), body(&retry));
+    assert!(header_text(&answer, header::HEAD).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_feed_failed_erasure_record_does_not_erase_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let erasures = replay.key_dir().join("accounts/erasure-attempts");
+    let permissions = std::fs::metadata(&erasures)
+        .expect("metadata")
+        .permissions();
+    std::fs::set_permissions(&erasures, std::fs::Permissions::from_mode(0o500)).expect("read only");
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let erased = Box::pin(replay.service.handle(request)).await;
+    std::fs::set_permissions(&erasures, permissions).expect("writable");
+    assert_eq!(erased.status, 503);
+    assert!(!erasures.join(alice_id()).exists(), "no record landed");
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let answer = Box::pin(replay.service.handle(request)).await;
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        survived,
+        "a record that was never written must not erase the account"
+    );
+    assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn test_feed_withdrawn_erasure_is_rechecked_after_waiting_for_lock() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let erased_at = mark_of(&replay).await.created_at_ms + 1;
+    replay
+        .marks
+        .record_erasure(&alice_id(), erased_at)
+        .await
+        .expect("pending erasure");
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let (answer, ()) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        until_account_lock_waits(&replay).await;
+        replay
+            .marks
+            .withdraw_erasure(&alice_id(), erased_at, None)
+            .await
+            .expect("withdraw failed erasure");
+        txn.commit().await.expect("release lock");
+    });
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let mark = replay.marks.read(&alice_id()).await.expect("mark");
+    let erasure = replay.marks.erasure(&alice_id()).await.expect("erasure");
+    replay.db.drop_database().await.expect("drop");
+    assert!(survived, "the withdrawn intent authorizes no deletion");
+    assert!(matches!(mark, pubky_switch::marks::MarkRead::Mark(_)));
+    assert_eq!(erasure, None);
+    assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn test_feed_failed_deletion_keeps_the_lock_until_record_withdrawal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE TRIGGER fail_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let pause = replay.service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let answered = AtomicBool::new(false);
+    let (erased, (answer, early)) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        let request = signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(&revoke_time()),
+        );
+        tokio::join!(
+            async {
+                let answer = Box::pin(replay.service.handle(request)).await;
+                answered.store(true, Ordering::SeqCst);
+                answer
+            },
+            async {
+                let early = tokio::time::timeout(Duration::from_millis(500), async {
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok();
+                pause.release();
+                early
+            }
+        )
+    });
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = replay.marks.erasure(&alice_id()).await.expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(erased.status, 503);
+    assert!(
+        survived,
+        "a request must not complete an erasure whose failure is withdrawing its record"
+    );
+    assert_eq!(record, None);
+    assert!(!early, "request passed the erasure before withdrawal");
+    assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn test_feed_failed_deferred_deletion_keeps_the_lock_until_record_withdrawal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_account_delete AFTER DELETE ON accounts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let pause = replay.service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let answered = AtomicBool::new(false);
+    let (erased, (answer, early)) = tokio::join!(Box::pin(replay.service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        let request = signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(&revoke_time()),
+        );
+        tokio::join!(
+            async {
+                let answer = Box::pin(replay.service.handle(request)).await;
+                answered.store(true, Ordering::SeqCst);
+                answer
+            },
+            async {
+                let early = tokio::time::timeout(Duration::from_millis(500), async {
+                    while !answered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok();
+                pause.release();
+                early
+            }
+        )
+    });
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = replay.marks.erasure(&alice_id()).await.expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(erased.status, 503);
+    assert!(
+        survived,
+        "a request must not complete an erasure whose failure is withdrawing its record"
+    );
+    assert_eq!(record, None);
+    assert!(!early, "request passed the erasure before withdrawal");
+    assert_eq!(answer.status, 200);
+}
+#[tokio::test]
+async fn test_feed_failed_deletion_with_expired_lock_preserves_account() {
+    use pubky_switch::store::{LockFreshness, LockTiming};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE TRIGGER fail_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let service = replay
+        .restarted_with(pubky_switch::limits::Limits::default())
+        .with_lock_freshness(LockFreshness::confirmed_ago(
+            Duration::ZERO,
+            LockTiming::checking_every(Duration::from_secs(1)),
+        ));
+    let pause = service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let (erased, ()) = tokio::join!(Box::pin(service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        pause.release();
+    });
+    assert_eq!(erased.status, 503);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the database rejected the deletion"
+    );
+    let read = Box::pin(replay.service.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = replay.marks.erasure(&alice_id()).await.expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        survived,
+        "a failed erasure cannot become committed when the lock is fresh again; read status {}, record {:?}",
+        read.status, record
+    );
+    assert_eq!(record, None);
+    assert_eq!(read.status, 200);
+}
+#[tokio::test]
+async fn test_feed_failed_deletion_with_unwritable_record_preserves_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    sqlx::query("CREATE SEQUENCE delete_attempt")
+        .execute(&mut connection)
+        .await
+        .expect("sequence");
+    sqlx::query("CREATE FUNCTION fail_account_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('delete_attempt') = 1 THEN RAISE EXCEPTION 'injected deletion failure'; END IF; RETURN OLD; END $$")
+        .execute(&mut connection).await.expect("function");
+    sqlx::query("CREATE TRIGGER fail_account_delete BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fail_account_delete()")
+        .execute(&mut connection).await.expect("trigger");
+    let service = replay.restarted_with(pubky_switch::limits::Limits::default());
+    let erasures = replay.key_dir().join("accounts/erasure-attempts");
+    let permissions = std::fs::metadata(&erasures)
+        .expect("metadata")
+        .permissions();
+    let pause = service.pause_next_erase_failure();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let (erased, ()) = tokio::join!(Box::pin(service.handle(request)), async {
+        tokio::time::timeout(Duration::from_secs(5), pause.reached())
+            .await
+            .expect("failed deletion");
+        std::fs::set_permissions(&erasures, std::fs::Permissions::from_mode(0o500))
+            .expect("read only");
+        pause.release();
+    });
+    std::fs::set_permissions(&erasures, permissions).expect("writable");
+    assert_eq!(erased.status, 503);
+    assert!(
+        replay
+            .db
+            .store()
+            .lookup(&alice_id())
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the database rejected the deletion"
+    );
+    let reopened = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        replay.keys.clone(),
+        pubky_switch::marks::MarkStore::open(replay.key_dir()).expect("reopened marks"),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    let read = Box::pin(reopened.handle(signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )))
+    .await;
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let record = pubky_switch::marks::MarkView::open(replay.key_dir())
+        .expect("view")
+        .erasure(&alice_id())
+        .expect("record");
+    connection.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+    assert!(
+        survived,
+        "a failed erasure cannot become committed after the mark store becomes writable and reloads; read status {}, record {:?}",
+        read.status, record
+    );
+    assert_eq!(record, None);
+    assert_eq!(read.status, 200);
 }

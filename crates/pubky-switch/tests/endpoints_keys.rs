@@ -19,7 +19,6 @@ use pubky_switch_core::{
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
-use sqlx::Connection;
 use support::*;
 
 fn alice_id() -> String {
@@ -611,39 +610,6 @@ async fn bundle_ranges(replay: &Replay, at: &str) -> Value {
         .find(|status| status["app_id"] == wallet.as_str())
         .expect("the wallet's status")["bundle_ranges"]
         .clone()
-}
-
-#[tokio::test]
-async fn test_keys_passed_parts_go_when_the_next_part_is_stored() {
-    let Some(replay) = replay().await else { return };
-    replay_chain_through_revoke(&replay).await;
-    let at = revoke_time();
-    // Epoch 1's part, passed before the service dropped parts at cursor moves: the wallet's
-    // cursor set past it directly.
-    store_parts(&replay, &[(1, 1)], 60, &at).await;
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("UPDATE apps SET cursor_generation = 1, cursor_seq = 10 WHERE account_id = $1")
-        .bind(alice_id())
-        .execute(&mut conn)
-        .await
-        .expect("cursor");
-    drop(conn);
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1]]));
-    // The next part stored: the passed part goes there, and only the new one is read.
-    let bundles = store_parts(&replay, &[(2, 2)], 61, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[2, 2]]));
-    let answer = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), &at).await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    let parts = body(&answer)["bundles"].as_array().expect("bundles").len();
-    assert_eq!((parts, bundles.len()), (1, 1));
-    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]

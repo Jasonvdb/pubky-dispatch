@@ -2172,12 +2172,16 @@ impl App {
         Ok(())
     }
 
-    /// How far apart the device clock and the service's are (Switch spec 10.1), `None`
-    /// before any verified answer.
+    /// The greater of the last sampled clock difference and the verified service time's
+    /// lead over the device clock (Switch spec 10.1). Without a stamped sample, this is
+    /// only a lower bound; `None` before any comparable answer.
     pub fn clock_skew_ms(&self) -> Option<u64> {
         let time = self.state.service_time?;
         let ahead = time.highest_ms.saturating_sub(self.now());
-        Some(time.offset_ms.unsigned_abs().max(ahead))
+        Some(
+            time.offset_ms
+                .map_or(ahead, |offset| offset.unsigned_abs().max(ahead)),
+        )
     }
 
     /// Reconciliation finished (Switch spec 12.4 step 2.4): reconcile mode ends, and with it
@@ -2833,6 +2837,9 @@ impl App {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;
         if self.reload {
+            // A refusal's time may still be dirty after a failed commit. Keep it before
+            // replacing memory with the stored state; a second failure stops this call.
+            self.keep_service_time().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
                 &self.env,
@@ -2879,6 +2886,9 @@ impl App {
         if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
             self.clear_erasing().await?;
         }
+        if result.is_err() {
+            self.keep_service_time().await?;
+        }
         match result {
             Ok(value) => Ok(value),
             Err(ClientError::Chain(error)) => Err(self
@@ -2890,55 +2900,72 @@ impl App {
         }
     }
 
-    /// The service time of the latest checked answer (Switch spec 10.1): the highest is
-    /// kept with its key, and its offset from the device clock; an earlier one from the
-    /// same key is misbehaviour, returned as the alarm.
-    fn note_service_time(&mut self) -> Option<Alarm> {
-        // Only the latest call's own stamped time: a refusal answered before the request
-        // verified carries the last committed time, and measures nothing (Switch wire 7.1).
-        let time = self.client.latest_server_time()?;
-        let now = self.now();
-        self.time_fresh_at = Some(now);
-        let key = self.state.meta.service_key;
-        let offset = i64::try_from(time)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX));
-        let mut alarm = None;
-        let record = match self.state.service_time {
-            Some(held) if held.key == key => {
-                if time < held.highest_ms {
-                    alarm = Some(Alarm::ServiceTimeBackwards {
-                        highest: held.highest_ms,
-                        signed: time,
-                    });
-                }
-                ServiceTime {
-                    key,
-                    highest_ms: held.highest_ms.max(time),
-                    offset_ms: offset,
-                }
-            }
-            _ => ServiceTime {
-                key,
-                highest_ms: time,
-                offset_ms: offset,
-            },
-        };
-        if time > now.saturating_add(SERVICE_TIME_AHEAD_MS)
-            || offset.unsigned_abs() > CLOCK_TOLERANCE_MS
-        {
-            let event = AppEvent::ClockSkew {
-                skew_ms: offset.unsigned_abs(),
-            };
-            if !self.events.contains(&event) {
-                self.events.push(event);
-            }
+    /// Keep comparison evidence even when a refusal has no other state to commit.
+    async fn keep_service_time(&mut self) -> Result<(), AppError> {
+        if self.service_time_dirty {
+            let tx = self.tx()?;
+            self.commit(tx).await?;
         }
+        Ok(())
+    }
+
+    /// Keep every comparable answer, independently of the latest stamped clock sample
+    /// (Switch spec 10.1). The first backward answer of an internal retry also counts.
+    fn note_service_time(&mut self) -> Option<Alarm> {
+        let compared = self.client.compared_times()?;
+        let key = self.state.meta.service_key;
+        let held = self.state.service_time.filter(|held| held.key == key);
+        let backwards = held
+            .filter(|held| compared.first < held.highest_ms)
+            .map(|held| (held.highest_ms, compared.first))
+            .or(compared.backwards);
+        let alarm =
+            backwards.map(|(highest, signed)| Alarm::ServiceTimeBackwards { highest, signed });
+        let highest_ms = held.map_or(compared.highest, |held| {
+            held.highest_ms.max(compared.highest)
+        });
+        // A headless refusal supplies a lower bound, never a clock-offset sample: on an
+        // idle account its last committed time may be days old (Switch wire 7.1).
+        let stamped = self
+            .client
+            .latest_compared_time()
+            .and(self.client.latest_server_time());
+        let offset_ms = match stamped {
+            Some(time) => {
+                let now = self.now();
+                self.time_fresh_at = Some(now);
+                Some(
+                    i64::try_from(time)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX)),
+                )
+            }
+            None => held.and_then(|held| held.offset_ms),
+        };
+        let record = ServiceTime {
+            key,
+            highest_ms,
+            offset_ms,
+        };
         if self.state.service_time != Some(record) {
             self.state.service_time = Some(record);
             self.service_time_dirty = true;
         }
+        // The same bound governs automatic attempts and their warning. A headless answer
+        // can prove the service ahead without measuring an offset (Switch spec 10.1).
+        self.warn_clock_skew();
         alarm
+    }
+
+    fn warn_clock_skew(&mut self) {
+        if let Some(skew_ms) = self.clock_skew_ms()
+            && skew_ms > CLOCK_TOLERANCE_MS
+        {
+            let event = AppEvent::ClockSkew { skew_ms };
+            if !self.events.contains(&event) {
+                self.events.push(event);
+            }
+        }
     }
 
     /// `POST /ops` with a batch whose body the caller committed: the answer's head goes to

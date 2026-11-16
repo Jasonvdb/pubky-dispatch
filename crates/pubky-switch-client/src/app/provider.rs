@@ -22,7 +22,7 @@
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
 //!   `403 not_current` answer from the service and generation the newest one names, while
 //!   it doesn't list the app with another certificate, means the app isn't current. A `404`
-//!   that the account's key didn't sign, while the identity publishes no `identity.json`,
+//!   that the pinned service key didn't sign, while the identity publishes no `identity.json`,
 //!   held at [`ERASURE_TRIES`] tries spread over [`ERASURE_WAIT_MS`], means its account is
 //!   gone. The app keeps that, stops and reports it; an erased account seen alive again
 //!   comes back.
@@ -193,7 +193,8 @@ pub(crate) enum TakeOver {
     ReadAgain,
 }
 
-/// What a `404` the account's key didn't sign means.
+/// What a `404` means that the pinned service key didn't sign, or that it signed for an identity
+/// the service doesn't host.
 enum Unknown {
     /// The account is gone.
     Gone,
@@ -432,6 +433,33 @@ impl App {
                 Ok(public) => public,
                 // An answer the pinned key didn't sign is looked into as at a read: a try
                 // of the erasure wait counts here too (Switch spec 12.7).
+                // The service's signed word that it doesn't host the identity is looked into
+                // the same way (Switch spec 12.7 step 5), but only from an answer to a
+                // request the app signed: the public read binds no timestamp, so its `404`
+                // verifies at any time (Switch wire 7.1 "Identical requests"). A page of no
+                // items asks.
+                Err(AppError::Switch(public)) if public.is_not_hosted() => {
+                    let signed = self
+                        .client
+                        .feed(FeedQuery {
+                            after: None,
+                            limit: Some(0),
+                            wait: None,
+                        })
+                        .await;
+                    let error = match self.take(signed).await {
+                        Err(AppError::Switch(error)) if error.is_not_hosted() => error,
+                        // Hosted after all, or no word: the read fails as it came.
+                        Ok(_) => return Err(AppError::Switch(public)),
+                        Err(error) => return Err(error),
+                    };
+                    self.reload_now().await?;
+                    return match self.not_hosted().await? {
+                        Unknown::Gone => Ok(ProviderStatus::Gone),
+                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Waiting(_) | Unknown::Unexplained => Err(AppError::Switch(error)),
+                    };
+                }
                 Err(error @ AppError::Switch(ClientError::BadServiceSignature { status })) => {
                     self.reload_now().await?;
                     return match self.unknown_account(status).await? {
@@ -569,8 +597,18 @@ impl App {
                 self.mark_gone(GoneReason::NotCurrent).await?;
                 Ok(TakeOver::Done(Ok(self.stopped_report())))
             }
+            AppError::Switch(not_hosted) if not_hosted.is_not_hosted() => {
+                // The service's signed word that it doesn't host the identity: the account is
+                // gone, or the identity went elsewhere. The own identity.json tells.
+                self.reload_now().await?;
+                match self.not_hosted().await? {
+                    Unknown::Gone => Ok(TakeOver::Done(Ok(self.stopped_report()))),
+                    Unknown::Moved => Ok(TakeOver::ReadAgain),
+                    Unknown::Waiting(_) | Unknown::Unexplained => Ok(TakeOver::Done(Err(error))),
+                }
+            }
             AppError::Switch(ClientError::BadServiceSignature { status }) => {
-                // An answer the pinned key didn't sign: the account's key changed, or the
+                // An answer the pinned key didn't sign: the pinned service key changed, or the
                 // account is gone. The own identity.json tells.
                 let status = *status;
                 self.reload_now().await?;
@@ -1804,7 +1842,7 @@ impl App {
         Ok(true)
     }
 
-    /// An answer the account's key didn't sign. A newer own `identity.json` is followed: a
+    /// An answer the pinned service key didn't sign. A newer own `identity.json` is followed: a
     /// key change or a move the app hadn't seen yet. For a `404`, the account may be erased
     /// (Switch spec 12.7): it is gone once the identity has published no `identity.json` at
     /// every try for [`ERASURE_WAIT_MS`], unless the verified own copy the app holds names a
@@ -1836,6 +1874,33 @@ impl App {
             Ok(None) => {
                 self.clear_erasing().await?;
                 Ok(Unknown::Unexplained)
+            }
+            Err(_) => Ok(Unknown::Unexplained),
+        }
+    }
+
+    /// The `404` the pinned key signed for an identity the service doesn't host, bound to the
+    /// app's own request (Switch wire 7.3 step 2). With no `identity.json` published, the two
+    /// together are an erasure, at once (Switch spec 12.7 step 5, wire 7.4.16 "Afterwards"),
+    /// unless the verified own copy the app holds names a later generation than it follows,
+    /// which is followed instead. A published `identity.json` that still names the service
+    /// ends nothing: the service counts as unreachable, and the call fails as it came. A
+    /// Homeserver it can't reach changes nothing.
+    async fn not_hosted(&mut self) -> Result<Unknown, AppError> {
+        let identity = self.state.meta.identity;
+        match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+            Ok(None) if self.provider_superseded() => Ok(Unknown::Moved),
+            Ok(None) => {
+                self.mark_gone(GoneReason::Erased).await?;
+                Ok(Unknown::Gone)
+            }
+            Ok(Some(doc)) => {
+                self.take_own_copy(doc).await?;
+                if self.state.own_doc.generation() > self.state.meta.generation {
+                    Ok(Unknown::Moved)
+                } else {
+                    Ok(Unknown::Unexplained)
+                }
             }
             Err(_) => Ok(Unknown::Unexplained),
         }

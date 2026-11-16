@@ -583,7 +583,7 @@ fn account_view<'a>(held: Option<&'a IdentityDoc>, origin: &'a str) -> AccountVi
         app_limit: 32,
         staged: false,
         origin,
-        pending_key: None,
+        enrollment_key: None,
         kept_app_ids: &[],
         kept_proofs: KeptProofs::default(),
     }
@@ -683,8 +683,12 @@ fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
             assert_eq!(e.revoked_apps(), [removed]);
         }
         // An answer for it, checked as the signer checks it.
-        let answer =
-            records::EnrollmentAnswer::new(&e, v3.inbox().service_key, records::Limits::default());
+        let answer = records::EnrollmentAnswer::new(
+            &e,
+            v3.inbox().service_key,
+            records::Limits::default(),
+            0,
+        );
         answer.check(&e).unwrap();
     }
 }

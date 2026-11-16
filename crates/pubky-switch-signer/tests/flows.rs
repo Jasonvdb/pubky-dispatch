@@ -1144,6 +1144,40 @@ async fn test_signer_run_never_republishes_over_another_body_or_a_newer_copy() {
 }
 
 #[tokio::test]
+async fn test_signer_too_large_that_binds_the_body_is_final() {
+    // A `413 too_large` that binds the delivery as sent, its body included, refuses those
+    // bytes for good: the version stays spent and isn't sent again (Switch wire 7.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world
+        .switch
+        .fail_next(pubky_switch_client::testing::Fault::Error {
+            path: "/identity".into(),
+            code: pubky_switch_core::http::ErrorCode::TooLarge,
+            current: serde_json::Value::Null,
+        });
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::Switch { status: 413, .. })
+        ),
+        "{error:?}"
+    );
+    let refused = world.sent_docs().last().unwrap().clone();
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        world
+            .sent_docs()
+            .iter()
+            .filter(|doc| doc.version() == refused.version())
+            .count(),
+        1,
+        "the refused version isn't sent again"
+    );
+}
+
+#[tokio::test]
 async fn test_signer_too_large_before_the_body_isnt_final() {
     // A `413 too_large` the switch gave before it read the body binds no body: it may answer
     // a request whose length was changed on the way, so the delivery isn't refused for good.

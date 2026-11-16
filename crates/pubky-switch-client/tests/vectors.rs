@@ -348,9 +348,10 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
             outcome(client.export_chunk(chunk).await)
         }
         ("POST", "erase") => {
-            // The `identity.json` the erasure follows, when it names one (Switch wire 7.4.16).
+            // The account's creation time, and the `identity.json` the erasure follows, when
+            // it names one (Switch wire 7.4.16).
             let named = pubky_switch_core::http::parse_erase_body(&body).unwrap();
-            outcome(client.erase(named.identity_hash).await)
+            outcome(client.erase(named.created, named.identity_hash).await)
         }
         ("PUT", "peers") => {
             let doc: SignedDoc = serde_json::from_slice(&body).unwrap();
@@ -466,6 +467,38 @@ fn account_of_key(keys: &Keys, public: &[u8; 32]) -> Option<[u8; 32]> {
 }
 
 #[test]
+fn test_vectors_http_received_cases_are_final_for_nothing() {
+    // An answer to the request as the service received it, otherwise than the client sent
+    // it, isn't the answer to what the client sent: a `413` over the empty body field is a
+    // failed call, final for nothing, and the rest fail as a signature that doesn't verify,
+    // an empty `Switch-Head` included (Switch wire 7.1).
+    let keys = keys();
+    let v = load("http.json");
+    let cases = arr(&v, "received_cases");
+    assert_eq!(cases.len(), 4);
+    for r in cases {
+        let name = st(r, "name");
+        let public = b32(st(r, "public_key"));
+        let account = account_of_key(&keys, &public).unwrap();
+        let sent = SentRequest::of(&request_answered(&v, r));
+        let checked = check_response(&public, &account, &sent, &response_of(r));
+        let status = u16::try_from(r["status"].as_u64().unwrap()).unwrap();
+        if r["received"]["body"] == "not read" {
+            assert!(
+                matches!(checked, Err(ClientError::BodyUnread { status: 413, .. })),
+                "{name}: {checked:?}"
+            );
+        } else {
+            assert_eq!(
+                checked,
+                Err(ClientError::BadServiceSignature { status }),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_vectors_http_responses_checked_with_the_pinned_key() {
     let keys = keys();
     let v = load("http.json");
@@ -473,29 +506,12 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
         let name = st(r, "name");
         let response = response_of(r);
         let public = b32(st(r, "public_key"));
+        let account = account_of_key(&keys, &public)
+            .unwrap_or_else(|| panic!("{name}: a service key of keys.json"));
         // The request it answers, as the client sent it, which the signature covers (wire
         // 7.1).
         let request = request_answered(&v, r);
         let sent = SentRequest::of(&request);
-        let Some(account) = account_of_key(&keys, &public) else {
-            // The operator's key, which no client knows: unauthenticated with any account
-            // key a client pins.
-            assert_eq!(response.status, 404, "{name}");
-            for (account, key) in &keys.services {
-                assert_eq!(
-                    check_response(
-                        &key.verifying_key().to_bytes(),
-                        &pubky_key(account).unwrap(),
-                        &sent,
-                        &response,
-                    )
-                    .unwrap_err(),
-                    ClientError::BadServiceSignature { status: 404 },
-                    "{name}"
-                );
-            }
-            continue;
-        };
         let checked = check_response(&public, &account, &sent, &response);
         if response.status < 300 {
             let checked = checked.unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -557,7 +573,18 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
         // none (wire 7.4.15).
         let added = changed(&|r| r.headers.push(Header::new(header::TRANSFER, "")));
         if pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query) {
-            assert!(check_response(&public, &account, &added, &response).is_ok());
+            // Checked as the answer to the request as sent: taken, or, for the not-hosted
+            // `404`, the error it signs, never a signature that doesn't verify.
+            let added = check_response(&public, &account, &added, &response);
+            assert!(
+                !matches!(added, Err(ClientError::BadServiceSignature { .. })),
+                "{name}: {added:?}"
+            );
+            assert_eq!(
+                added.err(),
+                check_response(&public, &account, &sent, &response).err(),
+                "{name}"
+            );
         } else {
             others.push(added);
         }

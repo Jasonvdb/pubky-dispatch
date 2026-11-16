@@ -2,11 +2,10 @@
 //! (7.4.12) and the deletion of claims whose time has passed (7.3 step 4).
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, ProofState, ServiceTransition, TransitionProof, item_hash},
+    chain::{ItemType, ProofBody, ProofState, ServiceTransition, item_hash},
     enc::{unb64_array, zbase32_decode},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
-    sig::SignedDoc,
 };
 use serde_json::json;
 
@@ -250,10 +249,7 @@ impl Service {
         };
         let kept = txn.keep_removed(&app, reason, time_ms, data_epoch).await;
         kept.map_err(|e| store_error(&e))?;
-        let identity = txn.head().identity_key;
-        let signed: SignedDoc = transition
-            .sign(signer, &identity)
-            .map_err(|_| temporary())?;
+        let signed = self.sign_transition(txn, signer, &transition)?;
         let item_bytes = signed.doc_bytes().map_err(|_| temporary())?;
         let hash = item_hash(ItemType::Service, &item_bytes);
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
@@ -286,12 +282,11 @@ impl Service {
             .await
             .map_err(|e| store_error(&e))?;
         let object = transition.proof_object().ok_or_else(temporary)?;
-        let proof = TransitionProof::sign(
+        let proof = self.sign_proof(
+            txn,
             signer,
-            &identity,
             ProofBody::new(stub, object, &ProofState::Service(transition.to_value())),
-        )
-        .map_err(|_| temporary())?;
+        )?;
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let body = super::identity::write_answer(&[proof.signed()], &head.to_json())?;
         Ok(Answer::ok(body).with_head(Some(head)))

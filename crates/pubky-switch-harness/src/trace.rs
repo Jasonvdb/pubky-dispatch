@@ -187,7 +187,7 @@ pub struct Recorder {
     distortion: Mutex<Option<Distortion>>,
     /// The faults to apply, each once, in the order added.
     faults: Mutex<Vec<Fault>>,
-    /// The enrollments sent, in order, as they were sent.
+    /// The different enrollments sent, in order, each as it was first sent.
     enrollments: Mutex<Vec<Request>>,
     /// The requests held back on their way: the method, and a part of the path.
     held_back: Mutex<Option<HeldBack>>,
@@ -509,8 +509,13 @@ impl Transport for Recorder {
             let sent = request.clone();
             if request.method == "POST" && request.path_and_query == "/v1/enroll" {
                 let mut enrollments = lock(&self.enrollments);
-                // One sent again is the same enrollment, not another.
-                if !enrollments.contains(&request) {
+                // One sent again is the same enrollment, not another, whenever it is sent:
+                // its body, the signed enrollment, stays the same bytes (Switch wire 7.4.1
+                // Errors), while the request's own signature and time are new at each run.
+                if !enrollments
+                    .iter()
+                    .any(|kept| kept.origin == request.origin && kept.body == request.body)
+                {
                     enrollments.push(request.clone());
                 }
             }
@@ -727,6 +732,7 @@ fn carried_json(text: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use pubky_switch_client::transport::Header;
     use pubky_switch_core::enc::b64;
     use serde_json::json;
 
@@ -915,21 +921,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enrollments_sent_count_one_sent_again_at_another_time_once() {
+        let (recorder, _inner) = recorder();
+        let enroll = |body: &[u8], timestamp: &str| Request {
+            path_and_query: "/v1/enroll".into(),
+            headers: vec![Header::new(header::TIMESTAMP, timestamp)],
+            body: body.to_vec(),
+            ..post("/v1/enroll")
+        };
+        recorder.send(enroll(b"first", "1")).await.unwrap();
+        recorder.send(enroll(b"first", "2")).await.unwrap();
+        assert_eq!(
+            recorder.enrollments_sent(),
+            1,
+            "the same enrollment, sent again"
+        );
+        assert_eq!(
+            recorder.enrollment(0).map(|sent| sent.headers),
+            Some(vec![Header::new(header::TIMESTAMP, "1")]),
+            "kept as it was first sent"
+        );
+        recorder.send(enroll(b"second", "2")).await.unwrap();
+        assert_eq!(recorder.enrollments_sent(), 2, "another enrollment");
+    }
+
+    #[tokio::test]
     async fn test_fault_refuse_answers_unsigned_in_the_switchs_place_once() {
         let (recorder, inner) = recorder();
         recorder.fail_next(Fault::Refuse {
             method: "POST".into(),
             path: "/v1/enroll".into(),
-            status: 409,
-            code: "conflict".into(),
+            status: 503,
+            code: "unavailable".into(),
         });
         // Another call isn't touched.
         let other = recorder.send(post("/v1/abc/ops")).await.unwrap();
         assert_eq!(other.status, 200);
         let refused = recorder.send(post("/v1/enroll")).await.unwrap();
-        assert_eq!(refused.status, 409);
+        assert_eq!(refused.status, 503);
         let body: Value = serde_json::from_slice(&refused.body).unwrap();
-        assert_eq!(body["code"], "conflict");
+        assert_eq!(body["code"], "unavailable");
         assert!(
             refused.header(header::SERVICE_SIGNATURE).is_none(),
             "no key signs it"
@@ -947,8 +978,8 @@ mod tests {
             fact(1, "fault").as_deref(),
             Some("an answer no key signs came back in the switch's place")
         );
-        assert_eq!(fact(1, "status").as_deref(), Some("409"));
-        assert_eq!(fact(1, "body.code").as_deref(), Some("text conflict"));
+        assert_eq!(fact(1, "status").as_deref(), Some("503"));
+        assert_eq!(fact(1, "body.code").as_deref(), Some("text unavailable"));
         assert_eq!(fact(1, SIGNED_WITH), None, "the checker isn't asked");
         assert_eq!(fact(2, "fault"), None);
     }

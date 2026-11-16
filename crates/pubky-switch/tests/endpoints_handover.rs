@@ -693,7 +693,7 @@ async fn test_handover_staged_account_is_unavailable() {
     let Some(replay) = replay().await else { return };
     let enrolled = http_case(
         "responses",
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     set_time(
         &replay.clock,

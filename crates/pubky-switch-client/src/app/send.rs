@@ -2876,6 +2876,11 @@ impl App {
     /// ([`super::Protocol::may_send`]). A message whose kind no protocol owns goes to its
     /// try; unreadable plaintext or unavailable protocol evidence keeps the delivery held.
     fn may_send(&self, item: &OutboxItem) -> bool {
+        // Retained-copy validation binds this routing kind to the authenticated JSON.
+        // An absent owner supplies no body rules and imposes no protocol hold.
+        let Some(owner) = self.protocols.of_kind(&item.kind) else {
+            return true;
+        };
         let Ok(plaintext) = item.plaintext() else {
             return false;
         };
@@ -2889,9 +2894,6 @@ impl App {
             .collect();
         let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
             return false;
-        };
-        let Some(owner) = self.protocols.of_kind(&message.kind) else {
-            return true;
         };
         let local = super::LocalView::new(
             self.state.meta.identity,

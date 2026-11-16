@@ -2,6 +2,126 @@ use super::*;
 use crate::app::{DeliveryOrigin, QueuedMessage};
 use crate::error::StoreError;
 
+struct OpaqueDelivery {
+    opaque: bool,
+}
+
+impl Protocol for OpaqueDelivery {
+    fn name(&self) -> String {
+        "retired".into()
+    }
+    fn has_keys(&self, _: &str) -> bool {
+        false
+    }
+    fn sent_between_own_apps(&self, _: &str) -> bool {
+        false
+    }
+    fn check_scopes(&self, _: &Message, _: &AppCert, _: &AppCert) -> Result<(), String> {
+        Ok(())
+    }
+    fn accepts(&self, _: &AppCert) -> Vec<String> {
+        vec!["retired.note".into()]
+    }
+    fn check_body(&self, _: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+    fn resend_needed(
+        &self,
+        _: &crate::app::ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        Ok(vec![])
+    }
+    fn missed(
+        &self,
+        _: &crate::app::MissedEntries,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        Ok(vec![])
+    }
+    fn opaque_members(&self) -> Vec<crate::app::OpaqueRule> {
+        if self.opaque {
+            vec![crate::app::OpaqueRule {
+                kind: None,
+                member: "rate".into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_delivery_view_unowned_opaque_sealed_retry_preserves_owner_boundary() {
+    Box::pin(async {
+        for keep_owner in [false, true] {
+            for rate in [json!(1), json!(1.5)] {
+                let p = Pair::new();
+                let sample = ApiProtocol::new(Mode::Plain);
+                let protocols = crate::app::ProtocolSet::new(vec![
+                    sample.clone(),
+                    Arc::new(OpaqueDelivery { opaque: true }),
+                ])
+                .unwrap();
+                let mut wallet = p
+                    .join_set(&p.alice, "wallet", protocols.clone(), &["sample-a"])
+                    .await;
+                let mut shop = p.join_set(&p.bob, "shop", protocols, &["sample-a"]).await;
+                let alice = p.alice.identity().public();
+                shop.invite(&alice).await.unwrap();
+                let id = wallet
+                    .queue(OutgoingMessage::new(
+                        p.bob.identity().public(),
+                        "retired.note",
+                        json!({"rate": rate}).as_object().unwrap().clone(),
+                    ))
+                    .await
+                    .unwrap();
+                p.bob.switch().fail_next(Fault::Unreachable {
+                    path: "/inbox".into(),
+                    after: 0,
+                });
+                wallet.flush_message(&id).await.unwrap();
+                let retained: Value = wallet
+                    .reader()
+                    .get(&format!("out/{id}"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(retained["sealed"].is_object());
+                assert_eq!(p.bob.switch().entries_from(&alice), 0);
+                let backup = wallet.backup().await.unwrap();
+                drop(wallet);
+                let mut current: Vec<Arc<dyn Protocol>> = vec![sample];
+                if keep_owner {
+                    current.push(Arc::new(OpaqueDelivery { opaque: false }));
+                }
+                let current = crate::app::ProtocolSet::new(current).unwrap();
+                let mut restored = App::restore(
+                    p.env(&p.alice, Arc::new(MemoryStore::new())),
+                    current,
+                    config(),
+                    &backup,
+                )
+                .await
+                .unwrap();
+                let listed = restored
+                    .queued_messages(if keep_owner { "retired" } else { "sample" })
+                    .await
+                    .unwrap();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0].kind, "retired.note");
+                restored.flush_message(&id).await.unwrap();
+                let allowed = !keep_owner || rate == json!(1);
+                assert_eq!(
+                    (p.bob.switch().entries_from(&alice), listed[0].may_send),
+                    (usize::from(allowed), allowed),
+                    "an unowned sealed copy retries; an owned body still obeys its parser"
+                );
+            }
+        }
+    })
+    .await;
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct DeliveryFact {
     owner: [u8; 32],

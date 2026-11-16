@@ -51,7 +51,7 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::feed::OwedCall;
-use super::protocol::{DenyListChange, MissedEntries, ResendNeeded, StoreFailure};
+use super::protocol::{DenyListChange, EntryReceipt, MissedEntries, ResendNeeded, StoreFailure};
 use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
@@ -127,6 +127,25 @@ impl EventId {
             epoch: epoch.try_into().map_err(|_| EventIdError)?,
             counter: u64::from_be_bytes(counter.try_into().map_err(|_| EventIdError)?),
         })
+    }
+}
+
+mod event_id {
+    use super::{EVENT_ID_LEN, EventId};
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        id: &EventId,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        pubky_switch_core::enc::serde_b64::serialize(&id.to_bytes(), serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<EventId, D::Error> {
+        let bytes: [u8; EVENT_ID_LEN] =
+            pubky_switch_core::enc::serde_b64::deserialize(deserializer)?;
+        EventId::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -338,18 +357,18 @@ pub enum AppEvent {
         accepted_at_ms: u64,
         /// Which bound it was past.
         reason: DropReason,
-        /// The data epoch whose scope key the entry waited for
-        /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
-        /// checked.
-        awaited_epoch: Option<u64>,
-        /// The `msg_id` of the message given up: named only for an entry that waited for a
-        /// scope key, which passed the recipient checks before it was stored, so its sender
-        /// signed it, and only when nothing else may still apply the message: no other entry
-        /// stored locally holds it, no kept effect is its, and it isn't processed. A copy
-        /// dropped while another still waits names none; the last to go names it. `None` too
-        /// for an entry whose sender couldn't be checked, whose `msg_id` no check stands
-        /// behind.
-        msg_id: Option<String>,
+        /// What the input waited for when it was selected.
+        waiting: WaitingReason,
+        /// The identity established for this signed input. Losing this copy says nothing
+        /// about another copy, a processed pair or an effect still kept for the message.
+        message: StoredMessageIdentity,
+        /// Whether the sender's standing was checked before this input was stored.
+        sender_verified: bool,
+        /// The original verified response observation, not a portable signed proof.
+        receipt: EntryReceipt,
+        /// The immutable identity of this notice across restore. `id` names its current
+        /// delivery; this identity names the same obligation when delivery IDs change.
+        notice_id: EventId,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -1035,10 +1054,12 @@ pub(crate) enum Duty {
         sender: [u8; 32],
         accepted_at_ms: u64,
         reason: DropReason,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        awaited_epoch: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        msg_id: Option<String>,
+        waiting: WaitingReason,
+        message: StoredMessageIdentity,
+        sender_verified: bool,
+        receipt: EntryReceipt,
+        #[serde(with = "event_id")]
+        notice_id: EventId,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -1166,8 +1187,11 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
-                awaited_epoch,
-                msg_id,
+                waiting,
+                message,
+                sender_verified,
+                receipt,
+                notice_id,
             } => AppEvent::StoredEntryDropped {
                 id,
                 stored_id,
@@ -1176,8 +1200,11 @@ impl Duty {
                 sender,
                 accepted_at_ms,
                 reason,
-                awaited_epoch,
-                msg_id,
+                waiting,
+                message,
+                sender_verified,
+                receipt,
+                notice_id,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -1255,6 +1282,40 @@ pub enum DropReason {
     Total,
 }
 
+/// What a locally retained input waits for (Switch spec 8.2). All three reasons share
+/// the same custody bounds and selection order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WaitingReason {
+    /// Its sender's standing could not be checked.
+    Sender,
+    /// Its receive step needs a scope key.
+    Key {
+        /// The epoch whose key is needed.
+        data_epoch: u64,
+    },
+    /// Its protocol has not admitted this input under its ordinary retained-state rule.
+    Admission,
+}
+
+/// The established identity of a signed input whose payload was dropped. These fields
+/// identify the lost copy; without its bytes they cannot reverify its signature.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredMessageIdentity {
+    /// The signing app's ID.
+    #[serde(with = "serde_b64")]
+    pub app_id: [u8; 16],
+    /// The signed message ID.
+    pub msg_id: String,
+    /// The signed message kind.
+    pub kind: String,
+    /// The signed plaintext's hash.
+    #[serde(with = "serde_b64")]
+    pub hash: [u8; 32],
+    /// The verified certificate's hash.
+    #[serde(with = "serde_b64")]
+    pub certificate_hash: [u8; 32],
+}
+
 /// Why an entry was stored locally (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -1263,6 +1324,9 @@ pub enum ParkReason {
     /// read, within the bounds Switch spec 8.2 sets: past them it is dropped
     /// ([`AppEvent::StoredEntryDropped`]).
     Unverifiable,
+    /// Its protocol has not admitted this input. It is tried again by the next scheduled
+    /// stored-input pass and shares the sender/key waiting bounds (Switch spec 8.2).
+    AwaitingAdmission,
     /// Its shared record write hit a per-kind limit, the storage quota or the value size.
     Quota,
     /// Its effect's batch was refused for good (Switch spec 6.4): it is kept, not applied,
@@ -1329,6 +1393,7 @@ impl ParkReason {
         matches!(
             self,
             Self::Unverifiable
+                | Self::AwaitingAdmission
                 | Self::Quota
                 | Self::StoreUnavailable
                 | Self::StoreRejected
@@ -1341,7 +1406,16 @@ impl ParkReason {
     /// (`unverified.rs`): those whose sender couldn't be checked and those that wait for a
     /// scope key, together.
     pub(crate) fn bounded(self) -> bool {
-        matches!(self, Self::Unverifiable | Self::AwaitingKey { .. })
+        self.waiting().is_some()
+    }
+
+    pub(crate) fn waiting(self) -> Option<WaitingReason> {
+        match self {
+            Self::Unverifiable => Some(WaitingReason::Sender),
+            Self::AwaitingKey { data_epoch } => Some(WaitingReason::Key { data_epoch }),
+            Self::AwaitingAdmission => Some(WaitingReason::Admission),
+            _ => None,
+        }
     }
 
     /// The data epoch an entry stored for this reason waits for, if it waits for a key.

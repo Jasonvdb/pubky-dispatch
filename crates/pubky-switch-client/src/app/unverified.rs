@@ -28,10 +28,12 @@
 
 use std::collections::BTreeMap;
 
-use pubky_switch_core::records::DAY_MS;
+use pubky_switch_core::message::{MessagePlaintext, VerifiedSender};
+use pubky_switch_core::records::{AppCert, DAY_MS};
 
-use super::events::{DropReason, Duty, ParkReason};
-use super::state::ParkedEntry;
+use super::events::{AppEvent, DropReason, Duty, EventId, ParkReason, StoredMessageIdentity};
+use super::protocol::Rules;
+use super::state::{ParkedEntry, RetryEntry, Tx, key};
 use super::{App, AppError};
 
 /// How long an entry stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingKey`]
@@ -129,93 +131,194 @@ pub(crate) fn over_bounds(entries: &[Counted], verified_ms: Option<u64>) -> Vec<
     drops
 }
 
-impl App {
-    /// Apply the bounds on entries stored as [`ParkReason::Unverifiable`] or
-    /// [`ParkReason::AwaitingKey`] (Switch spec 8.2): drop every entry past them, at most
-    /// [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each commit deleting the entries with
-    /// their retry counts and keeping a [`super::AppEvent::StoredEntryDropped`] for each.
-    ///
-    /// The entry a kept effect belongs to ([`super::state::PendingEffect::stored`]) is
-    /// neither counted nor dropped, whoever calls this: its effect may have been applied,
-    /// and its outcome is finished only with it, by the app or by one restored from a
-    /// backup taken meanwhile. It is bounded again once its effect settles.
-    pub(crate) async fn bound_unverified(&mut self) -> Result<(), AppError> {
-        let kept = self
-            .state
-            .pending_effect
-            .as_ref()
-            .and_then(|pending| pending.stored);
-        let counted: Vec<Counted> = self
-            .state
-            .parked
-            .iter()
-            .filter(|(id, stored)| ParkReason::bounded(stored.reason) && Some(**id) != kept)
-            .map(|(id, stored)| Counted {
-                id: *id,
-                sender: stored.sender,
-                accepted_at_ms: stored.accepted_at_ms,
-            })
-            .collect();
-        let drops = over_bounds(&counted, self.highest_service_time());
-        for step in drops.chunks(UNVERIFIED_DROPS_PER_COMMIT) {
-            let mut tx = self.tx()?;
-            for (id, reason) in step {
-                let Some(stored) = self.state.parked.get(id).cloned() else {
-                    continue;
-                };
-                let given_up = self.given_up(*id, &stored).await?;
-                self.keep_duty(&mut tx, dropped(*id, &stored, *reason, given_up))?;
-                self.unpark(Some(*id), &mut tx)?;
-            }
-            self.commit(tx).await?;
+/// A complete custody change, sized before it changes the app's in-memory state.
+pub(crate) struct WaitingChange {
+    tx: Tx,
+    candidate: Option<(u64, ParkedEntry)>,
+    removed: Vec<u64>,
+    retry_remove: Vec<u64>,
+    retry_move: Option<(u64, RetryEntry)>,
+    feed: Option<u64>,
+    next_stored_id: u64,
+    next_duty: u64,
+}
+
+impl WaitingChange {
+    pub(crate) fn size(&self) -> u64 {
+        self.tx.size()
+    }
+
+    pub(crate) fn retained(&self, id: u64) -> bool {
+        self.candidate.as_ref().is_some_and(|(kept, _)| *kept == id)
+    }
+
+    /// The writes fit before any matching in-memory change takes effect.
+    pub(crate) fn stage(self, app: &mut App, tx: &mut Tx) -> Result<(), AppError> {
+        tx.append(self.tx)?;
+        for id in self.removed {
+            app.state.parked.remove(&id);
         }
+        for id in self.retry_remove {
+            app.state.stored_retries.remove(&id);
+        }
+        if let Some(seq) = self.feed {
+            app.state.held.remove(&seq);
+            app.state.retries.remove(&seq);
+        }
+        if let Some((id, retry)) = self.retry_move {
+            app.state.stored_retries.insert(id, retry);
+        }
+        if let Some((id, stored)) = self.candidate {
+            app.state.parked.insert(id, stored);
+        }
+        app.state.next_stored_id = self.next_stored_id;
+        app.state.next_duty = self.next_duty;
         Ok(())
     }
 }
 
 impl App {
-    /// The `msg_id` of the message an entry dropped past the bounds gives up: only for an
-    /// entry that waited for a key, which passed the checks of its sender before it was
-    /// stored (Switch wire 5.1), so its `msg_id` is the signed one; and only when nothing
-    /// else may still apply the message: no other entry stored locally holds it, whatever
-    /// it waits for, no kept effect is its, and it isn't processed already. A copy dropped
-    /// while another waits names none; the last copy to go names it.
-    async fn given_up(&self, id: u64, stored: &ParkedEntry) -> Result<Option<String>, AppError> {
-        if stored.reason.awaited_epoch().is_none() {
-            return Ok(None);
+    /// Apply the shared sender/key/admission bounds before retry or backup. A pending
+    /// effect's input is protected until its outcome settles (Switch spec 8.2, 11).
+    pub(crate) async fn bound_unverified(&mut self) -> Result<(), AppError> {
+        loop {
+            let drops = self.waiting_drops(None);
+            if drops.is_empty() {
+                return Ok(());
+            }
+            let step = &drops[..drops.len().min(UNVERIFIED_DROPS_PER_COMMIT)];
+            let change = self.waiting_change(None, None, step)?;
+            let mut tx = self.tx()?;
+            change.stage(self, &mut tx)?;
+            self.commit(tx).await?;
         }
-        let Some(msg_id) = super::parked::stored_msg_id(stored) else {
-            return Ok(None);
+    }
+
+    /// Count the currently staged pool and the incoming input together. No protected
+    /// pending input is made evictable by a change of its cached waiting reason.
+    pub(crate) fn waiting_drops(
+        &self,
+        candidate: Option<(u64, &ParkedEntry)>,
+    ) -> Vec<(u64, DropReason)> {
+        let pending = self.state.pending_effect.as_ref().and_then(|effect| effect.stored);
+        let mut counted: Vec<Counted> = self.state.parked.iter()
+            .filter(|(id, stored)| stored.reason.bounded() && Some(**id) != pending
+                && candidate.is_none_or(|(incoming, _)| incoming != **id))
+            .map(|(id, stored)| counted_entry(*id, stored))
+            .collect();
+        if let Some((id, stored)) = candidate {
+            counted.push(counted_entry(id, stored));
+        }
+        over_bounds(&counted, self.highest_service_time())
+    }
+
+    /// Stage one indivisible input-inclusive selection, or an upkeep-only set of drops.
+    /// `feed` is present only for a new local ID taken by an input still on the feed.
+    pub(crate) fn waiting_change(
+        &self,
+        candidate: Option<(u64, ParkedEntry)>,
+        feed: Option<u64>,
+        drops: &[(u64, DropReason)],
+    ) -> Result<WaitingChange, AppError> {
+        let mut change = WaitingChange {
+            tx: Tx::new(&self.ns), candidate, removed: Vec::new(),
+            retry_remove: Vec::new(), retry_move: None, feed,
+            next_stored_id: self.state.next_stored_id, next_duty: self.state.next_duty,
         };
-        let held_elsewhere = self.state.parked.iter().any(|(other, entry)| {
-            *other != id
-                && entry.sender == stored.sender
-                && super::parked::stored_msg_id(entry).as_deref() == Some(msg_id.as_str())
-        });
-        let kept = self
-            .state
-            .pending_effect
-            .as_ref()
-            .is_some_and(|pending| pending.sender == stored.sender && pending.msg_id == msg_id);
-        let processed = self
-            .reader()
-            .exists(&super::state::key::processed(&stored.sender, &msg_id))
-            .await?;
-        Ok((!held_elsewhere && !kept && !processed).then_some(msg_id))
+        if let Some((id, stored)) = &change.candidate {
+            if !stored.reason.bounded()
+                || self.state.pending_effect.as_ref().is_some_and(|effect| effect.stored == Some(*id))
+                || self.state.parked.get(id).is_some_and(|old| old.reason == ParkReason::Uncertain)
+            {
+                return Err(super::corrupt());
+            }
+            self.waiting_identity(stored)?;
+            if let Some(seq) = feed {
+                if *id != self.state.next_stored_id || self.state.parked.contains_key(id) {
+                    return Err(super::corrupt());
+                }
+                change.next_stored_id = id.checked_add(1).ok_or_else(super::corrupt)?;
+                change.tx.put(key::STORED_NEXT, &change.next_stored_id)?;
+                change.tx.delete(&key::held(seq))?;
+                change.tx.delete(&key::retry(seq))?;
+            } else if !self.state.parked.contains_key(id) {
+                return Err(super::corrupt());
+            }
+            if !drops.iter().any(|(dropped, _)| dropped == id) {
+                change.tx.put(&key::parked(*id), stored)?;
+                if stored.reason == ParkReason::Unverifiable {
+                    if let Some(retry) = feed.and_then(|seq| self.state.retries.get(&seq)).copied() {
+                        change.tx.put(&key::stored_retry(*id), &retry)?;
+                        change.retry_move = Some((*id, retry));
+                    }
+                } else {
+                    change.tx.delete(&key::stored_retry(*id))?;
+                    change.retry_remove.push(*id);
+                }
+                if self.state.parked.get(id).is_none_or(|old| old.reason != stored.reason) {
+                    change.tx.report(AppEvent::Parked {
+                        id: None, seq: stored.seq, stored_id: *id, reason: stored.reason,
+                    });
+                }
+            }
+        }
+        for (id, reason) in drops {
+            let stored = change.candidate.as_ref().filter(|(incoming, _)| incoming == id)
+                .map(|(_, stored)| stored).or_else(|| self.state.parked.get(id))
+                .ok_or_else(super::corrupt)?;
+            let event = EventId::new(self.state.duty_epoch.epoch, change.next_duty);
+            let duty = self.waiting_notice(*id, stored, *reason, event)?;
+            change.tx.put(&key::duty(change.next_duty), &duty)?;
+            change.next_duty = change.next_duty.checked_add(1).ok_or_else(super::corrupt)?;
+            change.tx.report(duty.event(event));
+            change.tx.delete(&key::parked(*id))?;
+            change.tx.delete(&key::stored_retry(*id))?;
+            change.removed.push(*id);
+            change.retry_remove.push(*id);
+        }
+        if change.next_duty != self.state.next_duty {
+            change.tx.put(key::DUTY_NEXT, &change.next_duty)?;
+        }
+        if change.candidate.as_ref().is_some_and(|(id, _)| change.removed.contains(id)) {
+            change.candidate = None;
+        }
+        Ok(change)
+    }
+
+    /// Revalidate retained signed bytes without requiring current sender standing.
+    /// A notice carries only the resulting identity, never these bytes (Switch spec 8.2).
+    pub(crate) fn waiting_identity(&self, stored: &ParkedEntry) -> Result<StoredMessageIdentity, AppError> {
+        let cert = AppCert::verify(&stored.cert, &stored.sender).map_err(|_| super::corrupt())?;
+        if cert.expired_at(stored.accepted_at_ms) || stored.accepted_at_ms > stored.receipt.read_at_ms {
+            return Err(super::corrupt());
+        }
+        let plaintext = MessagePlaintext::decode(&stored.plaintext).map_err(|_| super::corrupt())?;
+        let opaque = self.protocol.opaque_members();
+        let rules = Rules::new(self.protocol.as_ref(), &self.state.cert, &opaque);
+        let message = plaintext.check(&self.state.meta.identity, &stored.sender,
+            &VerifiedSender::from_cert(&cert), &rules.opaque).map_err(|_| super::corrupt())?;
+        Ok(StoredMessageIdentity {
+            app_id: message.from.app_id, msg_id: message.msg_id, kind: message.kind,
+            hash: plaintext.hash(), certificate_hash: cert.hash(),
+        })
+    }
+
+    pub(crate) fn waiting_notice(
+        &self, id: u64, stored: &ParkedEntry, reason: DropReason, notice_id: EventId,
+    ) -> Result<Duty, AppError> {
+        Ok(Duty::StoredEntryDropped {
+            stored_id: id, seq: stored.seq, generation: stored.generation, sender: stored.sender,
+            accepted_at_ms: stored.accepted_at_ms, reason,
+            waiting: stored.reason.waiting().ok_or_else(super::corrupt)?,
+            message: self.waiting_identity(stored)?,
+            sender_verified: stored.reason != ParkReason::Unverifiable,
+            receipt: stored.receipt, notice_id,
+        })
     }
 }
 
-fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason, msg_id: Option<String>) -> Duty {
-    Duty::StoredEntryDropped {
-        stored_id: id,
-        seq: stored.seq,
-        generation: stored.generation,
-        sender: stored.sender,
-        accepted_at_ms: stored.accepted_at_ms,
-        reason,
-        awaited_epoch: stored.reason.awaited_epoch(),
-        msg_id,
-    }
+fn counted_entry(id: u64, stored: &ParkedEntry) -> Counted {
+    Counted { id, sender: stored.sender, accepted_at_ms: stored.accepted_at_ms }
 }
 
 #[cfg(test)]

@@ -294,8 +294,13 @@ impl SwitchClient {
         let checked = self.get(&query.path(), query.timeout()).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
-        let page = FeedPage::read(Obj::of(&value, what)?, &self.account())?;
         let key = self.key()?;
+        let page = FeedPage::read(
+            Obj::of(&value, what)?,
+            &self.account(),
+            checked.server_time_ms,
+            key,
+        )?;
         verify_head(&page.head, &key, &self.account())?;
         if let Some(checkpoint) = &page.checkpoint {
             verify_head(checkpoint, &key, &self.account())?;

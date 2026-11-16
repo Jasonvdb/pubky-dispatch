@@ -78,10 +78,27 @@ pub struct OpaqueRule {
     pub member: String,
 }
 
+/// The original observation of an inbox input in a verified feed response (Switch spec
+/// 8.2). This is retained metadata, not a portable signed proof of acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntryReceipt {
+    /// The inbox entry's ID.
+    #[serde(with = "pubky_switch_core::enc::serde_b64")]
+    pub entry_id: [u8; 16],
+    /// The pinned service key that verified the feed response.
+    #[serde(with = "pubky_switch_core::enc::serde_b64")]
+    pub service_key: [u8; 32],
+    /// The time stamped on that response, in Unix milliseconds. A retained input keeps
+    /// this value through retries, reload and restore; a later answer does not replace it.
+    pub read_at_ms: u64,
+}
+
 /// A message that passed the recipient checks 1 to 9 (Switch wire 5.1), handed to the
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
+    /// The original verified feed observation of this input.
+    pub receipt: EntryReceipt,
     /// The `seq` the entry was read at, in [`ReceivedMessage::generation`]. A stored
     /// entry's handle is its local ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
@@ -491,6 +508,17 @@ pub enum Outcome {
     /// [`MAX_STEP_LOCAL_BYTES`] bound as an [`Outcome::Apply`], and an over-bound step is
     /// stored and passed as too large without committing any of its local changes.
     Consume,
+    /// This input has not been admitted because the protocol's ordinary retained-state
+    /// rule cannot remove its required victim (Switch spec 8.2). All operations, local
+    /// writes and processed-pair forgets staged by this callback are discarded. No pair
+    /// is added. Before its cursor passes, the input or its payload-free drop notice is
+    /// kept in the same transaction as the shared waiting-pool selection.
+    ///
+    /// Only this input enters custody; already admitted protocol payloads and protected
+    /// effects remain unchanged. A later scheduled retry runs the decision again against
+    /// current state, retaining the input's original receipt and storage order. This is
+    /// neither a storage failure nor an immediate request to repeat the read.
+    AwaitAdmission,
     /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
     /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
     /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data

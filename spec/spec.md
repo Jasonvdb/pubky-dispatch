@@ -373,9 +373,12 @@ actual kept-batch ID before that batch can first be sent. After checking the
 operations, ownership and queued messages, signing the batch and checking that
 it can be kept, the client invokes a synchronous local-write builder with that
 ID. The builder returns only writes under the registered protocol's namespace.
-It is invoked at most once for this submission, never for a stored retry. The
-protocol binds its exact intended effect to the ID; another batch's completion
-must not overwrite or remove that preparation.
+The same invocation may also return separately identified Applied-only local
+writes, bound to this ID and retained with the pending batch; they are not run
+in the initial preparation commit. Existing and returned local writes together
+obey the same bound. The builder is invoked at most once for this submission,
+never for a stored retry. The protocol binds its exact intended effect to the
+ID; another batch's completion must not overwrite or remove that preparation.
 
 The preparation writes, complete signed pending batch, creation order and
 indexes commit in one bounded local transaction. The existing protocol-local

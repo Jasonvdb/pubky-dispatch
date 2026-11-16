@@ -64,6 +64,8 @@ pub mod sig {
     pub const HEAD: &str = "pubky-switch/v1/head";
     /// Current origin slot statement (Switch record origins 5).
     pub const RECORD_ORIGIN_STATEMENT: &str = "pubky-switch/v1/record-origin-statement";
+    /// Current record lineage statement (Switch record lineage 3).
+    pub const RECORD_LINEAGE_STATEMENT: &str = "pubky-switch/v1/record-lineage-statement";
     /// Export manifest, signed by the old service's key (Switch wire 10.2).
     pub const EXPORT_MANIFEST: &str = "pubky-switch/v1/export-manifest";
     /// Push webhook, signed by the registration's push key (Switch wire 8.2).
@@ -88,6 +90,8 @@ pub mod derive {
     pub const PROTECTED_POLICY: &str = "pubky-switch/v1/protected-policy";
     /// Retained origin slot hash (Switch record origins 5).
     pub const RECORD_ORIGIN: &str = "pubky-switch/v1/record-origin";
+    /// Exact record lineage descriptor hash (Switch record lineage 3).
+    pub const RECORD_LINEAGE: &str = "pubky-switch/v1/record-lineage";
     /// Initially sealed child value hash (Switch record origins 4).
     pub const INITIAL_RECORD_VALUE: &str = "pubky-switch/v1/initial-record-value";
     /// A sealed value's AAD, the first part of its `lp()` (Switch wire 6.2).

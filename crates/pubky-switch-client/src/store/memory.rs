@@ -1,9 +1,12 @@
 //! An in-memory [`StateStore`], for tests and for hosts that keep nothing across restarts.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{StateStore, StoreError, Write, WriteBatch};
+use super::{
+    AcquireOutcome, CommitOutcome, StateStore, StoreError, StoreLease, StoreOwner, Write,
+    WriteBatch, check_owned_batch,
+};
 
 type Entries = BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>;
 
@@ -13,12 +16,38 @@ type Entries = BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>;
 /// working sizes as a host does. It isn't durable: everything is gone when it is dropped.
 #[derive(Default)]
 pub struct MemoryStore {
-    entries: Mutex<Entries>,
+    state: Arc<Mutex<State>>,
+}
+
+#[derive(Default)]
+struct State {
+    entries: Entries,
+    owners: BTreeMap<String, StoreOwner>,
+}
+
+struct Lease {
+    state: Arc<Mutex<State>>,
+    namespace: String,
+    owner: StoreOwner,
+}
+
+impl StoreLease for Lease {}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.owners.get(&self.namespace) == Some(&self.owner) {
+            state.owners.remove(&self.namespace);
+        }
+    }
 }
 
 impl std::fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MemoryStore({} namespaces)", self.lock().len())
+        write!(f, "MemoryStore({} namespaces)", self.lock().entries.len())
     }
 }
 
@@ -28,17 +57,17 @@ impl MemoryStore {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, Entries> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         // A panic while the lock was held can't leave a batch half applied: commits apply
         // to a copy and swap it in. So a poisoned lock still guards consistent entries.
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The number of keys in `ns`.
     pub fn len(&self, ns: &str) -> usize {
-        self.lock().get(ns).map_or(0, BTreeMap::len)
+        self.lock().entries.get(ns).map_or(0, BTreeMap::len)
     }
 
     /// Whether `ns` holds no key.
@@ -49,7 +78,12 @@ impl MemoryStore {
 
 impl StateStore for MemoryStore {
     fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self.lock().get(ns).and_then(|keys| keys.get(key)).cloned())
+        Ok(self
+            .lock()
+            .entries
+            .get(ns)
+            .and_then(|keys| keys.get(key))
+            .cloned())
     }
 
     fn scan(
@@ -60,7 +94,7 @@ impl StateStore for MemoryStore {
         limit: u32,
     ) -> Result<Vec<super::KeyValue>, StoreError> {
         let entries = self.lock();
-        let Some(keys) = entries.get(ns) else {
+        let Some(keys) = entries.entries.get(ns) else {
             return Ok(Vec::new());
         };
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -74,29 +108,68 @@ impl StateStore for MemoryStore {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        let mut entries = self.lock();
-        let mut next = entries.clone();
-        for write in batch.into_writes() {
-            match write {
-                Write::Put { ns, key, value } => {
-                    next.entry(ns).or_default().insert(key, value);
+        let mut state = self.lock();
+        if batch
+            .writes()
+            .iter()
+            .any(|write| state.owners.contains_key(write.ns()))
+        {
+            return Err(StoreError::InUse);
+        }
+        apply(&mut state.entries, batch);
+        Ok(())
+    }
+
+    fn acquire(&self, ns: &str, owner: StoreOwner) -> Result<AcquireOutcome, StoreError> {
+        let mut state = self.lock();
+        if state.owners.contains_key(ns) {
+            return Ok(AcquireOutcome::Busy);
+        }
+        state.owners.insert(ns.to_owned(), owner);
+        Ok(AcquireOutcome::Acquired(Arc::new(Lease {
+            state: Arc::clone(&self.state),
+            namespace: ns.to_owned(),
+            owner,
+        })))
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: StoreOwner,
+        batch: WriteBatch,
+    ) -> Result<CommitOutcome, StoreError> {
+        check_owned_batch(ns, &batch)?;
+        let mut state = self.lock();
+        if state.owners.get(ns) != Some(&owner) {
+            return Ok(CommitOutcome::NotOwner);
+        }
+        apply(&mut state.entries, batch);
+        Ok(CommitOutcome::Applied)
+    }
+}
+
+fn apply(entries: &mut Entries, batch: WriteBatch) {
+    let mut next = entries.clone();
+    for write in batch.into_writes() {
+        match write {
+            Write::Put { ns, key, value } => {
+                next.entry(ns).or_default().insert(key, value);
+            }
+            Write::Delete { ns, key } => {
+                if let Some(keys) = next.get_mut(&ns) {
+                    keys.remove(&key);
                 }
-                Write::Delete { ns, key } => {
-                    if let Some(keys) = next.get_mut(&ns) {
-                        keys.remove(&key);
-                    }
-                }
-                Write::DeletePrefix { ns, prefix } => {
-                    if let Some(keys) = next.get_mut(&ns) {
-                        keys.retain(|key, _| !key.starts_with(&prefix));
-                    }
+            }
+            Write::DeletePrefix { ns, prefix } => {
+                if let Some(keys) = next.get_mut(&ns) {
+                    keys.retain(|key, _| !key.starts_with(&prefix));
                 }
             }
         }
-        next.retain(|_, keys| !keys.is_empty());
-        *entries = next;
-        Ok(())
     }
+    next.retain(|_, keys| !keys.is_empty());
+    *entries = next;
 }
 
 #[cfg(test)]
@@ -107,6 +180,35 @@ mod tests {
         let mut batch = WriteBatch::new();
         f(&mut batch);
         batch
+    }
+
+    #[test]
+    fn test_memory_store_concurrent_acquisition_has_one_owner() {
+        let store = Arc::new(MemoryStore::new());
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let acquired = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, start, acquired) = (
+                    Arc::clone(&store),
+                    Arc::clone(&start),
+                    Arc::clone(&acquired),
+                );
+                std::thread::spawn(move || {
+                    let owner = StoreOwner::new().unwrap();
+                    start.wait();
+                    let result = store.acquire("ns", owner).unwrap();
+                    // Every attempt finishes while the successful guard is still held.
+                    acquired.wait();
+                    matches!(result, AcquireOutcome::Acquired(_))
+                })
+            })
+            .collect();
+        let winners = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
     }
 
     #[test]

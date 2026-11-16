@@ -65,6 +65,30 @@ impl StateStore for KeptCommits {
         committed.push(batch);
         Ok(())
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+    ) -> Result<pubky_switch_client::store::AcquireOutcome, pubky_switch_client::store::StoreError>
+    {
+        self.store.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+        batch: pubky_switch_client::store::WriteBatch,
+    ) -> Result<pubky_switch_client::store::CommitOutcome, pubky_switch_client::store::StoreError>
+    {
+        let mut committed = lock(&self.committed);
+        let result = self.store.commit_if(ns, owner, batch.clone())?;
+        if result == pubky_switch_client::store::CommitOutcome::Applied {
+            committed.push(batch);
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

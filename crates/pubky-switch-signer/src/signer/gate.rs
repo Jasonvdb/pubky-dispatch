@@ -12,13 +12,21 @@
 //! request signatures, and the delivery and publication of signed versions, the re-delivery
 //! that clears an alarm included.
 
+use pubky_switch_client::store::{OwnedStoreHandle, StoreOwnership};
+
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::{IdentityKeyring, SigningKey};
 use crate::state::SignerState;
 
 /// That the gate's checks passed for one call: only [`signing_key`] makes one.
-pub(crate) struct GatePassed(());
+pub(crate) struct GatePassed(StoreOwnership);
+
+impl GatePassed {
+    pub(crate) fn ownership(&self) -> StoreOwnership {
+        self.0.clone()
+    }
+}
 
 /// Why the records `state` sign nothing now, if they don't: the account is erased
 /// ([`Refusal::Erased`]), another install is the signer
@@ -87,7 +95,11 @@ pub(crate) fn held_alarm(state: &SignerState) -> Option<&Alert> {
 /// # Errors
 ///
 /// The refusal of [`refusal`], or the key's error.
-pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
+pub(crate) fn signing_key(
+    keyring: &IdentityKeyring,
+    state: &SignerState,
+    store: &OwnedStoreHandle,
+) -> Result<SigningKey> {
     if let Some(refused) = refusal(state) {
         return Err(refused);
     }
@@ -95,7 +107,7 @@ pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Res
     if keyring.is_received() {
         return Err(Refusal::TakingOver.into());
     }
-    Ok(keyring.signing_key(GatePassed(()))?)
+    Ok(keyring.signing_key(GatePassed(store.ownership()?))?)
 }
 
 /// The identity key for a provider loss's own steps (Switch spec 12.6 step 1): its
@@ -107,14 +119,18 @@ pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Res
 ///
 /// [`SignerError::NotNamed`], [`Refusal::RecordsBehind`], [`Refusal::HandingOver`],
 /// [`Refusal::TakingOver`], or the key's error.
-pub(crate) fn recovery_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
+pub(crate) fn recovery_key(
+    keyring: &IdentityKeyring,
+    state: &SignerState,
+    store: &OwnedStoreHandle,
+) -> Result<SigningKey> {
     if let Some(refused) = recovery_refusal(state) {
         return Err(refused);
     }
     if keyring.is_received() {
         return Err(Refusal::TakingOver.into());
     }
-    Ok(keyring.signing_key(GatePassed(()))?)
+    Ok(keyring.signing_key(GatePassed(store.ownership()?))?)
 }
 
 /// Why the records `state` can't sign a provider loss's own steps, if they can't: another
@@ -146,14 +162,18 @@ pub(crate) fn recovery_refusal(state: &SignerState) -> Option<SignerError> {
 /// # Errors
 ///
 /// [`Refusal::NotHandingOver`] when it isn't handing over; otherwise as [`signing_key`].
-pub(crate) fn hand_over_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
+pub(crate) fn hand_over_key(
+    keyring: &IdentityKeyring,
+    state: &SignerState,
+    store: &OwnedStoreHandle,
+) -> Result<SigningKey> {
     if let Some(refused) = base_refusal(state) {
         return Err(refused);
     }
     if state.handing_over.is_none() || keyring.is_received() {
         return Err(Refusal::NotHandingOver.into());
     }
-    Ok(keyring.signing_key(GatePassed(()))?)
+    Ok(keyring.signing_key(GatePassed(store.ownership()?))?)
 }
 
 /// The identity key for a take-over's own step, the new signer's first delivery, signed with
@@ -165,6 +185,7 @@ pub(crate) fn hand_over_key(keyring: &IdentityKeyring, state: &SignerState) -> R
 pub(crate) fn taking_over_key(
     keyring: &IdentityKeyring,
     state: &SignerState,
+    store: &OwnedStoreHandle,
 ) -> Result<SigningKey> {
     if let Some(refused) = base_refusal(state) {
         return Err(refused);
@@ -172,7 +193,7 @@ pub(crate) fn taking_over_key(
     if !state.taking_over {
         return Err(Refusal::TakingOver.into());
     }
-    Ok(keyring.signing_key(GatePassed(()))?)
+    Ok(keyring.signing_key(GatePassed(store.ownership()?))?)
 }
 
 #[cfg(test)]
@@ -185,7 +206,7 @@ mod tests {
     fn test_gate_hands_out_the_key_only_when_nothing_holds_signing_back() {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let fresh = SignerState::new(keyring.public_key(), [1; 16]);
-        assert!(signing_key(&keyring, &fresh).is_ok());
+        assert!(signing_key(&keyring, &fresh, &crate::key::tests::owned_store()).is_ok());
         let alarm = Alert::Equivocation {
             source: Source::Homeserver,
             version: 2,
@@ -193,7 +214,7 @@ mod tests {
         let held = |change: &dyn Fn(&mut SignerState)| {
             let mut state = fresh.clone();
             change(&mut state);
-            signing_key(&keyring, &state).err()
+            signing_key(&keyring, &state, &crate::key::tests::owned_store()).err()
         };
         assert_eq!(
             held(&|s| s.managed_by = Some([7; 16])),
@@ -224,8 +245,8 @@ mod tests {
             state.recovering = true;
             change(&mut state);
             (
-                signing_key(&keyring, &state).err(),
-                recovery_key(&keyring, &state).err(),
+                signing_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
+                recovery_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             )
         };
         // Every routine step is refused; the recovery's own pass an alarm and an erasure.
@@ -280,21 +301,21 @@ mod tests {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let fresh = SignerState::new(keyring.public_key(), [1; 16]);
         assert_eq!(
-            hand_over_key(&keyring, &fresh).err(),
+            hand_over_key(&keyring, &fresh, &crate::key::tests::owned_store()).err(),
             Some(Refusal::NotHandingOver.into())
         );
         let mut state = fresh.clone();
         state.handing_over = Some(handing_over());
         assert_eq!(
-            signing_key(&keyring, &state).err(),
+            signing_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             Some(Refusal::HandingOver { to_app: [4; 16] }.into())
         );
-        assert!(hand_over_key(&keyring, &state).is_ok());
-        assert!(taking_over_key(&keyring, &state).is_err());
+        assert!(hand_over_key(&keyring, &state, &crate::key::tests::owned_store()).is_ok());
+        assert!(taking_over_key(&keyring, &state, &crate::key::tests::owned_store()).is_err());
         // The base checks still hold a hand-over's own steps back.
         state.switch_unconfirmed = true;
         assert_eq!(
-            hand_over_key(&keyring, &state).err(),
+            hand_over_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             Some(Refusal::SwitchUnconfirmed.into())
         );
     }
@@ -305,20 +326,20 @@ mod tests {
         let mut state = SignerState::new(keyring.public_key(), [1; 16]);
         // Not taking over: a received key signs nothing.
         assert_eq!(
-            signing_key(&keyring, &state).err(),
+            signing_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             Some(Refusal::TakingOver.into())
         );
-        assert!(taking_over_key(&keyring, &state).is_err());
+        assert!(taking_over_key(&keyring, &state, &crate::key::tests::owned_store()).is_err());
         state.taking_over = true;
         assert_eq!(
-            signing_key(&keyring, &state).err(),
+            signing_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             Some(Refusal::TakingOver.into())
         );
-        assert!(hand_over_key(&keyring, &state).is_err());
-        assert!(taking_over_key(&keyring, &state).is_ok());
+        assert!(hand_over_key(&keyring, &state, &crate::key::tests::owned_store()).is_err());
+        assert!(taking_over_key(&keyring, &state, &crate::key::tests::owned_store()).is_ok());
         state.managed_by = Some([9; 16]);
         assert_eq!(
-            taking_over_key(&keyring, &state).err(),
+            taking_over_key(&keyring, &state, &crate::key::tests::owned_store()).err(),
             Some(SignerError::NotNamed { install: [9; 16] })
         );
     }

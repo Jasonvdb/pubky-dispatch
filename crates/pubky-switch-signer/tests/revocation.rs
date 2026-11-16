@@ -969,11 +969,13 @@ async fn test_revocation_survives_a_crash_at_every_commit() {
             let id = a.keys.app_id_bytes();
             world.clock.advance_ms(DAY_MS);
             let faulty: Arc<dyn StateStore> = Arc::new(FaultStore::new(memory.clone(), fault));
+            drop(signer);
             let mut signer = Signer::open(world.env(faulty), world.keyring())
                 .await
                 .unwrap();
             let _ = signer.revoke(id, None, confirmed()).await;
             world.clock.advance_ms(DAY_MS);
+            drop(signer);
             let mut restarted = Signer::open(world.env(memory), world.keyring())
                 .await
                 .unwrap();

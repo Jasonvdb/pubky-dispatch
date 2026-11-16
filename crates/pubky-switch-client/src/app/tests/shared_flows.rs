@@ -5743,6 +5743,35 @@ impl StateStore for FailingReopen {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        let ends_reopen = batch.writes().iter().any(|write| {
+            matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
+        });
+        let fails = ends_reopen && {
+            let mut left = self.failing.lock().unwrap();
+            let fails = *left > 0;
+            *left = left.saturating_sub(1);
+            fails
+        };
+        if fails {
+            return Err(crate::error::StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 /// The reopening a key owes is kept with the key: when its own commit fails after the key
@@ -7282,6 +7311,37 @@ impl StateStore for FailingRecordCommit {
             }
         }
         self.inner.commit(batch)
+    }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        let puts_record = batch.writes().iter().any(|write| {
+            matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"rec/"))
+        });
+        if puts_record {
+            let mut armed = self.armed.lock().unwrap();
+            match *armed {
+                Some(0) => {
+                    *armed = None;
+                    return Err(crate::error::StoreError::Unavailable);
+                }
+                Some(pass) => *armed = Some(pass - 1),
+                None => {}
+            }
+        }
+        self.inner.commit_if(ns, owner, batch)
     }
 }
 

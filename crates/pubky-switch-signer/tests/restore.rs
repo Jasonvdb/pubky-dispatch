@@ -823,6 +823,7 @@ async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
         .unwrap();
     // The removal is done, so `revoke` answers `Ok`; only the cleanup's commit stopped.
     let _ = signer.revoke(id, None, confirmed()).await;
+    drop(signer);
     let mut signer = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{StateStore, StoreError, WriteBatch};
+use super::{AcquireOutcome, OwnedStoreHandle, StateStore, StoreError, StoreOwner, WriteBatch};
 
 /// How a [`StoreHandle`] runs the store's calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +75,26 @@ impl StoreHandle {
     /// The store.
     pub fn store(&self) -> &Arc<dyn StateStore> {
         &self.store
+    }
+
+    /// Acquire one namespace before reading or signing from its state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InUse`] while another owner holds it, or an acquisition/randomness error.
+    pub async fn acquire(&self, ns: &str) -> Result<OwnedStoreHandle, StoreError> {
+        let owner = StoreOwner::new()?;
+        let namespace = ns.to_owned();
+        let claimed = namespace.clone();
+        match self
+            .run(move |store| store.acquire(&claimed, owner))
+            .await?
+        {
+            AcquireOutcome::Acquired(lease) => {
+                Ok(OwnedStoreHandle::new(self, namespace, owner, lease))
+            }
+            AcquireOutcome::Busy => Err(StoreError::InUse),
+        }
     }
 
     async fn run<T: Send + 'static>(
@@ -207,6 +227,23 @@ mod tests {
             }
             fn commit(&self, _: WriteBatch) -> Result<(), StoreError> {
                 panic!("the host store crashed")
+            }
+
+            fn acquire(
+                &self,
+                _: &str,
+                _: crate::store::StoreOwner,
+            ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+                Err(StoreError::Unavailable)
+            }
+
+            fn commit_if(
+                &self,
+                _: &str,
+                _: crate::store::StoreOwner,
+                _: crate::store::WriteBatch,
+            ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+                Err(StoreError::Unavailable)
             }
         }
         let handle = StoreHandle::blocking(Arc::new(Broken));

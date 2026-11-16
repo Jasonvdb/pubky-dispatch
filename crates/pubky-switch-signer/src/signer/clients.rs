@@ -105,10 +105,11 @@ impl RequestClient {
         env: &SignerEnv,
         target: &Target<'_>,
         keyring: &IdentityKeyring,
+        store: &pubky_switch_client::store::OwnedStoreHandle,
     ) -> Result<Self> {
         let credentials = Credentials::SignerRequests {
             identity: target.identity,
-            key: keyring.request_signer()?,
+            key: keyring.request_signer(store.ownership()?)?,
         };
         Ok(Self(client_with(env, target, credentials)?))
     }

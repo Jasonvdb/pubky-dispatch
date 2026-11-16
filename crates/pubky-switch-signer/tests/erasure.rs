@@ -2210,6 +2210,7 @@ async fn test_erasure_records_behind_clearing_the_alarm_leaves_no_delivery() {
     let (mut signer, store, alert) = alarm_then_records_behind(&world).await;
     signer.clear_alert(&alert).await.unwrap();
     assert!(!signer.alerts().contains(&alert));
+    drop(signer);
     let mut reopened = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
@@ -2228,6 +2229,7 @@ async fn test_erasure_records_behind_after_the_clone_published_clearing_then_res
         .homeserver
         .set(IDENTITY_PATH, serde_json::to_vec(v2.signed()).unwrap());
     signer.clear_alert(&alert).await.unwrap();
+    drop(signer);
     let mut reopened = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();

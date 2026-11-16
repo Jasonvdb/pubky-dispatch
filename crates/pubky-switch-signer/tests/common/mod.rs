@@ -208,6 +208,28 @@ impl StateStore for FlakyStore {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+    ) -> Result<pubky_switch_client::store::AcquireOutcome, pubky_switch_client::store::StoreError>
+    {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+        batch: pubky_switch_client::store::WriteBatch,
+    ) -> Result<pubky_switch_client::store::CommitOutcome, pubky_switch_client::store::StoreError>
+    {
+        if *self.failing.lock().unwrap() {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 /// The path the test protocol adds to the grant of an app holding `notes_tags`.

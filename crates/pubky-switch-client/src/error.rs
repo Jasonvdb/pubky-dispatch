@@ -13,6 +13,12 @@ use pubky_switch_core::http::{ErrorCode, Retry};
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StoreError {
+    /// Another owner holds a namespace; no writes were applied.
+    #[error("the store namespace is in use")]
+    InUse,
+    /// The conditional writer no longer owns its namespace; no writes were applied.
+    #[error("the store namespace is not owned by this handle")]
+    NotOwner,
     /// Nothing was applied: the call may be retried.
     #[error("the store is unavailable; nothing was applied")]
     Unavailable,

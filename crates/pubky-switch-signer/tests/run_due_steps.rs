@@ -325,6 +325,7 @@ async fn test_run_due_crash_after_a_deletion_keeps_one_reminder() {
         .unwrap();
     let _ = signer.revoke(id, None, confirmed()).await;
     assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+    drop(signer);
     let mut signer = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();

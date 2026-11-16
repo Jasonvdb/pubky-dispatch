@@ -60,7 +60,7 @@ impl IdentityKeyring {
 
     pub(crate) fn install(vault, identity, secret) -> Result<Self, KeyError>; // a received key
     pub(crate) fn signing_key(&self, passed: GatePassed) -> Result<SigningKey, KeyError>; // the gate's alone
-    pub(crate) fn request_signer(&self) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError>; // Switch-Signature only
+    pub(crate) fn request_signer(&self, ownership: StoreOwnership) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError>; // Switch-Signature only
     pub(crate) fn open_backup(&self, backup: &SignerBackup) -> Result<Option<SignerRecords>, KeyError>;
     pub(crate) fn destroy(&self) -> Result<(), KeyError>;
 }
@@ -151,6 +151,10 @@ The signer uses the client's `StateStore` (atomic batches, durable writes) under
 
 A crash anywhere resends the same bytes, so nothing is ever signed twice (wire 2.1 "Sign once"). Nothing in the spec fixes how a signer persists its records; this is the crate's own rule.
 
+Every constructor acquires exclusive ownership before reading the state and flow. `OwnedStoreHandle` carries that guard, and each derived signing or request credential keeps it alive. The guard releases ownership only on its last drop or process death; metadata and any lock inode are separate from the records. The host must provide the actual cross-process exclusion; the trait cannot certify a dishonest adapter, and a process-local registry is insufficient.
+
+Before a possibly committing await the signer marks its cached state unresolved. A blocking call is retained and drained after cancellation, and its worker holds the guard through actual completion even if the signer is dropped. An ambiguous result or failed reload permits no next effect; a successful reload uses the exact durable state and flow. Already-sent remote requests remain subject to the existing reconciliation rules: local ownership cannot retract them. The synchronous `approved` accessor refuses unresolved state; display snapshots remain cached observations.
+
 ### 4.3 Flows
 
 At most one flow is in progress. A new one is refused until it ends, except an abort, which applies only to its own flow.
@@ -214,7 +218,7 @@ It returns a report and refreshes the alerts.
 
 A run is bounded, so the host may call it often and never waits on it for long. One budget covers the whole run, however its steps nest (a renewal's own `resume` spends from it too), and nothing that can't be done now takes a place in it: an unjoined or cut-off app isn't due for renewal, an app whose renewal the switch refused, automatic or the user's own, goes behind the others, a full-bundle request that can't be answered is passed over, a deletion or check the Homeserver fails goes behind the others, and every owed deletion's grant reminder is raised at once. Each step does a bounded amount, the rest left for the next run: at most four renewals in step 7, the soonest to expire first; four full-bundle answers in step 6, the oldest requests first, an app asking again going behind the others; 32 record deletions; 32 checks of owed deletions. Once 30 seconds have passed on the device clock since the run began, it starts no more of steps 5, 6, 7 and 9 once one of them has had work: the removals of step 4 always run, since cutting an app off is the safe step, and so does the first of the later steps with work. A flow it started finishes, or is resumed by the next run. How long one request may take is the host's, through its Pubky client's timeout, so a run takes at most its bounded number of requests times that: `run_due`'s doc counts them. The later steps run in turn from the one the last run didn't start (`due_from`), and a device clock that goes back counts as the time passed, so a clock that jumps or goes back holds no step back for good. One step's error holds back no other: the steps after it run all the same, the first error is returned once they have, and the next run starts from the step after the one that failed, so it goes last. A call of `resume`, `renew_expiring` or `serve_full_bundles` outside a run has a budget of its own. `run_due` returns `RunDue`, which says which bounds cut the run short, so the host may run again soon.
 
-### 4.6 The `StateStore` trait (proposal)
+### 4.6 The `StateStore` trait
 
 `pubky-switch-client` defines the trait, and the signer uses it. The host app implements it once per install, for example on SQLite.
 
@@ -230,7 +234,15 @@ pub trait StateStore: Send + Sync {
 
     /// Apply every write of `batch`, or none of them.
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError>;
+
+    fn acquire(&self, ns: &str, owner: StoreOwner) -> Result<AcquireOutcome, StoreError>;
+    fn commit_if(&self, ns: &str, owner: StoreOwner, batch: WriteBatch)
+        -> Result<CommitOutcome, StoreError>;
 }
+
+pub trait StoreLease: Send + Sync {}
+pub enum AcquireOutcome { Acquired(Arc<dyn StoreLease>), Busy }
+pub enum CommitOutcome { Applied, NotOwner }
 
 pub struct WriteBatch { /* the writes, read with writes() and into_writes() */ }
 
@@ -249,7 +261,7 @@ pub enum Write {
 1. **Atomic:** a `commit` applies all of its writes or none, also across a crash or power loss. `Err` means none were applied. A store that can't tell after an error returns `StoreError::Unknown`, and the crate reads its state again before going on.
 2. **Durable:** `commit` returns `Ok` only once the writes are on stable storage (for SQLite, `synchronous=FULL`). After `Ok` they survive a process kill and a power loss.
 3. **Ordered and consistent:** commits apply in the order they are made. A read sees every commit that returned before it and never part of a batch.
-4. **One writer per namespace:** only one process at a time writes a namespace, for example the main app and not a push extension. The crates serialize their own commits.
+4. **Exclusive ownership:** `acquire` atomically binds a namespace to a fresh opaque `StoreOwner` and returns a non-expiring guard. `commit_if` checks the active owner and applies the batch in the same atomic operation. It refuses foreign namespaces and charges the condition's namespace bytes and 32-byte ID against the 32 MiB batch cap. Raw `commit` refuses the whole batch if any namespace is owned. These rules cover every handle, thread and process sharing the physical store; there is no timeout takeover or read-then-write fallback.
 5. **Device-bound:** the store is excluded from device and cloud backups and is encrypted at rest under a key kept like the app's keys, as spec 3.1 asks of local state. The signer stores no secret key in it (the identity key stays in the `SecretVault`), but its records hold the signed hand-over and backup.
 6. **Real deletion:** `Delete` and `DeletePrefix` remove the data from the store's files, not only from its index (for SQLite, `secure_delete`). A signer that hands over deletes its records "in every copy it keeps" (spec 12.8, 3.1).
 7. **Sizes:** a value up to 16 MiB and a batch up to 32 MiB. The largest value is a hand-over or a backup kept as signed bytes: at most 128 envelopes, 11,185,390 bytes of JSON at the limits (wire 3.12, 3.13). A commit holds at most one such value with the flow step it belongs to, so a 32 MiB batch leaves room for two.

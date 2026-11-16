@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::clock::Clock;
-use pubky_switch_client::store::StoreHandle;
+use pubky_switch_client::store::{OwnedStoreHandle, StoreHandle};
 use pubky_switch_client::transport::Transport;
 use pubky_switch_client::{ClientError, StoreError};
 use pubky_switch_core::enc::{pubky_id, random_bytes};
@@ -213,12 +213,13 @@ fn status_of(state: &SignerState) -> SignerStatus {
 
 /// The signer of one identity, on one install.
 pub struct Signer {
+    store: OwnedStoreHandle,
     env: SignerEnv,
     keyring: IdentityKeyring,
     state: SignerState,
     flow: Option<Flow>,
-    /// A commit answered that the store can't tell whether it applied: the records and the
-    /// flow are read again before the next step.
+    /// Set before a possibly committing await: cancellation or an ambiguous answer requires
+    /// the records and flow to be read again before the next step.
     unsure: bool,
     /// What the [`Signer::run_due`] in progress left because a bound cut it short.
     left: RunDue,
@@ -251,14 +252,18 @@ impl Signer {
     /// or random generator failure.
     pub async fn create(env: SignerEnv, keyring: IdentityKeyring, origin: &str) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::set_up(&env.store, &identity).await? {
+        let mut store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        if state::set_up(&store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
         let state = SignerState::new(identity, install);
         let enrollment = {
-            let key = gate::signing_key(&keyring, &state)?;
+            let key = gate::signing_key(&keyring, &state, &store)?;
             let body = EnrollmentBody {
                 identity,
                 origin: origin.to_owned(),
@@ -276,8 +281,9 @@ impl Signer {
             enrollment: enrollment.signed().clone(),
             policy,
         };
-        state::save(&env.store, &state, Some(&flow)).await?;
+        state::save(&mut store, &state, Some(&flow)).await?;
         Ok(Self {
+            store,
             env,
             keyring,
             state,
@@ -297,11 +303,25 @@ impl Signer {
     /// don't read, or the store's error.
     pub async fn open(env: SignerEnv, keyring: IdentityKeyring) -> Result<Self> {
         let identity = keyring.public_key();
-        let (state, flow) = state::load(&env.store, &identity)
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        Self::open_owned(env, keyring, store).await
+    }
+
+    async fn open_owned(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        store: OwnedStoreHandle,
+    ) -> Result<Self> {
+        let identity = keyring.public_key();
+        let (state, flow) = state::load(&store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
         let handed_over = state.handed_over_to;
         let mut signer = Self {
+            store,
             env,
             keyring,
             state,
@@ -915,7 +935,8 @@ impl Signer {
             // A flow that ended without its version delivered leaves no certificate or claim.
             state.prune_unreferenced();
         }
-        match state::save(&self.env.store, &state, flow.as_ref()).await {
+        self.unsure = true;
+        match state::save(&mut self.store, &state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
                 self.flow = flow;
@@ -933,8 +954,9 @@ impl Signer {
 
     /// After a commit the store couldn't tell about, read the records and the flow again.
     async fn refresh(&mut self) -> Result<()> {
+        self.store.drain().await?;
         if self.unsure {
-            let (state, flow) = state::load(&self.env.store, &self.state.identity)
+            let (state, flow) = state::load(&self.store, &self.state.identity)
                 .await?
                 .ok_or(Refusal::NotSetUp)?;
             self.state = state;
@@ -945,6 +967,21 @@ impl Signer {
         if let Some(install) = self.state.handed_over_to {
             return self.delete_handed_over(install).await;
         }
+        Ok(())
+    }
+
+    fn check_owned_state(&self) -> Result<()> {
+        self.store.ownership()?;
+        if self.unsure {
+            return Err(StoreError::Unknown.into());
+        }
+        Ok(())
+    }
+
+    async fn delete_records(&mut self) -> Result<()> {
+        self.unsure = true;
+        state::delete(&mut self.store, &self.state.identity).await?;
+        self.unsure = false;
         Ok(())
     }
 
@@ -959,7 +996,12 @@ impl Signer {
     /// operation ([`crate::key::IdentityKeyring::request_signer`]).
     fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
-        RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
+        RequestClient::new(
+            &self.env,
+            &self.service_target(&service),
+            &self.keyring,
+            &self.store,
+        )
     }
 
     /// What the call in progress may still do: a full budget when none was taken.
@@ -1017,7 +1059,7 @@ impl Signer {
             pinned: Some(service.service_key),
             identity: self.state.identity,
         };
-        let read = RequestClient::new(&self.env, &target, &self.keyring)?
+        let read = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .apps()
             .await;
         Ok(matches!(read, Ok(_) | Err(ClientError::Switch { .. })))
@@ -1052,7 +1094,7 @@ impl Signer {
     /// The identity key for this call's signing steps, through the signing gate
     /// ([`gate::signing_key`]).
     pub(crate) fn signing_key(&self) -> Result<SigningKey> {
-        gate::signing_key(&self.keyring, &self.state)
+        gate::signing_key(&self.keyring, &self.state, &self.store)
     }
 
     /// Enroll at the switch, then sign the first `identity.json` naming it (Switch spec 4.3
@@ -1070,7 +1112,7 @@ impl Signer {
             pinned: None,
             identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .enroll(&enrollment)
             .await?;
         let key = self.signing_key()?;
@@ -1439,7 +1481,7 @@ impl Signer {
         // Sealing signs the backup, so it takes the gated key: a recovery's, while one is
         // delivered (Switch spec 12.6 step 1).
         let key = if self.state.recovering {
-            gate::recovery_key(&self.keyring, &self.state)?
+            gate::recovery_key(&self.keyring, &self.state, &self.store)?
         } else {
             self.signing_key()?
         };

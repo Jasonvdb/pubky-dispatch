@@ -1953,6 +1953,51 @@ impl StateStore for CompletionStore {
             _ => panic!("the completion store fails only its selected transaction"),
         }
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        use crate::store::Write;
+        let puts = |wanted: &[u8]| {
+            batch
+                .writes()
+                .iter()
+                .any(|write| matches!(write, Write::Put { key, .. } if key == wanted))
+        };
+        let point = if puts(&self.pair) {
+            self.completed.lock().unwrap().push(batch.clone());
+            Some(CompletionPoint::Effect)
+        } else if puts(crate::app::state::key::META.as_bytes()) {
+            self.providers.lock().unwrap().push(batch.clone());
+            Some(CompletionPoint::Provider)
+        } else {
+            None
+        };
+        if point != Some(self.at) {
+            return self.inner.commit_if(ns, owner, batch);
+        }
+        let fault = std::mem::replace(&mut *self.fault.lock().unwrap(), StoreFault::None);
+        match fault {
+            StoreFault::FailBefore(1) => Err(StoreError::Unavailable),
+            StoreFault::FailAfter(1) => {
+                self.inner.commit_if(ns, owner, batch)?;
+                Err(StoreError::Unknown)
+            }
+            StoreFault::None => self.inner.commit_if(ns, owner, batch),
+            _ => panic!("the completion store fails only its selected transaction"),
+        }
+    }
 }
 
 struct PendingCompletion {

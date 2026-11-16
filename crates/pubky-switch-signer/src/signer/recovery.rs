@@ -165,7 +165,7 @@ impl Signer {
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         self.recovery_body(&base, lost, origin, [0; 32], until)?;
         let identity = self.state.identity;
-        let key = gate::recovery_key(&self.keyring, &self.state)?;
+        let key = gate::recovery_key(&self.keyring, &self.state, &self.store)?;
         let body = EnrollmentBody {
             identity,
             origin: origin.to_owned(),
@@ -281,7 +281,7 @@ impl Signer {
                 pinned: Some(service.service_key),
                 identity,
             };
-            let Ok(answer) = RequestClient::new(&self.env, &target, &self.keyring)?
+            let Ok(answer) = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
                 .apps()
                 .await
             else {
@@ -418,7 +418,7 @@ impl Signer {
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         // The enrollment names no App ID this version lists: both come from `base`.
         let body = self.recovery_body(&base, lost, origin, answer.service_key, until)?;
-        let key = gate::recovery_key(&self.keyring, &self.state)?;
+        let key = gate::recovery_key(&self.keyring, &self.state, &self.store)?;
         let doc = IdentityDoc::sign(&key, body)?;
         drop(key);
         let mut state = self.state.clone();
@@ -549,7 +549,7 @@ impl Signer {
         let mut sends = 0;
         loop {
             sends += 1;
-            let error = match RequestClient::new(&self.env, &target, &self.keyring)?
+            let error = match RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
                 .enroll(&enrollment)
                 .await
             {

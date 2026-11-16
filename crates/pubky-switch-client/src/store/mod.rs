@@ -15,11 +15,15 @@
 mod fault;
 mod handle;
 mod memory;
+mod owned;
+mod ownership;
 
 #[cfg(feature = "test-support")]
 pub use fault::{Fault, FaultStore};
 pub use handle::StoreHandle;
 pub use memory::MemoryStore;
+pub use owned::{OwnedStoreHandle, StoreOwnership};
+pub use ownership::{AcquireOutcome, CommitOutcome, StoreLease, StoreOwner, check_owned_batch};
 
 use pubky_switch_core::enc::zbase32_encode;
 
@@ -65,9 +69,9 @@ pub fn client_namespace(app_id: &[u8; 16]) -> String {
 /// 3. **Ordered and consistent:** commits apply in the order they are made. A read sees
 ///    every commit that returned before it and never part of a batch, readers in other
 ///    processes included.
-/// 4. **One writer per namespace:** only one process at a time writes a namespace, for
-///    example the main app and not a push extension. The crates serialize their own
-///    commits.
+/// 4. **Exclusive ownership:** [`StateStore::acquire`] and [`StateStore::commit_if`]
+///    exclude every competing writer to an owned namespace, across processes. Raw commits
+///    cannot bypass it. For namespaces used without ownership, the host serializes writers.
 /// 5. **Device-bound and encrypted at rest:** the store is excluded from device and cloud
 ///    backups and is encrypted at rest under a key kept like the app's keys (Switch spec
 ///    3.1).
@@ -100,12 +104,43 @@ pub trait StateStore: Send + Sync {
     ) -> Result<Vec<KeyValue>, StoreError>;
 
     /// Apply every write of `batch`, in order, or none of them; durable before `Ok`.
+    /// Atomically refuse the entire batch with [`StoreError::InUse`] if any namespace it
+    /// touches is owned. This call cannot bypass [`Self::commit_if`].
     ///
     /// # Errors
     ///
     /// A [`StoreError`]: [`StoreError::Unknown`] when the store can't tell whether the
     /// writes were applied, any other variant when none were.
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError>;
+
+    /// Atomically acquire exclusive ownership of `ns` for this fresh instance ID.
+    ///
+    /// Exclusion covers all handles, threads and processes sharing the physical store.
+    /// It lasts until the last [`StoreLease`] holder drops, with no timeout or preemption.
+    /// Acquisition neither decodes nor replaces the namespace's records. The host keeps
+    /// ownership metadata apart from them. A second owner gets [`AcquireOutcome::Busy`].
+    ///
+    /// # Errors
+    ///
+    /// A storage or locking failure grants no usable ownership. An uncertain acquisition
+    /// must not allow overlapping owners. There is no read-then-write implementation.
+    fn acquire(&self, ns: &str, owner: StoreOwner) -> Result<AcquireOutcome, StoreError>;
+
+    /// Check active ownership and commit the complete batch as one atomic store operation.
+    ///
+    /// [`CommitOutcome::NotOwner`] applies nothing. The host enforces [`check_owned_batch`]
+    /// before applying any write. The caller retains the acquired lease through the call.
+    /// This method cannot be implemented by a separate read followed by [`Self::commit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit`]: only [`StoreError::Unknown`] permits ambiguous application.
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: StoreOwner,
+        batch: WriteBatch,
+    ) -> Result<CommitOutcome, StoreError>;
 }
 
 /// One write of a [`WriteBatch`].

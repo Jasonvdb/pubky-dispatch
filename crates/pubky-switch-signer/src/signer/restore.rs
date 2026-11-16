@@ -63,11 +63,16 @@ impl Signer {
         confirmed: UserConfirmed,
     ) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::set_up(&env.store, &identity).await? {
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        if state::set_up(&store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = pubky_switch_core::enc::random_bytes::<16>()?;
         let mut signer = Self {
+            store,
             env,
             keyring,
             state: SignerState::new(identity, install),
@@ -148,7 +153,7 @@ impl Signer {
             identity,
         };
         let mut serving = None;
-        let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = match RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .apps()
             .await
         {
@@ -468,7 +473,7 @@ impl Signer {
             pinned: Some(serving),
             identity,
         };
-        match RequestClient::new(&self.env, &target, &self.keyring)?
+        match RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .apps()
             .await
         {

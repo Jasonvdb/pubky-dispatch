@@ -402,9 +402,15 @@ impl IdentityKeyring {
     /// # Errors
     ///
     /// The errors of [`IdentityKeyring::with_key`].
-    pub(crate) fn request_signer(&self) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError> {
+    pub(crate) fn request_signer(
+        &self,
+        ownership: pubky_switch_client::store::StoreOwnership,
+    ) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError> {
         let secret = self.load()?;
-        Ok(Arc::new(RequestSigner(secret.key())))
+        Ok(Arc::new(RequestSigner {
+            key: secret.key(),
+            _ownership: ownership,
+        }))
     }
 
     /// Run `use_key` with the identity key, for one derivation or one opening, never a
@@ -520,7 +526,10 @@ impl SigningKey {
     /// The key as a client's credentials, for one call's operations and requests: it hands
     /// out signatures, never the key.
     pub(crate) fn signer(&self) -> Arc<dyn Signs + Send + Sync> {
-        Arc::new(GatedSigner(Arc::clone(&self.key)))
+        Arc::new(GatedSigner {
+            key: Arc::clone(&self.key),
+            _ownership: self._passed.ownership(),
+        })
     }
 
     /// Seal the signer's backup holding `doc` and these records to the backup key (Switch spec
@@ -597,15 +606,18 @@ impl SigningKey {
 }
 
 /// The gated key behind a signing client's credentials.
-struct GatedSigner(Arc<IdentityKey>);
+struct GatedSigner {
+    key: Arc<IdentityKey>,
+    _ownership: pubky_switch_client::store::StoreOwnership,
+}
 
 impl Signs for GatedSigner {
     fn public_key(&self) -> [u8; 32] {
-        self.0.public()
+        self.key.public()
     }
 
     fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
-        self.0.sign(label, fields)
+        self.key.sign(label, fields)
     }
 }
 
@@ -619,20 +631,34 @@ impl std::ops::Deref for SigningKey {
 
 /// The identity key behind a request-only credential: it signs `Switch-Signature` (Switch
 /// wire 7.1) and nothing else.
-struct RequestSigner(IdentityKey);
+struct RequestSigner {
+    key: IdentityKey,
+    _ownership: pubky_switch_client::store::StoreOwnership,
+}
 
 impl SignsRequests for RequestSigner {
     fn public_key(&self) -> [u8; 32] {
-        self.0.public()
+        self.key.public()
     }
 
     fn sign_request_fields(&self, fields: &[&[u8]]) -> [u8; 64] {
-        self.0.sign(labels::sig::HTTP, fields)
+        self.key.sign(labels::sig::HTTP, fields)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn owned_store() -> pubky_switch_client::store::OwnedStoreHandle {
+        let store = pubky_switch_client::store::StoreHandle::inline(std::sync::Arc::new(
+            pubky_switch_client::store::MemoryStore::new(),
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(store.acquire("signer-test"))
+            .unwrap()
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -933,7 +959,7 @@ pub(crate) mod tests {
         use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
         let keyring = IdentityKeyring::open(MemoryVault::holding([6; 32])).unwrap();
         let state = crate::state::SignerState::new(keyring.public_key(), [1; 16]);
-        let key = crate::signer::gate::signing_key(&keyring, &state).unwrap();
+        let key = crate::signer::gate::signing_key(&keyring, &state, &owned_store()).unwrap();
         let body = IdentityBody::first(
             keyring.public_key(),
             [1; 16],
@@ -1019,11 +1045,53 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_signing_and_request_credentials_retain_store_ownership() {
+        use pubky_switch_client::store::{MemoryStore, StoreHandle};
+        let handle = StoreHandle::inline(Arc::new(MemoryStore::new()));
+        for drop_requests_first in [false, true] {
+            let owned = handle.acquire("signer-test").await.unwrap();
+            let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+            let state = crate::state::SignerState::new(keyring.public_key(), [1; 16]);
+            let key = crate::signer::gate::signing_key(&keyring, &state, &owned).unwrap();
+            drop(owned);
+            assert!(matches!(
+                handle.acquire("signer-test").await,
+                Err(pubky_switch_client::StoreError::InUse)
+            ));
+            let signing = key.signer();
+            let requests = keyring.request_signer(key._passed.ownership()).unwrap();
+            drop(key);
+            assert!(matches!(
+                handle.acquire("signer-test").await,
+                Err(pubky_switch_client::StoreError::InUse)
+            ));
+            if drop_requests_first {
+                drop(requests);
+                assert!(matches!(
+                    handle.acquire("signer-test").await,
+                    Err(pubky_switch_client::StoreError::InUse)
+                ));
+                drop(signing);
+            } else {
+                drop(signing);
+                assert!(matches!(
+                    handle.acquire("signer-test").await,
+                    Err(pubky_switch_client::StoreError::InUse)
+                ));
+                drop(requests);
+            }
+            handle.acquire("signer-test").await.unwrap();
+        }
+    }
+
     #[test]
     fn test_request_signer_signs_requests() {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let key = IdentityKey::from_secret([7; 32]);
-        let request = keyring.request_signer().unwrap();
+        let request = keyring
+            .request_signer(owned_store().ownership().unwrap())
+            .unwrap();
         assert_eq!(request.public_key(), key.public());
         let fields: &[&[u8]] = &[b"request"];
         let signature = request.sign_request_fields(fields);
@@ -1036,7 +1104,9 @@ pub(crate) mod tests {
     fn test_request_signer_signature_holds_under_no_other_label() {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let key = IdentityKey::from_secret([7; 32]);
-        let request = keyring.request_signer().unwrap();
+        let request = keyring
+            .request_signer(owned_store().ownership().unwrap())
+            .unwrap();
         let fields: &[&[u8]] = &[b"op"];
         let signature = request.sign_request_fields(fields);
         assert!(

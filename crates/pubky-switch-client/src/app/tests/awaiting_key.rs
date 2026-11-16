@@ -752,6 +752,29 @@ impl StateStore for FailingDelete {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        let deletes = batch.writes().iter().any(|write| {
+            matches!(write, crate::store::Write::Delete { key, .. } if key.starts_with(self.prefix))
+        });
+        if deletes && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 /// alice's wallet with `protocol` on `store`, read once.

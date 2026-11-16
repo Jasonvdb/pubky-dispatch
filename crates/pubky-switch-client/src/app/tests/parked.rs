@@ -2328,7 +2328,7 @@ async fn test_provider_loss_completion_retires_prior_copies() {
         3,
         Some(1),
     );
-    pending.world.switch.lock().erased = true;
+    pending.world.switch.lock().not_hosted_unpinned = true;
     pending.app.refresh_identity().await.unwrap();
     pending.app.receive(None).await.unwrap();
     pending.reload(pending.store.clone()).await;

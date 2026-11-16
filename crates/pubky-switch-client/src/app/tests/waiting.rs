@@ -86,6 +86,22 @@ impl Protocol for Admission {
         if let Some(id) = m.message.body.get("forget").and_then(Value::as_str) {
             assert!(cx.forget_processed(m.sender, id).unwrap());
         }
+        if m.message.body["text"] == "unsealed" {
+            let target = crate::app::RecordTarget::new(
+                super::shared_flows::items(),
+                m.message.msg_id.as_bytes(),
+            );
+            assert!(matches!(
+                cx.put_record(
+                    &target,
+                    &super::shared_flows::value(&[&m.message.msg_id]),
+                    Vec::new(),
+                ),
+                Err(crate::app::AppError::Refused(crate::app::Refusal::NotNow(
+                    _
+                )))
+            ));
+        }
         if m.message.body["text"] == "large" {
             let target = crate::app::RecordTarget::new(
                 super::shared_flows::items(),
@@ -219,6 +235,26 @@ async fn test_admission_discards_staged_effects_and_allows_independent_progress(
 }
 
 #[tokio::test]
+async fn test_admission_discards_the_context_missing_key_marker() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    w.next_doc(|body| body.data_epoch = 2);
+    app.refresh_identity().await.unwrap();
+    let effects = w.effects();
+    let (seq, message) = w.note(app.app_id(), "unsealed");
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.stored_at(seq).map(|stored| stored.reason),
+        Some(ParkReason::AwaitingAdmission),
+        "admission discards the staged missing-key marker"
+    );
+    assert_eq!(app.protocol_get(b"admission-write").await.unwrap(), None);
+    assert!(!pair(&app, &w, &message).await);
+    assert_eq!(w.effects(), effects);
+}
+
+#[tokio::test]
 async fn test_admission_incoming_oldest_is_dropped_with_its_cursor() {
     let w = World::new();
     let p = Admission::new();
@@ -269,7 +305,11 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
         let mut restored = App::restore(w.env_on(fresh), p.clone(), World::config(), &backup)
             .await
             .unwrap();
-        assert_eq!(restored.state.held[&seq].receipt, receipt);
+        assert_eq!(
+            restored.state.held.get(&seq).map(|held| held.receipt),
+            Some(receipt),
+            "a backup retains the original held observation"
+        );
         w.clock.advance_ms(10_000);
         p.hold.store(false, Ordering::SeqCst);
         restored.refresh_identity().await.unwrap();
@@ -414,8 +454,8 @@ async fn test_admission_backup_restores_custody_or_the_same_payload_free_notice(
         .await
         .unwrap();
         assert_eq!(
-            restored.stored_at(seq).unwrap(),
-            &original,
+            restored.stored_at(seq),
+            Some(&original),
             "the snapshot retains exact custody"
         );
         restored.refresh_identity().await.unwrap();
@@ -445,7 +485,8 @@ async fn test_admission_backup_restores_custody_or_the_same_payload_free_notice(
         assert!(again.state.parked.is_empty());
         let replay = dropped(&again.unacknowledged_events().await.unwrap());
         assert_eq!(
-            replay[0].1, original_notice[0].1,
+            replay.first().map(|notice| notice.1),
+            Some(original_notice[0].1),
             "a restore retains the immutable notice identity"
         );
         assert_ne!(

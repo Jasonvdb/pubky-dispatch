@@ -1375,7 +1375,7 @@ pub enum ParkReason {
     /// key of `data_epoch` its certificate is given and a key came since its step last ran,
     /// and not before, so an entry whose key never comes, or one its certificate is never
     /// given, costs a read no request and no step. It is bounded together with the entries
-    /// stored as [`ParkReason::Unverifiable`], and dropped past the bounds
+    /// stored as [`ParkReason::Unverifiable`] or [`ParkReason::AwaitingAdmission`], and dropped past the bounds
     /// ([`AppEvent::StoredEntryDropped`]).
     AwaitingKey {
         /// The data epoch whose key the step waits for.
@@ -1386,7 +1386,7 @@ pub enum ParkReason {
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
     /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
-    /// store kept from finishing, that waits for a scope key (once the key is held), or that
+    /// store kept from finishing, that waits for admission or a scope key (once the key is held), or that
     /// the host released. The others stay stored until the protocol or the host acts on
     /// them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
@@ -1403,8 +1403,7 @@ impl ParkReason {
     }
 
     /// Whether entries stored for this reason count against the bounds of Switch spec 8.2
-    /// (`unverified.rs`): those whose sender couldn't be checked and those that wait for a
-    /// scope key, together.
+    /// (`unverified.rs`): sender standing, scope keys and protocol admission together.
     pub(crate) fn bounded(self) -> bool {
         self.waiting().is_some()
     }

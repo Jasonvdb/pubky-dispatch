@@ -94,6 +94,7 @@ struct ApiProtocol {
     opaque: Mutex<Vec<crate::app::OpaqueRule>>,
     blocked_origin: Mutex<Option<crate::app::DeliveryOrigin>>,
     send_origins: Mutex<Vec<(String, crate::app::DeliveryOrigin)>>,
+    require_send_fact: std::sync::atomic::AtomicBool,
 }
 
 impl ApiProtocol {
@@ -107,6 +108,7 @@ impl ApiProtocol {
             opaque: Mutex::new(Vec::new()),
             blocked_origin: Mutex::new(None),
             send_origins: Mutex::new(Vec::new()),
+            require_send_fact: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -132,6 +134,13 @@ impl Protocol for ApiProtocol {
             .lock()
             .unwrap()
             .push((delivery.message().msg_id.clone(), delivery.origin()));
+        if self
+            .require_send_fact
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !delivery_inventory::has_delivery_fact(delivery)?
+        {
+            return Ok(false);
+        }
         Ok(*self.blocked_origin.lock().unwrap() != Some(delivery.origin()))
     }
 

@@ -2,6 +2,391 @@ use super::*;
 use crate::app::{DeliveryOrigin, QueuedMessage};
 use crate::error::StoreError;
 
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct DeliveryFact {
+    owner: [u8; 32],
+    app_id: [u8; 16],
+    to: [u8; 32],
+    hash: [u8; 32],
+    cert: [u8; 32],
+    key: [u8; 32],
+}
+
+fn delivery_key(id: &str) -> Vec<u8> {
+    format!("delivery/{id}").into_bytes()
+}
+
+fn delivery_fact(app: &App, plaintext: &MessagePlaintext) -> DeliveryFact {
+    let message = Message::parse(plaintext.json(), &[]).unwrap();
+    DeliveryFact {
+        owner: app.identity(),
+        app_id: app.app_id(),
+        to: message.to,
+        hash: plaintext.hash(),
+        cert: app.cert().hash(),
+        key: app.blind(&delivery_key(&message.msg_id)),
+    }
+}
+
+pub(super) fn has_delivery_fact(
+    delivery: &crate::app::DeliveryView<'_>,
+) -> Result<bool, crate::app::StoreFailure> {
+    assert_eq!(format!("{delivery:?}"), "DeliveryView");
+    assert_eq!(delivery.hash(), delivery.plaintext().hash());
+    assert_eq!(
+        *delivery.message(),
+        Message::parse(delivery.plaintext().json(), &[]).unwrap()
+    );
+    let bytes = delivery
+        .local()
+        .local_get(&delivery_key(&delivery.message().msg_id))
+        .map_err(|error| crate::app::StoreFailure::try_from(error).unwrap())?;
+    let Some(bytes) = bytes else { return Ok(false) };
+    let Ok(fact) = serde_json::from_slice::<DeliveryFact>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(fact
+        == DeliveryFact {
+            owner: delivery.local().identity(),
+            app_id: delivery.local().app_id(),
+            to: delivery.message().to,
+            hash: delivery.hash(),
+            cert: delivery.cert().hash(),
+            key: delivery.blind(&delivery_key(&delivery.message().msg_id)),
+        })
+}
+
+fn fact_write(id: &str, fact: &DeliveryFact) -> LocalWrite {
+    LocalWrite::Put {
+        key: delivery_key(id),
+        value: serde_json::to_vec(fact).unwrap(),
+    }
+}
+
+/// Only the delivery's own local fact is unavailable; other durable work stays readable.
+struct DeliveryReadFault {
+    inner: Arc<MemoryStore>,
+    key: Vec<u8>,
+    fail: std::sync::atomic::AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StateStore for DeliveryReadFault {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        if key == self.key && self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.get(ns, key)
+    }
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
+        self.inner.commit(batch)
+    }
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, StoreError> {
+        self.inner.commit_if(ns, owner, batch)
+    }
+}
+
+#[tokio::test]
+async fn test_delivery_view_uses_original_signed_bytes_and_exact_local_fact() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        protocol
+            .require_send_fact
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let signed = wallet.sign_message(Pair::note(&p.bob, "bytes")).unwrap();
+        let json: Value = serde_json::from_slice(signed.plaintext().json()).unwrap();
+        let pretty = MessagePlaintext::sign_json(
+            &p.alice.identity().app_keys("wallet"),
+            serde_json::to_vec_pretty(&json).unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            Message::parse(pretty.json(), &[]).unwrap(),
+            Message::parse(signed.plaintext().json(), &[]).unwrap()
+        );
+        assert_ne!(pretty.hash(), signed.hash());
+        wallet.queue_stored(&pretty).await.unwrap();
+        let correct = delivery_fact(&wallet, &pretty);
+        let mut wrong_owner = correct.clone();
+        wrong_owner.owner = [1; 32];
+        let mut wrong_app = correct.clone();
+        wrong_app.app_id = [2; 16];
+        let mut wrong_to = correct.clone();
+        wrong_to.to = [3; 32];
+        let mut wrong_key = correct.clone();
+        wrong_key.key = wallet.blind(b"another local binding");
+        assert_ne!(wrong_key.key, correct.key);
+        let mut wrong_cert = correct.clone();
+        wrong_cert.cert = shop.cert().hash();
+        assert_ne!(wrong_cert.cert, correct.cert);
+        let variants = [
+            None,
+            Some(b"not JSON".to_vec()),
+            Some(serde_json::to_vec(&delivery_fact(&wallet, signed.plaintext())).unwrap()),
+            Some(serde_json::to_vec(&wrong_owner).unwrap()),
+            Some(serde_json::to_vec(&wrong_app).unwrap()),
+            Some(serde_json::to_vec(&wrong_to).unwrap()),
+            Some(serde_json::to_vec(&wrong_key).unwrap()),
+            Some(serde_json::to_vec(&wrong_cert).unwrap()),
+        ];
+        for bytes in variants {
+            let write = match bytes {
+                Some(value) => LocalWrite::Put {
+                    key: delivery_key(signed.msg_id()),
+                    value,
+                },
+                None => LocalWrite::Delete {
+                    key: delivery_key(signed.msg_id()),
+                },
+            };
+            wallet.protocol_commit("sample", &[write]).await.unwrap();
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            let routed = p.router.log();
+            let item = listed_origin(&wallet, &signed).await;
+            assert_eq!(
+                item.hash,
+                pretty.hash(),
+                "inventory retains original JSON hash"
+            );
+            assert_eq!(item.origin, DeliveryOrigin::Reconstructed);
+            assert!(
+                !item.may_send && item.waits(),
+                "missing or mismatched evidence holds"
+            );
+            assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+            assert_eq!(p.router.log(), routed, "inventory does not route");
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.router.log(), routed, "held delivery does not route");
+            assert!(wallet.outbox_record(signed.msg_id()).await.is_some());
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+        }
+        wallet
+            .protocol_commit("sample", &[fact_write(signed.msg_id(), &correct)])
+            .await
+            .unwrap();
+        assert!(listed_origin(&wallet, &signed).await.may_send);
+        assert!(matches!(
+            wallet.flush_message(signed.msg_id()).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_unavailable_local_fact_holds_only_its_delivery() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        protocol
+            .require_send_fact
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p
+            .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+            .await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let blocked = wallet.sign_message(Pair::note(&p.bob, "blocked")).unwrap();
+        let other = wallet.sign_message(Pair::note(&p.bob, "other")).unwrap();
+        for signed in [&blocked, &other] {
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            wallet
+                .protocol_commit(
+                    "sample",
+                    &[fact_write(
+                        signed.msg_id(),
+                        &delivery_fact(&wallet, signed.plaintext()),
+                    )],
+                )
+                .await
+                .unwrap();
+        }
+        let id = wallet.app_id();
+        drop(wallet);
+        let local = crate::app::protocols::qualified_key("sample", &delivery_key(blocked.msg_id()));
+        let fault = Arc::new(DeliveryReadFault {
+            inner: store.clone(),
+            key: [b"p/".as_slice(), local.as_slice()].concat(),
+            fail: std::sync::atomic::AtomicBool::new(true),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut wallet = App::load(
+            p.env(&p.alice, fault.clone()),
+            protocol.clone(),
+            config(),
+            id,
+        )
+        .await
+        .unwrap();
+        let before = wallet.reader().scan_raw("").await.unwrap();
+        let routed = p.router.log();
+        assert!(!listed_origin(&wallet, &blocked).await.may_send);
+        assert!(listed_origin(&wallet, &other).await.may_send);
+        assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+        assert_eq!(p.router.log(), routed);
+        let report = wallet.flush_outbox().await.unwrap();
+        assert_eq!(report.done, [other.msg_id()]);
+        assert!(fault.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+        assert!(wallet.outbox_record(blocked.msg_id()).await.is_some());
+        assert!(matches!(
+            wallet.delivery(blocked.msg_id()).await.unwrap(),
+            Some(Delivery::Queued { .. })
+        ));
+        drop(wallet);
+        let mut wallet = App::load(p.env(&p.alice, fault.clone()), protocol, config(), id)
+            .await
+            .unwrap();
+        wallet.flush_message(blocked.msg_id()).await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+        fault.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(listed_origin(&wallet, &blocked).await.may_send);
+        wallet.flush_message(blocked.msg_id()).await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_kept_local_state_and_restored_original_bytes() {
+    Box::pin(async {
+        for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            protocol
+                .require_send_fact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let signed = wallet
+                .sign_message(Pair::note(&p.bob, "kept fact"))
+                .unwrap();
+            let fact = delivery_fact(&wallet, signed.plaintext());
+            if origin == DeliveryOrigin::Reconstructed {
+                wallet.queue_stored(signed.plaintext()).await.unwrap();
+            }
+            p.alice.switch().fail_next(Fault::Unanswered {
+                path: "ops".into(),
+                after: 0,
+            });
+            wallet
+                .submit_batch(
+                    OpBatch::for_protocol("sample")
+                        .op(OpKind::AllowPut {
+                            pubky: [9; 32],
+                            kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        })
+                        .local(fact_write(signed.msg_id(), &fact))
+                        .queue(signed.clone()),
+                )
+                .await
+                .unwrap_err()
+                .kept_batch()
+                .unwrap();
+            let item = listed_origin(&wallet, &signed).await;
+            assert!(
+                !item.may_send,
+                "uncommitted batch locals cannot permit delivery"
+            );
+            assert_eq!(item.hash, signed.hash());
+            assert_eq!(
+                item.kept_batch.is_some(),
+                origin == DeliveryOrigin::Original
+            );
+            assert_eq!(item.origin, origin);
+            wallet
+                .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
+                .await
+                .unwrap();
+            assert!(listed_origin(&wallet, &signed).await.may_send);
+            let id = wallet.app_id();
+            drop(wallet);
+            let mut wallet = App::load(
+                p.env(&p.alice, store.clone()),
+                protocol.clone(),
+                config(),
+                id,
+            )
+            .await
+            .unwrap();
+            assert!(listed_origin(&wallet, &signed).await.may_send);
+            // Backups carry materialized deliveries. Materializing a kept original
+            // keeps its origin and unanswered batch; it adds no backup scope.
+            let pending = wallet.kept_batches().await.unwrap().len();
+            wallet.queue_stored(signed.plaintext()).await.unwrap();
+            assert_eq!(wallet.kept_batches().await.unwrap().len(), pending);
+            assert_eq!(listed_origin(&wallet, &signed).await.origin, origin);
+            let backup = wallet.backup_layered().await.unwrap();
+            wallet
+                .protocol_commit(
+                    "sample",
+                    &[LocalWrite::Delete {
+                        key: delivery_key(signed.msg_id()),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert!(!listed_origin(&wallet, &signed).await.may_send);
+            drop(wallet);
+            let restored =
+                App::restore(p.env(&p.alice, store), protocol.clone(), config(), &backup)
+                    .await
+                    .unwrap();
+            let item = listed_origin(&restored, &signed).await;
+            assert_eq!(
+                (item.hash, item.origin, item.may_send),
+                (signed.hash(), origin, true)
+            );
+            drop(restored);
+            let fresh = App::restore(
+                p.env(&p.alice, Arc::new(MemoryStore::new())),
+                protocol,
+                config(),
+                &backup,
+            )
+            .await
+            .unwrap();
+            let item = listed_origin(&fresh, &signed).await;
+            assert_eq!(
+                (item.hash, item.origin, item.may_send),
+                (signed.hash(), origin, true)
+            );
+        }
+    })
+    .await;
+}
+
 /// Fail the outcome transaction itself, independently of earlier read bookkeeping.
 struct SettlementFault {
     inner: Arc<MemoryStore>,

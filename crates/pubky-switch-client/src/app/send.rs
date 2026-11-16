@@ -48,10 +48,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
+use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
-use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
+use pubky_switch_core::records::{AppCert, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -240,6 +241,8 @@ pub struct DeliveryView<'a> {
     plaintext: &'a MessagePlaintext,
     origin: DeliveryOrigin,
     local: super::LocalView<'a>,
+    cert: &'a AppCert,
+    naming: &'a NamingKey,
 }
 
 impl std::fmt::Debug for DeliveryView<'_> {
@@ -272,6 +275,17 @@ impl<'a> DeliveryView<'a> {
     /// Only the owning protocol's local state, as committed.
     pub fn local(&self) -> &super::LocalView<'a> {
         &self.local
+    }
+
+    /// The app's current certificate, as [`App::cert`] gives it.
+    pub fn cert(&self) -> &AppCert {
+        self.cert
+    }
+
+    /// `blind(input)` under the app's naming key (Switch wire 1.5), as [`App::blind`]
+    /// gives it, without exposing the key.
+    pub fn blind(&self, input: &[u8]) -> [u8; 32] {
+        self.naming.blind(input)
     }
 }
 
@@ -2891,6 +2905,8 @@ impl App {
             plaintext: &plaintext,
             origin: item.origin,
             local,
+            cert: &self.state.cert,
+            naming: &self.state.naming,
         };
         owner.protocol.may_send(&delivery).unwrap_or(false)
     }

@@ -797,7 +797,8 @@ pub trait Protocol: Send + Sync {
     /// messages of the app's other protocols go on. Asked only about the protocol's own
     /// messages; every message by default.
     /// The view supplies its original signed plaintext, current origin and only this
-    /// protocol's committed local state. Its hash and origin are the same facts exposed
+    /// protocol's committed local state, with the app's certificate and naming-key
+    /// blinding to check their binding. Its hash and origin are the same facts exposed
     /// by [`super::QueuedMessage`], independent of acceptance and re-send status.
     /// [`super::App::queued_messages`] asks this same decision without sending anything,
     /// including for retained intents not yet materialized in the outbox.

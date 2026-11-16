@@ -2,6 +2,346 @@ use super::*;
 use crate::StoreError;
 use crate::app::StoreFailure;
 
+async fn accepted_resend_message(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+    with_record: bool,
+) -> (App, SignedMessage) {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p.join(&p.bob, "shop", protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let mut signed = wallet.sign_message(Pair::note(&p.bob, "accepted")).unwrap();
+    if with_record {
+        let target = RecordTarget::new(items(), &signed.hash());
+        signed = signed.with_record(RecordJob {
+            target,
+            tag: b"sent".to_vec(),
+        });
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 1,
+        });
+    }
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    assert!(matches!(
+        wallet.flush_message(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+    let item = wallet.outbox_record(signed.msg_id()).await;
+    assert_eq!(item.is_some(), with_record);
+    assert!(item.is_none_or(|item| !item.delivery_owed()));
+    p.alice.switch().lock().faults.clear();
+    wallet.take_events();
+    (wallet, signed)
+}
+
+async fn queue_and_hold_resend(p: &Pair, wallet: &mut App, msg_id: &str, with_record: bool) {
+    if with_record {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        wallet.resend(msg_id).await.unwrap(),
+        Delivery::Queued { .. }
+    ));
+    assert!(wallet.outbox_record(msg_id).await.unwrap().delivery_owed());
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+    p.alice.switch().lock().faults.clear();
+    p.bob.switch().lock().faults.clear();
+    assert!(wallet.hold_message("sample", msg_id).await.unwrap());
+    wallet.take_events();
+}
+
+async fn withdrawn_explicit_resend(with_record: bool, reachable: bool) {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, signed) = accepted_resend_message(&p, &protocol, with_record).await;
+    let msg_id = signed.msg_id();
+    queue_and_hold_resend(&p, &mut wallet, msg_id, with_record).await;
+    assert!(wallet.withdraw_message("sample", msg_id).await.unwrap());
+    assert!(wallet.held_messages("sample").await.unwrap().is_empty());
+    assert!(
+        crate::app::send::given_up(&wallet.reader(), msg_id, p.clock.now_ms())
+            .await
+            .unwrap()
+    );
+    let item = wallet.outbox_record(msg_id).await;
+    assert_eq!(item.is_some(), with_record);
+    assert!(item.is_none_or(|item| !item.delivery_owed()));
+    assert_eq!(undelivered(&wallet.take_events(), msg_id), [true]);
+    assert_eq!(
+        undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+        [true]
+    );
+    assert!(
+        wallet
+            .sent_to(&p.bob.identity().public(), 0, p.clock.now_ms())
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.msg_id == msg_id)
+    );
+    if with_record {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    if !reachable {
+        p.bob.switch().fail_next(Fault::Unreachable {
+            path: "inbox".into(),
+            after: 0,
+        });
+    }
+    let appends_before = inbox_appends(&p);
+    let result = wallet.resend(msg_id).await;
+    let fresh_notices = undelivered(&wallet.take_events(), msg_id);
+    let notices = undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id);
+    let delivery_owed = wallet
+        .outbox_record(msg_id)
+        .await
+        .is_some_and(|item| item.delivery_owed());
+    assert_eq!(
+        (
+            inbox_appends(&p) - appends_before,
+            p.bob.switch().entries_from(&p.alice.identity().public()),
+            delivery_owed,
+            notices,
+            fresh_notices,
+        ),
+        (0, 1, false, vec![true], Vec::<bool>::new()),
+        "append attempts, accepted entries, delivery owed, durable notices, new notices; resend: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_explicit_resend_withdrawn_sent_message_stays_ended() {
+    Box::pin(withdrawn_explicit_resend(false, true)).await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_withdrawn_sent_message_stays_unqueued() {
+    Box::pin(withdrawn_explicit_resend(false, false)).await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_withdrawn_record_message_stays_ended() {
+    Box::pin(withdrawn_explicit_resend(true, true)).await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_withdrawn_record_message_stays_unqueued() {
+    Box::pin(withdrawn_explicit_resend(true, false)).await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_expired_record_message_keeps_one_notice() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (mut wallet, signed) = accepted_resend_message(&p, &protocol, true).await;
+        let msg_id = signed.msg_id();
+        queue_and_hold_resend(&p, &mut wallet, msg_id, true).await;
+        p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+        wallet.flush_message(msg_id).await.unwrap();
+        assert!(!wallet.outbox_record(msg_id).await.unwrap().delivery_owed());
+        assert!(wallet.held_messages("sample").await.unwrap().is_empty());
+        assert!(
+            crate::app::send::given_up(&wallet.reader(), msg_id, p.clock.now_ms())
+                .await
+                .unwrap()
+        );
+        assert_eq!(undelivered(&wallet.take_events(), msg_id), [true]);
+        assert_eq!(
+            undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+            [true]
+        );
+        let appends_before = inbox_appends(&p);
+        let result = wallet.resend(msg_id).await;
+        let fresh_notices = undelivered(&wallet.take_events(), msg_id);
+        let notices = undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id);
+        let delivery_owed = wallet
+            .outbox_record(msg_id)
+            .await
+            .is_some_and(|item| item.delivery_owed());
+        assert_eq!(
+            (
+                inbox_appends(&p) - appends_before,
+                p.bob.switch().entries_from(&p.alice.identity().public()),
+                delivery_owed,
+                notices,
+                fresh_notices,
+            ),
+            (0, 1, false, vec![true], Vec::<bool>::new()),
+            "append attempts, accepted entries, delivery owed, durable notices, new notices; resend: {result:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_before_withdrawal_delivers_again() {
+    Box::pin(async {
+        for with_record in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let (mut wallet, signed) = accepted_resend_message(&p, &protocol, with_record).await;
+            p.clock.advance_ms(MINUTE);
+            assert!(matches!(
+                wallet.resend(signed.msg_id()).await.unwrap(),
+                Delivery::Accepted { .. }
+            ));
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+            assert!(
+                undelivered(
+                    &wallet.pending_duty_events().await.unwrap(),
+                    signed.msg_id()
+                )
+                .is_empty()
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_from_restored_host_delivers_again() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (mut wallet, signed) = accepted_resend_message(&p, &protocol, false).await;
+        queue_and_hold_resend(&p, &mut wallet, signed.msg_id(), false).await;
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        p.clock.advance_ms(MINUTE);
+        let mut restored = restored_wallet(&p, &protocol, &backup).await;
+        assert_eq!(
+            restored.held_messages("sample").await.unwrap(),
+            [signed.msg_id()]
+        );
+        restored
+            .release_message("sample", signed.msg_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.resend(signed.msg_id()).await.unwrap(),
+            Delivery::Accepted { .. }
+        ));
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+        assert!(
+            undelivered(
+                &restored.pending_duty_events().await.unwrap(),
+                signed.msg_id()
+            )
+            .is_empty()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_terminal_mark_outlives_retained_plaintext() {
+    Box::pin(async {
+        for with_record in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let (mut wallet, signed) = accepted_resend_message(&p, &protocol, with_record).await;
+            let msg_id = signed.msg_id();
+            queue_and_hold_resend(&p, &mut wallet, msg_id, with_record).await;
+            assert!(wallet.withdraw_message("sample", msg_id).await.unwrap());
+            assert_eq!(undelivered(&wallet.take_events(), msg_id), [true]);
+            p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+            let env = wallet.env.clone();
+            let app_id = wallet.app_id();
+            drop(wallet);
+            let mut loaded = App::load(env, protocol.clone(), config(), app_id)
+                .await
+                .unwrap();
+            assert_eq!(undelivered(&loaded.take_events(), msg_id), [true]);
+            let appends_before = inbox_appends(&p);
+            let result = loaded.resend(msg_id).await;
+            loaded
+                .resend_since(&p.bob.identity().public(), 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    inbox_appends(&p) - appends_before,
+                    loaded
+                        .outbox_record(msg_id)
+                        .await
+                        .is_some_and(|item| item.delivery_owed()),
+                    undelivered(&loaded.pending_duty_events().await.unwrap(), msg_id),
+                    undelivered(&loaded.take_events(), msg_id),
+                ),
+                (0, false, vec![true], Vec::<bool>::new()),
+                "retained terminal delivery after reload; record: {with_record}; resend: {result:?}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_explicit_resend_bounded_flush_keeps_terminal_record_mark() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (mut wallet, signed) = accepted_resend_message(&p, &protocol, true).await;
+        let msg_id = signed.msg_id();
+        for _ in 0..4 {
+            p.alice.switch().fail_next(Fault::Unreachable {
+                path: "ops".into(),
+                after: 0,
+            });
+        }
+        wallet.flush_outbox().await.unwrap();
+        p.alice.switch().lock().faults.clear();
+        assert!(wallet.outbox_record(msg_id).await.is_some());
+        queue_and_hold_resend(&p, &mut wallet, msg_id, true).await;
+        assert!(wallet.withdraw_message("sample", msg_id).await.unwrap());
+        p.clock.advance_ms(MINUTE);
+        let other = wallet.sign_message(Pair::note(&p.bob, "next")).unwrap();
+        wallet.queue_signed(other).await.unwrap();
+        p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
+        wallet.config.call_budget_ms = 0;
+        let report = wallet.flush_outbox().await.unwrap();
+        assert!(report.more);
+        assert!(wallet.outbox_record(msg_id).await.is_some());
+        assert!(
+            wallet
+                .sent_to(&p.bob.identity().public(), 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        wallet.take_events();
+        let appends_before = inbox_appends(&p);
+        let result = wallet.resend(msg_id).await;
+        assert_eq!(
+            (
+                inbox_appends(&p) - appends_before,
+                wallet
+                    .outbox_record(msg_id)
+                    .await
+                    .is_some_and(|item| item.delivery_owed()),
+                undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+                undelivered(&wallet.take_events(), msg_id),
+            ),
+            (0, false, vec![true], Vec::<bool>::new()),
+            "a bounded flush retained the record job; resend: {result:?}"
+        );
+    })
+    .await;
+}
+
 async fn keep_unsent(p: &Pair, wallet: &mut App, batch: OpBatch, first: bool) {
     for path in ["feed", "ops"] {
         p.alice.switch().fail_next(Fault::Unreachable {

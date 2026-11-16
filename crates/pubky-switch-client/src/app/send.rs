@@ -187,21 +187,26 @@ fn given_up_key(msg_id: &str) -> String {
 }
 
 /// Whether the app gave up the delivery of `msg_id` and its mark still stands at `now`
-/// ([`note_given_up`]): such a message isn't queued again, by [`App::queue_stored`] or by a
-/// kept batch that settles after the give-up.
+/// ([`note_given_up`]). A retained outbox item or sent copy keeps the mark effective until
+/// it goes too: neither may recreate an ended delivery (Switch spec 11).
 pub(crate) async fn given_up(
     reader: &super::state::Reader,
     msg_id: &str,
     now: u64,
 ) -> Result<bool, AppError> {
     let until: Option<u64> = reader.get(&given_up_key(msg_id)).await?;
-    Ok(until.is_some_and(|until| now <= until))
+    let Some(until) = until else {
+        return Ok(false);
+    };
+    Ok(now <= until
+        || reader.exists(&out_key(msg_id)).await?
+        || reader.exists(&sent_key(msg_id)).await?)
 }
 
 /// Note in `tx` that the delivery of `msg_id` was given up at `now`, in the commit that
 /// gives it up and tells the protocol: [`App::queue_stored`] refuses the message from then
-/// until [`SENT_RETENTION_MS`] later, past which its replay deadline refuses it anyway, so
-/// the protocol is told once.
+/// until [`SENT_RETENTION_MS`] later, and while the outbox or sent copies keep its plaintext.
+/// Past that window its replay deadline refuses it anyway, so the protocol is told once.
 pub(crate) fn note_given_up(
     tx: &mut super::state::Tx,
     msg_id: &str,
@@ -1570,16 +1575,16 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
+    /// [`Refusal::WontDeliver`] with [`WontDeliver::GivenUp`] for a delivery the app gave
+    /// up; [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
     pub async fn resend(&mut self, msg_id: &str) -> Result<Delivery, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            if !self.ask_resend_of_queued(msg_id).await? {
-                let sent: SentStored = self.read_sent(msg_id).await?.ok_or_else(|| {
-                    AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
-                })?;
-                self.queue_resend(&sent).await?;
+            if !self.prepare_resend(msg_id).await? {
+                return Err(AppError::Refused(Refusal::WontDeliver(
+                    WontDeliver::GivenUp,
+                )));
             }
             self.flush_item(msg_id).await?;
             self.delivery(msg_id)
@@ -1587,6 +1592,22 @@ impl App {
                 .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))
         })
         .await
+    }
+
+    /// Prepare either retained copy for a re-send, unless its delivery was given up.
+    /// Check before changing an accepted item's jobs or queuing its sent copy, so a repeated
+    /// request neither delivers it nor reports it undelivered again (Switch spec 11).
+    async fn prepare_resend(&mut self, msg_id: &str) -> Result<bool, AppError> {
+        if given_up(&self.reader(), msg_id, self.now()).await? {
+            return Ok(false);
+        }
+        if !self.ask_resend_of_queued(msg_id).await? {
+            let sent = self.read_sent(msg_id).await?.ok_or_else(|| {
+                AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
+            })?;
+            self.queue_resend(&sent).await?;
+        }
+        Ok(true)
     }
 
     /// A message still in the outbox: one already accepted, whose other jobs are owed, is
@@ -1676,16 +1697,9 @@ impl App {
             if sent.to != *pubky || last < since_ms {
                 continue;
             }
-            // A message whose delivery the app gave up, withdrawn or otherwise, and told the
-            // protocol so, isn't sent again.
-            if given_up(&self.reader(), &sent.msg_id, self.now()).await? {
-                continue;
+            if self.prepare_resend(&sent.msg_id).await? {
+                queued = queued.saturating_add(1);
             }
-            // One whose record job is still owed is in the outbox: marked to go again.
-            if !self.ask_resend_of_queued(&sent.msg_id).await? {
-                self.queue_resend(&sent).await?;
-            }
-            queued = queued.saturating_add(1);
         }
         if queued > 0 {
             self.events.push(AppEvent::ResendAfterLoss {
@@ -2316,7 +2330,13 @@ impl App {
         }
         let now = self.now();
         for (msg_id, until) in self.reader().scan::<u64>(GIVEN_UP_PREFIX).await? {
-            if until < now {
+            // A retained item may still await its turn in a bounded flush. Keep its mark
+            // until neither stored copy can produce a re-send, even if this commit removes
+            // the sent copy: the next prune can remove the mark.
+            if until < now
+                && !self.reader().exists(&out_key(&msg_id)).await?
+                && !self.reader().exists(&sent_key(&msg_id)).await?
+            {
                 tx.delete(&given_up_key(&msg_id))?;
             }
         }

@@ -791,16 +791,24 @@ pub trait Protocol: Send + Sync {
     /// Whether a message of the protocol's that the outbox holds goes out now: asked before
     /// every try of its delivery, a first one or a re-send, whichever call makes it
     /// ([`super::App::send`], [`super::App::flush_message`], [`super::App::resend`],
-    /// [`super::App::flush_outbox`]). `false` keeps it queued, with its `msg_id` and bytes,
+    /// [`super::App::flush_outbox`]). `Ok(false)` keeps it queued, with its `msg_id` and bytes,
     /// for a later try, as a hold of its counterparty does ([`super::App::hold_queued`]):
     /// its conversation entry waits with it, its replay deadline still runs, and the
     /// messages of the app's other protocols go on. Asked only about the protocol's own
     /// messages; every message by default.
-    /// `origin` is the same retained local fact exposed by [`super::QueuedMessage`],
-    /// independent of acceptance, re-send status and permission to deliver.
-    fn may_send(&self, message: &Message, origin: super::DeliveryOrigin) -> bool {
-        let _ = (message, origin);
-        true
+    /// The view supplies its original signed plaintext, current origin and only this
+    /// protocol's committed local state. Its hash and origin are the same facts exposed
+    /// by [`super::QueuedMessage`], independent of acceptance and re-send status.
+    /// [`super::App::queued_messages`] asks this same decision without sending anything,
+    /// including for retained intents not yet materialized in the outbox.
+    ///
+    /// # Errors
+    ///
+    /// A failure to read required local evidence also holds the delivery for a later try.
+    /// Ordinary policy refusal is `Ok(false)`, not a fabricated store failure.
+    fn may_send(&self, delivery: &super::DeliveryView<'_>) -> Result<bool, StoreFailure> {
+        let _ = delivery;
+        Ok(true)
     }
 
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by

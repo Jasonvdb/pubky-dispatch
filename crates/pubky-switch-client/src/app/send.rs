@@ -231,6 +231,50 @@ pub enum DeliveryOrigin {
     Reconstructed,
 }
 
+/// An authenticated outgoing message and its owning protocol's committed local state.
+///
+/// The plaintext retains the exact signed JSON bytes. Its hash and origin are the same
+/// facts exposed by [`QueuedMessage`] (Switch spec 11).
+pub struct DeliveryView<'a> {
+    message: &'a Message,
+    plaintext: &'a MessagePlaintext,
+    origin: DeliveryOrigin,
+    local: super::LocalView<'a>,
+}
+
+impl std::fmt::Debug for DeliveryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveryView")
+    }
+}
+
+impl<'a> DeliveryView<'a> {
+    /// The parsed authenticated message.
+    pub fn message(&self) -> &Message {
+        self.message
+    }
+
+    /// The retained signed plaintext, including its original JSON bytes.
+    pub fn plaintext(&self) -> &MessagePlaintext {
+        self.plaintext
+    }
+
+    /// The hash of the original signed JSON (Switch wire 5.1).
+    pub fn hash(&self) -> [u8; 32] {
+        self.plaintext.hash()
+    }
+
+    /// The current copy's retained origin, independently of acceptance or a re-send.
+    pub fn origin(&self) -> DeliveryOrigin {
+        self.origin
+    }
+
+    /// Only the owning protocol's local state, as committed.
+    pub fn local(&self) -> &super::LocalView<'a> {
+        &self.local
+    }
+}
+
 /// A message whose delivery is owed, including intents in unanswered batches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -241,6 +285,8 @@ pub struct QueuedMessage {
     pub to: [u8; 32],
     /// The authenticated message kind.
     pub kind: String,
+    /// The hash of the original signed JSON, as the delivery gate receives it.
+    pub hash: [u8; 32],
     /// Its retained local origin, as every protocol delivery gate receives it.
     pub origin: DeliveryOrigin,
     /// A re-send of a message accepted before, independently of its origin.
@@ -1386,10 +1432,12 @@ impl App {
                 continue;
             }
             let holds = self.delivery_holds(&item).await?;
+            let hash = item.plaintext()?.hash();
             result.push(QueuedMessage {
                 msg_id: item.msg_id,
                 to: item.to,
                 kind: item.kind,
+                hash,
                 origin: item.origin,
                 resend: item.accepted_at_ms.is_some() || item.resend_queued,
                 kept_batch,
@@ -1411,23 +1459,8 @@ impl App {
     async fn owned_owed(&self, protocol: &str, msg_id: &str) -> Result<Option<String>, AppError> {
         self.check_registered(protocol)?;
         let reader = self.reader();
-        if reader
-            .get::<OutboxItem>(&out_key(msg_id))
-            .await?
-            .is_some_and(|item| {
-                item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
-            })
-        {
-            return Err(store_corrupt());
-        }
+        validate_outbox(&reader, &self.state.meta, &self.state.cert).await?;
         let kept = super::batch::kept_queued(&reader).await?;
-        if kept
-            .iter()
-            .filter(|item| item.msg_id == msg_id)
-            .any(|item| !item.is_own(&self.state.meta, &self.state.cert))
-        {
-            return Err(store_corrupt());
-        }
         let kind = owed_kind(&reader, msg_id, self.now(), &kept).await?;
         match kind {
             Some(kind) if !self.owns_kind(protocol, &kind) => Err(Refusal::Usage(format!(
@@ -2074,6 +2107,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
             let budget = self.begin_budget();
             // The units this flush started: a delivery of the own `identity.json` or a
             // message's try. Past the budget none starts but the flush's first.
@@ -2825,11 +2859,11 @@ impl App {
     }
 
     /// Whether the protocol of an outbox message's kind lets it go out now
-    /// ([`super::Protocol::may_send`]); a message whose kind no protocol owns, or whose
-    /// plaintext doesn't read, goes to its try, which settles it.
+    /// ([`super::Protocol::may_send`]). A message whose kind no protocol owns goes to its
+    /// try; unreadable plaintext or unavailable protocol evidence keeps the delivery held.
     fn may_send(&self, item: &OutboxItem) -> bool {
         let Ok(plaintext) = item.plaintext() else {
-            return true;
+            return false;
         };
         let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<OpaqueMember<'_>> = rules
@@ -2840,11 +2874,25 @@ impl App {
             })
             .collect();
         let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
+            return false;
+        };
+        let Some(owner) = self.protocols.of_kind(&message.kind) else {
             return true;
         };
-        self.protocols
-            .of_kind(&message.kind)
-            .is_none_or(|owner| owner.protocol.may_send(&message, item.origin))
+        let local = super::LocalView::new(
+            self.state.meta.identity,
+            self.state.meta.app_id,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            &owner.name,
+        );
+        let delivery = DeliveryView {
+            message: &message,
+            plaintext: &plaintext,
+            origin: item.origin,
+            local,
+        };
+        owner.protocol.may_send(&delivery).unwrap_or(false)
     }
 
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope

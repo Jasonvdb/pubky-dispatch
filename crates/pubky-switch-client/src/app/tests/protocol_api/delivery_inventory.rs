@@ -1,5 +1,179 @@
 use super::*;
 use crate::app::{DeliveryOrigin, QueuedMessage};
+use crate::error::StoreError;
+
+/// Fail the outcome transaction itself, independently of earlier read bookkeeping.
+struct SettlementFault {
+    inner: Arc<MemoryStore>,
+    after: bool,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl SettlementFault {
+    fn completes(&self, batch: &crate::store::WriteBatch) -> bool {
+        let local = crate::app::protocols::qualified_key("sample", b"settled");
+        let target = [b"p/".as_slice(), local.as_slice()].concat();
+        batch.writes().iter().any(|write| {
+            matches!(write,
+            crate::store::Write::Put { key, .. } if *key == target)
+        }) && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl StateStore for SettlementFault {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(ns, key)
+    }
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
+        if self.completes(&batch) {
+            if self.after {
+                self.inner.commit(batch)?;
+                return Err(StoreError::Unknown);
+            }
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit(batch)
+    }
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, StoreError> {
+        if self.completes(&batch) {
+            if self.after {
+                return match self.inner.commit_if(ns, owner, batch)? {
+                    crate::store::CommitOutcome::Applied => Err(StoreError::Unknown),
+                    outcome => Ok(outcome),
+                };
+            }
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
+}
+
+fn assert_corrupt<T: std::fmt::Debug>(result: Result<T, AppError>) {
+    assert!(
+        matches!(result, Err(AppError::Store(StoreError::Corrupt))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_delivery_origin_overlapping_copies_refuse_before_effects() {
+    Box::pin(async {
+        for sent in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "overlap")).unwrap();
+            kept_with(&p, &mut wallet, &signed).await;
+            wallet.queue_stored(signed.plaintext()).await.unwrap();
+            let (id, _) = wallet.kept_batches().await.unwrap().pop().unwrap();
+            let key = format!("opq/{}", pubky_switch_core::enc::b64(&id));
+            let mut pending: Value = wallet.reader().get(&key).await.unwrap().unwrap();
+            if sent {
+                let mut shop = p.join(&p.bob, "shop", &protocol).await;
+                shop.invite(&p.alice.identity().public()).await.unwrap();
+                wallet.receive(None).await.unwrap();
+                wallet.flush_message(signed.msg_id()).await.unwrap();
+                assert!(wallet.outbox_record(signed.msg_id()).await.is_none());
+                assert!(
+                    wallet
+                        .reader()
+                        .exists(&format!("sent/{}", signed.msg_id()))
+                        .await
+                        .unwrap()
+                );
+            }
+            pending["queued"][0]["origin"] = json!("Reconstructed");
+            let mut tx = wallet.tx().unwrap();
+            tx.put(&key, &pending).unwrap();
+            wallet.commit(tx).await.unwrap();
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            let own_operations = p.alice.switch().applied().len();
+            let appends = p.bob.switch().entries_from(&p.alice.identity().public());
+            assert_corrupt(wallet.queued_messages("sample").await);
+            assert_corrupt(wallet.hold_message("sample", signed.msg_id()).await);
+            assert_corrupt(wallet.queue_stored(signed.plaintext()).await);
+            assert_corrupt(wallet.queue_signed(signed.clone()).await);
+            assert_corrupt(wallet.flush_outbox().await);
+            assert_corrupt(wallet.withdraw_message("sample", signed.msg_id()).await);
+            assert_corrupt(wallet.kept_batches().await);
+            assert_eq!(
+                wallet.reader().scan_raw("").await.unwrap(),
+                before,
+                "invalid overlap cannot mutate retained work"
+            );
+            assert_eq!(p.alice.switch().applied().len(), own_operations);
+            assert_eq!(
+                p.bob.switch().entries_from(&p.alice.identity().public()),
+                appends
+            );
+            let app_id = wallet.app_id();
+            drop(wallet);
+            assert!(matches!(
+                App::load(p.env(&p.alice, store), protocol, config(), app_id).await,
+                Err(AppError::Store(StoreError::Corrupt))
+            ));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_origin_authenticated_same_id_different_bytes_refuses() {
+    Box::pin(async {
+        for kept in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "first")).unwrap();
+            if kept {
+                kept_with(&p, &mut wallet, &signed).await;
+            } else {
+                wallet.queue_signed(signed.clone()).await.unwrap();
+            }
+            let mut json: Value = serde_json::from_slice(signed.plaintext().json()).unwrap();
+            json["body"]["text"] = json!("different");
+            let changed = MessagePlaintext::sign_json(
+                &p.alice.identity().app_keys("wallet"),
+                serde_json::to_vec(&json).unwrap(),
+                &[],
+            )
+            .unwrap();
+            assert_ne!(changed.hash(), signed.hash());
+            let before = wallet.reader().scan_raw("").await.unwrap();
+            assert_corrupt(wallet.queue_stored(&changed).await);
+            assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+            assert_eq!(
+                listed_origin(&wallet, &signed).await.origin,
+                DeliveryOrigin::Original
+            );
+        }
+    })
+    .await;
+}
 
 /// The `msg_id`s of `listed`, in order.
 fn queued_ids(listed: &[QueuedMessage]) -> Vec<String> {
@@ -334,7 +508,9 @@ async fn test_delivery_origin_inventory_and_dispatch_share_the_policy() {
     queue_origin(&mut wallet, &reconstructed, DeliveryOrigin::Reconstructed).await;
     let before = wallet.reader().scan_raw("").await.unwrap();
     let calls = p.alice.switch().applied().len();
+    let requests = p.router.log();
     let listed = wallet.queued_messages("sample").await.unwrap();
+    assert_eq!(p.router.log(), requests, "inventory makes no request");
     assert_eq!(
         wallet.reader().scan_raw("").await.unwrap(),
         before,
@@ -437,6 +613,9 @@ async fn test_delivery_origin_sent_cache_and_record_job_resends_keep_origin() {
     Box::pin(async {
         for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {
             for with_record in [false, true] {
+                if origin == DeliveryOrigin::Reconstructed && with_record {
+                    continue;
+                }
                 let p = Pair::new();
                 let protocol = ApiProtocol::new(Mode::Plain);
                 let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
@@ -454,12 +633,6 @@ async fn test_delivery_origin_sent_cache_and_record_job_resends_keep_origin() {
                 }
                 if origin == DeliveryOrigin::Reconstructed {
                     wallet.queue_stored(signed.plaintext()).await.unwrap();
-                    if with_record {
-                        // A reconstructed outbox owns no record job. Keep the signed job in
-                        // an unanswered batch; its matching copy must retain the same origin.
-                        kept_with(&p, &mut wallet, &signed).await;
-                        wallet.receive(None).await.unwrap();
-                    }
                 } else {
                     wallet.queue_signed(signed.clone()).await.unwrap();
                 }
@@ -472,6 +645,10 @@ async fn test_delivery_origin_sent_cache_and_record_job_resends_keep_origin() {
                 wallet.flush_message(signed.msg_id()).await.unwrap();
                 assert_eq!(p.bob.switch().entries_from(&alice), 1);
                 p.alice.switch().lock().faults.clear();
+                assert_eq!(
+                    wallet.outbox_record(signed.msg_id()).await.is_some(),
+                    with_record
+                );
                 let before = wallet.reader().scan_raw("").await.unwrap();
                 wallet.queue_stored(signed.plaintext()).await.unwrap();
                 assert_eq!(
@@ -632,6 +809,177 @@ async fn test_delivery_origin_queue_commit_failure_keeps_origin_atomic() {
 }
 
 #[tokio::test]
+async fn test_delivery_origin_kept_settlement_commits_local_and_origin_together() {
+    Box::pin(async {
+        for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {
+            for after in [false, true] {
+                let p = Pair::new();
+                let protocol = ApiProtocol::new(Mode::Plain);
+                let store = Arc::new(MemoryStore::new());
+                let mut wallet = p
+                    .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                    .await;
+                let signed = wallet
+                    .sign_message(Pair::note(&p.bob, "settlement"))
+                    .unwrap();
+                if origin == DeliveryOrigin::Reconstructed {
+                    wallet.queue_stored(signed.plaintext()).await.unwrap();
+                }
+                p.alice.switch().fail_next(Fault::Unanswered {
+                    path: "ops".into(),
+                    after: 0,
+                });
+                wallet
+                    .submit_batch(
+                        OpBatch::for_protocol("sample")
+                            .op(OpKind::AllowPut {
+                                pubky: [9; 32],
+                                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                            })
+                            .local(LocalWrite::Put {
+                                key: b"settled".to_vec(),
+                                value: b"yes".to_vec(),
+                            })
+                            .queue(signed.clone()),
+                    )
+                    .await
+                    .unwrap_err()
+                    .kept_batch()
+                    .unwrap();
+                wallet
+                    .hold_message("sample", signed.msg_id())
+                    .await
+                    .unwrap();
+                let id = wallet.app_id();
+                drop(wallet);
+                let fault = Arc::new(SettlementFault {
+                    inner: store.clone(),
+                    after,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                });
+                let mut wallet = App::load(
+                    p.env(&p.alice, fault.clone()),
+                    protocol.clone(),
+                    config(),
+                    id,
+                )
+                .await
+                .unwrap();
+                let result = wallet.receive(None).await;
+                assert!(
+                    matches!(&result, Err(error) if matches!(error.unkept(), AppError::Store(_))),
+                    "{result:?}; fault fired: {}",
+                    fault.fired.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                assert!(fault.fired.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(matches!(
+                    wallet.queued_messages("sample").await,
+                    Err(AppError::Refused(Refusal::NotNow(_)))
+                ));
+                drop(wallet);
+                let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    wallet
+                        .protocol_get("sample", b"settled")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    after
+                );
+                assert_eq!(wallet.kept_batches().await.unwrap().is_empty(), after);
+                let listed = listed_origin(&wallet, &signed).await;
+                assert_eq!((listed.origin, listed.held), (origin, true));
+                assert_eq!(
+                    listed.kept_batch.is_none(),
+                    after || origin == DeliveryOrigin::Reconstructed
+                );
+                wallet.receive(None).await.unwrap();
+                assert_eq!(
+                    wallet.protocol_get("sample", b"settled").await.unwrap(),
+                    Some(b"yes".to_vec())
+                );
+                assert!(wallet.kept_batches().await.unwrap().is_empty());
+                assert_eq!(
+                    (
+                        listed_origin(&wallet, &signed).await.origin,
+                        listed_origin(&wallet, &signed).await.held
+                    ),
+                    (origin, true)
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_origin_fresh_restore_commit_is_atomic() {
+    Box::pin(async {
+        for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {
+            for after in [false, true] {
+                let p = Pair::new();
+                let protocol = ApiProtocol::new(Mode::Plain);
+                let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+                let signed = wallet
+                    .sign_message(Pair::note(&p.bob, "restore commit"))
+                    .unwrap();
+                queue_origin(&mut wallet, &signed, origin).await;
+                wallet
+                    .hold_message("sample", signed.msg_id())
+                    .await
+                    .unwrap();
+                let backup = wallet.backup().await.unwrap();
+                let app_id = wallet.app_id();
+                let store = Arc::new(MemoryStore::new());
+                let fault = Arc::new(FaultStore::new(
+                    store.clone(),
+                    if after {
+                        StoreFault::FailAfter(1)
+                    } else {
+                        StoreFault::FailBefore(1)
+                    },
+                ));
+                let restored = App::restore(
+                    p.env(&p.alice, fault.clone()),
+                    protocol.clone(),
+                    config(),
+                    &backup,
+                )
+                .await;
+                assert!(matches!(restored, Err(AppError::Store(_))));
+                assert_eq!(fault.commits(), 1);
+                let loaded = App::load(
+                    p.env(&p.alice, store.clone()),
+                    protocol.clone(),
+                    config(),
+                    app_id,
+                )
+                .await;
+                if after {
+                    let loaded = loaded.unwrap();
+                    let item = listed_origin(&loaded, &signed).await;
+                    assert_eq!((item.origin, item.held), (origin, true));
+                    drop(loaded);
+                } else {
+                    assert!(
+                        loaded.is_err(),
+                        "a refused first commit leaves no partial app"
+                    );
+                }
+                let restored = App::restore(p.env(&p.alice, store), protocol, config(), &backup)
+                    .await
+                    .unwrap();
+                let item = listed_origin(&restored, &signed).await;
+                assert_eq!((item.origin, item.held), (origin, true));
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_queued_messages_repeated_batches_are_not_the_latest_status_index() {
     Box::pin(async {
         let p = Pair::new();
@@ -709,6 +1057,134 @@ async fn test_queued_messages_repeated_batches_are_not_the_latest_status_index()
         );
         wallet.flush_outbox().await.unwrap();
         assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_queued_messages_keeps_a_producer_after_the_latest_end_expires() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p
+            .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+            .await;
+        let signed = wallet.sign_message(Pair::note(&p.bob, "delayed")).unwrap();
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+        let first = wallet
+            .submit_batch(
+                OpBatch::new()
+                    .op(OpKind::AllowPut {
+                        pubky: [9; 32],
+                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                    })
+                    .queue(signed.clone()),
+            )
+            .await
+            .unwrap_err()
+            .kept_batch()
+            .unwrap();
+        p.alice.switch().lock().faults.clear();
+        assert_eq!(wallet.kept_batches().await.unwrap()[0].1.kept_ms, None);
+        let freeze = pubky_switch_core::records::Freeze::sign(
+            p.alice.identity().key(),
+            pubky_switch_core::records::FreezeBody {
+                identity: p.alice.identity().public(),
+                inbox: Inbox::new("https://recovered.example", [77; 32]),
+                next_generation: 2,
+                issued_at: p.clock.now_ms(),
+                nonce: [43; 16],
+            },
+        )
+        .unwrap();
+        p.alice.switch().freeze(&freeze).unwrap();
+        let error = wallet
+            .submit_batch(
+                OpBatch::new()
+                    .op(ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None).kind())
+                    .queue(signed.clone()),
+            )
+            .await
+            .unwrap_err();
+        let second = error
+            .kept_batch()
+            .unwrap_or_else(|| panic!("second batch was not retained: {error:?}"));
+        assert_ne!(first, second);
+        assert_eq!(wallet.kept_batches().await.unwrap().len(), 2);
+        p.router.remove(SWITCH_ORIGIN);
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap();
+        let next_origin = "https://recovered.example";
+        let next =
+            ScriptedSwitch::recovering(p.alice.identity().key(), [77; 32], p.clock.clone(), 2, 1)
+                .unwrap();
+        let doc = p
+            .alice
+            .sign_next(|body| {
+                body.generation = 2;
+                body.recovery_from = Some(1);
+                body.inbox = Inbox::new(next_origin, next.service_key());
+            })
+            .unwrap();
+        next.deliver_identity(&doc).unwrap();
+        // Discovery is public; the unavailable new route leaves registration pending.
+        wallet.refresh_identity().await.unwrap();
+        let _ = wallet.receive(None).await;
+        assert_eq!(wallet.cursor().generation, 2);
+        let kept = wallet.kept_batches().await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].0, kept[0].1.kept_ms), (first, None));
+        assert!(matches!(
+            wallet.delivery(signed.msg_id()).await.unwrap(),
+            Some(Delivery::Failed { .. })
+        ));
+        p.clock.advance_ms(SENT_RETENTION_MS + 1);
+        let app_id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), app_id)
+            .await
+            .unwrap();
+        assert_eq!(wallet.delivery(signed.msg_id()).await.unwrap(), None);
+        let before = wallet.reader().scan_raw("").await.unwrap();
+        let requests = p.router.log();
+        let listed = wallet.queued_messages("sample").await.unwrap();
+        assert_eq!(listed.len(), 1, "an older producer survives the latest end");
+        assert_eq!(
+            (
+                listed[0].msg_id.as_str(),
+                listed[0].kept_batch,
+                listed[0].origin,
+                listed[0].held
+            ),
+            (signed.msg_id(), Some(first), DeliveryOrigin::Original, true)
+        );
+        assert_eq!(wallet.reader().scan_raw("").await.unwrap(), before);
+        assert_eq!(p.router.log(), requests);
+        p.router.add_switch(next_origin, &next);
+        for _ in 0..4 {
+            wallet.receive(None).await.unwrap();
+        }
+        assert!(wallet.kept_batches().await.unwrap().is_empty());
+        let listed = listed_origin(&wallet, &signed).await;
+        assert_eq!(
+            (listed.kept_batch, listed.origin, listed.held),
+            (None, DeliveryOrigin::Original, true)
+        );
+        wallet
+            .withdraw_message("sample", signed.msg_id())
+            .await
+            .unwrap();
+        assert!(wallet.queued_messages("sample").await.unwrap().is_empty());
     })
     .await;
 }

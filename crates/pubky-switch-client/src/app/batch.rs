@@ -1387,6 +1387,7 @@ impl App {
 
     /// The batches kept under `opq/`, by ID.
     pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
+        super::send::validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         self.reader()
             .scan::<PendingBatch>(PENDING_PREFIX)
             .await?

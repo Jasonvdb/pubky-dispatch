@@ -124,12 +124,15 @@ fn text(result: Result<[u8; 32], AppError>) -> Result<(), String> {
 }
 
 impl Protocol for ApiProtocol {
-    fn may_send(&self, message: &Message, origin: crate::app::DeliveryOrigin) -> bool {
+    fn may_send(
+        &self,
+        delivery: &crate::app::DeliveryView<'_>,
+    ) -> Result<bool, crate::app::StoreFailure> {
         self.send_origins
             .lock()
             .unwrap()
-            .push((message.msg_id.clone(), origin));
-        *self.blocked_origin.lock().unwrap() != Some(origin)
+            .push((delivery.message().msg_id.clone(), delivery.origin()));
+        Ok(*self.blocked_origin.lock().unwrap() != Some(delivery.origin()))
     }
 
     fn name(&self) -> String {

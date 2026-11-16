@@ -86,6 +86,50 @@ fn named(name: &str) -> Named {
     }
 }
 
+#[tokio::test]
+async fn test_queued_inventory_uses_protocol_ownership_and_includes_unowned_kinds() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    *p.tasks.holding.lock().unwrap() = true;
+    let mut ids = Vec::new();
+    for kind in ["tasks.item", "chat.item", "retired.note"] {
+        ids.push(
+            app.queue(OutgoingMessage::new(
+                p.w.bob.public(),
+                kind,
+                json!({"text": kind}).as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap(),
+        );
+        p.w.clock.advance_ms(1);
+    }
+    app.hold_message("chat", &ids[1]).await.unwrap();
+    let tasks = app.queued_messages("tasks").await.unwrap();
+    let chat = app.queued_messages("chat").await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[0].as_str(), ids[2].as_str()]
+    );
+    assert_eq!(
+        chat.iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[1].as_str(), ids[2].as_str()]
+    );
+    assert!(!tasks[0].may_send && !tasks[0].held && tasks[0].waits());
+    assert!(chat[0].may_send && chat[0].held && chat[0].waits());
+    assert!(tasks[1].may_send && !tasks[1].waits());
+    usage(app.hold_message("chat", &ids[0]).await, "no kind");
+    app.hold_message("tasks", &ids[2]).await.unwrap();
+    assert!(app.queued_messages("chat").await.unwrap()[1].held);
+    app.release_message("chat", &ids[2]).await.unwrap();
+    assert!(!app.queued_messages("tasks").await.unwrap()[1].held);
+}
+
 #[test]
 fn test_protocol_set_one_owner_can_register_collection_policy_members() {
     let family = crate::app::Collection::with_sub_scopes(
@@ -282,9 +326,12 @@ impl Protocol for Named {
         ))
     }
 
-    fn may_send(&self, message: &Message, _origin: crate::app::DeliveryOrigin) -> bool {
-        self.asked_send.lock().unwrap().push(message.kind.clone());
-        !*self.holding.lock().unwrap()
+    fn may_send(&self, delivery: &crate::app::DeliveryView<'_>) -> Result<bool, StoreFailure> {
+        self.asked_send
+            .lock()
+            .unwrap()
+            .push(delivery.message().kind.clone());
+        Ok(!*self.holding.lock().unwrap())
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {

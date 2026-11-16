@@ -9034,3 +9034,97 @@ async fn test_deny_list_gap_told_without_its_list_after_lists_too_large_is_owed_
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn test_alarm_equivocation_survives_failed_commit_without_dirty_time() {
+    use crate::app::state::key;
+    let w = World::new();
+    let app = Box::pin(w.join("wallet")).await;
+    let id = app.app_id();
+    let mut body = app.own_identity().body().clone();
+    body.data_epoch += 1;
+    let other = IdentityDoc::sign(&w.alice, body).unwrap();
+    drop(app);
+    let fault = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = Box::pin(App::load(
+        w.env_on(fault.clone()),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    w.homeserver.publish(&other).unwrap();
+    fault.fail_put_once(key::ALARM.as_bytes());
+    let expected = Alarm::Equivocation {
+        version: other.version(),
+    };
+    assert_eq!(
+        Box::pin(app.refresh_identity()).await.unwrap_err(),
+        AppError::Alarm(expected.clone())
+    );
+    assert_eq!(app.alarm(), Some(&expected));
+    assert!(!app.service_time_dirty);
+    assert_eq!(app.reader().get::<Alarm>(key::ALARM).await.unwrap(), None);
+    Box::pin(app.pending_duty_events()).await.unwrap();
+    assert_eq!(app.alarm(), Some(&expected));
+    assert_eq!(
+        app.reader().get::<Alarm>(key::ALARM).await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    assert_eq!(app.may_attempt(true), Err(Refusal::Stopped));
+    drop(app);
+    let loaded = Box::pin(w.load(id)).await;
+    assert_eq!(loaded.alarm(), Some(&expected));
+}
+
+#[tokio::test]
+async fn test_alarm_compromise_leave_keeps_a_failed_alarm_write() {
+    use crate::app::state::key;
+    let w = World::new();
+    let app = Box::pin(w.join("wallet")).await;
+    let id = app.app_id();
+    let thief = ReceiveKey::from_secret(1, [42; 32]);
+    let record = ReceiveKeyRecord::sign(
+        &app_keys("wallet"),
+        app.cert(),
+        ReceiveKeyBody::new(app.cert(), &thief),
+    )
+    .unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    drop(app);
+    let fault = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = Box::pin(App::load(
+        w.env_on(fault.clone()),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    fault.fail_put_once(key::ALARM.as_bytes());
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+    assert!(w.switch.app(&id).departed);
+    let expected = app.alarm().cloned().unwrap();
+    assert_eq!(
+        app.reader().get::<Alarm>(key::ALARM).await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    drop(app);
+    let loaded = Box::pin(w.load(id)).await;
+    assert_eq!(loaded.alarm(), Some(&expected));
+    assert_eq!(loaded.may_attempt(true), Err(Refusal::Stopped));
+}

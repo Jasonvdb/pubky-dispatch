@@ -47,16 +47,12 @@ use crate::error::ClientError;
 const PENDING_PREFIX: &str = "opq/";
 
 /// The most bytes the batches kept unanswered (`opq/`) take together, as stored:
-/// [`App::submit_batch`] keeps no batch past it. A provider change carries every kept batch
-/// in its one commit, signed again or settled (Switch spec 12.5 "Kept batches"), so this
-/// bounds that commit: the change's own records (under 2 MiB: `meta`, the cursor and chain
-/// view, the move or loss record with its re-registration batch, the receive keys), the
-/// kept effect's outcome (its local writes, at most 4 MiB, `MAX_STEP_LOCAL_BYTES`; a
-/// settle without proofs caches no record), and the kept batches, each either signed again
-/// at about its own size or settled into its local writes and queued messages, both under
-/// its stored size plus 80 bytes, a fifth of the smallest batch: at most 1.2 x 12 MiB =
-/// 14.4 MiB. Under 21 MiB in all, below the 32 MiB batch size. One batch at the largest it
-/// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
+/// [`App::submit_batch`] keeps no batch past it. A provider change carries those batches
+/// in its lifecycle commit, signed again or settled (Switch spec 12.5 "Kept batches").
+/// This bounds retained batch data, not the entire lifecycle transaction, which also
+/// writes provider records and retained receive keys. A known-applied received effect is
+/// completed separately before that transaction, reusing its ordinary outcome budget.
+/// One batch at its largest, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), fits on its own.
 pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
 // A batch's answer is settled in one commit: its local writes and queued messages (under

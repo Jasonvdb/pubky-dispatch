@@ -527,7 +527,7 @@ async fn test_consume_crash_before_and_after_commit_reopens_one_complete_decisio
 }
 
 #[tokio::test]
-async fn test_consume_forget_keeps_protected_input_and_matches_sender() {
+async fn test_consume_forget_without_pair_keeps_stored_input_and_matches_sender() {
     let w = World::new();
     let p = Consuming::new();
     let mut app = wallet(&w, &p, w.store.clone()).await;
@@ -552,12 +552,11 @@ async fn test_consume_forget_keeps_protected_input_and_matches_sender() {
     let id = app.stored_id_at(seq).unwrap();
     let (_, current) = note(&w, &app, json!({"text":"consume", "forget":held.msg_id}));
     app.receive(None).await.unwrap();
-    assert!(matches!(
+    assert_eq!(
         p.forgets.lock().unwrap().last(),
-        Some(Err(crate::app::AppError::Refused(
-            crate::app::Refusal::NotNow(_)
-        )))
-    ));
+        Some(&Ok(false)),
+        "an absent prior pair permits the current local decision"
+    );
     assert_eq!(
         consumed(&app).await,
         Some(vec![2]),
@@ -567,7 +566,7 @@ async fn test_consume_forget_keeps_protected_input_and_matches_sender() {
     assert_eq!(
         app.stored_id_at(seq),
         Some(id),
-        "a prior protected input remains stored"
+        "a prior unprocessed input remains stored"
     );
     assert!(app.state.stored_retries.contains_key(&id));
 }

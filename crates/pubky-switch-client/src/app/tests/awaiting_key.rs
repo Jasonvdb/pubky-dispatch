@@ -1242,10 +1242,8 @@ async fn test_awaiting_key_of_a_later_epoch_isnt_due_for_an_earlier_epochs_keys(
     assert_eq!(app.stored_at(seq).map(|s| s.reason), awaiting(3));
 }
 
-/// A waiting entry dropped after another copy of its message was processed names no
-/// `msg_id`: the message wasn't given up.
 #[tokio::test]
-async fn test_awaiting_key_drop_of_a_processed_message_names_no_msg_id() {
+async fn test_awaiting_key_processed_copy_retires_waiting_entry() {
     use pubky_switch_core::message::{Message as Msg, Sender};
     let w = World::new();
     let protocol = Keyed::new(Mode::Await(3));
@@ -1275,8 +1273,10 @@ async fn test_awaiting_key_drop_of_a_processed_message_names_no_msg_id() {
     w.switch
         .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app_id])
         .unwrap();
-    app.receive(None).await.unwrap();
-    assert!(app.stored_at(waiting).is_some());
+    let report = app.receive(None).await.unwrap();
+    assert!(app.stored_at(waiting).is_none());
+    assert!(has(&report.events, |event| matches!(event,
+        AppEvent::Duplicate { seq, conflicting: false } if *seq == waiting)));
     w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS + 1);
     let mut events = Vec::new();
     for _ in 0..2 {
@@ -1284,9 +1284,9 @@ async fn test_awaiting_key_drop_of_a_processed_message_names_no_msg_id() {
     }
     assert!(app.stored_at(waiting).is_none());
     assert!(
-        has(&events, |e| matches!(
+        !has(&events, |e| matches!(
             e,
-            AppEvent::StoredEntryDropped { seq, msg_id: None, awaited_epoch: Some(3), .. } if *seq == waiting
+            AppEvent::StoredEntryDropped { seq, .. } if *seq == waiting
         )),
         "{events:?}"
     );

@@ -828,3 +828,221 @@ async fn test_service_time_headless_bound_allows_device_catch_up() {
         "no new service sample was needed"
     );
 }
+
+/// An unapplied commit whose host cannot tell whether it applied.
+struct UnknownCommit(Arc<crate::store::FaultStore>);
+
+impl StateStore for UnknownCommit {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
+        self.0.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::store::StoreError> {
+        self.0.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::store::StoreError> {
+        self.0.commit(batch).map_err(|error| match error {
+            crate::store::StoreError::Unavailable => crate::store::StoreError::Unknown,
+            error => error,
+        })
+    }
+}
+
+async fn alarm_commit_case(
+    fault: crate::store::Fault,
+    unknown_before: bool,
+) -> (
+    App,
+    Arc<crate::store::FaultStore>,
+    Arc<crate::transport::MockTransport>,
+    crate::app::Alarm,
+) {
+    use crate::app::{Alarm, Refusal, UserConfirmed};
+    use pubky_switch_core::http::ErrorCode;
+
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = Box::pin(restored(&w, &router, store.clone())).await;
+    Box::pin(app.end_reconcile(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(router.log().is_empty());
+    let id = app.app_id();
+    drop(app);
+    let fault = Arc::new(crate::store::FaultStore::new(store, fault));
+    let durable: Arc<dyn StateStore> = if unknown_before {
+        Arc::new(UnknownCommit(fault.clone()))
+    } else {
+        fault.clone()
+    };
+    let mut app = Box::pin(App::load(
+        router.env(&w, durable),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.refresh_identity()).await.unwrap();
+    assert_eq!(fault.commits(), 0);
+    assert!(router.log().is_empty());
+    assert_eq!(app.highest_service_time(), None);
+    assert_eq!(app.clock_skew_ms(), None);
+    assert_eq!(app.may_attempt(false), Ok(()));
+    assert_eq!(app.may_attempt(true), Ok(()));
+    let high = START + 2_000;
+    let low = START + 1_000;
+    let transport = refuse_at(
+        &w,
+        &router,
+        [
+            (high, ErrorCode::StaleTimestamp),
+            (low, ErrorCode::BadSignature),
+            (high, ErrorCode::BadSignature),
+        ],
+    );
+    assert_time_alarm(Box::pin(app.receive(None)).await.unwrap_err(), high, low);
+    let expected = Alarm::ServiceTimeBackwards {
+        highest: high,
+        signed: low,
+    };
+    assert_eq!(fault.commits(), 1);
+    assert_eq!(transport.requests().len(), 2);
+    assert!(
+        transport
+            .requests()
+            .iter()
+            .all(|request| request.path_and_query.ends_with("/directory"))
+    );
+    assert_eq!(app.alarm(), Some(&expected));
+    assert_eq!(app.highest_service_time(), Some(high));
+    assert_eq!(app.client.latest_compared_time(), Some(low));
+    assert_eq!(app.client.latest_server_time(), None);
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    assert_eq!(app.may_attempt(true), Err(Refusal::Stopped));
+    (app, fault, transport, expected)
+}
+
+async fn assert_alarm_survives_reload(
+    mut app: App,
+    transport: Arc<crate::transport::MockTransport>,
+    expected: crate::app::Alarm,
+) {
+    use crate::app::state::{ServiceTime, key};
+    use crate::app::{Alarm, AppError, Refusal};
+
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::Stopped));
+    assert_eq!(transport.requests().len(), 2);
+    Box::pin(app.pending_duty_events()).await.unwrap();
+    assert_eq!(app.alarm(), Some(&expected));
+    assert_eq!(
+        app.reader().get::<Alarm>(key::ALARM).await.unwrap(),
+        Some(expected.clone())
+    );
+    let time = app
+        .reader()
+        .get::<ServiceTime>(key::SERVICE_TIME)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(time.highest_ms, START + 2_000);
+    assert_eq!(time.offset_ms, None);
+    let env = app.env.clone();
+    let protocol = app.protocol.clone();
+    let config = app.config.clone();
+    let id = app.app_id();
+    drop(app);
+    let mut loaded = Box::pin(App::load(env, protocol, config, id))
+        .await
+        .unwrap();
+    assert_eq!(loaded.alarm(), Some(&expected));
+    assert_eq!(loaded.may_attempt(false), Err(Refusal::Stopped));
+    assert_eq!(loaded.may_attempt(true), Err(Refusal::Stopped));
+    assert_eq!(
+        Box::pin(loaded.receive(None)).await.unwrap_err(),
+        AppError::Refused(Refusal::Stopped)
+    );
+    assert_eq!(transport.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_alarm_failed_commit_remains_stopped_after_reload() {
+    use crate::app::state::key;
+    let (app, _, transport, alarm) =
+        Box::pin(alarm_commit_case(crate::store::Fault::FailBefore(1), false)).await;
+    assert_eq!(
+        app.reader()
+            .get::<crate::app::Alarm>(key::ALARM)
+            .await
+            .unwrap(),
+        None
+    );
+    Box::pin(assert_alarm_survives_reload(app, transport, alarm)).await;
+}
+
+#[tokio::test]
+async fn test_alarm_unknown_unapplied_commit_remains_stopped_after_reload() {
+    use crate::app::state::key;
+    let (app, _, transport, alarm) =
+        Box::pin(alarm_commit_case(crate::store::Fault::FailBefore(1), true)).await;
+    assert_eq!(
+        app.reader()
+            .get::<crate::app::Alarm>(key::ALARM)
+            .await
+            .unwrap(),
+        None
+    );
+    Box::pin(assert_alarm_survives_reload(app, transport, alarm)).await;
+}
+
+#[tokio::test]
+async fn test_alarm_unknown_applied_commit_remains_stopped_after_reload() {
+    use crate::app::state::key;
+    let (app, _, transport, alarm) =
+        Box::pin(alarm_commit_case(crate::store::Fault::FailAfter(1), false)).await;
+    assert_eq!(
+        app.reader()
+            .get::<crate::app::Alarm>(key::ALARM)
+            .await
+            .unwrap(),
+        Some(alarm.clone())
+    );
+    Box::pin(assert_alarm_survives_reload(app, transport, alarm)).await;
+}
+
+#[tokio::test]
+async fn test_alarm_failed_retry_stays_stopped_until_persisted() {
+    use crate::app::state::key;
+    use crate::app::{Alarm, AppError, Refusal};
+    let (mut app, fault, transport, alarm) =
+        Box::pin(alarm_commit_case(crate::store::Fault::FailBefore(1), false)).await;
+    fault.fail_put_once(key::ALARM.as_bytes());
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert_eq!(
+        error,
+        AppError::Store(crate::store::StoreError::Unavailable)
+    );
+    assert_eq!(app.alarm(), Some(&alarm));
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    assert_eq!(app.may_attempt(true), Err(Refusal::Stopped));
+    assert_eq!(app.reader().get::<Alarm>(key::ALARM).await.unwrap(), None);
+    assert_eq!(transport.requests().len(), 2);
+    Box::pin(assert_alarm_survives_reload(app, transport, alarm)).await;
+}
+
+#[tokio::test]
+async fn test_alarm_successful_commit_remains_stopped_after_reload() {
+    let (app, fault, transport, alarm) =
+        Box::pin(alarm_commit_case(crate::store::Fault::None, false)).await;
+    Box::pin(assert_alarm_survives_reload(app, transport, alarm)).await;
+    assert_eq!(fault.commits(), 1);
+}

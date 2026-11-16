@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::protocol::LocalWrite;
 use super::state::{Processed, key};
-use super::{App, AppError, AppState, Refusal};
+use super::{App, AppError, AppState, ParkReason, Refusal};
 
 /// The keys of the pair of `msg_id` from `sender`, if it is held (`processed`, read as the
 /// caller sees the store): the pair and its time index.
@@ -43,7 +43,9 @@ pub(crate) fn held_pair(
         return Err(Refusal::NotNow("the message's effect is kept to be sent".into()).into());
     }
     if state.parked.values().any(|stored| {
-        &stored.sender == sender && stored_msg_id(&stored.plaintext) == Some(msg_id.to_owned())
+        &stored.sender == sender
+            && stored_msg_id(&stored.plaintext).as_deref() == Some(msg_id)
+            && (processed.is_some() || stored.reason == ParkReason::Uncertain)
     }) {
         return Err(Refusal::NotNow("an entry stored locally holds the message".into()).into());
     }
@@ -78,7 +80,8 @@ impl App {
     /// Forget the processed pair of `msg_id` from `sender`, and commit `local`, the
     /// protocol's own writes that give up what the message brought, in the same commit.
     /// Returns whether a pair was held; forgetting one that isn't, another sender's or an
-    /// unknown `msg_id`, changes nothing but `local`.
+    /// unknown `msg_id`, changes nothing but `local`. With no pair, ordinary stored inputs
+    /// remain and do not prevent these writes; pending or uncertain effects still do.
     ///
     /// From then on a re-sent copy of the message is delivered as a new entry, and the
     /// protocol must not apply it twice itself: the message's sender can replay it at will,
@@ -93,7 +96,8 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::NotNow`] while the message's effect is kept to be sent, or an entry stored
-    /// locally holds it; [`Refusal::Stopped`] or [`Refusal::Left`]; a store failure, after
+    /// locally holds its pair or an uncertain effect; [`Refusal::Stopped`] or
+    /// [`Refusal::Left`]; a store failure, after
     /// which nothing was written.
     pub async fn forget_processed(
         &mut self,

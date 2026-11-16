@@ -464,10 +464,15 @@ exact form above, at most 2,048 bytes each. It does not require or synthesize a
 record operation or certificate. Parts share the upload's 16 MiB body bound.
 Attached origin evidence remains part of its indivisible record input.
 
-Verify each statement against the exact identity-signed `lost_identity` named
-by its `identity_hash`, for this account and the barrier's original lost
-generation. Its service signature, snapshot, canonical slot hash and declared
-parent key must agree. The part's `origin_key` and statement's `origin_key` equal
+Verify each statement against the exact identity-signed source document carried
+as `lost_identity` and named by its `identity_hash`, for this account. The source
+document and statement must name the same positive generation, at or before the
+barrier's original lost-generation bound. Thus evidence retained before a clean
+move or an earlier loss can still restrict the current recovery. A current or
+future generation is not eligible. The statement's service signature, snapshot,
+canonical slot hash and declared parent key must agree. This standalone rule
+does not date an uploaded record operation: its source-proof generation checks
+remain exactly those of wire 7.4.14. The part's `origin_key` and statement's `origin_key` equal
 the slot's parent key. The statement's `key` is either that parent or the exact
 declared child of a known initialized slot. Thus a checked child-view statement
 can preserve its parent's restrictions after the child payload is forgotten,

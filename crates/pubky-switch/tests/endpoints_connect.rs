@@ -724,6 +724,7 @@ impl Fresh {
         let signed_headers = RequestHeaders {
             timestamp: timestamp.clone(),
             identity: identity.clone(),
+            created: None,
             app: Some(app_id.clone()),
             cert: Some(compact.clone()),
             invite_code: None,

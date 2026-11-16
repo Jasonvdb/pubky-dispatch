@@ -13,10 +13,12 @@ use ed25519_dalek::SigningKey;
 use pubky_switch_core::enc::{app_id_decode, b64 as b64e, x25519_low_order};
 use pubky_switch_core::keys::{AppKeys as SwitchAppKeys, IdentityKey};
 use pubky_switch_core::records::{
-    self, AccountView, AppCert, AppRecord, AppRequest, AuthRequest, CLOCK_TOLERANCE_MS, DAY_MS,
-    Delivery, DiscardAnswer, Enrollment, ExportTransfer, Freeze, IdentityBody, IdentityDoc,
-    KeptProofs, ListedApp, ReceiveKeyRecord, RecordOrder, RecordView, RenewedCert, ServiceKeyEntry,
-    SignerView, Standing, Unfreeze, UnfreezeAt, VersionOrder,
+    self, ACCOUNT_OBSERVATION_VALIDITY_MS, AccountBinding, AccountMarkInput,
+    AccountObservationBody, AccountView, AppCert, AppRecord, AppRequest, AuthRequest,
+    CLOCK_TOLERANCE_MS, CarriedAccountObservation, DAY_MS, Delivery, DiscardAnswer, Enrollment,
+    EnrollmentBody, ExportTransfer, Freeze, IdentityBody, IdentityDoc, KeptProofs, ListedApp,
+    ReceiveKeyRecord, RecordOrder, RecordView, RenewedCert, ServiceKeyEntry, SignerView, Standing,
+    Unfreeze, UnfreezeAt, VersionOrder,
 };
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::parse_rfc3339;
@@ -71,6 +73,7 @@ fn body_value(signed: &SignedDoc) -> Value {
 #[test]
 fn test_vectors_documents() {
     let keys = keys();
+    enrollment_cases(&keys);
     let v = load("documents.json");
     let docs: HashMap<String, Doc> = arr(&v, "documents")
         .iter()
@@ -650,6 +653,149 @@ fn check_freeze_and_unfreeze(keys: &Keys, v: &Value, signed: &SignedDoc) {
     assert!(at_old.verify(&alice, &freeze, UnfreezeAt::Next).is_err());
 }
 
+/// Alice enrolls at two absent accounts (Switch account binding 2-3).
+pub(super) fn enrollment_cases(keys: &Keys) {
+    let alice = keys.identity("alice");
+    let key = identity_key(keys, &alice);
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
+    let freeze = Freeze::verify(&document("alice freeze"), &alice).unwrap();
+    let file = load("documents.json");
+    let http = load("http.json");
+    let request = arr(&http, "requests")
+        .iter()
+        .find(|r| st(r, "path") == "/v1/enroll")
+        .unwrap();
+    let first_at = parse_rfc3339(st(&request["headers"], "switch-timestamp")).unwrap();
+    for (name, service, at, identity_doc, revoked_apps) in [
+        (
+            "alice enrollment",
+            v3.inbox().service_key,
+            first_at,
+            None,
+            None,
+        ),
+        (
+            "alice enrollment at the next service, naming a revoked app",
+            freeze.next().service_key,
+            parse_rfc3339(START).unwrap(),
+            Some(v3.signed().clone()),
+            Some(vec![
+                app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap(),
+            ]),
+        ),
+    ] {
+        let mut case = arr(&file, "documents")
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap()
+            .clone();
+        let input: Value = serde_json::from_str(st(&case, "body")).unwrap();
+        let origin = st(&input, "origin");
+        let observation = enrollment_observation(keys, origin, service, at);
+        let enrollment = Enrollment::sign(
+            &key,
+            EnrollmentBody {
+                identity: alice,
+                origin: origin.into(),
+                nonce: b64n::<16>(st(&input, "nonce")),
+                intent: observation
+                    .verify(&alice, origin)
+                    .unwrap()
+                    .enrollment_intent()
+                    .unwrap(),
+                policy: serde_json::from_value(input["policy"].clone()).unwrap(),
+                identity_doc,
+                revoked_apps,
+            },
+        )
+        .unwrap();
+        let signed = enrollment.signed();
+        let body = signed.body_bytes().unwrap();
+        case["body"] = Value::String(std::str::from_utf8(&body).unwrap().into());
+        case["compact"] = Value::String(signed.compact());
+        case["doc_bytes_hex"] = Value::String(hex::encode(signed.doc_bytes().unwrap()));
+        case["doc_hash"] = Value::String(b64e(&signed.doc_hash().unwrap()));
+        case["signed"] = serde_json::to_value(signed).unwrap();
+        generated("documents.json", &[(Place::Case("/documents"), case)]);
+        if name == "alice enrollment" {
+            crate::signatures::generated_case(
+                labels::sig::ENROLL,
+                &["body"],
+                &[&body],
+                &signed.sig_bytes().unwrap(),
+            );
+        }
+    }
+}
+
+fn enrollment_observation(
+    keys: &Keys,
+    origin: &str,
+    service: [u8; 32],
+    at: u64,
+) -> CarriedAccountObservation {
+    use pubky_switch_core::{http, time};
+    let identity = keys.identity("alice");
+    let key = identity_key(keys, &identity);
+    let binding = AccountBinding::select(None, AccountMarkInput::Missing).unwrap();
+    let body = AccountObservationBody {
+        identity,
+        origin: origin.into(),
+        service_key: service,
+        store_id: seed(&format!("account-observation/{origin}/store-id"))[..16]
+            .try_into()
+            .unwrap(),
+        association: binding.association(),
+        created: binding.created(),
+        erased_at: None,
+        observed_at: at,
+        expires_at: at + ACCOUNT_OBSERVATION_VALIDITY_MS,
+    }
+    .to_json()
+    .unwrap();
+    let path = format!("/v1/{}/account", key.id());
+    let headers = http::RequestHeaders {
+        identity: key.id(),
+        timestamp: time::rfc3339_seconds(at),
+        ..http::RequestHeaders::default()
+    };
+    let target = http::RequestTarget {
+        method: "GET",
+        origin,
+        path_and_query: &path,
+        body: &[],
+    };
+    let request_signature = http::sign_request(&key, &target, &headers);
+    let signature = b64e(&request_signature);
+    let received = http::ReceivedHeaders::of([
+        (http::header::IDENTITY, headers.identity.as_bytes()),
+        (http::header::TIMESTAMP, headers.timestamp.as_bytes()),
+        (http::header::SIGNATURE, signature.as_bytes()),
+    ]);
+    let sig = http::sign_response(
+        &SigningKey::from_bytes(&keys.secret(&service).unwrap()),
+        &http::ResponseParts {
+            status: 200,
+            request: http::ReceivedRequest {
+                method: "GET",
+                origin,
+                path_and_query: &path,
+                body: http::BodyField::read(&[]),
+                headers: &received,
+            },
+            server_time: &time::rfc3339(at),
+            head: None,
+            body: &body,
+        },
+    );
+    CarriedAccountObservation {
+        body,
+        sig,
+        request_timestamp: headers.timestamp,
+        request_signature,
+    }
+}
+
 /// The enrollments (Switch wire 3.7): for their origin only, and at the next service with
 /// the current `identity.json` and the revoked App ID.
 fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
@@ -685,9 +831,9 @@ fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
         // An answer for it, checked as the signer checks it.
         let answer = records::EnrollmentAnswer::new(
             &e,
-            v3.inbox().service_key,
+            e.observation().unwrap().body().service_key,
             records::Limits::default(),
-            0,
+            e.observation().unwrap().body().observed_at,
         );
         answer.check(&e).unwrap();
     }

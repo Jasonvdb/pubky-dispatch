@@ -40,7 +40,7 @@ fn alice_id() -> String {
 
 /// Account `id`, created at `T0`; serving when its enrollment's `identity.json` names this
 /// service's origin and `service_key`.
-fn new_account(id: &str, service_key: [u8; 32], serving: bool) -> NewAccount {
+fn new_account(id: &str, service_key: [u8; 32], store_id: [u8; 16], serving: bool) -> NewAccount {
     let identity = IdentityKey::from_secret([7; 32]);
     let doc = serving.then(|| {
         let body = IdentityBody::first(
@@ -55,6 +55,7 @@ fn new_account(id: &str, service_key: [u8; 32], serving: bool) -> NewAccount {
             .clone()
     });
     NewAccount {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         id: id.into(),
         identity_key: identity.public(),
         generation: 1,
@@ -63,13 +64,19 @@ fn new_account(id: &str, service_key: [u8; 32], serving: bool) -> NewAccount {
         identity_doc: doc,
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
+        enrollment_store_id: store_id,
     }
 }
 
 /// Create account `id` in `replay`'s store, with its (0, 0) mark, as an enrollment makes
 /// them (Switch wire 7.3, Table 3).
 async fn create(replay: &Replay, id: &str, serving: bool) -> NewAccount {
-    let account = new_account(id, service_public(replay), serving);
+    let account = new_account(
+        id,
+        service_public(replay),
+        replay.marks.identity().await.expect("store identity"),
+        serving,
+    );
     assert!(
         replay
             .db

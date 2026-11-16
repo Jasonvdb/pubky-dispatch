@@ -466,6 +466,8 @@ impl IdentityKeyring {
 pub(crate) struct BackupView {
     /// The newest `identity.json` the backup's signer signed.
     pub(crate) identity_doc: IdentityDoc,
+    /// That document's original account creation (Switch wire 3.12-3.13).
+    pub(crate) account_created: u64,
     /// Every App ID it revoked or saw depart.
     pub(crate) revoked_apps: Vec<[u8; 16]>,
     /// The certificates `identity_doc` references.
@@ -485,6 +487,7 @@ impl BackupView {
     pub(crate) fn of(records: &SignerRecords) -> Self {
         Self {
             identity_doc: records.identity_doc().clone(),
+            account_created: records.account_created(),
             revoked_apps: records.revoked_apps().to_vec(),
             certs: records.certs().to_vec(),
             limits: *records.limits(),
@@ -546,6 +549,7 @@ impl SigningKey {
     pub(crate) fn seal_backup(
         &self,
         doc: IdentityDoc,
+        account_created: u64,
         revoked: &[[u8; 16]],
         issued: &[AppCert],
         limits: Limits,
@@ -556,6 +560,7 @@ impl SigningKey {
         let records = SignerRecords::new(
             IdentityKey::clone(&self.key),
             doc,
+            account_created,
             revoked,
             issued,
             limits,
@@ -583,6 +588,7 @@ impl SigningKey {
     pub(crate) fn seal_hand_over(
         &self,
         doc: IdentityDoc,
+        account_created: u64,
         revoked: &[[u8; 16]],
         issued: &[AppCert],
         limits: Limits,
@@ -594,6 +600,7 @@ impl SigningKey {
         let records = SignerRecords::new(
             IdentityKey::clone(&self.key),
             doc,
+            account_created,
             revoked,
             issued,
             limits,
@@ -968,10 +975,11 @@ pub(crate) mod tests {
         );
         let doc = IdentityDoc::sign(&key, body).unwrap();
         let backup = key
-            .seal_backup(doc, &[[2; 16]], &[], Limits::default(), &[], None, &[])
+            .seal_backup(doc, 123, &[[2; 16]], &[], Limits::default(), &[], None, &[])
             .unwrap();
         let view = keyring.open_backup(&backup).unwrap().unwrap();
         assert_eq!(view.revoked_apps, [[2; 16]]);
+        assert_eq!(view.account_created, 123);
         let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         assert!(other.open_backup(&backup).unwrap().is_none());
     }
@@ -993,6 +1001,7 @@ pub(crate) mod tests {
         };
         let view = |identity_doc: IdentityDoc, prev: Option<[u8; 32]>| BackupView {
             identity_doc,
+            account_created: 123,
             revoked_apps: Vec::new(),
             certs: Vec::new(),
             limits: Limits::default(),

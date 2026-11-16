@@ -230,6 +230,10 @@ pub struct TimeReading {
     pub base_ms: u64,
     /// Whether the service has trusted time now.
     pub trusted: bool,
+    /// The authenticated sample plus monotonic elapsed time, while usable. In explicit
+    /// development mode (`required: false`), this is the trusted wall clock instead.
+    /// Unlike `base_ms`, agreement with the wall clock does not select its value.
+    pub trusted_ms: Option<u64>,
     /// The uncertainty of trusted time, if there is a sample.
     pub uncertainty_ms: Option<u64>,
 }
@@ -318,6 +322,7 @@ impl TrustedTime {
             let reading = TimeReading {
                 base_ms: wall,
                 trusted: true,
+                trusted_ms: Some(wall),
                 uncertainty_ms: None,
             };
             return (reading, false);
@@ -326,6 +331,7 @@ impl TrustedTime {
             let reading = TimeReading {
                 base_ms: wall,
                 trusted: false,
+                trusted_ms: None,
                 uncertainty_ms: None,
             };
             return (reading, false);
@@ -348,6 +354,7 @@ impl TrustedTime {
         let reading = TimeReading {
             base_ms: if disagrees { estimate } else { wall },
             trusted,
+            trusted_ms: trusted.then_some(estimate),
             uncertainty_ms: Some(uncertainty),
         };
         (reading, disagrees)
@@ -454,6 +461,7 @@ mod tests {
     fn test_trusted_time_follows_monotonic_clock() {
         let (clock, time) = trusted(TrustedTimeConfig::default());
         assert!(!time.read().trusted, "no sample yet");
+        assert_eq!(time.read().trusted_ms, None);
         time.note(
             TimeSample {
                 utc_ms: START_MS,
@@ -465,6 +473,7 @@ mod tests {
         let reading = time.read();
         assert!(reading.trusted);
         assert_eq!(reading.base_ms, START_MS + 1_200_000);
+        assert_eq!(reading.trusted_ms, Some(START_MS + 1_200_000));
         // A wall-clock jump of an hour either way is overridden, and raises an alert.
         clock.set_wall_ms(START_MS + 1_200_000 + HOUR_MS);
         assert_eq!(time.read().base_ms, START_MS + 1_200_000);
@@ -476,6 +485,7 @@ mod tests {
         clock.advance_ms(24 * HOUR_MS);
         let reading = time.read();
         assert!(!reading.trusted);
+        assert_eq!(reading.trusted_ms, None);
         assert_eq!(reading.base_ms, START_MS + 1_200_000 + 24 * HOUR_MS);
     }
 
@@ -493,6 +503,7 @@ mod tests {
         let reading = time.read();
         assert!(reading.trusted);
         assert_eq!(reading.base_ms, START_MS + 4 * 60 * 1000);
+        assert_eq!(reading.trusted_ms, Some(START_MS));
         assert_eq!(time.alerts(), 0);
     }
 
@@ -514,6 +525,7 @@ mod tests {
         assert!(time.read().trusted);
         clock.advance_ms(60 * 1000);
         assert!(!time.read().trusted);
+        assert_eq!(time.read().trusted_ms, None);
     }
 
     #[test]
@@ -525,6 +537,7 @@ mod tests {
         let reading = time.read();
         assert!(reading.trusted);
         assert_eq!(reading.base_ms, clock.now_ms());
+        assert_eq!(reading.trusted_ms, Some(clock.now_ms()));
     }
 
     #[tokio::test]

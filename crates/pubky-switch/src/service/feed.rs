@@ -874,6 +874,7 @@ impl Service {
                         asked,
                         self.time.read().base_ms,
                         Some(read.time_ms),
+                        None,
                     )
                     .await;
             }
@@ -925,6 +926,7 @@ impl Service {
             head.chain,
             head.created_at_ms,
             body.as_ref(),
+            head.activation,
         );
         let judged = self.judge(&read.account.id, Some(account)).await;
         if judged.judgement.decision.erase_account_again {
@@ -937,6 +939,7 @@ impl Service {
                     asked,
                     self.time.read().base_ms,
                     Some(committed_ms),
+                    None,
                 )
                 .await;
         }
@@ -1065,6 +1068,7 @@ impl Service {
                 snapshot.chain,
                 snapshot.created_at_ms,
                 body.as_ref(),
+                snapshot.activation,
             )
         });
         let judged = self.judge_with(&read.account.id, account, inputs).await;
@@ -1758,7 +1762,13 @@ mod tests {
             start,
             window_end,
             current: current_at_nine(),
-            ..FeedSnapshot::default()
+            activation: pubky_switch_core::records::AccountActivation::Ordinary,
+            created_at_ms: 0,
+            stamped_time_ms: 0,
+            identity_doc: None,
+            reader: None,
+            reader_kept: false,
+            checkpoint: None,
         }
     }
 

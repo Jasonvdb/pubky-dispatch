@@ -27,6 +27,7 @@
 //! judgement, before anything is served or signed for it (Switch wire 7.3, Table 1;
 //! `erase`).
 
+mod account;
 mod admission;
 mod allow;
 mod app_keys;
@@ -642,6 +643,7 @@ impl Service {
             // when the request breaks the header rule (Switch wire 7.1 Timestamp).
             let at = match request.route.call {
                 Call::Enroll => AnswerTime::TimeBase(base_ms, Uncompared::Enrollment),
+                Call::GetAccount => AnswerTime::TimeBase(base_ms, Uncompared::AccountDiscovery),
                 Call::Erase => AnswerTime::TimeBase(base_ms, Uncompared::Erasure),
                 _ => AnswerTime::Unbound(base_ms),
             };
@@ -649,6 +651,9 @@ impl Service {
         }
         if request.route.call == Call::Enroll {
             return self.enroll(&request, base_ms, asked).await;
+        }
+        if request.route.call == Call::GetAccount {
+            return self.get_account(&request, base_ms, asked).await;
         }
         // Step 1: an unknown route, signed with the service key like every answer.
         let Some(account) = request.route.account.clone() else {
@@ -691,7 +696,16 @@ impl Service {
         // on time take: the time base, or the last time it stamped where the time base is
         // earlier.
         let service_ms = committed_ms.map_or(base_ms, |committed| base_ms.max(committed));
-        if matches!(routed.route, Route::Notice(_)) {
+        if matches!(routed.route, Route::Notice(_))
+            || (matches!(routed.route, Route::NotHosted)
+                && judged.mark().is_some()
+                && matches!(
+                    judged.judgement.decision.verdict,
+                    verdict::Verdict::NotHosted { delete_mark: false }
+                ))
+        {
+            // A surviving zero mark also supplies a creation for the authenticated
+            // comparison before its not-hosted answer (Switch account binding 1).
             // The notice replaces every later answer, a `401` and a `403` before
             // authentication included, but a `429` answered before it at an account the
             // service holds, which commits nothing and carries the last committed time; a
@@ -707,7 +721,15 @@ impl Service {
                 }
                 (Some(_), None) => {}
                 (None, _) if *call != Call::GetIdentity => {
-                    let _ = self.pre_lock(&account, &request, base_ms, service_ms).await;
+                    if let Ok(pre) = self.pre_lock(&account, &request, base_ms, service_ms).await
+                        && pre
+                            .caller
+                            .is_some_and(|claimed| claimed.caller == Caller::Signer)
+                    {
+                        return self
+                            .signer_notice_under_lock(&account, &request, &class, asked, base_ms)
+                            .await;
+                    }
                 }
                 (None, _) => {}
             }
@@ -796,7 +818,17 @@ impl Service {
                 Ok(Some(txn)) => txn,
                 Ok(None) => {
                     return self
-                        .answer_after_account_change(&account, &class, asked, base_ms, None)
+                        .answer_after_account_change(
+                            &account,
+                            &class,
+                            asked,
+                            base_ms,
+                            None,
+                            caller
+                                .as_ref()
+                                .is_some_and(|claimed| claimed.caller == Caller::Signer)
+                                .then_some(&request),
+                        )
                         .await;
                 }
                 Err(error) => return refused_early(store_error(&error)),
@@ -1072,6 +1104,21 @@ impl Service {
         // The time the account last committed: what an answer that commits nothing carries
         // (Switch wire 7.1 Timestamp).
         let committed_ms = txn.head().stamped_time_ms;
+        let bound_signer = caller.is_some_and(|claimed| claimed.caller == Caller::Signer);
+        let store_id = if bound_signer {
+            match self.marks.identity().await {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    return self.service_error(
+                        asked,
+                        AnswerTime::Account(committed_ms),
+                        &unavailable(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let held = match txn.held_identity().await {
             Ok(Some(held)) => match IdentityDoc::verify(&held.doc, &identity_key) {
                 Ok(doc) => Some(doc),
@@ -1100,15 +1147,39 @@ impl Service {
             head.chain,
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
+            head.activation,
         );
         let judged = self.judge(&identity, Some(account)).await;
+        if let Some(store_id) = store_id
+            && self.marks.identity().await.ok() != Some(store_id)
+        {
+            return self.service_error(asked, AnswerTime::Account(committed_ms), &unavailable());
+        }
         if judged.judgement.decision.erase_account_again {
             drop(txn);
             return self
-                .answer_after_account_change(&identity, class, asked, base_ms, Some(committed_ms))
+                .answer_after_account_change(
+                    &identity,
+                    class,
+                    asked,
+                    base_ms,
+                    Some(committed_ms),
+                    bound_signer.then_some(request),
+                )
                 .await;
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
+        if bound_signer
+            && !matches!(routed.route, Route::Unavailable)
+            && let Err(error) = account::check_creation(request, &judged)
+        {
+            return self.keyed_error(
+                &routed.key,
+                asked,
+                AnswerTime::TimeBase(base_ms, Uncompared::CreationConflict),
+                &error,
+            );
+        }
         if let Some(answer) =
             self.verdict_answer(&identity, &routed, asked, base_ms, Some(committed_ms))
         {
@@ -1273,10 +1344,29 @@ impl Service {
         // The mark moves to the committed head, durably, before the answer is released; a
         // commit that held whose mark didn't move answers `503`, and its retry is answered as
         // a retry (Switch wire 7.3, "Moving it").
-        if moves_mark
-            && let Some(tip) = tip
-            && self
-                .move_mark(
+        if moves_mark && let Some(tip) = tip {
+            let moved = if answer.starts_generation
+                && matches!(routed.route, Route::StartAfresh)
+                && let Some(old) = judged
+                    .mark()
+                    .filter(|old| old.created_at_ms < created_at_ms)
+            {
+                match store_id {
+                    Some(store_id) => {
+                        self.recover_older_mark(
+                            &identity,
+                            tip,
+                            answer_key,
+                            created_at_ms,
+                            *old,
+                            store_id,
+                        )
+                        .await
+                    }
+                    None => marking::MarkMove::Failed,
+                }
+            } else {
+                self.move_mark(
                     &identity,
                     tip,
                     answer_key,
@@ -1284,14 +1374,15 @@ impl Service {
                     answer.starts_generation,
                 )
                 .await
-                != marking::MarkMove::Done
-        {
-            return Self::signed_error(
-                &answer_signer,
-                asked,
-                AnswerTime::Account(time_ms),
-                &unavailable(),
-            );
+            };
+            if moved != marking::MarkMove::Done {
+                return Self::signed_error(
+                    &answer_signer,
+                    asked,
+                    AnswerTime::Account(time_ms),
+                    &unavailable(),
+                );
+            }
         }
         let mut answer = answer;
         match answer.deferred.take() {
@@ -1838,7 +1929,26 @@ impl Service {
         base_ms: u64,
     ) -> Result<Claimed, ApiError> {
         let claimed = decode_claim(account, &request.signed_headers(), base_ms)?;
+        if claimed.caller != Caller::Signer && claimed.headers.created.is_some() {
+            return Err(ApiError::bad_request(
+                "account binding: an app carries no creation header",
+            ));
+        }
         if claimed.caller == Caller::Signer {
+            let text = claimed.headers.created.as_deref().ok_or_else(|| {
+                ApiError::bad_request("account binding: Switch-Created is missing")
+            })?;
+            let created = wire_http::parse_created(text)
+                .map_err(|_| ApiError::bad_request("account binding: invalid creation"))?;
+            if request.route.call == Call::Erase {
+                let named = wire_http::parse_erase_body(&request.body)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                if named.created != Some(created) {
+                    return Err(ApiError::bad_request(
+                        "account binding: erasure body and header differ",
+                    ));
+                }
+            }
             let target = RequestTarget {
                 method: &request.method,
                 path_and_query: &request.path_and_query,

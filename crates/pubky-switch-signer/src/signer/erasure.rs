@@ -75,7 +75,7 @@ use super::revocation::UserConfirmed;
 use super::{Signer, Verdict, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::state::{Flow, ShownCopy};
+use crate::state::{Flow, Service, ShownCopy};
 
 impl Signer {
     /// Erase the identity's account at its switch, once the user has confirmed it (Switch spec
@@ -105,6 +105,12 @@ impl Signer {
             ready => ready?,
         }
         let flow = Flow::Erase {
+            account: match self.state.newest {
+                Some(_) => self.newest_account()?,
+                // A refused first delivery leaves the authenticated enrollment, but no
+                // accepted document (Switch wire 7.4.16).
+                None => self.service()?,
+            },
             unpublished: false,
             reminded: Vec::new(),
             unanswered: false,
@@ -172,15 +178,14 @@ impl Signer {
             .await
     }
 
-    /// The erasure's request, and what its answer makes of the flow. With `relearn`, a signed
-    /// `409` naming another creation time than the request did has it kept as the account's
-    /// and the request sent once more, naming it (Switch wire 7.4.16).
+    /// The erasure's request and its answer. A checked document conflict at the original
+    /// creation may update the document named once (Switch wire 7.4.16).
     async fn send_erasure(
         &mut self,
         unpublished: bool,
         reminded: Vec<[u8; 16]>,
         unanswered: bool,
-        relearn: bool,
+        name_copy: bool,
     ) -> Result<()> {
         // Through the signing gate, as every signing step: the erasure is the identity's
         // to ask for only while this install signs. It names the account's creation time and
@@ -188,10 +193,10 @@ impl Signer {
         // take-over, makes the switch refuse it, and so does a later account of the identity
         // there; a retry names the same (Switch wire 7.4.16).
         let (created, following) = self.erasure_names()?;
-        // Before every transmitted request, including one rebound by an authenticated
-        // conflict: its outcome may be unknown. The retained intent authorizes only this
+        // Before every transmitted request: its outcome may be unknown. The retained intent authorizes only this
         // erasure, after unpublication and the copy/signing checks (wire 7.4.16).
         let flow = Flow::Erase {
+            account: self.erasure_account()?,
             unpublished,
             reminded: reminded.clone(),
             unanswered: true,
@@ -201,7 +206,12 @@ impl Signer {
         self.commit(self.state.clone(), Some(flow)).await?;
         let answer = {
             let key = self.signing_key()?;
-            let client = self.signing_client(&key)?;
+            let account = self.erasure_account()?;
+            let client = super::clients::SigningClient::new(
+                &self.env,
+                &self.service_target(&account),
+                &key,
+            )?;
             drop(key);
             client.erase(created, following).await
         };
@@ -223,6 +233,7 @@ impl Signer {
             // request in doubt before, it erased nothing, and it never sets the doubt itself.
             Err(error @ ClientError::BadServiceSignature { status: 404 }) => {
                 let flow = Flow::Erase {
+                    account: self.erasure_account()?,
                     unpublished,
                     reminded,
                     unanswered: false,
@@ -248,6 +259,7 @@ impl Signer {
                 },
             ) => {
                 let flow = Flow::Erase {
+                    account: self.erasure_account()?,
                     unpublished,
                     reminded,
                     unanswered: true,
@@ -266,9 +278,10 @@ impl Signer {
                 ..
             }) if checked_against(&current).is_none() => {
                 let flow = Flow::Erase {
+                    account: self.erasure_account()?,
                     unpublished,
                     reminded,
-                    unanswered: false,
+                    unanswered,
                     first_404_ms: None,
                     shown: self.erasure_shown(),
                 };
@@ -278,6 +291,24 @@ impl Signer {
                 )
                 .into())
             }
+            Err(
+                error @ ClientError::Switch {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+            ) if matches!(&error, ClientError::Switch { current, .. } if checked_against(current) != created) =>
+            {
+                let flow = Flow::Erase {
+                    account: self.erasure_account()?,
+                    unpublished,
+                    reminded,
+                    unanswered,
+                    first_404_ms: None,
+                    shown: self.erasure_shown(),
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
+                Err(error.into())
+            }
             // At an account that answers the notice, the `409` carries the copy the account
             // holds, which is judged, then named in the erasure sent again (Switch wire
             // 7.4.16).
@@ -285,30 +316,9 @@ impl Signer {
                 code: ErrorCode::Conflict,
                 current,
                 ..
-            }) if relearn && current.get("identity").is_some() => {
+            }) if name_copy && current.get("identity").is_some() => {
                 self.erase_naming_the_shown_copy(unpublished, reminded, &current)
                     .await
-            }
-            // One other than the request named is the account's: it is kept, and the erasure
-            // is sent again naming it, whatever time was held, once (Switch wire 7.4.16).
-            Err(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            }) if relearn && checked_against(&current) != created => {
-                let mut state = self.state.clone();
-                if let Some(service) = state.service.as_mut() {
-                    service.created = checked_against(&current);
-                }
-                let flow = Flow::Erase {
-                    unpublished,
-                    reminded: reminded.clone(),
-                    unanswered: false,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(state, Some(flow)).await?;
-                Box::pin(self.send_erasure(unpublished, reminded, false, false)).await
             }
             // Signed with the service key, so the request didn't land: another
             // `identity.json`, or a move in progress. The switch's copy is judged first, as
@@ -321,9 +331,10 @@ impl Signer {
                 ..
             }) => {
                 let flow = Flow::Erase {
+                    account: self.erasure_account()?,
                     unpublished,
                     reminded: reminded.clone(),
-                    unanswered: false,
+                    unanswered,
                     first_404_ms: None,
                     shown: self.erasure_shown(),
                 };
@@ -335,6 +346,7 @@ impl Signer {
             // A well-formed definitive refusal: this request did not erase the account.
             Err(error @ ClientError::Switch { .. }) => {
                 let flow = Flow::Erase {
+                    account: self.erasure_account()?,
                     unpublished,
                     reminded,
                     unanswered: false,
@@ -348,27 +360,30 @@ impl Signer {
         }
     }
 
-    /// What the erasure's body names (Switch wire 7.4.16 Request), in one place: `created`,
-    /// the account's creation time its enrollment answer gave, or a `409` since, `None` where
-    /// this install holds none, after a restore or a hand-over; and `identity_hash`, the
-    /// document hash of the `identity.json` this install knows the account to hold: the copy
-    /// a `409` at an account that answers the notice showed, once one did
-    /// ([`Signer::erase_naming_the_shown_copy`]); else the mark's, once it names this
-    /// account's service, that is, once this install delivered a version here; `None` before,
-    /// as at a staged account it delivered nothing to, which holds none.
+    /// The original account of this erasure, kept before any remote effect.
+    fn erasure_account(&self) -> Result<Service> {
+        match &self.flow {
+            Some(Flow::Erase { account, .. }) => Ok(account.clone()),
+            _ => Err(Refusal::NotErasing.into()),
+        }
+    }
+
+    /// The original creation and the mark or checked same-account document conflict
+    /// named by the request (Switch wire 7.4.16, account binding 4).
     fn erasure_names(&self) -> Result<(Option<u64>, Option<[u8; 32]>)> {
-        let Some(service) = self.state.service.as_ref() else {
-            return Ok((None, None));
-        };
+        let account = self.erasure_account()?;
         if let Some(shown) = self.erasure_shown() {
-            return Ok((service.created, shown.hash));
+            return Ok((Some(account.created), shown.hash));
         }
         let following = self
             .state
             .newest_doc()?
-            .filter(|mark| mark.inbox().service_key == service.service_key)
+            .filter(|mark| {
+                mark.inbox().url == account.origin
+                    && mark.inbox().service_key == account.service_key
+            })
             .map(|mark| mark.hash());
-        Ok((service.created, following))
+        Ok((Some(account.created), following))
     }
 
     /// The copy a `409` at an account that answers the notice showed, as the erasure in
@@ -398,7 +413,9 @@ impl Signer {
         reminded: Vec<[u8; 16]>,
         current: &serde_json::Value,
     ) -> Result<()> {
+        let account = self.erasure_account()?;
         let kept = |shown: Option<ShownCopy>| Flow::Erase {
+            account: account.clone(),
             unpublished,
             reminded: reminded.clone(),
             unanswered: false,
@@ -440,10 +457,7 @@ impl Signer {
                 return self.alarm(alert).await;
             }
         }
-        let mut state = self.state.clone();
-        if let Some(service) = state.service.as_mut() {
-            service.created = checked_against(current);
-        }
+        let state = self.state.clone();
         let shown = ShownCopy {
             hash: copy.as_ref().map(IdentityDoc::hash),
         };
@@ -625,6 +639,7 @@ impl Signer {
         }
         if first_404_ms != Some(since_ms) {
             let flow = Flow::Erase {
+                account: self.erasure_account()?,
                 unpublished: true,
                 reminded,
                 unanswered: true,
@@ -714,6 +729,7 @@ impl Signer {
             newest.published = false;
         }
         let flow = Flow::Erase {
+            account: self.erasure_account()?,
             unpublished: true,
             reminded,
             unanswered: false,

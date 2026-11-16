@@ -265,7 +265,7 @@ impl AccountTxn {
         let id = self.head().id.clone();
         sqlx::query(
             "UPDATE accounts SET generation = $2, recovery_from = $3, \
-             recovery_declared_at_ms = $4, admission_staged = $5 WHERE id = $1",
+             recovery_declared_at_ms = $4, admission_staged = $5, activation_requirement = 'ordinary' WHERE id = $1",
         )
         .bind(&id)
         .bind(to_db(generation, "generation")?)
@@ -275,7 +275,7 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        self.start_head(generation);
+        self.start_recovery_head(generation);
         Ok(())
     }
 }

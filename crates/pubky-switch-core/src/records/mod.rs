@@ -15,6 +15,7 @@
 //! from (Switch wire 1.1, 2.2). Writers produce compact JSON with the members in the order
 //! of the wire format's tables.
 
+mod account;
 mod app_record;
 mod app_request;
 mod approval;
@@ -31,6 +32,13 @@ mod key_bundle;
 mod receive_key;
 mod renewal;
 
+pub use account::{
+    ACCOUNT_OBSERVATION_KIND, ACCOUNT_OBSERVATION_VALIDITY_MS, AccountActivation,
+    AccountAssociation, AccountBinding, AccountMarkInput, AccountObservation,
+    AccountObservationBody, CarriedAccountObservation, EnrollmentIntent,
+    MAX_ACCOUNT_OBSERVATION_BYTES, MAX_CARRIED_ACCOUNT_OBSERVATION_BYTES,
+    MAX_ENROLLMENT_INTENT_BYTES, ObservationValidity,
+};
 pub use app_record::{AppRecord, AppRecordBody, RECORD_KIND, RecordOrder, RecordView};
 pub use app_request::{
     APP_REQUEST_KIND, AppRequest, AppRequestBody, Approve, AuthRequest, IDENTITY_PATH,
@@ -48,6 +56,7 @@ pub use delivery::{
 };
 pub use enroll::{
     ENROLL_KIND, Enrollment, EnrollmentAnswer, EnrollmentBody, Limits, MAX_APP_LIMIT,
+    MAX_ENROLLMENT_BYTES, enrollment_request_len,
 };
 pub use export_transfer::{EXPORT_TRANSFER_KIND, ExportTransfer, ExportTransferBody};
 pub use freeze::{DiscardAnswer, FREEZE_KIND, Freeze, FreezeBody, Unfreeze, UnfreezeAt};
@@ -128,6 +137,9 @@ impl Inbox {
 /// Whether `url` is a switch origin: `https://host[:port]`, with no path, query, fragment,
 /// user information or trailing slash (Switch wire 3.3).
 pub fn is_origin(url: &str) -> bool {
+    if url.len() > crate::net::MAX_ORIGIN_LEN {
+        return false;
+    }
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
@@ -137,8 +149,10 @@ pub fn is_origin(url: &str) -> bool {
     };
     // Every label of the host is non-empty and neither starts nor ends with `-`.
     let host_ok = !host.is_empty()
+        && host.len() <= crate::net::MAX_DOMAIN_LEN
         && host.split('.').all(|label| {
             !label.is_empty()
+                && label.len() <= crate::net::MAX_DOMAIN_LABEL_LEN
                 && !label.starts_with('-')
                 && !label.ends_with('-')
                 && label

@@ -318,6 +318,7 @@ mod tests {
     fn account(state: AccountState) -> Account {
         Account {
             model: crate::account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
                 created_at_ms: 10,
                 document_generation: Some(2),

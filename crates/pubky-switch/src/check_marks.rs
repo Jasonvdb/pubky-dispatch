@@ -322,6 +322,7 @@ fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Accou
         head.chain,
         head.created_at_ms,
         body.as_ref(),
+        head.activation,
     );
     let serving = matches!(account.model.state, AccountState::Serving(_));
     (account, serving)
@@ -576,6 +577,7 @@ mod tests {
     fn serving(seq: u64, hash: u8) -> Account {
         Account {
             model: crate::account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::Serving(ChainTip {
                     generation: 1,
                     seq,

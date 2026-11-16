@@ -848,7 +848,9 @@ impl AccountTxn {
             KeptReason::Revoked => "revoked",
             KeptReason::Departed => "departed",
             // An enrollment's App IDs are kept when it is taken, never removed here.
-            KeptReason::Enrolled => return Err(StoreError::Corrupt("not a removal")),
+            KeptReason::Enrolled | KeptReason::Document => {
+                return Err(StoreError::Corrupt("not a removal"));
+            }
         };
         let id = self.head().id.clone();
         sqlx::query(

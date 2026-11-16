@@ -282,6 +282,12 @@ mod tests {
     fn handing_over() -> crate::state::HandingOver {
         crate::state::HandingOver {
             to_app: [4; 16],
+            account: crate::state::Service {
+                origin: "https://switch.example".into(),
+                service_key: [5; 32],
+                limits: pubky_switch_core::records::Limits::default(),
+                created: 0,
+            },
             doc: pubky_switch_core::sig::SignedDoc {
                 body: String::new(),
                 sig: String::new(),

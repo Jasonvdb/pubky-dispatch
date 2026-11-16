@@ -14,7 +14,7 @@ const fn tip(generation: u64, seq: u64, hash: u8) -> ChainTip {
 }
 
 fn mark(generation: u64, seq: u64, hash: u8) -> MarkInput {
-    MarkInput::Mark(mark_created(generation, seq, hash, 50))
+    MarkInput::Mark(mark_created(generation, seq, hash, 100))
 }
 
 fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> Mark {
@@ -40,6 +40,7 @@ enum Row {
 
 fn account(row: Row) -> Option<Account> {
     let staged = |state| Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
         created_at_ms: 100,
         document_generation: None,
@@ -47,6 +48,7 @@ fn account(row: Row) -> Option<Account> {
         enrolled_generation: 2,
     };
     let serving = |state| Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
         created_at_ms: 100,
         document_generation: Some(2),
@@ -160,6 +162,7 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
     assert_eq!(stub_for_fork_rule(Some((2, 3)), &Mark::zero(0)), None);
     // A later generation's state over another hash there is a fork.
     let serving = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::Serving(ChainTip {
             generation: 2,
             seq: 3,
@@ -196,7 +199,15 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
 #[test]
 fn test_verdict_erased_again_no_mark() {
     for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-        assert_erased_again(mark, &[], NOT_HOSTED);
+        assert_erased_again(
+            mark,
+            &[],
+            if matches!(mark, MarkInput::NotAMark) {
+                Verdict::Unknown
+            } else {
+                NOT_HOSTED
+            },
+        );
     }
 }
 
@@ -241,7 +252,14 @@ fn test_verdict_erased_again_retired() {
 #[test]
 fn test_verdict_none_no_mark() {
     for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-        assert_eq!(verdict(Row::None, mark, &[]), NOT_HOSTED);
+        assert_eq!(
+            verdict(Row::None, mark, &[]),
+            if matches!(mark, MarkInput::NotAMark) {
+                Verdict::Unknown
+            } else {
+                NOT_HOSTED
+            }
+        );
     }
 }
 
@@ -286,7 +304,14 @@ fn test_verdict_none_retired() {
 #[test]
 fn test_verdict_none_erased_no_mark() {
     for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-        assert_eq!(verdict(Row::NoneErased, mark, &[]), NOT_HOSTED);
+        assert_eq!(
+            verdict(Row::NoneErased, mark, &[]),
+            if matches!(mark, MarkInput::NotAMark) {
+                Verdict::Unknown
+            } else {
+                NOT_HOSTED
+            }
+        );
     }
 }
 
@@ -673,6 +698,7 @@ fn test_verdict_rule_retirement_counts_only_up_to_the_mark_generation() {
 #[test]
 fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generation() {
     let import = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedImport(tip(3, 7, 1)),
         created_at_ms: 100,
         document_generation: None,
@@ -705,6 +731,7 @@ fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generatio
     );
     // Its chain's generation, also above the document it holds.
     let with_document = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         document_generation: Some(2),
         ..import
     };
@@ -715,11 +742,13 @@ fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generatio
     );
     // Holding no chain, its document's; 0 while it holds neither.
     let staged = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedNoChain,
         ..with_document
     };
     assert_eq!(staged.generation(), 2);
     let empty = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         document_generation: None,
         ..staged
     };
@@ -810,7 +839,14 @@ fn test_verdict_rule_staged_no_chain_retired_with_the_mark_lost_fails() {
 #[test]
 fn test_verdict_rule_none_retired_without_a_mark_is_not_hosted() {
     for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-        assert_eq!(verdict(Row::None, mark, &[0, 1, 2]), NOT_HOSTED);
+        assert_eq!(
+            verdict(Row::None, mark, &[0, 1, 2]),
+            if matches!(mark, MarkInput::NotAMark) {
+                Verdict::Unknown
+            } else {
+                NOT_HOSTED
+            }
+        );
     }
     assert_eq!(verdict(Row::None, mark(0, 0, 0), &[0]), lost(0, true));
 }
@@ -879,6 +915,7 @@ const BEHIND: RecoveryNotice = RecoveryNotice {
 
 fn route_of(verdict: Verdict, class: RequestClass) -> Route {
     let judgement = Judgement {
+        recovery_required: false,
         erase_account_again: false,
         verdict,
         recovery_floor: BEHIND.generation,
@@ -1409,4 +1446,21 @@ fn test_answer_recovery_lost_mark_uses_document_floor() {
         request_route(&judgement, &put(2, Some(1))),
         Route::StartAfresh
     );
+}
+
+#[test]
+fn test_account_association_retains_physical_sql_floor() {
+    let mut held = account(Row::Serving).expect("account");
+    held.document_generation = Some(1);
+    let floors = [50, 200].map(|created| {
+        judge(&Inputs {
+            account: Some(&held),
+            mark: &MarkInput::Mark(mark_created(0, 0, 0, created)),
+            stub_at_mark: None,
+            erasure_at_ms: None,
+            retired: &[],
+        })
+        .recovery_floor
+    });
+    assert_eq!(floors, [2, 2]);
 }

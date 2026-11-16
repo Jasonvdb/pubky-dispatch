@@ -24,6 +24,8 @@ pub mod header {
     pub const CERT: &str = "switch-cert";
     /// An invite code.
     pub const INVITE_CODE: &str = "switch-invite-code";
+    /// The creation of the account a signer request concerns, with three fraction digits.
+    pub const CREATED: &str = "switch-created";
     /// The signer's export transfer in compact form, for the next service's chunk fetches.
     pub const TRANSFER: &str = "switch-transfer";
     /// The signing time, `YYYY-MM-DDTHH:MM:SSZ`.
@@ -58,6 +60,8 @@ pub struct RequestHeaders {
     pub cert: Option<String>,
     /// `Switch-Invite-Code`.
     pub invite_code: Option<String>,
+    /// `Switch-Created`; absent for app calls and fresh account discovery/creation.
+    pub created: Option<String>,
 }
 
 /// The parts of a request its signature covers besides the headers.
@@ -76,8 +80,8 @@ pub struct RequestTarget<'a> {
 
 /// The fields after the label of a request signature: method, as sent, path and query,
 /// `hash(body)`, `Switch-Timestamp`, switch origin, `Switch-Identity`, `Switch-App`,
-/// `Switch-Cert` and `Switch-Invite-Code`, an absent header as an empty field (Switch wire
-/// 7.1).
+/// `Switch-Cert`, `Switch-Invite-Code` and `Switch-Created`, an absent header as an empty
+/// field (Switch wire 7.1; Switch account binding 1).
 pub fn request_fields(target: &RequestTarget<'_>, headers: &RequestHeaders) -> Vec<Vec<u8>> {
     vec![
         target.method.as_bytes().to_vec(),
@@ -104,7 +108,27 @@ pub fn request_fields(target: &RequestTarget<'_>, headers: &RequestHeaders) -> V
             .unwrap_or_default()
             .as_bytes()
             .to_vec(),
+        headers
+            .created
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
     ]
+}
+
+/// Read an account creation header with exactly three fractional digits
+/// (Switch account binding 1).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] if the text is not the exact required UTC representation.
+pub fn parse_created(text: &str) -> Result<u64> {
+    let created = crate::time::parse_rfc3339(text)?;
+    if crate::time::rfc3339(created) != text {
+        return invalid("Switch account binding 1: creation needs three fraction digits");
+    }
+    Ok(created)
 }
 
 fn refs(fields: &[Vec<u8>]) -> Vec<&[u8]> {
@@ -203,7 +227,7 @@ pub fn verify_transfer_request(
 }
 
 /// The request headers a received request covers, in its order (Switch wire 7.1).
-pub const RECEIVED_HEADERS: [&str; 7] = [
+pub const RECEIVED_HEADERS: [&str; 8] = [
     header::IDENTITY,
     header::APP,
     header::CERT,
@@ -211,6 +235,7 @@ pub const RECEIVED_HEADERS: [&str; 7] = [
     header::TRANSFER,
     header::TIMESTAMP,
     header::SIGNATURE,
+    header::CREATED,
 ];
 
 /// The body field of a received request (Switch wire 7.1).
@@ -244,7 +269,7 @@ impl BodyField {
 /// absent (Switch wire 7.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReceivedHeaders {
-    values: [Vec<Vec<u8>>; 7],
+    values: [Vec<Vec<u8>>; 8],
 }
 
 impl ReceivedHeaders {
@@ -326,7 +351,8 @@ pub fn is_public_read(method: &str, path_and_query: &str) -> bool {
 
 /// The bytes of a received request (Switch wire 7.1): `lp(method, path and query, body
 /// field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert),
-/// H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature))`.
+/// H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature),
+/// H(Switch-Created))`.
 /// `H` of a header is empty when it is absent and `lp()` of its values in the order received
 /// when present. The public read binds every header field as absent, whatever the request
 /// carries ([`is_public_read`]). Every signer and verifier of a response takes the received
@@ -695,7 +721,7 @@ fn call_of(path: &str) -> Option<Vec<&str>> {
 pub fn body_cap(method: &str, path: &str) -> Option<usize> {
     let call = call_of(path)?;
     Some(match (method, call.as_slice()) {
-        ("POST", ["enroll"]) => 256 << 10,
+        ("POST", ["enroll"]) => crate::records::MAX_ENROLLMENT_BYTES,
         ("GET", _) => 0,
         ("POST", ["inbox"]) => 65_536,
         ("POST", ["ops"] | ["import"]) => 4 << 20,
@@ -713,6 +739,23 @@ pub fn body_cap(method: &str, path: &str) -> Option<usize> {
         ("POST", ["connect"]) | ("DELETE", ["connect", _]) => 0,
         _ => return None,
     })
+}
+
+/// A response-body limit imposed by the call and status, before accumulation or parsing.
+/// `None` leaves the caller's configured limit unchanged; a configured smaller limit still
+/// applies. Only successful account discovery has this additional bound
+/// (Switch account binding 2).
+pub fn response_body_cap(method: &str, path_and_query: &str, status: u16) -> Option<usize> {
+    (status == 200 && is_account_discovery(method, path_and_query))
+        .then_some(crate::records::MAX_ACCOUNT_OBSERVATION_BYTES)
+}
+
+fn is_account_discovery(method: &str, path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let Some(rest) = path.strip_prefix("/v1/") else {
+        return false;
+    };
+    matches!(rest.split_once('/'), Some((id, "account")) if method == "GET" && !id.is_empty())
 }
 
 /// Whether a frozen account answers a call with `410 moved` (Switch wire 7.3): the writes
@@ -938,6 +981,8 @@ pub enum Uncompared {
     /// Every answer to the enrollment, `POST /v1/enroll`, outside the comparison of the
     /// account's committed times.
     Enrollment,
+    /// Every authenticated account discovery answer, independent of committed account time.
+    AccountDiscovery,
     /// Every answer to the erasure, `POST /v1/{id}/erase`, outside the comparison of the
     /// account's committed times.
     Erasure,
@@ -947,6 +992,9 @@ pub enum Uncompared {
     /// An answer given before the body was read, which verifies only with the empty body
     /// field.
     BodyUnread,
+    /// An authenticated conflict names only the current account creation, with no head
+    /// (Switch account binding 1, Switch wire 7.1).
+    CreationConflict,
     /// The notice, `503 recovery_required` (Switch wire 7.6).
     Notice,
     /// Every `503 unavailable`: a temporary failure, which tells nothing of the account's
@@ -960,7 +1008,8 @@ pub enum Uncompared {
 /// The class of an answer that counts in no comparison of service times, `None` for one
 /// that counts (Switch wire 7.1 Timestamp): by the request it answers, `method` and
 /// `path_and_query` as sent and the body field the answer verifies with, and by the answer's
-/// `status` and, for an error, its `code` and `current`.
+/// `status` and, for an error, its `code` and `current`. `head_present` reports the actual
+/// received head field, not whether parsing that field succeeded.
 pub fn uncompared(
     method: &str,
     path_and_query: &str,
@@ -968,6 +1017,7 @@ pub fn uncompared(
     status: u16,
     code: Option<ErrorCode>,
     current: Option<&serde_json::Value>,
+    head_present: bool,
 ) -> Option<Uncompared> {
     let path = path_and_query.split('?').next().unwrap_or_default();
     let segments: Vec<&str> = path
@@ -976,6 +1026,9 @@ pub fn uncompared(
         .unwrap_or_default();
     match (method, segments.as_slice()) {
         ("POST", ["enroll"]) => return Some(Uncompared::Enrollment),
+        _ if is_account_discovery(method, path_and_query) => {
+            return Some(Uncompared::AccountDiscovery);
+        }
         ("POST", [id, "erase"]) if !id.is_empty() => return Some(Uncompared::Erasure),
         _ if is_public_read(method, path_and_query) => return Some(Uncompared::PublicRead),
         _ => {}
@@ -984,6 +1037,21 @@ pub fn uncompared(
         return Some(Uncompared::BodyUnread);
     }
     match code {
+        Some(ErrorCode::Conflict)
+            if status == 409
+                && !head_present
+                && current
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|fields| {
+                        fields.len() == 1
+                            && fields
+                                .get("created")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|created| parse_created(created).is_ok())
+                    }) =>
+        {
+            Some(Uncompared::CreationConflict)
+        }
         Some(ErrorCode::RecoveryRequired) if status == 503 => Some(Uncompared::Notice),
         Some(ErrorCode::Unavailable) if status == 503 => Some(Uncompared::Unavailable),
         Some(ErrorCode::NotFound) if status == 404 && current == Some(&not_hosted_current()) => {
@@ -1389,10 +1457,27 @@ mod tests {
             (header::APP, b"a".as_slice()),
         ]);
         let joined = ReceivedHeaders::of([(header::APP, b"a, a".as_slice())]);
-        let encodings: Vec<Vec<u8>> = [&none, &empty, &once, &twice, &joined]
-            .into_iter()
-            .map(|headers| received_request(&received(headers)))
-            .collect();
+        let created_empty = ReceivedHeaders::of([(header::CREATED, b"".as_slice())]);
+        let created_once = ReceivedHeaders::of([(header::CREATED, b"a".as_slice())]);
+        let created_twice = ReceivedHeaders::of([
+            (header::CREATED, b"a".as_slice()),
+            (header::CREATED, b"a".as_slice()),
+        ]);
+        let created_joined = ReceivedHeaders::of([(header::CREATED, b"a, a".as_slice())]);
+        let encodings: Vec<Vec<u8>> = [
+            &none,
+            &empty,
+            &once,
+            &twice,
+            &joined,
+            &created_empty,
+            &created_once,
+            &created_twice,
+            &created_joined,
+        ]
+        .into_iter()
+        .map(|headers| received_request(&received(headers)))
+        .collect();
         for (i, a) in encodings.iter().enumerate() {
             for b in &encodings[i + 1..] {
                 assert_ne!(a, b);
@@ -1401,14 +1486,18 @@ mod tests {
         // An absent header is an empty field; one present once with an empty value is
         // `u32_be(0)`.
         let fields = crate::enc::split_lp(&encodings[1]).unwrap();
-        assert_eq!(fields.len(), 11);
+        assert_eq!(fields.len(), 12);
         assert_eq!(fields[7], vec![0, 0, 0, 0]);
         assert!(
-            fields[4..11]
+            fields[4..12]
                 .iter()
                 .enumerate()
                 .all(|(i, f)| i == 3 || f.is_empty())
         );
+        let fields = crate::enc::split_lp(&encodings[5]).unwrap();
+        assert_eq!(fields.len(), 12);
+        assert_eq!(fields[11], vec![0, 0, 0, 0]);
+        assert!(fields[4..11].iter().all(Vec::is_empty));
         // Names are compared case-insensitively, and headers it doesn't cover are left out.
         let mixed = ReceivedHeaders::of([
             ("Switch-App", b"a".as_slice()),
@@ -1476,6 +1565,123 @@ mod tests {
             ),
         ] {
             assert_eq!(of(pairs).broken_rule(), Some(reason), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn test_creation_conflict_is_outside_account_time() {
+        let current = serde_json::json!({"created": "2026-01-01T00:00:00.000Z"});
+        assert_eq!(
+            super::uncompared(
+                "GET",
+                "/v1/x/apps",
+                BodyField::read(b""),
+                409,
+                Some(ErrorCode::Conflict),
+                Some(&current),
+                false
+            ),
+            Some(Uncompared::CreationConflict)
+        );
+    }
+
+    #[test]
+    fn test_creation_conflict_requires_exact_shape_and_absent_head() {
+        let current = serde_json::json!({"created": "2026-01-01T00:00:00.000Z"});
+        for (status, code, head) in [
+            (409, Some(ErrorCode::Conflict), true),
+            (400, Some(ErrorCode::Conflict), false),
+            (409, None, false),
+            (409, Some(ErrorCode::BadRequest), false),
+        ] {
+            assert_eq!(
+                super::uncompared(
+                    "GET",
+                    "/v1/x/apps",
+                    BodyField::read(b""),
+                    status,
+                    code,
+                    Some(&current),
+                    head
+                ),
+                None
+            );
+        }
+        for current in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"created": null})),
+            Some(serde_json::json!({"created": 0})),
+            Some(serde_json::json!({"created": "2026-01-01T00:00:00Z"})),
+            Some(serde_json::json!({"created": "2026-01-01T00:00:00.000+00:00"})),
+            Some(serde_json::json!({"created": "2026-13-01T00:00:00.000Z"})),
+            Some(serde_json::json!({"created": "2026-01-01T00:00:00.000Z", "binding": "changed"})),
+            Some(serde_json::json!({"binding": "expired"})),
+        ] {
+            assert_eq!(
+                super::uncompared(
+                    "GET",
+                    "/v1/x/apps",
+                    BodyField::read(b""),
+                    409,
+                    Some(ErrorCode::Conflict),
+                    current.as_ref(),
+                    false
+                ),
+                None,
+                "{current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_creation_conflict_preserves_endpoint_and_unread_precedence() {
+        let current = serde_json::json!({"created": "2026-01-01T00:00:00.000Z"});
+        for (method, path, body, class) in [
+            (
+                "POST",
+                "/v1/enroll",
+                BodyField::read(b""),
+                Uncompared::Enrollment,
+            ),
+            (
+                "GET",
+                "/v1/x/account",
+                BodyField::read(b""),
+                Uncompared::AccountDiscovery,
+            ),
+            (
+                "POST",
+                "/v1/x/erase",
+                BodyField::read(b""),
+                Uncompared::Erasure,
+            ),
+            (
+                "GET",
+                "/v1/x/identity",
+                BodyField::read(b""),
+                Uncompared::PublicRead,
+            ),
+            (
+                "PUT",
+                "/v1/x/identity",
+                BodyField::NotRead,
+                Uncompared::BodyUnread,
+            ),
+        ] {
+            assert_eq!(
+                super::uncompared(
+                    method,
+                    path,
+                    body,
+                    409,
+                    Some(ErrorCode::Conflict),
+                    Some(&current),
+                    false
+                ),
+                Some(class)
+            );
         }
     }
 
@@ -1580,7 +1786,7 @@ mod tests {
         ];
         for (method, path, body, status, code, current, class) in uncompared {
             assert_eq!(
-                super::uncompared(method, path, body, status, code, current),
+                super::uncompared(method, path, body, status, code, current, false),
                 Some(class),
                 "{method} {path} {status} {code:?}"
             );
@@ -1612,7 +1818,7 @@ mod tests {
         ];
         for (method, path, status, code, current) in compared {
             assert_eq!(
-                super::uncompared(method, path, read, status, code, current),
+                super::uncompared(method, path, read, status, code, current, false),
                 None,
                 "{method} {path} {status} {code:?}"
             );

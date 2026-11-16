@@ -47,7 +47,7 @@ use super::revocation::UserConfirmed;
 use super::{Room, Signer, gate};
 use crate::alert::{Alert, Source};
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
-use crate::state::{self, DeliverStep, Flow, Service, SignerState};
+use crate::state::{self, DeliverStep, Flow, RecoveryEnrollment, Service, SignerState};
 
 /// How many times in all a run sends a recovery's enrollment, the same bytes each time,
 /// before its failure is shown (Switch wire 7.4.1).
@@ -118,9 +118,9 @@ impl Signer {
         ) {
             return Err(Refusal::FlowInProgress.into());
         }
-        // Declared again where the recovery already goes: its enrollment or its version, sent
-        // there with the same bytes, goes on. A new enrollment there could find the first
-        // version taken, and a second at the same generation refused for good.
+        // A recovery version already in flight to this origin continues unchanged. Only an
+        // enrollment-only continuation may be ended by this explicit authorization while
+        // its remote outcome remains unknown (Switch account binding 3).
         // Declared again at a service an earlier declaration enrolled at: one that took that
         // version serves it, so it is read first under the key it was answered with.
         // The backup is judged first: an install that took over shows there, and its version
@@ -166,20 +166,16 @@ impl Signer {
         let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         self.recovery_body(&base, lost, origin, [0; 32], until)?;
-        let identity = self.state.identity;
-        let key = gate::recovery_key(&self.keyring, &self.state, &self.store)?;
-        let body = EnrollmentBody {
-            identity,
-            origin: origin.to_owned(),
+        if !pubky_switch_core::records::is_origin(origin) {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 3.7: invalid recovery origin".into(),
+            )));
+        }
+        let enrollment = RecoveryEnrollment::Preparing {
             nonce: pubky_switch_core::enc::random_bytes()?,
             policy: newest.body().policy,
-            identity_doc: None,
-            revoked_apps: Some(revoked),
+            revoked_apps: revoked,
         };
-        let enrollment = Enrollment::sign(&key, body)?;
-        drop(key);
-        // The enrollment's own check refuses an origin that isn't a switch origin.
-        Enrollment::verify(enrollment.signed(), &identity, origin)?;
         let mut state = self.state.clone();
         // An erasure ends: the account at the lost service counts as gone, and its reminders
         // for apps still listed are withdrawn (Switch spec 12.7). So are those of an erased
@@ -197,7 +193,7 @@ impl Signer {
         state.recovery_origin = Some(origin.to_owned());
         let flow = Flow::Recover {
             origin: origin.to_owned(),
-            enrollment: enrollment.signed().clone(),
+            enrollment,
         };
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
@@ -235,14 +231,12 @@ impl Signer {
         self.end_owed_admission().await
     }
 
-    /// Whether the recovery in progress goes to the service at `origin`: its enrollment is
-    /// unanswered there, or its version in flight there.
+    /// Whether the recovery's already signed version is in flight to `origin`.
     fn recovery_goes_to(&self, origin: &str) -> bool {
         if !self.state.recovering {
             return false;
         }
         match &self.flow {
-            Some(Flow::Recover { origin: going, .. }) => going == origin,
             Some(Flow::Deliver { .. }) => self
                 .state
                 .service
@@ -283,6 +277,7 @@ impl Signer {
             let target = Target {
                 origin,
                 pinned: Some(service.service_key),
+                created: Some(service.created),
                 identity,
             };
             let Ok(answer) = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
@@ -415,10 +410,25 @@ impl Signer {
         )
     }
 
-    /// Enroll at the service at `origin` with `signed`, then sign the version that recovers
-    /// there and commit its delivery (the module's doc, steps 1 and 2).
-    pub(super) async fn recover(&mut self, origin: &str, signed: &SignedDoc) -> Result<()> {
-        let answer = self.enroll_for_recovery(origin, signed).await?;
+    /// Continue only this recovery's preparation or original signed enrollment.
+    pub(super) async fn recover(
+        &mut self,
+        origin: &str,
+        enrollment: &RecoveryEnrollment,
+    ) -> Result<()> {
+        let RecoveryEnrollment::Ready {
+            observation,
+            enrollment,
+        } = enrollment
+        else {
+            return self.observe_recovery_account(origin, enrollment).await;
+        };
+        let observed = observation
+            .verify(&self.state.identity, origin)
+            .map_err(SignerError::StoredData)?;
+        let answer = self
+            .enroll_for_recovery(origin, enrollment, observed.body().service_key)
+            .await?;
         let base = self.recovery_base()?;
         let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
@@ -446,7 +456,7 @@ impl Signer {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
-            created: Some(answer.created),
+            created: answer.created,
         };
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
@@ -478,19 +488,70 @@ impl Signer {
                         origin: origin.to_owned(),
                         service_key,
                         limits: answer.limits,
-                        created: Some(answer.created),
+                        created: answer.created,
                     })
             }
         };
-        state.service = Some(service);
+        state.service = Some(service.clone());
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
+            account: service,
             doc: doc.signed().clone(),
             prev: None,
             backup: None,
             step: DeliverStep::Signed,
         };
         self.commit(state, Some(flow)).await
+    }
+
+    /// Select once under the user's recovery authorization, then commit before sending.
+    async fn observe_recovery_account(
+        &mut self,
+        origin: &str,
+        enrollment: &RecoveryEnrollment,
+    ) -> Result<()> {
+        let RecoveryEnrollment::Preparing {
+            nonce,
+            policy,
+            revoked_apps,
+        } = enrollment
+        else {
+            return Err(RecordsFault::Invariant("the recovery was already signed").into());
+        };
+        enrollment.check_exclusions(&self.state, origin)?;
+        let target = Target {
+            origin,
+            // The explicit recovery permits the selected HTTPS origin's current key
+            // (Switch spec 12.5-12.6); it never repins an older pending action.
+            pinned: None,
+            created: None,
+            identity: self.state.identity,
+        };
+        let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+            .observe_account()
+            .await?;
+        let key = gate::recovery_key(&self.keyring, &self.state, &self.store)?;
+        let signed = Enrollment::sign(
+            &key,
+            EnrollmentBody {
+                identity: self.state.identity,
+                origin: origin.to_owned(),
+                nonce: *nonce,
+                intent: observation.enrollment_intent()?,
+                policy: *policy,
+                identity_doc: None,
+                revoked_apps: Some(revoked_apps.clone()),
+            },
+        )?;
+        drop(key);
+        let flow = Flow::Recover {
+            origin: origin.to_owned(),
+            enrollment: RecoveryEnrollment::Ready {
+                observation: observation.carried().clone(),
+                enrollment: signed.signed().clone(),
+            },
+        };
+        self.commit(self.state.clone(), Some(flow)).await
     }
 
     /// The key the service at `origin` served generation `lost` with, as the Homeserver's
@@ -529,30 +590,23 @@ impl Signer {
             .map(|service| service.service_key)
     }
 
-    /// Enroll at the service at `origin` with `signed`, as the errors of `POST /enroll` ask
-    /// (Switch wire 3.7, 7.4.1 Errors). A service whose key this install pinned is asked with
-    /// it, which checks its errors; one it didn't pin can't be checked, and none of its errors
-    /// is the service's word. Either way an error changes nothing:
-    ///
-    /// - a `400` sends the same enrollment again;
-    /// - after [`ENROLL_TRIES`] sends in all in this run, it ends the flow: the failure is
-    ///   shown, and the recovery waits to be declared again
-    ///   ([`crate::SignerStatus::RecoveryRefused`]), which enrolls afresh.
-    ///
-    /// Any other failure keeps the flow, for the next run, which sends the same bytes.
+    /// Retry with the original observed key and signed body. A bounded run stops on its
+    /// error without retiring the continuation (Switch account binding 3).
     async fn enroll_for_recovery(
         &mut self,
         origin: &str,
         signed: &SignedDoc,
+        service_key: [u8; 32],
     ) -> Result<pubky_switch_core::records::EnrollmentAnswer> {
         let identity = self.state.identity;
-        let target = Target {
-            origin,
-            pinned: self.pinned_for(origin),
-            identity,
-        };
         let enrollment =
             Enrollment::verify(signed, &identity, origin).map_err(SignerError::StoredData)?;
+        let target = Target {
+            origin,
+            pinned: Some(service_key),
+            created: enrollment.body().intent.created(),
+            identity,
+        };
         let mut sends = 0;
         loop {
             sends += 1;
@@ -572,7 +626,6 @@ impl Signer {
                 return Err(error.into());
             }
             if sends >= ENROLL_TRIES {
-                self.commit(self.state.clone(), None).await?;
                 return Err(error.into());
             }
         }

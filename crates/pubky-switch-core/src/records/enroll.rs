@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{IdentityDoc, IdentityPolicy, check_tag, decode, encode, fmt, is_origin, open_value};
+use super::{
+    AccountObservation, EnrollmentIntent, IdentityDoc, IdentityPolicy, check_tag, decode, encode,
+    fmt, is_origin, open_value,
+};
 use crate::enc::{serde_b64, zbase32_encode};
 use crate::error::{Error, Result, invalid};
 use crate::keys::IdentityKey;
@@ -15,6 +18,39 @@ pub const ENROLL_KIND: &str = "pubky-switch.enroll";
 /// The highest app limit a service may announce (Switch wire 3.7).
 pub const MAX_APP_LIMIT: u64 = 255;
 
+/// The complete `POST /v1/enroll` JSON body cap, including its signed wrapper
+/// (Switch wire 3.7, 7.1).
+pub const MAX_ENROLLMENT_BYTES: usize = 256 << 10;
+
+/// The exact compact HTTP envelope size for `body_bytes` bytes of enrollment JSON.
+/// This includes the signed document, its 64-byte signature and the outer `enrollment`
+/// member, with unpadded base64 rounding (Switch account binding 2.1).
+///
+/// # Errors
+///
+/// [`crate::Error::Invalid`] when the length is unrepresentable.
+pub fn enrollment_request_len(body_bytes: usize) -> Result<usize> {
+    let overhead = br#"{"enrollment":{"body":"","sig":""}}"#.len() + 86;
+    body_bytes
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2))
+        .map(|n| n / 3)
+        .and_then(|n| n.checked_add(overhead))
+        .ok_or_else(|| Error::Invalid("Switch wire 3.7: enrollment size overflow".into()))
+}
+
+fn check_request_size(bytes: usize) -> Result<()> {
+    if bytes > MAX_ENROLLMENT_BYTES {
+        return invalid("Switch wire 3.7: complete enrollment exceeds its byte limit");
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct EnrollmentRequest<T> {
+    enrollment: T,
+}
+
 /// The members of an enrollment (Switch wire 3.7), as the signer writes them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentBody {
@@ -26,6 +62,8 @@ pub struct EnrollmentBody {
     /// A random nonce, new for every enrollment.
     #[serde(with = "serde_b64")]
     pub nonce: [u8; 16],
+    /// The exact account creation intent (Switch account binding 3).
+    pub intent: EnrollmentIntent,
     /// The policy; the delivered `identity.json`'s applies, this one is informational while
     /// the account is staged.
     pub policy: IdentityPolicy,
@@ -52,6 +90,14 @@ impl EnrollmentBody {
     /// doesn't verify for the identity, or `revoked_apps` present but empty or not unique and
     /// ascending by text (`400` at the service).
     pub fn check(&self, identity: &[u8; 32], origin: &str) -> Result<Option<IdentityDoc>> {
+        self.check_parts(identity, origin).map(|parts| parts.0)
+    }
+
+    fn check_parts(
+        &self,
+        identity: &[u8; 32],
+        origin: &str,
+    ) -> Result<(Option<IdentityDoc>, Option<AccountObservation>)> {
         if &self.identity != identity {
             return invalid("Switch wire 3.7: identity isn't the expected identity");
         }
@@ -67,10 +113,13 @@ impl EnrollmentBody {
                 return invalid("Switch wire 3.7: revoked_apps isn't unique and ascending by text");
             }
         }
-        self.identity_doc
+        let observation = self.intent.check(identity, origin)?;
+        let identity_doc = self
+            .identity_doc
             .as_ref()
             .map(|doc| IdentityDoc::verify(doc, identity))
-            .transpose()
+            .transpose()?;
+        Ok((identity_doc, observation))
     }
 
     /// The body's exact JSON bytes, as the signer writes them.
@@ -88,6 +137,7 @@ impl EnrollmentBody {
 pub struct Enrollment {
     body: EnrollmentBody,
     identity_doc: Option<IdentityDoc>,
+    observation: Option<AccountObservation>,
     signed: SignedDoc,
     hash: [u8; 32],
 }
@@ -107,12 +157,15 @@ impl Enrollment {
                 body.revoked_apps = None;
             }
         }
-        let identity_doc = body.check(&key.public(), &body.origin.clone())?;
-        let signed = key.sign_doc(labels::sig::ENROLL, &[], body.to_json()?);
+        let (identity_doc, observation) = body.check_parts(&key.public(), &body.origin)?;
+        let bytes = body.to_json()?;
+        check_request_size(enrollment_request_len(bytes.len())?)?;
+        let signed = key.sign_doc(labels::sig::ENROLL, &[], bytes);
         let hash = signed.doc_hash()?;
         Ok(Self {
             body,
             identity_doc,
+            observation,
             signed,
             hash,
         })
@@ -125,16 +178,83 @@ impl Enrollment {
     /// [`crate::Error::Signature`] if the identity key didn't sign it, and
     /// [`crate::Error::Invalid`] for any rule it breaks.
     pub fn verify(signed: &SignedDoc, identity: &[u8; 32], origin: &str) -> Result<Self> {
+        check_request_size(signed.body.len())?;
+        check_request_size(signed.sig.len())?;
+        check_request_size(serde_json::to_vec(&EnrollmentRequest { enrollment: signed })?.len())?;
         let value = open_value(signed, identity, labels::sig::ENROLL)?;
         check_tag(&value, ENROLL_KIND, "Switch wire 3.7")?;
         let body: EnrollmentBody = decode(value)?;
-        let identity_doc = body.check(identity, origin)?;
+        let (identity_doc, observation) = body.check_parts(identity, origin)?;
         Ok(Self {
             body,
             identity_doc,
+            observation,
             signed: signed.clone(),
             hash: signed.doc_hash()?,
         })
+    }
+
+    /// Read the complete enrollment HTTP body, checking its exact byte size before JSON
+    /// allocation or signature work (Switch wire 3.7, 7.4.1).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] for oversized or malformed input; otherwise the errors
+    /// from [`Self::verify`].
+    pub fn from_request(bytes: &[u8], identity: &[u8; 32], origin: &str) -> Result<Self> {
+        check_request_size(bytes.len())?;
+        let request: EnrollmentRequest<SignedDoc> = crate::json::parse_json(bytes)?;
+        Self::verify(&request.enrollment, identity, origin)
+    }
+
+    /// Write the complete compact HTTP body without changing the signed document bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] if the complete request exceeds its cap or cannot be encoded.
+    pub fn to_request_json(&self) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(&EnrollmentRequest {
+            enrollment: &self.signed,
+        })?;
+        check_request_size(bytes.len())?;
+        Ok(bytes)
+    }
+
+    /// Reserve a complete compact enrollment for any permitted destination and intent,
+    /// carrying this document, policy and every supplied revoked App ID. This measures
+    /// future enrollment without inventing or signing an observation
+    /// (Switch wire 3.7, Switch account binding 2.1).
+    ///
+    /// The caller includes every app that may later be revoked, and any separate headroom
+    /// required for changes to the document. Duplicate IDs over-reserve; none are dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] if an input cannot be encoded or a length is unrepresentable.
+    pub fn max_request_len(
+        policy: &IdentityPolicy,
+        identity_doc: Option<&SignedDoc>,
+        revoked_apps: &[[u8; 16]],
+    ) -> Result<usize> {
+        // Fixed fields are ASCII without JSON escaping. The remaining fields use their
+        // actual encoders, including the nested signed document's base64 body.
+        let mut bytes = br#"{"v":1,"kind":"pubky-switch.enroll","identity":"","origin":"","nonce":"","intent":,"policy":}"#.len()
+            + 52 + crate::net::MAX_ORIGIN_LEN + 22 + super::MAX_ENROLLMENT_INTENT_BYTES;
+        let mut add = |n: usize| -> Result<()> {
+            bytes = bytes.checked_add(n).ok_or_else(|| {
+                Error::Invalid("Switch wire 3.7: enrollment size overflow".into())
+            })?;
+            Ok(())
+        };
+        add(serde_json::to_vec(policy)?.len())?;
+        if let Some(doc) = identity_doc {
+            add(br#","identity_doc":"#.len() + serde_json::to_vec(doc)?.len())?;
+        }
+        if !revoked_apps.is_empty() {
+            let ids: Vec<String> = revoked_apps.iter().map(|id| zbase32_encode(id)).collect();
+            add(br#","revoked_apps":"#.len() + serde_json::to_vec(&ids)?.len())?;
+        }
+        enrollment_request_len(bytes)
     }
 
     /// The members as read.
@@ -145,6 +265,12 @@ impl Enrollment {
     /// The enrollment's `identity_doc`, verified.
     pub fn identity_doc(&self) -> Option<&IdentityDoc> {
         self.identity_doc.as_ref()
+    }
+
+    /// The carried discovery response, with both signatures and its binding verified.
+    /// Validity and the current durable tuple are checked separately under the service lock.
+    pub fn observation(&self) -> Option<&AccountObservation> {
+        self.observation.as_ref()
     }
 
     /// The App IDs it names as revoked or departed, ascending by text.
@@ -296,6 +422,9 @@ mod tests {
             identity: identity().public(),
             origin: ORIGIN.into(),
             nonce: [3; 16],
+            intent: EnrollmentIntent::Existing {
+                created: 1_767_225_600_000,
+            },
             policy: IdentityPolicy::default(),
             identity_doc: None,
             revoked_apps: None,

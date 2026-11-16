@@ -18,7 +18,7 @@ use pubky_switch_client::{ClientError, Credentials, SwitchClient};
 use pubky_switch_core::http::IdentityDelivery;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{Condition, OpKind, Position};
-use pubky_switch_core::records::{AppCert, Enrollment, EnrollmentAnswer};
+use pubky_switch_core::records::{AccountObservation, AppCert, Enrollment, EnrollmentAnswer};
 use pubky_switch_core::signing::Signs;
 
 use super::SignerEnv;
@@ -33,6 +33,8 @@ pub(crate) struct Target<'a> {
     pub(crate) origin: &'a str,
     /// The pinned service key; `None` before the enrollment answers.
     pub(crate) pinned: Option<[u8; 32]>,
+    /// The original account creation, absent for discovery, creation and app reads.
+    pub(crate) created: Option<u64>,
     /// The identity.
     pub(crate) identity: [u8; 32],
 }
@@ -57,14 +59,18 @@ fn client_with(
     target: &Target<'_>,
     credentials: Credentials,
 ) -> Result<SwitchClient> {
-    Ok(SwitchClient::new(
+    let client = SwitchClient::new(
         target.origin,
         target.identity,
         credentials,
         target.pinned,
         Arc::clone(&env.transport),
         Arc::clone(&env.clock),
-    )?)
+    )?;
+    Ok(match target.created {
+        Some(created) => client.with_account_created(created)?,
+        None => client,
+    })
 }
 
 /// That this install is the one named and its records aren't behind: only [`Named::check`]
@@ -112,6 +118,13 @@ impl RequestClient {
             key: keyring.request_signer(store.ownership()?)?,
         };
         Ok(Self(client_with(env, target, credentials)?))
+    }
+
+    /// Canonical authenticated discovery (Switch account-binding Section 2).
+    pub(crate) async fn observe_account(
+        &self,
+    ) -> std::result::Result<AccountObservation, ClientError> {
+        self.0.observe_account().await
     }
 
     /// `GET /apps` (Switch wire 7.4.12).

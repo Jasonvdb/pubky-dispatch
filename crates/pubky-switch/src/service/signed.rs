@@ -133,12 +133,14 @@ impl AnswerTime {
                 ms,
                 match class {
                     Uncompared::Enrollment
+                    | Uncompared::AccountDiscovery
                     | Uncompared::Erasure
                     | Uncompared::PublicRead
                     | Uncompared::BodyUnread => class,
-                    Uncompared::Notice | Uncompared::Unavailable | Uncompared::NotHosted => {
-                        Uncompared::Unavailable
-                    }
+                    Uncompared::CreationConflict
+                    | Uncompared::Notice
+                    | Uncompared::Unavailable
+                    | Uncompared::NotHosted => Uncompared::Unavailable,
                 },
             ),
             AnswerTime::Unbound(ms) => AnswerTime::TimeBase(ms, Uncompared::Unavailable),
@@ -241,6 +243,7 @@ fn check_time_base(asked: Asked<'_>, answer: &Answer, at: AnswerTime) {
         answer.status,
         code,
         body.get("current"),
+        answer.head.is_some(),
     );
     match at {
         AnswerTime::Account(_) => {}
@@ -486,9 +489,11 @@ mod tests {
         for name in &named {
             let class = [
                 Uncompared::Enrollment,
+                Uncompared::AccountDiscovery,
                 Uncompared::Erasure,
                 Uncompared::PublicRead,
                 Uncompared::BodyUnread,
+                Uncompared::CreationConflict,
                 Uncompared::Notice,
                 Uncompared::Unavailable,
                 Uncompared::NotHosted,
@@ -502,6 +507,12 @@ mod tests {
                     "POST",
                     "/v1/enroll",
                     BodyField::read(b"{}"),
+                    ApiError::unavailable("7.6: a temporary failure"),
+                ),
+                Uncompared::AccountDiscovery => (
+                    "GET",
+                    "/v1/x/account",
+                    BodyField::read(b""),
                     ApiError::unavailable("7.6: a temporary failure"),
                 ),
                 Uncompared::Erasure => (
@@ -521,6 +532,12 @@ mod tests {
                     "/v1/x/ops",
                     BodyField::NotRead,
                     ApiError::body_too_large(1),
+                ),
+                Uncompared::CreationConflict => (
+                    "GET",
+                    "/v1/x/apps",
+                    BodyField::read(b""),
+                    super::super::account::creation_conflict(1_767_225_600_000),
                 ),
                 Uncompared::Notice => (
                     "GET",
@@ -549,7 +566,8 @@ mod tests {
                     body,
                     error.status(),
                     Some(error.code),
-                    error.current.as_ref()
+                    error.current.as_ref(),
+                    false
                 ),
                 Some(class),
                 "{name}"

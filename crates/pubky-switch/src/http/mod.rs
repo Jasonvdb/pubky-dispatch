@@ -147,7 +147,7 @@ impl SwitchRequest {
     }
 }
 
-/// The signed request headers of a request (Switch wire 7.1), its seven `Switch-*` request
+/// The signed request headers of a request (Switch wire 7.1), its eight `Switch-*` request
 /// headers, each value exactly as received, its bytes, in the order received. The service
 /// reads them only through this type, never from the HTTP header map, so no conversion
 /// drops a value it can't read: a value repeated, empty or not printable ASCII is seen, and
@@ -157,7 +157,7 @@ pub struct SignedHeaders(pubky_switch_core::http::ReceivedHeaders);
 
 impl SignedHeaders {
     /// The one conversion of an HTTP header map into the signed request headers: every value
-    /// of each of the seven, as its bytes, so it represents each exactly.
+    /// of each of the eight, as its bytes, so it represents each exactly.
     pub fn of(map: &HeaderMap) -> Self {
         SignedHeaders(pubky_switch_core::http::ReceivedHeaders::of(
             map.iter()

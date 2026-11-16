@@ -154,7 +154,13 @@ fn hash_vector_time() -> String {
 /// The signer's erasure of alice's account naming the creation time `created` and `hash`,
 /// signed at `at_ms` (Switch wire 7.4.16).
 fn erasure_naming(created: Option<u64>, hash: Option<&[u8; 32]>, at_ms: u64) -> SwitchRequest {
-    signer_request("POST", &erase_path(), erase_body(created, hash), at_ms)
+    signer_request_at_creation(
+        "POST",
+        &erase_path(),
+        erase_body(created, hash),
+        at_ms,
+        created,
+    )
 }
 
 /// The signer's erasure of alice's account naming its creation time, as the mark's file or
@@ -178,10 +184,7 @@ async fn erase_held(replay: &Replay, at: &str) -> SwitchResponse {
 async fn enroll_alice(replay: &Replay) -> String {
     let at = enrolled_time();
     set_time(&replay.clock, &at);
-    let enrollment = vector_request(named(
-        &vectors("http.json")["requests"],
-        "signer: enrollment",
-    ));
+    let enrollment = fresh_alice_enrollment(replay, ms(&at)).await;
     let answer = replay.service.handle(enrollment).await;
     assert_eq!(answer.status, 200, "{}", text(&answer));
     at
@@ -786,7 +789,7 @@ async fn test_erase_retry_with_the_hash_after_it_landed_is_the_not_hosted_404() 
 }
 
 /// The vectors' enrollment with another nonce, signed by alice: a fresh one, not a retry.
-fn fresh_enrollment(nonce: u8) -> Vec<u8> {
+async fn fresh_enrollment(replay: &Replay, nonce: u8, at_ms: u64) -> Vec<u8> {
     use pubky_switch_core::{
         keys::IdentityKey,
         records::{Enrollment, EnrollmentBody},
@@ -802,6 +805,7 @@ fn fresh_enrollment(nonce: u8) -> Vec<u8> {
     let mut fields: EnrollmentBody =
         serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment body");
     fields.nonce = [nonce; 16];
+    fields.intent = new_alice_enrollment_intent(replay, at_ms).await;
     let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
     let enrollment = Enrollment::sign(&key, fields).expect("sign");
     serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json")
@@ -817,13 +821,14 @@ async fn test_erase_then_enrollment_starts_a_new_account() {
     let served = item_time(&vectors("chain.json")["items"][1]);
     assert_eq!(erase_held(&replay, &served).await.status, 200);
     let erased_at = record_of(&replay).await.expect("recorded");
+    replay.clock.set_wall_ms(erased_at + 1);
     let answer = replay
         .service
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            fresh_enrollment(5),
-            ms(&served),
+            fresh_enrollment(&replay, 5, erased_at + 1).await,
+            erased_at + 1,
         ))
         .await;
     assert_eq!(answer.status, 200, "{}", text(&answer));
@@ -848,7 +853,13 @@ async fn test_erase_then_enrollment_starts_a_new_account() {
     // Staged: it serves nothing until its first delivery (7.3 step 7).
     let apps = replay
         .service
-        .handle(signer_request("GET", &apps_path(), Vec::new(), ms(&served)))
+        .handle(signer_request_at_creation(
+            "GET",
+            &apps_path(),
+            Vec::new(),
+            erased_at + 1,
+            Some(created),
+        ))
         .await;
     assert_eq!(code_of(&apps), (503, json!("staged")));
     replay.db.drop_database().await.expect("drop");
@@ -884,13 +895,14 @@ async fn test_erase_and_enrollment_before_a_mark_move_leave_the_new_mark() {
             .handle(erasure(&replay, Some(&held_hash()), later_ms).await)
             .await;
         assert_eq!(erased.status, 200, "{}", text(&erased));
+        replay.clock.set_wall_ms(later_ms + 1);
         let enrolled = replay
             .service
             .handle(signer_request(
                 "POST",
                 "/v1/enroll",
-                fresh_enrollment(7),
-                later_ms,
+                fresh_enrollment(&replay, 7, later_ms + 1).await,
+                later_ms + 1,
             ))
             .await;
         assert_eq!(enrolled.status, 200, "{}", text(&enrolled));
@@ -1193,7 +1205,13 @@ async fn test_erase_at_a_lost_identity_writes_the_record_and_deletes_the_mark() 
     set_time(&replay.clock, now);
     let apps = replay
         .service
-        .handle(signer_request("GET", &apps_path(), Vec::new(), ms(now)))
+        .handle(signer_request_at_creation(
+            "GET",
+            &apps_path(),
+            Vec::new(),
+            ms(now),
+            Some(ms(created)),
+        ))
         .await;
     assert_eq!(code_of(&apps), (503, json!("recovery_required")));
     assert_eq!(body(&apps)["current"]["reason"], json!("behind"));
@@ -1209,7 +1227,7 @@ async fn test_erase_at_a_lost_identity_writes_the_record_and_deletes_the_mark() 
     not_hosted_to(
         &replay,
         &replay.service,
-        signer_request("GET", &apps_path(), Vec::new(), ms(now)),
+        signer_request_at_creation("GET", &apps_path(), Vec::new(), ms(now), Some(ms(created))),
         "signer read",
     )
     .await;
@@ -1804,7 +1822,13 @@ async fn test_erase_restored_account_erased_again_keeps_a_later_accounts_mark() 
             .create_zero(&alice_id(), service_public(&replay), erased_at + 1000)
             .await
             .expect("a later mark");
-        let request = signer_request("GET", &apps_path(), Vec::new(), ms(&revoke_time()));
+        let request = signer_request_at_creation(
+            "GET",
+            &apps_path(),
+            Vec::new(),
+            ms(&revoke_time()),
+            Some(erased_at + 1000),
+        );
         if at_start {
             let service = started(&replay, None).await;
             assert!(all_gone(&replay).await, "erased at start");
@@ -1858,8 +1882,35 @@ async fn test_erase_restored_account_then_enrollment_starts_a_new_account() {
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
     let erased_at = restored_after_erasure(&replay).await;
-    let at = enroll_alice(&replay).await;
-    let created = created_at(&replay).await.expect("the new account");
+    replay.clock.set_wall_ms(erased_at);
+    let discovery = signer_request(
+        "GET",
+        &format!("/v1/{}/account", alice_id()),
+        Vec::new(),
+        erased_at,
+    );
+    let refused = replay.service.handle(discovery).await;
+    assert_eq!(code_of(&refused), (503, json!("unavailable")));
+    assert!(
+        created_at(&replay).await.is_some(),
+        "discovery is read-only"
+    );
+    let cleanup = request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    not_hosted_to(
+        &replay,
+        &replay.service,
+        cleanup,
+        "covered restored account",
+    )
+    .await;
+    let at = erased_at + 1;
+    replay.clock.set_wall_ms(at);
+    let created = enroll_named(&replay, 5, at).await;
     assert!(created > erased_at, "created after the erasure");
     // Nothing of the old account: only the new account's row and its enrollment answer.
     let held: Vec<_> = rows(&replay, &alice_id())
@@ -1873,7 +1924,13 @@ async fn test_erase_restored_account_then_enrollment_starts_a_new_account() {
     // A start and a call later, it is still there: staged, as a new account is.
     let service = started(&replay, None).await;
     let apps = service
-        .handle(signer_request("GET", &apps_path(), Vec::new(), ms(&at)))
+        .handle(signer_request_at_creation(
+            "GET",
+            &apps_path(),
+            Vec::new(),
+            at,
+            Some(created),
+        ))
         .await;
     assert_eq!(code_of(&apps), (503, json!("staged")));
     assert_eq!(created_at(&replay).await, Some(created));
@@ -1882,10 +1939,9 @@ async fn test_erase_restored_account_then_enrollment_starts_a_new_account() {
 
 #[tokio::test]
 async fn test_erase_account_enrolled_after_its_erasure_is_kept() {
-    // An erasure, then an enrollment of the identity at an earlier service time than the
-    // erasure's (the erased account's time ran ahead): the new account is created after the
-    // ledger's time, so neither a start nor a call erases it, nor its mark (Switch spec 6.5,
-    // wire 7.3 Table 1).
+    // A backward wall clock cannot create a lifetime before its erasure. After trusted
+    // time catches up, the new account survives startup and ordinary requests
+    // (Switch account binding 2.2 and 3.1).
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
     let ahead = "2026-01-01T00:04:00.000Z";
@@ -1894,12 +1950,29 @@ async fn test_erase_account_enrolled_after_its_erasure_is_kept() {
     let erased_at = record_of(&replay).await.expect("recorded");
     let at = enrolled_time();
     assert!(ms(&at) < erased_at, "enrolled at an earlier time");
-    enroll_alice(&replay).await;
-    let created = created_at(&replay).await.expect("the new account");
+    set_time(&replay.clock, &at);
+    let query = signer_request(
+        "GET",
+        &format!("/v1/{}/account", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let refused = replay.service.handle(query).await;
+    assert_eq!(code_of(&refused), (503, json!("unavailable")));
+    assert_eq!(created_at(&replay).await, None);
+    assert_eq!(record_of(&replay).await, Some(erased_at));
+    replay.clock.set_wall_ms(erased_at + 1);
+    let created = enroll_named(&replay, 5, erased_at + 1).await;
     assert_eq!(created, erased_at + 1);
     let service = started(&replay, None).await;
     let apps = service
-        .handle(signer_request("GET", &apps_path(), Vec::new(), ms(&at)))
+        .handle(signer_request_at_creation(
+            "GET",
+            &apps_path(),
+            Vec::new(),
+            erased_at + 1,
+            Some(created),
+        ))
         .await;
     assert_eq!(code_of(&apps), (503, json!("staged")));
     assert_eq!(created_at(&replay).await, Some(created), "kept");
@@ -1971,7 +2044,8 @@ async fn test_erase_leftover_mark_is_deleted_at_a_request_and_at_start() {
                 .await
                 .expect("mark");
             set_time(&replay.clock, now);
-            let request = signer_request("GET", &apps_path(), Vec::new(), ms(now));
+            let request =
+                signer_request_at_creation("GET", &apps_path(), Vec::new(), ms(now), Some(created));
             let service = if at_start {
                 started(&replay, None).await
             } else {
@@ -2138,7 +2212,7 @@ async fn enroll_named(replay: &Replay, nonce: u8, at_ms: u64) -> u64 {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            fresh_enrollment(nonce),
+            fresh_enrollment(replay, nonce, at_ms).await,
             at_ms,
         ))
         .await;
@@ -2180,7 +2254,9 @@ async fn test_erase_replay_after_reenroll_refused() {
     let again = replayed(&request);
     let erased = replay.service.handle(request).await;
     assert_eq!(erased.status, 200, "{}", text(&erased));
-    let t2 = enroll_named(&replay, 2, at).await;
+    let next = record_of(&replay).await.expect("completed erasure") + 1;
+    replay.clock.set_wall_ms(next);
+    let t2 = enroll_named(&replay, 2, next).await;
     assert!(t2 > t1, "the later account is created later");
     let mark = held_mark(&replay, &alice_id()).await;
     let record = record_of(&replay).await;
@@ -2209,7 +2285,9 @@ async fn test_erase_names_creation_time_erases() {
         .handle(erasure_naming(Some(t1), None, at + 60_000))
         .await;
     assert_eq!(erased.status, 200, "{}", text(&erased));
-    let t2 = enroll_named(&replay, 2, at).await;
+    let next = record_of(&replay).await.expect("completed erasure") + 1;
+    replay.clock.set_wall_ms(next);
+    let t2 = enroll_named(&replay, 2, next).await;
     let answer = replay
         .service
         .handle(erasure_naming(Some(t2), None, at + 60_000))
@@ -2223,18 +2301,27 @@ async fn test_erase_names_creation_time_erases() {
 
 #[tokio::test]
 async fn test_erase_lost_enrollment_answer_learns_created() {
-    // A signer that lost the enrollment answer names no creation time: `409 conflict`
-    // carrying `current.created`, nothing deleted; the erasure naming it then erases (Switch
-    // wire 7.4.16).
+    // Discovery supplies a lost binding without an incomplete destructive request
+    // (Switch account binding 1 and 2).
     let Some(replay) = replay().await else { return };
     let at = ms(&enroll_alice(&replay).await);
     let created = held_mark(&replay, &alice_id()).await.created_at_ms;
     let answer = replay.service.handle(erasure_naming(None, None, at)).await;
-    let current = conflict_current(&answer);
-    assert_eq!(current, json!({ "created": rfc3339(created) }));
+    assert_eq!(code_of(&answer), (400, json!("bad_request")));
+    assert!(no_head(&answer));
     assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
     assert_eq!(record_of(&replay).await, None);
-    let learned = ms(current["created"].as_str().expect("created"));
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let observation = account_observation(&replay, &key, at).await;
+    let learned = observation
+        .verify(&key.public(), ORIGIN)
+        .expect("observation")
+        .body()
+        .created
+        .expect("creation");
+    assert_eq!(learned, created);
     let answer = replay
         .service
         .handle(erasure_naming(Some(learned), None, at))
@@ -2261,7 +2348,9 @@ async fn test_erase_replay_after_erasure_not_hosted() {
     assert!(all_gone(&replay).await);
     assert_eq!(mark_of(&replay, &alice_id()).await, MarkRead::Missing);
     assert_eq!(record_of(&replay).await, record, "the record stays");
-    let t2 = enroll_named(&replay, 2, at).await;
+    let next = record_of(&replay).await.expect("completed erasure") + 1;
+    replay.clock.set_wall_ms(next);
+    let t2 = enroll_named(&replay, 2, next).await;
     let answer = replay.service.handle(second_replay).await;
     assert_eq!(conflict_current(&answer), json!({ "created": rfc3339(t2) }));
     assert_eq!(created_at(&replay).await, Some(t2));
@@ -2272,15 +2361,10 @@ async fn test_erase_replay_after_erasure_not_hosted() {
 async fn test_erase_wrong_created_conflict() {
     // An erasure naming another creation time, by a millisecond, is `409 conflict` carrying
     // `current.created` at a healthy, a staged, a bounded and a failing account, and at one
-    // whose mark is lost, by the account's own creation time; at the bounded, the failing
-    // and the lost one `current.identity` too. Nothing is deleted, no record written, the
+    // whose mark is lost, by the account's own creation time. The common conflict has only
+    // `current.created`. Nothing is deleted, no record written, the
     // mark kept; the erasure naming the creation time then erases (Switch wire 7.4.16, 7.3
     // Tables 2 and 3).
-    let held_copy = named(
-        &vectors("documents.json")["documents"],
-        "alice identity.json",
-    )["signed"]
-        .clone();
     for case in ["healthy", "staged", "bounded", "failing", "mark lost"] {
         let Some(replay) = replay().await else { return };
         let (at, hash) = if matches!(case, "staged" | "bounded") {
@@ -2325,12 +2409,7 @@ async fn test_erase_wrong_created_conflict() {
         } else {
             held_mark(&replay, &alice_id()).await.created_at_ms
         };
-        let mut expected = json!({ "created": rfc3339(created) });
-        match case {
-            "bounded" => expected["identity"] = Value::Null,
-            "failing" | "mark lost" => expected["identity"] = held_copy.clone(),
-            _ => {}
-        }
+        let expected = json!({ "created": rfc3339(created) });
         let before = rows(&replay, &alice_id()).await;
         let mark = mark_of(&replay, &alice_id()).await;
         let answer = service
@@ -2352,7 +2431,7 @@ async fn test_erase_wrong_created_conflict() {
 #[tokio::test]
 async fn test_erase_lost_identity_requires_created() {
     // At a lost identity an erasure naming another creation time than the mark's is `409
-    // conflict` carrying the mark's time and `identity: null`, signed with the key in the
+    // conflict` carrying only the mark's time, signed with the key in the
     // mark: no record, the mark kept. Naming the mark's time erases: the record, then the
     // mark deleted (Switch wire 7.4.16, 7.3 Tables 2 and 3).
     let Some(replay) = replay().await else { return };
@@ -2365,11 +2444,16 @@ async fn test_erase_lost_identity_requires_created() {
         let request = erasure_naming(named, None, ms(now));
         let sent = signed_sent(&request);
         let answer = replay.service.handle(request).await;
-        assert_eq!(
-            conflict_current(&answer),
-            json!({ "created": created, "identity": null }),
-            "{named:?}"
-        );
+        if named.is_some() {
+            assert_eq!(
+                conflict_current(&answer),
+                json!({ "created": created }),
+                "{named:?}"
+            );
+        } else {
+            assert_eq!(code_of(&answer), (400, json!("bad_request")));
+            assert!(no_head(&answer));
+        }
         assert!(signed_with(&answer, &service_public(&replay), &sent));
         assert_eq!(record_of(&replay).await, None, "{named:?}");
         assert_eq!(held_mark(&replay, &alice_id()).await, mark, "{named:?}");
@@ -2386,10 +2470,9 @@ async fn test_erase_lost_identity_requires_created() {
 
 #[tokio::test]
 async fn test_enroll_created_later_than_taken_over_mark() {
-    // A new account's creation time is strictly later than the creation of a lost mark or a
-    // (0, 0) mark it takes over, and than an erasure's record of the identity, even with the
-    // time base behind them; with none of them ahead it is the time base (Switch wire 7.3,
-    // The mark; Table 3).
+    // Discovery cannot mint authority from a future creation or erasure. Once trusted
+    // time passes that floor, an authorized takeover/create is strictly later
+    // (Switch account binding 2.2 and 3.1).
     let base = ms(&enrolled_time());
     let ahead = base + 60_000;
     for case in ["lost mark", "(0, 0) mark", "record", "none"] {
@@ -2413,19 +2496,36 @@ async fn test_enroll_created_later_than_taken_over_mark() {
             }
             _ => {}
         }
-        let created = enroll_named(&replay, 1, base).await;
         let expected = if case == "none" { base } else { ahead + 1 };
+        if case != "none" {
+            let before = mark_of(&replay, &alice_id()).await;
+            let erasure = record_of(&replay).await;
+            let query = signer_request(
+                "GET",
+                &format!("/v1/{}/account", alice_id()),
+                Vec::new(),
+                base,
+            );
+            let sent = Sent::of(&query);
+            let answer = replay.service.handle(query).await;
+            assert_eq!(code_of(&answer), (503, json!("unavailable")), "{case}");
+            assert!(no_head(&answer));
+            assert!(signed_with(&answer, &service_public(&replay), &sent));
+            assert_eq!(mark_of(&replay, &alice_id()).await, before);
+            assert_eq!(record_of(&replay).await, erasure);
+            assert_eq!(created_at(&replay).await, None);
+            replay.clock.set_wall_ms(expected);
+        }
+        let created = enroll_named(&replay, 1, expected).await;
         assert_eq!(created, expected, "{case}");
         replay.db.drop_database().await.expect("drop");
     }
 }
 
 #[tokio::test]
-async fn test_enroll_accounts_within_one_millisecond_are_created_in_order() {
-    // The time base doesn't move: an account whose row is lost, leaving its (0, 0) mark,
-    // and the enrollment that takes the mark over, then the same once more, get creation
-    // times one millisecond apart, so no two accounts of the identity have the same (Switch
-    // wire 7.3, The mark; Table 3).
+async fn test_enroll_replacement_waits_for_the_next_millisecond() {
+    // A zero-mark takeover waits until trusted time is strictly above the old creation;
+    // retrying the exact signed intent then creates one later lifetime (account binding 3).
     let Some(replay) = replay().await else { return };
     let base = ms(&enrolled_time());
     set_time(&replay.clock, &enrolled_time());
@@ -2441,8 +2541,25 @@ async fn test_enroll_accounts_within_one_millisecond_are_created_in_order() {
             .await
             .expect("the account's row lost");
         conn.close().await.expect("close");
-        let created = enroll_named(&replay, nonce, base).await;
+        let pending = signer_request(
+            "POST",
+            "/v1/enroll",
+            fresh_enrollment(&replay, nonce, earlier).await,
+            earlier,
+        );
+        let retry = replayed(&pending);
+        let mark = held_mark(&replay, &alice_id()).await;
+        let refused = replay.service.handle(pending).await;
+        assert_eq!(code_of(&refused), (503, json!("unavailable")));
+        assert_eq!(created_at(&replay).await, None);
+        assert_eq!(held_mark(&replay, &alice_id()).await, mark);
+        replay.clock.set_wall_ms(earlier + 1);
+        let answer = replay.service.handle(retry).await;
+        assert_eq!(answer.status, 200, "{}", text(&answer));
+        let created = ms(body(&answer)["created"].as_str().expect("created"));
         assert_eq!(created, earlier + 1, "taking the mark over");
+        assert_eq!(created_at(&replay).await, Some(created));
+        assert_eq!(held_mark(&replay, &alice_id()).await.created_at_ms, created);
         earlier = created;
     }
     replay.db.drop_database().await.expect("drop");
@@ -2450,10 +2567,9 @@ async fn test_enroll_accounts_within_one_millisecond_are_created_in_order() {
 
 #[tokio::test]
 async fn test_enroll_right_after_an_erasure_is_created_after_its_record() {
-    // The time base doesn't move between an enrollment, its erasure and the next
-    // enrollment: the record is dated at the erased creation time, and the new account one
-    // millisecond after it, at once, so the erasure, sent again, can't reach it (Switch wire
-    // 7.3, The mark; Table 3; 7.4.16).
+    // Creation waits until trusted time passes the erasure's floor. The same signed
+    // intent then creates the later lifetime, which the old erasure cannot reach
+    // (Switch account binding 2.2 and 3; Switch wire 7.3 and 7.4.16).
     let Some(replay) = replay().await else { return };
     let base = ms(&enrolled_time());
     set_time(&replay.clock, &enrolled_time());
@@ -2463,7 +2579,20 @@ async fn test_enroll_right_after_an_erasure_is_created_after_its_record() {
     let erased = replay.service.handle(request).await;
     assert_eq!(erased.status, 200, "{}", text(&erased));
     assert_eq!(record_of(&replay).await, Some(first));
-    let later = enroll_named(&replay, 2, base).await;
+    let pending = signer_request(
+        "POST",
+        "/v1/enroll",
+        fresh_enrollment(&replay, 2, base).await,
+        base,
+    );
+    let retry = replayed(&pending);
+    let refused = replay.service.handle(pending).await;
+    assert_eq!(code_of(&refused), (503, json!("unavailable")));
+    assert_eq!(created_at(&replay).await, None);
+    replay.clock.set_wall_ms(base + 1);
+    let enrolled = replay.service.handle(retry).await;
+    assert_eq!(enrolled.status, 200, "{}", text(&enrolled));
+    let later = ms(body(&enrolled)["created"].as_str().expect("created"));
     assert_eq!(later, first + 1);
     let answer = replay.service.handle(again).await;
     assert_eq!(
@@ -2492,8 +2621,10 @@ async fn test_erasure_record_not_before_created() {
                 .create_zero(&alice_id(), service_public(&replay), ahead)
                 .await
                 .expect("a (0, 0) mark");
-            enroll_named(&replay, 1, base).await
+            replay.clock.set_wall_ms(ahead + 1);
+            enroll_named(&replay, 1, ahead + 1).await
         };
+        replay.clock.set_wall_ms(base);
         assert!(created > base, "created after the time base");
         let answer = replay
             .service
@@ -2537,8 +2668,8 @@ async fn test_erasure_record_drop_under_a_day_refused() {
 #[tokio::test]
 async fn test_erase_body_created_required_shape() {
     // An unknown member or a `created` that isn't a time is `400 bad_request`; a body
-    // without `created` is `409 conflict` carrying it; nothing is deleted. The body naming
-    // it erases (Switch wire 7.4.16, 1.6).
+    // without `created` cannot agree with its required header and is also malformed.
+    // Nothing is deleted. A matching body and header erase (Switch account binding 1).
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
     let at = hash_vector_time();
@@ -2569,8 +2700,9 @@ async fn test_erase_body_created_required_shape() {
         .service
         .handle(erasure_naming(None, Some(&held_hash()), ms(&at)))
         .await;
-    assert_eq!(conflict_current(&missing), json!({ "created": time }));
-    // `null` is a missing member (Switch wire 1.1 "Absent and null"): the same `409`.
+    assert_eq!(code_of(&missing), (400, json!("bad_request")));
+    assert!(no_head(&missing));
+    // Null is also not a valid creation matching the required header.
     let null = replay
         .service
         .handle(signer_request(
@@ -2580,7 +2712,8 @@ async fn test_erase_body_created_required_shape() {
             ms(&at),
         ))
         .await;
-    assert_eq!(conflict_current(&null), json!({ "created": time }));
+    assert_eq!(code_of(&null), (400, json!("bad_request")));
+    assert!(no_head(&null));
     assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
     assert_eq!(record_of(&replay).await, None);
     let answer = replay
@@ -3149,7 +3282,12 @@ async fn test_enroll_waiting_for_unresolved_erasure_changes_nothing() {
     }
     let at = revoke_time();
     set_time(&replay.clock, &at);
-    let enrollment = signer_request("POST", "/v1/enroll", fresh_enrollment(99), ms(&at));
+    let enrollment = signer_request(
+        "POST",
+        "/v1/enroll",
+        fresh_enrollment(&replay, 99, ms(&at)).await,
+        ms(&at),
+    );
     // queued holds the account row. The erasure takes the identity lock and waits for
     // that row before its pending attempt is written. The enrollment passes step 2,
     // waits for the same identity lock, then wakes after the deletion rolled back.

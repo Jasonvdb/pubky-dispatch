@@ -12,7 +12,7 @@
 use pubky_switch_core::{
     chain::ChainTip,
     http::{IdentityDelivery, NoticeReason, RecoveryNotice, Uncompared, not_hosted_current},
-    records::IdentityBody,
+    records::{AccountActivation, AccountAssociation, AccountBinding, IdentityBody},
     sig::SignedDoc,
 };
 
@@ -88,13 +88,18 @@ impl Judged {
         }
     }
 
-    /// The account's creation time, which its enrollment answer names and an erasure names
-    /// again (Switch wire 3.7, 7.4.16): the mark's, or the account's own where the mark is
-    /// lost.
-    pub(super) fn created_at_ms(&self) -> Option<u64> {
-        self.mark()
-            .map(|mark| mark.created_at_ms)
-            .or(self.account.map(|account| account.model.created_at_ms))
+    /// Select the lifetime without discarding either physical input's bounds
+    /// (Switch account binding 1.1).
+    pub(super) fn account_binding(&self) -> pubky_switch_core::Result<AccountBinding> {
+        verdict::account_binding(self.account.as_ref(), &self.mark)
+    }
+
+    /// The selected creation, with unknown inputs kept distinct from absence (Switch
+    /// account binding 1.1).
+    pub(super) fn created_at_ms(&self) -> Result<Option<u64>, ApiError> {
+        self.account_binding()
+            .map(AccountBinding::created)
+            .map_err(|_| ApiError::unavailable("account binding: creation is unknown"))
     }
 
     /// Whether the account answers the notice: it fails stop or is bounded (Table 2).
@@ -149,6 +154,7 @@ impl Service {
         chain: Option<(u64, [u8; 32])>,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
+        activation: AccountActivation,
     ) -> Account {
         Account::judged(
             &self.origin,
@@ -157,6 +163,7 @@ impl Service {
             chain,
             created_at_ms,
             doc,
+            activation,
         )
     }
 
@@ -172,6 +179,7 @@ impl Service {
             found.chain,
             found.created_at_ms,
             body.as_ref(),
+            found.activation,
         )
     }
 
@@ -248,9 +256,17 @@ impl Service {
         }
         // Table 1 selects exactly one retirement: the mark's generation, or the
         // account's when the mark is lost. No unrelated generation affects this verdict.
-        let generation = match &mark {
-            MarkInput::Mark(held) => Some(held.generation),
-            _ => account.map(|held| held.generation()),
+        let binding = verdict::account_binding(account.as_ref(), &mark);
+        let generation = match (&mark, &binding) {
+            (MarkInput::Mark(held), Ok(binding))
+                if binding.created() == Some(held.created_at_ms) =>
+            {
+                Some(held.generation)
+            }
+            (_, Ok(binding)) if binding.association() == AccountAssociation::Account => {
+                account.map(|held| held.generation())
+            }
+            _ => None,
         };
         let mut retired = None;
         if let Some(generation) = generation {
@@ -270,6 +286,7 @@ impl Service {
             .and_then(|account| account.model.state.state())
             .map(|state| (state.generation, state.seq));
         if let MarkInput::Mark(held) = &mark
+            && account.is_some_and(|account| account.model.created_at_ms == held.created_at_ms)
             && let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held)
         {
             match self.store.stub_hash_at(identity, generation, seq).await {
@@ -398,6 +415,7 @@ impl Service {
         asked: Asked<'_>,
         base_ms: u64,
         committed_ms: Option<u64>,
+        bound_signer: Option<&SwitchRequest>,
     ) -> SwitchResponse {
         let failed_at = committed_ms.map_or(
             AnswerTime::TimeBase(base_ms, Uncompared::Unavailable),
@@ -407,6 +425,13 @@ impl Service {
             Ok(judged) => judged,
             Err(error) => return self.service_error(asked, failed_at, &error),
         };
+        if let Some(request) = bound_signer {
+            // Cleanup may leave a different lifetime's mark. The authenticated request
+            // still names its original creation (Switch account binding 1).
+            return self
+                .signer_notice_under_lock(identity, request, class, asked, base_ms)
+                .await;
+        }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
         let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
         self.verdict_answer(identity, &routed, asked, base_ms, committed_ms)
@@ -531,12 +556,7 @@ impl Service {
         starts_generation: bool,
     ) -> MarkMove {
         #[cfg(any(test, feature = "test-util"))]
-        {
-            let pause = self.mark_move_pause.lock().take();
-            if let Some(pause) = pause {
-                pause.wait().await;
-            }
-        }
+        self.wait_before_mark_move().await;
         for _ in 0..2 {
             match self.marks.advance(identity, tip, key, created_at_ms).await {
                 Ok(Advance::Moved(_) | Advance::Unchanged(_) | Advance::Overtaken(_)) => {
@@ -577,6 +597,45 @@ impl Service {
             }
         }
         MarkMove::Failed
+    }
+
+    /// Bind the committed recovery to the same SQL lifetime, store and exact older mark
+    /// read before it committed (Switch account binding 3.2).
+    pub(super) async fn recover_older_mark(
+        &self,
+        identity: &str,
+        tip: ChainTip,
+        key: [u8; 32],
+        created_at_ms: u64,
+        old: AccountMark,
+        store_id: [u8; 16],
+    ) -> MarkMove {
+        #[cfg(any(test, feature = "test-util"))]
+        self.wait_before_mark_move().await;
+        let Ok(mut lock) = self.store.lock_identity(identity).await else {
+            return MarkMove::Failed;
+        };
+        match lock.account_created_at().await {
+            Ok(Some(created)) if created == created_at_ms => {}
+            Ok(_) => return account_gone(),
+            Err(_) => return MarkMove::Failed,
+        }
+        match self
+            .marks
+            .recover_older(identity, old, store_id, tip, key, created_at_ms)
+            .await
+        {
+            Ok(MarkWrite::Written(_)) => MarkMove::Done,
+            Ok(MarkWrite::Unchanged(_)) | Err(_) => MarkMove::Failed,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    async fn wait_before_mark_move(&self) {
+        let pause = self.mark_move_pause.lock().take();
+        if let Some(pause) = pause {
+            pause.wait().await;
+        }
     }
 
     /// Write `identity`'s lost mark anew at `tip` under the identity's lock, only while its

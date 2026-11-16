@@ -36,8 +36,8 @@ use pubky_switch_core::enc::{pubky_id, random_bytes};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 
 use pubky_switch_core::records::{
-    AppCert, ConnectRequests, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc,
-    IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup,
+    AppCert, ConnectRequests, Enrollment, EnrollmentBody, EnrollmentIntent, IDENTITY_PATH,
+    IdentityBody, IdentityDoc, IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_switch_core::sig::SignedDoc;
 
@@ -245,8 +245,8 @@ impl std::fmt::Debug for Signer {
 
 impl Signer {
     /// Set up the signer of a new identity, whose key `keyring` holds, to enroll at the switch
-    /// at `origin`: pick this install's signer ID, sign the enrollment and commit both
-    /// (Switch spec 4.3, Switch wire 3.7). Nothing is sent: [`Signer::resume`] enrolls,
+    /// at `origin`: commit this install's signer ID and enrollment nonce before discovery
+    /// (Switch spec 4.3, account binding 2-3). Nothing is sent: [`Signer::resume`] enrolls,
     /// delivers the first `identity.json` and publishes it.
     ///
     /// # Errors
@@ -266,23 +266,13 @@ impl Signer {
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
         let state = SignerState::new(identity, install);
-        let enrollment = {
-            let key = gate::signing_key(&keyring, &state, &store)?;
-            let body = EnrollmentBody {
-                identity,
-                origin: origin.to_owned(),
-                nonce: random_bytes()?,
-                policy,
-                identity_doc: None,
-                revoked_apps: None,
-            };
-            Enrollment::sign(&key, body)?
-        };
-        // The enrollment's own check refuses an origin that isn't a switch origin.
-        Enrollment::verify(enrollment.signed(), &identity, origin)?;
+        if !pubky_switch_core::records::is_origin(origin) {
+            return Err(pubky_switch_core::Error::Invalid("invalid switch origin".into()).into());
+        }
         let flow = Flow::Enroll {
             origin: origin.to_owned(),
-            enrollment: enrollment.signed().clone(),
+            nonce: random_bytes()?,
+            enrollment: None,
             policy,
         };
         state::save(&mut store, &state, Some(&flow)).await?;
@@ -460,16 +450,24 @@ impl Signer {
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Renew {
+                    account,
                     batches,
                     sent,
                     doc,
                     prev,
-                } => self.send_renewal(&batches, sent, doc, prev).await?,
+                } => {
+                    self.send_renewal(account, &batches, sent, doc, prev)
+                        .await?
+                }
                 Flow::Enroll {
                     origin,
+                    nonce,
                     enrollment,
                     policy,
-                } => self.enroll(&origin, &enrollment, policy).await?,
+                } => match enrollment {
+                    Some(enrollment) => self.enroll(&origin, &enrollment, policy).await?,
+                    None => self.observe_first_account(&origin, nonce, policy).await?,
+                },
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
                 Flow::Erase {
@@ -479,17 +477,19 @@ impl Signer {
                     ..
                 } => self.erase(unpublished, reminded, unanswered).await?,
                 Flow::Deliver {
+                    account,
                     doc,
                     prev,
                     backup,
                     step: DeliverStep::Signed,
-                } => self.write_backup(&doc, prev, backup).await?,
+                } => self.write_backup(account, &doc, prev, backup).await?,
                 Flow::Deliver {
+                    account,
                     doc,
                     prev,
                     step: DeliverStep::BackupWritten,
                     ..
-                } => self.deliver(doc, prev).await?,
+                } => self.deliver(account, doc, prev).await?,
             }
         }
         Ok(())
@@ -642,6 +642,7 @@ impl Signer {
         let again = match (&self.state.newest, &self.flow) {
             (Some(newest), None) if alarm && named && state.switch_unconfirmed => {
                 Some(Flow::Deliver {
+                    account: self.newest_account()?,
                     doc: newest.doc.clone(),
                     prev: newest.prev,
                     backup: None,
@@ -867,6 +868,7 @@ impl Signer {
         let body = self.next_body_on(&newest, change, room)?;
         let doc = IdentityDoc::sign(key, body)?;
         let flow = Flow::Deliver {
+            account: self.newest_account()?,
             doc: doc.signed().clone(),
             prev: Some(newest.hash()),
             backup: None,
@@ -1000,16 +1002,28 @@ impl Signer {
             )))
     }
 
+    fn newest_account(&self) -> Result<Service> {
+        self.state
+            .newest
+            .as_ref()
+            .and_then(|newest| newest.account.clone())
+            .ok_or_else(|| RecordsFault::Invariant("the document has no retained account").into())
+    }
+
+    fn account_client(&self, account: &Service) -> Result<RequestClient> {
+        RequestClient::new(
+            &self.env,
+            &self.service_target(account),
+            &self.keyring,
+            &self.store,
+        )
+    }
+
     /// A client of the switch the identity is enrolled at, for requests: it signs no
     /// operation ([`crate::key::IdentityKeyring::request_signer`]).
     fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
-        RequestClient::new(
-            &self.env,
-            &self.service_target(&service),
-            &self.keyring,
-            &self.store,
-        )
+        self.account_client(&service)
     }
 
     /// What the call in progress may still do: a full budget when none was taken.
@@ -1065,6 +1079,7 @@ impl Signer {
         let target = Target {
             origin: &service.origin,
             pinned: Some(service.service_key),
+            created: Some(service.created),
             identity: self.state.identity,
         };
         let read = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
@@ -1080,14 +1095,13 @@ impl Signer {
     /// with the new key the version names (Switch wire 3.13, 7.4.2): no answer under a third
     /// key is taken, and none under the earlier key as the new generation's.
     fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
-        let serving = self
-            .state
-            .recovery_serving
-            .as_ref()
-            .filter(|serving| serving.origin == service.origin);
+        let serving = self.state.recovery_serving.as_ref().filter(|serving| {
+            serving.origin == service.origin && serving.created == service.created
+        });
         Target {
             origin: &service.origin,
             pinned: Some(serving.map_or(service.service_key, |s| s.service_key)),
+            created: Some(service.created),
             identity: self.state.identity,
         }
     }
@@ -1105,6 +1119,47 @@ impl Signer {
         gate::signing_key(&self.keyring, &self.state, &self.store)
     }
 
+    /// Retain the original authenticated observation and complete signed creation before
+    /// its first enrollment send (Switch account binding 2-3).
+    async fn observe_first_account(
+        &mut self,
+        origin: &str,
+        nonce: [u8; 16],
+        policy: IdentityPolicy,
+    ) -> Result<()> {
+        let target = Target {
+            origin,
+            pinned: None,
+            created: None,
+            identity: self.state.identity,
+        };
+        let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+            .observe_account()
+            .await?;
+        let key = self.signing_key()?;
+        let enrollment = Enrollment::sign(
+            &key,
+            EnrollmentBody {
+                identity: self.state.identity,
+                origin: origin.to_owned(),
+                nonce,
+                intent: EnrollmentIntent::Create {
+                    observation: observation.carried().clone(),
+                },
+                policy,
+                identity_doc: None,
+                revoked_apps: None,
+            },
+        )?;
+        let flow = Flow::Enroll {
+            origin: origin.to_owned(),
+            nonce,
+            policy,
+            enrollment: Some(enrollment.signed().clone()),
+        };
+        self.commit(self.state.clone(), Some(flow)).await
+    }
+
     /// Enroll at the switch, then sign the first `identity.json` naming it (Switch spec 4.3
     /// steps 1 to 3, Switch wire 3.7).
     async fn enroll(
@@ -1118,7 +1173,10 @@ impl Signer {
             Enrollment::verify(signed, &identity, origin).map_err(SignerError::StoredData)?;
         let target = Target {
             origin,
-            pinned: None,
+            pinned: enrollment
+                .observation()
+                .map(|observation| observation.body().service_key),
+            created: enrollment.body().intent.created(),
             identity,
         };
         let answer = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
@@ -1133,14 +1191,16 @@ impl Signer {
         );
         let doc = IdentityDoc::sign(&key, body)?;
         let mut state = self.state.clone();
-        state.service = Some(Service {
+        let account = Service {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
-            created: Some(answer.created),
-        });
+            created: answer.created,
+        };
+        state.service = Some(account.clone());
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
+            account,
             doc: doc.signed().clone(),
             prev: None,
             backup: None,
@@ -1160,6 +1220,7 @@ impl Signer {
     /// writes its backup, and the signer writes its own with an alert.
     async fn write_backup(
         &mut self,
+        account: Service,
         doc: &SignedDoc,
         prev: Option<[u8; 32]>,
         backup: Option<SignerBackup>,
@@ -1170,8 +1231,9 @@ impl Signer {
             None => {
                 // Sealed once and kept, so a retry writes the same bytes. Sealed and committed
                 // before the check, so only the check's read comes before the write.
-                let backup = self.seal_backup(doc, prev)?;
+                let backup = self.seal_backup(doc, prev, &account)?;
                 let flow = Flow::Deliver {
+                    account: account.clone(),
                     doc: doc.clone(),
                     prev,
                     backup: Some(backup.clone()),
@@ -1196,6 +1258,7 @@ impl Signer {
         state.backup_owed = false;
         state.alerts.retain(|a| *a != Alert::BackupNotWritten);
         let flow = Flow::Deliver {
+            account,
             doc: doc.clone(),
             prev,
             backup: Some(backup),
@@ -1477,7 +1540,12 @@ impl Signer {
 
     /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). It holds
     /// no identity secret (Switch spec 12.8).
-    fn seal_backup(&self, doc: &SignedDoc, prev: Option<[u8; 32]>) -> Result<SignerBackup> {
+    fn seal_backup(
+        &self,
+        doc: &SignedDoc,
+        prev: Option<[u8; 32]>,
+        account: &Service,
+    ) -> Result<SignerBackup> {
         let identity = self.state.identity;
         let doc = state::stored_identity(doc, &identity)?;
         let issued = self
@@ -1486,7 +1554,8 @@ impl Signer {
             .iter()
             .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let limits = self.service()?.limits;
+        account.check_document(&doc)?;
+        let limits = account.limits;
         // Sealing signs the backup, so it takes the gated key: a recovery's, while one is
         // delivered (Switch spec 12.6 step 1).
         let key = if self.state.recovering {
@@ -1496,6 +1565,7 @@ impl Signer {
         };
         Ok(key.seal_backup(
             doc,
+            account.created,
             &self.state.tombstones,
             &issued,
             limits,
@@ -1506,26 +1576,31 @@ impl Signer {
     }
 
     /// Deliver the new version (Switch wire 7.4.2) and take the answer.
-    async fn deliver(&mut self, doc: SignedDoc, prev: Option<[u8; 32]>) -> Result<()> {
+    async fn deliver(
+        &mut self,
+        account: Service,
+        doc: SignedDoc,
+        prev: Option<[u8; 32]>,
+    ) -> Result<()> {
         self.check_named()?;
         let delivery = IdentityDelivery {
             identity: doc.clone(),
             prev,
         };
-        match self.service_client()?.put_identity(&delivery).await {
+        match self.account_client(&account)?.put_identity(&delivery).await {
             Ok(answer) => {
                 let delivered_at = answer
                     .proofs
                     .first()
                     .and_then(|proof| proof.body().chain.open().ok())
                     .map(|envelope| envelope.server_time);
-                self.delivered(doc, prev, delivered_at).await
+                self.delivered(account, doc, prev, delivered_at).await
             }
             Err(ClientError::Switch {
                 code: ErrorCode::StaleIdentity,
                 current,
                 ..
-            }) => self.stale(&current, doc, prev).await,
+            }) => self.stale(account, &current, doc, prev).await,
             // The key the lost generation served with is pinned in place, and an answer other
             // than a `200` it didn't sign may be the service's under the key the version names:
             // that version was taken, by this install or another, or the account is one the
@@ -1582,12 +1657,14 @@ impl Signer {
     /// 3.12).
     async fn delivered(
         &mut self,
+        account: Service,
         doc: SignedDoc,
         prev: Option<[u8; 32]>,
         delivered_at: Option<u64>,
     ) -> Result<()> {
         let mut state = self.state.clone();
         let delivered = IdentityDoc::verify(&doc, &state.identity)?;
+        account.check_document(&delivered)?;
         // A recovery's version, the only delivery while one is declared: the new service's
         // account is the one served from here (Switch spec 12.6 step 1). Whether the end of
         // its staged admission is owed, the next `GET /apps` says, publication's check first.
@@ -1661,6 +1738,7 @@ impl Signer {
             .as_ref()
             .is_some_and(|n| n.doc == doc && n.published);
         state.newest = Some(Newest {
+            account: Some(account),
             doc,
             prev,
             published,
@@ -1677,6 +1755,7 @@ impl Signer {
     /// `doc` itself means the switch took it, and the answer that said so was lost.
     async fn stale(
         &mut self,
+        account: Service,
         current: &Value,
         doc: SignedDoc,
         prev: Option<[u8; 32]>,
@@ -1699,7 +1778,7 @@ impl Signer {
             }
         };
         if copy.as_ref().is_some_and(|copy| copy.signed() == &doc) {
-            return self.delivered(doc, prev, None).await;
+            return self.delivered(account, doc, prev, None).await;
         }
         if let Some(copy) = copy.as_ref().filter(|copy| self.own_recovery_version(copy)) {
             return self.own_recovery_held(copy.clone()).await;
@@ -1759,7 +1838,8 @@ impl Signer {
             self.commit(self.state.clone(), None).await?;
             return Err(stale_without_copy());
         }
-        self.delivered(copy.signed().clone(), None, None).await
+        self.delivered(self.service()?, copy.signed().clone(), None, None)
+            .await
     }
 
     /// Judge a copy of `identity.json` from the switch against the high-water mark (Switch
@@ -1819,7 +1899,17 @@ impl Signer {
             if source == Source::Switch {
                 if let Some(prev) = self.own_hand_over_delivery(&copy)? {
                     return self
-                        .delivered(copy.signed().clone(), Some(prev), None)
+                        .delivered(
+                            self.state
+                                .handing_over
+                                .as_ref()
+                                .ok_or(Refusal::NotSetUp)?
+                                .account
+                                .clone(),
+                            copy.signed().clone(),
+                            Some(prev),
+                            None,
+                        )
                         .await;
                 }
                 if self.succeeded_by(&copy)? {
@@ -1836,6 +1926,7 @@ impl Signer {
         let mut state = self.state.clone();
         state.handing_over = None;
         state.newest = Some(Newest {
+            account: None,
             doc: copy.signed().clone(),
             prev: None,
             published: true,
@@ -2041,19 +2132,9 @@ pub(super) fn measures(
         revoked.extend(body.apps.iter().map(|listed| listed.app_id));
         revoked.sort_unstable();
         revoked.dedup();
-        let enrollment = EnrollmentBody {
-            identity: state.identity,
-            origin: "a".repeat(pubky_switch_core::net::MAX_ORIGIN_LEN),
-            nonce: [0; 16],
-            policy: body.policy,
-            identity_doc: Some(doc),
-            revoked_apps: (!revoked.is_empty()).then_some(revoked),
-        };
-        // The request's body: `{"enrollment":<signed enrollment>}` (Switch wire 7.4.1).
-        let request = serde_json::json!({ "enrollment": carried(&enrollment.to_json()?) });
         measured.push(Measure {
             body: SizedBody::Enrollment,
-            bytes: request.to_string().len(),
+            bytes: Enrollment::max_request_len(&body.policy, Some(&doc), &revoked)?,
             limit,
         });
     }
@@ -2457,12 +2538,85 @@ mod tests {
             identity: doc.signed().clone(),
             prev: Some([6; 32]),
         };
-        let host = format!(
-            "{}.example",
-            "a".repeat(pubky_switch_core::net::MAX_DOMAIN_LEN - 8)
-        );
+        let host = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
         let origin = format!("https://{host}:65535");
         assert_eq!(origin.len(), pubky_switch_core::net::MAX_ORIGIN_LEN);
+        let service = pubky_switch_core::keys::IdentityKey::from_secret([5; 32]);
+        let now = pubky_switch_core::time::MAX_TIME_MS
+            - pubky_switch_core::records::ACCOUNT_OBSERVATION_VALIDITY_MS;
+        let mut observation_body = pubky_switch_core::records::AccountObservationBody {
+            identity: key.public(),
+            origin: origin.clone(),
+            service_key: service.public(),
+            store_id: [8; 16],
+            association: pubky_switch_core::records::AccountAssociation::Mark,
+            created: Some(now),
+            erased_at: Some(now),
+            observed_at: now,
+            expires_at: pubky_switch_core::time::MAX_TIME_MS,
+        }
+        .to_json()
+        .unwrap();
+        observation_body.resize(
+            pubky_switch_core::records::MAX_ACCOUNT_OBSERVATION_BYTES,
+            b' ',
+        );
+        let path = format!("/v1/{}/account", key.id());
+        let timestamp = "2026-01-01T00:00:00Z";
+        let request_signature = pubky_switch_core::http::sign_request(
+            &key,
+            &pubky_switch_core::http::RequestTarget {
+                method: "GET",
+                path_and_query: &path,
+                origin: &origin,
+                body: b"",
+            },
+            &pubky_switch_core::http::RequestHeaders {
+                identity: key.id(),
+                timestamp: timestamp.into(),
+                app: None,
+                cert: None,
+                invite_code: None,
+                created: None,
+            },
+        );
+        let signature = pubky_switch_core::enc::b64(&request_signature);
+        let identity = key.id();
+        let headers = pubky_switch_core::http::ReceivedHeaders::of([
+            ("Switch-Identity", identity.as_bytes()),
+            ("Switch-Timestamp", timestamp.as_bytes()),
+            ("Switch-Signature", signature.as_bytes()),
+        ]);
+        let response_signature = pubky_switch_core::http::sign_response(
+            &service,
+            &pubky_switch_core::http::ResponseParts {
+                status: 200,
+                request: pubky_switch_core::http::ReceivedRequest {
+                    method: "GET",
+                    path_and_query: &path,
+                    origin: &origin,
+                    body: pubky_switch_core::http::BodyField::read(b""),
+                    headers: &headers,
+                },
+                server_time: &pubky_switch_core::time::rfc3339(now),
+                head: None,
+                body: &observation_body,
+            },
+        );
+        let observation = pubky_switch_core::records::CarriedAccountObservation {
+            body: observation_body,
+            sig: response_signature,
+            request_timestamp: timestamp.into(),
+            request_signature,
+        }
+        .verify(&key.public(), &origin)
+        .unwrap();
         let request = |revoked: Vec<[u8; 16]>| {
             let enrollment = pubky_switch_core::records::Enrollment::sign(
                 &key,
@@ -2470,6 +2624,7 @@ mod tests {
                     identity: key.public(),
                     origin: origin.clone(),
                     nonce: [1; 16],
+                    intent: observation.enrollment_intent().unwrap(),
                     policy: body.policy,
                     identity_doc: Some(doc.signed().clone()),
                     revoked_apps: Some(revoked),

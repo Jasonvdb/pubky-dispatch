@@ -5,13 +5,13 @@ use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::export::{
     ActivateAnswer, ActivateRequest, ChunkAnswer, ImportStart, ImportStatus, Manifest,
 };
-use pubky_switch_core::http::{IdentityDelivery, erase_body};
+use pubky_switch_core::http::{self, IdentityDelivery, erase_body, header};
 use pubky_switch_core::json::{Doc, parse_json};
 use pubky_switch_core::records::{
-    DiscardAnswer, Enrollment, EnrollmentAnswer, Freeze, IdentityDoc, Unfreeze,
+    AccountObservation, AccountObservationBody, CarriedAccountObservation, DiscardAnswer,
+    Enrollment, EnrollmentAnswer, Freeze, IdentityDoc, Unfreeze,
 };
 use pubky_switch_core::sig::SignedDoc;
-use serde_json::json;
 
 use super::answers::{
     AllowList, AppendAnswer, AppsAnswer, ClaimAnswer, ConnectAnswer, ConnectList, Directory,
@@ -20,9 +20,12 @@ use super::answers::{
     WriteAnswer,
 };
 use super::read::{self, Obj};
-use super::{Auth, Body, CheckedResponse, SentRequest, SwitchClient, check_response, verify_head};
+use super::{
+    Auth, Body, CheckedResponse, SentRequest, SwitchClient, check_response, stale_timestamp_hint,
+    verify_head,
+};
 use crate::error::ClientError;
-use crate::transport::TimeoutClass;
+use crate::transport::{Request, Response, TimeoutClass};
 
 /// An append answer or the single authenticated timestamp retry, not yet sent.
 pub(crate) struct AppendCall(super::CallStep);
@@ -184,22 +187,45 @@ impl SwitchClient {
                 "Switch wire 3.7: the enrollment names another identity or origin".into(),
             ));
         }
-        let body = json!({ "enrollment": enrollment.signed() })
-            .to_string()
-            .into_bytes();
+        let body = enrollment.to_request_json()?;
         let auth = Auth {
             timeout: TimeoutClass::Bulk,
             ..Auth::default()
         };
-        let signed = self.build("POST", "/v1/enroll", body, Body::Json, auth)?;
+        let signed = self.build("POST", "/v1/enroll", body.clone(), Body::Json, auth)?;
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
+        let checked = self.enrollment_answer(enrollment, &sent, &response);
+        let Some(at) = stale_timestamp_hint(&checked) else {
+            return checked;
+        };
+        let signed = self.build(
+            "POST",
+            "/v1/enroll",
+            body,
+            Body::Json,
+            Auth {
+                timestamp_ms: Some(at),
+                ..auth
+            },
+        )?;
+        let sent = SentRequest::of(&signed.request);
+        let response = self.send_response(signed.request).await?;
+        self.enrollment_answer(enrollment, &sent, &response)
+    }
+
+    fn enrollment_answer(
+        &self,
+        enrollment: &Enrollment,
+        sent: &SentRequest,
+        response: &Response,
+    ) -> Result<EnrollmentAnswer, ClientError> {
         let status = response.status;
         if !(200..300).contains(&status) {
             // Errors are signed with the service key: a client that pinned it checks them,
             // one that holds none can't (Switch wire 7.1, 7.4.1 Errors).
             return Err(match self.pinned_key() {
-                Some(key) => match check_response(&key, &self.account(), &sent, &response) {
+                Some(key) => match check_response(&key, &self.account(), sent, response) {
                     Err(error) => error,
                     Ok(_) => ClientError::BadServiceSignature { status },
                 },
@@ -209,12 +235,97 @@ impl SwitchClient {
         // The key that verifies the answer is the one it names (Switch wire 3.7).
         let answer = EnrollmentAnswer::from_json(&response.body)
             .map_err(|_| ClientError::BadServiceSignature { status })?;
-        check_response(&answer.service_key, &self.account(), &sent, &response)?;
+        check_response(&answer.service_key, &self.account(), sent, response)?;
         answer.check(enrollment)?;
         if self.pinned_key().is_none() {
             self.pin(answer.service_key);
         }
         Ok(answer)
+    }
+
+    /// Read an authenticated observation of this account (Switch account-binding Section 2).
+    /// The carried result retains the exact response and original request authentication.
+    /// It changes neither the client's pin nor its account creation binding, and its time
+    /// counts in no account-time comparison. It does not establish an identity document.
+    ///
+    /// An unpinned signer checks the successful answer with its body's service key at this
+    /// explicitly selected HTTPS origin. With a pin, that key must verify the answer.
+    /// Observation validity and current-state authorization are the service's locked checks.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] for non-signer credentials; otherwise as every checked call.
+    /// A verified stale-timestamp answer is retried once with only the request time changed.
+    /// An unpinned client cannot authenticate an error answer.
+    pub async fn observe_account(&self) -> Result<AccountObservation, ClientError> {
+        self.signer_only()?;
+        self.forget_latest();
+        let path = self.path("account");
+        let signed = self.build("GET", &path, Vec::new(), Body::Empty, Auth::default())?;
+        let response = self.send_response(signed.request.clone()).await?;
+        let checked = self.account_observation(&signed.request, &response);
+        let Some(at) = stale_timestamp_hint(&checked) else {
+            return checked;
+        };
+        let signed = self.build(
+            "GET",
+            &path,
+            Vec::new(),
+            Body::Empty,
+            Auth {
+                timestamp_ms: Some(at),
+                ..Auth::default()
+            },
+        )?;
+        let response = self.send_response(signed.request.clone()).await?;
+        self.account_observation(&signed.request, &response)
+    }
+
+    fn account_observation(
+        &self,
+        request: &Request,
+        response: &Response,
+    ) -> Result<AccountObservation, ClientError> {
+        let status = response.status;
+        let invalid = || ClientError::BadServiceSignature { status };
+        if response
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(header::HEAD))
+        {
+            return Err(invalid());
+        }
+        let key = match self.pinned_key() {
+            Some(key) => key,
+            None if status == 200 => {
+                AccountObservationBody::from_json(&response.body)
+                    .map_err(|_| invalid())?
+                    .service_key
+            }
+            None => return Err(invalid()),
+        };
+        check_response(&key, &self.account, &SentRequest::of(request), response)?;
+        if status != 200 {
+            return Err(invalid());
+        }
+        let signature = |text: Option<&str>| {
+            text.and_then(|text| http::decode_signature(text).ok())
+                .ok_or_else(invalid)
+        };
+        let carried = CarriedAccountObservation {
+            body: response.body.clone(),
+            sig: signature(response.header(header::SERVICE_SIGNATURE))?,
+            request_timestamp: request
+                .header(header::TIMESTAMP)
+                .ok_or_else(invalid)?
+                .to_owned(),
+            request_signature: signature(request.header(header::SIGNATURE))?,
+        };
+        let observation = carried.verify(&self.account, &self.origin)?;
+        if observation.body().service_key != key {
+            return Err(invalid());
+        }
+        Ok(observation)
     }
 
     /// `PUT /v1/{id}/identity` (signer, Switch wire 7.4.2): deliver an `identity.json`,

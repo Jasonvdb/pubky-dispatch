@@ -9,13 +9,15 @@
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use super::{StoreError, from_db, to_db};
-use pubky_switch_core::sig::SignedDoc;
+use pubky_switch_core::{records::AccountActivation, sig::SignedDoc};
 
 use crate::keys::KeyId;
 
 /// A new account, at enrollment (Switch wire 7.4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewAccount {
+    /// The activation required by this account's initial state (Switch account binding 3.1).
+    pub activation: AccountActivation,
     /// The identity's Pubky ID.
     pub id: String,
     /// The identity's Ed25519 public key.
@@ -34,12 +36,16 @@ pub struct NewAccount {
     /// The document hash of the enrollment that creates the account, whose answer the
     /// account keeps (Switch wire 3.7).
     pub enrollment_hash: [u8; 32],
+    /// The confirmed mark-store identity associated with the creating enrollment.
+    pub enrollment_store_id: [u8; 16],
 }
 
 /// An account's position: its generation and key, the last `seq` given out, the chain head
 /// and the stamped service time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountHead {
+    /// The persisted activation requirement of this lifetime.
+    pub activation: AccountActivation,
     /// The identity's Pubky ID.
     pub id: String,
     /// The identity's Ed25519 public key.
@@ -173,6 +179,7 @@ impl std::fmt::Debug for AccountTxn {
 pub struct Creation {
     tx: Transaction<'static, Postgres>,
     account: NewAccount,
+    kept: Vec<super::KeptAppId>,
 }
 
 impl std::fmt::Debug for Creation {
@@ -196,7 +203,7 @@ pub(super) async fn create(
         .transpose()?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, created_at_ms, \
-         stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $4, $5, $6) \
+         stamped_time_ms, announced_limits, identity_doc, activation_requirement) VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(&account.id)
@@ -208,6 +215,7 @@ pub(super) async fn create(
             .map_err(|_| StoreError::Corrupt("the announced limits don't encode"))?,
     )
     .bind(identity_doc)
+    .bind(account.activation.as_str())
     .execute(&mut *tx)
     .await
     .map_err(StoreError::from_db)?
@@ -218,6 +226,7 @@ pub(super) async fn create(
     Ok(Some(Creation {
         tx,
         account: account.clone(),
+        kept: Vec::new(),
     }))
 }
 
@@ -226,6 +235,31 @@ impl Creation {
     pub async fn commit(mut self) -> Result<(), StoreError> {
         let account = &self.account;
         let created_at_ms = account.created_at_ms;
+        for kept in &self.kept {
+            let reason = match kept.reason {
+                super::KeptReason::Revoked => "revoked",
+                super::KeptReason::Departed => "departed",
+                super::KeptReason::Enrolled => "enrolled",
+                super::KeptReason::Document => "document",
+            };
+            sqlx::query(
+                "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch, rotated) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&account.id)
+            .bind(kept.app_id.as_slice())
+            .bind(reason)
+            .bind(kept.at_ms.map(|at| to_db(at, "at_ms")).transpose()?)
+            .bind(
+                kept.data_epoch
+                    .map(|epoch| to_db(epoch, "data_epoch"))
+                    .transpose()?,
+            )
+            .bind(kept.rotated)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        }
         for app_id in &account.revoked_apps {
             sqlx::query(
                 "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
@@ -243,16 +277,23 @@ impl Creation {
         if let Some(doc) = &account.identity_doc {
             let doc = pubky_switch_core::records::IdentityDoc::verify(doc, &account.identity_key)
                 .map_err(|_| StoreError::Corrupt("the enrollment's identity.json"))?;
-            let listed = super::apps::newly_listed(None, &doc);
-            super::apps::note_listings(&mut self.tx, &account.id, &listed, doc.data_epoch())
-                .await?;
+            super::apps::note_removed(&mut self.tx, &account.id, &doc).await?;
+            if account.activation == AccountActivation::Ordinary {
+                let listed = super::apps::newly_listed(None, &doc);
+                super::apps::note_listings(&mut self.tx, &account.id, &listed, doc.data_epoch())
+                    .await?;
+            }
         }
         // The first enrollment's answer: an account keeps far fewer than any limit allows.
         super::enrollments::keep(
             &mut self.tx,
             &account.id,
             &account.enrollment_hash,
-            created_at_ms,
+            &super::enrollments::EnrollmentReceipt {
+                created_at_ms,
+                store_id: account.enrollment_store_id,
+                answered_at_ms: created_at_ms,
+            },
             u64::MAX >> 1,
             true,
         )
@@ -263,6 +304,40 @@ impl Creation {
 }
 
 impl AccountTxn {
+    /// Replace this proven-older lifetime with an empty, recovery-only account in the
+    /// same transaction, retaining its exclusions and push-key deletion obligations
+    /// (Switch account binding 3.1). The caller has durably taken the exact newer mark.
+    pub async fn replace_for_recovery(
+        mut self,
+        account: &NewAccount,
+    ) -> Result<Creation, StoreError> {
+        if account.id != self.head.id
+            || account.identity_key != self.head.identity_key
+            || account.activation != AccountActivation::Recovery
+            || account.created_at_ms <= self.head.created_at_ms
+            || account.created_at_ms < self.head.stamped_time_ms
+            || account.generation < self.head.generation
+        {
+            return Err(StoreError::Corrupt(
+                "an invalid recovery-only account replacement",
+            ));
+        }
+        let held = self.held_identity().await?;
+        if held.as_ref().map(|held| &held.doc) != account.identity_doc.as_ref() {
+            return Err(StoreError::Corrupt(
+                "a replacement changed its retained document",
+            ));
+        }
+        self.join_held_revoked_apps(account.created_at_ms).await?;
+        let kept = self.kept_entries().await?;
+        self.delete_account(account.created_at_ms).await?;
+        let mut creation = create(self.tx, account).await?.ok_or(StoreError::Corrupt(
+            "an account appeared under its identity lock",
+        ))?;
+        creation.kept = kept;
+        Ok(creation)
+    }
+
     /// Lock account `id` in `tx` and read its position.
     pub(super) async fn lock(
         mut tx: Transaction<'static, Postgres>,
@@ -270,7 +345,7 @@ impl AccountTxn {
     ) -> Result<Option<Self>, StoreError> {
         let row = sqlx::query(
             "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, \
-             stamped_time_ms, created_at_ms FROM accounts WHERE id = $1 FOR UPDATE",
+             stamped_time_ms, created_at_ms, activation_requirement FROM accounts WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -292,6 +367,8 @@ impl AccountTxn {
             _ => return Err(StoreError::Corrupt("chain head")),
         };
         let head = AccountHead {
+            activation: AccountActivation::parse(row.try_get("activation_requirement")?)
+                .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
             id: row.try_get("id")?,
             identity_key: <[u8; 32]>::try_from(identity_key.as_slice())
                 .map_err(|_| StoreError::Corrupt("identity_key"))?,
@@ -592,6 +669,13 @@ impl AccountTxn {
     /// yet, as at a generation start: the next chain item is the new generation's first.
     /// What the store holds changes with the caller's own writes, in this transaction; a
     /// rollback to a savepoint before it undoes both.
+    /// Update the transaction's head after writing an authorized recovery start. The
+    /// activation requirement changes durably only with that same SQL commit.
+    pub(super) fn start_recovery_head(&mut self, generation: u64) {
+        self.start_head(generation);
+        self.head.activation = AccountActivation::Ordinary;
+    }
+
     pub(super) fn start_head(&mut self, generation: u64) {
         self.head.generation = generation;
         self.head.last_seq = 0;

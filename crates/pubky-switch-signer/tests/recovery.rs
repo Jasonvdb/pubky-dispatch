@@ -1141,6 +1141,7 @@ async fn test_provider_loss_stops_at_a_newer_own_backup() {
     let records = pubky_switch_core::records::SignerRecords::new(
         pubky_switch_core::keys::IdentityKey::from_secret(SECRET),
         own.clone(),
+        world.backup().account_created(),
         &[],
         &[],
         pubky_switch_core::records::Limits::default(),
@@ -1484,8 +1485,12 @@ async fn test_provider_loss_never_takes_its_own_earlier_version_as_records_behin
         .unwrap_err();
     let first = service.identity_doc().unwrap();
     let holding = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
-    holding.deliver_identity(&first).unwrap();
-    signer
+    holding.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::StaleIdentity,
+        current: serde_json::json!({ "identity": first.signed() }),
+    });
+    let error = signer
         .declare_provider_loss(THIRD_ORIGIN, confirmed())
         .await
         .unwrap_err();
@@ -1493,7 +1498,8 @@ async fn test_provider_loss_never_takes_its_own_earlier_version_as_records_behin
         signer.status(),
         SignerStatus::RecoveryRefused {
             origin: THIRD_ORIGIN.into()
-        }
+        },
+        "{error:?}"
     );
     let fourth = service_on(&world, &router, "https://fourth.example", 0x7e);
     let recovered = signer
@@ -2072,10 +2078,9 @@ fn enrollment_errors(service: &ScriptedSwitch, code: pubky_switch_core::http::Er
 }
 
 #[tokio::test]
-async fn test_provider_loss_enrollment_sent_again_after_an_unverified_refusal() {
-    // A `400` no key the signer holds verifies, as an intermediary could forge it, isn't the
-    // service's word: the same enrollment goes again, and the recovery completes (Switch
-    // wire 7.4.1).
+async fn test_provider_loss_enrollment_sent_again_after_refusal() {
+    // The observed target authenticates the refusal; the same enrollment goes again and
+    // the recovery completes (Switch account binding 3).
     let world = World::new();
     let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
     enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 1);
@@ -2088,48 +2093,62 @@ async fn test_provider_loss_enrollment_sent_again_after_an_unverified_refusal() 
 }
 
 #[tokio::test]
-async fn test_provider_loss_enrollment_refused_ends_the_flow() {
-    // Unverified refusals past the bound end the flow: the failure is shown, nothing is sent
-    // again, and declaring again there enrolls afresh (Switch wire 7.4.1).
+async fn test_provider_loss_enrollment_refusal_preserves_its_continuation() {
+    // A bounded run stops on its refusal. Reload and resume retain the original action
+    // and observed target, without another discovery (Switch account binding 3).
     let world = World::new();
-    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
-    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 3);
+    let (mut signer, store) = world.enrolled().await;
+    let start = world.transport.requests().len();
+    enrollment_errors(
+        &world.switch,
+        pubky_switch_core::http::ErrorCode::BadRequest,
+        4,
+    );
     let error = signer
-        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
         .await
         .unwrap_err();
-    // A service this install never pinned a key for: its errors can't be checked.
-    assert!(
-        matches!(
-            error,
-            SignerError::Switch(pubky_switch_client::ClientError::BadServiceSignature {
-                status: 400
-            })
-        ),
-        "{error:?}"
-    );
-    assert_eq!(enrollments_at(&router, NEW_ORIGIN), 3);
+    assert!(is_switch_400(&error), "{error:?}");
+    let sent = world.transport.requests();
+    let initial: Vec<_> = sent[start..]
+        .iter()
+        .filter(|r| r.path_and_query.ends_with("/enroll"))
+        .collect();
+    assert_eq!(initial.len(), 3);
+    let original = initial[0].body.clone();
     assert_eq!(
         signer.status(),
-        SignerStatus::RecoveryRefused {
-            origin: NEW_ORIGIN.into()
+        SignerStatus::Recovering {
+            origin: SWITCH_ORIGIN.into()
         }
     );
-    let sent = router.log().len();
-    signer.resume().await.unwrap();
-    assert_eq!(router.log().len(), sent, "not sent again");
-    signer
-        .declare_provider_loss(NEW_ORIGIN, confirmed())
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
-    signs_again(&world, &mut signer, &service).await;
+    signer.resume().await.unwrap();
+    let sent = world.transport.requests();
+    let retries: Vec<_> = sent[start..]
+        .iter()
+        .filter(|r| r.path_and_query.ends_with("/enroll"))
+        .collect();
+    assert_eq!(retries.len(), 5);
+    assert!(retries.iter().all(|r| r.body == original));
+    assert_eq!(
+        sent[start..]
+            .iter()
+            .filter(|r| r.path_and_query.ends_with("/account"))
+            .count(),
+        1
+    );
+    signs_again(&world, &mut signer, &world.switch).await;
 }
 
 #[tokio::test]
 async fn test_provider_loss_enrollment_errors_of_a_pinned_service_are_checked_with_its_key() {
     // Declared in place: the service's key is pinned, so its enrollment errors are checked
-    // with it and read as its word, `400` and all; they change nothing but the count, and
-    // past the bound the flow ends (Switch wire 7.4.1 Errors).
+    // with it and read as its word, `400` and all. Past the bound the same action stays
+    // pending (Switch account binding 3).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     enrollment_errors(
@@ -2142,7 +2161,12 @@ async fn test_provider_loss_enrollment_errors_of_a_pinned_service_are_checked_wi
         .await
         .unwrap_err();
     assert!(is_switch_400(&error), "{error:?}");
-    assert_eq!(signer.status(), refused_at(SWITCH_ORIGIN));
+    assert_eq!(
+        signer.status(),
+        SignerStatus::Recovering {
+            origin: SWITCH_ORIGIN.into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -3379,8 +3403,8 @@ async fn test_restore_in_place_takes_another_installs_pending_revocation() {
 
 #[tokio::test]
 async fn test_provider_loss_counts_every_enrollment_send() {
-    // Three sends in all in the run, the same bytes each, then the flow ends (Switch wire
-    // 7.4.1).
+    // Three sends in all in the run, the same bytes each; the continuation stays pending
+    // (Switch account binding 3).
     let world = World::new();
     let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
     enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 5);
@@ -3391,7 +3415,7 @@ async fn test_provider_loss_counts_every_enrollment_send() {
     assert_eq!(enrollments_at(&router, NEW_ORIGIN), 3);
     assert_eq!(
         signer.status(),
-        SignerStatus::RecoveryRefused {
+        SignerStatus::Recovering {
             origin: NEW_ORIGIN.into()
         }
     );
@@ -4321,4 +4345,191 @@ async fn taken_then_elsewhere_then_back(refusal: Option<Fault>) {
 #[tokio::test]
 async fn test_provider_loss_in_place_taken_then_elsewhere_then_back_after_a_failed_read() {
     taken_then_elsewhere_then_back(None).await;
+}
+
+#[tokio::test]
+async fn test_provider_loss_selects_the_observed_account_association() {
+    use pubky_switch_core::records::EnrollmentIntent;
+    for kind in ["existing", "takeover", "create"] {
+        let world = World::new();
+        let (mut signer, _) = world.enrolled().await;
+        let original = world.switch.created();
+        match kind {
+            "takeover" => world.switch.lose_account(),
+            "create" => {
+                let doc = world.switch.identity_doc().unwrap();
+                world
+                    .signer_client(Some(original))
+                    .erase(Some(original), Some(doc.hash()))
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        world.clock.advance_ms(1000);
+        let start = world.transport.requests().len();
+        signer
+            .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+            .await
+            .unwrap();
+        let sent = world.transport.requests();
+        let enrollment = sent[start..]
+            .iter()
+            .find(|request| request.path_and_query.ends_with("/enroll"))
+            .unwrap();
+        let found = pubky_switch_core::records::Enrollment::from_request(
+            &enrollment.body,
+            &world.key.public(),
+            SWITCH_ORIGIN,
+        )
+        .unwrap();
+        match (&found.body().intent, kind) {
+            (EnrollmentIntent::Existing { created }, "existing")
+            | (EnrollmentIntent::Takeover { created, .. }, "takeover") => {
+                assert_eq!(*created, original);
+            }
+            (EnrollmentIntent::Create { .. }, "create") => {}
+            _ => panic!("the enrollment didn't select the observed association"),
+        }
+        assert_eq!(
+            sent[start..]
+                .iter()
+                .filter(|r| r.path_and_query.ends_with("/account"))
+                .count(),
+            1
+        );
+        assert_eq!(world.backup().account_created(), world.switch.created());
+        if kind == "existing" {
+            assert_eq!(world.switch.created(), original);
+        } else {
+            assert!(world.switch.created() > original);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_provider_loss_preparation_survives_discovery_failure() {
+    use pubky_switch_client::store::StateStore;
+    use pubky_switch_signer::state::signer_namespace;
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/account".into(),
+        after: 0,
+    });
+    assert!(
+        signer
+            .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+            .await
+            .is_err()
+    );
+    let flow: serde_json::Value = serde_json::from_slice(
+        &store
+            .get(&signer_namespace(&world.key.public()), b"flow")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let prepared = flow.pointer("/Recover/enrollment/Preparing").unwrap();
+    let nonce: [u8; 16] = serde_json::from_value(prepared["nonce"].clone()).unwrap();
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(signer.resume().await.is_err());
+    let sent = world.transport.requests();
+    let first = sent
+        .iter()
+        .rev()
+        .find(|r| r.path_and_query.ends_with("/enroll"))
+        .unwrap();
+    let enrollment = pubky_switch_core::records::Enrollment::from_request(
+        &first.body,
+        &world.key.public(),
+        SWITCH_ORIGIN,
+    )
+    .unwrap();
+    assert_eq!(enrollment.body().nonce, nonce);
+    let original = first.body.clone();
+    signer.resume().await.unwrap();
+    let sent = world.transport.requests();
+    let last = sent
+        .iter()
+        .rev()
+        .find(|r| r.path_and_query.ends_with("/enroll"))
+        .unwrap();
+    assert_eq!(last.body, original);
+}
+
+#[tokio::test]
+async fn test_provider_loss_explicit_recovery_replaces_only_the_enrollment() {
+    use pubky_switch_core::records::{Enrollment, EnrollmentIntent};
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let old_created = world.switch.created();
+    world.switch.lose_account();
+    world.clock.advance_ms(1000);
+    let start = world.transport.requests().len();
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(
+        signer
+            .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+            .await
+            .is_err()
+    );
+    let new_created = world.switch.created();
+    assert!(new_created > old_created);
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    // Its exact receipt remains useful after the observation expires. Losing that answer
+    // again leaves the same old enrollment unresolved, not eligible for automatic rebinding.
+    world
+        .clock
+        .advance_ms(pubky_switch_core::records::ACCOUNT_OBSERVATION_VALIDITY_MS);
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(signer.resume().await.is_err());
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    let sent = world.transport.requests();
+    let enrollments: Vec<_> = sent[start..]
+        .iter()
+        .filter(|r| r.path_and_query.ends_with("/enroll"))
+        .collect();
+    assert_eq!(enrollments.len(), 3);
+    assert_eq!(enrollments[0].body, enrollments[1].body);
+    assert_ne!(enrollments[1].body, enrollments[2].body);
+    let first =
+        Enrollment::from_request(&enrollments[0].body, &world.key.public(), SWITCH_ORIGIN).unwrap();
+    let last =
+        Enrollment::from_request(&enrollments[2].body, &world.key.public(), SWITCH_ORIGIN).unwrap();
+    assert!(
+        matches!(first.body().intent, EnrollmentIntent::Takeover { created, .. } if created == old_created)
+    );
+    assert_eq!(
+        last.body().intent,
+        EnrollmentIntent::Existing {
+            created: new_created
+        }
+    );
+    assert_ne!(first.body().nonce, last.body().nonce);
+    assert_eq!(
+        sent[start..]
+            .iter()
+            .filter(|r| r.path_and_query.ends_with("/account"))
+            .count(),
+        2
+    );
+    assert_eq!(world.switch.created(), new_created);
+    assert_eq!(world.backup().account_created(), new_created);
 }

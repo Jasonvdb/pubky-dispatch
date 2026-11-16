@@ -37,6 +37,7 @@ fn own_newer(world: &World, doc: &IdentityDoc, version: u64) -> (IdentityDoc, Ve
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         newer.clone(),
+        world.backup().account_created(),
         &[],
         &[],
         Limits::default(),
@@ -329,6 +330,7 @@ fn backup_of(
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         doc.clone(),
+        world.backup().account_created(),
         revoked,
         &certs,
         Limits::default(),
@@ -653,6 +655,7 @@ fn others_backup(world: &World, doc: &IdentityDoc) -> Vec<u8> {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         doc.clone(),
+        world.backup().account_created(),
         &[],
         &[],
         Limits::default(),
@@ -1071,6 +1074,7 @@ async fn test_restore_owed_backup_stops_at_a_newer_backup_of_its_own() {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         newer.clone(),
+        world.backup().account_created(),
         &[],
         &[],
         Limits::default(),
@@ -1421,4 +1425,39 @@ async fn test_restore_refuses_a_backup_below_the_readable_epoch_floor() {
     signer.restore(confirmed()).await.unwrap();
     let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
     assert_eq!(renewed.data_epoch(), 4);
+}
+
+#[tokio::test]
+async fn test_restore_backup_keeps_the_original_account() {
+    use pubky_switch_client::ClientError;
+    use pubky_switch_core::http::{ErrorCode, header};
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let created = world.switch.created();
+    let backup = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+    drop(signer);
+    let replacement = world.create_after_erasure().await;
+    let start = world.transport.requests().len();
+    let error = restored(&world).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    let requests = world.transport.requests();
+    assert_eq!(requests.len() - start, 1);
+    assert_eq!(requests[start].method, "GET");
+    assert!(requests[start].path_and_query.ends_with("/apps"));
+    assert_eq!(
+        requests[start].header(header::CREATED),
+        Some(pubky_switch_core::time::rfc3339(created).as_str())
+    );
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), backup);
+    assert_eq!(world.switch.created(), replacement);
+    assert!(world.switch.identity_doc().is_none());
 }

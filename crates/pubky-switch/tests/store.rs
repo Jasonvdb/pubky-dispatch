@@ -25,6 +25,28 @@ const ID_C: &str = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty";
 const ID_D: &str = "9xk3pd5ojmm4z8ckab1nrqjzo6aiu4e7fxg8b3fyeq7tts1yhcwo";
 const T0: u64 = 1_767_225_600_000;
 
+fn account_key() -> pubky_switch_core::keys::IdentityKey {
+    pubky_switch_core::keys::IdentityKey::from_secret([7; 32])
+}
+
+fn identity_doc() -> pubky_switch_core::sig::SignedDoc {
+    use pubky_switch_core::records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox};
+    let key = account_key();
+    let body = IdentityBody::first(
+        key.public(),
+        [8; 16],
+        Inbox::new(
+            "https://switch.example",
+            pubky_switch_core::keys::IdentityKey::from_secret([9; 32]).public(),
+        ),
+        IdentityPolicy::default(),
+    );
+    IdentityDoc::sign(&key, body)
+        .expect("identity")
+        .signed()
+        .clone()
+}
+
 struct Fixture {
     db: TestDatabase,
 }
@@ -51,14 +73,16 @@ impl Fixture {
 /// Account `id` at generation 1, created at `T0`, holding no `identity.json`.
 fn new_account(id: &str) -> NewAccount {
     NewAccount {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         id: id.into(),
-        identity_key: [7; 32],
+        identity_key: account_key().public(),
         generation: 1,
         created_at_ms: T0,
         limits: pubky_switch_core::records::Limits::default(),
         identity_doc: None,
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
+        enrollment_store_id: [1; 16],
     }
 }
 
@@ -119,6 +143,104 @@ async fn test_store_creates_account_once() {
 async fn test_store_unknown_account_is_none() {
     let Some(fx) = fixture().await else { return };
     assert!(fx.store().begin(ID_B).await.expect("begin").is_none());
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_kept_exclusion_schema_requires_event_provenance() {
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut connection = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("connect");
+    for (reason, at, epoch, rotated) in [
+        ("revoked", None, None, false),
+        ("departed", None, None, false),
+        ("enrolled", None, None, false),
+        ("document", Some(T0 as i64), None, false),
+        ("document", None, Some(1_i64), false),
+        ("document", None, None, true),
+    ] {
+        let result = sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch, rotated) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(ID_A)
+        .bind([44_u8; 16].as_slice())
+        .bind(reason)
+        .bind(at)
+        .bind(epoch)
+        .bind(rotated)
+        .execute(&mut connection)
+        .await;
+        assert!(
+            matches!(result, Err(sqlx::Error::Database(ref error))
+            if error.code().as_deref() == Some("23514")),
+            "{reason}: {result:?}"
+        );
+    }
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason) VALUES ($1, $2, 'document')",
+    )
+    .bind(ID_A)
+    .bind([44_u8; 16].as_slice())
+    .execute(&mut connection)
+    .await
+    .expect("document exclusion");
+    connection.close().await.expect("close");
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let kept = txn.kept_entries().await.expect("kept entries");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].reason, pubky_switch::store::KeptReason::Document);
+    assert_eq!(kept[0].at_ms, None);
+    drop(txn);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_kept_exclusion_reader_rejects_unknown_event_time() {
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut connection = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("connect");
+    let checks: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint \
+         WHERE conrelid = 'kept_app_ids'::regclass AND contype = 'c'",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .expect("checks");
+    for check in checks {
+        let quoted = check.replace('"', "\"\"");
+        connection
+            .execute(format!("ALTER TABLE kept_app_ids DROP CONSTRAINT \"{quoted}\"").as_str())
+            .await
+            .expect("allow corrupted data");
+    }
+    sqlx::query("INSERT INTO kept_app_ids (account_id, app_id, reason) VALUES ($1, $2, 'revoked')")
+        .bind(ID_A)
+        .bind([44_u8; 16].as_slice())
+        .execute(&mut connection)
+        .await
+        .expect("corrupted event");
+    connection.close().await.expect("close");
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    assert!(matches!(
+        txn.kept_entries().await,
+        Err(StoreError::Corrupt("a kept App ID's event provenance"))
+    ));
+    drop(txn);
     fx.finish().await;
 }
 
@@ -1389,6 +1511,7 @@ async fn test_store_identity_lock_holds_a_creation_until_the_erasure_commits() {
             .expect("begin")
             .expect("the account");
         let account = NewAccount {
+            activation: pubky_switch_core::records::AccountActivation::Ordinary,
             created_at_ms: T0 + 1_000,
             ..old.clone()
         };
@@ -1456,6 +1579,7 @@ async fn test_store_creation_commits_at_the_time_asked_for() {
     let Some(fx) = fixture().await else { return };
     for (id, at) in [(ID_A, T0), (ID_B, T0 + 5_001)] {
         let account = NewAccount {
+            activation: pubky_switch_core::records::AccountActivation::Ordinary,
             created_at_ms: at,
             ..new_account(id)
         };
@@ -1589,7 +1713,7 @@ async fn seed_state(fx: &Fixture, id: &str) -> KeyId {
         .expect("record");
     txn.hold_revoked_apps(&[[8; 16]]).await.expect("hold");
     txn.set_identity(&HeldIdentity {
-        doc: pubky_switch_core::sig::SignedDoc::from_parts(b"{}", &[0; 64]),
+        doc: identity_doc(),
         proof: None,
     })
     .await
@@ -1792,7 +1916,7 @@ async fn test_store_lookup_reads_generation_chain_and_document() {
         ),
         (1, None, T0, T0, None)
     );
-    let doc = pubky_switch_core::sig::SignedDoc::from_parts(b"{\"v\":1}", &[4; 64]);
+    let doc = identity_doc();
     let mut txn = fx
         .store()
         .begin(ID_A)

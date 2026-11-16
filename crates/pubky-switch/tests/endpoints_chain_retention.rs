@@ -495,10 +495,11 @@ async fn test_retention_reads_and_drops_a_bounded_number_at_one_request() {
 #[tokio::test]
 async fn test_retention_waits_for_trusted_time() {
     // Without trusted time nothing is signed or dropped (wire 7.3 step 4).
-    let Some(replay) = registered(small(), true).await else {
+    let Some(mut replay) = registered(small(), false).await else {
         return;
     };
     chain(&replay, 10, 6, AT).await;
+    replay.service = replay.without_trusted_time_with(small());
     let before = kept(&replay).await;
     cursors(&replay, ALL, head_seq(&replay).await).await;
     request(&replay, &after(31 * DAY_MS)).await;

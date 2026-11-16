@@ -61,12 +61,17 @@ fn alice_keys() -> Alice {
 }
 
 /// The vector enrollment's body, with another nonce or origin, signed by alice.
-fn enrollment_body(nonce: u8, origin: &str) -> Vec<u8> {
-    enrollment_with(nonce, origin, None)
+async fn enrollment_body(replay: &Replay, nonce: u8, origin: &str) -> Vec<u8> {
+    enrollment_with(replay, nonce, origin, None).await
 }
 
 /// The vector enrollment's body with another nonce, origin and `identity_doc`.
-fn enrollment_with(nonce: u8, origin: &str, identity_doc: Option<SignedDoc>) -> Vec<u8> {
+async fn enrollment_with(
+    replay: &Replay,
+    nonce: u8,
+    origin: &str,
+    identity_doc: Option<SignedDoc>,
+) -> Vec<u8> {
     let http = vectors("http.json");
     let vector = named(&http["requests"], "signer: enrollment");
     let body: Value = serde_json::from_slice(
@@ -79,24 +84,43 @@ fn enrollment_with(nonce: u8, origin: &str, identity_doc: Option<SignedDoc>) -> 
     fields.nonce = [nonce; 16];
     fields.origin = origin.into();
     fields.identity_doc = identity_doc;
+    fields.intent = if origin == ORIGIN {
+        new_alice_enrollment_intent(replay, ms(T)).await
+    } else {
+        let other = replay_at(origin, "service/alice", Limits::default(), false)
+            .await
+            .expect("service");
+        set_time(&other.clock, T);
+        let observation = account_observation_at(&other, &alice_keys().key, origin, ms(T)).await;
+        other.db.drop_database().await.expect("drop");
+        pubky_switch_core::records::EnrollmentIntent::Create { observation }
+    };
     let enrollment = Enrollment::sign(&alice_keys().key, fields).expect("sign");
     serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json")
 }
 
 const T: &str = "2026-01-01T00:00:00.000Z";
 
-/// Enroll alice with the vectors' enrollment, then deliver her version 1 at `T`.
-async fn serving(replay: &Replay) {
+/// Enroll alice from current account evidence, then deliver her version 1 at `T`.
+async fn serving(replay: &Replay) -> (Vec<u8>, Vec<u8>) {
     let http = vectors("http.json");
     set_time(&replay.clock, "2025-12-30T00:00:00.040Z");
-    let enrolled = replay
-        .service
-        .handle(vector_request(named(
-            &http["requests"],
-            "signer: enrollment",
-        )))
-        .await;
+    let request = fresh_alice_enrollment(replay, alice_created()).await;
+    let enrollment = request.body.to_vec();
+    let enrolled = replay.service.handle(request).await;
     assert_eq!(enrolled.status, 200);
+    let wrapper: Value = serde_json::from_slice(&enrollment).expect("enrollment request");
+    let signed: SignedDoc =
+        serde_json::from_value(wrapper["enrollment"].clone()).expect("enrollment");
+    let expected = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the service key",
+    );
+    let mut expected: Value = serde_json::from_str(expected["body"].as_str().expect("answer body"))
+        .expect("enrollment answer");
+    expected["enrollment"] = json!(b64(&signed.doc_hash().expect("enrollment hash")));
+    assert_eq!(json(&enrolled), expected);
+    let first_answer = enrolled.body.to_vec();
     set_time(&replay.clock, "2025-12-30T00:00:02.000Z");
     let delivered = replay
         .service
@@ -112,6 +136,7 @@ async fn serving(replay: &Replay) {
         String::from_utf8_lossy(&delivered.body)
     );
     set_time(&replay.clock, T);
+    (enrollment, first_answer)
 }
 
 fn version(name: &str) -> SignedDoc {
@@ -132,7 +157,7 @@ async fn test_enroll_same_enrollment_same_answer() {
     let Some(replay) = replay().await else { return };
     let alice = alice_keys();
     set_time(&replay.clock, T);
-    let body = enrollment_body(1, ORIGIN);
+    let body = enrollment_body(&replay, 1, ORIGIN).await;
     let first = replay
         .service
         .handle(signer_request("POST", "/v1/enroll", body.clone(), ms(T)))
@@ -152,7 +177,7 @@ async fn test_enroll_same_enrollment_same_answer() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(2, ORIGIN),
+            enrollment_body(&replay, 2, ORIGIN).await,
             ms(T),
         ))
         .await;
@@ -170,7 +195,12 @@ async fn test_enroll_serving_account_answers_the_current_key() {
     serving(&replay).await;
     let account_key = vectors("keys.json")["service_keys"][0]["public"].clone();
     for nonce in [3, 4] {
-        let request = signer_request("POST", "/v1/enroll", enrollment_body(nonce, ORIGIN), ms(T));
+        let request = signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(&replay, nonce, ORIGIN).await,
+            ms(T),
+        );
         let sent = Sent::of(&request);
         let answer = replay.service.handle(request).await;
         assert_eq!(answer.status, 200);
@@ -205,7 +235,7 @@ async fn test_enroll_refusals() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(5, "https://other.example"),
+            enrollment_body(&replay, 5, "https://other.example").await,
             ms(T),
         ))
         .await;
@@ -214,8 +244,13 @@ async fn test_enroll_refusals() {
         (400, "bad_request")
     );
     // A request signature over another body.
-    let mut tampered = signer_request("POST", "/v1/enroll", enrollment_body(6, ORIGIN), ms(T));
-    tampered.body = enrollment_body(7, ORIGIN).into();
+    let mut tampered = signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment_body(&replay, 6, ORIGIN).await,
+        ms(T),
+    );
+    tampered.body = enrollment_body(&replay, 7, ORIGIN).await.into();
     let refused = replay.service.handle(tampered).await;
     assert_eq!(
         (refused.status, code(&refused).as_str()),
@@ -226,7 +261,12 @@ async fn test_enroll_refusals() {
         "signed with the service key"
     );
     // An app of the identity.
-    let mut app = signer_request("POST", "/v1/enroll", enrollment_body(8, ORIGIN), ms(T));
+    let mut app = signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment_body(&replay, 8, ORIGIN).await,
+        ms(T),
+    );
     app.headers.insert(
         header::APP,
         "wejf37ngr7qizej3eoijn3hq4c".parse().expect("value"),
@@ -289,10 +329,12 @@ async fn test_identity_callers_and_timestamps() {
     let body = delivery(version("alice identity.json"), None);
 
     // An own app isn't current before app records are served.
-    let mut app = signer_request("PUT", &path, body.clone(), ms(T));
-    app.headers.insert(
-        header::APP,
-        "wejf37ngr7qizej3eoijn3hq4c".parse().expect("value"),
+    let app = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "PUT",
+        &path,
+        body.clone(),
+        ms(T),
     );
     assert_eq!(code(&replay.service.handle(app).await), "not_current");
 
@@ -346,7 +388,7 @@ async fn test_public_identity_staged_and_limits() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(1, ORIGIN),
+            enrollment_body(&replay, 1, ORIGIN).await,
             ms(T),
         ))
         .await;
@@ -373,7 +415,7 @@ async fn test_public_identity_staged_and_limits() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_with(2, ORIGIN, Some(elsewhere)),
+            enrollment_with(&replay, 2, ORIGIN, Some(elsewhere)).await,
             ms(T),
         ))
         .await;
@@ -698,7 +740,7 @@ async fn test_delivery_away_from_this_service_moves_the_mark() {
 async fn test_enrollment_answer_keeps_its_limits_after_a_config_change() {
     let Some(replay) = replay().await else { return };
     set_time(&replay.clock, T);
-    let body = enrollment_body(1, ORIGIN);
+    let body = enrollment_body(&replay, 1, ORIGIN).await;
     let first = replay
         .service
         .handle(signer_request("POST", "/v1/enroll", body.clone(), ms(T)))
@@ -729,7 +771,7 @@ async fn test_commit_failure_answer_keeps_the_committed_time() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(1, ORIGIN),
+            enrollment_body(&replay, 1, ORIGIN).await,
             ms(T),
         ))
         .await;
@@ -754,7 +796,13 @@ async fn test_commit_failure_answer_keeps_the_committed_time() {
     set_time(&replay.clock, &pubky_switch_core::time::rfc3339(later));
     let http = vectors("http.json");
     let mut put = vector_request(named(&http["requests"], "signer: identity.json delivery"));
-    put = signer_request("PUT", &put.path_and_query, put.body.to_vec(), later);
+    put = signer_request_at_creation(
+        "PUT",
+        &put.path_and_query,
+        put.body.to_vec(),
+        later,
+        Some(ms(T)),
+    );
     let failed = replay.service.handle(put).await;
     assert_eq!(code(&failed), "unavailable");
     assert_eq!(
@@ -769,7 +817,7 @@ async fn test_commit_failure_answer_keeps_the_committed_time() {
 async fn test_concurrent_first_enrollments_share_one_account() {
     let Some(replay) = replay().await else { return };
     set_time(&replay.clock, T);
-    let body = enrollment_body(1, ORIGIN);
+    let body = enrollment_body(&replay, 1, ORIGIN).await;
     let (a, b) = tokio::join!(
         replay
             .service
@@ -882,6 +930,7 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
         serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment body");
     fields.identity_doc = None;
     fields.revoked_apps = Some(vec![wallet]);
+    fields.intent = new_alice_enrollment_intent(&replay, ms(T)).await;
     let enrollment = Enrollment::sign(&alice.key, fields).expect("sign");
     let body = serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json");
     let enrolled = replay
@@ -897,7 +946,7 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
     let path = format!("/v1/{}/identity", alice.id);
     let delivered = replay
         .service
-        .handle(signer_request(
+        .handle(signer_request_at_creation(
             "PUT",
             &path,
             delivery(
@@ -905,6 +954,7 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
                 None,
             ),
             ms(T),
+            Some(ms(T)),
         ))
         .await;
     assert_eq!(
@@ -924,25 +974,17 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
 #[tokio::test]
 async fn test_enroll_retry_after_serving_gets_the_first_answer() {
     let Some(replay) = replay().await else { return };
-    serving(&replay).await;
-    // The vectors' enrollment again, under a fresh request signature, once the account
+    let (body, first_answer) = serving(&replay).await;
+    // The same signed enrollment, under a fresh request signature, once the account
     // serves: the answer it got first.
-    let http = vectors("http.json");
-    let vector = named(&http["requests"], "signer: enrollment");
-    let body =
-        pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64");
     let again = replay
         .service
         .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
         .await;
-    let first = named(
-        &http["responses"],
-        "signer: enrollment answer, signed with the service key",
-    );
     assert_eq!(again.status, 200);
     assert_eq!(
         String::from_utf8_lossy(&again.body),
-        first["body"].as_str().expect("body"),
+        String::from_utf8_lossy(&first_answer),
         "the same enrollment, the same answer"
     );
     // A new enrollment gets the current key, the account's.
@@ -951,7 +993,7 @@ async fn test_enroll_retry_after_serving_gets_the_first_answer() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(5, ORIGIN),
+            enrollment_body(&replay, 5, ORIGIN).await,
             ms(T),
         ))
         .await;
@@ -1018,12 +1060,12 @@ async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
     let Some(replay) = replay_with(limits).await else {
         return;
     };
-    serving(&replay).await;
+    let (body, first_answer) = serving(&replay).await;
     let alice = alice_keys();
     // Three more enrollments, all at one time.
     let mut newest = [0; 32];
     for nonce in 11..=13 {
-        let body = enrollment_body(nonce, ORIGIN);
+        let body = enrollment_body(&replay, nonce, ORIGIN).await;
         let value: Value = serde_json::from_slice(&body).expect("json");
         let signed: SignedDoc = serde_json::from_value(value["enrollment"].clone()).expect("doc");
         newest = signed.doc_hash().expect("hash");
@@ -1051,21 +1093,13 @@ async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
     assert!(kept[0].1, "the creating enrollment's answer stays");
     assert_eq!(kept[1].0, newest.to_vec(), "the newest of the others stays");
     // The creating enrollment again: its own answer, byte for byte.
-    let http = vectors("http.json");
-    let vector = named(&http["requests"], "signer: enrollment");
-    let body =
-        pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64");
     let again = replay
         .service
         .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
         .await;
-    let first = named(
-        &http["responses"],
-        "signer: enrollment answer, signed with the service key",
-    );
     assert_eq!(
         String::from_utf8_lossy(&again.body),
-        first["body"].as_str().expect("body")
+        String::from_utf8_lossy(&first_answer)
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -1077,7 +1111,7 @@ async fn enroll(replay: &Replay, nonce: u8) -> pubky_switch::http::SwitchRespons
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(nonce, ORIGIN),
+            enrollment_body(replay, nonce, ORIGIN).await,
             ms(T),
         ))
         .await
@@ -1092,14 +1126,23 @@ async fn test_enroll_answer_dropped_past_the_bound_is_built_again() {
     set_time(&replay.clock, T);
     // The creating enrollment, then a second while the account is staged: the service key.
     let first = enroll(&replay, 20).await;
-    let second = enroll(&replay, 21).await;
+    let second_body = enrollment_body(&replay, 21, ORIGIN).await;
+    let second = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            second_body.clone(),
+            ms(T),
+        ))
+        .await;
     assert_eq!(second.status, 200);
     assert_eq!(json(&second)["service_key"], json(&first)["service_key"]);
     // The account serves, and 16 fresh enrollments get the current key.
     let alice = alice_keys();
     let delivered = replay
         .service
-        .handle(signer_request(
+        .handle(signer_request_at_creation(
             "PUT",
             &format!("/v1/{}/identity", alice.id),
             delivery(
@@ -1107,6 +1150,7 @@ async fn test_enroll_answer_dropped_past_the_bound_is_built_again() {
                 None,
             ),
             ms(T),
+            Some(ms(T)),
         ))
         .await;
     assert_eq!(
@@ -1119,7 +1163,7 @@ async fn test_enroll_answer_dropped_past_the_bound_is_built_again() {
         let answer = enroll(&replay, nonce).await;
         assert_eq!(json(&answer)["service_key"], json(&first)["service_key"]);
     }
-    let value: Value = serde_json::from_slice(&enrollment_body(21, ORIGIN)).expect("json");
+    let value: Value = serde_json::from_slice(&second_body).expect("json");
     let signed: SignedDoc = serde_json::from_value(value["enrollment"].clone()).expect("doc");
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -1135,7 +1179,10 @@ async fn test_enroll_answer_dropped_past_the_bound_is_built_again() {
     conn.close().await.expect("close");
     assert_eq!(held, 0, "the second answer dropped");
     // The second enrollment again: its own answer, byte for byte.
-    let again = enroll(&replay, 21).await;
+    let again = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", second_body, ms(T)))
+        .await;
     assert_eq!(
         again.body, second.body,
         "the same enrollment, the same answer"
@@ -1280,7 +1327,7 @@ async fn test_enroll_takes_a_zero_mark_left_without_an_account() {
         .handle(signer_request(
             "POST",
             "/v1/enroll",
-            enrollment_body(2, ORIGIN),
+            enrollment_body(&replay, 2, ORIGIN).await,
             later,
         ))
         .await;
@@ -1339,18 +1386,30 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
     let answer = replay.service.handle(read).await;
     assert_notice(&answer, 1, "behind");
     assert!(signed_with(&answer, &key, &sent), "the key in the mark");
-    let apps = signer_request("GET", &format!("/v1/{}/apps", alice.id), Vec::new(), ms(T));
+    let apps = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice.id),
+        Vec::new(),
+        ms(T),
+        Some(lost_at),
+    );
     assert_notice(&replay.service.handle(apps).await, 1, "behind");
     let first = delivery(
         version("alice identity.json, first delivery (version 1)"),
         None,
     );
-    let put = signer_request("PUT", &path, first.clone(), ms(T));
+    let put = signer_request_at_creation("PUT", &path, first.clone(), ms(T), Some(lost_at));
     assert_notice(&replay.service.handle(put).await, 1, "behind");
     // Retired by the operator: the notice is permanent, and the retirement outlives the
     // take-over.
     replay.marks.retire(&alice.id, 1).await.expect("retire");
-    let apps = signer_request("GET", &format!("/v1/{}/apps", alice.id), Vec::new(), ms(T));
+    let apps = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice.id),
+        Vec::new(),
+        ms(T),
+        Some(lost_at),
+    );
     assert_notice_of(&replay.service.handle(apps).await, 1, "behind", true);
 
     let enrolled = enroll(&replay, 1).await;
@@ -1375,9 +1434,15 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
     assert_eq!(replay.marks.retired(&alice.id).await.expect("retired"), [1]);
     assert_eq!(created_at_of(&replay, &alice.id).await, ms(T));
     // Staged and bounded by the mark.
-    let apps = signer_request("GET", &format!("/v1/{}/apps", alice.id), Vec::new(), ms(T));
+    let apps = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice.id),
+        Vec::new(),
+        ms(T),
+        Some(ms(T)),
+    );
     assert_notice_of(&replay.service.handle(apps).await, 1, "behind", true);
-    let put = signer_request("PUT", &path, first, ms(T));
+    let put = signer_request_at_creation("PUT", &path, first, ms(T), Some(ms(T)));
     assert_notice_of(&replay.service.handle(put).await, 1, "behind", true);
     for (generation, recovery_from) in [(2, None), (2, Some(0)), (1, Some(0))] {
         let doc = alice_version(|body| {
@@ -1385,7 +1450,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
             body.generation = generation;
             body.recovery_from = recovery_from;
         });
-        let put = signer_request("PUT", &path, delivery(doc, None), ms(T));
+        let put = signer_request_at_creation("PUT", &path, delivery(doc, None), ms(T), Some(ms(T)));
         assert_notice_of(&replay.service.handle(put).await, 1, "behind", true);
     }
     // The start above both generations serves it.
@@ -1394,7 +1459,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
         body.generation = 2;
         body.recovery_from = Some(1);
     });
-    let put = signer_request("PUT", &path, delivery(start, None), ms(T));
+    let put = signer_request_at_creation("PUT", &path, delivery(start, None), ms(T), Some(ms(T)));
     let sent = Sent::of(&put);
     let started = replay.service.handle(put).await;
     assert_eq!(
@@ -1410,7 +1475,13 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
         (mark.generation, mark.seq, mark.created_at_ms),
         (2, 2, ms(T))
     );
-    let apps = signer_request("GET", &format!("/v1/{}/apps", alice.id), Vec::new(), ms(T));
+    let apps = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice.id),
+        Vec::new(),
+        ms(T),
+        Some(ms(T)),
+    );
     assert_eq!(replay.service.handle(apps).await.status, 200, "serving");
     replay.db.drop_database().await.expect("drop");
 }
@@ -1423,10 +1494,15 @@ async fn test_enroll_while_the_mark_store_cant_be_read_is_503() {
     let Some(replay) = replay().await else { return };
     let alice = alice_keys();
     set_time(&replay.clock, T);
+    let request = signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment_body(&replay, 1, ORIGIN).await,
+        ms(T),
+    );
     let store_id = replay.key_dir().join("accounts").join("store-id");
     let id = std::fs::read(&store_id).expect("store-id");
     std::fs::remove_file(&store_id).expect("remove");
-    let request = signer_request("POST", "/v1/enroll", enrollment_body(1, ORIGIN), ms(T));
     let sent = Sent::of(&request);
     let refused = replay.service.handle(request).await;
     assert_eq!(
@@ -1626,11 +1702,12 @@ async fn test_enroll_concurrent_creations_answer_one_creation_time() {
     assert_eq!(json(&second)["created"], created_text);
     assert_eq!(mark_of(&replay, &alice.id).await.created_at_ms, created);
     assert_eq!(accounts_of(&replay, &alice.id).await, 1);
-    let erase = signer_request(
+    let erase = signer_request_at_creation(
         "POST",
         &format!("/v1/{}/erase", alice.id),
         pubky_switch_core::http::erase_body(Some(created), None),
         ms(T) + 10,
+        Some(created),
     );
     let erased = replay.service.handle(erase).await;
     assert_eq!(
@@ -1664,7 +1741,12 @@ async fn test_enroll_under_a_stale_instance_lock_writes_nothing() {
     let alice = alice_keys();
     set_time(&replay.clock, T);
     let stale = with_stale_lock(&replay);
-    let request = signer_request("POST", "/v1/enroll", enrollment_body(1, ORIGIN), ms(T));
+    let request = signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment_body(&replay, 1, ORIGIN).await,
+        ms(T),
+    );
     let refused = stale.handle(request).await;
     assert_eq!(
         (refused.status, code(&refused).as_str()),
@@ -1678,7 +1760,12 @@ async fn test_enroll_under_a_stale_instance_lock_writes_nothing() {
     );
     assert_eq!(enroll(&replay, 1).await.status, 200);
     let mark = mark_of(&replay, &alice.id).await;
-    let request = signer_request("POST", "/v1/enroll", enrollment_body(2, ORIGIN), ms(T));
+    let request = signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment_body(&replay, 2, ORIGIN).await,
+        ms(T),
+    );
     let refused = stale.handle(request).await;
     assert_eq!(
         (refused.status, code(&refused).as_str()),
@@ -1724,11 +1811,12 @@ async fn test_erase_lost_identity_under_a_stale_instance_lock_writes_nothing() {
     let mark = mark_of(&replay, &alice.id).await;
     set_time(&replay.clock, T);
     let erase = || {
-        signer_request(
+        signer_request_at_creation(
             "POST",
             &format!("/v1/{}/erase", alice.id),
             pubky_switch_core::http::erase_body(Some(lost_at), None),
             ms(T),
+            Some(lost_at),
         )
     };
     let refused = with_stale_lock(&replay).handle(erase()).await;
@@ -1763,9 +1851,8 @@ async fn test_erase_lost_identity_under_a_stale_instance_lock_writes_nothing() {
 
 #[tokio::test]
 async fn test_erase_null_members_read_as_missing() {
-    // `null` is a missing member (Switch wire 1.1 "Absent and null"): an erasure whose
-    // `created` is `null` gets the `409 conflict` a missing one gets, carrying the creation
-    // time, never a `400` (Switch wire 7.4.16).
+    // Null cannot agree with the required creation header. The malformed erasure is
+    // refused before any destructive action (Switch account binding 1).
     let Some(replay) = replay().await else { return };
     serving(&replay).await;
     let alice = alice_keys();
@@ -1778,15 +1865,11 @@ async fn test_erase_null_members_read_as_missing() {
     let refused = replay.service.handle(erase).await;
     assert_eq!(
         (refused.status, code(&refused).as_str()),
-        (409, "conflict"),
+        (400, "bad_request"),
         "{}",
         String::from_utf8_lossy(&refused.body)
     );
-    let created = mark_of(&replay, &alice.id).await.created_at_ms;
-    assert_eq!(
-        json(&refused)["current"]["created"],
-        json!(pubky_switch_core::time::rfc3339(created))
-    );
+    assert!(header_text(&refused, pubky_switch_core::http::header::HEAD).is_none());
     assert_eq!(accounts_of(&replay, &alice.id).await, 1, "nothing erased");
     replay.db.drop_database().await.expect("drop");
 }

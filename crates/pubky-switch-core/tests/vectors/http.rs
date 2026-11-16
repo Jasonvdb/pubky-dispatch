@@ -36,7 +36,7 @@ fn refs(fields: &[Vec<u8>]) -> Vec<&[u8]> {
 
 /// The names of a request's signed fields, of a response's and of a received request's
 /// (Switch wire 7.1), as the files write them.
-const REQUEST_FIELDS: [&str; 9] = [
+const REQUEST_FIELDS: [&str; 10] = [
     "method",
     "path and query",
     "BLAKE3(body)",
@@ -46,6 +46,7 @@ const REQUEST_FIELDS: [&str; 9] = [
     "Switch-App",
     "Switch-Cert",
     "Switch-Invite-Code",
+    "Switch-Created",
 ];
 const RESPONSE_FIELDS: [&str; 5] = [
     "u64(status)",
@@ -54,7 +55,7 @@ const RESPONSE_FIELDS: [&str; 5] = [
     "head field",
     "BLAKE3(body)",
 ];
-const RECEIVED_FIELDS: [&str; 11] = [
+const RECEIVED_FIELDS: [&str; 12] = [
     "method",
     "path and query",
     "body field",
@@ -66,6 +67,7 @@ const RECEIVED_FIELDS: [&str; 11] = [
     "H(Switch-Transfer)",
     "H(Switch-Timestamp)",
     "H(Switch-Signature)",
+    "H(Switch-Created)",
 ];
 
 /// The origin every request of the file is signed for but bob's switch's.
@@ -233,6 +235,7 @@ fn request_case(
         (http::header::APP, &headers.app),
         (http::header::CERT, &headers.cert),
         (http::header::INVITE_CODE, &headers.invite_code),
+        (http::header::CREATED, &headers.created),
     ] {
         if let Some(value) = value {
             sent[name] = Value::String(value.clone());
@@ -252,6 +255,74 @@ fn request_case(
         "signed_bytes_hex": hex::encode(sig::signed_bytes(labels::sig::HTTP, &refs(&fields))),
         "signer": name,
     })
+}
+
+fn signature_case(case: &Value, names: &[&str]) {
+    let fields = fields_of(case);
+    crate::signatures::generated_case(
+        st(case, "label"),
+        names,
+        &refs(&fields),
+        &b64n::<64>(st(case, "signature")),
+    );
+}
+
+/// Reproduce each ordinary request with its actual account creation binding.
+fn request_signatures(keys: &Keys) {
+    let file = load("http.json");
+    let created = pubky_switch_core::time::rfc3339(created_of(&file));
+    let mut cases = Vec::new();
+    for held in arr(&file, "requests") {
+        if header(held, http::header::TRANSFER).is_some() {
+            continue;
+        }
+        let mut body = b64(st(held, "body_b64"));
+        let mut headers = RequestHeaders {
+            identity: header(held, http::header::IDENTITY).unwrap().into(),
+            timestamp: header(held, http::header::TIMESTAMP).unwrap().into(),
+            app: header(held, http::header::APP).map(str::to_owned),
+            cert: header(held, http::header::CERT).map(str::to_owned),
+            invite_code: header(held, http::header::INVITE_CODE).map(str::to_owned),
+            created: None,
+        };
+        let path = st(held, "path");
+        if path == "/v1/enroll" {
+            let enrollment = Enrollment::verify(
+                &document("alice enrollment"),
+                &keys.identity("alice"),
+                st(held, "origin"),
+            )
+            .unwrap();
+            body = enrollment.to_request_json().unwrap();
+            headers.created = enrollment
+                .body()
+                .intent
+                .created()
+                .map(pubky_switch_core::time::rfc3339);
+        } else if headers.app.is_none() {
+            headers.created = Some(created.clone());
+        }
+        if st(held, "method") == "PUT" && path.ends_with("/handover") {
+            let mut value: Value = serde_json::from_slice(&body).unwrap();
+            value["handover"] = load("envelopes.json")["signer_handover"]["handover"].clone();
+            body = serde_json::to_vec(&value).unwrap();
+        }
+        let target = RequestTarget {
+            method: st(held, "method"),
+            origin: st(held, "origin"),
+            path_and_query: path,
+            body: &body,
+        };
+        let public = b64n::<32>(st(held, "public_key"));
+        let key = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&public).unwrap());
+        let mut case = request_case(st(held, "name"), &key, &target, &headers);
+        case["signer"] = held["signer"].clone();
+        if case["name"] == "own app: long-poll feed read" {
+            signature_case(&case, &REQUEST_FIELDS);
+        }
+        cases.push((Place::Case("/requests"), case));
+    }
+    generated("http.json", &cases);
 }
 
 /// The requests of the three responses the reference prototype wrote without theirs, which
@@ -299,6 +370,7 @@ fn answered_requests(keys: &Keys) {
                 app: Some(keys.app("shop").app_id.clone()),
                 cert: Some(document("shop certificate").compact()),
                 invite_code: None,
+                created: None,
             },
         ),
         request_case(
@@ -363,7 +435,7 @@ fn response_signatures(keys: &Keys) {
     });
     let pointer = format!("/responses/{not_hosted_at}");
     let not_hosted = signed_case(keys, &file, not_hosted);
-    let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent, and the method as sent; the timestamp is RFC 3339 UTC to the second. Each response names the request case it answers in request (null for an unsigned public read) and gives the request as the service received it in received_request: lp(method, path and query, body field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature)), the body field BLAKE3(body) once the body is read, each H empty when the header is absent and lp of its values when present, every H empty for the public read. Response signatures cover u64(status), BLAKE3 of the received request, the exact Switch-Server-Time text, the head field (empty without Switch-Head, BLAKE3 of its exact text with one) and BLAKE3(body).";
+    let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent, and the method as sent; the timestamp is RFC 3339 UTC to the second. Each response names the request case it answers in request (null for an unsigned public read) and gives the request as the service received it in received_request: lp(method, path and query, body field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature), H(Switch-Created)), the body field BLAKE3(body) once the body is read, each H empty when the header is absent and lp of its values when present, every H empty for the public read. Response signatures cover u64(status), BLAKE3 of the received request, the exact Switch-Server-Time text, the head field (empty without Switch-Head, BLAKE3 of its exact text with one) and BLAKE3(body).";
     generated(
         "http.json",
         &[
@@ -378,10 +450,17 @@ fn response_signatures(keys: &Keys) {
     let cases: Vec<(Place<'_>, Value)> = arr(&file, "responses")
         .iter()
         .map(|case| {
-            (
-                Place::Case("/responses"),
-                signed_case(keys, &file, case.clone()),
-            )
+            let mut case = case.clone();
+            let mut body: Value = serde_json::from_str(st(&case, "body")).unwrap();
+            if body.get("handover").is_some_and(Value::is_object) {
+                body["handover"] = load("envelopes.json")["signer_handover"]["handover"].clone();
+                case["body"] = Value::String(serde_json::to_string(&body).unwrap());
+            }
+            let case = signed_case(keys, &file, case);
+            if case["name"] == "own app: feed page, with the head header" {
+                signature_case(&case, &RESPONSE_FIELDS);
+            }
+            (Place::Case("/responses"), case)
         })
         .collect();
     generated("http.json", &cases);
@@ -552,10 +631,14 @@ fn enrollment_answer_at(file: &Value) -> usize {
 
 /// The account's creation time (Switch wire 3.7, 7.3): the time the enrollment that created
 /// it was answered at, which its answer names in `created`.
-fn created_of(file: &Value) -> u64 {
+pub(super) fn created_of(file: &Value) -> u64 {
     let answer = &arr(file, "responses")[enrollment_answer_at(file)];
-    pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
-        .unwrap()
+    let at =
+        pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
+            .unwrap();
+    let body = EnrollmentAnswer::from_json(st(answer, "body").as_bytes()).unwrap();
+    assert_eq!(body.created, at);
+    body.created
 }
 
 /// The enrollment answer (Switch wire 3.7), which `pubky-switch-core` writes (README "How
@@ -668,6 +751,7 @@ fn erasures(keys: &Keys) {
         let headers = RequestHeaders {
             timestamp: timestamp.to_owned(),
             identity: alice_id.clone(),
+            created: Some(pubky_switch_core::time::rfc3339(created)),
             ..RequestHeaders::default()
         };
         let request = request_case(name, &identity, &target, &headers);
@@ -798,7 +882,9 @@ fn feed_page_cursors(keys: &Keys) {
 #[test]
 fn test_vectors_http() {
     let keys = keys();
+    crate::documents::enrollment_cases(&keys);
     answered_requests(&keys);
+    request_signatures(&keys);
     enrollment_answer(&keys);
     erasures(&keys);
     feed_page_cursors(&keys);
@@ -909,6 +995,7 @@ fn test_vectors_http() {
                 app: header(r, http::header::APP).map(str::to_owned),
                 cert: header(r, http::header::CERT).map(str::to_owned),
                 invite_code: header(r, http::header::INVITE_CODE).map(str::to_owned),
+                created: header(r, http::header::CREATED).map(str::to_owned),
             };
             http::verify_request(&public, &target, &headers, &signature)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));

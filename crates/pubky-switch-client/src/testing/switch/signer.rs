@@ -2,7 +2,7 @@
 //! `identity.json` delivery (Switch wire 3.3, 7.4.2) and the app list (Switch wire 7.4.12).
 //! The delivery is judged by the core's `check_delivery`, the rule the service applies.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use pubky_switch_core::chain::{ItemType, ProofState, ServiceTransition, item_hash};
@@ -11,13 +11,14 @@ use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
-    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, GenerationChange,
-    IdentityDoc, KeptProofs, Limits, check_delivery, needed_generations,
+    AccountActivation, AccountAssociation, AccountView, Delivery, DeliveryRefusal, Enrollment,
+    EnrollmentAnswer, GenerationChange, IdentityDoc, KeptProofs, Limits, check_delivery,
+    needed_generations,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
 
-use super::{Answer, Inner, SWITCH_ORIGIN, ScriptedSwitch, bad};
+use super::{Answer, Inner, SWITCH_ORIGIN, ScriptedSwitch, SwitchApp, bad};
 use crate::clock::TestClock;
 use crate::testing::ScriptError;
 
@@ -31,7 +32,16 @@ pub(crate) struct Enrolled {
     pub(crate) limits: Limits,
     /// The answer to each enrollment taken, by enrollment hash, so the same enrollment again
     /// gets the same answer.
-    pub(crate) answers: HashMap<[u8; 32], Value>,
+    pub(crate) answers: HashMap<[u8; 32], EnrollmentReceipt>,
+}
+
+/// An exact completed enrollment and the account/store to which it applied (account
+/// binding 3). Keeping the result never authorizes another application of its intent.
+#[derive(Clone, Debug)]
+pub(crate) struct EnrollmentReceipt {
+    created: u64,
+    store_id: [u8; 16],
+    answer: Value,
 }
 
 impl ScriptedSwitch {
@@ -64,6 +74,21 @@ impl ScriptedSwitch {
             // No account, and no mark yet (Switch wire 7.3).
             inner.marks = super::marks::MarkStore::default();
         }
+        switch
+    }
+
+    /// An unenrolled account in the service store identified by `store_id`.
+    /// Accounts at one service origin share this identity across enrollment and erasure;
+    /// another service store is constructed with another identity.
+    pub fn unenrolled_at_in_store(
+        identity: &pubky_switch_core::keys::IdentityKey,
+        service_secret: [u8; 32],
+        clock: Arc<TestClock>,
+        origin: &str,
+        store_id: [u8; 16],
+    ) -> Arc<Self> {
+        let switch = Self::unenrolled_at(identity, service_secret, clock, origin);
+        switch.lock().marks.identity = Some(store_id);
         switch
     }
 
@@ -138,49 +163,144 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// `POST /v1/enroll` (Switch wire 3.7, 7.4.1).
-    pub(super) fn enroll(
-        &mut self,
+    /// Authenticate the wrapper and exact enrollment before a mark/erasure judgement can
+    /// mutate state (Switch account binding 3).
+    pub(super) fn check_enrollment(
+        &self,
         request: &crate::transport::Request,
-    ) -> Result<Answer, ScriptError> {
-        let identity = self.identity.public();
-        let body: Value = match parse_json(&request.body) {
-            Ok(value) => value,
-            Err(_) => return Ok(bad(ErrorCode::BadRequest, "malformed body", json!(null))),
-        };
-        let Some(signed) = body
+    ) -> Result<Enrollment, Answer> {
+        self.authenticate_signer(request)?;
+        let body: Value = parse_json(&request.body)
+            .map_err(|_| bad(ErrorCode::BadRequest, "malformed body", Value::Null))?;
+        let signed = body
             .get("enrollment")
-            .and_then(|e| serde_json::from_value::<SignedDoc>(e.clone()).ok())
-        else {
-            return Ok(bad(ErrorCode::BadRequest, "no enrollment", json!(null)));
+            .and_then(|value| serde_json::from_value::<SignedDoc>(value.clone()).ok())
+            .ok_or_else(|| bad(ErrorCode::BadRequest, "no enrollment", Value::Null))?;
+        let enrollment = Enrollment::verify(&signed, &self.identity.public(), &self.origin)
+            .map_err(|error| match error {
+                pubky_switch_core::Error::Signature(_) => bad(
+                    ErrorCode::BadSignature,
+                    "invalid enrollment signature",
+                    Value::Null,
+                ),
+                _ => bad(ErrorCode::BadRequest, "invalid enrollment", Value::Null),
+            })?;
+        let created = request
+            .header(pubky_switch_core::http::header::CREATED)
+            .map(pubky_switch_core::http::parse_created)
+            .transpose()
+            .map_err(|_| bad(ErrorCode::BadRequest, "invalid creation", Value::Null))?;
+        if created != enrollment.body().intent.created() {
+            return Err(bad(
+                ErrorCode::BadRequest,
+                "header and enrollment intent differ",
+                Value::Null,
+            ));
+        }
+        Ok(enrollment)
+    }
+
+    /// `POST /v1/enroll` after authentication and the current locked judgement (Switch
+    /// wire 3.7, 7.4.1; account binding 3).
+    pub(super) fn enroll(&mut self, enrollment: &Enrollment) -> Result<Answer, ScriptError> {
+        let store_id = match self.confirmed_store() {
+            Ok(id) => id,
+            Err(answer) => return Ok(answer),
         };
-        let enrollment = match Enrollment::verify(&signed, &identity, &self.origin) {
-            Ok(enrollment) => enrollment,
-            Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
+        let binding = match self.account_binding() {
+            Ok(binding) => binding,
+            Err(answer) => return Ok(answer),
         };
         // The same enrollment again gets its kept answer, with no other effect (Switch wire
         // 3.7, 7.4.1).
         if let Some(answer) = self
             .enrolled
             .as_ref()
+            .filter(|_| {
+                binding.association() == pubky_switch_core::records::AccountAssociation::Account
+            })
             .and_then(|e| e.answers.get(&enrollment.hash()))
             .cloned()
         {
-            return Ok((200, answer));
+            if Some(answer.created) != binding.created() || answer.store_id != store_id {
+                return Ok(super::account::binding_changed());
+            }
+            return Ok((200, answer.answer));
+        }
+        if let Err(answer) = self.authorize_enrollment(enrollment, store_id) {
+            return Ok(answer);
         }
         // A switch a test made answer as for an identity it doesn't host makes a new account.
         if self.not_hosted_unpinned {
             self.drop_account();
         }
-        let creating = !self.hosts();
-        // An enrollment that creates the account writes its mark first (Switch wire 7.3,
-        // Table 3): (0, 0), or the mark a crash or a lost account left, taken over.
+        let creating = binding.association() != AccountAssociation::Account;
         if creating {
-            self.mark_new_account();
+            let replacing = self.hosts();
+            let now = self.now();
+            let previous = binding
+                .created()
+                .into_iter()
+                .chain(self.marks.erasure_at_ms)
+                .chain(replacing.then_some(self.created_at_ms));
+            if previous.into_iter().any(|created| created >= now)
+                || (replacing && self.stamped_ms > now)
+            {
+                return Ok(bad(
+                    ErrorCode::Unavailable,
+                    "account binding: creation time is unavailable",
+                    Value::Null,
+                ));
+            }
+            let baseline = replacing.then(|| self.doc.clone()).flatten();
+            let generation = if replacing {
+                self.tip
+                    .generation
+                    .max(baseline.as_ref().map_or(0, IdentityDoc::generation))
+                    .max(match self.marks.slot {
+                        super::marks::MarkSlot::At(mark) => mark.generation,
+                        _ => 0,
+                    })
+            } else {
+                enrollment.identity_doc().map_or(1, IdentityDoc::generation)
+            };
+            let exclusions = if replacing {
+                self.exclusions()
+            } else {
+                BTreeMap::new()
+            };
+            // The mark precedes replacement. The remaining state changes are atomic
+            // under this mutex (Switch account binding 3.1).
+            self.mark_new_account(now);
+            self.drop_account();
+            self.created_at_ms = now;
+            self.tip.generation = generation;
+            self.tips = vec![self.tip];
+            self.activation = if replacing {
+                AccountActivation::Recovery
+            } else {
+                AccountActivation::Ordinary
+            };
+            self.doc = if replacing {
+                baseline
+            } else {
+                enrollment.identity_doc().cloned()
+            };
+            self.staged = replacing
+                || self.doc.as_ref().is_none_or(|doc| {
+                    doc.inbox().url != self.origin
+                        || doc.inbox().service_key != self.service.verifying_key().to_bytes()
+                });
+            self.apps = exclusions;
+            self.kept_app_ids = self.apps.keys().copied().collect();
         }
+        self.stamped_ms = self.stamped_ms.max(self.now()).max(self.created_at_ms);
         // At a serving account the App IDs it names are held for the next generation
         // (Switch wire 3.7).
-        if !creating && self.doc.is_some() && !self.staged {
+        if !creating
+            && self.doc.is_some()
+            && (!self.staged || self.activation == AccountActivation::Recovery)
+        {
             for app in enrollment.revoked_apps() {
                 if !self.held_app_ids.contains(app) {
                     self.held_app_ids.push(*app);
@@ -191,22 +311,92 @@ impl Inner {
         // The one key it names, at every account (Switch wire 7.4.1).
         let service_key = self.service.verifying_key().to_bytes();
         // The account's creation time, fixed for the account (Switch wire 3.7).
-        let created = self.creation_time();
+        let created = self.created_at_ms;
         let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
             limits,
             answers: HashMap::new(),
         });
-        let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits, created);
+        let answer = EnrollmentAnswer::new(enrollment, service_key, enrolled.limits, created);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
-        enrolled.answers.insert(enrollment.hash(), value.clone());
+        enrolled.answers.insert(
+            enrollment.hash(),
+            EnrollmentReceipt {
+                created,
+                store_id,
+                answer: value.clone(),
+            },
+        );
         // The enrollment that makes the account names the App IDs it keeps for good; another
         // enrollment for an existing account changes nothing (Switch wire 3.7).
         if creating {
-            let kept: BTreeSet<[u8; 16]> = enrollment.revoked_apps().iter().copied().collect();
+            let kept: BTreeSet<[u8; 16]> = self
+                .kept_app_ids
+                .iter()
+                .chain(enrollment.revoked_apps())
+                .copied()
+                .collect();
             self.kept_app_ids = kept.into_iter().collect();
             self.kept_at = self.now();
+            if let Some(doc) = self.doc.clone() {
+                self.keep_document_exclusions(&doc);
+            }
         }
         Ok((200, value))
+    }
+
+    /// Only irrevocable app exclusions survive a loss of the account state
+    /// (Switch account binding 3.1); records, certificates and cursors do not.
+    fn exclusions(&self) -> BTreeMap<[u8; 16], SwitchApp> {
+        let mut kept = BTreeMap::new();
+        for (id, app) in &self.apps {
+            if app.departed {
+                kept.insert(
+                    *id,
+                    SwitchApp {
+                        departed: true,
+                        revoked_at: app.revoked_at,
+                        departed_at: app.departed_at,
+                        rotated: app.rotated,
+                        ..SwitchApp::default()
+                    },
+                );
+            }
+        }
+        for id in &self.kept_app_ids {
+            kept.entry(*id).or_insert_with(|| SwitchApp {
+                departed: true,
+                revoked_at: Some(self.kept_at),
+                ..SwitchApp::default()
+            });
+        }
+        for id in &self.held_app_ids {
+            kept.entry(*id).or_insert_with(|| SwitchApp {
+                departed: true,
+                revoked_at: Some(self.now()),
+                ..SwitchApp::default()
+            });
+        }
+        kept
+    }
+
+    fn keep_document_exclusions(&mut self, doc: &IdentityDoc) {
+        for removed in &doc.body().removed {
+            let enrolled_at = self
+                .kept_app_ids
+                .contains(&removed.app_id)
+                .then_some(self.kept_at);
+            let app = self
+                .apps
+                .entry(removed.app_id)
+                .or_insert_with(|| SwitchApp {
+                    revoked_at: enrolled_at,
+                    ..SwitchApp::default()
+                });
+            app.departed = true;
+            if !self.kept_app_ids.contains(&removed.app_id) {
+                self.kept_app_ids.push(removed.app_id);
+            }
+        }
     }
 
     /// The account is gone, its mark store staying: after an erasure, or for a lost account
@@ -239,6 +429,7 @@ impl Inner {
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
         fresh.max_contacts = self.max_contacts;
         fresh.max_deny = self.max_deny;
+        fresh.retention = self.retention;
         fresh.feed_limit = self.feed_limit;
         fresh.max_page_bytes = self.max_page_bytes;
         fresh.max_page_scan = self.max_page_scan;
@@ -288,6 +479,7 @@ impl Inner {
         fresh.apps_version = self.apps_version;
         fresh.directory_version = self.directory_version;
         // What a test set of the switch's configuration stays set, as a service's does.
+        fresh.retention = self.retention;
         fresh.feed_limit = self.feed_limit;
         fresh.max_page_bytes = self.max_page_bytes;
         fresh.max_page_scan = self.max_page_scan;
@@ -298,17 +490,8 @@ impl Inner {
         // let it drop a later read's waker under the same number.
         fresh.held_ids = self.held_ids;
         fresh.kept_at = self.kept_at;
-        fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
-        for (id, app) in &self.apps {
-            if app.departed && !fresh.kept_app_ids.contains(id) {
-                fresh.kept_app_ids.push(*id);
-            }
-        }
-        for id in std::mem::take(&mut self.held_app_ids) {
-            if !fresh.kept_app_ids.contains(&id) {
-                fresh.kept_app_ids.push(id);
-            }
-        }
+        fresh.apps = self.exclusions();
+        fresh.kept_app_ids = fresh.apps.keys().copied().collect();
         *self = fresh;
     }
 
@@ -361,6 +544,7 @@ impl Inner {
                 app.rotated = true;
             }
         }
+        self.keep_document_exclusions(doc);
         self.doc = Some(doc.clone());
         // The next version, whoever delivered it, ends a stored hand-over (Switch wire 7.4.17).
         self.handover = None;
@@ -419,6 +603,13 @@ impl Inner {
         for (id, app) in &self.apps {
             if app.departed && !kept.contains(id) {
                 kept.push(*id);
+            }
+        }
+        if let Some(held) = &self.doc {
+            for removed in &held.body().removed {
+                if !kept.contains(&removed.app_id) {
+                    kept.push(removed.app_id);
+                }
             }
         }
         let generation_before = self.tip.generation;
@@ -784,7 +975,7 @@ impl Inner {
                     "last_seen": held.and_then(|a| a.last_seen).map(pubky_switch_core::time::rfc3339),
                     "revoked_at": held
                         .and_then(|a| a.revoked_at)
-                        .or(enrolled_kept.then_some(self.kept_at))
+                        .or((enrolled_kept && held.is_none()).then_some(self.kept_at))
                         .map(pubky_switch_core::time::rfc3339),
                     "departed_at": held
                         .and_then(|a| a.departed_at)
@@ -875,6 +1066,7 @@ fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
 
     #[test]
     fn test_scripted_staged_import_erasure_follows_abort_eligibility() {
@@ -964,33 +1156,141 @@ mod tests {
         }
     }
 
-    /// The scripted switch's answer to an enrollment of `identity`'s with `nonce`.
-    fn enroll_at(
+    fn signed_request(
+        identity: &pubky_switch_core::keys::IdentityKey,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        created: Option<u64>,
+        at: u64,
+    ) -> crate::transport::Request {
+        use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, header};
+        let fields = RequestHeaders {
+            identity: identity.id(),
+            timestamp: pubky_switch_core::time::rfc3339_seconds(at),
+            created: created.map(pubky_switch_core::time::rfc3339),
+            ..RequestHeaders::default()
+        };
+        let signature = http::sign_request(
+            identity,
+            &RequestTarget {
+                method,
+                path_and_query: path,
+                body: &body,
+                origin: SWITCH_ORIGIN,
+            },
+            &fields,
+        );
+        let mut headers = vec![
+            crate::transport::Header::new(header::IDENTITY, &fields.identity),
+            crate::transport::Header::new(header::TIMESTAMP, &fields.timestamp),
+            crate::transport::Header::new(header::SIGNATURE, &b64(&signature)),
+        ];
+        if let Some(created) = fields.created {
+            headers.push(crate::transport::Header::new(header::CREATED, &created));
+        }
+        crate::transport::Request {
+            method: method.into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: path.into(),
+            headers,
+            body,
+            timeout: Default::default(),
+        }
+    }
+
+    fn creation_observation(
+        switch: &ScriptedSwitch,
+        identity: &pubky_switch_core::keys::IdentityKey,
+    ) -> pubky_switch_core::records::CarriedAccountObservation {
+        use pubky_switch_core::http::header;
+        let now = switch.lock().now();
+        let request = signed_request(
+            identity,
+            "GET",
+            &format!("/v1/{}/account", identity.id()),
+            vec![],
+            None,
+            now,
+        );
+        let answer = switch.handle(&request).unwrap();
+        assert_eq!(answer.status, 200);
+        let carried = pubky_switch_core::records::CarriedAccountObservation {
+            body: answer.body.clone(),
+            sig: pubky_switch_core::enc::unb64_array(
+                answer.header(header::SERVICE_SIGNATURE).unwrap(),
+            )
+            .unwrap(),
+            request_timestamp: request.header(header::TIMESTAMP).unwrap().to_owned(),
+            request_signature: pubky_switch_core::enc::unb64_array(
+                request.header(header::SIGNATURE).unwrap(),
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            carried
+                .verify(&identity.public(), SWITCH_ORIGIN)
+                .unwrap()
+                .body()
+                .created,
+            None
+        );
+        carried
+    }
+
+    /// Make one distinct intent. A retry keeps the returned signed enrollment unchanged.
+    fn enrollment_for(
         switch: &ScriptedSwitch,
         identity: &pubky_switch_core::keys::IdentityKey,
         nonce: u8,
         revoked: Option<Vec<[u8; 16]>>,
-    ) -> (u16, Value) {
-        let body = pubky_switch_core::records::EnrollmentBody {
-            identity: identity.public(),
-            origin: SWITCH_ORIGIN.to_owned(),
-            nonce: [nonce; 16],
-            policy: pubky_switch_core::records::IdentityPolicy::default(),
-            identity_doc: None,
-            revoked_apps: revoked,
+    ) -> Enrollment {
+        let current = {
+            let inner = switch.lock();
+            inner.hosts().then(|| inner.creation_time())
         };
-        let enrollment = Enrollment::sign(identity, body).unwrap();
-        let request = crate::transport::Request {
-            method: "POST".into(),
-            origin: SWITCH_ORIGIN.into(),
-            path_and_query: "/v1/enroll".into(),
-            headers: Vec::new(),
-            body: json!({ "enrollment": enrollment.signed() })
+        let intent = match current {
+            Some(created) => pubky_switch_core::records::EnrollmentIntent::Existing { created },
+            None => pubky_switch_core::records::EnrollmentIntent::Create {
+                observation: creation_observation(switch, identity),
+            },
+        };
+        Enrollment::sign(
+            identity,
+            pubky_switch_core::records::EnrollmentBody {
+                identity: identity.public(),
+                origin: SWITCH_ORIGIN.to_owned(),
+                nonce: [nonce; 16],
+                intent,
+                policy: pubky_switch_core::records::IdentityPolicy::default(),
+                identity_doc: None,
+                revoked_apps: revoked,
+            },
+        )
+        .unwrap()
+    }
+
+    fn enroll_at(
+        switch: &ScriptedSwitch,
+        identity: &pubky_switch_core::keys::IdentityKey,
+        enrollment: &Enrollment,
+    ) -> (u16, Value) {
+        let now = switch.lock().now();
+        let request = signed_request(
+            identity,
+            "POST",
+            "/v1/enroll",
+            json!({ "enrollment": enrollment.signed() })
                 .to_string()
                 .into_bytes(),
-            timeout: crate::transport::TimeoutClass::default(),
-        };
-        switch.lock().enroll(&request).unwrap()
+            enrollment.body().intent.created(),
+            now,
+        );
+        let response = switch.handle(&request).unwrap();
+        (
+            response.status,
+            serde_json::from_slice(&response.body).unwrap(),
+        )
     }
 
     #[test]
@@ -1017,8 +1317,10 @@ mod tests {
         use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let clock = Arc::new(crate::clock::TestClock::new(1_700_000_000_000));
-        let switch = ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock, SWITCH_ORIGIN);
-        let (status, first) = enroll_at(&switch, &identity, 1, Some(vec![[7; 16]]));
+        let switch =
+            ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock.clone(), SWITCH_ORIGIN);
+        let first_enrollment = enrollment_for(&switch, &identity, 1, Some(vec![[7; 16]]));
+        let (status, first) = enroll_at(&switch, &identity, &first_enrollment);
         assert_eq!(status, 200);
         assert_eq!(switch.kept_app_ids(), vec![[7; 16]]);
         {
@@ -1055,7 +1357,9 @@ mod tests {
         assert!(switch.erased());
         assert_eq!(switch.mark(), None, "the mark went with the account");
 
-        let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
+        clock.advance_ms(1);
+        let second_enrollment = enrollment_for(&switch, &identity, 2, Some(vec![[9; 16]]));
+        let (status, second) = enroll_at(&switch, &identity, &second_enrollment);
         assert_eq!(status, 200);
         assert_eq!(second["service_key"], first["service_key"], "the one key");
         assert!(!switch.erased());
@@ -1084,7 +1388,7 @@ mod tests {
             assert_eq!(inner.uploads_per_app_per_hour, 7);
         }
         // The same enrollment again gets the same answer, and makes no further account.
-        let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
+        let (status, again) = enroll_at(&switch, &identity, &second_enrollment);
         assert_eq!((status, again), (200, second));
     }
 
@@ -1098,27 +1402,18 @@ mod tests {
         let clock = Arc::new(crate::clock::TestClock::new(now));
         let switch =
             ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock.clone(), SWITCH_ORIGIN);
-        let body = pubky_switch_core::records::EnrollmentBody {
-            identity: identity.public(),
-            origin: SWITCH_ORIGIN.to_owned(),
-            nonce: [1; 16],
-            policy: pubky_switch_core::records::IdentityPolicy::default(),
-            identity_doc: None,
-            revoked_apps: None,
-        };
-        let enrollment = Enrollment::sign(&identity, body).unwrap();
-        let sent_at = |at: u64| crate::transport::Request {
-            method: "POST".into(),
-            origin: SWITCH_ORIGIN.into(),
-            path_and_query: "/v1/enroll".into(),
-            headers: vec![crate::transport::Header::new(
-                pubky_switch_core::http::header::TIMESTAMP,
-                &pubky_switch_core::time::rfc3339(at),
-            )],
-            body: json!({ "enrollment": enrollment.signed() })
-                .to_string()
-                .into_bytes(),
-            timeout: crate::transport::TimeoutClass::default(),
+        let enrollment = enrollment_for(&switch, &identity, 1, None);
+        let sent_at = |at: u64| {
+            signed_request(
+                &identity,
+                "POST",
+                "/v1/enroll",
+                json!({ "enrollment": enrollment.signed() })
+                    .to_string()
+                    .into_bytes(),
+                enrollment.body().intent.created(),
+                at,
+            )
         };
         let refused = |request: &crate::transport::Request, answer: &crate::transport::Response| {
             let body: Value = serde_json::from_slice(&answer.body).unwrap();
@@ -1185,7 +1480,8 @@ mod tests {
             Arc::new(crate::clock::TestClock::new(0)),
             SWITCH_ORIGIN,
         );
-        let (status, first) = enroll_at(&switch, &identity, 1, None);
+        let first_enrollment = enrollment_for(&switch, &identity, 1, None);
+        let (status, first) = enroll_at(&switch, &identity, &first_enrollment);
         assert_eq!(status, 200);
         let key = |answer: &Value| answer["service_key"].as_str().unwrap().to_owned();
         let outgoing = key(&first);
@@ -1205,12 +1501,13 @@ mod tests {
             switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
             200
         );
-        let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
+        let second_enrollment = enrollment_for(&switch, &identity, 2, Some(vec![[7; 16]]));
+        let (status, second) = enroll_at(&switch, &identity, &second_enrollment);
         assert_eq!(status, 200);
         assert_eq!(key(&second), outgoing, "the one key at a serving account");
         assert_eq!(switch.lock().held_app_ids, vec![[7; 16]]);
         // The same enrollment again: its kept answer.
-        let (status, replayed) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
+        let (status, replayed) = enroll_at(&switch, &identity, &second_enrollment);
         assert_eq!((status, replayed), (200, second.clone()));
         let mut body = doc.body().clone();
         body.version = 2;
@@ -1270,7 +1567,7 @@ mod tests {
             // Pending connect requests don't outlive it (Switch spec 12.6 step 1, wire 7.4.7).
             assert!(inner.shared.connect.is_empty());
         }
-        let (status, again) = enroll_at(&switch, &identity, 1, None);
+        let (status, again) = enroll_at(&switch, &identity, &first_enrollment);
         assert_eq!((status, again), (200, first));
     }
 
@@ -1537,5 +1834,166 @@ mod tests {
         assert_eq!(inner.put_identity(&body).unwrap().0, 200);
         assert_eq!(inner.doc.as_ref().unwrap().generation(), 4);
         assert_eq!((inner.tip.generation, inner.tip.seq), (4, 2));
+    }
+    fn retention_chain(
+        switch: &ScriptedSwitch,
+        identity: &pubky_switch_core::keys::IdentityKey,
+        first_version: u64,
+        count: u64,
+    ) -> IdentityDoc {
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let mut body = switch.identity_doc().map_or_else(
+            || {
+                IdentityBody::first(
+                    identity.public(),
+                    [3; 16],
+                    Inbox::new(SWITCH_ORIGIN, switch.service_key()),
+                    IdentityPolicy::default(),
+                )
+            },
+            |doc| doc.body().clone(),
+        );
+        for version in first_version..first_version + count {
+            body.version = version;
+            let doc = IdentityDoc::sign(identity, body.clone()).unwrap();
+            switch.deliver_identity(&doc).unwrap();
+        }
+        switch.identity_doc().unwrap()
+    }
+
+    fn retention_read(switch: &ScriptedSwitch, identity: &pubky_switch_core::keys::IdentityKey) {
+        let (created, now) = {
+            let inner = switch.lock();
+            (inner.creation_time(), inner.now())
+        };
+        let request = signed_request(
+            identity,
+            "GET",
+            &format!("/v1/{}/apps", identity.id()),
+            vec![],
+            Some(created),
+            now,
+        );
+        assert_eq!(switch.handle(&request).unwrap().status, 200);
+    }
+
+    #[test]
+    fn test_scripted_retention_after_creation_keeps_the_configured_sweep() {
+        use super::super::Retention;
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let clock = Arc::new(TestClock::new(crate::testing::START_MS));
+        let switch =
+            ScriptedSwitch::unenrolled_at(&identity, [2; 32], Arc::clone(&clock), SWITCH_ORIGIN);
+        switch.set_retention(Some(Retention {
+            checkpoint_behind: 3,
+            per_request: 8,
+            ..Retention::default()
+        }));
+        let enrollment = enrollment_for(&switch, &identity, 1, None);
+        assert_eq!(enroll_at(&switch, &identity, &enrollment).0, 200);
+        retention_chain(&switch, &identity, 1, 12);
+        clock.advance_ms(31 * 24 * 60 * 60 * 1_000);
+        retention_read(&switch, &identity);
+        let (checkpoint, through) = switch.retained();
+        assert_eq!(
+            through, 8,
+            "the first request prunes only its configured budget"
+        );
+        assert_eq!(checkpoint.unwrap().seq, 8);
+        retention_read(&switch, &identity);
+        let (checkpoint, through) = switch.retained();
+        assert_eq!(
+            through, 11,
+            "the next request prunes the remaining old stubs"
+        );
+        assert_eq!(checkpoint.unwrap().seq, 11);
+        assert_eq!(switch.tip_seq(), 12, "the head remains");
+    }
+
+    #[test]
+    fn test_scripted_retention_after_erasure_keeps_disabled_sweeps() {
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let clock = Arc::new(TestClock::new(crate::testing::START_MS));
+        let switch =
+            ScriptedSwitch::unenrolled_at(&identity, [2; 32], Arc::clone(&clock), SWITCH_ORIGIN);
+        switch.set_retention(None);
+        let enrollment = enrollment_for(&switch, &identity, 1, None);
+        assert_eq!(enroll_at(&switch, &identity, &enrollment).0, 200);
+        let doc = retention_chain(&switch, &identity, 1, 1);
+        let created = switch.lock().creation_time();
+        let erase = signed_request(
+            &identity,
+            "POST",
+            &format!("/v1/{}/erase", identity.id()),
+            pubky_switch_core::http::erase_body(Some(created), Some(&doc.hash())),
+            Some(created),
+            clock.now_ms(),
+        );
+        assert_eq!(switch.handle(&erase).unwrap().status, 200);
+        assert!(switch.erased());
+        assert_eq!(switch.lock().retention, None);
+        clock.advance_ms(1);
+        let enrollment = enrollment_for(&switch, &identity, 2, None);
+        assert_eq!(enroll_at(&switch, &identity, &enrollment).0, 200);
+        assert!(!switch.erased());
+        assert!(switch.identity_doc().is_none());
+        assert_eq!(switch.tip_seq(), 0);
+        assert_eq!(switch.lock().retention, None);
+        retention_chain(&switch, &identity, 1, 1_002);
+        clock.advance_ms(31 * 24 * 60 * 60 * 1_000);
+        retention_read(&switch, &identity);
+        assert_eq!(switch.retained(), (None, 0));
+        assert_eq!(switch.tip_seq(), 1_002);
+    }
+
+    #[test]
+    fn test_scripted_retention_after_recovery_keeps_the_configured_sweep() {
+        use super::super::Retention;
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let clock = Arc::new(TestClock::new(crate::testing::START_MS));
+        let switch =
+            ScriptedSwitch::unenrolled_at(&identity, [2; 32], Arc::clone(&clock), SWITCH_ORIGIN);
+        let enrollment = enrollment_for(&switch, &identity, 1, None);
+        assert_eq!(enroll_at(&switch, &identity, &enrollment).0, 200);
+        let doc = retention_chain(&switch, &identity, 1, 1);
+        // Set the configuration after creation so this exercises the generation reset.
+        switch.set_retention(Some(Retention {
+            checkpoint_behind: 3,
+            per_request: 8,
+            ..Retention::default()
+        }));
+        let mut body = doc.body().clone();
+        body.version = 2;
+        body.generation = 2;
+        body.recovery_from = Some(1);
+        let recovery = IdentityDoc::sign(&identity, body).unwrap();
+        let delivery = signed_request(
+            &identity,
+            "PUT",
+            &format!("/v1/{}/identity", identity.id()),
+            json!({ "identity": recovery.signed(), "prev": b64(&doc.hash()) })
+                .to_string()
+                .into_bytes(),
+            Some(switch.lock().creation_time()),
+            clock.now_ms(),
+        );
+        let response = switch.handle(&delivery).unwrap();
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert_eq!((switch.generation(), switch.tip_seq()), (2, 2));
+        retention_chain(&switch, &identity, 3, 10);
+        clock.advance_ms(31 * 24 * 60 * 60 * 1_000);
+        retention_read(&switch, &identity);
+        let (checkpoint, through) = switch.retained();
+        assert_eq!(through, 8);
+        assert_eq!(
+            (checkpoint.unwrap().generation, switch.generation()),
+            (2, 2)
+        );
+        assert_eq!(switch.tip_seq(), 12);
     }
 }

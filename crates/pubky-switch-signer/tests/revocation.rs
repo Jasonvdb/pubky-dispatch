@@ -285,6 +285,7 @@ fn taken_over_backup(world: &World, signer: &Signer, apps: &[&App]) -> Vec<u8> {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         world.other_install_version(&newest, [7; 16]),
+        world.backup().account_created(),
         &[],
         &certs,
         Limits::default(),
@@ -379,6 +380,7 @@ async fn test_revocation_isnt_sent_when_the_backup_shows_a_take_over() {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         world.other_install_version(&newest, [7; 16]),
+        world.backup().account_created(),
         &[],
         &certs,
         Limits::default(),

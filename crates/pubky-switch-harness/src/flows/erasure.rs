@@ -486,9 +486,19 @@ pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResu
             pubky_switch_client::testing::ErasureOutcome::Unresolved,
         )
         .await?;
+    let client = client.with_account_created(created)?;
     let first = client.erase(Some(created), Some(doc.hash())).await;
-    if first.is_ok() {
-        return Err("the external attempt answered success".into());
+    if !matches!(
+        first,
+        Err(pubky_switch_client::ClientError::Switch {
+            status: 503,
+            code: pubky_switch_core::http::ErrorCode::Unavailable,
+            ..
+        })
+    ) {
+        return Err(
+            format!("the external attempt did not leave an unresolved erasure: {first:?}").into(),
+        );
     }
     let result = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
     world.outcome("unavailable before authorization", &ended(&result));

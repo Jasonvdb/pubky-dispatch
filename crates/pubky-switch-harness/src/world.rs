@@ -198,12 +198,15 @@ impl World {
             Backend::Scripted => {
                 // A scripted switch holds one account: one per identity, behind one origin.
                 let mut accounts = Vec::with_capacity(identities.len());
+                let store_id = pubky_switch_core::enc::random_bytes()
+                    .map_err(|error| HarnessError::Setup(error.to_string()))?;
                 for identity in identities {
-                    let switch = ScriptedSwitch::unenrolled_at(
+                    let switch = ScriptedSwitch::unenrolled_at_in_store(
                         identity.key(),
                         secret,
                         self.clock.clone(),
                         origin,
+                        store_id,
                     );
                     // The limits an enrollment announces that the scripted switch has a
                     // setting for: the inbox quota and the app limit.

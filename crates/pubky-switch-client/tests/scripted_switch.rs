@@ -400,6 +400,33 @@ fn poll_once(
     }
 }
 
+fn sign_signer_request(s: &Setup, request: &mut Request) {
+    use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, header};
+    use pubky_switch_core::time::{rfc3339, rfc3339_seconds};
+    let fields = RequestHeaders {
+        identity: s.alice.identity().key().id(),
+        timestamp: rfc3339_seconds(s.clock.now_ms()),
+        created: Some(rfc3339(s.alice.switch().created())),
+        ..RequestHeaders::default()
+    };
+    let signature = http::sign_request(
+        s.alice.identity().key(),
+        &RequestTarget {
+            method: &request.method,
+            origin: &request.origin,
+            path_and_query: &request.path_and_query,
+            body: &request.body,
+        },
+        &fields,
+    );
+    request.headers.extend([
+        Header::new(header::IDENTITY, &fields.identity),
+        Header::new(header::TIMESTAMP, &fields.timestamp),
+        Header::new(header::CREATED, fields.created.as_deref().unwrap()),
+        Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
+    ]);
+}
+
 type AnswerOrError = Result<Response, pubky_switch_client::TransportError>;
 
 fn items_of(answer: &Response) -> usize {
@@ -771,7 +798,7 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
     let mut read = transport.send(request.clone());
     assert!(poll_once(&mut read).is_none());
     // The signer erases the account while the read is held (Switch wire 7.4.16).
-    let erase = Request {
+    let mut erase = Request {
         method: "POST".into(),
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
@@ -782,6 +809,7 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
         ),
         timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
+    sign_signer_request(&s, &mut erase);
     let erased = switch.transport().send(erase).await.unwrap();
     assert_eq!(erased.status, 200);
     assert_eq!(switch.held_reads(), 0, "the erasure woke the read");
@@ -926,7 +954,7 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         (403, "not_current")
     );
     // An account erased before the read: the not-hosted `404` at once.
-    let erase = Request {
+    let mut erase = Request {
         method: "POST".into(),
         origin: SWITCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
@@ -937,6 +965,7 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
         ),
         timeout: pubky_switch_client::transport::TimeoutClass::default(),
     };
+    sign_signer_request(&s, &mut erase);
     assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
     let mut read = transport.send(request);
     let answer = poll_once(&mut read).expect("answered at once");
@@ -1114,10 +1143,12 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         ("switch-app", "\u{e9}"),
         ("x-other", ""),
     ] {
-        let odd = Request {
-            headers: vec![Header::new(name, value)],
+        let mut odd = Request {
+            headers: Vec::new(),
             ..repeated.clone()
         };
+        sign_signer_request(&s, &mut odd);
+        odd.headers.push(Header::new(name, value));
         let answer = switch.transport().send(odd.clone()).await.unwrap();
         if name == "x-other" {
             assert_ne!(answer.status, 400, "{name}");
@@ -1144,4 +1175,32 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
     };
     let answer = switch.transport().send(read).await.unwrap();
     assert_ne!(answer.status, 400);
+}
+
+#[tokio::test]
+async fn test_account_binding_held_read_refuses_creation_before_arrival() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, mut request) = held_read(&s).await;
+    let before = switch.app(&app.app_id()).last_seen;
+    assert_eq!(switch.held_reads(), 0);
+    request.headers.push(Header::new(
+        pubky_switch_core::http::header::CREATED,
+        &pubky_switch_core::time::rfc3339(START_MS),
+    ));
+    s.clock.advance_ms(1_000);
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request.clone());
+    let answer = poll_once(&mut read);
+    let observed = (
+        answer.as_ref().map(|answer| answer.status),
+        switch.app(&app.app_id()).last_seen,
+        switch.held_reads(),
+    );
+    assert_eq!(
+        observed,
+        (Some(400), before, 0),
+        "request={request:?}; before_last_seen={before:?}; now={}",
+        s.clock.now_ms(),
+    );
 }

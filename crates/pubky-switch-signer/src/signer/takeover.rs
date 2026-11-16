@@ -136,6 +136,7 @@ impl Signer {
         let target = Target {
             origin: &app.origin,
             pinned: Some(app.service_key),
+            created: None,
             identity,
         };
         let stored = AppClient::new(&env, &target, &app.keys, &app.cert)?
@@ -145,7 +146,7 @@ impl Signer {
             return Err(invalid("the switch serves a hand-over for another app"));
         }
         // Checks 1 and 2 before anything is kept.
-        let limits = {
+        let (limits, account_created) = {
             let bundle_secret = Zeroizing::new(app.keys.bundle_secret());
             let records = stored.handover.open(&identity, &app_id, &bundle_secret)?;
             let inbox = records.identity_doc().inbox();
@@ -154,7 +155,7 @@ impl Signer {
                     "the handed-over identity.json names another switch than the one asked",
                 ));
             }
-            *records.limits()
+            (*records.limits(), records.account_created())
         };
         let install = pubky_switch_core::enc::random_bytes::<16>()?;
         let mut state = SignerState::new(identity, install);
@@ -163,7 +164,7 @@ impl Signer {
             origin: app.origin.clone(),
             service_key: app.service_key,
             limits,
-            created: None,
+            created: account_created,
         });
         let flow = Flow::TakingOver {
             handover: stored.handover,
@@ -241,6 +242,19 @@ impl Signer {
         let bundle_secret = Zeroizing::new(keys.bundle_secret());
         let (keyring, records) =
             IdentityKeyring::received(vault, handover, &state.identity, app_id, &bundle_secret)?;
+        let account = state
+            .service
+            .as_ref()
+            .ok_or(crate::error::RecordsFault::Invariant(
+                "the hand-over has no original account",
+            ))?;
+        account.check_document(records.identity_doc())?;
+        if account.created != records.account_created() {
+            return Err(crate::error::RecordsFault::Invariant(
+                "the hand-over names another creation",
+            )
+            .into());
+        }
         let signer = Self {
             store,
             env,
@@ -293,6 +307,7 @@ impl Signer {
         state.taking_over = true;
         // The old signer's version, published already: this install's own replaces it.
         state.newest = Some(Newest {
+            account: Some(self.service()?),
             doc: handed.signed().clone(),
             prev: None,
             published: true,
@@ -398,6 +413,7 @@ impl Signer {
             state.note_size(nearest.bytes, nearest.limit);
         }
         state.newest = Some(Newest {
+            account: Some(self.service()?),
             doc: delivery.doc,
             prev: Some(delivery.prev),
             published: false,

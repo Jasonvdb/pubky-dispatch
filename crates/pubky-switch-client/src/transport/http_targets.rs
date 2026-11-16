@@ -40,6 +40,8 @@ fn client(origin: &str, transport: Arc<HttpTransport>) -> SwitchClient {
         Arc::new(TestClock::new(NOW)),
     )
     .unwrap()
+    .with_account_created(0)
+    .unwrap()
 }
 
 fn signed(mut request: Request) -> SignedRequest {
@@ -47,6 +49,7 @@ fn signed(mut request: Request) -> SignedRequest {
     let headers = RequestHeaders {
         timestamp: pubky_switch_core::time::rfc3339(NOW),
         identity: key.id(),
+        created: Some(pubky_switch_core::time::rfc3339(0)),
         ..RequestHeaders::default()
     };
     let target = RequestTarget {
@@ -61,6 +64,7 @@ fn signed(mut request: Request) -> SignedRequest {
         Header::new(header::IDENTITY, &headers.identity),
         Header::new(header::TIMESTAMP, &headers.timestamp),
         Header::new(header::SIGNATURE, &b64(&signature)),
+        Header::new(header::CREATED, &pubky_switch_core::time::rfc3339(0)),
     ];
     SignedRequest { request }
 }
@@ -238,6 +242,7 @@ async fn answer_socket(mut socket: tokio::net::TcpStream, origin: String, unread
         let headers = RequestHeaders {
             timestamp: received.header(header::TIMESTAMP).unwrap().into(),
             identity: received.header(header::IDENTITY).unwrap().into(),
+            created: received.header(header::CREATED).map(str::to_owned),
             ..RequestHeaders::default()
         };
         let target = RequestTarget {

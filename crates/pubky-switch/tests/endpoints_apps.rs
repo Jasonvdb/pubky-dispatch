@@ -115,7 +115,7 @@ async fn test_apps_after_the_chain() {
     assert_eq!(apps["recovery"], Value::Null);
     // The record's write and the live claim's attempt keep proofs of generation 1.
     assert_eq!(apps["proof_generations"], json!([1]));
-    // The three apps version 3 lists, in the order of their App ID bytes.
+    // Listed apps and permanently retained document exclusions, in App ID byte order.
     let order: Vec<&str> = apps["apps"]
         .as_array()
         .expect("apps")
@@ -124,13 +124,36 @@ async fn test_apps_after_the_chain() {
         .collect();
     let keys = vectors("keys.json");
     let id = |name: &str| app(&keys, name)["app_id"].as_str().expect("id").to_string();
-    let mut listed = ["wallet", "phone", "executor"].map(|name| {
-        let bytes =
-            hex::decode(app(&keys, name)["app_id_bytes_hex"].as_str().expect("hex")).expect("hex");
-        (bytes, id(name))
-    });
+    let mut listed: Vec<_> = ["wallet", "phone", "executor"]
+        .map(|name| {
+            let bytes = hex::decode(app(&keys, name)["app_id_bytes_hex"].as_str().expect("hex"))
+                .expect("hex");
+            (bytes, id(name))
+        })
+        .into();
+    let doc = IdentityDoc::verify(
+        &held_doc("alice identity.json"),
+        &hex32(&alice(&keys)["public_hex"]),
+    )
+    .expect("identity");
+    for removed in &doc.body().removed {
+        let id = pubky_switch_core::enc::zbase32_encode(&removed.app_id);
+        listed.push((removed.app_id.to_vec(), id.clone()));
+        let status = apps["apps"]
+            .as_array()
+            .expect("apps")
+            .iter()
+            .find(|status| status["app_id"] == id)
+            .expect("retained exclusion");
+        assert_eq!(status["current"], false);
+        assert_eq!(status["revoked_at"], Value::Null);
+        assert_eq!(status["departed_at"], Value::Null);
+    }
     listed.sort();
-    assert_eq!(order, listed.map(|(_, id)| id).to_vec());
+    assert_eq!(
+        order,
+        listed.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    );
 
     let wallet = status(&apps, "wallet");
     let op = SignedOp::peek(
@@ -744,6 +767,7 @@ async fn test_apps_lists_an_enrollment_named_app_id_as_revoked() {
         serde_json::from_slice(&signed.body_bytes().expect("body")).expect("fields");
     fields.identity_doc = None;
     fields.revoked_apps = Some(vec![named_id]);
+    fields.intent = new_alice_enrollment_intent(&replay, ms(enrolled_at)).await;
     let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
     let enrollment = Enrollment::sign(&key, fields).expect("sign");
     let request = serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("body");
@@ -772,7 +796,13 @@ async fn test_apps_lists_an_enrollment_named_app_id_as_revoked() {
     let path = format!("/v1/{}/identity", alice_id());
     let answer = replay
         .service
-        .handle(signer_request("PUT", &path, delivery, ms(later)))
+        .handle(signer_request_at_creation(
+            "PUT",
+            &path,
+            delivery,
+            ms(later),
+            Some(ms(enrolled_at)),
+        ))
         .await;
     assert_eq!(
         answer.status,
@@ -780,7 +810,15 @@ async fn test_apps_lists_an_enrollment_named_app_id_as_revoked() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    let apps = body(&get_apps(&replay, "signer", later).await);
+    let request = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(later),
+        Some(ms(enrolled_at)),
+    );
+    let answer = replay.service.handle(request).await;
+    let apps = body(&answer);
     let id = pubky_switch_core::enc::zbase32_encode(&named_id);
     let named_status = apps["apps"]
         .as_array()

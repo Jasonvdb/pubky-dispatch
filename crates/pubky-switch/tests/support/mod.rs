@@ -215,6 +215,7 @@ pub async fn serve_bob(replay: &Replay) -> String {
         .db
         .store()
         .create_account(&pubky_switch::store::NewAccount {
+            activation: pubky_switch_core::records::AccountActivation::Ordinary,
             id: id.clone(),
             identity_key: hex32(&bob["public_hex"]),
             generation: 1,
@@ -223,6 +224,7 @@ pub async fn serve_bob(replay: &Replay) -> String {
             identity_doc: Some(doc),
             revoked_apps: Vec::new(),
             enrollment_hash: [0; 32],
+            enrollment_store_id: replay.marks.identity().await.expect("store identity"),
         })
         .await
         .expect("bob's account");
@@ -291,6 +293,7 @@ pub fn other_request_as(
         app: Some(app_id.clone()),
         cert: Some(cert.compact()),
         invite_code: invite_code.map(str::to_string),
+        created: None,
     };
     let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&signer));
     let signature = b64(&wire_http::sign_request(
@@ -489,8 +492,45 @@ pub fn set_time(clock: &ManualClock, text: &str) {
     clock.set_wall_ms(parse_rfc3339(text).expect("time"));
 }
 
-/// A request from alice's signer, signed with her fixed identity key at `at_ms`.
+/// The creation of alice's original vector account.
+pub fn alice_created() -> u64 {
+    let http = vectors("http.json");
+    let answer = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the service key",
+    );
+    let body: Value =
+        serde_json::from_str(answer["body"].as_str().expect("body")).expect("enrollment answer");
+    ms(body["created"].as_str().expect("created"))
+}
+
+/// A request from alice's signer, bound to her original vector account where required.
 pub fn signer_request(method: &str, path: &str, body: Vec<u8>, at_ms: u64) -> SwitchRequest {
+    let created = match route(method, path).expect("route").call {
+        pubky_switch::http::route::Call::Enroll => {
+            let wrapper: Option<Value> = serde_json::from_slice(&body).ok();
+            wrapper.and_then(|wrapper| {
+                let signed: SignedDoc =
+                    serde_json::from_value(wrapper["enrollment"].clone()).ok()?;
+                let fields: pubky_switch_core::records::EnrollmentBody =
+                    serde_json::from_slice(&signed.body_bytes().ok()?).ok()?;
+                fields.intent.created()
+            })
+        }
+        pubky_switch::http::route::Call::GetAccount => None,
+        _ => Some(alice_created()),
+    };
+    signer_request_at_creation(method, path, body, at_ms, created)
+}
+
+/// A signer request carrying exactly `created`, including an intentionally absent binding.
+pub fn signer_request_at_creation(
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    at_ms: u64,
+    created: Option<u64>,
+) -> SwitchRequest {
     let keys = vectors("keys.json");
     let alice = alice(&keys);
     let alice_id = alice["pubky_id"].as_str().expect("id").to_string();
@@ -498,6 +538,7 @@ pub fn signer_request(method: &str, path: &str, body: Vec<u8>, at_ms: u64) -> Sw
     let signed_headers = RequestHeaders {
         timestamp: timestamp.clone(),
         identity: alice_id.clone(),
+        created: created.map(pubky_switch_core::time::rfc3339),
         ..RequestHeaders::default()
     };
     let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&alice["secret_hex"]));
@@ -511,16 +552,15 @@ pub fn signer_request(method: &str, path: &str, body: Vec<u8>, at_ms: u64) -> Sw
         },
         &signed_headers,
     ));
-    request(
-        method,
-        path,
-        &[
-            (header::IDENTITY, &alice_id),
-            (header::TIMESTAMP, &timestamp),
-            (header::SIGNATURE, &signature),
-        ],
-        body,
-    )
+    let mut headers = vec![
+        (header::IDENTITY, alice_id.as_str()),
+        (header::TIMESTAMP, timestamp.as_str()),
+        (header::SIGNATURE, signature.as_str()),
+    ];
+    if let Some(created) = signed_headers.created.as_deref() {
+        headers.push((header::CREATED, created));
+    }
+    request(method, path, &headers, body)
 }
 
 /// alice's entry in `keys.json`.
@@ -598,6 +638,138 @@ pub fn item_time(item: &Value) -> String {
     envelope["server_time"].as_str().expect("time").to_string()
 }
 
+/// Read genuine account evidence for a new fixture action, preserving its signed bytes.
+pub async fn account_observation(
+    replay: &Replay,
+    key: &pubky_switch_core::keys::IdentityKey,
+    at_ms: u64,
+) -> pubky_switch_core::records::CarriedAccountObservation {
+    account_observation_at(replay, key, ORIGIN, at_ms).await
+}
+
+/// Read account evidence at the fixture service's explicit origin.
+pub async fn account_observation_at(
+    replay: &Replay,
+    key: &pubky_switch_core::keys::IdentityKey,
+    origin: &str,
+    at_ms: u64,
+) -> pubky_switch_core::records::CarriedAccountObservation {
+    use pubky_switch_core::records::CarriedAccountObservation;
+    let path = format!("/v1/{}/account", key.id());
+    let fields = RequestHeaders {
+        timestamp: rfc3339_seconds(at_ms),
+        identity: key.id(),
+        ..RequestHeaders::default()
+    };
+    let signature = wire_http::sign_request(
+        key,
+        &RequestTarget {
+            method: "GET",
+            path_and_query: &path,
+            body: &[],
+            origin,
+        },
+        &fields,
+    );
+    let encoded = b64(&signature);
+    let query = request(
+        "GET",
+        &path,
+        &[
+            (header::IDENTITY, fields.identity.as_str()),
+            (header::TIMESTAMP, fields.timestamp.as_str()),
+            (header::SIGNATURE, encoded.as_str()),
+        ],
+        Vec::new(),
+    );
+    let sent = Sent::at(&query, origin);
+    let answer = replay.service.handle(query).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "account observation: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_with(&answer, &service_public(replay), &sent));
+    let observation = CarriedAccountObservation {
+        body: answer.body.to_vec(),
+        sig: pubky_switch_core::enc::unb64_array(
+            header_text(&answer, header::SERVICE_SIGNATURE).expect("response signature"),
+        )
+        .expect("signature bytes"),
+        request_timestamp: fields.timestamp,
+        request_signature: signature,
+    };
+    let observed = observation
+        .verify(&key.public(), origin)
+        .expect("observation");
+    assert_eq!(
+        observed.body().store_id,
+        replay.marks.identity().await.expect("store identity")
+    );
+    observation
+}
+
+/// Begin a new fixture enrollment from the current authenticated association. A retry
+/// instead keeps the originally signed enrollment and never calls this helper again.
+pub async fn new_alice_enrollment_intent(
+    replay: &Replay,
+    at_ms: u64,
+) -> pubky_switch_core::records::EnrollmentIntent {
+    use pubky_switch_core::records::{AccountAssociation, EnrollmentIntent};
+    let keys = vectors("keys.json");
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let observation = account_observation(replay, &key, at_ms).await;
+    let body = observation
+        .verify(&key.public(), ORIGIN)
+        .expect("observation")
+        .body()
+        .clone();
+    match body.association {
+        AccountAssociation::Account => EnrollmentIntent::Existing {
+            created: body.created.expect("account creation"),
+        },
+        AccountAssociation::Mark => EnrollmentIntent::Takeover {
+            created: body.created.expect("mark creation"),
+            observation,
+        },
+        AccountAssociation::Absent => EnrollmentIntent::Create { observation },
+    }
+}
+
+/// Create alice's enrollment from this service's authenticated absence observation.
+pub async fn fresh_alice_enrollment(replay: &Replay, at_ms: u64) -> SwitchRequest {
+    use pubky_switch_core::records::{AccountAssociation, Enrollment, EnrollmentIntent};
+    let keys = vectors("keys.json");
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let observation = account_observation(replay, &key, at_ms).await;
+    assert_eq!(
+        observation
+            .verify(&key.public(), ORIGIN)
+            .expect("observation")
+            .body()
+            .association,
+        AccountAssociation::Absent
+    );
+    let http = vectors("http.json");
+    let template = vector_request(named(&http["requests"], "signer: enrollment"));
+    let wrapper: Value = serde_json::from_slice(&template.body).expect("enrollment request");
+    let signed: SignedDoc =
+        serde_json::from_value(wrapper["enrollment"].clone()).expect("signed enrollment");
+    let mut body = Enrollment::verify(&signed, &key.public(), ORIGIN)
+        .expect("enrollment template")
+        .body()
+        .clone();
+    body.intent = EnrollmentIntent::Create { observation };
+    let enrollment = Enrollment::sign(&key, body).expect("enrollment");
+    signer_request(
+        "POST",
+        "/v1/enroll",
+        enrollment.to_request_json().expect("request"),
+        at_ms,
+    )
+}
+
 /// alice's account as `chain.json` starts it: enrolled, then given `identity.json` version
 /// 1 at seq 1 and version 3 at seq 2, at the items' times.
 pub async fn serve_alice(replay: &Replay) {
@@ -616,11 +788,19 @@ pub async fn serve_alice(replay: &Replay) {
             .as_str()
             .expect("time"),
     );
-    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    let enrollment = fresh_alice_enrollment(
+        replay,
+        ms(enrolled["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time")),
+    )
+    .await;
+    let answer = replay.service.handle(enrollment).await;
+    assert_eq!(answer.status, 200, "enrolled");
+    let answer: Value = serde_json::from_slice(&answer.body).expect("enrollment answer");
     assert_eq!(
-        replay.service.handle(enrollment).await.status,
-        200,
-        "enrolled"
+        ms(answer["created"].as_str().expect("created")),
+        alice_created()
     );
     let items = chain["items"].as_array().expect("items");
     set_time(&replay.clock, &item_time(&items[0]));
@@ -669,6 +849,17 @@ pub fn signed_request(
         app: app.map(str::to_string),
         ..RequestHeaders::default()
     };
+    signed_request_with_headers(key, signed_headers, method, path, body)
+}
+
+/// Sign the exact fixture headers, including an explicit account creation where required.
+pub fn signed_request_with_headers(
+    key: &ed25519_dalek::SigningKey,
+    headers: RequestHeaders,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> SwitchRequest {
     let signature = b64(&wire_http::sign_request(
         key,
         &RequestTarget {
@@ -677,17 +868,20 @@ pub fn signed_request(
             body: &body,
             origin: ORIGIN,
         },
-        &signed_headers,
+        &headers,
     ));
-    let mut headers = vec![
-        (header::IDENTITY, identity),
-        (header::TIMESTAMP, timestamp.as_str()),
+    let mut fields = vec![
+        (header::IDENTITY, headers.identity.as_str()),
+        (header::TIMESTAMP, headers.timestamp.as_str()),
         (header::SIGNATURE, signature.as_str()),
     ];
-    if let Some(app) = app {
-        headers.push((header::APP, app));
+    if let Some(app) = headers.app.as_deref() {
+        fields.push((header::APP, app));
     }
-    request(method, path, &headers, body)
+    if let Some(created) = headers.created.as_deref() {
+        fields.push((header::CREATED, created));
+    }
+    request(method, path, &fields, body)
 }
 
 /// The fixed secret of a vectors' seed label, by the seed rule `spec/vectors/README.md`
@@ -1264,10 +1458,11 @@ pub async fn erasure_of(
     at_ms: u64,
 ) -> SwitchRequest {
     let created = creation_time(replay, account).await;
-    signer_request(
+    signer_request_at_creation(
         "POST",
         &format!("/v1/{account}/erase"),
         wire_http::erase_body(created, identity_hash),
         at_ms,
+        created,
     )
 }

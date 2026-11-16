@@ -52,7 +52,9 @@ use crate::alert::{Alert, RenewalSkip};
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
-use crate::state::{AskedRenewal, Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
+use crate::state::{
+    AskedRenewal, Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, Service, SignerState,
+};
 
 /// The most signed operations in one batch (Switch wire 6.4).
 const MAX_OPS: usize = 8;
@@ -445,7 +447,7 @@ impl Signer {
         doc: &IdentityDoc,
         flow: Flow,
     ) -> Result<()> {
-        let Flow::Deliver { prev, .. } = flow else {
+        let Flow::Deliver { account, prev, .. } = flow else {
             return Err(SignerError::Records(RecordsFault::Invariant(
                 "a version without its delivery",
             )));
@@ -469,6 +471,7 @@ impl Signer {
                     .is_none_or(|through| held.last_epoch > through)
         });
         let flow = Flow::Renew {
+            account,
             batches,
             sent: 0,
             doc: doc.signed().clone(),
@@ -492,12 +495,13 @@ impl Signer {
     /// took over (Switch spec 4.3, 12.8).
     pub(super) async fn send_renewal(
         &mut self,
+        account: Service,
         batches: &[RenewBatch],
         sent: usize,
         doc: SignedDoc,
         prev: Option<[u8; 32]>,
     ) -> Result<()> {
-        let client = self.service_client()?;
+        let client = self.account_client(&account)?;
         for (index, batch) in batches.iter().enumerate().skip(sent) {
             // Before each batch, not once: another install may take over between two.
             self.ensure_signer().await?;
@@ -516,6 +520,7 @@ impl Signer {
                         state.bundle_parts.push(*part);
                     }
                     let flow = Flow::Renew {
+                        account: account.clone(),
                         batches: batches.to_vec(),
                         sent: index.saturating_add(1),
                         doc: doc.clone(),
@@ -538,6 +543,7 @@ impl Signer {
             }
         }
         let deliver = Flow::Deliver {
+            account,
             doc,
             prev,
             backup: None,
@@ -702,6 +708,7 @@ impl Signer {
             }
             state.time_asked = Some(version);
             let again = Flow::Deliver {
+                account: self.newest_account()?,
                 doc: newest.doc,
                 prev: newest.prev,
                 backup: None,

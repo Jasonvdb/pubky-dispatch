@@ -53,6 +53,10 @@ impl AccountTxn {
     /// drops it, and a retry of the same bytes, which writes nothing, keeps it.
     pub async fn set_identity(&mut self, held: &HeldIdentity) -> Result<(), StoreError> {
         let id = self.head().id.clone();
+        let checked =
+            pubky_switch_core::records::IdentityDoc::verify(&held.doc, &self.head().identity_key)
+                .map_err(|_| StoreError::Corrupt("identity_doc"))?;
+        super::apps::note_removed(self.conn(), &id, &checked).await?;
         let doc = encode_doc(&held.doc)?;
         let proof = held.proof.as_ref().map(encode_doc).transpose()?;
         sqlx::query("UPDATE accounts SET identity_doc = $2, identity_proof = $3 WHERE id = $1")
@@ -82,7 +86,7 @@ impl AccountTxn {
     }
 
     /// The App IDs the account keeps for good: revoked, departed, or named by an
-    /// enrollment.
+    /// enrollment or a verified identity document.
     pub async fn kept_app_ids(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
         let id = self.head().id.clone();
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(

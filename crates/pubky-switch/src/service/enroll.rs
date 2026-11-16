@@ -4,12 +4,16 @@ use pubky_switch_core::{
     Error as CoreError,
     enc::pubky_key,
     http::{self as wire_http, RequestTarget, Uncompared, header},
-    records::{Enrollment, EnrollmentAnswer, IdentityDoc, Limits as AnnouncedLimits},
+    records::{
+        AccountActivation, AccountAssociation, Enrollment, EnrollmentAnswer, EnrollmentIntent,
+        IdentityDoc, Limits as AnnouncedLimits, ObservationValidity,
+    },
     sig::SignedDoc,
 };
 
 use super::{
     Answer, Service,
+    account::{binding_changed, creation_conflict},
     rules::{Caller, decode_claim},
     signed::{AnswerTime, Asked, sign_answer},
     store_error,
@@ -21,7 +25,7 @@ use crate::{
         error::{ApiError, ErrorCode},
     },
     limits::{Limits, fixed},
-    marks::{MarkRead, MarkWrite},
+    marks::MarkWrite,
     store::NewAccount,
 };
 
@@ -156,6 +160,18 @@ impl Service {
                 )
             })?;
         let enrollment = read_enrollment(&request.body, &identity, &self.origin)?;
+        let created = claimed
+            .headers
+            .created
+            .as_deref()
+            .map(wire_http::parse_created)
+            .transpose()
+            .map_err(|_| ApiError::bad_request("account binding: invalid creation"))?;
+        if created != enrollment.body().intent.created() {
+            return Err(ApiError::bad_request(
+                "account binding: header and enrollment intent differ",
+            ));
+        }
         Ok((enrollment, identity_text))
     }
 
@@ -190,9 +206,9 @@ impl Service {
             .map_err(|_| at(unavailable()))?;
         let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
         match routed.route {
-            Route::CreateAccount | Route::TakeOverMark if found.is_none() => {
+            Route::CreateAccount | Route::TakeOverMark => {
                 if let Some(created) = self
-                    .create_account(enrollment, identity_text, enrollment_hash, base_ms)
+                    .create_account(enrollment, identity_text, enrollment_hash)
                     .await
                     .map_err(at)?
                 {
@@ -230,7 +246,6 @@ impl Service {
         enrollment: &Enrollment,
         identity_text: &str,
         enrollment_hash: [u8; 32],
-        base_ms: u64,
     ) -> Result<Option<Enrolled>, ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let mark_failure = |failure: crate::marks::MarkStoreError, what: &'static str| {
@@ -242,12 +257,58 @@ impl Service {
             .lock_identity(identity_text)
             .await
             .map_err(|e| store_error(&e))?;
-        if lock.has_account().await.map_err(|e| store_error(&e))? {
+        enum Source {
+            Empty(crate::store::IdentityLock),
+            Account(Box<crate::store::AccountTxn>),
+        }
+        let mut source = if lock.has_account().await.map_err(|e| store_error(&e))? {
+            Source::Account(Box::new(
+                lock.account()
+                    .await
+                    .map_err(|e| store_error(&e))?
+                    .ok_or_else(unavailable)?,
+            ))
+        } else {
+            Source::Empty(lock)
+        };
+        let (account_input, baseline) = match &mut source {
+            Source::Empty(_) => (None, None),
+            Source::Account(txn) => {
+                let baseline = txn
+                    .held_identity()
+                    .await
+                    .map_err(|e| store_error(&e))?
+                    .map(|held| IdentityDoc::verify(&held.doc, &enrollment.body().identity))
+                    .transpose()
+                    .map_err(|_| unavailable())?;
+                let head = txn.head();
+                (
+                    Some(self.account_input(
+                        head.generation,
+                        head.chain,
+                        head.created_at_ms,
+                        baseline.as_ref().map(IdentityDoc::body),
+                        head.activation,
+                    )),
+                    baseline,
+                )
+            }
+        };
+        let store_id = self.marks.identity().await.map_err(|_| unavailable())?;
+        let inputs = self.mark_inputs(identity_text).await;
+        let judged = self.judge_with(identity_text, account_input, inputs).await;
+        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+            return Err(unavailable());
+        }
+        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
+        if judged
+            .account_binding()
+            .map_err(|_| unavailable())?
+            .association()
+            == AccountAssociation::Account
+        {
             return Ok(None);
         }
-        let inputs = self.mark_inputs(identity_text).await;
-        let judged = self.judge_with(identity_text, None, inputs).await;
-        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
         match routed.route {
             Route::CreateAccount | Route::TakeOverMark => {}
             Route::Unavailable => {
@@ -255,32 +316,53 @@ impl Service {
             }
             _ => return Err(unavailable()),
         }
+        if matches!(enrollment.body().intent, EnrollmentIntent::Existing { .. }) {
+            return Err(
+                match verdict::answer(
+                    &judged.judgement,
+                    &RequestClass::Ordinary,
+                    self.current_key(),
+                )
+                .route
+                {
+                    Route::NotHosted => super::marking::not_hosted(),
+                    Route::Notice(notice) => self.notice(identity_text, notice),
+                    _ => unavailable(),
+                },
+            );
+        }
+        let now = self.authorize_creation(enrollment, &judged, store_id)?;
+        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+            return Err(unavailable());
+        }
         let key = self.current_key();
         // Created after every erasure's record of the identity, so it is never taken for one
         // a restored database brought back, and after the creation of any mark it takes over,
         // so an erasure that named the earlier time never reaches it (Switch wire 7.3, Table 1
         // and "The mark"). Read under the lock, so no record or mark changes before the
         // account commits.
-        let created_at_ms = [
+        let older_head = match &source {
+            Source::Empty(_) => None,
+            Source::Account(txn) => Some(txn.head()),
+        };
+        let floor = [
             judged.erasure_at_ms,
             judged.mark().map(|mark| mark.created_at_ms),
+            older_head.map(|head| head.created_at_ms),
         ]
         .into_iter()
         .flatten()
-        .fold(base_ms, |at, earlier| at.max(earlier.saturating_add(1)));
-        let leftover = matches!(
-            judged.judgement.decision.verdict,
-            Verdict::NotHosted { delete_mark: true }
-        );
-        if leftover && let Some(erased_at_ms) = judged.erasure_at_ms {
-            // An erasure's leftover isn't taken: it is deleted first (Table 3).
-            self.marks
-                .delete_created_by(identity_text, erased_at_ms)
-                .await
-                .map_err(|failure| mark_failure(failure, "deleting an erasure's leftover mark"))?;
+        .try_fold(0, |at: u64, earlier| {
+            earlier.checked_add(1).map(|after| at.max(after))
+        })
+        .ok_or_else(unavailable)?
+        .max(older_head.map_or(0, |head| head.stamped_time_ms));
+        if now < floor {
+            return Err(unavailable());
         }
+        let created_at_ms = now;
         let marked = match judged.mark() {
-            Some(held) if !leftover => self
+            Some(held) => self
                 .marks
                 .take(identity_text, *held, key, created_at_ms)
                 .await
@@ -297,21 +379,50 @@ impl Service {
             return Err(unavailable());
         }
         let limits = announced_limits(&self.limits);
+        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+            return Err(unavailable());
+        }
+        let enrollment_store_id = store_id;
+        let replacing = older_head.is_some();
+        let generation = if let Some(head) = older_head {
+            head.generation
+                .max(baseline.as_ref().map_or(0, IdentityDoc::generation))
+                .max(judged.mark().map_or(0, |mark| mark.generation))
+        } else {
+            enrollment.identity_doc().map_or(1, IdentityDoc::generation)
+        };
         let account = NewAccount {
+            activation: if replacing {
+                AccountActivation::Recovery
+            } else {
+                AccountActivation::Ordinary
+            },
             id: identity_text.to_string(),
             identity_key: enrollment.body().identity,
-            generation: enrollment.identity_doc().map_or(1, IdentityDoc::generation),
+            generation,
             created_at_ms,
             limits,
-            identity_doc: enrollment.identity_doc().map(|doc| doc.signed().clone()),
+            identity_doc: if replacing {
+                baseline.as_ref()
+            } else {
+                enrollment.identity_doc()
+            }
+            .map(|doc| doc.signed().clone()),
             revoked_apps: enrollment.revoked_apps().to_vec(),
             enrollment_hash,
+            enrollment_store_id,
         };
-        let creation = lock
-            .create(&account)
-            .await
-            .map_err(|e| store_error(&e))?
-            .ok_or_else(unavailable)?;
+        let creation = match source {
+            Source::Empty(lock) => lock
+                .create(&account)
+                .await
+                .map_err(|e| store_error(&e))?
+                .ok_or_else(unavailable)?,
+            Source::Account(txn) => (*txn)
+                .replace_for_recovery(&account)
+                .await
+                .map_err(|e| store_error(&e))?,
+        };
         creation.commit().await.map_err(|e| store_error(&e))?;
         // Answered at the time it was created, which may be past `base_ms`.
         Ok(Some(Enrolled {
@@ -319,6 +430,73 @@ impl Service {
             limits,
             created: created_at_ms,
         }))
+    }
+
+    /// Fresh creation authority uses the service's trusted time and the same locked
+    /// store/erasure/creation tuple as discovery (Switch account binding 2.2 and 3).
+    fn authorize_creation(
+        &self,
+        enrollment: &Enrollment,
+        judged: &super::marking::Judged,
+        store_id: [u8; 16],
+    ) -> Result<u64, ApiError> {
+        let unavailable = || {
+            ApiError::unavailable("account binding: current state or trusted time is unavailable")
+        };
+        let observation = enrollment.observation().ok_or_else(binding_changed)?;
+        let now = self.time.read().trusted_ms.ok_or_else(unavailable)?;
+        match observation.validity(now) {
+            ObservationValidity::Future => return Err(unavailable()),
+            ObservationValidity::Expired => {
+                return Err(
+                    ApiError::new(ErrorCode::Conflict, "account binding: expired")
+                        .with_current(serde_json::json!({ "binding": "expired" })),
+                );
+            }
+            ObservationValidity::Current => {}
+        }
+        let body = observation.body();
+        let binding = judged.account_binding().map_err(|_| unavailable())?;
+        if body.service_key != self.current_key()
+            || body.store_id != store_id
+            || body.erased_at != judged.erasure_at_ms
+            || body.created != binding.created()
+            || body.association != binding.association()
+        {
+            return Err(binding_changed());
+        }
+        if judged
+            .erasure_at_ms
+            .into_iter()
+            .chain(binding.created())
+            .any(|at| at > now)
+        {
+            return Err(unavailable());
+        }
+        if judged.judgement.decision.erase_account_again
+            || matches!(
+                judged.judgement.decision.verdict,
+                Verdict::Unknown | Verdict::NotHosted { delete_mark: true }
+            )
+        {
+            return Err(unavailable());
+        }
+        let allowed = match enrollment.body().intent {
+            EnrollmentIntent::Create { .. } => {
+                judged.account.is_none() && matches!(judged.mark, verdict::MarkInput::Missing)
+            }
+            EnrollmentIntent::Takeover { created, .. } => {
+                binding.association() == AccountAssociation::Mark
+                    && judged
+                        .mark()
+                        .is_some_and(|mark| mark.created_at_ms == created)
+            }
+            EnrollmentIntent::Existing { .. } => false,
+        };
+        if !allowed {
+            return Err(binding_changed());
+        }
+        Ok(now)
     }
 
     /// An enrollment at an account that exists (Switch wire 3.7, 7.3 Table 3), under the
@@ -368,6 +546,7 @@ impl Service {
         base_ms: u64,
     ) -> Result<Enrolled, ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let store_id = self.marks.identity().await.map_err(|_| unavailable())?;
         let held = txn
             .held_identity()
             .await
@@ -384,39 +563,97 @@ impl Service {
             head.chain,
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
+            head.activation,
         );
         let judged = self.judge(identity_text, Some(account)).await;
         let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
-        if judged.judgement.decision.erase_account_again
-            || routed.route != (Route::Proceed { head: false })
+        if judged.judgement.decision.erase_account_again {
+            return Err(unavailable());
+        }
+        let binding = judged.account_binding().map_err(|_| unavailable())?;
+        if binding.association() != AccountAssociation::Account {
+            if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. }) {
+                return Err(binding_changed());
+            }
+            if let EnrollmentIntent::Existing { created } = enrollment.body().intent
+                && let Some(current) = binding.created()
+                && created != current
+            {
+                return Err(creation_conflict(current));
+            }
+            return Err(
+                match verdict::answer(
+                    &judged.judgement,
+                    &RequestClass::Ordinary,
+                    self.current_key(),
+                )
+                .route
+                {
+                    Route::NotHosted => super::marking::not_hosted(),
+                    Route::Notice(notice) => self.notice(identity_text, notice),
+                    _ => unavailable(),
+                },
+            );
+        }
+        if routed.route != (Route::Proceed { head: false }) {
+            return Err(unavailable());
+        }
+        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+            return Err(unavailable());
+        }
+        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
+        // The selected SQL creation, read under the lock (Switch account binding 1.1).
+        let created = binding.created().ok_or_else(unavailable)?;
+        // Read-only receipt recovery precedes freshness and never applies the intent again
+        // (Switch account binding 3). Missing or evicted receipts prove no non-application.
+        if let Some(receipt) = txn
+            .enrollment_answer(&enrollment_hash)
+            .await
+            .map_err(|e| store_error(&e))?
         {
+            if receipt.created_at_ms != txn.head().created_at_ms
+                || receipt.created_at_ms != created
+                || receipt.store_id != store_id
+            {
+                return Err(binding_changed());
+            }
+            if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+                return Err(unavailable());
+            }
+            return Ok(Enrolled {
+                time_ms: txn.head().stamped_time_ms,
+                limits,
+                created,
+            });
+        }
+        match enrollment.body().intent {
+            EnrollmentIntent::Existing { created: expected } if expected == created => {}
+            EnrollmentIntent::Existing { .. } => return Err(creation_conflict(created)),
+            _ => return Err(binding_changed()),
+        }
+        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
             return Err(unavailable());
         }
         let time_ms = txn.stamp(base_ms);
-        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
-        // The account's creation time, read under the lock: the mark's, or the account's
-        // own where the mark is lost (Switch wire 3.7).
-        let created = match self.marks.read(identity_text).await {
-            Ok(MarkRead::Mark(mark)) => mark.created_at_ms,
-            Ok(MarkRead::Missing | MarkRead::NotAMark) => txn.head().created_at_ms,
-            Err(failure) => {
-                tracing::error!(%failure, "reading a mark");
-                return Err(ApiError::unavailable("7.4.1: the mark store can't be read"));
-            }
-        };
         let key = self.current_key();
-        let serving = held.as_ref().is_some_and(|doc| {
-            doc.inbox().url == self.origin
-                && self.keys.signer_for(&doc.inbox().service_key).is_some()
-        });
+        let serving = txn.head().activation == AccountActivation::Recovery
+            || held.as_ref().is_some_and(|doc| {
+                doc.inbox().url == self.origin
+                    && self.keys.signer_for(&doc.inbox().service_key).is_some()
+            });
         if serving {
             txn.hold_revoked_apps(enrollment.revoked_apps())
                 .await
                 .map_err(|e| store_error(&e))?;
         }
-        txn.keep_enrollment_answer(&enrollment_hash, time_ms, self.limits.max_enrollments)
-            .await
-            .map_err(|e| store_error(&e))?;
+        txn.keep_enrollment_answer(
+            &enrollment_hash,
+            time_ms,
+            self.limits.max_enrollments,
+            store_id,
+        )
+        .await
+        .map_err(|e| store_error(&e))?;
         if !serving && let Err(failure) = self.marks.set_key(identity_text, key, created).await {
             tracing::error!(%failure, "a staged account's mark taking the current key");
             return Err(unavailable());

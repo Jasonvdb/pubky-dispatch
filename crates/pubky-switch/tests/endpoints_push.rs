@@ -514,13 +514,8 @@ async fn test_push_staged_account_keeps_nothing() {
         .expect("time")
         .to_string();
     set_time(&replay.clock, &enrolled_at);
-    let enrolled = replay
-        .service
-        .handle(vector_request(named(
-            &http["requests"],
-            "signer: enrollment",
-        )))
-        .await;
+    let enrollment = fresh_alice_enrollment(&replay, ms(&enrolled_at)).await;
+    let enrolled = replay.service.handle(enrollment).await;
     assert_eq!(enrolled.status, 200);
     let path = format!("/v1/{}/push", alice_id());
     let request = app_request(

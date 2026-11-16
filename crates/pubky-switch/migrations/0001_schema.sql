@@ -27,6 +27,9 @@ CREATE TABLE accounts (
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
     -- When the account was created, in service time.
     created_at_ms   BIGINT   NOT NULL CHECK (created_at_ms >= 0),
+    -- A replacement's retained baseline needs a durable higher recovery before use
+    -- (Switch account binding 3.1). Every current writer supplies this requirement.
+    activation_requirement TEXT NOT NULL CHECK (activation_requirement IN ('ordinary', 'recovery')),
     -- The limits announced at the first enrollment, as the answer writes them; every later
     -- enrollment announces the same (Switch wire 3.7).
     announced_limits BYTEA   NOT NULL,
@@ -58,18 +61,19 @@ CREATE TABLE accounts (
     swept_at_ms     BIGINT   CHECK (swept_at_ms >= 0),
     CHECK ((chain_seq IS NULL) = (chain_hash IS NULL)),
     CHECK (identity_proof IS NULL OR identity_doc IS NOT NULL),
+    CHECK (activation_requirement != 'recovery' OR
+           (last_seq = 0 AND chain_seq IS NULL AND identity_proof IS NULL AND recovery_from IS NULL)),
     CHECK ((recovery_from IS NULL) = (recovery_declared_at_ms IS NULL))
 );
 
 -- App IDs the account keeps for good: revoked, departed, or named by an enrollment's
--- revoked_apps, so they are never current again (Switch wire 3.3, 3.7, 9.1).
+-- revoked_apps, or removed in a verified document (Switch wire 3.3, 3.7, 9.1).
 CREATE TABLE kept_app_ids (
     account_id  TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     app_id      BYTEA   NOT NULL CHECK (octet_length(app_id) = 16),
-    -- Why it is kept: 'revoked', 'departed' or 'enrolled'.
-    reason      TEXT    NOT NULL CHECK (reason IN ('revoked', 'departed', 'enrolled')),
-    -- The service time it was revoked, departed, or the enrollment that named it.
-    at_ms       BIGINT  NOT NULL CHECK (at_ms >= 0),
+    reason      TEXT    NOT NULL CHECK (reason IN ('revoked', 'departed', 'enrolled', 'document')),
+    -- A local event's service time; a document alone supplies no local event time.
+    at_ms       BIGINT  CHECK (at_ms >= 0),
     -- The newest document's data_epoch when the app was revoked or departed; null for App
     -- IDs an enrollment named. A departure's rotation is done once a delivered identity.json
     -- lists it in removed with a higher data_epoch than this, and stays done whatever later
@@ -77,6 +81,8 @@ CREATE TABLE kept_app_ids (
     -- wire 3.3).
     data_epoch  BIGINT  CHECK (data_epoch >= 0),
     rotated     BOOLEAN NOT NULL DEFAULT false,
+    CHECK ((reason = 'document') = (at_ms IS NULL)),
+    CHECK (reason != 'document' OR (data_epoch IS NULL AND NOT rotated)),
     PRIMARY KEY (account_id, app_id)
 );
 
@@ -123,6 +129,9 @@ CREATE INDEX chain_items_by_doc_app ON chain_items (account_id, doc_app)
 CREATE TABLE enrollment_answers (
     account_id       TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     enrollment_hash  BYTEA   NOT NULL CHECK (octet_length(enrollment_hash) = 32),
+    -- The exact account and external mark store where this intent was applied.
+    created_at_ms    BIGINT  NOT NULL CHECK (created_at_ms >= 0),
+    store_id         BYTEA   NOT NULL CHECK (octet_length(store_id) = 16),
     -- When it was first answered, in service time.
     answered_at_ms   BIGINT  NOT NULL CHECK (answered_at_ms >= 0),
     -- The order answers were kept in; the oldest drops first.

@@ -12,6 +12,7 @@ use pubky_switch_core::chain::{ChainTip, ZERO_HASH};
 use pubky_switch_core::http::{
     ErrorCode, NoticeReason, RecoveryNotice, header, not_hosted_current,
 };
+use pubky_switch_core::records::{AccountActivation, AccountAssociation};
 use pubky_switch_core::time::rfc3339;
 use serde_json::json;
 
@@ -60,14 +61,29 @@ pub(crate) enum MarkSlot {
 
 /// The identity's part of the mark store: its mark, its retired generations and its
 /// erasure's record, and whether the store can be read (Switch wire 7.3, "The store").
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct MarkStore {
+    /// The store identity, absent only if its initial generation failed.
+    pub(crate) identity: Option<[u8; 16]>,
     pub(crate) slot: MarkSlot,
     pub(crate) unreadable: bool,
     pub(crate) retired: BTreeSet<u64>,
     /// The time of the erasure's record for the identity, if there is one.
     pub(crate) erasure_at_ms: Option<u64>,
     pub(super) attempt: Option<super::erasure::Attempt>,
+}
+
+impl Default for MarkStore {
+    fn default() -> Self {
+        Self {
+            identity: pubky_switch_core::enc::random_bytes().ok(),
+            slot: MarkSlot::Missing,
+            unreadable: false,
+            retired: BTreeSet::new(),
+            erasure_at_ms: None,
+            attempt: None,
+        }
+    }
 }
 
 impl MarkStore {
@@ -155,10 +171,22 @@ impl Inner {
     /// Only a recovery above both the held document and readable mark starts (Switch wire
     /// 7.3, Table 2). The notice still names the chain generation where one is held (7.6).
     pub(super) fn starts_recovery(&self, generation: u64, from: Option<u64>) -> bool {
+        let retained_sql = if self.hosts()
+            && (self.activation == AccountActivation::Recovery
+                || self
+                    .marks
+                    .mark()
+                    .is_some_and(|mark| mark.created_at_ms != self.created_at_ms))
+        {
+            self.tip.generation
+        } else {
+            0
+        };
         let floor = self
             .doc
             .as_ref()
             .map_or(0, |doc| doc.generation())
+            .max(retained_sql)
             .max(self.marks.mark().map_or(0, |mark| mark.generation));
         generation > floor && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
     }
@@ -194,8 +222,13 @@ impl Inner {
         if self.not_hosted_unpinned {
             return Verdict::NotHosted { delete_mark: false };
         }
-        let mark = marks.mark();
-        if !self.hosts() {
+        let Ok(binding) = self.account_binding() else {
+            return Verdict::Unknown;
+        };
+        let mark = marks
+            .mark()
+            .filter(|mark| binding.created() == Some(mark.created_at_ms));
+        if binding.association() != AccountAssociation::Account {
             let Some(mark) = mark else {
                 return Verdict::NotHosted { delete_mark: false };
             };
@@ -228,6 +261,12 @@ impl Inner {
             reason,
             permanent,
         };
+        if self.activation == AccountActivation::Recovery {
+            return match mark {
+                Some(_) => Verdict::Bounded(notice(NoticeReason::Behind, retired)),
+                None => Verdict::Failing(notice(NoticeReason::MarkLost, retired)),
+            };
+        }
         let Some(state) = state else {
             // Row "Staged, holding no chain".
             return match mark {
@@ -282,21 +321,10 @@ impl Inner {
         }
     }
 
-    /// Step 2 of Switch wire 7.3: the answer Table 2 gives in place of whatever the later
-    /// steps would, a `401` or a `403` before authentication included; `None` where the
-    /// request goes on. Deletes an erasure's leftover mark, and answers the erasure at a lost
-    /// identity, which no later step reaches.
-    pub(super) fn step_two(&mut self, request: &Request) -> Option<Response> {
-        if let Some(answer) = self.pending_erasure(request) {
-            return Some(answer);
-        }
-        let class = class_of(request);
-        let verdict = self.judge();
-        let unknown = matches!(verdict, Verdict::Unknown);
-        if let Verdict::NotHosted { delete_mark: true } = verdict {
-            self.marks.slot = MarkSlot::Missing;
-        }
-        let answer = match (verdict, class) {
+    /// Table 2's read-only route decision, also used when authentication fails before
+    /// any request-dependent effect (Switch wire 7.3).
+    pub(super) fn verdict_refusal(&self, request: &Request, verdict: Verdict) -> Option<Answer> {
+        Some(match (verdict, class_of(request)) {
             (Verdict::Unknown, _) => bad(
                 ErrorCode::Unavailable,
                 "Switch wire 7.3: the mark store can't be read",
@@ -315,13 +343,39 @@ impl Inner {
                     recovery_from,
                 },
             ) if self.starts_recovery(generation, recovery_from) => return None,
-            (Verdict::Bounded(_), Class::Upload) => return None,
+            (Verdict::Bounded(_), Class::Upload)
+                if self.activation == AccountActivation::Ordinary =>
+            {
+                return None;
+            }
             (Verdict::Bounded(_) | Verdict::Failing(_), Class::Erase) => return None,
-            (Verdict::Lost(_), Class::Erase) => self.erase_lost(request),
+            (Verdict::Lost(_), Class::Erase) => return None,
             (Verdict::Bounded(notice) | Verdict::Failing(notice) | Verdict::Lost(notice), _) => {
                 notice_answer(&notice)
             }
-        };
+        })
+    }
+
+    /// Step 2 of Switch wire 7.3: the answer Table 2 gives in place of whatever the later
+    /// steps would, a `401` or a `403` before authentication included; `None` where the
+    /// request goes on. Deletes an erasure's leftover mark, and answers the erasure at a lost
+    /// identity, which no later step reaches.
+    pub(super) fn step_two(&mut self, request: &Request) -> Option<Response> {
+        if let Some(answer) = self.pending_erasure(request) {
+            return Some(answer);
+        }
+        let class = class_of(request);
+        let verdict = self.judge();
+        let unknown = matches!(verdict, Verdict::Unknown);
+        if let Verdict::NotHosted { delete_mark: true } = verdict {
+            self.marks.slot = MarkSlot::Missing;
+        }
+        let answer =
+            if !self.hosts() && matches!((verdict, class), (Verdict::Lost(_), Class::Erase)) {
+                self.erase_lost(request)
+            } else {
+                self.verdict_refusal(request, verdict)?
+            };
         let (status, body) = answer;
         if self.not_hosted_unpinned {
             let other = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
@@ -387,11 +441,15 @@ impl Inner {
     }
 
     /// The account's creation time (Switch wire 3.7, 7.3): the one in its mark, or the
-    /// account's own where the mark is lost.
+    /// later physical lifetime when both SQL and the mark survive (account binding 1.1).
     pub(super) fn creation_time(&self) -> u64 {
-        self.marks
-            .mark()
-            .map_or(self.created_at_ms, |mark| mark.created_at_ms)
+        self.marks.mark().map_or(self.created_at_ms, |mark| {
+            if self.hosts() {
+                mark.created_at_ms.max(self.created_at_ms)
+            } else {
+                mark.created_at_ms
+            }
+        })
     }
 
     /// What binds an erasure to the account it erases (Switch wire 7.4.16), in one place, as
@@ -407,8 +465,9 @@ impl Inner {
     pub(super) fn erasure_binding(&self, request: &Request) -> Result<u64, Answer> {
         let named = pubky_switch_core::http::parse_erase_body(&request.body)
             .map_err(|error| bad(ErrorCode::BadRequest, &error.to_string(), json!(null)))?;
-        let created = self.creation_time();
-        let lost = !self.hosts();
+        let binding = self.account_binding()?;
+        let created = binding.created().ok_or_else(not_hosted)?;
+        let lost = binding.association() != AccountAssociation::Account;
         let conflict = |why: &str| {
             let mut current = json!({ "created": rfc3339(created) });
             if lost {
@@ -439,18 +498,8 @@ impl Inner {
     /// at a (0, 0) mark left with no account, or a lost account's mark, the new account
     /// takes it over with the current key and its own creation time, its generation, `seq`,
     /// chain hash and retirements staying.
-    pub(super) fn mark_new_account(&mut self) {
+    pub(super) fn mark_new_account(&mut self, created: u64) {
         let key = self.service.verifying_key().to_bytes();
-        // A creation time after any erasure's record, so the record never covers the new
-        // account (Table 1's first row), and after that of the mark it takes over, so no two
-        // accounts of the identity have the same one (Switch wire 7.3, The mark).
-        let created = [
-            self.marks.erasure_at_ms,
-            self.marks.mark().map(|mark| mark.created_at_ms),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(self.now(), |at, earlier| at.max(earlier.saturating_add(1)));
         self.created_at_ms = created;
         self.marks.slot = MarkSlot::At(match self.marks.slot {
             MarkSlot::At(mark) => Mark {
@@ -465,7 +514,7 @@ impl Inner {
     /// Move the mark to the account's state after a commit that gives out a head (Switch
     /// wire 7.3, Table 3): only while the account is healthy, and only to a higher pair.
     pub(super) fn settle_mark(&mut self) {
-        if self.judge() != Verdict::Healthy {
+        if self.judge() != Verdict::Healthy || self.tip.seq == 0 {
             return;
         }
         let tip = self.tip;
@@ -485,10 +534,6 @@ impl Inner {
     /// Table 3).
     pub(super) fn mark_generation_start(&mut self) {
         let created = self.created_at_ms;
-        let created = match self.marks.slot {
-            MarkSlot::At(mark) => mark.created_at_ms,
-            MarkSlot::Missing | MarkSlot::Corrupt => created,
-        };
         self.marks.slot = MarkSlot::At(Mark {
             generation: self.tip.generation,
             seq: self.tip.seq,
@@ -549,6 +594,18 @@ impl ScriptedSwitch {
     /// one in its mark, or the account's own where the mark is lost.
     pub fn created(&self) -> u64 {
         self.lock().creation_time()
+    }
+
+    /// Restore only the SQL account's creation field, leaving the separately retained
+    /// mark unchanged (Switch account binding 1.1).
+    pub fn restore_account_creation(&self, created_at_ms: u64) {
+        self.lock().created_at_ms = created_at_ms;
+    }
+
+    /// The physical account's creation, independently of its retained mark.
+    pub fn stored_creation(&self) -> Option<u64> {
+        let inner = self.lock();
+        inner.hosts().then_some(inner.created_at_ms)
     }
 
     /// The time of the erasure's record for the identity, if there is one.

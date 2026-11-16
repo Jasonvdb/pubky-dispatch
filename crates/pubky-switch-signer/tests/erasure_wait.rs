@@ -281,6 +281,26 @@ async fn test_erasure_wait_revocation_pending_from_before_isnt_sent_while_erasin
 }
 
 #[tokio::test]
+async fn test_erasure_wait_without_enrollment_sends_nothing() {
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(
+        world.env(store),
+        world.keyring(),
+        pubky_switch_client::testing::SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        signer.close_account(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::FlowInProgress)
+    );
+    assert_eq!(signer.status(), SignerStatus::Enrolling);
+    assert!(world.transport.requests().is_empty());
+    assert!(world.homeserver.deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_erasure_wait_with_no_mark_runs_on_the_retrys_404_alone() {
     // The first delivery was refused (`400`): no mark, so no check reads the switch. The
     // retry's unsigned `404` starts the wait, the next one keeps it, no `GET /apps` goes out,
@@ -322,8 +342,8 @@ async fn test_erasure_wait_with_no_mark_runs_on_the_retrys_404_alone() {
         path: "/erase".into(),
         after: 0,
     });
-    signer.close_account(confirmed()).await.unwrap_err();
-    assert_eq!(signer.status(), SignerStatus::Erasing);
+    let error = signer.close_account(confirmed()).await.unwrap_err();
+    assert_eq!(signer.status(), SignerStatus::Erasing, "{error:?}");
     let apps_reads = |transport: &MockTransport| {
         transport
             .requests()
@@ -372,6 +392,7 @@ fn a_clone_delivers_and_backs_up(
     let records = SignerRecords::new(
         IdentityKey::from_secret(world.key.secret_bytes()),
         next.clone(),
+        world.backup().account_created(),
         held.revoked_apps(),
         held.certs(),
         *held.limits(),

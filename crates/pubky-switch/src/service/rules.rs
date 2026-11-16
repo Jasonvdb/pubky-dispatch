@@ -102,6 +102,7 @@ pub fn decode_claim(
             app: header_text(headers, header::APP).map(str::to_string),
             cert: header_text(headers, header::CERT).map(str::to_string),
             invite_code: header_text(headers, header::INVITE_CODE).map(str::to_string),
+            created: header_text(headers, header::CREATED).map(str::to_string),
         },
         signature,
         timestamp_ms,

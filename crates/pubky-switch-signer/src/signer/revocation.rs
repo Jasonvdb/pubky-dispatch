@@ -764,6 +764,7 @@ impl Signer {
             // After the parts, the newest version again: its backup lists them, and its
             // delivery is a retry the switch answers with its proof (Switch wire 3.13, 7.4.2).
             let flow = Flow::Renew {
+                account: self.newest_account()?,
                 batches,
                 sent: 0,
                 doc: held.doc,

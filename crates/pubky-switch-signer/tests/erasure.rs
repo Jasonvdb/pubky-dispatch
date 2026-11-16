@@ -1240,6 +1240,7 @@ fn a_clone_signs_on(
     let records = SignerRecords::new(
         IdentityKey::from_secret(world.key.secret_bytes()),
         next.clone(),
+        world.backup().account_created(),
         held.revoked_apps(),
         held.certs(),
         *held.limits(),
@@ -2491,53 +2492,71 @@ async fn test_signer_erase_names_the_created_of_its_enrollment_answer() {
 }
 
 #[tokio::test]
-async fn test_signer_erase_without_a_held_created_learns_it_from_the_409() {
-    // A restored signer holds no creation time, since the backup doesn't carry it: its
-    // erasure names none, the signed `409 conflict` carries it, and the erasure sent again
-    // naming it goes through (Switch wire 7.4.16).
+async fn test_signer_erase_keeps_the_restored_account() {
     let world = World::new();
     let (mut signer, _, _) = with_an_app(&world).await;
     let created = world.switch.created();
+    assert_eq!(world.backup().account_created(), created);
+    let before = world.transport.requests().len();
     signer.restore(confirmed()).await.unwrap();
+    assert_eq!(world.backup().account_created(), created);
     signer.close_account(confirmed()).await.unwrap();
     assert!(world.switch.erased());
-    assert_eq!(named_created(&world), [None, Some(created)]);
+    assert_eq!(named_created(&world), [Some(created)]);
     assert_eq!(signer.status(), SignerStatus::Erased);
+    let requests = world.transport.requests();
+    assert!(requests[before..].iter().all(|request| {
+        request.header(pubky_switch_core::http::header::CREATED)
+            == Some(pubky_switch_core::time::rfc3339(created).as_str())
+    }));
+    assert!(
+        !requests[before..]
+            .iter()
+            .any(|request| request.path_and_query.ends_with("/account"))
+    );
 }
 
 #[tokio::test]
-async fn test_signer_erase_adopts_conflict_created() {
-    // A signed `409` naming another creation time than the request did, such as a later
-    // account's after a request in doubt: the signer names that one in the erasure it sends
-    // again, whatever time it held (Switch wire 7.4.16).
+async fn test_signer_erase_keeps_its_creation_after_conflict() {
     let world = World::new();
-    let (mut signer, _, _) = with_an_app(&world).await;
+    let (mut signer, _, store) = with_an_app(&world).await;
     let created = world.switch.created();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    assert!(signer.close_account(confirmed()).await.is_err());
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
         code: ErrorCode::Conflict,
         current: checked_against(created + 7),
     });
-    // The switch's next answer checks the time it named, which isn't the account's: the
-    // signer, having relearned once, takes that `409` as a refusal.
-    assert_eq!(
-        signer.close_account(confirmed()).await.unwrap_err(),
-        SignerError::Refused(Refusal::ErasureRefused)
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(pubky_switch_client::ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ),
+        "{error:?}"
     );
-    assert_eq!(named_created(&world), [Some(created), Some(created + 7)]);
+    assert_eq!(named_created(&world), [Some(created), Some(created)]);
     assert!(!world.switch.erased());
-    // The time it learned is the one it holds and names next: the switch's `409` to it named
-    // the account's, which the signer adopts in turn, and the erasure goes through.
-    signer.close_account(confirmed()).await.unwrap();
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
     assert!(world.switch.erased());
     assert_eq!(
         named_created(&world),
-        [
-            Some(created),
-            Some(created + 7),
-            Some(created + 7),
-            Some(created)
-        ]
+        [Some(created), Some(created), Some(created)]
     );
 }
 

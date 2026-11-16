@@ -205,6 +205,13 @@ mod tests {
             world.transport(),
             world.clock().clone(),
         )?;
+        let created = client
+            .observe_account()
+            .await?
+            .body()
+            .created
+            .ok_or("the enrolled account has no creation")?;
+        let client = client.with_account_created(created)?;
         let before = client
             .apps()
             .await?

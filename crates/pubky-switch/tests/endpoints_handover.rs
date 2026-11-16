@@ -237,7 +237,15 @@ fn phone_body() -> Vec<u8> {
 }
 
 /// A hand-over of alice's records, version 3, to the executor.
-fn executor_body() -> Vec<u8> {
+async fn executor_body(replay: &Replay) -> Vec<u8> {
+    let created = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .expect("account")
+        .created_at_ms;
     let key = identity_key();
     let alice = key.public();
     let doc = IdentityDoc::verify(&document("alice identity.json"), &alice).expect("version 3");
@@ -253,6 +261,7 @@ fn executor_body() -> Vec<u8> {
     let records = SignerRecords::new(
         IdentityKey::from_secret(key.secret_bytes()),
         doc,
+        created,
         &[],
         &certs,
         Limits::default(),
@@ -482,7 +491,7 @@ async fn test_handover_target_without_a_record_is_conflict() {
     replay_chain_through_revoke(&replay).await;
     set_time(&replay.clock, &vector_time());
     assert_eq!(
-        code_of(&put(&replay, executor_body()).await),
+        code_of(&put(&replay, executor_body(&replay).await).await),
         (409, json!("conflict"))
     );
     replay.db.drop_database().await.expect("drop");
@@ -501,7 +510,7 @@ async fn test_handover_expired_target_is_stored_but_not_served_to_it() {
         .handle(signer_request(
             "PUT",
             &handover_path(),
-            executor_body(),
+            executor_body(&replay).await,
             ms(expired),
         ))
         .await;
@@ -602,7 +611,7 @@ async fn test_handover_replaced_by_the_next_put() {
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
     assert_eq!(put(&replay, phone_body()).await.status, 200);
-    let executor = executor_body();
+    let executor = executor_body(&replay).await;
     let stored = put(&replay, executor.clone()).await;
     assert_eq!(
         stored.status,
@@ -701,7 +710,7 @@ async fn test_handover_staged_account_is_unavailable() {
             .as_str()
             .expect("time"),
     );
-    let enrollment = vector_request(&http_case("requests", "signer: enrollment"));
+    let enrollment = fresh_alice_enrollment(&replay, alice_created()).await;
     assert_eq!(replay.service.handle(enrollment).await.status, 200);
     let at = enrolled["headers"]["switch-server-time"]
         .as_str()

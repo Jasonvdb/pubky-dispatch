@@ -312,7 +312,8 @@ Every protected direct/list/conflict record view carries its complete policy
 and required `origin`, either the object below or null when recovery cannot
 establish even complete restrictive slot facts. Null is unavailable evidence,
 never absence. A retired parent-key GET is `200` with exactly
-`{"origin_tombstone":<origin object>}` under the retained parent read scope.
+`{"origin_tombstone":<origin object>,"account_created":<time>}` under the retained
+parent read scope, with the required response context of wire 7.4.9.
 It is not `404` or a current value. Forgotten children can return `404`; their
 parent slot still prohibits reinitialization.
 
@@ -331,7 +332,9 @@ Its exact body is compact JSON in this member order:
 `key` is the requested parent or child key; `origin_key` is the parent key.
 They coincide for a tombstone. Account creation time, current identity document
 hash and head bind the durable authenticated snapshot as for a lineage statement.
-Wire 7.3 applies. A cached statement is not current evidence. Child read scope
+Wire 7.3 applies. The statement's creation equals the same response's
+`account_created` under wire 7.4.9, including in a collection page. A cached
+statement or response context is not current evidence. Child read scope
 permits this metadata, never the parent ciphertext. A feed reader fetches the
 required current evidence before deriving authority from the item.
 

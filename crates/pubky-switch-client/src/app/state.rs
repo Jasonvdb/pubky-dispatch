@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use super::error::AppError;
 use super::events::{AppEvent, ParkReason};
-use super::protocol::LocalWrite;
+use super::protocol::{EntryReceipt, LocalWrite};
 use crate::error::StoreError;
 use crate::store::{StoreHandle, Write, WriteBatch};
 
@@ -442,6 +442,7 @@ impl ParkedRound {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
     pub(crate) since_ms: u64,
+    pub(crate) receipt: EntryReceipt,
 }
 
 /// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry
@@ -459,6 +460,8 @@ pub(crate) struct RetryEntry {
 /// holds the opened message, so its `Debug` shows only its size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedEntry {
+    /// The original verified feed observation; waiting never refreshes it.
+    pub(crate) receipt: EntryReceipt,
     /// The `seq` the entry was read at, in [`ParkedEntry::generation`].
     pub(crate) seq: u64,
     /// The generation it was read at.
@@ -565,6 +568,7 @@ pub(crate) struct PendingEffect {
 /// ([`PendingEffect::entry`]). Sensitive: it holds the opened message.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KeptEntry {
+    pub(crate) receipt: EntryReceipt,
     pub(crate) cert: SignedDoc,
     /// The signed plaintext's bytes (Switch wire 4.5).
     #[serde(with = "serde_b64_vec")]
@@ -722,6 +726,29 @@ impl Tx {
     /// Every write in the batch, not yet committed, in order.
     pub(crate) fn pending_writes(&self) -> &[Write] {
         self.batch.writes()
+    }
+
+    /// Append a completely staged transition, after checking its full contribution.
+    pub(crate) fn append(&mut self, other: Self) -> Result<(), AppError> {
+        other.batch.check_namespace(&self.ns)?;
+        let size = self.size().saturating_add(other.size());
+        if size > crate::store::MAX_BATCH_BYTES {
+            return Err(crate::store::BatchError::BatchTooLarge {
+                size,
+                cap: crate::store::MAX_BATCH_BYTES,
+            }
+            .into());
+        }
+        for write in other.batch.into_writes() {
+            match write {
+                Write::Put { ns, key, value } => self.batch.put(&ns, key, value)?,
+                Write::Delete { ns, key } => self.batch.delete(&ns, key)?,
+                Write::DeletePrefix { ns, prefix } => self.batch.delete_prefix(&ns, prefix)?,
+            };
+        }
+        self.duties.extend(other.duties);
+        self.local.extend(other.local);
+        Ok(())
     }
 
     /// What the batch leaves at `key`, not yet committed: `Some(true)` when its last write
@@ -957,6 +984,13 @@ pub(crate) mod kept_local {
 
 #[cfg(test)]
 mod tests {
+    fn receipt() -> super::EntryReceipt {
+        super::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: 3,
+        }
+    }
     use super::*;
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
@@ -1018,6 +1052,7 @@ mod tests {
             kept_ms: u64::MAX,
             forget: Vec::new(),
             entry: KeptEntry {
+                receipt: receipt(),
                 cert: SignedDoc {
                     body: "A".repeat(33 * 1024),
                     sig: "A".repeat(86),
@@ -1148,6 +1183,7 @@ mod tests {
     #[test]
     fn test_parked_entry_debug_hides_the_message() {
         let parked = ParkedEntry {
+            receipt: receipt(),
             seq: 1,
             generation: 1,
             sender: [1; 32],
@@ -1179,8 +1215,14 @@ mod tests {
         let handle = StoreHandle::inline(Arc::clone(&store));
         let mut tx = Tx::new("client/a");
         for seq in 0..600u64 {
-            tx.put(&key::held(seq), &HeldEntry { since_ms: seq })
-                .unwrap();
+            tx.put(
+                &key::held(seq),
+                &HeldEntry {
+                    receipt: receipt(),
+                    since_ms: seq,
+                },
+            )
+            .unwrap();
         }
         tx.local(&[LocalWrite::Put {
             key: b"x".to_vec(),
@@ -1194,7 +1236,13 @@ mod tests {
         };
         let held: BTreeMap<u64, HeldEntry> = reader.scan_numbered("held/").await.unwrap();
         assert_eq!(held.len(), 600);
-        assert_eq!(held.get(&599), Some(&HeldEntry { since_ms: 599 }));
+        assert_eq!(
+            held.get(&599),
+            Some(&HeldEntry {
+                receipt: receipt(),
+                since_ms: 599
+            })
+        );
         assert_eq!(reader.get_raw(b"p/x").await.unwrap(), Some(b"1".to_vec()));
         // Another namespace never reads the app's records.
         assert!(store.scan("client/b", b"", None, 10).unwrap().is_empty());

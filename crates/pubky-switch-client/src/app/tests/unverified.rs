@@ -25,6 +25,7 @@ use crate::store::{KeyValue, Write, WriteBatch};
 struct BackedUp {
     sample: SampleProtocol,
     released: Mutex<Vec<bool>>,
+    positions: Mutex<Vec<(u64, u64, bool)>>,
 }
 
 impl Protocol for BackedUp {
@@ -59,6 +60,10 @@ impl Protocol for BackedUp {
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         self.released.lock().unwrap().push(message.released);
+        self.positions
+            .lock()
+            .unwrap()
+            .push((message.generation, message.seq, message.released));
         self.sample.receive(message, cx)
     }
 
@@ -125,13 +130,13 @@ impl StateStore for Counting {
 }
 
 /// A sender identity other than alice's, with one app.
-struct Peer {
-    identity: IdentityKey,
-    keys: AppKeys,
-    cert: AppCert,
+pub(super) struct Peer {
+    pub(super) identity: IdentityKey,
+    pub(super) keys: AppKeys,
+    pub(super) cert: AppCert,
 }
 
-fn peer(w: &World, name: &str) -> Peer {
+pub(super) fn peer(w: &World, name: &str) -> Peer {
     let identity = IdentityKey::from_secret(seed(&format!("{name}/identity")));
     let keys = app_keys(&format!("{name}-app"));
     let cert = cert_for(&identity, &keys, w.clock.now_ms(), &["scope-a"]);
@@ -179,12 +184,11 @@ async fn stored_unverified(w: &World, app: &mut App, peers: &[(&Peer, usize)]) -
     w.clock.advance_ms(World::config().park_after_ms + 1);
     app.receive(None).await.unwrap();
     for seq in seqs.iter().flatten() {
-        assert_eq!(
-            app.stored_at(*seq).map(|stored| stored.reason),
-            Some(ParkReason::Unverifiable),
-            "{seq}"
-        );
+        if let Some(stored) = app.stored_at(*seq) {
+            assert_eq!(stored.reason, ParkReason::Unverifiable, "{seq}");
+        }
     }
+    assert!(app.state.parked.len() <= MAX_UNVERIFIED_TOTAL);
     seqs
 }
 
@@ -220,6 +224,11 @@ fn entry_of(
     )
     .unwrap();
     ParkedEntry {
+        receipt: crate::app::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: accepted_at_ms,
+        },
         seq,
         generation: 1,
         sender: peer.identity.public(),
@@ -346,8 +355,9 @@ async fn test_unverified_bound_drop_keeps_a_duty_event_naming_the_entry() {
                 sender,
                 accepted_at_ms,
                 reason: DropReason::Age,
-                awaited_epoch: None,
-                msg_id: None,
+                waiting: crate::app::WaitingReason::Sender,
+                sender_verified: false,
+                ..
             } if *stored_id == id
                 && *s == seq
                 && *sender == h.identity.public()
@@ -365,10 +375,10 @@ async fn test_unverified_bound_per_sender_drops_the_accepted_earliest() {
     let mut app = wallet(&w, w.env()).await;
     let h = peer(&w, "honest");
     let seqs = stored_unverified(&w, &mut app, &[(&h, MAX_UNVERIFIED_PER_SENDER + 1)]).await;
-    // The next read applies the bound: the one accepted earliest goes.
-    let report = app.receive(None).await.unwrap();
+    // The incoming transition applied the bound before any later read.
+    app.receive(None).await.unwrap();
     assert_eq!(
-        dropped(&report.events),
+        dropped(&app.kept_duties().await.unwrap()),
         vec![(seqs[0][0], DropReason::PerSender)]
     );
     assert!(app.stored_at(seqs[0][0]).is_none());
@@ -394,9 +404,9 @@ async fn test_unverified_bound_total_drops_from_the_largest_holder_not_an_honest
         ],
     )
     .await;
-    assert_eq!(app.stored_seqs().len(), 138);
-    let report = app.receive(None).await.unwrap();
-    let drops = dropped(&report.events);
+    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+    app.receive(None).await.unwrap();
+    let drops = dropped(&app.kept_duties().await.unwrap());
     assert_eq!(drops.len(), 138 - MAX_UNVERIFIED_TOTAL);
     assert!(drops.iter().all(|(_, reason)| *reason == DropReason::Total));
     // The honest sender's entries all stay; the hostile ones' accepted earliest go, five
@@ -445,8 +455,7 @@ async fn test_unverified_bound_applies_at_a_read_to_entries_stored_before_in_ste
     let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
     w.homeserver.set_down(true);
     let h = peer(&w, "honest");
-    // 200 of one sender, as one read stores them before the next read's bounds apply: 136
-    // over.
+    // A retained snapshot with 200 of one sender is 136 over the bound.
     let now = w.clock.now_ms();
     let entries: Vec<ParkedEntry> = (0..200u64)
         .map(|n| entry_of(&w, &h, 1_000 + n, now + n, ParkReason::Unverifiable))
@@ -528,7 +537,7 @@ async fn test_unverified_bound_runs_before_the_retries() {
     w.homeserver.set_down(false);
     let report = app.receive(None).await.unwrap();
     assert_eq!(
-        dropped(&report.events),
+        dropped(&app.kept_duties().await.unwrap()),
         vec![(seqs[0][0], DropReason::PerSender)]
     );
     assert!(!has(&report.events, |e| matches!(
@@ -548,7 +557,7 @@ async fn test_unverified_bound_applies_before_a_layered_backup() {
     let h = peer(&w, "honest");
     let a1 = peer(&w, "hostile-1");
     let a2 = peer(&w, "hostile-2");
-    // 138 stored by one read, 10 over the total, and a backup taken before any other read.
+    // 138 inputs select ten victims in their intake commits, before another read.
     stored_unverified(
         &w,
         &mut app,
@@ -559,7 +568,7 @@ async fn test_unverified_bound_applies_before_a_layered_backup() {
         ],
     )
     .await;
-    assert_eq!(app.stored_seqs().len(), 138);
+    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
     let backup = app.backup_layered().await.unwrap();
     // The backup holds what the bounds leave, and the drops were kept as duty events.
     assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
@@ -577,50 +586,45 @@ async fn test_unverified_bound_applies_before_a_layered_backup() {
 }
 
 #[tokio::test]
-async fn test_unverified_bound_skipped_by_a_layered_backup_of_a_halted_app() {
+async fn test_unverified_bound_halted_backup_keeps_drops_and_alarm() {
     let w = World::new();
     let counting = Arc::new(Counting {
-        inner: Arc::clone(&w.store),
+        inner: w.store.clone(),
         deleted: Mutex::new(Vec::new()),
     });
-    let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
-    let a1 = peer(&w, "hostile-1");
-    let a2 = peer(&w, "hostile-2");
+    let mut app = wallet(&w, w.env_on(counting.clone())).await;
     let h = peer(&w, "honest");
-    stored_unverified(
-        &w,
-        &mut app,
-        &[
-            (&h, 10),
-            (&a1, MAX_UNVERIFIED_PER_SENDER),
-            (&a2, MAX_UNVERIFIED_PER_SENDER),
-        ],
-    )
-    .await;
-    assert_eq!(app.stored_seqs().len(), 138);
-    // Halted by an alarm: the backup is taken read-only, with every entry, and nothing is
-    // committed or dropped.
-    app.state.alarm = Some(crate::app::Alarm::Rollback {
-        reason: "test".into(),
-    });
-    let commits = counting.deleted.lock().unwrap().len();
+    // A retained snapshot exceeds the bound. Local bookkeeping still runs under a halt.
+    let now = w.clock.now_ms();
+    let entries = (0..70)
+        .map(|n| entry_of(&w, &h, 1_000 + n, now, ParkReason::Unverifiable))
+        .collect();
+    write_stored(&mut app, entries).await;
+    let alarm = crate::app::Alarm::Rollback {
+        reason: "a retained observation".into(),
+    };
+    app.raise(alarm.clone()).await;
     let backup = app.backup_layered().await.unwrap();
-    assert_eq!(counting.deleted.lock().unwrap().len(), commits);
-    assert_eq!(app.stored_seqs().len(), 138);
-    assert!(dropped(&app.kept_duties().await.unwrap()).is_empty());
+    assert_eq!(app.state.parked.len(), MAX_UNVERIFIED_PER_SENDER);
+    assert_eq!(dropped(&app.kept_duties().await.unwrap()).len(), 6);
+    assert_eq!(app.state.alarm, Some(alarm.clone()));
+    assert_eq!(
+        app.reader()
+            .get::<crate::app::Alarm>(crate::app::state::key::ALARM)
+            .await
+            .unwrap(),
+        Some(alarm)
+    );
     let restored = App::restore(
-        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.env_on(Arc::new(MemoryStore::new())),
         Arc::new(BackedUp::default()),
         World::config(),
         &backup,
     )
     .await
     .unwrap();
-    assert_eq!(restored.stored_seqs().len(), 138);
-    // Running again, the next backup applies the bounds.
-    app.state.alarm = None;
-    app.backup_layered().await.unwrap();
-    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+    assert_eq!(restored.state.parked.len(), MAX_UNVERIFIED_PER_SENDER);
+    assert_eq!(dropped(&restored.kept_duties().await.unwrap()).len(), 6);
 }
 
 /// Alice's wallet holding 65 of bob's entries stored unverified, one over his bound, the
@@ -681,6 +685,7 @@ async fn restored_from(w: &World, backup: &crate::app::AppBackup) -> (App, Arc<B
 /// the host releases it, the next read runs it, marked released.
 async fn held_uncertain_then_released(app: &mut App, protocol: &BackedUp, seq: u64) {
     let id = app.stored_id_at(seq).unwrap();
+    let generation = app.state.parked[&id].generation;
     assert_eq!(
         app.state.parked.get(&id).map(|e| e.reason),
         Some(ParkReason::Uncertain)
@@ -703,7 +708,19 @@ async fn held_uncertain_then_released(app: &mut App, protocol: &BackedUp, seq: u
         app.receive(None).await.unwrap();
     }
     assert_eq!(app.stored_id_at(seq), None);
-    assert_eq!(protocol.released.lock().unwrap().last(), Some(&true));
+    let target: Vec<bool> = protocol
+        .positions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(g, s, _)| *g == generation && *s == seq)
+        .map(|(_, _, released)| *released)
+        .collect();
+    assert_eq!(
+        target,
+        vec![true],
+        "the exact released input is handed once with its flag"
+    );
 }
 
 #[tokio::test]
@@ -791,10 +808,9 @@ async fn test_unverified_bound_backup_of_a_feed_entrys_kept_effect_never_applies
 }
 
 #[tokio::test]
-async fn test_unverified_bound_restored_entries_are_tried_from_the_first_round() {
-    // An entry stored late in the backed-up app's life, in its round 40: the restored app's
-    // first round starts past the newest round an entry was stored in, so it tries it at its
-    // first read.
+async fn test_unverified_bound_restore_keeps_the_retry_round() {
+    // A consistent late round is retained. Its next turn still reaches a newly stored
+    // entry, without resetting the fair retry position at restore.
     let w = World::new();
     let mut app = wallet(&w, w.env()).await;
     let bob = Peer {
@@ -806,6 +822,11 @@ async fn test_unverified_bound_restored_entries_are_tried_from_the_first_round()
     let mut entry = entry_of(&w, &bob, 10_000, now, ParkReason::Unverifiable);
     entry.round = 40;
     write_stored(&mut app, vec![entry]).await;
+    app.state.parked_round.number = 40;
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PARKED_NEXT, &app.state.parked_round)
+        .unwrap();
+    app.commit(tx).await.unwrap();
     let backup = app.backup_layered().await.unwrap();
     let (mut restored, protocol) = restored_from(&w, &backup).await;
     restored.receive(None).await.unwrap();

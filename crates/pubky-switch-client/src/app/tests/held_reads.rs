@@ -48,16 +48,16 @@ impl Recording {
     pub(super) fn forged(request: &Request) -> Response {
         let body = operator_503().to_string().into_bytes();
         let server_time = "2026-01-01T00:00:00.000Z";
-        let request_signature = request
-            .header(header::SIGNATURE)
-            .and_then(|text| unb64(text).ok())
-            .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+        let sent = crate::client::SentRequest::of(request);
         let signature = pubky_switch_core::http::sign_response(
             &SigningKey::from_bytes(&[42; 32]),
-            503,
-            request_signature.as_ref(),
-            server_time,
-            &body,
+            &pubky_switch_core::http::ResponseParts {
+                status: 503,
+                request: sent.received(true),
+                server_time,
+                head: None,
+                body: &body,
+            },
         );
         Response {
             status: 503,
@@ -74,10 +74,7 @@ impl Transport for Recording {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let feed = request.path_and_query.contains("/feed");
-            let request_signature = request
-                .header(header::SIGNATURE)
-                .and_then(|text| unb64(text).ok())
-                .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+            let sent = crate::client::SentRequest::of(&request);
             let answer = if feed && *self.forge.lock().unwrap() {
                 Ok(Self::forged(&request))
             } else {
@@ -95,10 +92,13 @@ impl Transport for Recording {
                     .is_some_and(|(signature, time)| {
                         pubky_switch_core::http::verify_response(
                             &operator,
-                            response.status,
-                            request_signature.as_ref(),
-                            time,
-                            &response.body,
+                            &pubky_switch_core::http::ResponseParts {
+                                status: response.status,
+                                request: sent.received(true),
+                                server_time: time,
+                                head: response.header(header::HEAD),
+                                body: &response.body,
+                            },
                             &signature,
                         )
                         .is_ok()

@@ -2932,14 +2932,11 @@ fn answer_verifies(
     let named = pubky_switch_core::records::EnrollmentAnswer::from_json(&response.body)
         .ok()
         .map(|answer| answer.service_key)?;
-    let signature = request
-        .header(pubky_switch_core::http::header::SIGNATURE)
-        .and_then(|text| pubky_switch_core::http::decode_signature(text).ok());
     Some(
         pubky_switch_client::client::check_response(
             &named,
             &world.key.public(),
-            signature.as_ref(),
+            &pubky_switch_client::client::SentRequest::of(request),
             response,
         )
         .is_ok(),
@@ -2977,14 +2974,11 @@ async fn test_scripted_enrollment_again_gets_its_kept_answer() {
     // Its errors are the operator's, as at the service: the account's key doesn't verify
     // them, an injected one included (Switch wire 7.4.1).
     let under_the_account_key = |response: &pubky_switch_client::transport::Response| {
-        let signature = creating
-            .header(pubky_switch_core::http::header::SIGNATURE)
-            .and_then(|text| pubky_switch_core::http::decode_signature(text).ok());
         !matches!(
             pubky_switch_client::client::check_response(
                 &world.switch.service_key(),
                 &world.key.public(),
-                signature.as_ref(),
+                &pubky_switch_client::client::SentRequest::of(&creating),
                 response,
             ),
             Err(pubky_switch_client::ClientError::BadServiceSignature { .. })

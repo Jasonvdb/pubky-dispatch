@@ -1505,12 +1505,16 @@ impl Signer {
                 Err(error.into())
             }
             Err(
-                error @ ClientError::Switch {
+                error @ (ClientError::Switch {
                     status: 400 | 413, ..
-                },
+                }
+                | ClientError::BodyOverCap { .. }),
             ) => {
-                // A definite refusal, a `400` or a `413 too_large` (Switch wire 7.1): the same
-                // bytes would be refused again. The version stays spent (`signed_through`). A
+                // A definite refusal, a `400` or a `413 too_large` that binds the delivery as
+                // sent, its body included, or a body over the call's cap, which the client
+                // refuses before sending it (Switch wire 7.1): the same bytes would be refused
+                // again. A `413` given before the body was read binds no body and is final
+                // for nothing. The version stays spent (`signed_through`). A
                 // renewal it carried didn't happen, and the user is told in the same commit.
                 let mut state = self.state.clone();
                 self.note_refused_renewals(&mut state, &doc)?;

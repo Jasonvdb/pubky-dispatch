@@ -13,17 +13,37 @@ use crate::transport::{BoxFuture, Request, Response, Transport};
 use crate::{TransportError, error::ClientError};
 use pubky_switch_core::http::{ErrorCode, header};
 
-/// The switch, every `403` answered without its head, as before the request verified.
-struct Headless(Arc<dyn Transport>);
+/// The switch, every `403` answered without its head, as before the request verified, and
+/// signed again with the service key over that answer (Switch wire 7.1).
+struct Headless(Arc<dyn Transport>, ed25519_dalek::SigningKey);
 
 impl Transport for Headless {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
+            let sent = crate::client::SentRequest::of(&request);
             let mut response = self.0.send(request).await?;
             if response.status == 403 {
                 response
                     .headers
                     .retain(|h| !h.name.eq_ignore_ascii_case(header::HEAD));
+                let server_time = response.header(header::SERVER_TIME).unwrap().to_owned();
+                let signature = pubky_switch_core::http::sign_response(
+                    &self.1,
+                    &pubky_switch_core::http::ResponseParts {
+                        status: response.status,
+                        request: sent.received(true),
+                        server_time: &server_time,
+                        head: None,
+                        body: &response.body,
+                    },
+                );
+                response
+                    .headers
+                    .retain(|h| !h.name.eq_ignore_ascii_case(header::SERVICE_SIGNATURE));
+                response.headers.push(crate::transport::Header::new(
+                    header::SERVICE_SIGNATURE,
+                    &pubky_switch_core::enc::b64(&signature),
+                ));
             }
             Ok(response)
         })
@@ -43,7 +63,10 @@ async fn test_not_registered_headless_not_current_isnt_a_removal() {
     let w = World::new();
     let me = w.join("wallet").await.app_id();
     let env = AppEnv {
-        transport: Arc::new(Headless(w.switch.transport())),
+        transport: Arc::new(Headless(
+            w.switch.transport(),
+            w.switch.lock().service.clone(),
+        )),
         ..w.env()
     };
     let mut app = App::load(env, w.protocol.clone(), World::config(), me)

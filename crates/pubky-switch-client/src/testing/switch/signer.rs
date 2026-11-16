@@ -1057,7 +1057,7 @@ mod tests {
                 .into_bytes(),
             timeout: crate::transport::TimeoutClass::default(),
         };
-        let refused = |answer: &crate::transport::Response| {
+        let refused = |request: &crate::transport::Request, answer: &crate::transport::Response| {
             let body: Value = serde_json::from_slice(&answer.body).unwrap();
             let signature = pubky_switch_core::enc::unb64_array::<64>(
                 answer
@@ -1068,12 +1068,15 @@ mod tests {
             let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
             let by_operator = pubky_switch_core::http::verify_response(
                 &operator.verifying_key().to_bytes(),
-                answer.status,
-                None,
-                answer
-                    .header(pubky_switch_core::http::header::SERVER_TIME)
-                    .unwrap(),
-                &answer.body,
+                &pubky_switch_core::http::ResponseParts {
+                    status: answer.status,
+                    request: crate::client::SentRequest::of(request).received(true),
+                    server_time: answer
+                        .header(pubky_switch_core::http::header::SERVER_TIME)
+                        .unwrap(),
+                    head: answer.header(pubky_switch_core::http::header::HEAD),
+                    body: &answer.body,
+                },
                 &signature,
             )
             .is_ok();
@@ -1084,8 +1087,12 @@ mod tests {
             )
         };
         let tolerance = pubky_switch_core::records::CLOCK_TOLERANCE_MS;
-        let stale = switch.handle(&sent_at(now - tolerance - 1_000)).unwrap();
-        assert_eq!(refused(&stale), (401, Some("stale_timestamp".into()), true));
+        let stale_request = sent_at(now - tolerance - 1_000);
+        let stale = switch.handle(&stale_request).unwrap();
+        assert_eq!(
+            refused(&stale_request, &stale),
+            (401, Some("stale_timestamp".into()), true)
+        );
         assert!(switch.lock().enrolled.is_none(), "nothing was enrolled");
         // At the edge of the window it is taken.
         assert_eq!(
@@ -1094,8 +1101,12 @@ mod tests {
         );
         // The same enrollment once its timestamp is stale: its kept answer isn't given.
         clock.advance_ms(2_000);
-        let again = switch.handle(&sent_at(now - tolerance)).unwrap();
-        assert_eq!(refused(&again), (401, Some("stale_timestamp".into()), true));
+        let again_request = sent_at(now - tolerance);
+        let again = switch.handle(&again_request).unwrap();
+        assert_eq!(
+            refused(&again_request, &again),
+            (401, Some("stale_timestamp".into()), true)
+        );
     }
 
     #[test]

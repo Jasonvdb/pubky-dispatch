@@ -201,6 +201,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
 ## Other calls
 
+- **Refusals as received** (Switch wire 7.1), as at the service and before any fault: a body
+  over its call's cap is `413 too_large` over the empty body field, and a signed request
+  header sent more than once, but at the public read, is `400 bad_request`, both signed with
+  the operator key, without a head. No flow reaches them, since the client never sends
+  either; a scripted-switch test sends them by hand.
 - **Queries** are read as the service reads them (`crates/pubky-switch/src/http/route.rs`,
   `parse_query`; Switch wire 7.1): names and values percent-decoded, and a bad escape or a
   parameter given twice `400` before the endpoint's checks, at `GET /feed` (after the
@@ -485,8 +490,13 @@ What stays only on the scripted switch, and why:
   what the signer does about them.
 - **A delivery refused for good,** other than a recovery's version over the service's app
   limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
-  version), a take-over refused `400`, or a `413 too_large`. No conforming signer meets
-  these at the service, so the tests script the refusal.
+  version) or a take-over refused `400`. No conforming signer meets these at the service,
+  so the tests script the refusal. A body over its call's cap is never sent: the client
+  refuses it before sending, for good. The switch's own `413 too_large` to such a body
+  comes before it reads the body, binds the empty body field and is final for nothing; the
+  test scripts it with `Fault::BeforeTheBody`, signed with the account's key as a service
+  whose one key signs every answer gives it, since the service signs it with the operator
+  key.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.

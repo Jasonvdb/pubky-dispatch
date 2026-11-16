@@ -18,20 +18,107 @@
 //! changed, or when the keyed section fails. Nothing else in the service signs an answer or a
 //! head: `sign_answer` is this module's alone.
 
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use pubky_switch_core::{
     chain::{ChainTip, SignedHead},
     enc::b64,
-    http::{self as wire_http, header},
+    http::{self as wire_http, BodyField, ReceivedHeaders, ReceivedRequest, header},
     time::rfc3339,
 };
 
 use super::{Answer, Service, unsigned};
 use crate::{
-    http::{SwitchResponse, error::ApiError},
+    http::{Refusal, SwitchRequest, SwitchResponse, error::ApiError},
     keys::{KeyId, Mark, ServiceSigner, sign_head},
     store::{AccountTxn, Keyed},
 };
+
+/// The request a response answers, exactly as the service received it (Switch wire 7.1),
+/// built once per request from what the transport received, before the service routes it.
+///
+/// The body field comes from what was received, never from a call site: a [`SwitchRequest`]
+/// holds a body the transport read whole, so it binds the body's hash; a [`Refusal`] binds
+/// it only where the transport read the body, so a body over its cap binds the empty field.
+/// The public read binds no header, by its call, in the core
+/// ([`received_request`](wire_http::received_request)).
+#[derive(Debug)]
+pub(super) struct Received<'a> {
+    method: &'a str,
+    path_and_query: &'a str,
+    origin: &'a str,
+    body: BodyField,
+    headers: ReceivedHeaders,
+}
+
+/// The headers of `map` a received request covers, each value in the order received.
+fn received_headers(map: &HeaderMap) -> ReceivedHeaders {
+    ReceivedHeaders::of(
+        map.iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+}
+
+impl<'a> Received<'a> {
+    /// A request the transport read whole, at the switch origin `origin`.
+    pub(super) fn read(request: &'a SwitchRequest, origin: &'a str) -> Self {
+        Received {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            origin,
+            body: BodyField::read(&request.body),
+            headers: received_headers(&request.headers),
+        }
+    }
+
+    /// A request the transport refused, at the switch origin `origin`: an unknown route,
+    /// whose body it read, or a body over its call's cap, which it didn't (Switch wire 7.1).
+    pub(super) fn refused(refusal: &'a Refusal, origin: &'a str) -> Self {
+        let (method, path_and_query, headers, body) = match refusal {
+            Refusal::UnknownRoute {
+                method,
+                path_and_query,
+                headers,
+                body,
+            } => (method, path_and_query, headers, BodyField::read(body)),
+            Refusal::TooLarge {
+                method,
+                path_and_query,
+                headers,
+                ..
+            } => (method, path_and_query, headers, BodyField::NotRead),
+        };
+        Received {
+            method,
+            path_and_query,
+            origin,
+            body,
+            headers: received_headers(headers),
+        }
+    }
+
+    /// Whether it carries one of the signed request headers more than once (Switch wire
+    /// 7.1).
+    pub(super) fn repeats_a_signed_header(&self) -> bool {
+        wire_http::RECEIVED_HEADERS
+            .iter()
+            .any(|name| self.headers.values(name).len() > 1)
+    }
+
+    /// The request every answer to it signs.
+    pub(super) fn asked(&self) -> Asked<'_> {
+        Asked(ReceivedRequest {
+            method: self.method,
+            path_and_query: self.path_and_query,
+            body: self.body,
+            origin: self.origin,
+            headers: &self.headers,
+        })
+    }
+}
+
+/// The request an answer answers, as the response signature covers it ([`Received`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Asked<'a>(ReceivedRequest<'a>);
 
 /// What shows the account still names the key an answer is signed with.
 pub(super) enum Proof<'a> {
@@ -88,21 +175,30 @@ impl Signing<'_> {
     }
 }
 
-/// Sign `answer` (Switch wire 7.1): the response signature over its status, the request
-/// signature, `Switch-Server-Time` and the body.
+/// Sign `answer` (Switch wire 7.1): the response signature over its status, the request it
+/// answers as the service received it, `Switch-Server-Time`, the head field of the
+/// `Switch-Head` text as sent and the body.
 fn sign_answer(
     signer: &ServiceSigner,
-    request_signature: Option<&[u8; 64]>,
+    asked: Asked<'_>,
     time_ms: u64,
     answer: Answer,
 ) -> SwitchResponse {
     let server_time = rfc3339(time_ms);
+    // The head's header text, signed exactly as it is sent.
+    let head = answer
+        .head
+        .as_ref()
+        .and_then(|head| HeaderValue::try_from(head.to_header()).ok());
     let signature = wire_http::sign_response(
         signer,
-        answer.status,
-        request_signature,
-        &server_time,
-        &answer.body,
+        &wire_http::ResponseParts {
+            status: answer.status,
+            request: asked.0,
+            server_time: &server_time,
+            head: head.as_ref().and_then(|value| value.to_str().ok()),
+            body: &answer.body,
+        },
     );
     let mut headers = Vec::new();
     let mut put = |name: &'static str, value: String| {
@@ -112,9 +208,6 @@ fn sign_answer(
     };
     put(header::SERVICE_SIGNATURE, b64(&signature));
     put(header::SERVER_TIME, server_time);
-    if let Some(head) = &answer.head {
-        put(header::HEAD, head.to_header());
-    }
     if let Some(seconds) = answer.retry_after {
         put(header::RETRY_AFTER, seconds.to_string());
     }
@@ -123,6 +216,9 @@ fn sign_answer(
     }
     if answer.no_store {
         put("cache-control", "no-store".into());
+    }
+    if let Some(head) = head {
+        headers.push((HeaderName::from_static(header::HEAD), head));
     }
     SwitchResponse {
         status: answer.status,
@@ -135,12 +231,12 @@ impl Service {
     /// An answer signed with the operator key, at the time base (Switch wire 7.1).
     pub(super) async fn operator_answer(
         &self,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         base_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
         match self.keys.operator().await {
-            Ok(signer) => sign_answer(&signer, request_signature, base_ms, Answer::error(error)),
+            Ok(signer) => sign_answer(&signer, asked, base_ms, Answer::error(error)),
             Err(failure) => {
                 tracing::error!(%failure, "the operator key");
                 unsigned(error)
@@ -155,12 +251,12 @@ impl Service {
         &self,
         proof: Proof<'_>,
         signer: &ServiceSigner,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         build: impl FnOnce(&Signing<'_>) -> (Answer, u64),
     ) -> Result<SwitchResponse, NotKeyed> {
         let sign = || {
             let (answer, time_ms) = build(&Signing { signer });
-            sign_answer(signer, request_signature, time_ms, answer)
+            sign_answer(signer, asked, time_ms, answer)
         };
         match proof {
             Proof::Locked(_) => Ok(sign()),
@@ -188,7 +284,7 @@ impl Service {
         &self,
         proof: Proof<'_>,
         signer: &ServiceSigner,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         time_ms: u64,
         answer: Answer,
         base_ms: u64,
@@ -199,19 +295,13 @@ impl Service {
             Proof::Locked(_) => None,
         };
         let signed = self
-            .try_sign_keyed(proof, signer, request_signature, |_| (answer, time_ms))
+            .try_sign_keyed(proof, signer, asked, |_| (answer, time_ms))
             .await;
         match signed {
             Ok(signed) => signed,
             Err(not_keyed) => {
-                self.not_keyed_answer(
-                    account.as_deref(),
-                    not_keyed,
-                    by_signer,
-                    request_signature,
-                    base_ms,
-                )
-                .await
+                self.not_keyed_answer(account.as_deref(), not_keyed, by_signer, asked, base_ms)
+                    .await
             }
         }
     }
@@ -229,7 +319,7 @@ impl Service {
         txn: AccountTxn,
         signer: &ServiceSigner,
         key: &KeyId,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         time_ms: u64,
         answer: Answer,
         base_ms: u64,
@@ -241,7 +331,7 @@ impl Service {
         self.sign_keyed(
             Proof::checked(&account, &key),
             signer,
-            request_signature,
+            asked,
             time_ms,
             answer,
             base_ms,
@@ -256,15 +346,14 @@ impl Service {
         account: Option<&str>,
         not_keyed: NotKeyed,
         by_signer: bool,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         base_ms: u64,
     ) -> SwitchResponse {
         let error = match (not_keyed, account) {
             (NotKeyed::Gone, Some(account)) => self.no_such_account(account, by_signer).await,
             _ => ApiError::unavailable("7.6: a temporary failure"),
         };
-        self.operator_answer(request_signature, base_ms, &error)
-            .await
+        self.operator_answer(asked, base_ms, &error).await
     }
 
     /// Sign the head of the account's chain as it will be committed, for an answer to the
@@ -321,5 +410,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_received_request_built_only_from_what_was_received() {
+        // The body field, and the received request it is part of, come only from what the
+        // transport received (Switch wire 7.1): built here, once per request, never chosen
+        // by a call site.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        sources(&dir, &mut found);
+        let mut builds = 0;
+        for (path, text) in &found {
+            if path.ends_with("service/keyed.rs") {
+                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                assert_eq!(code.matches("BodyField::NotRead").count(), 1);
+                assert_eq!(code.matches("BodyField::read(").count(), 2);
+                continue;
+            }
+            for needle in [
+                "BodyField",
+                "ReceivedRequest",
+                "ReceivedHeaders",
+                "received_request(",
+            ] {
+                assert!(
+                    !text.contains(needle),
+                    "{} builds a received request outside keyed.rs: {needle}",
+                    path.display()
+                );
+            }
+            builds += text.matches("Received::read(").count();
+            builds += text.matches("Received::refused(").count();
+        }
+        // One for a request the handler serves, one for a refusal of the transport.
+        assert_eq!(builds, 2);
     }
 }

@@ -13,7 +13,7 @@ use pubky_switch_core::{
 use super::{
     Answer, Service,
     erase::to_the_end,
-    keyed::Proof,
+    keyed::{Asked, Proof},
     rules::{
         AccountState, Caller, EnrollmentKey, decode_claim, enrollment_key, names_this_service,
     },
@@ -80,9 +80,8 @@ impl Service {
         &self,
         request: &SwitchRequest,
         base_ms: u64,
-        request_signature: Option<[u8; 64]>,
+        signature: Asked<'_>,
     ) -> SwitchResponse {
-        let signature = request_signature.as_ref();
         let (enrollment, identity_text) = match self.check_enrollment(request, base_ms) {
             Ok(checked) => checked,
             Err(error) => return self.operator_answer(signature, base_ms, &error).await,

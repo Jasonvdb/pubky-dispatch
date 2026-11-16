@@ -386,8 +386,10 @@ pub(crate) enum RefusalPlace {
     /// batch is never answered and is handled at once as one kept past the window: an
     /// effect's entry stored as uncertain, a batch dropped with its attempts. It is
     /// uncertain, not refused: a batch applied under an earlier service can be refused for
-    /// its shape by a later one. `400` (steps 2 to 4), `413 too_large` (step 2), and every
-    /// code not classified above.
+    /// its shape by a later one. `400` (steps 2 to 4), a body over its call's cap, which the
+    /// client refuses before sending it as `413 too_large` (step 2; the switch's own answer
+    /// there comes before it reads the body, so it binds no body and is final for nothing),
+    /// and every code not classified above.
     ///
     /// `400`, `413 too_large` and `404 not_found` also come from step 9, an operation's
     /// shape or its rules (an invite code not held), after the lookup, which would prove the
@@ -455,9 +457,18 @@ pub(crate) fn never_left(error: &AppError) -> bool {
 /// built again (after re-reading, with the key bundle, signed again or sealed again). Every
 /// other failure may pass with the same bytes later: `429`, `503`, `401 stale_timestamp`
 /// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
-/// transport failure, or an answer whose signature didn't verify or that didn't read, which
-/// may not be the service's (Switch wire 2.1, 7.1).
+/// transport failure, an answer whose signature didn't verify or that didn't read, which
+/// may not be the service's (Switch wire 2.1, 7.1), or one given before the body was read
+/// ([`ClientError::BodyUnread`]), which may answer other bytes. Only a
+/// [`ClientError::Switch`] is final: an answer that verified with the request as sent, its
+/// body included (Switch wire 7.1, 7.6); and a body over its call's cap, which the client
+/// refuses before sending it ([`ClientError::BodyOverCap`]), as `413 too_large`.
 pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
+    // A body over its call's cap, refused before it was sent: the same bytes are refused
+    // every time, as the switch's `413 too_large` refuses them (Switch wire 7.1).
+    if let AppError::Switch(ClientError::BodyOverCap { .. }) = error {
+        return Some(ErrorCode::TooLarge);
+    }
     let AppError::Switch(ClientError::Switch { code, .. }) = error else {
         return None;
     };
@@ -524,7 +535,142 @@ impl From<Alarm> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{SentRequest, check_response};
+    use crate::transport::{Header, Request, Response};
     use pubky_switch_core::chain::ChainError;
+    use pubky_switch_core::http::{ResponseParts, header, sign_response};
+
+    /// The answer `code` to a request, signed with the service key over `answered`'s
+    /// request as received, its body field the body's hash where `body_read`, checked
+    /// against the request the client sent.
+    fn checked_refusal(code: ErrorCode, body_read: bool, answered: &str) -> AppError {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let request = |path: &str| Request {
+            method: "POST".into(),
+            origin: "https://switch.example".into(),
+            path_and_query: path.into(),
+            headers: vec![Header::new(header::SIGNATURE, "c2ln")],
+            body: b"{}".to_vec(),
+            timeout: Default::default(),
+        };
+        let body = serde_json::json!({ "code": code.as_str(), "message": "m" })
+            .to_string()
+            .into_bytes();
+        let time = "2026-01-01T00:00:00.000Z";
+        let signature = sign_response(
+            &key,
+            &ResponseParts {
+                status: code.status(),
+                request: SentRequest::of(&request(answered)).received(body_read),
+                server_time: time,
+                head: None,
+                body: &body,
+            },
+        );
+        let response = Response {
+            status: code.status(),
+            headers: vec![
+                Header::new(
+                    header::SERVICE_SIGNATURE,
+                    &pubky_switch_core::enc::b64(&signature),
+                ),
+                Header::new(header::SERVER_TIME, time),
+            ],
+            body,
+        };
+        let sent = SentRequest::of(&request("/v1/x/ops"));
+        check_response(&key.verifying_key().to_bytes(), &[1; 32], &sent, &response)
+            .unwrap_err()
+            .into()
+    }
+
+    /// `code` refuses for good only an answer that binds the request as sent, its body
+    /// included: the same answer over the empty body field, or to another request, doesn't
+    /// (Switch wire 7.1, 7.6).
+    fn final_only_with_the_full_binding(code: ErrorCode) {
+        assert_eq!(
+            refused_for_good(&checked_refusal(code, true, "/v1/x/ops")),
+            Some(code)
+        );
+        assert_eq!(
+            refused_for_good(&checked_refusal(code, false, "/v1/x/ops")),
+            None
+        );
+        assert_eq!(
+            refused_for_good(&checked_refusal(code, true, "/v1/x/ops?x=1")),
+            None
+        );
+    }
+
+    macro_rules! final_refusals {
+        ($($name:ident => $code:ident),* $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    final_only_with_the_full_binding(ErrorCode::$code);
+                }
+            )*
+        };
+    }
+
+    final_refusals! {
+        test_refused_for_good_bad_request_needs_the_full_binding => BadRequest,
+        test_refused_for_good_bad_signature_needs_the_full_binding => BadSignature,
+        test_refused_for_good_not_admitted_needs_the_full_binding => NotAdmitted,
+        test_refused_for_good_permission_missing_needs_the_full_binding => PermissionMissing,
+        test_refused_for_good_not_current_needs_the_full_binding => NotCurrent,
+        test_refused_for_good_cert_expired_needs_the_full_binding => CertExpired,
+        test_refused_for_good_not_found_needs_the_full_binding => NotFound,
+        test_refused_for_good_stale_identity_needs_the_full_binding => StaleIdentity,
+        test_refused_for_good_too_large_needs_the_full_binding => TooLarge,
+        test_refused_for_good_conflict_needs_the_full_binding => Conflict,
+        test_refused_for_good_stale_epoch_needs_the_full_binding => StaleEpoch,
+        test_refused_for_good_stale_generation_needs_the_full_binding => StaleGeneration,
+        test_refused_for_good_stale_key_needs_the_full_binding => StaleKey,
+    }
+
+    #[test]
+    fn test_refused_for_good_members_are_the_final_codes() {
+        // Every code `refused_for_good` takes has its test above.
+        let tested = [
+            ErrorCode::BadRequest,
+            ErrorCode::BadSignature,
+            ErrorCode::NotAdmitted,
+            ErrorCode::PermissionMissing,
+            ErrorCode::NotCurrent,
+            ErrorCode::CertExpired,
+            ErrorCode::NotFound,
+            ErrorCode::StaleIdentity,
+            ErrorCode::TooLarge,
+            ErrorCode::Conflict,
+            ErrorCode::StaleEpoch,
+            ErrorCode::StaleGeneration,
+            ErrorCode::StaleKey,
+        ];
+        for code in ErrorCode::ALL {
+            let error = AppError::Switch(ClientError::Switch {
+                status: code.status(),
+                code,
+                message: "m".into(),
+                current: serde_json::Value::Null,
+                known_version: None,
+                retry_after: None,
+            });
+            assert_eq!(
+                refused_for_good(&error).is_some(),
+                tested.contains(&code),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_refused_for_good_takes_a_body_over_its_cap() {
+        // Refused before it was sent: the same bytes are over the cap every time.
+        let error = AppError::Switch(ClientError::BodyOverCap { cap: 16 });
+        assert_eq!(refused_for_good(&error), Some(ErrorCode::TooLarge));
+        assert_eq!(refused_at(&error), Some(RefusalPlace::Bytes));
+    }
 
     #[test]
     fn test_app_error_maps_client_failures() {
@@ -578,6 +724,21 @@ mod tests {
             AppError::Transport(TransportError::Timeout),
         ] {
             assert_eq!(refused_for_good(&error), None, "{error:?}");
+        }
+        // An answer given before the body was read binds the request without its body: it
+        // is final for nothing, whatever its code (Switch wire 7.1).
+        for (status, code) in [
+            (413, ErrorCode::TooLarge),
+            (404, ErrorCode::NotFound),
+            (429, ErrorCode::RateLimited),
+        ] {
+            let error = AppError::Switch(ClientError::BodyUnread {
+                status,
+                code,
+                retry_after: None,
+            });
+            assert_eq!(refused_for_good(&error), None, "{code}");
+            assert_eq!(refused_at(&error), None, "{code}");
         }
     }
 

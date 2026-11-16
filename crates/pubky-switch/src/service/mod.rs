@@ -79,7 +79,7 @@ use crate::{
     time::TrustedTime,
 };
 
-use self::keyed::{NotKeyed, Proof};
+use self::keyed::{Asked, NotKeyed, Proof, Received};
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
 /// How many sweeps of owed keys a retried erasure of an account gone may run each minute, for
@@ -560,20 +560,22 @@ impl Service {
         let reading = self.time.read();
         let base_ms = reading.base_ms;
         let due = reading.trusted.then_some(base_ms);
-        let request_signature = wire_http::request_signature_of(
-            request
-                .headers
-                .get(header::SIGNATURE)
-                .and_then(|value| value.to_str().ok()),
-        );
+        // The request as received, which every answer to it signs (Switch wire 7.1).
+        let received = Received::read(&request, &self.origin);
+        let asked = received.asked();
+        // A signed request header sent more than once is refused before the account is looked
+        // up and before any signature work: the service never chooses between two signed
+        // values. The public read uses none of them (Switch wire 7.1).
+        if received.repeats_a_signed_header() && request.route.call != Call::GetIdentity {
+            let error = ApiError::bad_request("7.1: a signed request header sent more than once");
+            return self.operator_answer(asked, base_ms, &error).await;
+        }
         if request.route.call == Call::Enroll {
-            return self.enroll(&request, base_ms, request_signature).await;
+            return self.enroll(&request, base_ms, asked).await;
         }
         let Some(account) = request.route.account.clone() else {
             let error = ApiError::not_found("no such route");
-            return self
-                .operator_answer(request_signature.as_ref(), base_ms, &error)
-                .await;
+            return self.operator_answer(asked, base_ms, &error).await;
         };
         // Step 2: the account, looked up without taking its lock (Switch wire 7.2 Order).
         let found = match self.store.lookup(&account).await {
@@ -600,13 +602,11 @@ impl Service {
                     let _ = self.sweep_erased_keys().await;
                 }
                 let error = self.no_such_account(&account, by_signer).await;
-                return self
-                    .operator_answer(request_signature.as_ref(), base_ms, &error)
-                    .await;
+                return self.operator_answer(asked, base_ms, &error).await;
             }
             Err(error) => {
                 return self
-                    .operator_answer(request_signature.as_ref(), base_ms, &store_error(&error))
+                    .operator_answer(asked, base_ms, &store_error(&error))
                     .await;
             }
         };
@@ -621,14 +621,10 @@ impl Service {
                     .signed_by_identity(&account, &request, base_ms)
                     .is_some();
                 let error = self.no_such_account(&account, by_signer).await;
-                return self
-                    .operator_answer(request_signature.as_ref(), base_ms, &error)
-                    .await;
+                return self.operator_answer(asked, base_ms, &error).await;
             }
             Err(error) => {
-                return self
-                    .operator_answer(request_signature.as_ref(), base_ms, &error)
-                    .await;
+                return self.operator_answer(asked, base_ms, &error).await;
             }
         }
         let call = &request.route.call;
@@ -637,11 +633,6 @@ impl Service {
         let looked_up_key = found.service_key.clone();
         let (account_ref, looked_up_ref, request_ref) = (&account, &looked_up_key, &request);
         let refused_early = |error: ApiError| {
-            let signature = if *call == Call::GetIdentity {
-                None
-            } else {
-                request_signature
-            };
             async move {
                 // A read of the account's state that finds no account: erased since the
                 // lookup, its key maybe still in the store while owed. As for an account the
@@ -651,11 +642,9 @@ impl Service {
                         .no_longer_keyed(account_ref, looked_up_ref, false)
                         .await
                 {
-                    return self
-                        .operator_answer(signature.as_ref(), base_ms, &gone)
-                        .await;
+                    return self.operator_answer(asked, base_ms, &gone).await;
                 }
-                self.early_answer(&found, request_ref, signature.as_ref(), base_ms, &error)
+                self.early_answer(&found, request_ref, asked, base_ms, &error)
                     .await
             }
         };
@@ -812,9 +801,7 @@ impl Service {
                 Ok(None) => {
                     let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
                     let error = self.no_such_account(&account, by_signer).await;
-                    return self
-                        .operator_answer(request_signature.as_ref(), base_ms, &error)
-                        .await;
+                    return self.operator_answer(asked, base_ms, &error).await;
                 }
                 // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
                 // stays owed: never signed with the key looked up before it (7.4.16).
@@ -824,26 +811,17 @@ impl Service {
                         .no_longer_keyed(&account, &looked_up_key, by_signer)
                         .await
                     {
-                        return self
-                            .operator_answer(request_signature.as_ref(), base_ms, &error)
-                            .await;
+                        return self.operator_answer(asked, base_ms, &error).await;
                     }
                     return refused_early(store_error(&error)).await;
                 }
-            };
-            let signature = if caller.is_some() {
-                request_signature
-            } else {
-                // The public read's answer signs the hash of the empty string as the request
-                // signature, so it is the same for every reader (Switch wire 7.4.15).
-                None
             };
             self.at_account(
                 txn,
                 &request,
                 base_ms,
                 due,
-                signature,
+                asked,
                 caller.as_ref(),
                 verified.as_ref(),
                 other.as_ref(),
@@ -869,7 +847,7 @@ impl Service {
         &self,
         found: &crate::store::FoundAccount,
         request: &SwitchRequest,
-        request_signature: Option<&[u8; 64]>,
+        asked: Asked<'_>,
         base_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
@@ -877,32 +855,22 @@ impl Service {
             Ok(signer) => signer,
             Err(failure) => {
                 tracing::error!(%failure, "an account's service key");
-                return self
-                    .operator_answer(request_signature, base_ms, error)
-                    .await;
+                return self.operator_answer(asked, base_ms, error).await;
             }
         };
         let account = request.route.account.as_deref().unwrap_or_default();
         let proof = Proof::checked(account, &found.service_key);
         let answer = Answer::error(error);
         match self
-            .try_sign_keyed(proof, &signer, request_signature, |_| {
-                (answer, found.stamped_time_ms)
-            })
+            .try_sign_keyed(proof, &signer, asked, |_| (answer, found.stamped_time_ms))
             .await
         {
             Ok(signed) => signed,
             Err(not_keyed) => {
                 let by_signer = not_keyed == NotKeyed::Gone
                     && self.signed_by_identity(account, request, base_ms).is_some();
-                self.not_keyed_answer(
-                    Some(account),
-                    not_keyed,
-                    by_signer,
-                    request_signature,
-                    base_ms,
-                )
-                .await
+                self.not_keyed_answer(Some(account), not_keyed, by_signer, asked, base_ms)
+                    .await
             }
         }
     }
@@ -1040,13 +1008,12 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
         due: Option<u64>,
-        request_signature: Option<[u8; 64]>,
+        signature: Asked<'_>,
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
         prepared: Option<&Prepared>,
     ) -> SwitchResponse {
-        let signature = request_signature.as_ref();
         let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         // The time the account last committed, for an answer whose commit fails.
         let committed_ms = txn.head().stamped_time_ms;
@@ -2109,6 +2076,11 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
     ) -> Option<bool> {
+        // The public read decides nothing by its headers, on any path: its answer is the same
+        // for every reader (Switch wire 7.1, 7.4.15).
+        if request.route.call == Call::GetIdentity {
+            return None;
+        }
         let identity_key = pubky_switch_core::enc::pubky_key(account).ok()?;
         let text = request.headers.get(header::TIMESTAMP)?.to_str().ok()?;
         let signed_at = pubky_switch_core::time::parse_rfc3339(text).ok()?;
@@ -2145,18 +2117,12 @@ impl Handler for Service {
     fn refuse(&self, refusal: Refusal) -> HandlerFuture<'_> {
         Box::pin(async move {
             let base_ms = self.time.read().base_ms;
-            let (headers, error) = match &refusal {
-                Refusal::UnknownRoute { headers } => {
-                    (headers, ApiError::not_found("no such route"))
-                }
-                Refusal::TooLarge { headers, cap, .. } => (headers, ApiError::body_too_large(*cap)),
+            let error = match &refusal {
+                Refusal::UnknownRoute { .. } => ApiError::not_found("no such route"),
+                Refusal::TooLarge { cap, .. } => ApiError::body_too_large(*cap),
             };
-            let signature = wire_http::request_signature_of(
-                headers
-                    .get(header::SIGNATURE)
-                    .and_then(|value| value.to_str().ok()),
-            );
-            self.operator_answer(signature.as_ref(), base_ms, &error)
+            let received = Received::refused(&refusal, &self.origin);
+            self.operator_answer(received.asked(), base_ms, &error)
                 .await
         })
     }

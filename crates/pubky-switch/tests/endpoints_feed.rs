@@ -823,16 +823,7 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
         Vec::new(),
         ms(&at),
     );
-    let request_signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        request
-            .headers
-            .get(header::SIGNATURE)
-            .and_then(|value| value.to_str().ok())
-            .expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
+    let sent = Sent::of(&request);
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         // The signer erases the account (Switch wire 7.4.16).
@@ -872,23 +863,7 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
     );
     assert!(header_text(&answer, header::HEAD).is_none());
     // Signed with the operator key, as for an account the service doesn't hold.
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        header_text(&answer, header::SERVICE_SIGNATURE).expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
-    assert!(
-        pubky_switch_core::http::verify_response(
-            &operator_public(),
-            404,
-            Some(&request_signature),
-            header_text(&answer, header::SERVER_TIME).expect("time"),
-            &answer.body,
-            &signature,
-        )
-        .is_ok()
-    );
+    assert!(signed_with(&answer, &operator_public(), &sent));
     replay.db.drop_database().await.expect("drop");
 }
 

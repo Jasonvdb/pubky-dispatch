@@ -356,6 +356,83 @@ pub fn header_text<'a>(response: &'a SwitchResponse, name: &str) -> Option<&'a s
         .and_then(|(_, value)| value.to_str().ok())
 }
 
+/// A request as the service received it, which a response signature covers (Switch wire
+/// 7.1).
+#[derive(Clone, Debug)]
+pub struct Sent {
+    method: String,
+    path_and_query: String,
+    body: wire_http::BodyField,
+    origin: String,
+    headers: wire_http::ReceivedHeaders,
+}
+
+impl Sent {
+    /// `request` as a service at [`ORIGIN`] receives it, its body read whole.
+    pub fn of(request: &SwitchRequest) -> Self {
+        Self::at(request, ORIGIN)
+    }
+
+    /// `request` as a service at `origin` receives it, its body read whole.
+    pub fn at(request: &SwitchRequest, origin: &str) -> Self {
+        Sent {
+            method: request.method.clone(),
+            path_and_query: request.path_and_query.clone(),
+            body: wire_http::BodyField::read(&request.body),
+            origin: origin.to_owned(),
+            headers: wire_http::ReceivedHeaders::of(
+                request
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            ),
+        }
+    }
+
+    /// The same request with its body not read, as a refusal before the body binds it.
+    pub fn unread(mut self) -> Self {
+        self.body = wire_http::BodyField::NotRead;
+        self
+    }
+
+    /// Whether it carries `Switch-Signature`.
+    pub fn signed(&self) -> bool {
+        !self.headers.values(header::SIGNATURE).is_empty()
+    }
+
+    /// The core's view of it.
+    pub fn request(&self) -> wire_http::ReceivedRequest<'_> {
+        wire_http::ReceivedRequest {
+            method: &self.method,
+            path_and_query: &self.path_and_query,
+            body: self.body,
+            origin: &self.origin,
+            headers: &self.headers,
+        }
+    }
+}
+
+/// Whether `answer` to `sent` is signed with `key` (Switch wire 7.1).
+pub fn signed_with(answer: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
+    let Some(signature) = header_text(answer, header::SERVICE_SIGNATURE)
+        .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
+    else {
+        return false;
+    };
+    wire_http::verify_response(
+        key,
+        &wire_http::ResponseParts {
+            status: answer.status,
+            request: sent.request(),
+            server_time: header_text(answer, header::SERVER_TIME).expect("time"),
+            head: header_text(answer, header::HEAD),
+            body: &answer.body,
+        },
+        &signature,
+    )
+    .is_ok()
+}
+
 /// The response matches the vector byte for byte: status, body, server time and signature.
 pub fn assert_matches(response: &SwitchResponse, expected: &Value) {
     let name = expected["name"].as_str().expect("name");

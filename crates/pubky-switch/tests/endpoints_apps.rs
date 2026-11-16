@@ -482,16 +482,7 @@ async fn test_apps_signature_covers_the_body_and_time() {
         Vec::new(),
         ms(&at),
     );
-    let request_signature: [u8; 64] = unb64(
-        request
-            .headers
-            .get(header::SIGNATURE)
-            .and_then(|value| value.to_str().ok())
-            .expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
+    let sent = Sent::of(&request);
     let answer = replay.service.handle(request).await;
     let signature: [u8; 64] = unb64(header_text(&answer, header::SERVICE_SIGNATURE).expect("sig"))
         .expect("b64")
@@ -514,10 +505,13 @@ async fn test_apps_signature_covers_the_body_and_time() {
     let verify = |time: &str, body: &[u8]| {
         pubky_switch_core::http::verify_response(
             &key,
-            200,
-            Some(&request_signature),
-            time,
-            body,
+            &pubky_switch_core::http::ResponseParts {
+                status: 200,
+                request: sent.request(),
+                server_time: time,
+                head: header_text(&answer, header::HEAD),
+                body,
+            },
             &signature,
         )
     };

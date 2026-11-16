@@ -55,35 +55,14 @@ fn code(response: &SwitchResponse) -> (u16, String) {
 }
 
 /// Whether `response` is signed with `key` (Switch wire 7.1).
-fn signed_by(response: &SwitchResponse, key: &[u8; 32], request_signature: &[u8; 64]) -> bool {
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        header_text(response, header::SERVICE_SIGNATURE).expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
-    pubky_switch_core::http::verify_response(
-        key,
-        response.status,
-        Some(request_signature),
-        header_text(response, header::SERVER_TIME).expect("time"),
-        &response.body,
-        &signature,
-    )
-    .is_ok()
+fn signed_by(response: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
+    signed_with(response, key, sent)
 }
 
-fn signature_of(request: &pubky_switch::http::SwitchRequest) -> [u8; 64] {
-    pubky_switch_core::enc::unb64(
-        request
-            .headers
-            .get(header::SIGNATURE)
-            .and_then(|value| value.to_str().ok())
-            .expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64")
+fn signature_of(request: &pubky_switch::http::SwitchRequest) -> Sent {
+    let sent = Sent::of(request);
+    assert!(sent.signed(), "signature");
+    sent
 }
 
 /// The vectors' enrollment with another nonce and `revoked_apps`.
@@ -200,7 +179,7 @@ async fn deliver(
     doc: SignedDoc,
     prev: Option<[u8; 32]>,
     at_ms: u64,
-) -> (SwitchResponse, [u8; 64]) {
+) -> (SwitchResponse, Sent) {
     let path = format!("/v1/{}/identity", alice_id());
     let request = signer_request(
         "PUT",

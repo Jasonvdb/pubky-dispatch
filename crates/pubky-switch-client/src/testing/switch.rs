@@ -15,9 +15,7 @@ use pubky_switch_core::chain::{
 };
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
-use pubky_switch_core::http::{
-    ErrorCode, frozen_refuses, header, request_signature_of, sign_response,
-};
+use pubky_switch_core::http::{ErrorCode, ResponseParts, frozen_refuses, header, sign_response};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{
@@ -33,6 +31,7 @@ use pubky_switch_core::time::rfc3339;
 use serde_json::{Map, Value, json};
 
 use super::ScriptError;
+use crate::client::SentRequest;
 use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Transport};
@@ -281,6 +280,16 @@ pub enum Fault {
         code: ErrorCode,
         /// The secret of the key that signs the answer.
         secret: [u8; 32],
+    },
+    /// The answer `code`, given before the switch read the body: signed with the account's
+    /// key over the empty body field, with no head, as a service whose one key signs every
+    /// answer gives a `413 too_large`, a `429 rate_limited` or a `404 not_found` (Switch wire
+    /// 7.1).
+    BeforeTheBody {
+        /// A part of the request's path and query.
+        path: String,
+        /// The error code answered.
+        code: ErrorCode,
     },
 }
 
@@ -1205,6 +1214,9 @@ impl ScriptedSwitch {
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
         inner.minute_sweep();
+        if let Some(refused) = inner.refused_as_received(request) {
+            return Ok(refused);
+        }
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
@@ -1219,7 +1231,8 @@ impl ScriptedSwitch {
             | Fault::LeaveOut { path: p, .. }
             | Fault::Replace { path: p, .. }
             | Fault::SignWith { path: p, .. }
-            | Fault::ErrorSignedWith { path: p, .. } => path.contains(p.as_str()),
+            | Fault::ErrorSignedWith { path: p, .. }
+            | Fault::BeforeTheBody { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(
@@ -1266,6 +1279,19 @@ impl ScriptedSwitch {
                     let key = SigningKey::from_bytes(&secret);
                     return Ok(inner.respond_with(&key, request, status, &body));
                 }
+                Some(Fault::BeforeTheBody { code, .. }) => {
+                    let (status, body) = bad(code, "scripted", Value::Null);
+                    let at = inner.now();
+                    return Ok(inner.respond_bound(
+                        &inner.service,
+                        request,
+                        status,
+                        &body,
+                        at,
+                        None,
+                        false,
+                    ));
+                }
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -1273,6 +1299,35 @@ impl ScriptedSwitch {
                 Some(Fault::Unanswered { .. }) => return Err(TransportError::Timeout),
                 None => {}
             }
+        }
+        let public = pubky_switch_core::http::is_public_read(&request.method, &path);
+        let finish = |inner: &Inner, (status, mut body): Answer| {
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
+                object.remove(&member);
+            }
+            if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
+                object.insert(member, value);
+            }
+            if let Some(secret) = sign_with {
+                let key = SigningKey::from_bytes(&secret);
+                return Ok(inner.respond_with(&key, request, status, &body));
+            }
+            if public && (inner.erased || inner.enrolled.is_none()) {
+                let operator = SigningKey::from_bytes(&[42; 32]);
+                return Ok(inner.respond_with(&operator, request, status, &body));
+            }
+            Ok(inner.respond(request, status, &body))
+        };
+        // Public identity reads decide nothing by a caller header, including its time,
+        // app and identity. Faults remain explicit (Switch wire 7.1, 7.4.15).
+        if public {
+            let answer = inner
+                .gate(&request.method, &path)
+                .unwrap_or_else(|| inner.identity_answer());
+            return finish(&inner, answer);
         }
         if request.method == "POST" && path == "/v1/enroll" {
             // Its timestamp is checked first, as every request's (Switch wire 7.1): a stale
@@ -1363,22 +1418,9 @@ impl ScriptedSwitch {
         };
         // An own app's request: its last-seen time, also for the request that registered it.
         inner.seen(request);
-        let (status, mut body) =
+        let answer =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
-        if lose {
-            return Err(TransportError::Timeout);
-        }
-        if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
-            object.remove(&member);
-        }
-        if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
-            object.insert(member, value);
-        }
-        if let Some(secret) = sign_with {
-            let key = SigningKey::from_bytes(&secret);
-            return Ok(inner.respond_with(&key, request, status, &body));
-        }
-        Ok(inner.respond(request, status, &body))
+        finish(&inner, answer)
     }
 
     /// Deliver an own `identity.json` (the signer's `PUT /identity`): an `identity` chain
@@ -1878,7 +1920,9 @@ impl Inner {
     /// The scripted switch takes an app with a record, not revoked, departed or kept, as
     /// authenticated; the service sees no other.
     fn seen(&mut self, request: &Request) {
-        if self.seen_at_arrival {
+        if self.seen_at_arrival
+            || pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
+        {
             return;
         }
         let Some(app) = request
@@ -2046,16 +2090,23 @@ impl Inner {
     /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
     /// answered before that, nor to an enrollment or an erasure (Switch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
-        let mut response = self.respond_with(&self.service, request, status, body);
         let own =
             request.header(header::IDENTITY) == Some(pubky_id(&self.identity.public()).as_str());
         let path = request.path_and_query.as_str();
-        if own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase") {
-            response
-                .headers
-                .push(Header::new(header::HEAD, &self.head().to_header()));
-        }
-        response
+        let head = (own
+            && status != 401
+            && !path.ends_with("/enroll")
+            && !path.ends_with("/erase")
+            && !pubky_switch_core::http::is_public_read(&request.method, path))
+        .then(|| self.head().to_header());
+        self.respond_signed(
+            &self.service,
+            request,
+            status,
+            body,
+            self.now(),
+            head.as_deref(),
+        )
     }
 
     /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
@@ -2126,20 +2177,99 @@ impl Inner {
         body: &Value,
         at: u64,
     ) -> Response {
+        self.respond_signed(key, request, status, body, at, None)
+    }
+
+    /// An answer whose `Switch-Server-Time` is `at`, carrying `head` as its `Switch-Head`;
+    /// the response signature covers `request` as received, its body read whole, the server
+    /// time, the head field and the body (Switch wire 7.1).
+    fn respond_signed(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+        head: Option<&str>,
+    ) -> Response {
+        self.respond_bound(key, request, status, body, at, head, true)
+    }
+
+    /// The refusals the service gives a request as it arrives, before anything else, signed
+    /// with the operator key and without a head, as the service signs them: a body over its
+    /// call's cap, `413 too_large` over the empty body field, since the body isn't read; a
+    /// signed request header sent more than once, `400 bad_request`, but at the public read,
+    /// which uses none (Switch wire 7.1).
+    fn refused_as_received(&self, request: &Request) -> Option<Response> {
+        let operator = SigningKey::from_bytes(&[42; 32]);
+        let at = self.now();
+        if let Some(cap) =
+            pubky_switch_core::http::body_cap(&request.method, &request.path_and_query)
+            && request.body.len() > cap
+        {
+            let (status, body) = bad(
+                ErrorCode::TooLarge,
+                "Switch wire 7.1: the body is over its call's cap",
+                Value::Null,
+            );
+            return Some(self.respond_bound(&operator, request, status, &body, at, None, false));
+        }
+        let repeated = pubky_switch_core::http::RECEIVED_HEADERS
+            .iter()
+            .any(|name| {
+                request
+                    .headers
+                    .iter()
+                    .filter(|header| header.name.eq_ignore_ascii_case(name))
+                    .count()
+                    > 1
+            });
+        if repeated
+            && !pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
+        {
+            let (status, body) = bad(
+                ErrorCode::BadRequest,
+                "Switch wire 7.1: a signed request header sent more than once",
+                Value::Null,
+            );
+            return Some(self.respond_bound(&operator, request, status, &body, at, None, true));
+        }
+        None
+    }
+
+    /// [`Inner::respond_signed`], the body field the body's hash where `body_read`, else
+    /// empty, for an answer given before the body is read (Switch wire 7.1).
+    #[allow(clippy::too_many_arguments)]
+    fn respond_bound(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+        head: Option<&str>,
+        body_read: bool,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
         let server_time = rfc3339(at);
-        let request_signature = request_signature_of(request.header(header::SIGNATURE));
+        let sent = SentRequest::of(request);
         let signature = sign_response(
             key,
-            status,
-            request_signature.as_ref(),
-            &server_time,
-            &bytes,
+            &ResponseParts {
+                status,
+                request: sent.received(body_read),
+                server_time: &server_time,
+                head,
+                body: &bytes,
+            },
         );
         let mut headers = vec![
             Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
             Header::new(header::SERVER_TIME, &server_time),
         ];
+        if let Some(head) = head {
+            headers.push(Header::new(header::HEAD, head));
+        }
         // A `429` repeats its body's `retry_after` in `Retry-After` (Switch wire 7.1, 7.6).
         if let Some(seconds) = body
             .get("retry_after")

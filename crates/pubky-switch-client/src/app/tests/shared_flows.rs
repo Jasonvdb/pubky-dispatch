@@ -6621,7 +6621,13 @@ fn scripted_call(
     method: &str,
     rest: &str,
 ) -> (u16, Value, bool, Option<String>) {
-    scripted_request(s, app, method, rest, b"{}".to_vec())
+    // A `GET` takes no body (Switch wire 7.1 Body caps).
+    let body = if method == "GET" {
+        Vec::new()
+    } else {
+        b"{}".to_vec()
+    };
+    scripted_request(s, app, method, rest, body)
 }
 
 /// As [`scripted_call`], a `POST` with `body`.

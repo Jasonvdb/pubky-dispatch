@@ -35,6 +35,7 @@
 
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
+use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
@@ -48,6 +49,198 @@ use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
+/// Confirmation that the user chose restoration after seeing what unusable local records
+/// may lose: claims, undelivered changes, pending effects and local history (Switch spec 12.8).
+/// This is the host's attestation, not verification that a user interface was shown.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordsDiscarded(());
+
+impl RecordsDiscarded {
+    /// Made by the host only after showing the losses and obtaining confirmation to restore.
+    #[must_use]
+    pub fn shown_and_confirmed() -> Self {
+        Self(())
+    }
+}
+
+// A missing copy in readable current state is different from a copy whose evidence was lost.
+enum KeptCopy {
+    Absent,
+    Verified(Box<IdentityDoc>),
+    Unusable,
+}
+
+impl KeptCopy {
+    fn read(signed: Option<&SignedDoc>, identity: &[u8; 32]) -> Self {
+        match signed {
+            None => Self::Absent,
+            Some(signed) => match state::stored_identity(signed, identity) {
+                Ok(doc) => Self::Verified(Box::new(doc)),
+                Err(_) => Self::Unusable,
+            },
+        }
+    }
+}
+
+// Retained restrictions, never a ready signer or permission to sign. Only a whole decoded
+// current state for the requested identity contributes its scalar and collection members.
+struct RestoreLocal {
+    state: Option<SignerState>,
+    copies: [KeptCopy; 2],
+    signed_through: Option<u64>,
+    epoch_through: Option<u64>,
+}
+
+impl RestoreLocal {
+    fn from_state(state: Option<SignerState>, identity: &[u8; 32]) -> Self {
+        let copies = match &state {
+            Some(state) => [
+                KeptCopy::read(state.newest.as_ref().map(|newest| &newest.doc), identity),
+                KeptCopy::read(state.recovery_base.as_ref(), identity),
+            ],
+            None => [KeptCopy::Unusable, KeptCopy::Unusable],
+        };
+        let mut local = Self {
+            signed_through: state.as_ref().map(|state| state.signed_through),
+            epoch_through: state.as_ref().map(|state| state.epoch_through),
+            state,
+            copies,
+        };
+        for copy in &local.copies {
+            if let KeptCopy::Verified(doc) = copy {
+                local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
+                local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
+            }
+        }
+        local
+    }
+
+    fn intact(state: SignerState) -> Result<Self> {
+        state.check_copies()?;
+        let identity = state.identity;
+        Ok(Self::from_state(Some(state), &identity))
+    }
+
+    fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
+        let mut damaged = false;
+        let state = match records.state {
+            Ok(state) => state,
+            Err(error) => {
+                local_damage(error)?;
+                damaged = true;
+                None
+            }
+        };
+        let flow = match records.flow {
+            Ok(flow) => flow,
+            Err(error) => {
+                local_damage(error)?;
+                damaged = true;
+                None
+            }
+        };
+        if let Some(state) = &state {
+            if let Err(error) = state.check_copies() {
+                local_damage(error)?;
+                damaged = true;
+            }
+        } else if flow.is_some() {
+            damaged = true;
+        }
+        let mut intact_flow = false;
+        if let Some(flow) = &flow {
+            match flow.check_copies(identity) {
+                Ok(()) => intact_flow = true,
+                Err(error) => {
+                    local_damage(error)?;
+                    damaged = true;
+                }
+            }
+        }
+        if !damaged {
+            return Err(if state.is_some() {
+                Refusal::AlreadySetUp
+            } else {
+                Refusal::NotSetUp
+            }
+            .into());
+        }
+        if let Some(state) = &state {
+            check_local_restore(state, intact_flow)?;
+        } else if intact_flow {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let mut local = Self::from_state(state, identity);
+        // A valid signed version in an otherwise unusable flow still spent that version
+        // and may have sent its epoch's keys. It is not proof that a service accepted it.
+        let signed = match &flow {
+            Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
+            Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
+            _ => None,
+        };
+        if let Some(signed) = signed
+            && let Ok(doc) = state::stored_identity(signed, identity)
+        {
+            local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
+            local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
+        }
+        Ok(local)
+    }
+}
+
+fn local_damage(error: SignerError) -> Result<()> {
+    match error {
+        SignerError::StoredData(_)
+        | SignerError::Records(
+            RecordsFault::Undecodable { .. }
+            | RecordsFault::InvalidHeader
+            | RecordsFault::OtherIdentity
+            | RecordsFault::Incomplete,
+        ) => Ok(()),
+        other => Err(other),
+    }
+}
+
+fn restored_alerts(state: &SignerState) -> Vec<Alert> {
+    state
+        .alerts
+        .iter()
+        .filter(|alert| {
+            !matches!(
+                alert,
+                Alert::RecordsBehind { .. }
+                    | Alert::ManagedByOtherInstall { .. }
+                    | Alert::RenewalsStopped { .. }
+                    | Alert::LapsingWithOpenAttempts { .. }
+                    | Alert::RenewalRefused { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn check_local_restore(state: &SignerState, has_flow: bool) -> Result<()> {
+    if state.erased {
+        return Err(Refusal::Erased.into());
+    }
+    if has_flow {
+        return Err(Refusal::FlowInProgress.into());
+    }
+    if let Some(handing) = &state.handing_over {
+        return Err(Refusal::HandingOver {
+            to_app: handing.to_app,
+        }
+        .into());
+    }
+    if state.taking_over {
+        return Err(Refusal::TakingOver.into());
+    }
+    if let Some(install) = state.handed_over_to {
+        return Err(SignerError::NotNamed { install });
+    }
+    Ok(())
+}
+
 impl Signer {
     /// Set up this install from the signer backup on the Homeserver, for an identity whose
     /// key `keyring` holds and whose records this store doesn't hold, as on a new device
@@ -60,7 +253,7 @@ impl Signer {
     pub async fn restore_new(
         env: SignerEnv,
         keyring: IdentityKeyring,
-        confirmed: UserConfirmed,
+        _confirmed: UserConfirmed,
     ) -> Result<Self> {
         let identity = keyring.public_key();
         let store = env
@@ -70,8 +263,48 @@ impl Signer {
         if state::set_up(&store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
+        let mut signer = Self::restore_target(env, keyring, store)?;
+        signer.restore_records(None).await?;
+        Ok(signer)
+    }
+
+    /// Restore over records this call itself proves unusable, after the user accepts the
+    /// losses (Switch spec 12.8, Switch wire 3.13). Readable local restrictions remain binding.
+    /// The same namespace owner is retained through the first atomic replacement and retry.
+    /// No record is deleted before the verified replacement is committed.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::AlreadySetUp`] for usable records, [`Refusal::NotSetUp`] for an empty store;
+    /// a host read failure never permits replacement. Intact flows, erasure, hand-over,
+    /// take-over, security alarms and known version or epoch floors still constrain it.
+    /// A completed hand-over refuses with [`SignerError::NotNamed`]. Otherwise as
+    /// [`Signer::restore`]. An unknown write requires reopening the actual stored result;
+    /// repeating this entry cannot replace a successfully committed usable candidate.
+    pub async fn restore_over_unusable(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        _confirmed: RecordsDiscarded,
+    ) -> Result<Self> {
+        let identity = keyring.public_key();
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        let local = RestoreLocal::unusable(state::read(&store, &identity).await?, &identity)?;
+        let mut signer = Self::restore_target(env, keyring, store)?;
+        signer.restore_records(Some(local)).await?;
+        Ok(signer)
+    }
+
+    fn restore_target(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        store: OwnedStoreHandle,
+    ) -> Result<Self> {
+        let identity = keyring.public_key();
         let install = pubky_switch_core::enc::random_bytes::<16>()?;
-        let mut signer = Self {
+        Ok(Self {
             store,
             env,
             keyring,
@@ -80,9 +313,7 @@ impl Signer {
             unsure: false,
             left: super::RunDue::default(),
             run: std::sync::Arc::default(),
-        };
-        signer.restore_records(false, confirmed).await?;
-        Ok(signer)
+        })
     }
 
     /// Restore this install's records from the signer backup on the Homeserver, in place:
@@ -103,34 +334,14 @@ impl Signer {
     /// Homeserver holds none; [`Refusal::UnreadableBackup`] for one that doesn't open or
     /// verify; [`Refusal::StaleBackup`] when the switch's or the Homeserver's copy is past it;
     /// otherwise as [`Signer::resume`].
-    pub async fn restore(&mut self, confirmed: UserConfirmed) -> Result<IdentityDoc> {
+    pub async fn restore(&mut self, _confirmed: UserConfirmed) -> Result<IdentityDoc> {
         self.refresh().await?;
-        // An erased account has no switch to restore at (Switch spec 12.7).
-        if self.state.erased {
-            return Err(Refusal::Erased.into());
-        }
-        if self.flow.is_some() {
-            return Err(Refusal::FlowInProgress.into());
-        }
-        // A restore would sign the version after the one handed over, racing the new signer
-        // at its own version, and drop the hand-over from the records.
-        if let Some(handing) = &self.state.handing_over {
-            return Err(Refusal::HandingOver {
-                to_app: handing.to_app,
-            }
-            .into());
-        }
-        if self.state.taking_over {
-            return Err(Refusal::TakingOver.into());
-        }
-        self.restore_records(true, confirmed).await
+        check_local_restore(&self.state, self.flow.is_some())?;
+        let local = RestoreLocal::intact(self.state.clone())?;
+        self.restore_records(Some(local)).await
     }
 
-    async fn restore_records(
-        &mut self,
-        in_place: bool,
-        _confirmed: UserConfirmed,
-    ) -> Result<IdentityDoc> {
+    async fn restore_records(&mut self, local: Option<RestoreLocal>) -> Result<IdentityDoc> {
         let identity = self.state.identity;
         let bytes = self
             .env
@@ -195,7 +406,7 @@ impl Signer {
         // its copy of that generation counts as no copy (Switch wire 3.13).
         let answer = without_the_lost_copy(&view, answer, &identity);
         let first = self
-            .check_restore(&view, answer.identity.as_ref(), in_place)
+            .check_restore(&view, answer.identity.as_ref(), local.as_ref())
             .await?;
 
         // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
@@ -205,18 +416,29 @@ impl Signer {
         let mut tombstones = view.revoked_apps.clone();
         tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
         tombstones.extend(removed_at_switch(&answer, &doc));
-        let cleanup = if in_place {
-            tombstones.extend(self.state.tombstones.iter().copied());
-            self.state.cleanup.clone()
+        let kept = local.as_ref().and_then(|local| local.state.as_ref());
+        let cleanup = if let Some(kept) = kept {
+            tombstones.extend(kept.tombstones.iter().copied());
+            kept.cleanup.clone()
         } else {
             Vec::new()
         };
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
-        if in_place {
-            if self.state.epoch_through > doc.data_epoch().saturating_add(1) {
-                return Err(Refusal::StaleBackup.into());
+        if let Some(local) = &local {
+            if let Some(epoch) = local.epoch_through {
+                if epoch > doc.data_epoch().saturating_add(1) {
+                    return Err(Refusal::StaleBackup.into());
+                }
+                state.epoch_through = state.epoch_through.max(epoch);
             }
-            state.epoch_through = state.epoch_through.max(self.state.epoch_through);
+            if let Some(version) = local.signed_through {
+                state.signed_through = state.signed_through.max(version);
+            }
+        }
+        if let Some(kept) = kept {
+            for alert in restored_alerts(kept) {
+                state.alert(alert);
+            }
         }
         // The first commit must also tell a restart to finish taking over (Switch wire 3.13).
         state.owes_own_version = true;
@@ -224,8 +446,8 @@ impl Signer {
         // alerts; those only the backup names are added. Where both picked a time to distrust
         // an app from, the earlier wins: after a compromise it trusts less, and two installs
         // that disagree never trust more than either asked (Switch wire 3.12).
-        if in_place {
-            for carried in &self.state.revoking {
+        if let Some(kept) = kept {
+            for carried in &kept.revoking {
                 if let Some(rebuilt) = state
                     .revoking
                     .iter_mut()
@@ -240,7 +462,7 @@ impl Signer {
                     state.alerts.retain(|alert| {
                         !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
                             if *app_id == carried.app_id)
-                            || self.state.alerts.contains(alert)
+                            || kept.alerts.contains(alert)
                     });
                 } else {
                     state.revoking.push(carried.clone());
@@ -260,10 +482,11 @@ impl Signer {
             // The services this recovery enrolled at, kept in place for the same lost
             // generation, and the one the backup's version names, under its key: declared
             // again at one, it is read under that key first.
-            if in_place && self.state.recovering && self.state.lost_generation == Some(lost) {
-                state
-                    .recovery_services
-                    .clone_from(&self.state.recovery_services);
+            if let Some(kept) = kept
+                && kept.recovering
+                && kept.lost_generation == Some(lost)
+            {
+                state.recovery_services.clone_from(&kept.recovery_services);
             }
             if let Some(service) = state.service.clone()
                 && !state.recovery_services.contains(&service)
@@ -363,25 +586,7 @@ impl Signer {
         let doc = &view.identity_doc;
         let mut state = SignerState::new(self.state.identity, self.state.install);
         state.signed_through = self.state.signed_through.max(doc.version());
-        state.alerts = self
-            .state
-            .alerts
-            .iter()
-            // The count of untaken renewals starts again from none, and the alert it raised
-            // goes with it (Switch spec 3.1). A refused renewal's alert goes too: the restored
-            // version's certificate shows what the app holds (Switch spec 3.2).
-            .filter(|a| {
-                !matches!(
-                    a,
-                    Alert::RecordsBehind { .. }
-                        | Alert::ManagedByOtherInstall { .. }
-                        | Alert::RenewalsStopped { .. }
-                        | Alert::LapsingWithOpenAttempts { .. }
-                        | Alert::RenewalRefused { .. }
-                )
-            })
-            .cloned()
-            .collect();
+        state.alerts = restored_alerts(&self.state);
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
         // The install the records came from published its versions (Switch wire 3.12, 3.13).
@@ -512,27 +717,29 @@ impl Signer {
         &self,
         view: &BackupView,
         held: Option<&SignedDoc>,
-        in_place: bool,
+        local: Option<&RestoreLocal>,
     ) -> Result<Option<Option<[u8; 32]>>> {
         let identity = self.state.identity;
         let doc = &view.identity_doc;
-        if in_place {
-            if let Some(alarm) = gate::held_alarm(&self.state) {
-                return Err(SignerError::Alarm(alarm.clone()));
-            }
-            // A version of this install's own seen at the switch counts as the mark does:
-            // the backup never goes below it either.
-            if let Some(seen) = self.state.records_behind
-                && doc.version() < seen
-            {
-                return Err(Refusal::StaleBackup.into());
-            }
-            if let Some(mark) = self.high_water()? {
-                let below = doc.version() < mark.version
-                    || doc.generation() < mark.generation
-                    || (doc.version() == mark.version && doc.body_hash() != mark.body_hash);
-                if below {
+        if let Some(local) = local {
+            if let Some(state) = &local.state {
+                if let Some(alarm) = gate::held_alarm(state) {
+                    return Err(SignerError::Alarm(alarm.clone()));
+                }
+                if let Some(seen) = state.records_behind
+                    && doc.version() < seen
+                {
                     return Err(Refusal::StaleBackup.into());
+                }
+            }
+            for copy in &local.copies {
+                if let KeptCopy::Verified(mark) = copy {
+                    let below = doc.version() < mark.version()
+                        || doc.generation() < mark.generation()
+                        || (doc.version() == mark.version() && doc.body_hash() != mark.body_hash());
+                    if below {
+                        return Err(Refusal::StaleBackup.into());
+                    }
                 }
             }
         }

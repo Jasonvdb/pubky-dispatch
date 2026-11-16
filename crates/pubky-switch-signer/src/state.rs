@@ -616,7 +616,7 @@ impl SignerState {
     }
 
     /// Check the signed copies independently of the service and of caller-supplied keys.
-    fn check_copies(&self) -> Result<()> {
+    pub(crate) fn check_copies(&self) -> Result<()> {
         self.newest_doc()?;
         self.certificates()?;
         if let Some(base) = &self.recovery_base {
@@ -750,7 +750,7 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
-    fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
+    pub(crate) fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
         match self {
             Self::Enroll {
                 origin, enrollment, ..
@@ -854,32 +854,51 @@ pub(crate) async fn load(
     store: &OwnedStoreHandle,
     identity: &[u8; 32],
 ) -> Result<Option<(SignerState, Option<Flow>)>> {
+    let records = read(store, identity).await?;
+    let Some(state) = records.state? else {
+        if !matches!(records.flow, Ok(None)) {
+            return Err(RecordsFault::Incomplete.into());
+        }
+        return Ok(None);
+    };
+    let flow = records.flow?;
+    state.check_copies()?;
+    if let Some(flow) = &flow {
+        flow.check_copies(identity)?;
+    }
+    Ok(Some((state, flow)))
+}
+
+/// Independently decoded current records, read together while the namespace is owned.
+/// A decoded state has the current header and requested identity; its copies are not yet
+/// authenticated. Only the explicit confirmed restore may retain it after a copy fails.
+pub(crate) struct ReadRecords {
+    pub(crate) state: Result<Option<SignerState>>,
+    pub(crate) flow: Result<Option<Flow>>,
+}
+
+pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Result<ReadRecords> {
     if store.namespace() != signer_namespace(identity) {
         return Err(RecordsFault::Invariant("another store namespace").into());
     }
     let bytes = store.get(STATE_KEY).await?;
     let flow = store.get(FLOW_KEY).await?;
-    let Some(bytes) = bytes else {
-        if flow.is_some() {
-            return Err(RecordsFault::Incomplete.into());
-        }
-        return Ok(None);
-    };
-    let state: SignerState = decode(&bytes, SignerRecord::State)?;
-    if state.v != SCHEMA_VERSION {
-        return Err(RecordsFault::InvalidHeader.into());
-    }
-    if &state.identity != identity {
-        return Err(RecordsFault::OtherIdentity.into());
-    }
+    let state = bytes
+        .map(|bytes| {
+            let state: SignerState = decode(&bytes, SignerRecord::State)?;
+            if state.v != SCHEMA_VERSION {
+                return Err(RecordsFault::InvalidHeader.into());
+            }
+            if &state.identity != identity {
+                return Err(RecordsFault::OtherIdentity.into());
+            }
+            Ok(state)
+        })
+        .transpose();
     let flow = flow
         .map(|bytes| decode(&bytes, SignerRecord::Flow))
-        .transpose()?;
-    state.check_copies()?;
-    if let Some(flow) = &flow {
-        Flow::check_copies(flow, identity)?;
-    }
-    Ok(Some((state, flow)))
+        .transpose();
+    Ok(ReadRecords { state, flow })
 }
 
 /// Commit the records and the flow together, in one atomic write.

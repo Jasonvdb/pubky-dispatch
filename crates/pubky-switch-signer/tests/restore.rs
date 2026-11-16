@@ -1295,3 +1295,67 @@ async fn test_restore_brings_back_no_refused_renewal() {
         listed
     );
 }
+
+#[tokio::test]
+async fn test_restore_first_commit_keeps_the_take_over_owed() {
+    use pubky_switch_client::StoreError;
+    use pubky_switch_client::store::{Fault, FaultStore};
+
+    for deliver_backup_first in [false, true] {
+        let world = World::new();
+        let (mut old, _) = world.enrolled().await;
+        if deliver_backup_first {
+            world.switch.fail_next(SwitchFault::Unreachable {
+                path: "/identity".into(),
+                after: 0,
+            });
+            old.set_record_max_age(Some(60)).await.unwrap_err();
+        }
+        let backup = world.backup().identity_doc().clone();
+        drop(old);
+        let store = Arc::new(MemoryStore::new());
+        let fault = Arc::new(FaultStore::new(store.clone(), Fault::FailAfter(1)));
+        assert_eq!(
+            Signer::restore_new(world.env(fault), world.keyring(), confirmed())
+                .await
+                .unwrap_err(),
+            SignerError::Store(StoreError::Unknown)
+        );
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        signer.resume().await.unwrap();
+        let restored = signer.identity_doc().unwrap().unwrap();
+        assert_eq!(restored.version(), backup.version() + 1);
+        assert_eq!(restored.body().signer, signer.install_id());
+        assert_eq!(
+            world.switch.identity_doc().unwrap().signed(),
+            restored.signed()
+        );
+        assert_eq!(world.backup().identity_doc().signed(), restored.signed());
+    }
+}
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_the_local_epoch_floor() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let reduce = || CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(a.keys.app_id_bytes(), reduce())
+        .await
+        .unwrap_err();
+    assert_eq!(world.backup().identity_doc().data_epoch(), 1);
+    signer.restore(confirmed()).await.unwrap();
+    let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
+    assert_eq!(renewed.data_epoch(), 3);
+}

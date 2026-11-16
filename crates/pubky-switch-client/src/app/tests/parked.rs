@@ -1235,7 +1235,7 @@ async fn test_parked_processing_retires_all_copies_with_local_effect() {
     assert_eq!(protocol.handed(), handed + 1);
     assert!(processed(&app, &message).await);
     assert!(
-        app.forget_processed(w.bob.public(), &message.msg_id, &[])
+        app.forget_processed("tasks", w.bob.public(), &message.msg_id, &[])
             .await
             .unwrap()
     );
@@ -1305,6 +1305,7 @@ async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
     assert!(!processed(&app, &message).await);
     assert!(
         !app.forget_processed(
+            "tasks",
             w.bob.public(),
             &message.msg_id,
             &[LocalWrite::Put {
@@ -1317,7 +1318,7 @@ async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
     );
     assert!(listed(&mut app, entry.stored_id).await.is_some());
     assert_eq!(
-        app.protocol_get(b"evicted").await.unwrap(),
+        app.protocol_get("tasks", b"evicted").await.unwrap(),
         Some(b"yes".to_vec())
     );
 }
@@ -1500,7 +1501,7 @@ async fn test_parked_processing_backup_keeps_unknown_effect_and_copies() {
     assert_eq!(w.effects(), applied);
     assert!(matches!(
         restored
-            .forget_processed(w.bob.public(), &message.msg_id, &[])
+            .forget_processed("tasks", w.bob.public(), &message.msg_id, &[])
             .await,
         Err(AppError::Refused(Refusal::NotNow(_)))
     ));
@@ -1545,10 +1546,13 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
         let (entry, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
         let duties = app.unacknowledged_events().await.unwrap();
-        app.protocol_commit(&[LocalWrite::Put {
-            key: b"retained".to_vec(),
-            value: b"old".to_vec(),
-        }])
+        app.protocol_commit(
+            "tasks",
+            &[LocalWrite::Put {
+                key: b"retained".to_vec(),
+                value: b"old".to_vec(),
+            }],
+        )
         .await
         .unwrap();
         let fault = Arc::new(FaultStore::new(
@@ -1570,7 +1574,7 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
             },
         ];
         let result = app
-            .forget_processed(w.bob.public(), &message.msg_id, &local)
+            .forget_processed("tasks", w.bob.public(), &message.msg_id, &local)
             .await;
         assert!(
             matches!(
@@ -1588,22 +1592,30 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         );
         let restored = load_on(&w, &protocol, w.store.clone()).await;
         assert_eq!(
-            restored.protocol_get(b"evicted").await.unwrap().is_some(),
+            restored
+                .protocol_get("tasks", b"evicted")
+                .await
+                .unwrap()
+                .is_some(),
             after
         );
         assert_eq!(
-            restored.protocol_get(b"retained").await.unwrap().is_none(),
+            restored
+                .protocol_get("tasks", b"retained")
+                .await
+                .unwrap()
+                .is_none(),
             after,
             "the retained value and its drop mark change in one local decision"
         );
         assert!(!processed(&restored, &message).await);
         assert!(
-            !app.forget_processed(w.bob.public(), &message.msg_id, &local)
+            !app.forget_processed("tasks", w.bob.public(), &message.msg_id, &local)
                 .await
                 .unwrap()
         );
         assert_eq!(
-            app.protocol_get(b"evicted").await.unwrap(),
+            app.protocol_get("tasks", b"evicted").await.unwrap(),
             Some(b"yes".to_vec())
         );
         assert!(listed(&mut app, entry.stored_id).await.is_some());
@@ -1620,7 +1632,7 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         assert!(listed(&mut restored, entry.stored_id).await.is_some());
         assert!(!processed(&restored, &message).await);
         assert_eq!(
-            restored.protocol_get(b"evicted").await.unwrap(),
+            restored.protocol_get("tasks", b"evicted").await.unwrap(),
             Some(b"yes".to_vec())
         );
     }
@@ -1641,13 +1653,18 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     }];
     assert!(
         matches!(
-            app.forget_processed(w.bob.public(), &message.msg_id, &local)
+            app.forget_processed("tasks", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "pending effect protects the absent pair"
     );
-    assert!(app.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("tasks", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     let backup = app.backup_layered().await.unwrap();
     let mut restored = App::restore(
         w.env_on(Arc::new(MemoryStore::new())),
@@ -1663,13 +1680,19 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     assert!(
         matches!(
             restored
-                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .forget_processed("tasks", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "uncertainty protects its held pair"
     );
-    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        restored
+            .protocol_get("tasks", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     w.clock.advance_ms(super::super::PROCESSED_RETENTION_MS + 1);
     restored.receive(None).await.unwrap();
     assert!(
@@ -1679,13 +1702,19 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     assert!(
         matches!(
             restored
-                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .forget_processed("tasks", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "uncertainty still protects locals after pair retention"
     );
-    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        restored
+            .protocol_get("tasks", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(listed(&mut restored, entry.stored_id).await.is_some());
 }
 
@@ -1849,7 +1878,7 @@ async fn test_parked_move_settlement_retires_prior_copies() {
     assert!(processed(&app, &message).await);
     assert_eq!(w.effects(), effects);
     assert_eq!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("tasks", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap(),
         Some(b"parked note".to_vec())
@@ -2275,7 +2304,10 @@ async fn test_provider_completion_failure_and_unknown_are_atomic() {
                 assert_eq!(processed(&loaded, &pending.message).await, effect_done);
                 assert_eq!(
                     loaded
-                        .protocol_get(format!("notes/{}", pending.message.msg_id).as_bytes())
+                        .protocol_get(
+                            "tasks",
+                            format!("notes/{}", pending.message.msg_id).as_bytes()
+                        )
                         .await
                         .unwrap()
                         .is_some(),

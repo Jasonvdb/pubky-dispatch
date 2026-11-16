@@ -611,6 +611,22 @@ impl StateStore for CountOwedScans {
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
         self.store.commit(batch)
     }
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, StoreError> {
+        self.store.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, StoreError> {
+        self.store.commit_if(ns, owner, batch)
+    }
 }
 
 #[test]

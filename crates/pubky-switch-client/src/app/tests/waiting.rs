@@ -40,6 +40,9 @@ impl Admission {
 }
 
 impl Protocol for Admission {
+    fn name(&self) -> String {
+        "tasks".into()
+    }
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -60,9 +63,6 @@ impl Protocol for Admission {
     }
     fn resend_needed(&self, m: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.sample.resend_needed(m)
-    }
-    fn backup_name(&self) -> Option<String> {
-        Some("sample.admission".into())
     }
     fn receive(&self, m: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         self.calls
@@ -213,7 +213,7 @@ async fn test_admission_discards_staged_effects_and_allows_independent_progress(
         "admission discards even the staged local-bound marker"
     );
     assert_eq!(
-        app.protocol_get(b"admission-write").await.unwrap(),
+        app.protocol_get("tasks", b"admission-write").await.unwrap(),
         None,
         "admission commits no staged local write"
     );
@@ -249,7 +249,10 @@ async fn test_admission_discards_the_context_missing_key_marker() {
         Some(ParkReason::AwaitingAdmission),
         "admission discards the staged missing-key marker"
     );
-    assert_eq!(app.protocol_get(b"admission-write").await.unwrap(), None);
+    assert_eq!(
+        app.protocol_get("tasks", b"admission-write").await.unwrap(),
+        None
+    );
     assert!(!pair(&app, &w, &message).await);
     assert_eq!(w.effects(), effects);
 }
@@ -390,12 +393,12 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
                 value: vec![1],
             }];
             assert!(
-                app.ack_event_with(id, &local).await.is_err(),
+                app.ack_event_with("tasks", id, &local).await.is_err(),
                 "inspection/loading is not delivery"
             );
             app.unacknowledged_events().await.unwrap();
             assert!(
-                app.ack_event_with(id, &local).await.is_err(),
+                app.ack_event_with("tasks", id, &local).await.is_err(),
                 "the selected commit fault is reached"
             );
             if reload {
@@ -406,7 +409,7 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
             }
             let kept = app.unacknowledged_events().await.unwrap();
             assert_eq!(
-                app.protocol_get(b"handled").await.unwrap(),
+                app.protocol_get("tasks", b"handled").await.unwrap(),
                 after.then_some(vec![1]),
                 "local handling and exact acknowledgment have the same durable outcome"
             );
@@ -416,17 +419,20 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
             );
             assert_eq!(kept.iter().any(|e| e.id() == Some(id)), !after);
             if !after {
-                app.ack_event_with(id, &local).await.unwrap();
+                app.ack_event_with("tasks", id, &local).await.unwrap();
             }
             let replacement = [LocalWrite::Put {
                 key: b"handled".to_vec(),
                 value: vec![2],
             }];
             assert!(
-                app.ack_event_with(id, &replacement).await.is_err(),
+                app.ack_event_with("tasks", id, &replacement).await.is_err(),
                 "an absent event always refuses"
             );
-            assert_eq!(app.protocol_get(b"handled").await.unwrap(), Some(vec![1]));
+            assert_eq!(
+                app.protocol_get("tasks", b"handled").await.unwrap(),
+                Some(vec![1])
+            );
         }
     }
 }
@@ -671,14 +677,14 @@ async fn test_admission_acknowledgment_refusals_do_not_write_locals() {
         key: b"refused".to_vec(),
         value: vec![1; MAX_STEP_LOCAL_BYTES + 1],
     }];
-    assert!(app.ack_event_with(id, &huge).await.is_err());
+    assert!(app.ack_event_with("tasks", id, &huge).await.is_err());
     let local = [LocalWrite::Put {
         key: b"refused".to_vec(),
         value: vec![1],
     }];
     let foreign = EventId::new([99; 16], id.counter());
-    assert!(app.ack_event_with(foreign, &local).await.is_err());
-    assert_eq!(app.protocol_get(b"refused").await.unwrap(), None);
+    assert!(app.ack_event_with("tasks", foreign, &local).await.is_err());
+    assert_eq!(app.protocol_get("tasks", b"refused").await.unwrap(), None);
     assert!(
         app.pending_duty_events()
             .await
@@ -751,11 +757,17 @@ async fn test_admission_restore_deduplicates_exact_notices_and_rejects_conflicts
         key: b"handled".to_vec(),
         value: vec![1],
     }];
-    restored.ack_event_with(notices[0].0, &local).await.unwrap();
+    restored
+        .ack_event_with("tasks", notices[0].0, &local)
+        .await
+        .unwrap();
     let mut replay = App::restore(w.env(), p.clone(), World::config(), &backup)
         .await
         .unwrap();
-    assert_eq!(replay.protocol_get(b"handled").await.unwrap(), None);
+    assert_eq!(
+        replay.protocol_get("tasks", b"handled").await.unwrap(),
+        None
+    );
     assert_eq!(
         dropped(&replay.unacknowledged_events().await.unwrap())[0].1,
         notices[0].1,
@@ -763,7 +775,7 @@ async fn test_admission_restore_deduplicates_exact_notices_and_rejects_conflicts
     );
     let mut conflict = backup.clone();
     if let crate::app::events::Duty::StoredEntryDropped { message, .. } =
-        &mut conflict.waiting.notices[0]
+        &mut conflict.waiting.notices[0].duty
     {
         message.hash[0] ^= 1;
     }
@@ -775,7 +787,7 @@ async fn test_admission_restore_deduplicates_exact_notices_and_rejects_conflicts
     );
     let mut malformed = backup.clone();
     if let crate::app::events::Duty::StoredEntryDropped { message, .. } =
-        &mut malformed.waiting.notices[0]
+        &mut malformed.waiting.notices[0].duty
     {
         message.msg_id = "not an identity".into();
     }

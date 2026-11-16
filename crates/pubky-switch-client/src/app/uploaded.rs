@@ -37,7 +37,7 @@ use pubky_switch_core::scopes::Permission;
 
 use super::claims::{claim_key_of, reread_key};
 use super::events::Duty;
-use super::records::{owe_listing, record_key_of};
+use super::records::record_key_of;
 use super::state::Tx;
 use super::{App, AppError};
 use crate::error::{ClientError, StoreError};
@@ -89,14 +89,16 @@ impl App {
     /// transition's read. An app without `claims.read` can't read claims, and marks none; a
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
-    /// listing instead, but for records the app holds outside the protocol's collections.
+    /// listing instead, but for records the app holds outside the protocol's collections:
+    /// returns whether it does, and the caller owes the listing at the transition's item.
     pub(crate) async fn mark_uploaded(
         &self,
         mut records: Vec<[u8; 32]>,
         mut claims: Vec<[u8; 32]>,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let at = self.now();
+        let mut lists = false;
         records.truncate(MAX_MARKED_KEYS);
         claims.truncate(MAX_MARKED_KEYS);
         if !records.is_empty() {
@@ -126,13 +128,13 @@ impl App {
                 keys.sort_unstable();
                 keys.dedup();
                 let listed: Vec<String> = self
-                    .protocol
+                    .protocols
                     .collections()
                     .into_iter()
                     .map(|collection| collection.name)
                     .collect();
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                owe_listing(tx)?;
+                lists = true;
                 for key in keys {
                     if let Some(held) = self.held_collection(&key).await?
                         && !listed.contains(&held.name)
@@ -158,7 +160,7 @@ impl App {
                 }
             }
         }
-        Ok(())
+        Ok(lists)
     }
 
     /// At the end of a read: read again the records an upload listed (Switch wire 7.4.14),
@@ -171,21 +173,41 @@ impl App {
     /// and the rest still marked, and the feed's read still succeeds; an alarm or a store
     /// failure fails it.
     ///
-    /// Returns whether marks are left that this read didn't reach, past its budget of
-    /// [`RECORD_REREADS_PER_READ`] or its time ([`super::AppConfig::call_budget_ms`]): the
-    /// next read goes on with them ([`super::ReceiveReport::more`]).
+    /// A record is read again as it stands then, not in feed order: only for a protocol
+    /// that is with the read, told through everything it covered ([`App::may_tell`], Switch
+    /// spec 8.3). The mark of a record whose protocol is behind, or that the app can't
+    /// place while any protocol is behind, stays, untouched and unread, until then; the
+    /// others' marks are read meanwhile, the read's window taken from them alone.
+    ///
+    /// Returns whether marks are left that this read could read and didn't reach, past its
+    /// budget of [`RECORD_REREADS_PER_READ`] or its time
+    /// ([`super::AppConfig::call_budget_ms`]): the next read goes on with them
+    /// ([`super::ReceiveReport::more`]). Marks waiting for a protocol that is behind aren't
+    /// that: the read that brings it level reaches them.
     pub(crate) async fn reread_records(
         &mut self,
         budget: Option<&super::CallBudget>,
     ) -> Result<bool, AppError> {
         let mut marks = self.reader().scan::<u64>(RECORD_REREAD_PREFIX).await?;
         marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
-        let left = marks.len() > RECORD_REREADS_PER_READ;
-        for (index, (rest, _)) in marks.into_iter().take(RECORD_REREADS_PER_READ).enumerate() {
+        let mut due = Vec::new();
+        let mut left = false;
+        for (rest, _) in marks {
+            let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            let protocol = self.record_protocol(&key).await?;
+            if !self.may_tell_of(protocol.as_deref()) {
+                continue;
+            }
+            if due.len() == RECORD_REREADS_PER_READ {
+                left = true;
+                break;
+            }
+            due.push(key);
+        }
+        for (index, key) in due.into_iter().enumerate() {
             if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
                 return Ok(true);
             }
-            let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
             let view = match self.record_view(&key).await {
                 Ok(view) => view.filter(|view| view.key == key),
                 Err(AppError::Switch(ClientError::Switch {
@@ -243,7 +265,13 @@ impl App {
         };
         if divergent && !held {
             tx.put(&mark, &())?;
-            self.keep_duty(tx, Duty::RecordDivergent { key: *key })?;
+            // For the protocol of the record's collection, as far as the app knows it, `tx`'s
+            // writes included: the protocol its judging was admitted for.
+            let to = match self.record_protocol_in(key, tx).await? {
+                Some(name) => vec![name],
+                None => self.protocols.names(),
+            };
+            self.keep_duty_for(tx, to, Duty::RecordDivergent { key: *key })?;
         } else if !divergent && held {
             tx.delete(&mark)?;
         }

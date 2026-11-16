@@ -1023,6 +1023,10 @@ impl App {
             if let Some(chain) = self.state.chain.as_mut() {
                 chain.write(&mut tx)?;
             }
+            // Reconcile mode starts anew, for every protocol (Switch spec 12.4 step 2.4).
+            if checked.gap.is_some() {
+                tx.delete(key::RECONCILED)?;
+            }
             self.commit(tx).await?;
             if !page.more {
                 return Ok(());
@@ -1301,7 +1305,8 @@ impl App {
             tx.delete(key::PENDING_EFFECT)?;
             self.state.pending_effect = None;
             if carry == Carry::AfterLoss {
-                self.attempts_dropped(&Batch::from_body(pending.body.clone())?, tx)?;
+                let to = self.owners_of_kind(&pending.kind);
+                self.attempts_dropped(&Batch::from_body(pending.body.clone())?, to, tx)?;
             }
         }
         for (id, pending) in self.kept_batches().await? {
@@ -1368,16 +1373,24 @@ impl App {
             KeptBatchDrop::Unsent
         };
         self.end_kept_batch(id, pending, Ended::Dropped(reason), tx)?;
-        self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
-        self.attempts_dropped(batch, tx)
+        let to = self.batch_owners(pending);
+        self.keep_duty_for(tx, to.clone(), Duty::KeptBatchDropped { batch_id: *id })?;
+        self.attempts_dropped(batch, to, tx)
     }
 
-    /// Each `attempt` of a batch the app drops unsent, reported in `tx` so the protocol
-    /// treats its obligation as uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5).
-    fn attempts_dropped(&mut self, batch: &Batch, tx: &mut Tx) -> Result<(), AppError> {
+    /// Each `attempt` of a batch the app drops unsent, reported in `tx` to the protocols
+    /// `to`, the batch's, so they treat its obligation as uncertain (Switch spec 12.5 "Kept
+    /// batches", 12.6 step 5).
+    fn attempts_dropped(
+        &mut self,
+        batch: &Batch,
+        to: Vec<String>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         for attempt in attempts_in(batch) {
-            self.keep_duty(
+            self.keep_duty_for(
                 tx,
+                to.clone(),
                 Duty::AttemptDropped {
                     claim_key: attempt.claim_key,
                     attempt_id: attempt.attempt_id,
@@ -1802,10 +1815,10 @@ impl App {
         }
         let gone_duties: Vec<u64> = self
             .reader()
-            .scan_numbered::<Duty>(key::DUTY_PREFIX)
+            .scan_numbered::<super::events::KeptDuty>(key::DUTY_PREFIX)
             .await?
             .into_iter()
-            .filter(|(_, duty)| *duty == Duty::AccountGone)
+            .filter(|(_, kept)| kept.duty == Duty::AccountGone)
             .map(|(n, _)| n)
             .collect();
         // `gone` and its duty events go with the copy, in its commit: a copy that fails

@@ -21,6 +21,27 @@ use super::protocol::LocalWrite;
 use super::state::{Processed, key};
 use super::{App, AppError, AppState, ParkReason, Refusal};
 
+/// A processed pair belongs to the protocol owning its message kind (Switch spec 3.3,
+/// 11). A kind with no registered owner may be forgotten by any registered protocol.
+pub(crate) fn check_owner(
+    protocols: &super::ProtocolSet,
+    protocol: &str,
+    processed: Option<&Processed>,
+) -> Result<(), AppError> {
+    let Some(processed) = processed else {
+        return Ok(());
+    };
+    pubky_switch_core::message::check_kind(&processed.kind)
+        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+    if protocols
+        .of_kind(&processed.kind)
+        .is_some_and(|owner| owner.name != protocol)
+    {
+        return Err(Refusal::Usage("the message belongs to another protocol".into()).into());
+    }
+    Ok(())
+}
+
 /// The keys of the pair of `msg_id` from `sender`, if it is held (`processed`, read as the
 /// caller sees the store): the pair and its time index.
 ///
@@ -83,6 +104,10 @@ impl App {
     /// unknown `msg_id`, changes nothing but `local`. With no pair, ordinary stored inputs
     /// remain and do not prevent these writes; pending or uncertain effects still do.
     ///
+    /// Only the registered owner of the message's kind may forget it; another protocol
+    /// gets [`Refusal::Usage`] without committing `local`. A kind with no registered owner
+    /// may be forgotten by any registered protocol.
+    ///
     /// From then on a re-sent copy of the message is delivered as a new entry, and the
     /// protocol must not apply it twice itself: the message's sender can replay it at will,
     /// as often as it likes, and nothing in the app drops a copy as a duplicate any more,
@@ -101,24 +126,33 @@ impl App {
     /// which nothing was written.
     pub async fn forget_processed(
         &mut self,
+        protocol: &str,
         sender: [u8; 32],
         msg_id: &str,
         local: &[LocalWrite],
     ) -> Result<bool, AppError> {
         let msg_id = msg_id.to_owned();
+        let local = super::protocols::qualify(protocol, local.iter().cloned());
+        let protocol = protocol.to_owned();
         Box::pin(async move {
+            if !self.protocols.contains(&protocol) {
+                return Err(
+                    Refusal::Usage(format!("no protocol `{protocol}` is registered")).into(),
+                );
+            }
             self.ready_local().await?;
             self.refuse_when_halted()?;
             let processed = self
                 .reader()
                 .get::<Processed>(&key::processed(&sender, &msg_id))
                 .await?;
+            check_owner(&self.protocols, &protocol, processed.as_ref())?;
             let keys = held_pair(&self.state, &sender, &msg_id, processed)?;
             let mut tx = self.tx()?;
             for key in keys.iter().flatten() {
                 tx.delete(key)?;
             }
-            tx.local(local)?;
+            tx.local(&local)?;
             self.commit(tx).await?;
             Ok(keys.is_some())
         })

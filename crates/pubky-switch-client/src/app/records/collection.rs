@@ -176,11 +176,27 @@ impl RecordTarget {
 }
 
 impl App {
-    /// The protocol's collection a write names, by its collection ID and a policy of the
-    /// collection's family: the member it names.
+    /// The registered protocol other than `name` that the record `put` writes belongs to
+    /// ([`super::ProtocolSet::foreign_owner`]): by the collection of a registered protocol
+    /// it names, or by its read scope.
+    pub(crate) fn foreign_put(&self, name: &str, put: &RecordPut) -> Option<String> {
+        // Ownership belongs to the collection ID even when the supplied policy is not
+        // one this protocol accepts for reading (Switch spec 3.3).
+        let collection = self
+            .protocols
+            .collections()
+            .into_iter()
+            .find(|collection| collection.id(&self.state.meta.identity) == put.collection)
+            .map(|collection| collection.name);
+        self.protocols
+            .foreign_owner(name, collection.as_deref(), &put.policy.read_scope)
+            .map(str::to_owned)
+    }
+
+    /// The collection member matching both the ID and an admitted policy.
     pub(super) fn collection_of(&self, put: &RecordPut) -> Option<Collection> {
         let identity = self.state.meta.identity;
-        self.protocol
+        self.protocols
             .collections()
             .into_iter()
             .find(|c| c.id(&identity) == put.collection && c.admits(&put.policy))
@@ -188,7 +204,7 @@ impl App {
     }
 
     pub(crate) fn collection_of_name(&self, collection: &Collection) -> bool {
-        self.protocol
+        self.protocols
             .collections()
             .iter()
             .any(|c| c.name == collection.name && c.admits(&collection.policy))

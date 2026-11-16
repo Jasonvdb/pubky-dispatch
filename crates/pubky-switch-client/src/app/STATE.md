@@ -45,7 +45,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
-- **After a failed commit the app reloads** from the store before its next call.
+- **After a failed commit the app reloads** from the store before its next call. A
+  pending alarm and verified service-time evidence are first retried in one commit;
+  a failed or unknown outcome leaves them held in memory and stops the call. Every app
+  commit carries the pending alarm, including a compromise's required leave. Only a
+  confirmed successful write clears its pending status, so a reload cannot erase the
+  evidence that stopped the app (Switch spec 3.6, 4.3, 10.1). Before that first successful
+  write the evidence is held only in the running app, not promised durable across a crash.
 - **A kept batch or effect is never sent again past its window**, whatever the generation:
   30 days from its first send, less an hour, both ends in verified service time, erring
   older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and the
@@ -82,8 +88,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   the host since the app was loaded, by `take_events`, a call's report or
   `unacknowledged_events`. `pending_duty_events` inspects the same kept duties in ascending
   ID order after any automatic reload owed by a failed commit, without handing them over,
-  consuming the next report or extending acknowledgement eligibility. It adds no stored
-  state. The host still handles every delivered duty through an ID before acknowledging it.
+  consuming the next report or extending acknowledgement eligibility. Inspection adds no
+  stored queue of its own. The host still handles every delivered duty through an ID before
+  acknowledging it.
 - **Only the host's acknowledgement removes a duty event,** with one exception: the commit
   that takes an erased account back (`AccountBack`, Switch spec 12.7) removes the
   `AccountGone` events not yet acknowledged, which no longer hold. The app sets no cap on

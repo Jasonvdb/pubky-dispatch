@@ -397,15 +397,22 @@ impl App {
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            // Local age selection runs even when an alarm forbids intake or callbacks.
+            self.bound_unverified().await?;
             self.reopen_failures = 0;
             let budget = self.begin_budget();
             let mut admission_declined = BTreeSet::new();
-            let result = self.receive_once(wait, &budget, &mut admission_declined).await;
+            let result = self
+                .receive_once(wait, &budget, &mut admission_declined)
+                .await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
             let result = match self.take_over(result).await {
                 TakeOver::Done(result) => result,
-                TakeOver::ReadAgain => self.receive_once(None, &budget, &mut admission_declined).await,
+                TakeOver::ReadAgain => {
+                    self.receive_once(None, &budget, &mut admission_declined)
+                        .await
+                }
             };
             // A reopening outside a read is tried whenever it is asked for.
             self.reopen_failures = 0;
@@ -761,7 +768,8 @@ impl App {
             } else if !report.stopped {
                 // Nothing is handed over while a listing is owed (Switch spec 8.2).
                 if !self.reader().exists(super::records::LIST_DUE).await? {
-                    self.retry_awaited(&due_at_start, Some(budget), admission_declined).await?;
+                    self.retry_awaited(&due_at_start, Some(budget), admission_declined)
+                        .await?;
                 }
                 let claims_left = self.reread_claims(Some(budget)).await?;
                 let records_left = self.reread_records(Some(budget)).await?;
@@ -1495,8 +1503,15 @@ impl App {
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
                 Outcome::AwaitAdmission => {
-                    let custody = self.park_waiting(entry, &received.plaintext,
-                        ParkReason::AwaitingAdmission, None, read).await?;
+                    let custody = self
+                        .park_waiting(
+                            entry,
+                            &received.plaintext,
+                            ParkReason::AwaitingAdmission,
+                            None,
+                            read,
+                        )
+                        .await?;
                     read.admission_declined.insert(custody.id);
                     return Ok(Step::Pass);
                 }
@@ -1751,8 +1766,14 @@ impl App {
         } else {
             Some(self.keys_held())
         };
-        let custody = self.park_waiting(entry, &received.plaintext, reason, keys_at, read).await?;
-        Ok(Some(if entry.stored.is_some() && custody.retained { Step::Hold } else { Step::Pass }))
+        let custody = self
+            .park_waiting(entry, &received.plaintext, reason, keys_at, read)
+            .await?;
+        Ok(Some(if entry.stored.is_some() && custody.retained {
+            Step::Hold
+        } else {
+            Step::Pass
+        }))
     }
 
     fn received_event(&mut self, entry: &Entry, received: &Received) {
@@ -2242,7 +2263,10 @@ impl App {
         }
         let now = self.now();
         if entry.stored.is_none() && !self.state.held.contains_key(&entry.seq) {
-            let held = HeldEntry { receipt: entry.receipt, since_ms: now };
+            let held = HeldEntry {
+                receipt: entry.receipt,
+                since_ms: now,
+            };
             read.tx.put(&key::held(entry.seq), &held)?;
             self.state.held.insert(entry.seq, held);
         }
@@ -2316,14 +2340,18 @@ impl App {
         let since = match self.state.held.get(&entry.seq) {
             Some(held) => held.since_ms,
             None => {
-                let held = HeldEntry { receipt: entry.receipt, since_ms: now };
+                let held = HeldEntry {
+                    receipt: entry.receipt,
+                    since_ms: now,
+                };
                 read.tx.put(&key::held(entry.seq), &held)?;
                 self.state.held.insert(entry.seq, held);
                 now
             }
         };
         if now.saturating_sub(since) >= self.config.park_after_ms {
-            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read).await?;
+            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read)
+                .await?;
             return Ok(Step::Pass);
         }
         self.events.push(AppEvent::Held { seq: entry.seq });
@@ -2333,27 +2361,48 @@ impl App {
     /// Select bounds with the new input included, then attach every custody write before
     /// the caller can pass its cursor (Switch spec 8.2). No callback write enters this Tx.
     async fn park_waiting(
-        &mut self, entry: &Entry, plaintext: &MessagePlaintext, reason: ParkReason,
-        keys_at: Option<u64>, read: &mut Read,
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        reason: ParkReason,
+        keys_at: Option<u64>,
+        read: &mut Read,
     ) -> Result<Custody, AppError> {
         let id = entry.stored.unwrap_or(self.state.next_stored_id);
         let candidate = match entry.stored.and_then(|id| self.state.parked.get(&id)) {
-            Some(stored) => ParkedEntry { reason, keys_at, ..stored.clone() },
+            Some(stored) => ParkedEntry {
+                reason,
+                keys_at,
+                ..stored.clone()
+            },
             None => ParkedEntry {
-                receipt: entry.receipt, seq: entry.seq, generation: entry.generation,
-                sender: entry.sender, cert: entry.cert.clone(), accepted_at_ms: entry.accepted_at_ms,
-                plaintext: plaintext.encode(), context: entry.context.clone(), reason,
-                round: self.state.parked_round.number, released: false, keys_at,
+                receipt: entry.receipt,
+                seq: entry.seq,
+                generation: entry.generation,
+                sender: entry.sender,
+                cert: entry.cert.clone(),
+                accepted_at_ms: entry.accepted_at_ms,
+                plaintext: plaintext.encode(),
+                context: entry.context.clone(),
+                reason,
+                round: self.state.parked_round.number,
+                released: false,
+                keys_at,
             },
         };
         let drops = self.waiting_drops(Some((id, &candidate)));
-        let change = self.waiting_change(Some((id, candidate)),
-            entry.stored.is_none().then_some(entry.seq), &drops)?;
+        let change = self.waiting_change(
+            Some((id, candidate)),
+            entry.stored.is_none().then_some(entry.seq),
+            &drops,
+        )?;
         let retained = change.retained(id);
         if !self.make_room(read, change.size()).await? {
             return Err(crate::store::BatchError::BatchTooLarge {
-                size: change.size().saturating_add(ENTRY_RESERVE_BYTES), cap: MAX_BATCH_BYTES,
-            }.into());
+                size: change.size().saturating_add(ENTRY_RESERVE_BYTES),
+                cap: MAX_BATCH_BYTES,
+            }
+            .into());
         }
         change.stage(self, &mut read.tx)?;
         Ok(Custody { id, retained })
@@ -2368,6 +2417,9 @@ impl App {
         reason: ParkReason,
         read: &mut Read,
     ) -> Result<u64, AppError> {
+        if reason.bounded() {
+            return Err(super::corrupt());
+        }
         let id = match entry.stored {
             Some(id) => id,
             None => self.new_stored_id(&mut read.tx)?,
@@ -2648,8 +2700,11 @@ impl App {
     /// entry due is tried within two rounds of one read per entry. No `more` is said for
     /// them: an entry the store keeps failing comes again at every read, so the host's next
     /// read, not one at once, tries it.
-    async fn retry_parked(&mut self, budget: Option<&super::CallBudget>,
-        admission_declined: &mut BTreeSet<u64>) -> Result<(), AppError> {
+    async fn retry_parked(
+        &mut self,
+        budget: Option<&super::CallBudget>,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<(), AppError> {
         let gaps = self.key_gaps();
         let keys_held = self.keys_held();
         // An entry that waits for a key may read the records a reopening still owes: it
@@ -2716,7 +2771,9 @@ impl App {
             .filter(|id| !due_at_start.contains(id) && !admission_declined.contains(id))
             .take(PARKED_RETRIES_PER_READ)
             .collect();
-        self.retry_stored(ids, budget, admission_declined).await.map(|_| ())
+        self.retry_stored(ids, budget, admission_declined)
+            .await
+            .map(|_| ())
     }
 
     /// The local IDs of the entries waiting for a scope key that are due now, in order.

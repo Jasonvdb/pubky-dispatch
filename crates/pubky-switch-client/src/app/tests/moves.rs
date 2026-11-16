@@ -1440,6 +1440,11 @@ async fn store_entries(
         for n in chunk {
             let id = n + 1;
             let stored = crate::app::state::ParkedEntry {
+                receipt: crate::app::EntryReceipt {
+                    entry_id: [1; 16],
+                    service_key: [2; 32],
+                    read_at_ms: lost.w.clock.now_ms(),
+                },
                 seq: 3 + n,
                 generation: 1,
                 sender: lost.w.bob.public(),
@@ -1527,6 +1532,11 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
     let seq = note_at(&lost.w, &lost.next, me, "after the loss");
     let mut tx = app.tx().unwrap();
     let stored = crate::app::state::ParkedEntry {
+        receipt: crate::app::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: lost.note_at_ms,
+        },
         seq,
         generation: 1,
         sender: lost.w.bob.public(),
@@ -3986,6 +3996,11 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         kept_ms: lost.note_at_ms,
         forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
+            receipt: crate::app::EntryReceipt {
+                entry_id: [1; 16],
+                service_key: [2; 32],
+                read_at_ms: lost.w.clock.now_ms(),
+            },
             cert: app.cert().signed().clone(),
             plaintext: Vec::new(),
             context: None,
@@ -4033,6 +4048,11 @@ async fn keep_an_effect(
         )
         .unwrap();
     let entry = crate::app::state::KeptEntry {
+        receipt: crate::app::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: w.clock.now_ms(),
+        },
         cert: w.bob_cert.signed().clone(),
         plaintext: b"kept".to_vec(),
         context: None,
@@ -4060,6 +4080,7 @@ async fn keep_an_effect(
         .unwrap();
     if parked {
         let stored = crate::app::state::ParkedEntry {
+            receipt: entry.receipt,
             seq,
             generation: 1,
             sender: w.bob.public(),

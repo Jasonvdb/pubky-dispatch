@@ -139,11 +139,17 @@ impl App {
                 for item in &page.items {
                     if let FeedItem::Entry(entry) = item
                         && entry.seq > cursor.seq
-                        && let Some(peeked) = self.peek_entry(entry, trusted, super::protocol::EntryReceipt {
-                            entry_id: entry.entry_id,
-                            service_key: page.service_key,
-                            read_at_ms: page.server_time_ms,
-                        }).await?
+                        && let Some(peeked) = self
+                            .peek_entry(
+                                entry,
+                                trusted,
+                                super::protocol::EntryReceipt {
+                                    entry_id: entry.entry_id,
+                                    service_key: page.service_key,
+                                    read_at_ms: page.server_time_ms,
+                                },
+                            )
+                            .await?
                     {
                         report.items.push(peeked);
                     }

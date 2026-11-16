@@ -333,9 +333,9 @@ pub enum AppEvent {
         conflicting: bool,
     },
     /// An entry stored because its sender's standing couldn't be checked
-    /// ([`ParkReason::Unverifiable`]), or because it waits for a scope key
-    /// ([`ParkReason::AwaitingKey`]), was dropped without being processed, past the bounds
-    /// Switch spec 8.2 sets for both together ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// ([`ParkReason::Unverifiable`]), a scope key ([`ParkReason::AwaitingKey`]) or protocol
+    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed,
+    /// past the shared bounds Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
     /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
     /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
@@ -1265,8 +1265,8 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] or
-/// [`ParkReason::AwaitingKey`], counted together, an entry was dropped past (Switch spec
+/// Which of the shared bounds on sender/key/admission waiting inputs an entry was dropped
+/// past (Switch spec
 /// 8.2, [`AppEvent::StoredEntryDropped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -1275,7 +1275,7 @@ pub enum DropReason {
     /// judged on the highest service time the app verified.
     Age,
     /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
-    /// entries, of both reasons, and it was that sender's accepted earliest.
+    /// entries, and it was that sender's accepted earliest.
     PerSender,
     /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
     /// and it was the one accepted earliest of the sender identity that held the most.

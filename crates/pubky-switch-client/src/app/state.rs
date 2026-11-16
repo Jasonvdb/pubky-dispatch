@@ -736,7 +736,8 @@ impl Tx {
             return Err(crate::store::BatchError::BatchTooLarge {
                 size,
                 cap: crate::store::MAX_BATCH_BYTES,
-            }.into());
+            }
+            .into());
         }
         for write in other.batch.into_writes() {
             match write {
@@ -984,7 +985,11 @@ pub(crate) mod kept_local {
 #[cfg(test)]
 mod tests {
     fn receipt() -> super::EntryReceipt {
-        super::EntryReceipt { entry_id: [1; 16], service_key: [2; 32], read_at_ms: 3 }
+        super::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: 3,
+        }
     }
     use super::*;
     use crate::store::{MemoryStore, StateStore};
@@ -1210,8 +1215,14 @@ mod tests {
         let handle = StoreHandle::inline(Arc::clone(&store));
         let mut tx = Tx::new("client/a");
         for seq in 0..600u64 {
-            tx.put(&key::held(seq), &HeldEntry { receipt: receipt(), since_ms: seq })
-                .unwrap();
+            tx.put(
+                &key::held(seq),
+                &HeldEntry {
+                    receipt: receipt(),
+                    since_ms: seq,
+                },
+            )
+            .unwrap();
         }
         tx.local(&[LocalWrite::Put {
             key: b"x".to_vec(),
@@ -1225,7 +1236,13 @@ mod tests {
         };
         let held: BTreeMap<u64, HeldEntry> = reader.scan_numbered("held/").await.unwrap();
         assert_eq!(held.len(), 600);
-        assert_eq!(held.get(&599), Some(&HeldEntry { receipt: receipt(), since_ms: 599 }));
+        assert_eq!(
+            held.get(&599),
+            Some(&HeldEntry {
+                receipt: receipt(),
+                since_ms: 599
+            })
+        );
         assert_eq!(reader.get_raw(b"p/x").await.unwrap(), Some(b"1".to_vec()));
         // Another namespace never reads the app's records.
         assert!(store.scan("client/b", b"", None, 10).unwrap().is_empty());

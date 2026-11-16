@@ -296,6 +296,17 @@ pub struct CheckedResponse {
     pub head: Option<SignedHead>,
 }
 
+pub(crate) enum CallStep {
+    Answer(CheckedResponse),
+    Retry(Box<TimestampRetry>),
+}
+
+pub(crate) struct TimestampRetry {
+    signed: SignedRequest,
+    key: [u8; 32],
+    success_key: Option<[u8; 32]>,
+}
+
 /// Check a response with the pinned service key before anything in it is used (Switch wire
 /// 7.1): its signature over the status, the request `sent` as the service received it,
 /// `Switch-Server-Time`, the head field of the `Switch-Head` text as received and the body;
@@ -931,10 +942,27 @@ impl SwitchClient {
         content: Body,
         auth: Auth<'_>,
     ) -> Result<CheckedResponse, ClientError> {
+        let step = self
+            .start_call(method, path_and_query, body, content, auth)
+            .await?;
+        self.finish_call(step).await
+    }
+
+    pub(crate) async fn start_call(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Vec<u8>,
+        content: Body,
+        auth: Auth<'_>,
+    ) -> Result<CallStep, ClientError> {
         let key = match self.pinned_key() {
             Some(key) => key,
             None if auth.public => {
-                return self.unpinned_public_read(method, path_and_query).await;
+                return self
+                    .unpinned_public_read(method, path_and_query)
+                    .await
+                    .map(CallStep::Answer);
             }
             None => return Err(ClientError::Unpinned),
         };
@@ -943,14 +971,28 @@ impl SwitchClient {
         let signed = self.build(method, path_and_query, body, content, auth)?;
         let checked = self.send_checked(signed, key, auth.success_key).await?;
         let Some(at) = stale_timestamp_hint(&checked) else {
-            return checked;
+            return checked.map(CallStep::Answer);
         };
         let auth = Auth {
             timestamp_ms: Some(at),
             ..auth
         };
         let signed = self.build(method, path_and_query, retry_body, content, auth)?;
-        self.send_checked(signed, key, auth.success_key).await?
+        Ok(CallStep::Retry(Box::new(TimestampRetry {
+            signed,
+            key,
+            success_key: auth.success_key,
+        })))
+    }
+
+    pub(crate) async fn finish_call(&self, step: CallStep) -> Result<CheckedResponse, ClientError> {
+        match step {
+            CallStep::Answer(answer) => Ok(answer),
+            CallStep::Retry(retry) => {
+                self.send_checked(retry.signed, retry.key, retry.success_key)
+                    .await?
+            }
+        }
     }
 
     /// Receive an answer without losing a protected header (Switch wire 7.1).

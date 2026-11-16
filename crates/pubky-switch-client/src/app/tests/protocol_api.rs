@@ -4,6 +4,7 @@
 //! service time, collections with a policy per sub-scope, and two identities messaging each
 //! other, each on its own scripted switch.
 
+mod delivery_inventory;
 mod delivery_lifecycle;
 
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,9 @@ struct Seen {
     condition: Option<Condition>,
 }
 
+type DeliveryCheck =
+    dyn Fn(&crate::app::DeliveryView<'_>) -> Result<bool, crate::app::StoreFailure> + Send + Sync;
+
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
 struct ApiProtocol {
     items: ItemsProtocol,
@@ -91,6 +95,10 @@ struct ApiProtocol {
     reject: Mutex<u32>,
     /// The body members it names opaque.
     opaque: Mutex<Vec<crate::app::OpaqueRule>>,
+    blocked_origin: Mutex<Option<crate::app::DeliveryOrigin>>,
+    send_origins: Mutex<Vec<(String, crate::app::DeliveryOrigin)>>,
+    require_send_fact: std::sync::atomic::AtomicBool,
+    delivery_check: Mutex<Option<Arc<DeliveryCheck>>>,
 }
 
 impl ApiProtocol {
@@ -102,6 +110,10 @@ impl ApiProtocol {
             seen: Mutex::new(Vec::new()),
             reject: Mutex::new(0),
             opaque: Mutex::new(Vec::new()),
+            blocked_origin: Mutex::new(None),
+            send_origins: Mutex::new(Vec::new()),
+            require_send_fact: std::sync::atomic::AtomicBool::new(false),
+            delivery_check: Mutex::new(None),
         })
     }
 
@@ -119,6 +131,30 @@ fn text(result: Result<[u8; 32], AppError>) -> Result<(), String> {
 }
 
 impl Protocol for ApiProtocol {
+    fn may_send(
+        &self,
+        delivery: &crate::app::DeliveryView<'_>,
+    ) -> Result<bool, crate::app::StoreFailure> {
+        self.send_origins
+            .lock()
+            .unwrap()
+            .push((delivery.message().msg_id.clone(), delivery.origin()));
+        if self
+            .require_send_fact
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !delivery_inventory::has_delivery_fact(delivery)?
+        {
+            return Ok(false);
+        }
+        let check = self.delivery_check.lock().unwrap().clone();
+        if let Some(check) = check
+            && !check(delivery)?
+        {
+            return Ok(false);
+        }
+        Ok(*self.blocked_origin.lock().unwrap() != Some(delivery.origin()))
+    }
+
     fn name(&self) -> String {
         "sample".into()
     }

@@ -24,6 +24,8 @@ use super::send::{Delivery, SENT_RETENTION_MS};
 use super::state::{Tx, key};
 use super::{App, AppError};
 use crate::client::Batch;
+use crate::clock::Clock;
+use crate::store::StateStore;
 
 /// The prefix of the ends of kept batches, by batch ID.
 const END_PREFIX: &str = "kb/";
@@ -148,6 +150,53 @@ struct KeptIndex {
     batch_id: [u8; 16],
 }
 
+fn retention_cutoff(now_ms: u64) -> u64 {
+    now_ms.saturating_sub(SENT_RETENTION_MS)
+}
+
+fn pending_status(bytes: &[u8]) -> Result<KeptBatchStatus, AppError> {
+    let pending: PendingBatch = super::state::decode(bytes)?;
+    let wire_batch_id = Batch::from_body(pending.body)?
+        .id()
+        .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
+    Ok(KeptBatchStatus::Kept {
+        wire_batch_id,
+        sent_at_ms: pending.kept_ms,
+    })
+}
+
+fn ended_status(bytes: &[u8], now_ms: u64) -> Result<Option<KeptBatchStatus>, AppError> {
+    let end: KeptBatchEnd = super::state::decode(bytes)?;
+    if end.at_ms <= retention_cutoff(now_ms) {
+        return Ok(None);
+    }
+    Ok(Some(match end.ended {
+        Ended::Applied => KeptBatchStatus::Applied {
+            applied_at_ms: end.at_ms,
+        },
+        Ended::Dropped(reason) => KeptBatchStatus::Dropped {
+            dropped_at_ms: end.at_ms,
+            reason,
+        },
+    }))
+}
+
+/// The same known-ID status for a synchronous delivery decision, without writes or scans.
+pub(crate) fn read_kept_batch(
+    store: &dyn StateStore,
+    ns: &str,
+    clock: &dyn Clock,
+    batch_id: [u8; 16],
+) -> Result<Option<KeptBatchStatus>, AppError> {
+    if let Some(bytes) = store.get(ns, pending_key(&batch_id).as_bytes())? {
+        return pending_status(&bytes).map(Some);
+    }
+    match store.get(ns, end_key(&batch_id).as_bytes())? {
+        Some(bytes) => ended_status(&bytes, clock.now_ms()),
+        None => Ok(None),
+    }
+}
+
 /// Index the messages `pending` queues and the attempts `batch` carries by `batch_id`, in
 /// `tx`, the commit that keeps it. A later kept batch naming one takes it over.
 pub(crate) fn index_kept(
@@ -200,11 +249,6 @@ impl App {
         tx.put(&end_time_key(at_ms, batch_id), &())
     }
 
-    /// Whether an end at `at_ms` is past its retention, as a failed outbox message is.
-    fn past_retention(&self, at_ms: u64) -> bool {
-        at_ms <= self.now().saturating_sub(SENT_RETENTION_MS)
-    }
-
     /// What became of the batch kept under `batch_id`, the ID [`super::AppError::Kept`],
     /// [`super::AppEvent::BatchRefused`], [`super::AppEvent::KeptBatchDropped`],
     /// [`super::AppEvent::KeptBatchApplied`] and [`super::AppEvent::KeptBatchSignedAgain`]
@@ -220,30 +264,13 @@ impl App {
         batch_id: [u8; 16],
     ) -> Result<Option<KeptBatchStatus>, AppError> {
         let reader = self.reader();
-        if let Some(pending) = reader.get::<PendingBatch>(&pending_key(&batch_id)).await? {
-            let wire_batch_id = Batch::from_body(pending.body)?
-                .id()
-                .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
-            return Ok(Some(KeptBatchStatus::Kept {
-                wire_batch_id,
-                sent_at_ms: pending.kept_ms,
-            }));
+        if let Some(bytes) = reader.get_raw(pending_key(&batch_id).as_bytes()).await? {
+            return pending_status(&bytes).map(Some);
         }
-        let Some(end) = reader.get::<KeptBatchEnd>(&end_key(&batch_id)).await? else {
-            return Ok(None);
-        };
-        if self.past_retention(end.at_ms) {
-            return Ok(None);
+        match reader.get_raw(end_key(&batch_id).as_bytes()).await? {
+            Some(bytes) => ended_status(&bytes, self.now()),
+            None => Ok(None),
         }
-        Ok(Some(match end.ended {
-            Ended::Applied => KeptBatchStatus::Applied {
-                applied_at_ms: end.at_ms,
-            },
-            Ended::Dropped(reason) => KeptBatchStatus::Dropped {
-                dropped_at_ms: end.at_ms,
-                reason,
-            },
-        }))
     }
 
     /// The kept batch that carries `attempt`, and what became of it, as
@@ -299,7 +326,7 @@ impl App {
     /// Forget the ends of kept batches past their retention, oldest first, with the index
     /// entries that still name them, in one commit.
     pub(crate) async fn prune_kept_ends(&mut self) -> Result<(), AppError> {
-        let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
+        let cutoff = retention_cutoff(self.now());
         let reader = self.reader();
         let mut tx = self.tx()?;
         for (rest, ()) in reader.scan::<()>(END_TIME_PREFIX).await? {

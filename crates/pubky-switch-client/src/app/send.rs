@@ -44,12 +44,15 @@
 //! the clock shorter than that still deletes nothing. A failed message
 //! is forgotten, plaintext and all, after the retention of sent messages.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
+use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
-use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
+use pubky_switch_core::records::{AppCert, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -140,7 +143,7 @@ async fn owed_kind(
     if let Some(item) = reader.get::<OutboxItem>(&out_key(msg_id)).await? {
         return Ok(item.delivery_pending().then_some(item.kind));
     }
-    if reader.exists(&sent_key(msg_id)).await? || given_up(reader, msg_id, now).await? {
+    if !kept_message_owed(reader, msg_id, now).await? {
         return Ok(None);
     }
     Ok(kept
@@ -216,6 +219,145 @@ pub(crate) fn note_given_up(
         &given_up_key(msg_id),
         &now.saturating_add(SENT_RETENTION_MS),
     )
+}
+
+/// The retained local origin of an outgoing message (Switch spec 11).
+///
+/// This is independent of prior acceptance, a re-send, and permission to deliver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryOrigin {
+    /// Work queued directly, including an intent retained in an unanswered batch.
+    Original,
+    /// A copy reconstructed from signed plaintext without a retained original intent.
+    Reconstructed,
+}
+
+/// An authenticated outgoing message and its owning protocol's committed local state.
+///
+/// The plaintext retains the exact signed JSON bytes. Its hash and origin are the same
+/// facts exposed by [`QueuedMessage`] (Switch spec 11).
+pub struct DeliveryView<'a> {
+    message: &'a Message,
+    plaintext: &'a MessagePlaintext,
+    origin: DeliveryOrigin,
+    local: super::LocalView<'a>,
+    cert: &'a AppCert,
+    naming: &'a NamingKey,
+    store: &'a dyn crate::store::StateStore,
+    ns: &'a str,
+    clock: &'a dyn crate::clock::Clock,
+}
+
+impl std::fmt::Debug for DeliveryView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveryView")
+    }
+}
+
+impl<'a> DeliveryView<'a> {
+    /// The parsed authenticated message.
+    pub fn message(&self) -> &Message {
+        self.message
+    }
+
+    /// The retained signed plaintext, including its original JSON bytes.
+    pub fn plaintext(&self) -> &MessagePlaintext {
+        self.plaintext
+    }
+
+    /// The hash of the original signed JSON (Switch wire 5.1).
+    pub fn hash(&self) -> [u8; 32] {
+        self.plaintext.hash()
+    }
+
+    /// The current copy's retained origin, independently of acceptance or a re-send.
+    pub fn origin(&self) -> DeliveryOrigin {
+        self.origin
+    }
+
+    /// Only the owning protocol's local state, as committed.
+    pub fn local(&self) -> &super::LocalView<'a> {
+        &self.local
+    }
+
+    /// The app's current certificate, as [`App::cert`] gives it.
+    pub fn cert(&self) -> &AppCert {
+        self.cert
+    }
+
+    /// `blind(input)` under the app's naming key (Switch wire 1.5), as [`App::blind`]
+    /// gives it, without exposing the key.
+    pub fn blind(&self, input: &[u8]) -> [u8; 32] {
+        self.naming.blind(input)
+    }
+
+    /// The current host wall time in Unix milliseconds, sampled on each call.
+    ///
+    /// This is the app's [`crate::clock::Clock`], not a verified service time.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The current status of a known batch ID in this app, as [`App::kept_batch`] gives it.
+    ///
+    /// This reads app-wide metadata, without exposing the batch or another protocol's
+    /// local state. An absent or expired status is not evidence that nothing was sent.
+    /// No request, settlement or pruning is performed.
+    ///
+    /// # Errors
+    ///
+    /// A store failure, or a kept batch that doesn't read, as for [`App::kept_batch`].
+    pub fn kept_batch(
+        &self,
+        batch_id: [u8; 16],
+    ) -> Result<Option<super::KeptBatchStatus>, AppError> {
+        super::kept::read_kept_batch(self.store, self.ns, self.clock, batch_id)
+    }
+}
+
+/// A message whose delivery is owed, including intents in unanswered batches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QueuedMessage {
+    /// The message's identifier, as the per-message hold and withdrawal calls use it.
+    pub msg_id: String,
+    /// The recipient identity.
+    pub to: [u8; 32],
+    /// The authenticated message kind.
+    pub kind: String,
+    /// The hash of the original signed JSON, as the delivery gate receives it.
+    pub hash: [u8; 32],
+    /// Its retained local origin, as every protocol delivery gate receives it.
+    pub origin: DeliveryOrigin,
+    /// A re-send of a message accepted before, independently of its origin.
+    pub resend: bool,
+    /// The earliest retained batch that will materialize it; none if already in the outbox.
+    pub kept_batch: Option<[u8; 16]>,
+    /// The per-message hold is set.
+    pub held: bool,
+    /// The recipient-wide hold is set.
+    pub counterparty_held: bool,
+    /// The owning protocol currently permits this delivery; true for an unowned kind.
+    pub may_send: bool,
+}
+
+impl QueuedMessage {
+    /// Whether a message, recipient or protocol hold prevents delivery now.
+    pub fn waits(&self) -> bool {
+        self.held || self.counterparty_held || !self.may_send
+    }
+}
+
+struct DeliveryHolds {
+    message: bool,
+    counterparty: bool,
+    may_send: bool,
+}
+
+impl DeliveryHolds {
+    fn any(&self) -> bool {
+        self.message || self.counterparty || !self.may_send
+    }
 }
 
 /// The shared record a sent message is written into (Switch spec 8.2), and the protocol's
@@ -538,6 +680,7 @@ impl KeptJob {
 /// invite code.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OutboxItem {
+    origin: DeliveryOrigin,
     #[serde(with = "serde_b64")]
     to: [u8; 32],
     kind: String,
@@ -556,6 +699,8 @@ pub(crate) struct OutboxItem {
     /// the retention of sent messages.
     failed: Option<(String, u64)>,
     last_error: Option<String>,
+    /// Job tries begun while unheld; delivery retries share this count. A hold
+    /// discovered after earlier work does not undo that work or its try.
     tries: u64,
     queued_ms: u64,
     /// An accepted message is to be sent again, sealed to the current keys (Switch spec 11).
@@ -771,6 +916,7 @@ pub(crate) async fn carried_outbox(
 /// `sent/<msg_id>`: a sent message, kept 30 days. Sensitive.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SentStored {
+    origin: DeliveryOrigin,
     #[serde(with = "serde_b64")]
     to: [u8; 32],
     kind: String,
@@ -831,6 +977,8 @@ pub(crate) fn put_outbox_item(
 
 /// What one delivery try came to.
 enum Tried {
+    /// The current hold decision stopped the remaining delivery work, without an answer.
+    Held,
     Accepted(AppendAnswer),
     Queued(String),
     /// Queued after `403 not_admitted` or `403 not_current`, for a bounded time.
@@ -870,33 +1018,95 @@ fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
 
-/// Check the indexed outbox and every retained producer before a load or reload can
-/// expose its routing fields (Switch spec 11).
-pub(crate) async fn validate_outbox(
+/// The immutable parts shared by every retained copy of one outgoing message.
+#[derive(PartialEq, Eq)]
+struct DeliveryCopy {
+    to: [u8; 32],
+    kind: String,
+    plaintext: Vec<u8>,
+    origin: DeliveryOrigin,
+}
+
+impl DeliveryCopy {
+    fn of(item: &OutboxItem) -> Self {
+        Self {
+            to: item.to,
+            kind: item.kind.clone(),
+            plaintext: item.plaintext.clone(),
+            origin: item.origin,
+        }
+    }
+
+    fn remember(self, msg_id: String, copies: &mut BTreeMap<String, Self>) -> Result<(), AppError> {
+        match copies.entry(msg_id) {
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &self => {
+                Err(store_corrupt())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Ok(()),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(self);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Authenticate every retained copy and require overlapping copies to agree before use.
+async fn retained_copies(
     reader: &super::state::Reader,
     meta: &super::state::Meta,
     cert: &pubky_switch_core::records::AppCert,
-) -> Result<(), AppError> {
+) -> Result<BTreeMap<String, DeliveryCopy>, AppError> {
+    let mut copies = BTreeMap::new();
     for (msg_id, item) in reader.scan::<OutboxItem>(OUT_PREFIX).await? {
         if msg_id != item.msg_id || !item.is_own(meta, cert) {
             return Err(store_corrupt());
         }
+        DeliveryCopy::of(&item).remember(msg_id, &mut copies)?;
     }
     for (msg_id, sent) in reader.scan::<SentStored>(SENT_PREFIX).await? {
         if msg_id != sent.msg_id || !sent.is_own(meta, cert) {
             return Err(store_corrupt());
         }
+        DeliveryCopy {
+            to: sent.to,
+            kind: sent.kind,
+            plaintext: sent.plaintext,
+            origin: sent.origin,
+        }
+        .remember(msg_id, &mut copies)?;
     }
     for item in super::batch::kept_queued(reader).await? {
         if !item.is_own(meta, cert) {
             return Err(store_corrupt());
         }
+        DeliveryCopy::of(&item).remember(item.msg_id, &mut copies)?;
     }
-    Ok(())
+    Ok(copies)
+}
+
+pub(crate) async fn validate_outbox(
+    reader: &super::state::Reader,
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Result<(), AppError> {
+    retained_copies(reader, meta, cert).await.map(|_| ())
+}
+
+/// The exact condition under which settlement can materialize a retained queued intent.
+pub(crate) async fn kept_message_owed(
+    reader: &super::state::Reader,
+    msg_id: &str,
+    now: u64,
+) -> Result<bool, AppError> {
+    Ok(!reader.exists(&out_key(msg_id)).await?
+        && !reader.exists(&sent_key(msg_id)).await?
+        && !given_up(reader, msg_id, now).await?)
 }
 
 impl App {
     async fn read_outbox(&self, msg_id: &str) -> Result<Option<OutboxItem>, AppError> {
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let item = self.reader().get::<OutboxItem>(&out_key(msg_id)).await?;
         if item.as_ref().is_some_and(|item| {
             item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
@@ -907,6 +1117,7 @@ impl App {
     }
 
     async fn read_sent(&self, msg_id: &str) -> Result<Option<SentStored>, AppError> {
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let sent = self.reader().get::<SentStored>(&sent_key(msg_id)).await?;
         if sent.as_ref().is_some_and(|sent| {
             sent.msg_id != msg_id || !sent.is_own(&self.state.meta, &self.state.cert)
@@ -914,6 +1125,35 @@ impl App {
             return Err(store_corrupt());
         }
         Ok(sent)
+    }
+
+    fn inherit_origin(
+        &self,
+        item: &mut OutboxItem,
+        copies: &mut BTreeMap<String, DeliveryCopy>,
+    ) -> Result<(), AppError> {
+        if !item.is_own(&self.state.meta, &self.state.cert) {
+            return Err(Refusal::Usage("a message this app did not sign".into()).into());
+        }
+        if let Some(kept) = copies.get(&item.msg_id) {
+            item.origin = kept.origin;
+        }
+        DeliveryCopy::of(item).remember(item.msg_id.clone(), copies)
+    }
+
+    pub(crate) async fn outbox_items(
+        &self,
+        messages: &[SignedMessage],
+    ) -> Result<Vec<OutboxItem>, AppError> {
+        let mut copies =
+            retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        let mut items = Vec::new();
+        for message in messages {
+            let mut item = self.outbox_item(message)?;
+            self.inherit_origin(&mut item, &mut copies)?;
+            items.push(item);
+        }
+        Ok(items)
     }
 
     // ---------------------------------------------------------------------------------
@@ -1185,6 +1425,74 @@ impl App {
             .is_none_or(|owner| owner.name == protocol)
     }
 
+    /// List every owed delivery of `protocol`, including every retained batch producer
+    /// and kinds no registered protocol owns (Switch spec 11). Materialized items come
+    /// first by queue time and ID, then kept intents by batch order, each message once.
+    /// Holds, a protocol refusal to send, and elapsed replay deadlines do not hide work
+    /// that has not yet ended. `kept_batch` names its earliest remaining producer.
+    ///
+    /// This reads local state only: it writes nothing, settles no batch and sends no
+    /// request. The protocol decision is the same one dispatch asks. For a local cleanup
+    /// based on absence, the host must resolve earlier writes and retain exclusive App
+    /// namespace ownership across this read, a fresh [`App::delivery`] and
+    /// [`App::protocol_commit`], with no intervening producer or restore call.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for an unregistered protocol; [`Refusal::NotNow`] while a failed
+    /// commit requires reload; a store failure or inconsistent retained copies.
+    pub async fn queued_messages(&self, protocol: &str) -> Result<Vec<QueuedMessage>, AppError> {
+        self.check_registered(protocol)?;
+        if self.reload {
+            return Err(Refusal::NotNow(
+                "a commit failed: reload before listing deliveries".into(),
+            )
+            .into());
+        }
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        let reader = self.reader();
+        let mut outbox = reader.scan::<OutboxItem>(OUT_PREFIX).await?;
+        outbox.sort_by(|a, b| (a.1.queued_ms, &a.0).cmp(&(b.1.queued_ms, &b.0)));
+        let mut owed: Vec<_> = outbox
+            .into_iter()
+            .filter(|(_, item)| item.delivery_pending())
+            .map(|(_, item)| (item, None))
+            .collect();
+        let mut batches = self.kept_batches().await?;
+        batches.sort_by_key(|(id, pending)| (pending.queued_n, *id));
+        let mut listed = BTreeSet::new();
+        for (batch_id, pending) in batches {
+            for item in pending.queued {
+                if kept_message_owed(&reader, &item.msg_id, self.now()).await?
+                    && listed.insert(item.msg_id.clone())
+                {
+                    owed.push((item, Some(batch_id)));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for (item, kept_batch) in owed {
+            if !self.owns_kind(protocol, &item.kind) {
+                continue;
+            }
+            let holds = self.delivery_holds(&item).await?;
+            let hash = item.plaintext()?.hash();
+            result.push(QueuedMessage {
+                msg_id: item.msg_id,
+                to: item.to,
+                kind: item.kind,
+                hash,
+                origin: item.origin,
+                resend: item.accepted_at_ms.is_some() || item.resend_queued,
+                kept_batch,
+                held: holds.message,
+                counterparty_held: holds.counterparty,
+                may_send: holds.may_send,
+            });
+        }
+        Ok(result)
+    }
+
     /// The kind of the message `msg_id` when the app owes its delivery, checked to be a
     /// message of the protocol `protocol`: what the per-message calls act on.
     ///
@@ -1195,23 +1503,8 @@ impl App {
     async fn owned_owed(&self, protocol: &str, msg_id: &str) -> Result<Option<String>, AppError> {
         self.check_registered(protocol)?;
         let reader = self.reader();
-        if reader
-            .get::<OutboxItem>(&out_key(msg_id))
-            .await?
-            .is_some_and(|item| {
-                item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
-            })
-        {
-            return Err(store_corrupt());
-        }
+        validate_outbox(&reader, &self.state.meta, &self.state.cert).await?;
         let kept = super::batch::kept_queued(&reader).await?;
-        if kept
-            .iter()
-            .filter(|item| item.msg_id == msg_id)
-            .any(|item| !item.is_own(&self.state.meta, &self.state.cert))
-        {
-            return Err(store_corrupt());
-        }
         let kind = owed_kind(&reader, msg_id, self.now(), &kept).await?;
         match kind {
             Some(kind) if !self.owns_kind(protocol, &kind) => Err(Refusal::Usage(format!(
@@ -1358,7 +1651,10 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let item = self.outbox_item(&message)?;
+            let mut item = self.outbox_item(&message)?;
+            let mut copies =
+                retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
+            self.inherit_origin(&mut item, &mut copies)?;
             if self.knows_message(&item.msg_id).await? {
                 return Ok(item.msg_id);
             }
@@ -1420,7 +1716,10 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let item = self.stored_item(plaintext)?;
+            let mut item = self.stored_item(plaintext)?;
+            let mut copies =
+                retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
+            self.inherit_origin(&mut item, &mut copies)?;
             if self.knows_message(&item.msg_id).await? {
                 return Ok(item.msg_id);
             }
@@ -1482,6 +1781,7 @@ impl App {
             .saturating_sub(CLOCK_TOLERANCE_MS)
             .saturating_add(SENT_RETENTION_MS);
         Ok(OutboxItem {
+            origin: DeliveryOrigin::Reconstructed,
             to: message.to,
             conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
             kind: message.kind,
@@ -1520,6 +1820,7 @@ impl App {
             return Err(Refusal::Usage("a message this app didn't sign".into()).into());
         }
         Ok(OutboxItem {
+            origin: DeliveryOrigin::Original,
             to: message.to,
             kind: message.kind.clone(),
             msg_id: message.msg_id.clone(),
@@ -1637,6 +1938,7 @@ impl App {
 
     async fn queue_resend(&mut self, sent: &SentStored) -> Result<(), AppError> {
         let item = OutboxItem {
+            origin: sent.origin,
             to: sent.to,
             kind: sent.kind.clone(),
             msg_id: sent.msg_id.clone(),
@@ -1849,6 +2151,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
             let budget = self.begin_budget();
             // The units this flush started: a delivery of the own `identity.json` or a
             // message's try. Past the budget none starts but the flush's first.
@@ -2054,8 +2357,9 @@ impl App {
     }
 
     /// One try of each job of one message, as one unit: the conversation entry, one round of
-    /// the delivery, and the record job. Each is a bounded call of its own, and a try once
-    /// begun goes whole, so no job of a message waits behind another of its jobs.
+    /// the delivery, and the record job. Each is a bounded call of its own. A new hold
+    /// stops the remaining delivery work, preserving jobs already completed and allowing
+    /// an accepted message's record job to continue.
     async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
         let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
@@ -2121,6 +2425,7 @@ impl App {
         }
         if item.delivery_owed() && !held {
             match self.deliver(&mut item).await? {
+                Tried::Held => self.save_item(&item).await?,
                 Tried::Accepted(answer) => self.accept(&mut item, &answer).await?,
                 Tried::Queued(why) => {
                     item.last_error = Some(why);
@@ -2251,6 +2556,7 @@ impl App {
             None => {
                 tx.put(&sent_time_key(first, &item.msg_id), &())?;
                 SentStored {
+                    origin: item.origin,
                     to: item.to,
                     kind: item.kind.clone(),
                     msg_id: item.msg_id.clone(),
@@ -2404,6 +2710,11 @@ impl App {
         let round = self.begin_budget();
         let mut reread = false;
         loop {
+            // Conversation settlement or a prior retry may have committed new local
+            // policy. Re-read the common holds before further delivery work.
+            if self.delivery_waits(item).await? {
+                return Ok(Tried::Held);
+            }
             match Box::pin(self.deliver_under(item, &round)).await? {
                 Delivered::Tried(tried) => return Ok(tried),
                 // At most once a round, however long its requests take, and within its time.
@@ -2501,26 +2812,55 @@ impl App {
             let Some(sealed) = item.sealed.clone() else {
                 return Ok(Delivered::Tried(Tried::Queued("not sealed".into())));
             };
-            let result = if own {
-                let result = self
-                    .client
-                    .append(
-                        sealed.envelope.as_bytes().to_vec(),
-                        sealed.apps_version,
-                        None,
-                    )
-                    .await;
-                self.take(result).await
+            // Identity delivery, sealing and retry preparation may write state. The
+            // same current decision gates every actual append, own or peer, including
+            // retries, with no state-changing await between this check and the call.
+            if self.delivery_waits(item).await? {
+                return Ok(Delivered::Tried(Tried::Held));
+            }
+            let peer = if own {
+                None
             } else {
-                let client = self.peer_client(&to, &doc)?;
-                client
-                    .append(
-                        sealed.envelope.as_bytes().to_vec(),
-                        sealed.apps_version,
-                        invite.as_deref(),
-                    )
-                    .await
-                    .map_err(AppError::from)
+                Some(self.peer_client(&to, &doc)?)
+            };
+            let started = peer
+                .as_ref()
+                .unwrap_or(&self.client)
+                .start_append(
+                    sealed.envelope.as_bytes().to_vec(),
+                    sealed.apps_version,
+                    if own { None } else { invite.as_deref() },
+                )
+                .await;
+            let started = if own {
+                self.take(started).await
+            } else {
+                started.map_err(AppError::from)
+            };
+            let result = match started {
+                Ok(call) => {
+                    if call.needs_retry() {
+                        // Keep the first authenticated response before another decision;
+                        // a withheld timestamp retry is not a failed or accepted delivery.
+                        if own {
+                            self.keep_observations().await?;
+                        }
+                        if self.delivery_waits(item).await? {
+                            return Ok(Delivered::Tried(Tried::Held));
+                        }
+                    }
+                    let answer = peer
+                        .as_ref()
+                        .unwrap_or(&self.client)
+                        .finish_append(call)
+                        .await;
+                    if own {
+                        self.take(answer).await
+                    } else {
+                        answer.map_err(AppError::from)
+                    }
+                }
+                Err(error) => Err(error),
             };
             match result {
                 Ok(answer) => return Ok(Delivered::Tried(Tried::Accepted(answer))),
@@ -2586,20 +2926,29 @@ impl App {
     /// [`App::flush_outbox`]) goes through `try_item`, which asks this, so no call passes
     /// any of the holds.
     async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
-        if !item.delivery_owed() || !self.may_send(item) {
-            return Ok(item.delivery_owed());
-        }
+        Ok(item.delivery_owed() && self.delivery_holds(item).await?.any())
+    }
+
+    async fn delivery_holds(&self, item: &OutboxItem) -> Result<DeliveryHolds, AppError> {
         let reader = self.reader();
-        Ok(reader.exists(&hold_key(&item.to)).await?
-            || reader.exists(&message_hold_key(&item.msg_id)).await?)
+        Ok(DeliveryHolds {
+            message: reader.exists(&message_hold_key(&item.msg_id)).await?,
+            counterparty: reader.exists(&hold_key(&item.to)).await?,
+            may_send: self.may_send(item),
+        })
     }
 
     /// Whether the protocol of an outbox message's kind lets it go out now
-    /// ([`super::Protocol::may_send`]); a message whose kind no protocol owns, or whose
-    /// plaintext doesn't read, goes to its try, which settles it.
+    /// ([`super::Protocol::may_send`]). A message whose kind no protocol owns goes to its
+    /// try; unreadable plaintext or unavailable protocol evidence keeps the delivery held.
     fn may_send(&self, item: &OutboxItem) -> bool {
-        let Ok(plaintext) = item.plaintext() else {
+        // Retained-copy validation binds this routing kind to the authenticated JSON.
+        // An absent owner supplies no body rules and imposes no protocol hold.
+        let Some(owner) = self.protocols.of_kind(&item.kind) else {
             return true;
+        };
+        let Ok(plaintext) = item.plaintext() else {
+            return false;
         };
         let rules = self.protocols.opaque_of_json(plaintext.json());
         let opaque: Vec<OpaqueMember<'_>> = rules
@@ -2610,11 +2959,27 @@ impl App {
             })
             .collect();
         let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
-            return true;
+            return false;
         };
-        self.protocols
-            .of_kind(&message.kind)
-            .is_none_or(|owner| owner.protocol.may_send(&message))
+        let local = super::LocalView::new(
+            self.state.meta.identity,
+            self.state.meta.app_id,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            &owner.name,
+        );
+        let delivery = DeliveryView {
+            message: &message,
+            plaintext: &plaintext,
+            origin: item.origin,
+            local,
+            cert: &self.state.cert,
+            naming: &self.state.naming,
+            store: self.env.store.store().as_ref(),
+            ns: &self.ns,
+            clock: self.env.clock.as_ref(),
+        };
+        owner.protocol.may_send(&delivery).unwrap_or(false)
     }
 
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope
@@ -2696,7 +3061,7 @@ impl App {
 
 /// What one try of a delivery came to.
 enum Delivered {
-    /// Tried: accepted, queued, undeliverable or failed.
+    /// Held, or tried: accepted, queued, undeliverable or failed.
     Tried(Tried),
     /// An answer of the recipient's switch that didn't verify with the service key of the
     /// copy `held` of its `identity.json`.
@@ -2814,6 +3179,7 @@ mod tests {
     /// its re-send.
     fn accepted_item() -> OutboxItem {
         OutboxItem {
+            origin: DeliveryOrigin::Original,
             to: [1; 32],
             kind: "sample.note".into(),
             msg_id: "m1".into(),

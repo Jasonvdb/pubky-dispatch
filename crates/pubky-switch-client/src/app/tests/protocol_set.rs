@@ -71,6 +71,8 @@ struct Named {
     restored: Mutex<Vec<bool>>,
     /// It holds its outbox messages back.
     holding: Mutex<bool>,
+    /// Its deliveries need their exact hash under the protocol's own local key.
+    require_send_fact: Mutex<bool>,
     /// The kinds of the outbox messages it was asked about.
     asked_send: Mutex<Vec<String>>,
     /// The `seq` of each feed item it took, a message or a missed item, in the order taken.
@@ -84,6 +86,50 @@ fn named(name: &str) -> Named {
         name: name.into(),
         ..Named::default()
     }
+}
+
+#[tokio::test]
+async fn test_queued_inventory_uses_protocol_ownership_and_includes_unowned_kinds() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    *p.tasks.holding.lock().unwrap() = true;
+    let mut ids = Vec::new();
+    for kind in ["tasks.item", "chat.item", "retired.note"] {
+        ids.push(
+            app.queue(OutgoingMessage::new(
+                p.w.bob.public(),
+                kind,
+                json!({"text": kind}).as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap(),
+        );
+        p.w.clock.advance_ms(1);
+    }
+    app.hold_message("chat", &ids[1]).await.unwrap();
+    let tasks = app.queued_messages("tasks").await.unwrap();
+    let chat = app.queued_messages("chat").await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[0].as_str(), ids[2].as_str()]
+    );
+    assert_eq!(
+        chat.iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[1].as_str(), ids[2].as_str()]
+    );
+    assert!(!tasks[0].may_send && !tasks[0].held && tasks[0].waits());
+    assert!(chat[0].may_send && chat[0].held && chat[0].waits());
+    assert!(tasks[1].may_send && !tasks[1].waits());
+    usage(app.hold_message("chat", &ids[0]).await, "no kind");
+    app.hold_message("tasks", &ids[2]).await.unwrap();
+    assert!(app.queued_messages("chat").await.unwrap()[1].held);
+    app.release_message("chat", &ids[2]).await.unwrap();
+    assert!(!app.queued_messages("tasks").await.unwrap()[1].held);
 }
 
 #[test]
@@ -103,6 +149,70 @@ fn test_protocol_set_one_owner_can_register_collection_policy_members() {
     assert!(
         result.is_ok(),
         "one collection with two policies still has one owner: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_delivery_view_reads_only_authenticated_kind_owner_locals() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    *p.tasks.require_send_fact.lock().unwrap() = true;
+    *p.chat.require_send_fact.lock().unwrap() = true;
+    let task = app
+        .sign_message(OutgoingMessage::new(
+            p.w.bob.public(),
+            "tasks.item",
+            json!({"text": "task"}).as_object().unwrap().clone(),
+        ))
+        .unwrap();
+    let chat = app
+        .sign_message(OutgoingMessage::new(
+            p.w.bob.public(),
+            "chat.item",
+            json!({"text": "chat"}).as_object().unwrap().clone(),
+        ))
+        .unwrap();
+    app.queue_signed(task.clone()).await.unwrap();
+    app.queue_signed(chat.clone()).await.unwrap();
+    let fact = |hash: [u8; 32]| LocalWrite::Put {
+        key: b"delivery/permit".to_vec(),
+        value: hash.to_vec(),
+    };
+    app.protocol_commit("chat", &[fact(task.hash())])
+        .await
+        .unwrap();
+    assert!(
+        !app.queued_messages("tasks").await.unwrap()[0].may_send,
+        "another owner cannot grant permission"
+    );
+    app.protocol_commit("chat", &[fact(chat.hash())])
+        .await
+        .unwrap();
+    let before = app.reader().scan_raw("").await.unwrap();
+    let tasks = app.queued_messages("tasks").await.unwrap();
+    let chats = app.queued_messages("chat").await.unwrap();
+    assert!(!tasks[0].may_send && chats[0].may_send);
+    assert_eq!((tasks[0].hash, chats[0].hash), (task.hash(), chat.hash()));
+    assert_eq!(app.reader().scan_raw("").await.unwrap(), before);
+    app.protocol_commit("tasks", &[fact(task.hash())])
+        .await
+        .unwrap();
+    assert!(app.queued_messages("tasks").await.unwrap()[0].may_send);
+    assert!(
+        p.tasks
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|kind| kind == "tasks.item")
+    );
+    assert!(
+        p.chat
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|kind| kind == "chat.item")
     );
 }
 
@@ -282,9 +392,29 @@ impl Protocol for Named {
         ))
     }
 
-    fn may_send(&self, message: &Message) -> bool {
-        self.asked_send.lock().unwrap().push(message.kind.clone());
-        !*self.holding.lock().unwrap()
+    fn may_send(&self, delivery: &crate::app::DeliveryView<'_>) -> Result<bool, StoreFailure> {
+        self.asked_send
+            .lock()
+            .unwrap()
+            .push(delivery.message().kind.clone());
+        if *self.require_send_fact.lock().unwrap() {
+            let value = delivery
+                .local()
+                .local_get(b"delivery/permit")
+                .map_err(|error| StoreFailure::try_from(error).unwrap())?;
+            let entries = delivery
+                .local()
+                .local_scan(b"delivery/")
+                .map_err(|error| StoreFailure::try_from(error).unwrap())?;
+            if value.as_deref() != Some(delivery.hash().as_slice()) {
+                return Ok(false);
+            }
+            assert_eq!(
+                entries,
+                vec![(b"delivery/permit".to_vec(), delivery.hash().to_vec())]
+            );
+        }
+        Ok(!*self.holding.lock().unwrap())
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {

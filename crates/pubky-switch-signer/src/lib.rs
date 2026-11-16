@@ -38,7 +38,7 @@ mod signer;
 pub mod state;
 
 pub use alert::{Alert, RenewalSkip, Source};
-pub use error::{Refusal, Result, SignerError, SizedBody};
+pub use error::{RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody};
 pub use homeserver::Homeserver;
 pub use key::{
     AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,

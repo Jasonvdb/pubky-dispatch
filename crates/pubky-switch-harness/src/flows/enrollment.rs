@@ -130,7 +130,7 @@ fn shown_alert(alert: &pubky_switch_signer::Alert) -> String {
 /// What a signer shows of itself, for the trace.
 pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let doc = signer.identity_doc()?;
-    let high_water = signer.high_water();
+    let high_water = signer.high_water()?;
     Ok(json!({
         // The status's name: what it carries, such as another install's ID, differs from
         // run to run.

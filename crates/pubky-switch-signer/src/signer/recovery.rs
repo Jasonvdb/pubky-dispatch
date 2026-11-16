@@ -46,8 +46,8 @@ use super::erasure::withdraw_reminders;
 use super::revocation::UserConfirmed;
 use super::{Room, Signer, gate};
 use crate::alert::{Alert, Source};
-use crate::error::{Refusal, Result, SignerError};
-use crate::state::{DeliverStep, Flow, Service, SignerState};
+use crate::error::{RecordsFault, Refusal, Result, SignerError};
+use crate::state::{self, DeliverStep, Flow, Service, SignerState};
 
 /// How many times in all a run sends a recovery's enrollment, the same bytes each time,
 /// before its failure is shown (Switch wire 7.4.1).
@@ -135,7 +135,9 @@ impl Signer {
             return self
                 .state
                 .newest_doc()?
-                .ok_or_else(|| SignerError::Records("the recovery's version is gone".into()));
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the recovery's version is gone",
+                )));
         }
         // Taken before the checks below, which may end a flow in progress.
         let base = self.recovery_base()?;
@@ -202,7 +204,9 @@ impl Signer {
         self.complete_listed_revocations().await?;
         self.state
             .newest_doc()?
-            .ok_or_else(|| SignerError::Records("the recovery's version is gone".into()))
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the recovery's version is gone",
+            )))
     }
 
     /// End the staged admission a recovery started at the service (Switch spec 12.6 step 2;
@@ -353,12 +357,12 @@ impl Signer {
         if self.state.recovering
             && let Some(base) = &self.state.recovery_base
         {
-            return Ok(IdentityDoc::verify(base, &identity)?);
+            return state::stored_identity(base, &identity);
         }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let in_flight = match &self.flow {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => {
-                Some(IdentityDoc::verify(doc, &identity)?)
+                Some(state::stored_identity(doc, &identity)?)
             }
             _ => None,
         };
@@ -389,9 +393,11 @@ impl Signer {
         service_key: [u8; 32],
         until: u64,
     ) -> Result<IdentityBody> {
-        let generation = lost
-            .checked_add(1)
-            .ok_or_else(|| SignerError::Records("the generation can't go higher".into()))?;
+        let generation =
+            lost.checked_add(1)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the generation can't go higher",
+                )))?;
         let owed = self.owed_in(base)?;
         self.next_body_on(
             base,
@@ -545,7 +551,8 @@ impl Signer {
             pinned: self.pinned_for(origin),
             identity,
         };
-        let enrollment = Enrollment::verify(signed, &identity, origin)?;
+        let enrollment =
+            Enrollment::verify(signed, &identity, origin).map_err(SignerError::StoredData)?;
         let mut sends = 0;
         loop {
             sends += 1;

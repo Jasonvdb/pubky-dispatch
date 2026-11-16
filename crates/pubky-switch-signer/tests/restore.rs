@@ -738,7 +738,7 @@ async fn test_restore_in_place_refuses_a_backup_at_a_lower_generation() {
     let five = IdentityDoc::sign(&world.key, body).unwrap();
     world.switch.deliver_identity(&five).unwrap();
     signer.set_record_max_age(Some(60)).await.unwrap_err();
-    assert_eq!(signer.high_water().unwrap().generation, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().generation, 2);
     let mut body = first.body().clone();
     body.version = 6;
     body.signer = [7; 16];

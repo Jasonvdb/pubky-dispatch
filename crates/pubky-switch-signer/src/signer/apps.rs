@@ -72,7 +72,7 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`crate::SignerError::InvalidData`] when the stored newest document or a stored
+    /// [`crate::SignerError::StoredData`] when the stored newest document or a stored
     /// certificate no longer verifies.
     pub fn apps(&self) -> Result<Vec<AppSummary>> {
         let Some(doc) = self.state.newest_doc()? else {

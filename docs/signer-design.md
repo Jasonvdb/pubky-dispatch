@@ -155,6 +155,8 @@ Every constructor acquires exclusive ownership before reading the state and flow
 
 Before a possibly committing await the signer marks its cached state unresolved. A blocking call is retained and drained after cancellation, and its worker holds the guard through actual completion even if the signer is dropped. An ambiguous result or failed reload permits no next effect; a successful reload uses the exact durable state and flow. Already-sent remote requests remain subject to the existing reconciliation rules: local ownership cannot retract them. The synchronous `approved` accessor refuses unresolved state; display snapshots remain cached observations.
 
+Loading reads both local values before decoding them, so a host read failure stays a store error and a surviving flow is never mistaken for an empty install. Decoding failures name the local record and position, without quoting its content; write construction and invariant failures are distinct. Stored signed documents, certificates, enrollments, renewal operations and sealed outer signatures are checked at their local origin. Their failures are `StoredData`, not invalid network input. High-water reads and reference pruning propagate verification failures instead of treating a corrupt copy as absent. These checks do not authenticate every local field or a kept approval claim without its auth secret, nor classify wrong caller app keys as damaged storage.
+
 ### 4.3 Flows
 
 At most one flow is in progress. A new one is refused until it ends, except an abort, which applies only to its own flow.

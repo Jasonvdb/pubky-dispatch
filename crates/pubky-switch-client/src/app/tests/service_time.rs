@@ -393,7 +393,12 @@ async fn test_service_time_first_headless_refusal_survives_load_without_clock_sa
         Some(high),
         "the first refusal is durable"
     );
-    assert_eq!(loaded.clock_skew_ms(), None, "no stamped clock sample");
+    assert_eq!(
+        loaded.state.service_time.unwrap().offset_ms,
+        None,
+        "no stamped clock sample"
+    );
+    assert_eq!(loaded.clock_skew_ms(), Some(high - START));
     Box::pin(loaded.refresh_identity()).await.unwrap();
     assert_time_alarm(Box::pin(loaded.receive(None)).await.unwrap_err(), high, low);
     assert_eq!(transport.requests().len(), 2);
@@ -503,7 +508,8 @@ async fn test_service_time_retry_uncompared_answer_preserves_first_watermark() {
     .await
     .unwrap();
     assert_eq!(loaded.highest_service_time(), Some(high));
-    assert_eq!(loaded.clock_skew_ms(), None);
+    assert_eq!(loaded.state.service_time.unwrap().offset_ms, None);
+    assert_eq!(loaded.clock_skew_ms(), Some(high - START));
     assert!(
         loaded.alarm().is_none(),
         "the unavailable time does not compare"
@@ -581,4 +587,244 @@ async fn test_service_time_failed_watermark_commit_is_retried_before_reload() {
     assert_eq!(fault.commits(), 1);
     assert_time_alarm(Box::pin(app.receive(None)).await.unwrap_err(), high, low);
     assert_eq!(transport.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_service_time_first_headless_watermark_bounds_automatic_attempts() {
+    use crate::app::{AppEvent, Refusal, UserConfirmed};
+    use pubky_switch_core::http::ErrorCode;
+    use pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = Box::pin(restored(&w, &router, store.clone())).await;
+    Box::pin(app.end_reconcile(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(app.may_attempt(false).is_ok());
+    assert!(app.may_attempt(true).is_ok());
+    assert!(app.state.service_time.is_none());
+    let ahead = CLOCK_TOLERANCE_MS + 1;
+    let high = START + ahead;
+    let transport = refuse_at(&w, &router, [(high, ErrorCode::BadSignature)]);
+    assert!(Box::pin(app.receive(None)).await.is_err());
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(app.highest_service_time(), Some(high));
+    assert_eq!(app.client.latest_server_time(), None);
+    assert_eq!(app.state.service_time.unwrap().offset_ms, None);
+    assert!(
+        app.may_attempt(false).is_ok(),
+        "the verified lower bound does not forbid manual attempts"
+    );
+    assert!(
+        matches!(app.may_attempt(true), Err(Refusal::NotNow(_))),
+        "automatic attempts must pause at the verified lower bound"
+    );
+    assert_eq!(
+        app.clock_skew_ms(),
+        Some(ahead),
+        "the verified lower bound is independent of an offset sample"
+    );
+    assert!(
+        app.take_events()
+            .iter()
+            .any(|event| matches!(event, AppEvent::ClockSkew { skew_ms } if *skew_ms == ahead))
+    );
+    let id = app.app_id();
+    drop(app);
+    let loaded = Box::pin(App::load(
+        router.env(&w, store),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(loaded.clock_skew_ms(), Some(ahead));
+    assert_eq!(loaded.state.service_time.unwrap().offset_ms, None);
+    w.clock.advance_ms(ahead);
+    assert!(loaded.may_attempt(true).is_ok());
+    assert_eq!(
+        transport.requests().len(),
+        1,
+        "the bound changes without another service response"
+    );
+}
+
+/// One first comparable refusal after public restore, with no stamped clock sample.
+async fn first_headless_clock(
+    w: &World,
+    router: &Router,
+    store: Arc<dyn StateStore>,
+    at: u64,
+) -> (App, Arc<crate::transport::MockTransport>) {
+    use crate::app::{AppError, UserConfirmed};
+    use crate::error::ClientError;
+    use pubky_switch_core::http::ErrorCode;
+
+    let mut app = Box::pin(restored(w, router, store)).await;
+    Box::pin(app.end_reconcile(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(app.may_attempt(false).is_ok());
+    assert!(app.may_attempt(true).is_ok());
+    assert!(app.state.service_time.is_none());
+    let transport = refuse_at(w, router, [(at, ErrorCode::BadSignature)]);
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Switch(ClientError::Switch {
+                code: ErrorCode::BadSignature,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(app.highest_service_time(), Some(at));
+    assert_eq!(app.client.latest_server_time(), None);
+    assert_eq!(app.state.service_time.unwrap().offset_ms, None);
+    (app, transport)
+}
+
+#[tokio::test]
+async fn test_service_time_first_headless_bound_warns_over_tolerance() {
+    use crate::app::AppEvent;
+    use pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+    let w = World::new();
+    let router = Router::of(&w);
+    let ahead = CLOCK_TOLERANCE_MS + 1;
+    let (mut app, _) = Box::pin(first_headless_clock(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        START + ahead,
+    ))
+    .await;
+    assert!(app.may_attempt(false).is_ok());
+    assert!(
+        app.take_events()
+            .iter()
+            .any(|event| matches!(event, AppEvent::ClockSkew { skew_ms } if *skew_ms == ahead)),
+        "the verified forward bound must warn without a sampled offset"
+    );
+}
+
+#[tokio::test]
+async fn test_service_time_first_headless_bound_warns_beyond_a_day() {
+    use crate::app::{AppEvent, SERVICE_TIME_AHEAD_MS};
+    let w = World::new();
+    let router = Router::of(&w);
+    let ahead = SERVICE_TIME_AHEAD_MS + 1;
+    let (mut app, _) = Box::pin(first_headless_clock(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        START + ahead,
+    ))
+    .await;
+    assert!(
+        app.take_events()
+            .iter()
+            .any(|event| matches!(event, AppEvent::ClockSkew { skew_ms } if *skew_ms == ahead)),
+        "a time more than a day ahead must be shown to the user"
+    );
+    assert!(app.may_attempt(true).is_err());
+    assert!(app.may_attempt(false).is_ok());
+    assert_eq!(app.state.service_time.unwrap().offset_ms, None);
+}
+
+#[tokio::test]
+async fn test_service_time_headless_stale_near_and_exact_tolerance_are_healthy() {
+    use crate::app::AppEvent;
+    use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS};
+    for at in [
+        START - 3 * DAY_MS,
+        START,
+        START + 2_000,
+        START + CLOCK_TOLERANCE_MS,
+    ] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let (mut app, _) = Box::pin(first_headless_clock(
+            &w,
+            &router,
+            Arc::new(MemoryStore::new()),
+            at,
+        ))
+        .await;
+        assert!(app.may_attempt(true).is_ok(), "{at}");
+        assert!(app.may_attempt(false).is_ok(), "{at}");
+        assert!(
+            !app.take_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::ClockSkew { .. })),
+            "{at}"
+        );
+        assert_eq!(app.state.service_time.unwrap().offset_ms, None, "{at}");
+    }
+}
+
+#[tokio::test]
+async fn test_service_time_headless_forward_bound_is_applied_after_load() {
+    use crate::app::Refusal;
+    use pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+    let w = World::new();
+    let router = Router::of(&w);
+    let store = Arc::new(MemoryStore::new());
+    let high = START + CLOCK_TOLERANCE_MS + 1;
+    let (app, transport) = Box::pin(first_headless_clock(&w, &router, store.clone(), high)).await;
+    let id = app.app_id();
+    drop(app);
+    let loaded = Box::pin(App::load(
+        router.env(&w, store),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(loaded.highest_service_time(), Some(high));
+    assert_eq!(loaded.state.service_time.unwrap().offset_ms, None);
+    assert!(loaded.may_attempt(false).is_ok());
+    assert_eq!(transport.requests().len(), 1);
+    assert!(
+        matches!(loaded.may_attempt(true), Err(Refusal::NotNow(_))),
+        "a loaded watermark independently bounds automatic attempts"
+    );
+}
+
+#[tokio::test]
+async fn test_service_time_headless_bound_allows_device_catch_up() {
+    use pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+    let w = World::new();
+    let router = Router::of(&w);
+    let high = START + CLOCK_TOLERANCE_MS + 1;
+    let (app, transport) = Box::pin(first_headless_clock(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        high,
+    ))
+    .await;
+    w.clock.advance_ms(1);
+    assert!(
+        app.may_attempt(true).is_ok(),
+        "exact tolerance is permitted"
+    );
+    w.clock.advance_ms(CLOCK_TOLERANCE_MS);
+    assert!(
+        app.may_attempt(true).is_ok(),
+        "the clock reached the watermark"
+    );
+    assert!(app.may_attempt(false).is_ok());
+    assert_eq!(app.highest_service_time(), Some(high));
+    assert_eq!(app.state.service_time.unwrap().offset_ms, None);
+    assert_eq!(
+        transport.requests().len(),
+        1,
+        "no new service sample was needed"
+    );
 }

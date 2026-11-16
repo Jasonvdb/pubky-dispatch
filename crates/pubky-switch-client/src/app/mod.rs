@@ -2172,12 +2172,16 @@ impl App {
         Ok(())
     }
 
-    /// How far apart the device clock and the service's are (Switch spec 10.1), `None`
-    /// before any stamped answer.
+    /// The greater of the last sampled clock difference and the verified service time's
+    /// lead over the device clock (Switch spec 10.1). Without a stamped sample, this is
+    /// only a lower bound; `None` before any comparable answer.
     pub fn clock_skew_ms(&self) -> Option<u64> {
         let time = self.state.service_time?;
         let ahead = time.highest_ms.saturating_sub(self.now());
-        Some(time.offset_ms?.unsigned_abs().max(ahead))
+        Some(
+            time.offset_ms
+                .map_or(ahead, |offset| offset.unsigned_abs().max(ahead)),
+        )
     }
 
     /// Reconciliation finished (Switch spec 12.4 step 2.4): reconcile mode ends, and with it
@@ -2926,43 +2930,42 @@ impl App {
             .client
             .latest_compared_time()
             .and(self.client.latest_server_time());
-        let Some(time) = stamped else {
-            let record = ServiceTime {
-                key,
-                highest_ms,
-                offset_ms: held.and_then(|held| held.offset_ms),
-            };
-            if self.state.service_time != Some(record) {
-                self.state.service_time = Some(record);
-                self.service_time_dirty = true;
+        let offset_ms = match stamped {
+            Some(time) => {
+                let now = self.now();
+                self.time_fresh_at = Some(now);
+                Some(
+                    i64::try_from(time)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX)),
+                )
             }
-            return alarm;
+            None => held.and_then(|held| held.offset_ms),
         };
-        let now = self.now();
-        self.time_fresh_at = Some(now);
-        let offset = i64::try_from(time)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX));
         let record = ServiceTime {
             key,
             highest_ms,
-            offset_ms: Some(offset),
+            offset_ms,
         };
-        if time > now.saturating_add(SERVICE_TIME_AHEAD_MS)
-            || offset.unsigned_abs() > CLOCK_TOLERANCE_MS
-        {
-            let event = AppEvent::ClockSkew {
-                skew_ms: offset.unsigned_abs(),
-            };
-            if !self.events.contains(&event) {
-                self.events.push(event);
-            }
-        }
         if self.state.service_time != Some(record) {
             self.state.service_time = Some(record);
             self.service_time_dirty = true;
         }
+        // The same bound governs automatic attempts and their warning. A headless answer
+        // can prove the service ahead without measuring an offset (Switch spec 10.1).
+        self.warn_clock_skew();
         alarm
+    }
+
+    fn warn_clock_skew(&mut self) {
+        if let Some(skew_ms) = self.clock_skew_ms()
+            && skew_ms > CLOCK_TOLERANCE_MS
+        {
+            let event = AppEvent::ClockSkew { skew_ms };
+            if !self.events.contains(&event) {
+                self.events.push(event);
+            }
+        }
     }
 
     /// `POST /ops` with a batch whose body the caller committed: the answer's head goes to

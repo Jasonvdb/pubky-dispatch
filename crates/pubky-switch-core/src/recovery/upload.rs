@@ -267,6 +267,7 @@ pub fn proved_version(
     op_generation: u64,
     built_on: RecordVersion,
 ) -> Option<RecordVersion> {
+    proof.record_revision().ok()?;
     let state = &proof.body().state;
     let version = RecordVersion::new(
         state.get("generation")?.as_u64()?,

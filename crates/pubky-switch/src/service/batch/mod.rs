@@ -1149,6 +1149,7 @@ async fn save(
             };
             txn.put_record(&StoredRecord {
                 state: record.state.clone(),
+                revision: record.revision,
                 value_bytes: record.value_bytes,
                 writer: record.writer,
                 cert: record.cert.clone(),

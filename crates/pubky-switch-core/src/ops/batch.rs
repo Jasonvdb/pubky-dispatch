@@ -417,6 +417,11 @@ pub fn retry_check(
 /// The state conditions are checked against, before the batch (Switch wire 6.3), and what the
 /// caller may read of it (Switch wire 7.6).
 pub trait ConditionState {
+    /// Exact known current facts; `None` cannot satisfy `record_current` and does not
+    /// establish absence (Switch record lineage 1).
+    fn record_current(&self, key: &[u8; 32]) -> Option<crate::shared::CurrentRecord>;
+    /// The complete current view, before the caller's read-scope redaction.
+    fn record_view(&self, key: &[u8; 32]) -> Option<Value>;
     /// A record's current version; [`RecordVersion::NONE`] for a record that doesn't exist or
     /// whose key the service forgot.
     fn record_version(&self, key: &[u8; 32]) -> RecordVersion;
@@ -444,14 +449,35 @@ pub trait ConditionState {
 ///
 /// `409 conflict` at the first that fails, with the current value the caller may read
 /// (Switch wire 7.6): `{ "record_version": { "key", "generation", "version" } }`, `{
-/// "claim_step": { "claim_key", "step" }, "claim": view | null }` or `{ "server_time" }`, and
-/// `{}` for what it may not read.
+/// "claim_step": { "claim_key", "step" }, "claim": view | null }`, `{ "record_view": view }`
+/// for an exact-current guard, or `{ "server_time" }`, and `{}` for what it may not read.
 pub fn check_conditions<'a>(
     conditions: impl IntoIterator<Item = &'a Condition>,
     state: &impl ConditionState,
 ) -> std::result::Result<(), Refusal> {
     for condition in conditions {
         let current = match condition {
+            Condition::RecordCurrent {
+                key,
+                lineage_id,
+                revision,
+                deleted,
+            } => {
+                let expected = crate::shared::CurrentRecord {
+                    lineage_id: *lineage_id,
+                    revision: *revision,
+                    deleted: *deleted,
+                };
+                (state.record_current(key) != Some(expected)).then(|| {
+                    if state.may_read_record(key) {
+                        state
+                            .record_view(key)
+                            .map_or_else(|| json!({}), |view| json!({ "record_view": view }))
+                    } else {
+                        json!({})
+                    }
+                })
+            }
             Condition::RecordVersion { key, version } => {
                 let now = state.record_version(key);
                 // `{0, 0}` matches a record that is absent, forgotten or deleted, as a
@@ -851,6 +877,13 @@ mod tests {
     }
 
     impl ConditionState for State {
+        fn record_current(&self, _: &[u8; 32]) -> Option<crate::shared::CurrentRecord> {
+            None
+        }
+        fn record_view(&self, _: &[u8; 32]) -> Option<Value> {
+            None
+        }
+
         fn record_version(&self, _: &[u8; 32]) -> RecordVersion {
             self.version
         }
@@ -1125,5 +1158,128 @@ mod tests {
         assert_eq!(continued.unwrap(), CursorMove::Stays);
         // The bounds still come first.
         assert!(check_cursor(at(10), 1, None, 9, Some(4)).is_err());
+    }
+    struct CurrentState {
+        key: [u8; 32],
+        held: Option<crate::shared::CurrentRecord>,
+        readable: bool,
+    }
+
+    impl ConditionState for CurrentState {
+        fn record_current(&self, key: &[u8; 32]) -> Option<crate::shared::CurrentRecord> {
+            (*key == self.key).then_some(self.held).flatten()
+        }
+        fn record_view(&self, key: &[u8; 32]) -> Option<Value> {
+            self.record_current(key).map(|held| json!({"key": b64(key), "deleted": held.deleted, "revision": {
+                "generation": held.revision.generation, "seq": held.revision.seq, "item_hash": b64(&held.revision.item_hash)
+            }}))
+        }
+        fn record_version(&self, _: &[u8; 32]) -> RecordVersion {
+            RecordVersion::NONE
+        }
+        fn may_read_record(&self, _: &[u8; 32]) -> bool {
+            self.readable
+        }
+        fn claim_step(&self, _: &[u8; 32]) -> u64 {
+            0
+        }
+        fn claim_view(&self, _: &[u8; 32]) -> Option<Value> {
+            None
+        }
+        fn may_read_claims(&self) -> bool {
+            false
+        }
+        fn server_time(&self) -> u64 {
+            1
+        }
+    }
+
+    #[test]
+    fn test_record_current_compares_each_fact() {
+        let held = crate::shared::CurrentRecord {
+            lineage_id: None,
+            revision: crate::record_authority::ApplicationRef {
+                generation: 2,
+                seq: 9,
+                item_hash: [8; 32],
+            },
+            deleted: true,
+        };
+        let state = CurrentState {
+            key: [3; 32],
+            held: Some(held),
+            readable: true,
+        };
+        let condition = Condition::RecordCurrent {
+            key: state.key,
+            lineage_id: held.lineage_id,
+            revision: held.revision,
+            deleted: held.deleted,
+        };
+        assert!(check_conditions([&condition], &state).is_ok());
+        for case in 0..6 {
+            let mut changed = condition;
+            let Condition::RecordCurrent {
+                key,
+                lineage_id,
+                revision,
+                deleted,
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match case {
+                0 => *key = [4; 32],
+                1 => *lineage_id = Some([7; 32]),
+                2 => revision.generation += 1,
+                3 => revision.seq += 1,
+                4 => revision.item_hash = [9; 32],
+                _ => *deleted = false,
+            }
+            let refused = check_conditions([&changed], &state).unwrap_err();
+            assert_eq!(refused.status(), 409, "case {case}");
+        }
+        let missing = CurrentState {
+            held: None,
+            ..state
+        };
+        assert_eq!(
+            check_conditions([&condition], &missing)
+                .unwrap_err()
+                .status(),
+            409
+        );
+    }
+
+    #[test]
+    fn test_record_current_conflict_redacts_the_view() {
+        let held = crate::shared::CurrentRecord {
+            lineage_id: None,
+            revision: crate::record_authority::ApplicationRef {
+                generation: 2,
+                seq: 9,
+                item_hash: [8; 32],
+            },
+            deleted: true,
+        };
+        let mut state = CurrentState {
+            key: [3; 32],
+            held: Some(held),
+            readable: true,
+        };
+        let stale = Condition::RecordCurrent {
+            key: state.key,
+            lineage_id: None,
+            revision: held.revision,
+            deleted: false,
+        };
+        let readable = check_conditions([&stale], &state).unwrap_err();
+        assert_eq!(
+            readable.current,
+            Some(json!({"record_view": state.record_view(&state.key).unwrap()}))
+        );
+        state.readable = false;
+        let hidden = check_conditions([&stale], &state).unwrap_err();
+        assert_eq!(hidden.current, Some(json!({})));
     }
 }

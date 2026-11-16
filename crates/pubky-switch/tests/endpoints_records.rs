@@ -266,6 +266,7 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
             "write_scopes": ["tasks"],
             "generation": 1,
             "version": seq,
+            "revision": {"generation": 1, "seq": seq, "item_hash": b64(&op.item_hash().expect("hash"))},
             "seq": seq,
             "deleted": false,
             "writer": wallet["app_id"],
@@ -631,7 +632,8 @@ async fn as_uploaded(replay: &Replay, key: &[u8; 32], upload_seq: u64, divergent
         .expect("conn");
     sqlx::query(
         "UPDATE shared_records SET from_upload = true, proof = NULL, upload_seq = $3, \
-         version_exact = false WHERE account_id = $1 AND key = $2",
+         version_exact = false, application_generation = generation + 1, application_seq = $3 \
+         WHERE account_id = $1 AND key = $2",
     )
     .bind(alice_id())
     .bind(key.as_slice())
@@ -1557,6 +1559,364 @@ async fn test_records_write_superseding_an_item_that_doesnt_read_still_commits()
     assert_eq!(
         chain_document_kept(&replay, &id, other).await,
         (false, false)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+fn current_guard(key: [u8; 32], view: &Value) -> pubky_switch_core::ops::Condition {
+    pubky_switch_core::ops::Condition::RecordCurrent {
+        key,
+        lineage_id: None,
+        revision: pubky_switch_core::record_authority::ApplicationRef::parse(
+            &serde_json::to_vec(&view["revision"]).expect("revision"),
+        )
+        .expect("reference"),
+        deleted: view["deleted"].as_bool().expect("deleted"),
+    }
+}
+
+fn guarded(
+    app_name: &str,
+    id: u8,
+    condition: pubky_switch_core::ops::Condition,
+    put: RecordPut,
+) -> Vec<SignedOp> {
+    let mut fields = batch(app_name, id, vec![OpKind::RecordPut(put)])[0]
+        .body()
+        .clone();
+    fields.conditions = vec![condition];
+    let keys = vectors("keys.json");
+    let key =
+        ed25519_dalek::SigningKey::from_bytes(&hex32(&app(&keys, app_name)["signing_secret_hex"]));
+    vec![SignedOp::sign(&key, fields).expect("guarded operation")]
+}
+
+fn guarded_request(
+    app_name: &str,
+    ops: &[SignedOp],
+    cursor: Option<pubky_switch_core::ops::Position>,
+) -> pubky_switch::http::SwitchRequest {
+    let keys = vectors("keys.json");
+    app_request(
+        app(&keys, app_name),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(ops, cursor).to_json(),
+        ms(AT),
+    )
+}
+
+#[tokio::test]
+async fn test_record_current_conflict_respects_read_scope() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, _, _) = create(&replay, 1, b"privacy", "tasks_people").await;
+    let path = format!("records/{}?revision=1", b64(&key));
+    let before = body(&get_as(&replay, "wallet", &path).await);
+    let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
+    let put = record_put(
+        TASK_ITEMS,
+        b"privacy",
+        "tasks_people",
+        expected,
+        b"{\"n\":2}",
+    );
+    // Both apps can write under tasks. Only the wallet can read tasks_people.
+    let mut stale = current_guard(key, &before);
+    if let pubky_switch_core::ops::Condition::RecordCurrent { revision, .. } = &mut stale {
+        revision.seq += 1;
+    }
+    for (i, name) in ["wallet", "phone"].iter().enumerate() {
+        let ops = guarded(name, 2 + u8::try_from(i).expect("id"), stale, put.clone());
+        let answer = replay
+            .service
+            .handle(guarded_request(name, &ops, None))
+            .await;
+        assert_eq!(code_of(&answer), (409, json!("conflict")));
+        assert_eq!(
+            body(&answer)["current"],
+            if *name == "wallet" {
+                json!({"record_view": before})
+            } else {
+                json!({})
+            }
+        );
+        assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
+    }
+    let ops = guarded("phone", 4, current_guard(key, &before), put);
+    let answer = replay
+        .service
+        .handle(guarded_request("phone", &ops, None))
+        .await;
+    assert_eq!(answer.status, 200, "{}", body(&answer));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_record_current_listing_keeps_snapshot_reference() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, _, _) = create(&replay, 1, b"snapshot", "tasks").await;
+    let before = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    let put = record_put(
+        TASK_ITEMS,
+        b"snapshot",
+        "tasks",
+        RecordVersion::new(1, before["version"].as_u64().expect("version")),
+        b"{\"n\":2}",
+    );
+    let ops = guarded("wallet", 2, current_guard(key, &before), put);
+    let list = list_path(&task_items(), "");
+    let pause = replay.db.pause_next_snapshot_read();
+    let exchange = async {
+        tokio::join!(get_as(&replay, "phone", &list), async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+                .await
+                .expect("snapshot reached");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                replay.service.handle(guarded_request("wallet", &ops, None)),
+            )
+            .await;
+            pause.resume.notify_one();
+            result.expect("overwrite ended")
+        })
+    };
+    let (page, write) = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .expect("read and write ended");
+    assert_eq!(write.status, 200, "{}", body(&write));
+    assert_eq!(page.status, 200);
+    assert_eq!(body(&page)["records"], json!([before]));
+    let after = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    assert_ne!(after["revision"], before["revision"]);
+    assert_eq!(
+        after["revision"]["item_hash"],
+        b64(&ops[0].item_hash().expect("item"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_record_current_store_failure_and_restart_keep_application() {
+    use sqlx::Connection;
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, _, _) = create(&replay, 1, b"durable", "tasks").await;
+    let path = format!("records/{}?revision=1", b64(&key));
+    let before = body(&get_as(&replay, "wallet", &path).await);
+    let seq = last_seq(&replay).await;
+    let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
+    let put = record_put(TASK_ITEMS, b"durable", "tasks", expected, b"{\"n\":2}");
+    let ops = guarded("wallet", 2, current_guard(key, &before), put);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let app_id = pubky_switch_core::enc::app_id_decode(
+        app(&vectors("keys.json"), "wallet")["app_id"]
+            .as_str()
+            .expect("app"),
+    )
+    .expect("app id");
+    let cursor_sql =
+        "SELECT cursor_generation, cursor_seq FROM apps WHERE account_id=$1 AND app_id=$2";
+    let old_cursor: (Option<i64>, Option<i64>) = sqlx::query_as(cursor_sql)
+        .bind(alice_id())
+        .bind(app_id.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("cursor");
+    let cursor = Some(pubky_switch_core::ops::Position { generation: 1, seq });
+    let mut stale = ops[0].body().clone();
+    if let pubky_switch_core::ops::Condition::RecordCurrent { revision, .. } =
+        &mut stale.conditions[0]
+    {
+        revision.seq += 1;
+    }
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&hex32(
+        &app(&vectors("keys.json"), "wallet")["signing_secret_hex"],
+    ));
+    let stale = SignedOp::sign(&signing_key, stale).expect("signed stale condition");
+    let refused = replay
+        .service
+        .handle(guarded_request("wallet", &[stale], cursor))
+        .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
+    assert_eq!(last_seq(&replay).await, seq);
+    let refused_cursor: (Option<i64>, Option<i64>) = sqlx::query_as(cursor_sql)
+        .bind(alice_id())
+        .bind(app_id.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("cursor");
+    assert_eq!(refused_cursor, old_cursor);
+    for statement in [
+        "CREATE FUNCTION refuse_record() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER refuse_record BEFORE UPDATE ON shared_records FOR EACH ROW EXECUTE FUNCTION refuse_record()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    let answer = replay
+        .service
+        .handle(guarded_request("wallet", &ops, cursor))
+        .await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
+    assert_eq!(last_seq(&replay).await, seq);
+    let after_cursor: (Option<i64>, Option<i64>) = sqlx::query_as(cursor_sql)
+        .bind(alice_id())
+        .bind(app_id.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("cursor");
+    assert_eq!(after_cursor, old_cursor);
+    sqlx::query("DROP TRIGGER refuse_record ON shared_records")
+        .execute(&mut conn)
+        .await
+        .expect("remove refusal");
+    let accepted = replay
+        .service
+        .handle(guarded_request("wallet", &ops, cursor))
+        .await;
+    assert_eq!(accepted.status, 200, "{}", body(&accepted));
+    assert_eq!(last_seq(&replay).await, seq + 1);
+    let after = body(&get_as(&replay, "wallet", &path).await);
+    assert_eq!(
+        after["revision"]["item_hash"],
+        b64(&ops[0].item_hash().expect("hash"))
+    );
+    let restarted = replay.restarted_with(Limits::default());
+    let keys = vectors("keys.json");
+    let read = restarted
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &format!("/v1/{}/{path}", alice_id()),
+            Vec::new(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(read.status, 200, "{}", body(&read));
+    assert_eq!(body(&read), after);
+    let retry = restarted
+        .handle(guarded_request("wallet", &ops, cursor))
+        .await;
+    assert_eq!(retry.status, 200);
+    assert_eq!(body(&retry)["proofs"], body(&accepted)["proofs"]);
+    assert_eq!(last_seq(&replay).await, seq + 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_record_current_stored_reference_is_checked() {
+    use sqlx::Connection;
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, _, _) = create(&replay, 1, b"corrupt", "tasks").await;
+    let path = format!("records/{}?revision=1", b64(&key));
+    let before = body(&get_as(&replay, "wallet", &path).await);
+    let old_seq = last_seq(&replay).await;
+    let put = record_put(
+        TASK_ITEMS,
+        b"corrupt",
+        "tasks",
+        RecordVersion::new(1, before["version"].as_u64().expect("version")),
+        b"{\"n\":2}",
+    );
+    let ops = guarded("wallet", 2, current_guard(key, &before), put);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let reference = pubky_switch_core::record_authority::ApplicationRef::parse(
+        &serde_json::to_vec(&before["revision"]).expect("json"),
+    )
+    .expect("reference");
+    for column in [
+        "application_seq = application_seq + 1",
+        "application_generation = application_generation + 1",
+        "application_item_hash = decode(repeat('00',32),'hex')",
+        "deleted = true, value_bytes = 0",
+    ] {
+        sqlx::query(&format!(
+            "UPDATE shared_records SET {column} WHERE account_id=$1 AND key=$2"
+        ))
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("corrupt fixture");
+        let read = get_as(&replay, "wallet", &path).await;
+        assert_eq!(code_of(&read), (503, json!("unavailable")), "{column}");
+        assert!(body(&read).get("revision").is_none());
+        let write = replay
+            .service
+            .handle(guarded_request("wallet", &ops, None))
+            .await;
+        assert_eq!(code_of(&write), (503, json!("unavailable")), "{column}");
+        assert_eq!(last_seq(&replay).await, old_seq);
+        let original_op =
+            SignedOp::peek(&serde_json::from_value(before["op"].clone()).expect("op")).expect("op");
+        let OpKind::RecordPut(original_put) = &original_op.body().kind else {
+            panic!("record")
+        };
+        sqlx::query("UPDATE shared_records SET application_generation=$3, application_seq=$4, application_item_hash=$5, deleted=false, value_bytes=$6 WHERE account_id=$1 AND key=$2")
+            .bind(alice_id()).bind(key.as_slice()).bind(i64::try_from(reference.generation).expect("generation"))
+            .bind(i64::try_from(reference.seq).expect("seq")).bind(reference.item_hash.as_slice())
+            .bind(i64::try_from(original_put.value_sealed.ct.len()).expect("bytes")).execute(&mut conn).await.expect("restore fixture");
+        assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_record_current_generated_condition_is_applied() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    set_time(&replay.clock, AT);
+    let doc: SignedDoc =
+        serde_json::from_value(vectors("operations.json")["record_current"]["signed"].clone())
+            .expect("signed operation");
+    let op = SignedOp::peek(&doc).expect("operation");
+    let key = match &op.body().kind {
+        OpKind::RecordPut(put) => put.key,
+        _ => panic!("record"),
+    };
+    let answer = replay
+        .service
+        .handle(guarded_request("wallet", std::slice::from_ref(&op), None))
+        .await;
+    assert_eq!(answer.status, 200, "{}", body(&answer));
+    let proofs = vec![serde_json::from_value(body(&answer)["proofs"][0].clone()).expect("proof")];
+    let bound = pubky_switch_core::chain::bind_answer(
+        std::slice::from_ref(&op),
+        &proofs,
+        &service_public(&replay),
+        &alice_key().public(),
+    )
+    .expect("bound answer");
+    let revision = bound[0].record_revision().expect("revision");
+    assert_eq!(revision.item_hash, op.item_hash().expect("hash"));
+    assert_eq!(revision.seq, 10);
+    let read = body(
+        &get_as(
+            &replay,
+            "wallet",
+            &format!("records/{}?revision=1", b64(&key)),
+        )
+        .await,
+    );
+    assert_eq!(
+        read["revision"],
+        serde_json::from_slice::<Value>(&revision.to_json().expect("reference"))
+            .expect("reference")
     );
     replay.db.drop_database().await.expect("drop");
 }

@@ -102,7 +102,7 @@ fn test_switch_rules_rebuild_chain_proofs() {
         };
         let generation = envelope["generation"].as_u64().expect("generation");
         let after = state_after(&op, seq, generation, &body["state"]);
-        let state = proof_state(&op.body().kind, &after).expect("state");
+        let state = proof_state(&op, &after).expect("state");
         let object = op
             .body()
             .kind
@@ -136,7 +136,7 @@ fn test_switch_rules_state_after_must_fit_the_operation() {
     assert!(matches!(op.body().kind, OpKind::AppPut { .. }));
     // An app.put given a record's version is a mistake, not a state.
     let wrong = StateAfter::Record(RecordVersion::new(1, 3));
-    assert!(proof_state(&op.body().kind, &wrong).is_err());
+    assert!(proof_state(&op, &wrong).is_err());
 }
 
 #[test]
@@ -306,17 +306,23 @@ fn test_switch_rules_a_delete_shows_deleted() {
     // The vectors' delete: its `ct` is the AEAD tag alone.
     let delete = named("record.put delete");
     let after = StateAfter::Record(RecordVersion::new(1, 12));
-    match proof_state(&delete.body().kind, &after).expect("state") {
-        ProofState::Record { version, deleted } => {
+    match proof_state(&delete, &after).expect("state") {
+        ProofState::Record {
+            version,
+            deleted,
+            revision,
+        } => {
             assert!(deleted, "a delete's proof shows deleted");
             assert_eq!((version.generation, version.version), (1, 12));
+            assert_eq!(revision.item_hash, delete.item_hash().expect("item hash"));
+            assert_eq!((revision.generation, revision.seq), (1, 12));
         }
         other => panic!("not a record state: {other:?}"),
     }
     // A write with a value isn't a delete.
     let update = named("record.put update");
     assert!(matches!(
-        proof_state(&update.body().kind, &after).expect("state"),
+        proof_state(&update, &after).expect("state"),
         ProofState::Record { deleted: false, .. }
     ));
 }

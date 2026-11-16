@@ -309,7 +309,7 @@ impl Inner {
                 seq: self.seq,
             };
             match &body.kind {
-                OpKind::RecordPut(put) => draft.shared.record_written(put, written),
+                OpKind::RecordPut(put) => draft.shared.record_written(put, written)?,
                 OpKind::Claim(fields) => draft.shared.claim_written(fields, written),
                 OpKind::AllowPut {
                     pubky,
@@ -475,7 +475,7 @@ impl Inner {
                 .ok_or_else(|| Refusal::bad_request("Switch wire 6.2: for an app only"))
         };
         let state = match &body.kind {
-            OpKind::RecordPut(put) => draft.shared.record_put(put, cx, generation, seq)?,
+            OpKind::RecordPut(_) => draft.shared.record_put(op, cx, generation, seq)?,
             OpKind::Claim(fields) => draft.shared.claim(fields, cx)?,
             OpKind::AllowPut { pubky, kind } => draft.shared.allow_put(pubky, *kind, cx),
             OpKind::AllowDelete { pubky, kind } => draft.shared.allow_delete(pubky, *kind),

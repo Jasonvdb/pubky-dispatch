@@ -210,6 +210,11 @@ fn state_of_op(
         OpKind::RecordPut(put) => ProofState::Record {
             version: RecordVersion::new(env.generation, env.seq),
             deleted: put.value_sealed.looks_like_delete(),
+            revision: pubky_switch_core::record_authority::ApplicationRef {
+                generation: env.generation,
+                seq: env.seq,
+                item_hash: op.item_hash().unwrap(),
+            },
         },
         OpKind::AppPut { .. } => ProofState::App {
             app_id: body.app_id.unwrap(),
@@ -562,7 +567,7 @@ fn check_record_delete(
 
     // The proof, with the state the record rule gives a delete.
     let state = proof_state(
-        &OpKind::RecordPut(put.clone()),
+        &op,
         &StateAfter::Record(RecordVersion::new(tip.generation, seq)),
     )
     .unwrap();
@@ -571,6 +576,11 @@ fn check_record_delete(
         ProofState::Record {
             version: RecordVersion::new(tip.generation, seq),
             deleted: true,
+            revision: pubky_switch_core::record_authority::ApplicationRef {
+                generation: tip.generation,
+                seq,
+                item_hash: hash
+            },
         }
     );
     let object = op.body().kind.proof_object(Some(&app_id)).unwrap();

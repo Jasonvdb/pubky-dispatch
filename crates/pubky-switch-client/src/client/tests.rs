@@ -1206,6 +1206,8 @@ fn feed_page_with(items: Value) -> Result<FeedPage, ClientError> {
     FeedPage::read(
         Obj::of(&value, "a feed page").unwrap(),
         &identity().public(),
+        NOW,
+        service_public(),
     )
 }
 

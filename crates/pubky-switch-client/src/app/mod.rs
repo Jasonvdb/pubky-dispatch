@@ -1927,6 +1927,20 @@ impl App {
                 }
             }
             backup.waiting.validate(backup, &cert, &protocols)?;
+            let ns = client_namespace(&meta.app_id);
+            // A restore in place keeps the store's event epoch and counter, and what the store
+            // holds of what the app still owes its protocol: the duty events not
+            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
+            // on another device or wiped, starts a new epoch at the first counter. A store
+            // that can't be read fails the restore (`STATE.md`, "What the app owes its
+            // protocol").
+            let old = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let mut carried = Self::kept_for_protocol(&old, &protocols)
+                .await?
+                .unwrap_or_default();
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
@@ -2057,20 +2071,6 @@ impl App {
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
-            let ns = client_namespace(&meta.app_id);
-            // A restore in place keeps the store's event epoch and counter, and what the store
-            // holds of what the app still owes its protocol: the duty events not
-            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
-            // on another device or wiped, starts a new epoch at the first counter. A store
-            // that can't be read fails the restore (`STATE.md`, "What the app owes its
-            // protocol").
-            let old = Reader {
-                ns: ns.clone(),
-                store: env.store.clone(),
-            };
-            let mut carried = Self::kept_for_protocol(&old, &protocols)
-                .await?
-                .unwrap_or_default();
             // Every restore takes the backup's owed calls, each checked as a carried one is
             // and keeping only the protocols registered here; one that isn't whole, or is
             // owed to none of them, is left behind and counted. The restore replaces each
@@ -3092,6 +3092,7 @@ impl App {
                         carried.lost_duties = carried.lost_duties.saturating_add(1);
                         continue;
                     }
+                    kept.check_owners(protocols)?;
                     let value = serde_json::to_value(&kept).map_err(|_| corrupt())?;
                     carried
                         .values

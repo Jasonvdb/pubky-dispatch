@@ -11,6 +11,7 @@ enum Decision {
     Consume,
     Wait,
     Retry,
+    Wide,
 }
 
 struct Input {
@@ -109,6 +110,19 @@ impl Protocol for Input {
         .unwrap();
         match *self.decision.lock().unwrap() {
             Decision::Apply => Outcome::Apply(Effect::default()),
+            Decision::Wide => Outcome::Apply(Effect {
+                ops: vec![
+                    (
+                        Vec::new(),
+                        OpKind::AllowPut {
+                            pubky: message.sender,
+                            kind: AllowKind::Conversation
+                        }
+                    );
+                    pubky_switch_core::ops::MAX_BATCH_ENTRIES
+                ],
+                local: Vec::new(),
+            }),
             Decision::Consume => Outcome::Consume,
             Decision::Wait => Outcome::AwaitAdmission,
             Decision::Retry => Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable)),
@@ -197,7 +211,7 @@ impl Inputs {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(app.event_owners(id).unwrap(), ["tasks", "chat"]);
+        assert_eq!(app.event_owners(id).unwrap(), app.protocols.names());
         id
     }
 }
@@ -899,4 +913,121 @@ async fn test_protocol_inputs_opaque_custody_restores_with_only_its_owner_rules(
             "owned opaque custody keeps its authenticated identity and observation"
         );
     }
+}
+
+async fn duplicate_carried_recipients(waiting: bool) {
+    use crate::app::events::KeptDuty;
+    use crate::store::WriteBatch;
+    let inputs = Inputs::new();
+    let mut app = inputs.join().await;
+    let backup = app.backup_layered().await.unwrap();
+    let id = if waiting {
+        inputs.orphan_notice(&mut app).await
+    } else {
+        inputs.tasks.set(Decision::Wide);
+        let (seq, _) = inputs.send(&app, "tasks.item", json!({"text":"unavailable"}));
+        read(&mut app, 1).await;
+        app.unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                AppEvent::EffectRefused {
+                    id, seq: parked, ..
+                } if *parked == seq => Some(*id),
+                _ => None,
+            })
+            .unwrap()
+    };
+    app.protocol_commit("tasks", &local(b"sentinel", 9))
+        .await
+        .unwrap();
+    let ns = app.ns.clone();
+    let me = app.app_id();
+    let duty_key = key::duty(id.counter());
+    let mut duty: KeptDuty = app.reader().get(&duty_key).await.unwrap().unwrap();
+    duty.to = vec!["tasks".into(), "tasks".into()];
+    let mut corrupt = WriteBatch::new();
+    corrupt
+        .put(
+            &ns,
+            duty_key.into_bytes(),
+            crate::app::state::encode(&duty).unwrap(),
+        )
+        .unwrap();
+    inputs.pair.store.commit(corrupt).unwrap();
+    let before = inputs.pair.snapshot(&me);
+    let hooks = (
+        inputs.tasks.base.restored.lock().unwrap().len(),
+        inputs.chat.base.restored.lock().unwrap().len(),
+    );
+    drop(app);
+    let result = App::restore(inputs.pair.env(), inputs.set(), World::config(), &backup).await;
+    assert!(
+        matches!(result, Err(AppError::Store(StoreError::Corrupt))),
+        "duplicate carried recipients are corrupt"
+    );
+    let unchanged = inputs.pair.snapshot(&me) == before;
+    let sentinel = inputs.pair.store.get(&ns, b"p/tasks/sentinel").unwrap() == Some(vec![9]);
+    let untouched_hooks = (
+        inputs.tasks.base.restored.lock().unwrap().len(),
+        inputs.chat.base.restored.lock().unwrap().len(),
+    ) == hooks;
+    let load_refuses = matches!(
+        App::load(inputs.pair.env(), inputs.set(), World::config(), me).await,
+        Err(AppError::Store(StoreError::Corrupt))
+    );
+    assert_eq!(
+        (unchanged, sentinel, untouched_hooks, load_refuses),
+        (true, true, true, true),
+        "invalid carried recipients refuse before replacement or restore hooks"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_inputs_restore_rejects_duplicate_carried_notice_before_replacement() {
+    duplicate_carried_recipients(true).await;
+}
+
+#[tokio::test]
+async fn test_protocol_inputs_restore_rejects_duplicate_carried_duty_before_replacement() {
+    duplicate_carried_recipients(false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_inputs_restore_intersects_carried_recipients_before_validation() {
+    let inputs = Inputs::new();
+    let mut app = inputs.join().await;
+    let original = app.backup_layered().await.unwrap();
+    drop(app);
+    let news = Input::new("news");
+    let expanded = ProtocolSet::new(vec![
+        inputs.tasks.clone() as Arc<dyn Protocol>,
+        inputs.chat.clone(),
+        news,
+    ])
+    .unwrap();
+    let mut app = App::restore(inputs.pair.env(), expanded, World::config(), &original)
+        .await
+        .unwrap();
+    let id = inputs.orphan_notice(&mut app).await;
+    assert_eq!(app.event_owners(id).unwrap(), ["tasks", "chat", "news"]);
+    drop(app);
+    let mut app = App::restore(inputs.pair.env(), inputs.set(), World::config(), &original)
+        .await
+        .unwrap();
+    let events = app.unacknowledged_events().await.unwrap();
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::StoredEntryDropped { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        app.event_owners(notices[0]).unwrap(),
+        ["tasks", "chat"],
+        "valid old recipients are intersected with the restored registration"
+    );
 }

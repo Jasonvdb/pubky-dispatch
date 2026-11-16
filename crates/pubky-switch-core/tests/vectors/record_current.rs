@@ -1,7 +1,7 @@
 //! Generate and check the signed dependencies of record applications (Switch wire 6.5).
 
 use ed25519_dalek::SigningKey;
-use pubky_switch_core::chain::{ProofBody, Stub, TransitionProof};
+use pubky_switch_core::chain::{ProofBody, SignedHead, Stub, TransitionProof};
 use pubky_switch_core::enc::{b64 as b64e, hash, pubky_id};
 use pubky_switch_core::export::{
     ChunkAnswer, DEFAULT_CHUNK_TARGET, Manifest, ManifestBody, Part, pack,
@@ -322,6 +322,94 @@ fn transfer_cases(keys: &Keys) {
     }
 }
 
+fn ordered_object(fields: Vec<(&str, String)>) -> String {
+    let members: Vec<_> = fields
+        .into_iter()
+        .map(|(name, value)| format!("{}:{value}", serde_json::to_string(name).unwrap()))
+        .collect();
+    format!("{{{}}}", members.join(","))
+}
+
+/// Feed members follow wire 7.4.4; signed documents, stubs and heads use core encoders.
+fn feed_page(page: &Value) -> String {
+    let items: Vec<_> = arr(page, "items")
+        .iter()
+        .map(|item| {
+            let order: &[&str] = match st(item, "type") {
+                "entry" => &[
+                    "type",
+                    "seq",
+                    "entry_id",
+                    "sender",
+                    "cert",
+                    "accepted_at",
+                    "context",
+                    "envelope",
+                ],
+                "chain" => &[
+                    "type",
+                    "seq",
+                    "stub",
+                    "item_type",
+                    "item",
+                    "context",
+                    "proof",
+                ],
+                "stub" => &["type", "seq", "stub"],
+                kind => panic!("unrecognized feed fixture item: {kind}"),
+            };
+            let fields: Vec<_> = order
+                .iter()
+                .filter_map(|name| {
+                    item.get(*name).map(|value| {
+                        let text = match *name {
+                            "stub" => String::from_utf8(Stub::from_value(value).unwrap().to_json())
+                                .unwrap(),
+                            "cert" | "item" | "proof" => {
+                                serde_json::to_string(&signed(value)).unwrap()
+                            }
+                            _ => serde_json::to_string(value).unwrap(),
+                        };
+                        (*name, text)
+                    })
+                })
+                .collect();
+            assert_eq!(fields.len(), item.as_object().unwrap().len());
+            ordered_object(fields)
+        })
+        .collect();
+    let text = ordered_object(vec![
+        ("items", format!("[{}]", items.join(","))),
+        ("next", serde_json::to_string(&page["next"]).unwrap()),
+        (
+            "scanned_through",
+            serde_json::to_string(&page["scanned_through"]).unwrap(),
+        ),
+        ("more", serde_json::to_string(&page["more"]).unwrap()),
+        ("cursor", serde_json::to_string(&page["cursor"]).unwrap()),
+        (
+            "head",
+            String::from_utf8(SignedHead::from_value(&page["head"]).unwrap().to_json()).unwrap(),
+        ),
+    ]);
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), *page);
+    text
+}
+
+/// Write answers retain the member order of wire 7.1.
+fn write_answer(body: &Value) -> String {
+    let proofs: Vec<SignedDoc> = arr(body, "proofs").iter().map(signed).collect();
+    let text = ordered_object(vec![
+        ("proofs", serde_json::to_string(&proofs).unwrap()),
+        (
+            "head",
+            String::from_utf8(SignedHead::from_value(&body["head"]).unwrap().to_json()).unwrap(),
+        ),
+    ]);
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), *body);
+    text
+}
+
 fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &ChunkAnswer) {
     let file = load("http.json");
     for (i, case) in arr(&file, "responses").iter().enumerate() {
@@ -330,9 +418,12 @@ fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &ChunkAnswer)
         replace_proofs(&mut body, replacements);
         let text = if st(case, "name").contains("the export chunk") {
             String::from_utf8(chunk.to_json()).unwrap()
-        } else if body != old {
-            serde_json::to_string(&body).unwrap()
+        } else if st(case, "name").contains("feed page") {
+            feed_page(&body)
+        } else if body.get("proofs").is_some() {
+            write_answer(&body)
         } else {
+            assert_eq!(body, old, "unhandled signed response dependency");
             st(case, "body").to_owned()
         };
         let mut new = case.clone();

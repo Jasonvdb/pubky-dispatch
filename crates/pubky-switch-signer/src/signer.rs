@@ -72,6 +72,7 @@ pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use renewal::{CertChange, RunDue};
+pub use restore::RecordsDiscarded;
 pub use revocation::UserConfirmed;
 pub use takeover::ReceivingApp;
 

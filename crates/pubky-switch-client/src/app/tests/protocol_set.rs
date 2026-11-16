@@ -2205,6 +2205,37 @@ async fn test_protocol_set_restored_gap_waits_behind_a_call_a_protocol_owes() {
 }
 
 #[tokio::test]
+async fn test_protocol_set_message_holds_are_each_protocols_own() {
+    // `tasks` holds, releases, withdraws and lists only messages of its kinds; `chat`'s
+    // messages are `chat`'s to hold.
+    let (p, _tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    let mine = wallet.queue(message("tasks.item")).await.unwrap();
+    let theirs = wallet.queue(message("chat.item")).await.unwrap();
+    for refused in [
+        wallet.hold_message("tasks", &theirs).await.map(|_| ()),
+        wallet.release_message("tasks", &theirs).await,
+        wallet.withdraw_message("tasks", &theirs).await.map(|_| ()),
+    ] {
+        usage(refused, "`tasks`");
+    }
+    assert!(wallet.hold_message("tasks", &mine).await.unwrap());
+    assert!(wallet.hold_message("chat", &theirs).await.unwrap());
+    assert_eq!(
+        wallet.held_messages("tasks").await.unwrap(),
+        vec![mine.clone()]
+    );
+    assert_eq!(
+        wallet.held_messages("chat").await.unwrap(),
+        vec![theirs.clone()]
+    );
+    assert!(wallet.withdraw_message("chat", &theirs).await.unwrap());
+    assert!(wallet.held_messages("chat").await.unwrap().is_empty());
+    assert_eq!(wallet.held_messages("tasks").await.unwrap(), vec![mine]);
+}
+
+#[tokio::test]
 async fn test_protocol_set_upload_transition_waits_behind_a_call_its_protocol_owes() {
     // An upload makes a record of `tasks` divergent while `tasks` owes a missed call it
     // keeps failing: the transition is held, so `tasks` is told nothing of the record past

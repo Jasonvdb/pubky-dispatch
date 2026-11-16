@@ -109,7 +109,68 @@ pub(crate) fn put_hold(tx: &mut super::state::Tx, pubky: &[u8; 32]) -> Result<()
     tx.put(&hold_key(pubky), &())
 }
 
-fn out_key(msg_id: &str) -> String {
+/// A message the app holds ([`App::hold_message`]), by `msg_id`.
+pub(crate) const MESSAGE_HOLD_PREFIX: &str = "outheld/";
+
+fn message_hold_key(msg_id: &str) -> String {
+    format!("{MESSAGE_HOLD_PREFIX}{msg_id}")
+}
+
+/// Hold the message `msg_id`, in `tx` ([`App::hold_message`]): a restore's commit.
+pub(crate) fn put_message_hold(tx: &mut super::state::Tx, msg_id: &str) -> Result<(), AppError> {
+    tx.put(&message_hold_key(msg_id), &())
+}
+
+/// End the hold of the message `msg_id`, in `tx`: in the commit that gives its delivery up.
+pub(crate) fn end_message_hold(tx: &mut super::state::Tx, msg_id: &str) -> Result<(), AppError> {
+    tx.delete(&message_hold_key(msg_id))
+}
+
+/// The kind of the message `msg_id` when `reader` owes its delivery at `now`: the outbox
+/// holds it with a delivery owed and not refused for good, or, absent from the outbox and
+/// not kept as sent, one of `kept`, the messages kept batches put there once they settle,
+/// is it, its delivery not given up. What [`App::hold_message`] and
+/// [`App::withdraw_message`] act on.
+async fn owed_kind(
+    reader: &super::state::Reader,
+    msg_id: &str,
+    now: u64,
+    kept: &[OutboxItem],
+) -> Result<Option<String>, AppError> {
+    if let Some(item) = reader.get::<OutboxItem>(&out_key(msg_id)).await? {
+        return Ok(item.delivery_pending().then_some(item.kind));
+    }
+    if reader.exists(&sent_key(msg_id)).await? || given_up(reader, msg_id, now).await? {
+        return Ok(None);
+    }
+    Ok(kept
+        .iter()
+        .find(|item| item.msg_id == msg_id)
+        .map(|item| item.kind.clone()))
+}
+
+/// The messages `reader` holds ([`App::hold_message`]) whose delivery it owes at `now`,
+/// each with its kind, in `msg_id` order. Every commit that ends a delivery ends its hold,
+/// so none is left over; one that is isn't listed or carried.
+pub(crate) async fn held_messages_of(
+    reader: &super::state::Reader,
+    now: u64,
+) -> Result<Vec<(String, String)>, AppError> {
+    let marks = reader.scan::<()>(MESSAGE_HOLD_PREFIX).await?;
+    if marks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kept = super::batch::kept_queued(reader).await?;
+    let mut held = Vec::new();
+    for (msg_id, ()) in marks {
+        if let Some(kind) = owed_kind(reader, &msg_id, now, &kept).await? {
+            held.push((msg_id, kind));
+        }
+    }
+    Ok(held)
+}
+
+pub(crate) fn out_key(msg_id: &str) -> String {
     format!("{OUT_PREFIX}{msg_id}")
 }
 
@@ -126,21 +187,26 @@ fn given_up_key(msg_id: &str) -> String {
 }
 
 /// Whether the app gave up the delivery of `msg_id` and its mark still stands at `now`
-/// ([`note_given_up`]): such a message isn't queued again, by [`App::queue_stored`] or by a
-/// kept batch that settles after the give-up.
+/// ([`note_given_up`]). A retained outbox item or sent copy keeps the mark effective until
+/// it goes too: neither may recreate an ended delivery (Switch spec 11).
 pub(crate) async fn given_up(
     reader: &super::state::Reader,
     msg_id: &str,
     now: u64,
 ) -> Result<bool, AppError> {
     let until: Option<u64> = reader.get(&given_up_key(msg_id)).await?;
-    Ok(until.is_some_and(|until| now <= until))
+    let Some(until) = until else {
+        return Ok(false);
+    };
+    Ok(now <= until
+        || reader.exists(&out_key(msg_id)).await?
+        || reader.exists(&sent_key(msg_id)).await?)
 }
 
 /// Note in `tx` that the delivery of `msg_id` was given up at `now`, in the commit that
 /// gives it up and tells the protocol: [`App::queue_stored`] refuses the message from then
-/// until [`SENT_RETENTION_MS`] later, past which its replay deadline refuses it anyway, so
-/// the protocol is told once.
+/// until [`SENT_RETENTION_MS`] later, and while the outbox or sent copies keep its plaintext.
+/// Past that window its replay deadline refuses it anyway, so the protocol is told once.
 pub(crate) fn note_given_up(
     tx: &mut super::state::Tx,
     msg_id: &str,
@@ -430,8 +496,7 @@ pub struct OutboxReport {
 /// The envelope sealed for one try, and where.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Sealed {
-    #[serde(with = "serde_b64_vec")]
-    envelope: Vec<u8>,
+    envelope: pubky_switch_core::envelope::SealedEnvelope,
     apps_version: u64,
     origin: String,
     generation: u64,
@@ -533,6 +598,23 @@ impl OutboxItem {
         &self.msg_id
     }
 
+    /// The cached routing fields agree with the plaintext authenticated by this app
+    /// (Switch wire 5.1). Body rules are not needed to retain an unregistered kind.
+    pub(crate) fn is_own(
+        &self,
+        meta: &super::state::Meta,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> bool {
+        own_message(&self.plaintext, &self.to, meta, cert)
+            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+            && self.sealed.as_ref().is_none_or(|sealed| {
+                sealed
+                    .envelope
+                    .matches_plaintext(&self.plaintext)
+                    .unwrap_or(false)
+            })
+    }
+
     fn complete(&self) -> bool {
         self.accepted_at_ms.is_some() && !self.resend && (self.record.is_none() || self.record_done)
     }
@@ -540,6 +622,12 @@ impl OutboxItem {
     /// Whether a delivery is owed: never accepted, or a re-send asked since.
     pub(crate) fn delivery_owed(&self) -> bool {
         self.accepted_at_ms.is_none() || self.resend
+    }
+
+    /// Whether a delivery is owed and the message wasn't refused for good: what a hold
+    /// ([`App::hold_message`]) holds.
+    pub(crate) fn delivery_pending(&self) -> bool {
+        self.failed.is_none() && self.delivery_owed()
     }
 
     /// Count a `403 not_admitted` or `403 not_current` answer at `now`, for `reason`: the
@@ -702,6 +790,15 @@ struct SentStored {
 }
 
 impl SentStored {
+    fn is_own(
+        &self,
+        meta: &super::state::Meta,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> bool {
+        own_message(&self.plaintext, &self.to, meta, cert)
+            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+    }
+
     /// The re-sends' acceptance times, ascending.
     fn resent_ascending(&self) -> Vec<u64> {
         let mut times = self.resent.clone();
@@ -741,11 +838,84 @@ enum Tried {
     Failed(String),
 }
 
+/// Read this app's authenticated common message fields without requiring the original
+/// protocol to remain registered (Switch wire 5.1).
+fn own_message(
+    bytes: &[u8],
+    to: &[u8; 32],
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Option<Message> {
+    let plaintext = MessagePlaintext::decode(bytes).ok()?;
+    if plaintext.sender_app_id() != meta.app_id
+        || plaintext.verify_signature(&cert.signing_key(), to).is_err()
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(plaintext.json()).ok()?;
+    let body = value.get("body")?.as_object()?;
+    // Only the common fields are read from these already-authenticated bytes.
+    let opaque: Vec<_> = body
+        .keys()
+        .map(|member| OpaqueMember { kind: None, member })
+        .collect();
+    let message = Message::parse(plaintext.json(), &opaque).ok()?;
+    (message.to == *to
+        && message.from.identity == meta.identity
+        && message.from.app_id == meta.app_id)
+        .then_some(message)
+}
+
 fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
 
+/// Check the indexed outbox and every retained producer before a load or reload can
+/// expose its routing fields (Switch spec 11).
+pub(crate) async fn validate_outbox(
+    reader: &super::state::Reader,
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Result<(), AppError> {
+    for (msg_id, item) in reader.scan::<OutboxItem>(OUT_PREFIX).await? {
+        if msg_id != item.msg_id || !item.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
+    for (msg_id, sent) in reader.scan::<SentStored>(SENT_PREFIX).await? {
+        if msg_id != sent.msg_id || !sent.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
+    for item in super::batch::kept_queued(reader).await? {
+        if !item.is_own(meta, cert) {
+            return Err(store_corrupt());
+        }
+    }
+    Ok(())
+}
+
 impl App {
+    async fn read_outbox(&self, msg_id: &str) -> Result<Option<OutboxItem>, AppError> {
+        let item = self.reader().get::<OutboxItem>(&out_key(msg_id)).await?;
+        if item.as_ref().is_some_and(|item| {
+            item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
+        }) {
+            return Err(store_corrupt());
+        }
+        Ok(item)
+    }
+
+    async fn read_sent(&self, msg_id: &str) -> Result<Option<SentStored>, AppError> {
+        let sent = self.reader().get::<SentStored>(&sent_key(msg_id)).await?;
+        if sent.as_ref().is_some_and(|sent| {
+            sent.msg_id != msg_id || !sent.is_own(&self.state.meta, &self.state.cert)
+        }) {
+            return Err(store_corrupt());
+        }
+        Ok(sent)
+    }
+
     // ---------------------------------------------------------------------------------
     // Queueing
 
@@ -833,7 +1003,8 @@ impl App {
 
     /// Hold every message to `pubky` that isn't delivered yet, such as when the user blocks
     /// that counterparty, until [`App::release_queued`]. Local only: it sends nothing.
-    /// [`App::withdraw_queued`] gives the held messages up instead.
+    /// [`App::withdraw_queued`] gives the held messages up instead, and
+    /// [`App::hold_message`] holds one message alone.
     ///
     /// - **What is held:** no flush or send delivers a message to `pubky`, a first delivery
     ///   or a re-send, nor writes the conversation entry a first message to it needs. The
@@ -910,6 +1081,147 @@ impl App {
             .collect()
     }
 
+    /// Hold the message `msg_id` of the protocol `protocol`, queued and not delivered yet,
+    /// until [`App::release_message`]: for a protocol that holds some messages to a
+    /// counterparty while others to it still go, such as those of one side of a flow. A
+    /// protocol holds only its own messages, those of its kinds. Local only: it sends
+    /// nothing. [`App::withdraw_message`] gives the message up instead. Returns whether it
+    /// holds it: `false`, writing nothing, when the app owes no delivery of `msg_id`, such
+    /// as for a message delivered, given up, refused for good or never queued here.
+    ///
+    /// It holds as [`App::hold_queued`] holds a counterparty's messages, for this message
+    /// alone, whichever of the two holds:
+    /// - **What is held:** no flush or send delivers it, a first delivery or a re-send, nor
+    ///   writes the conversation entry it needs. It stays queued, untried, and its tries
+    ///   aren't counted. A message a batch kept from an earlier call puts in the outbox once
+    ///   it settles is held too, and so is the copy of it [`App::queue_signed`] or
+    ///   [`App::queue_stored`] queues meanwhile.
+    /// - **What isn't held:** its record job, once the counterparty's inbox accepted it, and
+    ///   the app's other messages to the same counterparty.
+    /// - **The replay deadline keeps running** ([`App::queue_stored`]): a message still held
+    ///   past it is given up and the protocol told ([`AppEvent::MessageUndelivered`]).
+    /// - **It lasts as long as the delivery:** it ends with the release, and in the commit
+    ///   that ends the delivery, whatever ends it: the message delivered, refused for good,
+    ///   given up or withdrawn, the kept batch that would queue it dropped (unless the
+    ///   outbox or another kept batch holds it), or a restore whose outbox doesn't owe it.
+    ///   Nothing else ends it, and a message queued again after its delivery ended starts
+    ///   unheld.
+    /// - **Where it holds:** in this app's store: another app or device of the same
+    ///   identity has an outbox of its own.
+    /// - **A backup carries it** for a message the backup carries in its outbox. A restore
+    ///   keeps the store's holds of the messages its outbox owes as well as the backup's, so
+    ///   a release made after the backup is undone by a restore in place: the protocol
+    ///   releases again. A backup taken before the hold doesn't carry it, nor one taken while
+    ///   the message was only in a kept batch: the client delivers nothing during
+    ///   [`App::restore`], [`App::load`] or [`App::receive`], so a protocol that holds again
+    ///   before the host calls [`App::flush_outbox`], [`App::flush_message`], [`App::send`]
+    ///   or [`App::resend`] leaves no window.
+    /// - **A try in flight:** after a crash during a delivery's try, the message may have
+    ///   reached the counterparty's inbox although the outbox still owes it; a hold then
+    ///   holds a re-try that the inbox drops as a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered, or a message of another
+    /// protocol's kind; [`Refusal::Stopped`] or [`Refusal::Left`]; a store failure.
+    pub async fn hold_message(&mut self, protocol: &str, msg_id: &str) -> Result<bool, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            if self.owned_owed(protocol, msg_id).await?.is_none() {
+                return Ok(false);
+            }
+            let mut tx = self.tx()?;
+            put_message_hold(&mut tx, msg_id)?;
+            self.commit(tx).await?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Lift [`App::hold_message`] of the protocol `protocol` for `msg_id`: it goes again
+    /// from the next flush, unless its counterparty is held ([`App::hold_queued`]).
+    /// Releasing a message that isn't held changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered, or a message of another
+    /// protocol's kind; [`Refusal::Stopped`] or [`Refusal::Left`]; a store failure.
+    pub async fn release_message(&mut self, protocol: &str, msg_id: &str) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.owned_owed(protocol, msg_id).await?;
+            let mut tx = self.tx()?;
+            end_message_hold(&mut tx, msg_id)?;
+            self.commit(tx).await
+        })
+        .await
+    }
+
+    /// The messages of the protocol `protocol` the app holds ([`App::hold_message`]) and
+    /// still owes a delivery of, in `msg_id` order.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered; a store failure.
+    pub async fn held_messages(&self, protocol: &str) -> Result<Vec<String>, AppError> {
+        self.check_registered(protocol)?;
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        Ok(held_messages_of(&self.reader(), self.now())
+            .await?
+            .into_iter()
+            .filter(|(_, kind)| self.owns_kind(protocol, kind))
+            .map(|(msg_id, _)| msg_id)
+            .collect())
+    }
+
+    /// Whether `kind` is a kind of the protocol `protocol`, or of no registered protocol,
+    /// as a message a restore with another set of protocols brings back: any protocol may
+    /// then act on it, so its hold can still be released.
+    fn owns_kind(&self, protocol: &str, kind: &str) -> bool {
+        self.protocols
+            .of_kind(kind)
+            .is_none_or(|owner| owner.name == protocol)
+    }
+
+    /// The kind of the message `msg_id` when the app owes its delivery, checked to be a
+    /// message of the protocol `protocol`: what the per-message calls act on.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered, or a message of another kind than
+    /// its own; a store failure.
+    async fn owned_owed(&self, protocol: &str, msg_id: &str) -> Result<Option<String>, AppError> {
+        self.check_registered(protocol)?;
+        let reader = self.reader();
+        if reader
+            .get::<OutboxItem>(&out_key(msg_id))
+            .await?
+            .is_some_and(|item| {
+                item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
+            })
+        {
+            return Err(store_corrupt());
+        }
+        let kept = super::batch::kept_queued(&reader).await?;
+        if kept
+            .iter()
+            .filter(|item| item.msg_id == msg_id)
+            .any(|item| !item.is_own(&self.state.meta, &self.state.cert))
+        {
+            return Err(store_corrupt());
+        }
+        let kind = owed_kind(&reader, msg_id, self.now(), &kept).await?;
+        match kind {
+            Some(kind) if !self.owns_kind(protocol, &kind) => Err(Refusal::Usage(format!(
+                "`{msg_id}` is a message of no kind of `{protocol}`"
+            ))
+            .into()),
+            kind => Ok(kind),
+        }
+    }
+
     /// Give up every message to `pubky` that isn't delivered yet, held or not: each is
     /// deleted from the outbox, plaintext and all, and the protocol told once
     /// ([`AppEvent::MessageUndelivered`], a duty event, `resend: true` for a re-send of one
@@ -917,11 +1229,11 @@ impl App {
     /// batch kept from an earlier call would put in the outbox once it settles: the batch's
     /// other operations still go, and the message isn't queued. A message given up so is
     /// never queued again by this store: [`App::queue_stored`] refuses it, and a re-send
-    /// after the counterparty's provider loss leaves it out. Only the host's own
-    /// [`App::resend`] of it sends it again. Returns the messages given up: those of the
-    /// outbox in queue order, then those of kept batches. Until its batch settles,
-    /// [`App::delivery`] of a message given up from a kept batch still reads
-    /// [`Delivery::Kept`], and `None` after. Local only: it sends nothing.
+    /// after the counterparty's provider loss leaves it out. [`App::resend`] refuses
+    /// it too. Returns the messages given up: those of the outbox in queue order,
+    /// then those of kept batches. The retained queued copies and
+    /// their delivery index are removed in the same commit, leaving the batch's other
+    /// operations and local writes intact. Local only: it sends nothing.
     ///
     /// # Errors
     ///
@@ -931,59 +1243,100 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let now = self.now();
-            let mut items: Vec<OutboxItem> = self
-                .reader()
-                .scan::<OutboxItem>(OUT_PREFIX)
-                .await?
-                .into_iter()
-                .map(|(_, item)| item)
-                .filter(|item| item.to == *pubky && item.failed.is_none() && item.delivery_owed())
-                .collect();
-            items.sort_by_key(|item| item.queued_ms);
-            let mut withdrawn = Vec::new();
-            for item in items {
+            self.withdraw_where(|item| item.to == *pubky).await
+        })
+        .await
+    }
+
+    /// Give up the message `msg_id` of the protocol `protocol`, held or not, as
+    /// [`App::withdraw_queued`] gives up each message to a counterparty, with the same
+    /// exceptions (a re-send whose record job is still owed keeps its outbox item for that
+    /// job; [`App::queue_signed`] checks no give-up): its delivery ends, in the outbox or in
+    /// what a batch kept from an earlier call puts there once it settles, and the protocol
+    /// is told once ([`AppEvent::MessageUndelivered`]); its hold, if any, ends. Returns
+    /// whether it gave it up: `false`, changing nothing, when the app owes no delivery of
+    /// `msg_id`. Local only: it sends nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered, or a message of another
+    /// protocol's kind; [`Refusal::Stopped`] or [`Refusal::Left`]; a store failure.
+    pub async fn withdraw_message(
+        &mut self,
+        protocol: &str,
+        msg_id: &str,
+    ) -> Result<bool, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            if self.owned_owed(protocol, msg_id).await?.is_none() {
+                return Ok(false);
+            }
+            let withdrawn = self.withdraw_where(|item| item.msg_id == msg_id).await?;
+            Ok(!withdrawn.is_empty())
+        })
+        .await
+    }
+
+    /// Give up every message `matches` takes whose delivery is owed, as
+    /// [`App::withdraw_queued`] says: those of the outbox in queue order, each in a commit of
+    /// its own, then those of kept batches.
+    async fn withdraw_where(
+        &mut self,
+        matches: impl Fn(&OutboxItem) -> bool,
+    ) -> Result<Vec<String>, AppError> {
+        validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        let now = self.now();
+        let mut items: Vec<OutboxItem> = self
+            .reader()
+            .scan::<OutboxItem>(OUT_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(_, item)| item)
+            .filter(|item| matches(item) && item.failed.is_none() && item.delivery_owed())
+            .collect();
+        items.sort_by_key(|item| item.queued_ms);
+        let mut withdrawn = Vec::new();
+        for item in items {
+            let msg_id = item.msg_id.clone();
+            let to = self.owners_of_kind(&item.kind);
+            let (kept, duty) = item.give_up_delivery();
+            let mut tx = self.tx()?;
+            match &kept {
+                // Kept for its record job: the mark stops a re-send after a loss.
+                Some(kept) => tx.put(&out_key(&msg_id), kept)?,
+                None => tx.delete(&out_key(&msg_id))?,
+            }
+            self.end_delivery(&msg_id, &mut tx).await?;
+            self.keep_duty_for(&mut tx, to, duty)?;
+            self.commit(tx).await?;
+            withdrawn.push(msg_id);
+        }
+        // The messages kept batches would queue once they settle.
+        for (_, pending) in self.kept_batches().await? {
+            for item in pending.queued.iter().filter(|item| matches(item)) {
                 let msg_id = item.msg_id.clone();
-                let to = self.owners_of_kind(&item.kind);
-                let (kept, duty) = item.give_up_delivery();
-                let mut tx = self.tx()?;
-                match &kept {
-                    // Kept for its record job: the mark stops a re-send after a loss.
-                    Some(kept) => tx.put(&out_key(&msg_id), kept)?,
-                    None => tx.delete(&out_key(&msg_id))?,
+                if self.knows_message(&msg_id).await?
+                    || given_up(&self.reader(), &msg_id, now).await?
+                {
+                    continue;
                 }
-                note_given_up(&mut tx, &msg_id, now)?;
-                self.keep_duty_for(&mut tx, to, duty)?;
+                let mut tx = self.tx()?;
+                self.end_delivery(&msg_id, &mut tx).await?;
+                let to = self.owners_of_kind(&item.kind);
+                self.keep_duty_for(
+                    &mut tx,
+                    to,
+                    Duty::MessageUndelivered {
+                        msg_id: msg_id.clone(),
+                        resend: false,
+                    },
+                )?;
                 self.commit(tx).await?;
                 withdrawn.push(msg_id);
             }
-            // The messages kept batches would queue once they settle.
-            for (_, pending) in self.kept_batches().await? {
-                for item in pending.queued.iter().filter(|item| item.to == *pubky) {
-                    let msg_id = item.msg_id.clone();
-                    if self.knows_message(&msg_id).await?
-                        || given_up(&self.reader(), &msg_id, now).await?
-                    {
-                        continue;
-                    }
-                    let mut tx = self.tx()?;
-                    note_given_up(&mut tx, &msg_id, now)?;
-                    let to = self.owners_of_kind(&item.kind);
-                    self.keep_duty_for(
-                        &mut tx,
-                        to,
-                        Duty::MessageUndelivered {
-                            msg_id: msg_id.clone(),
-                            resend: false,
-                        },
-                    )?;
-                    self.commit(tx).await?;
-                    withdrawn.push(msg_id);
-                }
-            }
-            Ok(withdrawn)
-        })
-        .await
+        }
+        Ok(withdrawn)
     }
 
     /// Record a message signed by [`App::sign_message`] in the outbox, with its jobs,
@@ -1222,17 +1575,16 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
+    /// [`Refusal::WontDeliver`] with [`WontDeliver::GivenUp`] for a delivery the app gave
+    /// up; [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
     pub async fn resend(&mut self, msg_id: &str) -> Result<Delivery, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            if !self.ask_resend_of_queued(msg_id).await? {
-                let sent: SentStored =
-                    self.reader().get(&sent_key(msg_id)).await?.ok_or_else(|| {
-                        AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
-                    })?;
-                self.queue_resend(&sent).await?;
+            if !self.prepare_resend(msg_id).await? {
+                return Err(AppError::Refused(Refusal::WontDeliver(
+                    WontDeliver::GivenUp,
+                )));
             }
             self.flush_item(msg_id).await?;
             self.delivery(msg_id)
@@ -1242,10 +1594,26 @@ impl App {
         .await
     }
 
+    /// Prepare either retained copy for a re-send, unless its delivery was given up.
+    /// Check before changing an accepted item's jobs or queuing its sent copy, so a repeated
+    /// request neither delivers it nor reports it undelivered again (Switch spec 11).
+    async fn prepare_resend(&mut self, msg_id: &str) -> Result<bool, AppError> {
+        if given_up(&self.reader(), msg_id, self.now()).await? {
+            return Ok(false);
+        }
+        if !self.ask_resend_of_queued(msg_id).await? {
+            let sent = self.read_sent(msg_id).await?.ok_or_else(|| {
+                AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
+            })?;
+            self.queue_resend(&sent).await?;
+        }
+        Ok(true)
+    }
+
     /// A message still in the outbox: one already accepted, whose other jobs are owed, is
     /// marked to be sealed and sent again. Returns whether it is in the outbox.
     async fn ask_resend_of_queued(&mut self, msg_id: &str) -> Result<bool, AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
         };
         if let Some(accepted) = item.accepted_at_ms
@@ -1315,7 +1683,10 @@ impl App {
         since_ms: u64,
     ) -> Result<(), AppError> {
         let mut queued = 0u64;
-        for (_, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+        for (msg_id, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+            if msg_id != sent.msg_id || !sent.is_own(&self.state.meta, &self.state.cert) {
+                return Err(store_corrupt());
+            }
             let last = sent
                 .resent
                 .iter()
@@ -1326,16 +1697,9 @@ impl App {
             if sent.to != *pubky || last < since_ms {
                 continue;
             }
-            // A message whose delivery the app gave up, withdrawn or otherwise, and told the
-            // protocol so, isn't sent again.
-            if given_up(&self.reader(), &sent.msg_id, self.now()).await? {
-                continue;
+            if self.prepare_resend(&sent.msg_id).await? {
+                queued = queued.saturating_add(1);
             }
-            // One whose record job is still owed is in the outbox: marked to go again.
-            if !self.ask_resend_of_queued(&sent.msg_id).await? {
-                self.queue_resend(&sent).await?;
-            }
-            queued = queued.saturating_add(1);
         }
         if queued > 0 {
             self.events.push(AppEvent::ResendAfterLoss {
@@ -1359,7 +1723,7 @@ impl App {
     ///
     /// A store failure.
     pub async fn delivery(&self, msg_id: &str) -> Result<Option<Delivery>, AppError> {
-        if let Some(item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? {
+        if let Some(item) = self.read_outbox(msg_id).await? {
             return Ok(Some(match (&item.failed, item.accepted_at_ms) {
                 (Some((reason, failed_at_ms)), _) => Delivery::Failed {
                     reason: reason.clone(),
@@ -1376,7 +1740,7 @@ impl App {
                 },
             }));
         }
-        if let Some(sent) = self.reader().get::<SentStored>(&sent_key(msg_id)).await? {
+        if let Some(sent) = self.read_sent(msg_id).await? {
             return Ok(Some(Delivery::Accepted {
                 accepted_at_ms: sent.first_ms,
             }));
@@ -1399,7 +1763,10 @@ impl App {
         until_ms: u64,
     ) -> Result<Vec<SentMessage>, AppError> {
         let mut out = Vec::new();
-        for (_, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+        for (msg_id, sent) in self.reader().scan::<SentStored>(SENT_PREFIX).await? {
+            if msg_id != sent.msg_id || !sent.is_own(&self.state.meta, &self.state.cert) {
+                return Err(store_corrupt());
+            }
             let within = std::iter::once(sent.first_ms)
                 .chain(sent.resent.iter().copied())
                 .any(|at| at >= from_ms && at <= until_ms);
@@ -1647,7 +2014,7 @@ impl App {
     /// message never accepted is deleted, plaintext and all; one accepted before keeps its
     /// record while its record job is owed, and only the re-send is given up.
     async fn give_up_too_large(&mut self, msg_id: &str) -> Result<(), AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(());
         };
         let resend =
@@ -1662,10 +2029,10 @@ impl App {
             let mut tx = self.tx()?;
             if gone {
                 tx.delete(&out_key(msg_id))?;
-                note_given_up(&mut tx, msg_id, self.now())?;
             } else {
                 tx.put(&out_key(msg_id), &item)?;
             }
+            self.end_delivery(msg_id, &mut tx).await?;
             let to = self.owners_of_kind(&item.kind);
             self.keep_duty_for(
                 &mut tx,
@@ -1690,14 +2057,15 @@ impl App {
     /// the delivery, and the record job. Each is a bounded call of its own, and a try once
     /// begun goes whole, so no job of a message waits behind another of its jobs.
     async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
-        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+        let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
         };
         if item.failed.is_some() {
             return Ok(false);
         }
-        // A delivery to a counterparty the host holds, or one its protocol holds back, isn't
-        // tried, a first one or a re-send ([`App::hold_queued`], [`super::Protocol::may_send`]);
+        // A delivery to a counterparty the host holds, of a message it holds, or one its
+        // protocol holds back, isn't tried, a first one or a re-send ([`App::hold_queued`],
+        // [`App::hold_message`], [`super::Protocol::may_send`]);
         // its replay deadline still runs, and its record job goes.
         let held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
@@ -1720,9 +2088,9 @@ impl App {
                     Some(kept) => tx.put(&out_key(msg_id), kept)?,
                     None => {
                         tx.delete(&out_key(msg_id))?;
-                        note_given_up(&mut tx, msg_id, self.now())?;
                     }
                 }
+                self.end_delivery(msg_id, &mut tx).await?;
                 self.keep_duty_for(&mut tx, to, duty)?;
                 self.commit(tx).await?;
                 return Ok(true);
@@ -1767,8 +2135,12 @@ impl App {
                     }
                 }
                 Tried::Failed(why) => {
+                    // Refused for good: the delivery ends, and its hold with it.
                     item.failed = Some((why, self.now()));
-                    self.save_item(&item).await?;
+                    let mut tx = self.tx()?;
+                    tx.put(&out_key(&item.msg_id), &item)?;
+                    self.end_delivery(&item.msg_id, &mut tx).await?;
+                    self.commit(tx).await?;
                 }
             }
         }
@@ -1822,10 +2194,10 @@ impl App {
         let mut tx = self.tx()?;
         if gone {
             tx.delete(&out_key(&item.msg_id))?;
-            note_given_up(&mut tx, &item.msg_id, self.now())?;
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
+        self.end_delivery(&item.msg_id, &mut tx).await?;
         // A duty event for the protocol of the message's kind, kept in the commit that
         // gives the delivery up.
         let to = self.owners_of_kind(&item.kind);
@@ -1863,11 +2235,9 @@ impl App {
         item.clear_undeliverable();
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
-        let sent = match self
-            .reader()
-            .get::<SentStored>(&sent_key(&item.msg_id))
-            .await?
-        {
+        // No retained producer can recreate this completed delivery after retention.
+        self.end_delivery(&item.msg_id, &mut tx).await?;
+        let sent = match self.read_sent(&item.msg_id).await? {
             Some(mut sent) => {
                 if at != sent.first_ms && !sent.resent.contains(&at) {
                     sent.resent.push(at);
@@ -1960,7 +2330,13 @@ impl App {
         }
         let now = self.now();
         for (msg_id, until) in self.reader().scan::<u64>(GIVEN_UP_PREFIX).await? {
-            if until < now {
+            // A retained item may still await its turn in a bounded flush. Keep its mark
+            // until neither stored copy can produce a re-send, even if this commit removes
+            // the sent copy: the next prune can remove the mark.
+            if until < now
+                && !self.reader().exists(&out_key(&msg_id)).await?
+                && !self.reader().exists(&sent_key(&msg_id)).await?
+            {
                 tx.delete(&given_up_key(&msg_id))?;
             }
         }
@@ -2128,14 +2504,18 @@ impl App {
             let result = if own {
                 let result = self
                     .client
-                    .append(sealed.envelope.clone(), sealed.apps_version, None)
+                    .append(
+                        sealed.envelope.as_bytes().to_vec(),
+                        sealed.apps_version,
+                        None,
+                    )
                     .await;
                 self.take(result).await
             } else {
                 let client = self.peer_client(&to, &doc)?;
                 client
                     .append(
-                        sealed.envelope.clone(),
+                        sealed.envelope.as_bytes().to_vec(),
                         sealed.apps_version,
                         invite.as_deref(),
                     )
@@ -2200,13 +2580,18 @@ impl App {
     }
 
     /// Whether the delivery of an outbox message waits: one is owed, and the host holds its
-    /// counterparty ([`App::hold_queued`]) or its protocol holds it back
-    /// ([`super::Protocol::may_send`]). Every call that tries a delivery ([`App::send`],
-    /// [`App::flush_message`], [`App::resend`], [`App::flush_outbox`]) goes through
-    /// `try_item`, which asks this, so no call passes either hold.
+    /// counterparty ([`App::hold_queued`]) or the message itself ([`App::hold_message`]), or
+    /// its protocol holds it back ([`super::Protocol::may_send`]). Every call that tries a
+    /// delivery ([`App::send`], [`App::flush_message`], [`App::resend`],
+    /// [`App::flush_outbox`]) goes through `try_item`, which asks this, so no call passes
+    /// any of the holds.
     async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
-        Ok(item.delivery_owed()
-            && (!self.may_send(item) || self.reader().exists(&hold_key(&item.to)).await?))
+        if !item.delivery_owed() || !self.may_send(item) {
+            return Ok(item.delivery_owed());
+        }
+        let reader = self.reader();
+        Ok(reader.exists(&hold_key(&item.to)).await?
+            || reader.exists(&message_hold_key(&item.msg_id)).await?)
     }
 
     /// Whether the protocol of an outbox message's kind lets it go out now
@@ -2247,7 +2632,12 @@ impl App {
         let message = Message::parse(plaintext.json(), &opaque)?;
         let (routes, apps_version) = self.routes(&item.to, &message, invite).await?;
         let recipients: Vec<_> = routes.iter().map(|r: &Route| r.recipient).collect();
-        let envelope = plaintext.seal(&item.to, &recipients, item.notify)?;
+        let envelope = pubky_switch_core::envelope::seal_retained(
+            &item.to,
+            &recipients,
+            &plaintext.encode(),
+            item.notify,
+        )?;
         let doc = self.peer_identity(&item.to, false).await?;
         item.sealed = Some(Sealed {
             envelope,
@@ -2279,10 +2669,7 @@ impl App {
     /// The record job: the protocol builds the record's next value from what the app holds,
     /// written compare-and-swap.
     async fn record_job(&mut self, item: &OutboxItem, job: &KeptJob) -> Result<(), AppError> {
-        let kept = self
-            .reader()
-            .get::<SentStored>(&sent_key(&item.msg_id))
-            .await?;
+        let kept = self.read_sent(&item.msg_id).await?;
         let sent = SentMessage {
             to: item.to,
             kind: item.kind.clone(),
@@ -2435,7 +2822,17 @@ mod tests {
             invite_code: None,
             conversation: false,
             sealed: Some(Sealed {
-                envelope: vec![7],
+                envelope: pubky_switch_core::envelope::seal_retained(
+                    &[1; 32],
+                    &[pubky_switch_core::envelope::Recipient::new(
+                        pubky_switch_core::keys::ReceiveKey::generate(0)
+                            .unwrap()
+                            .public,
+                    )],
+                    &[],
+                    false,
+                )
+                .unwrap(),
                 apps_version: 1,
                 origin: "https://bob.example".into(),
                 generation: 1,

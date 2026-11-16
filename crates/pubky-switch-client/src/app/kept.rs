@@ -168,6 +168,11 @@ pub(crate) fn index_kept(
     Ok(())
 }
 
+/// Remove the status index of a delivery removed from every retained batch.
+pub(crate) fn forget_delivery(tx: &mut Tx, msg_id: &str) -> Result<(), AppError> {
+    tx.delete(&message_key(msg_id))
+}
+
 impl App {
     /// End the batch kept under `batch_id` in `tx`: it is no longer kept, and its end is
     /// written in the same commit, at the app's clock.

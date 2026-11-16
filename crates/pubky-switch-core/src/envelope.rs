@@ -24,7 +24,8 @@ use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable as _, OpModeR, OpModeS, Serializable as _};
-use zeroize::{Zeroize as _, Zeroizing};
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::enc::{SUITE_1, derive, kid, lp, random_bytes, x25519_low_order};
 use crate::error::{Error, Result, SizeRefusal, invalid};
@@ -302,6 +303,52 @@ fn has_duplicate_kid(kids: impl Iterator<Item = [u8; 8]>) -> bool {
     kids.into_iter().any(|kid| !seen.insert(kid))
 }
 
+/// Exact envelope bytes retained for retries, with the content key needed to check that
+/// they encrypt the queued plaintext (Switch spec 11; Switch wire 4.2, 4.3).
+///
+/// Sensitive: store this as securely as the plaintext. Its fields are private, its debug
+/// output includes neither the key nor the envelope, and dropping it clears both.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct SealedEnvelope {
+    #[serde(with = "crate::enc::serde_b64_vec")]
+    bytes: Vec<u8>,
+    #[serde(with = "crate::enc::serde_b64")]
+    content_key: [u8; CONTENT_KEY_LEN],
+}
+
+impl std::fmt::Debug for SealedEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealedEnvelope")
+    }
+}
+
+impl SealedEnvelope {
+    /// The unchanged envelope bytes to append, including on a retry.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Whether these exact bytes encrypt `plaintext` followed only by zero padding.
+    /// The content-key commitment makes every recipient open the same plaintext or none
+    /// (Switch wire 4.3). This check needs no recipient key and never changes the envelope.
+    ///
+    /// # Errors
+    ///
+    /// An invalid envelope, a content key that fails its commitment, or a body that fails
+    /// authenticated decryption.
+    pub fn matches_plaintext(&self, plaintext: &[u8]) -> Result<bool> {
+        let header = check_at_inbox(&self.bytes)
+            .map_err(|_| Error::Invalid("Switch wire 4.4: an invalid retained envelope".into()))?;
+        check_content_key(&header, &self.content_key)?;
+        let opened = open_body(&self.bytes, &header, &self.content_key)?;
+        Ok(opened
+            .split_at_checked(plaintext.len())
+            .is_some_and(|(body, padding)| {
+                body == plaintext && padding.iter().all(|byte| *byte == 0)
+            }))
+    }
+}
+
 /// Seal `plaintext` to `recipients`, keys of apps of `recipient_identity` (Switch wire 4.3).
 ///
 /// The plaintext is padded with zeros to the smallest bucket that holds it (Switch wire
@@ -319,6 +366,23 @@ pub fn seal(
     plaintext: &[u8],
     notify: bool,
 ) -> Result<Vec<u8>> {
+    seal_retained(recipient_identity, recipients, plaintext, notify)
+        .map(|mut sealed| std::mem::take(&mut sealed.bytes))
+}
+
+/// Seal with OS randomness as [`seal`] does, retaining the content key alongside the
+/// exact envelope for later plaintext checks. This material is local to the sender; only
+/// [`SealedEnvelope::as_bytes`] is sent (Switch spec 11).
+///
+/// # Errors
+///
+/// As [`seal`].
+pub fn seal_retained(
+    recipient_identity: &[u8; 32],
+    recipients: &[Recipient],
+    plaintext: &[u8],
+    notify: bool,
+) -> Result<SealedEnvelope> {
     let content_key = Zeroizing::new(random_bytes::<CONTENT_KEY_LEN>()?);
     let nonce = random_bytes::<NONCE_LEN>()?;
     let ikm_e = Zeroizing::new(
@@ -327,7 +391,7 @@ pub fn seal(
             .map(|_| random_bytes::<32>())
             .collect::<Result<Vec<_>>>()?,
     );
-    seal_parts(
+    let bytes = seal_parts(
         recipient_identity,
         recipients,
         plaintext,
@@ -335,7 +399,11 @@ pub fn seal(
         &content_key,
         &nonce,
         &ikm_e,
-    )
+    )?;
+    Ok(SealedEnvelope {
+        bytes,
+        content_key: *content_key,
+    })
 }
 
 /// [`seal`] with fixed randomness, to rebuild the shared vectors: the content key, the nonce,
@@ -558,6 +626,14 @@ pub fn open(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let header = parse_header(envelope)?;
     let content_key = unwrap_content_key(envelope, &header, recipient_identity, secret)?;
+    open_body(envelope, &header, &content_key)
+}
+
+fn open_body(
+    envelope: &[u8],
+    header: &Header,
+    content_key: &[u8; CONTENT_KEY_LEN],
+) -> Result<Zeroizing<Vec<u8>>> {
     // Step 5: the body, with the whole header as AAD.
     let (header_bytes, body) = envelope
         .split_at_checked(header.len())
@@ -565,7 +641,7 @@ pub fn open(
     let ciphertext = body
         .get(NONCE_LEN..)
         .ok_or_else(|| Error::Invalid("Switch wire 4.3 step 1: a short envelope".into()))?;
-    XChaCha20Poly1305::new((&*content_key).into())
+    XChaCha20Poly1305::new(content_key.into())
         .decrypt(
             chacha20poly1305::XNonce::from_slice(&header.nonce),
             Payload {
@@ -645,13 +721,18 @@ fn unwrap_content_key(
             Error::Crypto("Switch wire 4.3 step 3: the content key isn't 32 bytes".into())
         })?,
     );
+    check_content_key(header, &content_key)?;
+    Ok(content_key)
+}
+
+fn check_content_key(header: &Header, content_key: &[u8; CONTENT_KEY_LEN]) -> Result<()> {
     // Step 4: the key commitment, so every recipient opens the same plaintext or none.
-    if key_commitment(&content_key) != header.key_commitment {
+    if key_commitment(content_key) != header.key_commitment {
         return Err(Error::Crypto(
             "Switch wire 4.3 step 4: the content key doesn't match the key commitment".into(),
         ));
     }
-    Ok(content_key)
+    Ok(())
 }
 
 /// Frame a JSON document for an envelope: `u32_be(len(JSON)) || JSON`, which sealing pads with
@@ -843,6 +924,100 @@ mod tests {
         assert_eq!(opened_a.len(), 1024 - 40 - 2 * 88 - 24 - 16);
         assert!(opened_a.starts_with(b"hello"));
         check_padding(&opened_a[5..]).unwrap();
+    }
+
+    #[test]
+    fn test_envelope_retained_opens_the_same_plaintext_after_serialization() {
+        let a = key(1);
+        let b = key(2);
+        let recipients = [Recipient::new(a.public), Recipient::new(b.public)];
+        let retained = seal_retained(&IDENTITY, &recipients, b"same message", true).unwrap();
+        let encoded = serde_json::to_vec(&retained).unwrap();
+        let restored: SealedEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.as_bytes(), retained.as_bytes());
+        assert!(restored.matches_plaintext(b"same message").unwrap());
+        assert!(!restored.matches_plaintext(b"other message").unwrap());
+        assert!(
+            !restored
+                .matches_plaintext(&vec![0; MAX_ENVELOPE_LEN])
+                .unwrap()
+        );
+        for recipient in [&a, &b] {
+            let opened = open(restored.as_bytes(), &IDENTITY, &recipient.secret()).unwrap();
+            assert_eq!(&opened[..12], b"same message");
+            check_padding(&opened[12..]).unwrap();
+        }
+        assert_eq!(format!("{restored:?}"), "SealedEnvelope");
+        let mut cleared = restored.clone();
+        cleared.zeroize();
+        assert!(cleared.bytes.is_empty());
+        assert_eq!(cleared.content_key, [0; CONTENT_KEY_LEN]);
+    }
+
+    #[test]
+    fn test_envelope_retained_rejects_changed_key_header_and_ciphertext() {
+        let recipient = key(1);
+        let retained = seal_retained(
+            &IDENTITY,
+            &[Recipient::new(recipient.public)],
+            b"same",
+            false,
+        )
+        .unwrap();
+        let mut wrong_key = retained.clone();
+        wrong_key.content_key[0] ^= 1;
+        assert!(wrong_key.matches_plaintext(b"same").is_err());
+        for at in [0, 8, 40, retained.bytes.len() - 1] {
+            let mut changed = retained.clone();
+            changed.bytes[at] ^= 1;
+            assert!(changed.matches_plaintext(b"same").is_err(), "byte {at}");
+        }
+    }
+
+    #[test]
+    fn test_envelope_retained_checks_the_commitment_before_plaintext() {
+        let recipient = key(1);
+        let mut retained = seal_retained(
+            &IDENTITY,
+            &[Recipient::new(recipient.public)],
+            b"same",
+            false,
+        )
+        .unwrap();
+        // A body can authenticate under a key whose commitment the header doesn't name.
+        // Every recipient rejects that key, so the sender must reject it too.
+        retained.bytes[8] ^= 1;
+        let header = parse_header(&retained.bytes).unwrap();
+        let padded_len = retained.bytes.len() - header.len() - NONCE_LEN - TAG_LEN;
+        let mut padded = vec![0; padded_len];
+        padded[..4].copy_from_slice(b"same");
+        let ciphertext = XChaCha20Poly1305::new((&retained.content_key).into())
+            .encrypt(
+                chacha20poly1305::XNonce::from_slice(&header.nonce),
+                Payload {
+                    msg: &padded,
+                    aad: &retained.bytes[..header.len()],
+                },
+            )
+            .unwrap();
+        retained.bytes.truncate(header.len() + NONCE_LEN);
+        retained.bytes.extend_from_slice(&ciphertext);
+        assert!(open_body(retained.as_bytes(), &header, &retained.content_key).is_ok());
+        assert!(retained.matches_plaintext(b"same").is_err());
+    }
+
+    #[test]
+    fn test_envelope_retained_rejects_nonzero_plaintext_padding() {
+        let recipient = key(1);
+        let retained = seal_retained(
+            &IDENTITY,
+            &[Recipient::new(recipient.public)],
+            b"same\x01",
+            false,
+        )
+        .unwrap();
+        assert!(retained.matches_plaintext(b"same\x01").unwrap());
+        assert!(!retained.matches_plaintext(b"same").unwrap());
     }
 
     #[test]

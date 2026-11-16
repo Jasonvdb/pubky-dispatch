@@ -1326,7 +1326,7 @@ impl App {
             let never_sent = pending.kept_ms.is_none();
             if resend_first && !never_sent {
                 if !answer_decides(pending.kept_ms) {
-                    self.kept_batch_dropped(&id, &pending, &kept, tx)?;
+                    self.kept_batch_dropped(&id, &pending, &kept, tx).await?;
                 }
                 continue;
             }
@@ -1335,7 +1335,7 @@ impl App {
                 matches!(kind, OpKind::Claim(claim) if claim.kind == ClaimType::Attempt)
             });
             if carry == Carry::AfterLoss && attempts {
-                self.kept_batch_dropped(&id, &pending, &kept, tx)?;
+                self.kept_batch_dropped(&id, &pending, &kept, tx).await?;
                 continue;
             }
             let signed = self.sign_ops(ops, None)?;
@@ -1360,13 +1360,14 @@ impl App {
     /// those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). Duty
     /// events, kept in `tx`, the commit that drops the batch. One whose first send never
     /// left was never applied; once sent, whether it was can't be told.
-    pub(crate) fn kept_batch_dropped(
+    pub(crate) async fn kept_batch_dropped(
         &mut self,
         id: &[u8; 16],
         pending: &super::batch::PendingBatch,
         batch: &Batch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        self.end_dropped_holds(id, pending, tx).await?;
         let reason = if pending.kept_ms.is_some() {
             KeptBatchDrop::Uncertain
         } else {

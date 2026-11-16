@@ -86,11 +86,12 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, EntryReceipt, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite,
-    MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
-    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
-    Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason,
-    StoreFailure, WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
+    DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
+    LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
+    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
+    ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state, encode_local_state,
+    local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -430,6 +431,10 @@ pub struct AppBackup {
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     held_counterparties: Vec<String>,
+    /// The messages of `outbox` the app holds ([`App::hold_message`]), by `msg_id`: a
+    /// restore holds them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    held_messages: Vec<String>,
     /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for
     /// none: a restore keeps them, so the record's next `expires_at` is still the earliest
     /// of them. Absent while no protocol asked for one.
@@ -1269,6 +1274,7 @@ impl App {
         let keys: AppKeys = reader.get(key::KEYS).await?.ok_or_else(missing)?;
         let cert_doc: SignedDoc = reader.get(key::CERT).await?.ok_or_else(missing)?;
         let cert = AppCert::verify(&cert_doc, &meta.identity).map_err(|_| corrupt())?;
+        send::validate_outbox(reader, &meta, &cert).await?;
         let renewal = match reader.get::<SignedDoc>(key::CERT_RENEWAL).await? {
             None => None,
             Some(doc) => Some(AppCert::verify(&doc, &meta.identity).map_err(|_| corrupt())?),
@@ -1444,6 +1450,7 @@ impl App {
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             held_counterparties: Vec::new(),
+            held_messages: Vec::new(),
             record_expiries: Vec::new(),
             layers: Vec::new(),
             beyond_cursor: None,
@@ -1474,9 +1481,29 @@ impl App {
                 .map_err(|_| AppError::InvalidData("a backup's held counterparty".into()))?;
             send::put_hold(tx, &pubky)?;
         }
-        let now = self.now();
+        // Each held message is one of the outbox the backup carries, its delivery owed: no
+        // writer carries the hold of another.
+        for msg_id in &backup.held_messages {
+            // The item the restore puts back for `msg_id` is the last the backup lists, and a
+            // message the backup left out past its budget isn't one it carries.
+            if !backup
+                .outbox
+                .iter()
+                .rev()
+                .find(|item| item.msg_id() == msg_id)
+                .is_some_and(send::OutboxItem::delivery_pending)
+                || backup
+                    .outbox_left_out
+                    .iter()
+                    .any(|(left, _)| left == msg_id)
+            {
+                return Err(AppError::InvalidData(
+                    "a backup's held message isn't one of its outbox owed a delivery".into(),
+                ));
+            }
+            send::put_message_hold(tx, msg_id)?;
+        }
         for (msg_id, resend) in &backup.outbox_left_out {
-            send::note_given_up(tx, msg_id, now)?;
             self.keep_duty(
                 tx,
                 events::Duty::MessageUndelivered {
@@ -1493,8 +1520,15 @@ impl App {
     /// the same `msg_id` and bytes.
     /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
+        send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         let carried = send::carried_outbox(reader).await?;
+        backup.held_messages = send::held_messages_of(reader, self.now())
+            .await?
+            .into_iter()
+            .map(|(msg_id, _)| msg_id)
+            .filter(|msg_id| carried.items.iter().any(|item| item.msg_id() == msg_id))
+            .collect();
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
         backup.held_counterparties = reader
@@ -1812,6 +1846,22 @@ impl App {
             if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
                 return Err(invalid("its certificate isn't its keys'"));
             }
+            let mut carried_ids = BTreeSet::new();
+            for item in &backup.outbox {
+                if !carried_ids.insert(item.msg_id()) || !item.is_own(&meta, &cert) {
+                    return Err(invalid(
+                        "its outbox identity or signed message is inconsistent",
+                    ));
+                }
+            }
+            let mut omitted_ids = BTreeSet::new();
+            for (msg_id, _) in &backup.outbox_left_out {
+                if carried_ids.contains(msg_id.as_str()) || !omitted_ids.insert(msg_id) {
+                    return Err(invalid(
+                        "its outbox identities are both carried and omitted or repeated",
+                    ));
+                }
+            }
             // The app record the restore installs carries that very certificate, so what the
             // protocol checks below is all that is installed: the app writes the two
             // together, at a join and when it takes a certificate, so they never differ in a
@@ -2113,6 +2163,21 @@ impl App {
                 .into_iter()
                 .map(|(rest, _)| rest)
                 .collect();
+            // The store's message holds of the messages the restored outbox owes: the
+            // restore replaces the outbox, which ends the delivery of every other one.
+            let old_message_holds: Vec<String> = send::held_messages_of(&old, env.clock.now_ms())
+                .await?
+                .into_iter()
+                .map(|(msg_id, _)| msg_id)
+                .filter(|msg_id| {
+                    backup
+                        .outbox
+                        .iter()
+                        .rev()
+                        .find(|item| item.msg_id() == msg_id)
+                        .is_some_and(send::OutboxItem::delivery_pending)
+                })
+                .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
@@ -2206,6 +2271,11 @@ impl App {
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
+                // The store's message holds before the backup's outbox, which ends the hold of
+                // any message it gives up.
+                for msg_id in &old_message_holds {
+                    send::put_message_hold(&mut tx, msg_id)?;
+                }
                 app.reinstall_outbox(backup, &mut tx)?;
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
@@ -2993,6 +3063,14 @@ impl App {
     ) -> Result<(), AppError> {
         let n = self.state.next_duty;
         let next = n.checked_add(1).ok_or_else(corrupt)?;
+        // A message's hold ends in the commit that tells it undelivered: its delivery is no
+        // longer owed (`App::hold_message`).
+        if let events::Duty::MessageUndelivered { msg_id, .. } = &duty {
+            send::end_message_hold(tx, msg_id)?;
+            // Retaining an accepted item's record job never queues its ended delivery
+            // again through the sent-message cache (Switch spec 11).
+            send::note_given_up(tx, msg_id, self.now())?;
+        }
         let kept = events::KeptDuty { to, duty };
         tx.put(&key::duty(n), &kept)?;
         tx.put(key::DUTY_NEXT, &next)?;
@@ -3218,7 +3296,7 @@ impl App {
     }
 
     /// [`Refusal::Usage`] for a name no protocol of the app is registered under.
-    fn check_registered(&self, protocol: &str) -> Result<(), AppError> {
+    pub(crate) fn check_registered(&self, protocol: &str) -> Result<(), AppError> {
         if self.protocols.contains(protocol) {
             Ok(())
         } else {
@@ -3613,6 +3691,57 @@ impl App {
             self.load_told().await?;
         }
         Ok(())
+    }
+
+    /// Raise the rollback alarm for the protocol `protocol` on its evidence
+    /// ([`Alarm::ProtocolRollback`], Switch spec 10.1): for a protocol that finds, in what
+    /// the service signed for its own data, that the service went back on it or contradicts
+    /// itself, such as a shared record write that breaks a rule only the service's state
+    /// could break. The app keeps the alarm and stops, as for one it found itself: every
+    /// later call is refused, for every protocol of the app, not only the one that raised
+    /// it, until the user resolves it, by moving to another provider or declaring a provider
+    /// loss. The store keeps it: only a restore or a fresh join, on a store without it,
+    /// starts again without it. So a protocol raises it only on evidence the service
+    /// signed, never on a doubt of its own.
+    ///
+    /// `reason` names the rule broken, without content: it is kept and shown, cut to
+    /// [`MAX_REGRESSION_REASON_BYTES`], 256 bytes, at a character boundary. Returns the
+    /// alarm the app holds: this one, kept and told ([`AppEvent::Alarm`], naming
+    /// `protocol`) in the commit that raises it, or the alarm it held already, which stays
+    /// as it was. A protocol that finds the evidence in a receive step answers it so the
+    /// read doesn't pass the entry, and the host raises it after the read returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a protocol not registered; [`Refusal::Left`] for an app that
+    /// left; a store failure, after which the app isn't stopped on this alarm: the host
+    /// raises it again, and one the store kept after all is the alarm then returned.
+    pub async fn raise_rollback(
+        &mut self,
+        protocol: &str,
+        reason: impl Into<String>,
+    ) -> Result<Alarm, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.check_registered(protocol)?;
+            if self.state.leave.is_some() {
+                return Err(Refusal::Left.into());
+            }
+            if let Some(held) = &self.state.alarm {
+                return Ok(held.clone());
+            }
+            let alarm = Alarm::ProtocolRollback {
+                protocol: protocol.to_owned(),
+                reason: records::cut_reason(reason.into()),
+            };
+            let mut tx = self.tx()?;
+            tx.put(key::ALARM, &alarm)?;
+            self.commit(tx).await?;
+            self.state.alarm = Some(alarm.clone());
+            self.events.push(AppEvent::Alarm(alarm.clone()));
+            Ok(alarm)
+        })
+        .await
     }
 
     /// Raise an alarm: keep it, stop, and return it as the error.

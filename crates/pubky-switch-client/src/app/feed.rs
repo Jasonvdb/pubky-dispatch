@@ -87,10 +87,10 @@ use super::events::{AppEvent, Duty, KeptRefusal, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::order::{Handover, Kept, Walk};
 use super::protocol::{
-    DenyListChange, Effect, EntryReceipt, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES,
-    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
-    local_writes_bytes,
+    DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, Need, OpaqueRule,
+    Outcome, PARKED_RETRIES_PER_READ, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
+    ResendReason, StoreFailure, local_writes_bytes,
 };
 use super::protocols::Rules;
 use super::provider::TakeOver;
@@ -100,7 +100,7 @@ use super::state::{
     CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
     Processed, RetryEntry, Tx, encode, key,
 };
-use super::{App, AppError, PROCESSED_RETENTION_MS};
+use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
 use crate::error::ClientError;
@@ -3679,13 +3679,34 @@ impl App {
     /// restore in place may carry, is of a sequence it doesn't know yet: it comes after
     /// everything it knows, and waits until the app follows it.
     pub(crate) fn feed_order(&self, generation: u64, seq: u64) -> (u8, u64, u64) {
-        if generation > self.state.own_doc.generation() {
-            (2, generation, seq)
-        } else if self.current_sequence(generation) {
-            (1, 0, seq)
-        } else {
-            (0, generation, seq)
-        }
+        feed_place(&self.state, generation, seq)
+    }
+
+    /// Compare two positions of the feed, such as those of two received entries
+    /// ([`ReceivedMessage::position`]), in feed order (Switch spec 8.3): the order in
+    /// which the app reads the items and hands its protocols the calls it owes them. A
+    /// protocol orders what it keeps by it, never by the `(generation, seq)` pair, which
+    /// puts an entry read before a move after one read since. `None` where the app can't
+    /// tell: the protocol then holds whatever depends on the order.
+    ///
+    /// The order is the app's, as its newest own `identity.json` tells it:
+    /// - **One generation:** by `seq`.
+    /// - **Within the current sequence** the positions compare by `seq` alone, whatever
+    ///   generation names them: a cooperative move and a key change in place continue it.
+    /// - **A sequence a provider loss ended** comes before the current one, and before a
+    ///   generation past the newest own `identity.json`.
+    /// - **Otherwise**, two generations of which the app doesn't know whether a loss
+    ///   separates them: of lost sequences (the newest `identity.json` names only the newest
+    ///   loss, and a lost sequence may have spanned a move), or past the newest own
+    ///   `identity.json` the app follows, as a restore in place may carry. Where their
+    ///   generations and their `seq`s order them the same way, that is the order, either way;
+    ///   where they disagree, `None`.
+    ///
+    /// An order given before a provider loss may be unknown after it, since positions of the
+    /// sequence it ended no longer compare by `seq` alone: a protocol that keeps an order it
+    /// took compares again after a loss ([`super::Protocol::provider_lost`]).
+    pub fn received_order(&self, a: FeedPosition, b: FeedPosition) -> Option<std::cmp::Ordering> {
+        received_order(&self.state, a, b)
     }
 
     /// Whether the owed call stored under `stored` (`owed/<generation>/<seq>`) is at a
@@ -4288,6 +4309,52 @@ fn local_size(ns: &str, local: &[LocalWrite]) -> u64 {
             .saturating_add(len(key))
             .saturating_add(len(value))
     })
+}
+
+/// Where the item at (`generation`, `seq`) stands in feed order, as the app `state` knows
+/// it ([`App::received_order`]).
+pub(crate) fn feed_place(state: &AppState, generation: u64, seq: u64) -> (u8, u64, u64) {
+    if generation > state.own_doc.generation() {
+        (2, generation, seq)
+    } else if state
+        .own_doc
+        .body()
+        .recovery_from
+        .is_none_or(|lost| generation > lost)
+    {
+        (1, 0, seq)
+    } else {
+        (0, generation, seq)
+    }
+}
+
+/// Compare two feed positions in feed order, as the app `state` knows it, `None` where it
+/// can't tell ([`App::received_order`]).
+pub(crate) fn received_order(
+    state: &AppState,
+    a: FeedPosition,
+    b: FeedPosition,
+) -> Option<std::cmp::Ordering> {
+    let by_seq = a.seq.cmp(&b.seq);
+    if a.generation == b.generation {
+        return Some(by_seq);
+    }
+    let (class_a, class_b) = (
+        feed_place(state, a.generation, a.seq).0,
+        feed_place(state, b.generation, b.seq).0,
+    );
+    match (class_a, class_b) {
+        // Both of the current sequence.
+        (1, 1) => Some(by_seq),
+        // A lost sequence and a later one: the current, or one past it.
+        (0, 1) | (1, 0) | (0, 2) | (2, 0) => Some(class_a.cmp(&class_b)),
+        // Whether a loss separates them is unknown: one sequence orders them by `seq`,
+        // two by generation.
+        _ => {
+            let by_generation = a.generation.cmp(&b.generation);
+            (by_generation == by_seq).then_some(by_seq)
+        }
+    }
 }
 
 #[cfg(test)]

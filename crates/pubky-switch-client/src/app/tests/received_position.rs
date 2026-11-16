@@ -9,7 +9,7 @@ use pubky_switch_core::scopes::Permission;
 
 use super::moves::{Router, has, join_on, note_at, publish_at};
 use super::*;
-use crate::app::{AppEvent, ParkReason, ReceiveContext, StoreFailure};
+use crate::app::{AppEvent, FeedPosition, ParkReason, ReceiveContext, StoreFailure};
 use crate::error::StoreError;
 use crate::testing::SWITCH_ORIGIN as ORIGIN;
 
@@ -180,4 +180,68 @@ async fn test_received_position_of_a_stored_entry_retried_after_a_provider_chang
     // cursor's.
     assert_eq!(handed, vec![(1, stored, true), (2, after, false)]);
     assert!(app.state.parked.is_empty());
+}
+
+fn at(generation: u64, seq: u64) -> FeedPosition {
+    FeedPosition { generation, seq }
+}
+
+/// Across a key change in place the sequence goes on: positions compare by `seq` alone,
+/// whatever generation they were read at, where the plain pair puts them the other way;
+/// a future generation that disagrees with the sequence remains incomparable.
+#[tokio::test]
+async fn test_received_order_compares_by_seq_across_a_key_change() {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let w = World::new();
+    let router = Router::of(&w);
+    let protocol = Arc::new(PositionProtocol::default());
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        protocol.clone(),
+        &[Permission::ConversationAdd],
+    )
+    .await;
+    let me = app.app_id();
+    let before = note_at(&w, &w.switch, me, "before");
+    app.receive(None).await.unwrap();
+    let changed = change_key(&w, &router);
+    let after = note_at(&w, &changed, me, "after the change");
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(after > before);
+    assert_eq!(app.received_order(at(1, before), at(2, after)), Some(Less));
+    assert_eq!(app.received_order(at(2, before), at(1, after)), Some(Less));
+    assert!((2, before) > (1, after), "the plain pair says otherwise");
+    assert_eq!(app.received_order(at(1, after), at(2, after)), Some(Equal));
+    // Past the followed generation: whether a loss came between is unknown, so the order
+    // is known only where generation and `seq` agree.
+    assert_eq!(
+        app.received_order(at(3, after + 5), at(2, after)),
+        Some(Greater)
+    );
+    assert_eq!(app.received_order(at(3, 1), at(2, after)), None);
+    assert_eq!(app.received_order(at(3, 1), at(4, 1)), None);
+}
+
+/// After a provider loss the lost sequence comes first, whatever its `seq`, and the new one
+/// compares by `seq`.
+#[tokio::test]
+async fn test_received_order_puts_a_lost_sequence_first() {
+    use std::cmp::Ordering::{Greater, Less};
+    let store = Arc::new(MemoryStore::new());
+    let lost = super::moves::lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (app, _) = super::moves::follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(app.received_order(at(1, 100), at(2, 1)), Some(Less));
+    assert_eq!(app.received_order(at(2, 3), at(2, 5)), Some(Less));
+    assert_eq!(app.received_order(at(2, 1), at(1, 100)), Some(Greater));
+    // The lost sequence comes before a generation past the followed one too; two such
+    // generations whose `seq`s disagree with them are unknown.
+    assert_eq!(app.received_order(at(1, 100), at(3, 1)), Some(Less));
+    assert_eq!(app.received_order(at(3, 5), at(4, 2)), None);
 }

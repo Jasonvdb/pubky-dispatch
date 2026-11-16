@@ -44,7 +44,7 @@ use super::clients::{RequestClient, Target};
 use super::revocation::UserConfirmed;
 use super::{Signer, gate};
 use crate::alert::Alert;
-use crate::error::{Refusal, Result, SignerError};
+use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
@@ -311,9 +311,9 @@ impl Signer {
             doc: signed, prev, ..
         } = flow
         else {
-            return Err(SignerError::Records(
-                "a version without its delivery".into(),
-            ));
+            return Err(SignerError::Records(RecordsFault::Invariant(
+                "a version without its delivery",
+            )));
         };
         let mut state = self.state.clone();
         state.signed_through = next.version();
@@ -519,7 +519,7 @@ impl Signer {
             {
                 return Err(Refusal::StaleBackup.into());
             }
-            if let Some(mark) = self.high_water() {
+            if let Some(mark) = self.high_water()? {
                 let below = doc.version() < mark.version
                     || doc.generation() < mark.generation
                     || (doc.version() == mark.version && doc.body_hash() != mark.body_hash);
@@ -572,7 +572,7 @@ impl Signer {
         };
         // Sealed before the check, so only the check's read comes before the write.
         let backup = self.seal_backup(&newest.doc, newest.prev)?;
-        let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
+        let bytes = serde_json::to_vec(&backup).map_err(|_| RecordsFault::Encode)?;
         let raised = match self.check_backup_write().await {
             Ok(raised) => raised,
             Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => {

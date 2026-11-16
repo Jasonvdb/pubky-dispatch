@@ -107,13 +107,13 @@ async fn test_store_ownership_signer_constructors_preserve_current_records() {
         .unwrap();
     signer.resume().await.unwrap();
     let install = signer.install_id();
-    let high = signer.high_water().unwrap();
+    let high = signer.high_water().unwrap().unwrap();
     drop(signer);
     let reopened = Signer::open(world.env(store.clone()), world.keyring())
         .await
         .unwrap();
     assert_eq!(reopened.install_id(), install);
-    assert_eq!(reopened.high_water().unwrap(), high);
+    assert_eq!(reopened.high_water().unwrap().unwrap(), high);
     drop(reopened);
     assert_eq!(
         Signer::create(world.env(store), world.keyring(), SWITCH_ORIGIN)

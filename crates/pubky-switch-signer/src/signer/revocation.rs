@@ -38,7 +38,7 @@ use super::Signer;
 use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
 use crate::alert::Alert;
-use crate::error::{Refusal, Result, SignerError};
+use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking};
 
 /// The host's word that it showed the user what a step does and the user confirmed it: a
@@ -226,10 +226,9 @@ impl Signer {
         }
         let found = self.removals(&newest, &statuses, answered_at);
         let removing = found.apps;
-        let last = newest
-            .data_epoch()
-            .checked_add(1)
-            .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?;
+        let last = newest.data_epoch().checked_add(1).ok_or_else(|| {
+            SignerError::Records(RecordsFault::Invariant("the data epoch can't go higher"))
+        })?;
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
         let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();
@@ -699,9 +698,9 @@ impl Signer {
                 continue;
             }
             let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
-                return Err(SignerError::Records(
-                    "a listed certificate isn't held".into(),
-                ));
+                return Err(SignerError::Records(RecordsFault::Invariant(
+                    "a listed certificate isn't held",
+                )));
             };
             let unowned = protocols.unowned(cert.scopes());
             if !unowned.is_empty() {

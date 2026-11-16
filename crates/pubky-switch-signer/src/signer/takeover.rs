@@ -348,7 +348,7 @@ impl Signer {
                     code: ErrorCode::StaleIdentity,
                     current,
                     ..
-                }) => match self.read_409(&current, &delivery.doc) {
+                }) => match self.read_409(&current, &delivery.doc)? {
                     Answer409::Won => {}
                     Answer409::Lost { install } => return self.take_over_lost(install).await,
                     Answer409::Unsure => {
@@ -413,30 +413,29 @@ impl Signer {
     }
 
     /// Judge the `current` of a `409 stale_identity` answering the delivery `own`.
-    fn read_409(&self, current: &Value, own: &SignedDoc) -> Answer409 {
+    fn read_409(&self, current: &Value, own: &SignedDoc) -> Result<Answer409> {
+        let own_version = state::stored_identity(own, &self.state.identity)?.version();
         let Some(copy) = current
             .get("identity")
             .and_then(|doc| serde_json::from_value::<SignedDoc>(doc.clone()).ok())
             .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok())
         else {
-            return Answer409::Unsure;
+            return Ok(Answer409::Unsure);
         };
         if copy.signed() == own {
-            return Answer409::Won;
+            return Ok(Answer409::Won);
         }
-        let own_version =
-            IdentityDoc::verify(own, &self.state.identity).map_or(u64::MAX, |doc| doc.version());
         if copy.version() < own_version {
-            return Answer409::Unsure;
+            return Ok(Answer409::Unsure);
         }
         // At or above the delivery's version: another install's got ahead; this install's own
         // means its delivery won earlier and it signed on, as after a resend of stale bytes.
         if copy.body().signer == self.state.install {
-            return Answer409::Won;
+            return Ok(Answer409::Won);
         }
-        Answer409::Lost {
+        Ok(Answer409::Lost {
             install: copy.body().signer,
-        }
+        })
     }
 
     /// The take-over lost to `install`'s version: delete the records and the flow, with the

@@ -138,9 +138,9 @@ impl Signer {
             .held_certs()?
             .into_iter()
             .find(|cert| cert.hash() == listed)
-            .ok_or_else(|| {
-                SignerError::Records(RecordsFault::Invariant("the listed certificate isn't held"))
-            })?;
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the listed certificate isn't held",
+            )))?;
         let scopes = change.scopes.unwrap_or_else(|| old.scopes().to_vec());
         let terms = self.env.protocols.terms(&scopes)?;
         let now = self.env.clock.now_ms();
@@ -212,9 +212,11 @@ impl Signer {
             };
         let current = newest.data_epoch();
         let last = if rotates {
-            current.checked_add(1).ok_or_else(|| {
-                SignerError::Records(RecordsFault::Invariant("the data epoch can't go higher"))
-            })?
+            current
+                .checked_add(1)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the data epoch can't go higher",
+                )))?
         } else {
             current
         };
@@ -602,12 +604,11 @@ impl Signer {
     /// Every certificate the signer holds, verified.
     pub(super) fn held_certs(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
-        Ok(self
-            .state
+        self.state
             .certs
             .iter()
             .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()
     }
 
     /// The apps whose closing delivery the signer owes: open renewals in the newest version

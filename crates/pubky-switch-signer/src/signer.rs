@@ -887,9 +887,9 @@ impl Signer {
             .version()
             .max(self.state.signed_through)
             .checked_add(1)
-            .ok_or_else(|| {
-                SignerError::Records(RecordsFault::Invariant("the version can't go higher"))
-            })?;
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the version can't go higher",
+            )))?;
         let mut body = base.body().clone();
         body.version = version;
         body.signer = self.state.install;
@@ -991,9 +991,12 @@ impl Signer {
     }
 
     fn service(&self) -> Result<Service> {
-        self.state.service.clone().ok_or_else(|| {
-            SignerError::Records(RecordsFault::Invariant("no switch before the enrollment"))
-        })
+        self.state
+            .service
+            .clone()
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "no switch before the enrollment",
+            )))
     }
 
     /// A client of the switch the identity is enrolled at, for requests: it signs no
@@ -2072,9 +2075,9 @@ pub(super) fn version_size(
                 .saturating_mul(b.limit)
                 .cmp(&b.bytes.saturating_mul(a.limit))
         })
-        .ok_or_else(|| {
-            SignerError::Records(RecordsFault::Invariant("no body to measure the version in"))
-        })
+        .ok_or(SignerError::Records(RecordsFault::Invariant(
+            "no body to measure the version in",
+        )))
 }
 
 /// Room kept under the cap for what a later version adds to one measured now without any

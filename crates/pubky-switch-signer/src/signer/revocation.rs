@@ -226,9 +226,12 @@ impl Signer {
         }
         let found = self.removals(&newest, &statuses, answered_at);
         let removing = found.apps;
-        let last = newest.data_epoch().checked_add(1).ok_or_else(|| {
-            SignerError::Records(RecordsFault::Invariant("the data epoch can't go higher"))
-        })?;
+        let last = newest
+            .data_epoch()
+            .checked_add(1)
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the data epoch can't go higher",
+            )))?;
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
         let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();

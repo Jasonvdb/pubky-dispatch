@@ -472,12 +472,11 @@ impl Signer {
     /// [`SignerError::StoredData`] when a stored certificate no longer verifies.
     pub fn certificates(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
-        Ok(self
-            .state
+        self.state
             .certs
             .iter()
             .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()
     }
 
     /// The host delivered the claim of `request` and approved its grant: the signer drops

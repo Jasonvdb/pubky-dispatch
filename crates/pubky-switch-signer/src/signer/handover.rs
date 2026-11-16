@@ -142,14 +142,13 @@ impl Signer {
             .iter()
             .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let cert = issued
-            .iter()
-            .find(|cert| cert.hash() == cert_hash)
-            .ok_or_else(|| {
-                SignerError::Records(RecordsFault::Invariant(
+        let cert =
+            issued
+                .iter()
+                .find(|cert| cert.hash() == cert_hash)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
                     "the target's certificate isn't held",
-                ))
-            })?;
+                )))?;
         let limits = self.service()?.limits;
         let handover = {
             let key = self.signing_key()?;
@@ -436,11 +435,9 @@ impl Signer {
                         .version()
                         .max(self.state.signed_through)
                         .checked_add(1)
-                        .ok_or_else(|| {
-                            SignerError::Records(RecordsFault::Invariant(
-                                "the version can't go higher",
-                            ))
-                        })?;
+                        .ok_or(SignerError::Records(RecordsFault::Invariant(
+                            "the version can't go higher",
+                        )))?;
                     body.signer = self.state.install;
                     let doc = {
                         let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;

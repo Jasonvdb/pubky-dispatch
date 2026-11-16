@@ -132,9 +132,12 @@ impl Signer {
         if goes_to || self.taken_under_an_earlier_key(origin, false).await? {
             self.resume().await?;
             self.complete_listed_revocations().await?;
-            return self.state.newest_doc()?.ok_or_else(|| {
-                SignerError::Records(RecordsFault::Invariant("the recovery's version is gone"))
-            });
+            return self
+                .state
+                .newest_doc()?
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the recovery's version is gone",
+                )));
         }
         // Taken before the checks below, which may end a flow in progress.
         let base = self.recovery_base()?;
@@ -199,9 +202,11 @@ impl Signer {
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
         self.complete_listed_revocations().await?;
-        self.state.newest_doc()?.ok_or_else(|| {
-            SignerError::Records(RecordsFault::Invariant("the recovery's version is gone"))
-        })
+        self.state
+            .newest_doc()?
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the recovery's version is gone",
+            )))
     }
 
     /// End the staged admission a recovery started at the service (Switch spec 12.6 step 2;
@@ -352,7 +357,7 @@ impl Signer {
         if self.state.recovering
             && let Some(base) = &self.state.recovery_base
         {
-            return Ok(state::stored_identity(base, &identity)?);
+            return state::stored_identity(base, &identity);
         }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let in_flight = match &self.flow {
@@ -388,9 +393,11 @@ impl Signer {
         service_key: [u8; 32],
         until: u64,
     ) -> Result<IdentityBody> {
-        let generation = lost.checked_add(1).ok_or_else(|| {
-            SignerError::Records(RecordsFault::Invariant("the generation can't go higher"))
-        })?;
+        let generation =
+            lost.checked_add(1)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the generation can't go higher",
+                )))?;
         let owed = self.owed_in(base)?;
         self.next_body_on(
             base,

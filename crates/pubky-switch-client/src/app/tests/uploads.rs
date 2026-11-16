@@ -710,7 +710,8 @@ async fn test_upload_divergent_flag_reads_in_the_receive_context() {
         let store = Arc::clone(app.env.store.store());
         let cx = crate::app::ReceiveContext::new(
             &app.state,
-            app.protocol.as_ref(),
+            &app.protocols,
+            "sample",
             store.as_ref(),
             &app.ns,
             false,
@@ -1082,10 +1083,10 @@ async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag(
                     key: b"pause".to_vec(),
                     value: vec![1],
                 }];
-                assert!(app.protocol_commit(&writes).await.is_err());
+                assert!(app.protocol_commit("sample", &writes).await.is_err());
                 assert_eq!(app.pending_duty_events().await.unwrap(), kept);
                 assert!(!app.reload);
-                assert_eq!(app.protocol_get(b"pause").await.unwrap(), None);
+                assert_eq!(app.protocol_get("sample", b"pause").await.unwrap(), None);
                 assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
                 assert_eq!(app.duty_handed, 0);
                 let ids = divergent_ids(&kept, key);
@@ -1208,7 +1209,7 @@ async fn test_upload_divergence_is_told_to_each_app_that_holds_the_record() {
     let protocol = Arc::new(super::moves::LossProtocol::default());
     let wallet_store = Arc::new(MemoryStore::new());
     let (mut wallet, key) = holding_a_record(&w, &router, &wallet_store, &protocol).await;
-    let spec = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+    let spec = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
     let request = w.signer.approve(&app_keys("phone"), &spec).unwrap();
     let mut phone = App::join(
         router.env(&w, Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),

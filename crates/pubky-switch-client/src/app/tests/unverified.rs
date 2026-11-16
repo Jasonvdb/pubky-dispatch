@@ -29,6 +29,10 @@ struct BackedUp {
 }
 
 impl Protocol for BackedUp {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -76,10 +80,6 @@ impl Protocol for BackedUp {
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
-    }
-
-    fn backup_name(&self) -> Option<String> {
-        Some("sample.bound".into())
     }
 }
 
@@ -164,7 +164,7 @@ pub(super) struct Peer {
 pub(super) fn peer(w: &World, name: &str) -> Peer {
     let identity = IdentityKey::from_secret(seed(&format!("{name}/identity")));
     let keys = app_keys(&format!("{name}-app"));
-    let cert = cert_for(&identity, &keys, w.clock.now_ms(), &["scope-a"]);
+    let cert = cert_for(&identity, &keys, w.clock.now_ms(), &["sample-a"]);
     Peer {
         identity,
         keys,
@@ -174,7 +174,7 @@ pub(super) fn peer(w: &World, name: &str) -> Peer {
 
 /// Alice's wallet on `env`.
 async fn wallet(w: &World, env: AppEnv) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     App::join(env, Arc::new(BackedUp::default()), World::config(), request)
         .await
         .unwrap()

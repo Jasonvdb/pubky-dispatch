@@ -979,7 +979,7 @@ async fn assert_alarm_survives_reload(
     assert_eq!(time.highest_ms, START + 2_000);
     assert_eq!(time.offset_ms, None);
     let env = app.env.clone();
-    let protocol = app.protocol.clone();
+    let protocol = app.protocols.clone();
     let config = app.config.clone();
     let id = app.app_id();
     drop(app);

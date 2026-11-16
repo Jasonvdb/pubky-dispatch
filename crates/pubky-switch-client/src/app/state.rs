@@ -81,9 +81,22 @@ pub(crate) mod key {
     use super::{b64, pubky_id, zbase32_encode};
 
     pub(crate) const META: &str = "meta";
+    /// The names of the protocols the app was set up with (`protos`), which every load
+    /// registers.
+    pub(crate) const PROTOCOLS: &str = "protos";
+    /// The protocols that ended the reconcile mode under way (`rcd`,
+    /// [`super::App::end_reconcile_for`]); the mode ends when the last of them does.
+    pub(crate) const RECONCILED: &str = "rcd";
+    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for none:
+    /// the record's `expires_at` is the earliest.
+    pub(crate) const RECORD_EXPIRIES: &str = "rexp";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";
+    /// The hash of the newest renewed certificate the app's protocols refused
+    /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
+    /// never refused with a second event.
+    pub(crate) const CERT_REFUSED: &str = "cert/refused";
     pub(crate) const RECORD: &str = "record";
     pub(crate) const NAMING: &str = "naming";
     pub(crate) const BUNDLE: &str = "bundle";
@@ -321,6 +334,9 @@ pub(crate) struct Cursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChainRecord {
     pub(crate) generation: u64,
+    /// The highest feed position scanned in this sequence, including inbox items.
+    /// A bound for stored protocol positions, not evidence of chain continuity.
+    pub(crate) read_through: (u64, u64),
     pub(crate) last_seq: u64,
     #[serde(with = "serde_b64")]
     pub(crate) last_hash: [u8; 32],
@@ -355,8 +371,10 @@ pub(crate) enum RestorePending {
 }
 
 /// `proc/<sender>/<msg_id>`: a processed message (Switch spec 11).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Processed {
+    /// The message kind, which determines the protocol allowed to forget it.
+    pub(crate) kind: String,
     #[serde(with = "serde_b64")]
     pub(crate) hash: [u8; 32],
     /// When it was processed, app clock, for the retention.
@@ -749,6 +767,32 @@ impl Tx {
         self.duties.extend(other.duties);
         self.local.extend(other.local);
         Ok(())
+    }
+
+    /// The value the batch leaves at `key`, not yet committed: `Some(Some(value))` when its
+    /// last write there puts it, `Some(None)` when it deletes it, `None` when the batch
+    /// doesn't touch it (the store's value stands).
+    pub(crate) fn pending_get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<Option<T>>, AppError> {
+        let bytes = key.as_bytes();
+        let last = self
+            .batch
+            .writes()
+            .iter()
+            .rev()
+            .find_map(|write| match write {
+                Write::Put { key: k, value, .. } if k == bytes => Some(Some(value)),
+                Write::Delete { key: k, .. } if k == bytes => Some(None),
+                Write::DeletePrefix { prefix, .. } if bytes.starts_with(prefix) => Some(None),
+                _ => None,
+            });
+        match last {
+            Some(Some(value)) => Ok(Some(Some(decode(value)?))),
+            Some(None) => Ok(Some(None)),
+            None => Ok(None),
+        }
     }
 
     /// What the batch leaves at `key`, not yet committed: `Some(true)` when its last write

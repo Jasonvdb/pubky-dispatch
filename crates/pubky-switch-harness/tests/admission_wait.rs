@@ -22,6 +22,9 @@ struct Admission {
     consume: AtomicBool,
 }
 impl Protocol for Admission {
+    fn name(&self) -> String {
+        "notes".into()
+    }
     fn has_keys(&self, scope: &str) -> bool {
         self.base.has_keys(scope)
     }
@@ -42,9 +45,6 @@ impl Protocol for Admission {
     }
     fn missed(&self, m: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.base.missed(m)
-    }
-    fn backup_name(&self) -> Option<String> {
-        Some("tasks.waiting".into())
     }
     fn receive(&self, _: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let n = cx.local_get(b"completed").unwrap().map_or(0, |v| v[0]);
@@ -144,7 +144,7 @@ async fn flow(world: &World) -> Vec<u8> {
         "the incoming transition enforces the sender bound on both services"
     );
     assert_eq!(
-        wallet.protocol_get(b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         None,
         "admission commits no callback-staged local effect"
     );
@@ -159,6 +159,7 @@ async fn flow(world: &World) -> Vec<u8> {
     assert_eq!(Some(notices[0].1.clone()), first);
     wallet
         .ack_event_with(
+            "notes",
             notices[0].0,
             &[LocalWrite::Put {
                 key: b"handled".to_vec(),
@@ -177,7 +178,7 @@ async fn flow(world: &World) -> Vec<u8> {
     .await
     .unwrap();
     assert_eq!(
-        restored.protocol_get(b"handled").await.unwrap(),
+        restored.protocol_get("notes", b"handled").await.unwrap(),
         Some(vec![1])
     );
     assert_eq!(restored.parked_entries().await.unwrap().len(), 64);
@@ -198,7 +199,11 @@ async fn flow(world: &World) -> Vec<u8> {
         restored.parked_entries().await.unwrap().is_empty(),
         "completion retires all admitted custody"
     );
-    let completed = restored.protocol_get(b"completed").await.unwrap().unwrap();
+    let completed = restored
+        .protocol_get("notes", b"completed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(completed, vec![64], "every retained input completes once");
     completed
 }

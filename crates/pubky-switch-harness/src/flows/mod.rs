@@ -26,6 +26,7 @@ mod messaging;
 mod notice;
 mod own_record;
 mod pages;
+mod protocols;
 mod push;
 mod records;
 mod recovery;
@@ -76,6 +77,7 @@ pub use notice::{
 };
 pub use own_record::own_record;
 pub use pages::pages;
+pub use protocols::{protocol_deny_barrier, protocol_retry_after_deny, two_protocols};
 pub use push::push_registration;
 pub use records::records;
 pub use recovery::{
@@ -234,6 +236,13 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(rotation_given_up(world))
     }),
     ("two collections", |world| Box::pin(two_collections(world))),
+    ("two protocols", |world| Box::pin(two_protocols(world))),
+    ("protocol deny barrier", |world| {
+        Box::pin(protocol_deny_barrier(world))
+    }),
+    ("protocol retry after deny", |world| {
+        Box::pin(protocol_retry_after_deny(world))
+    }),
     ("waiting read", |world| Box::pin(waiting_read(world))),
     ("lagging app", |world| Box::pin(lagging_app(world))),
     ("behind a checkpoint", |world| {

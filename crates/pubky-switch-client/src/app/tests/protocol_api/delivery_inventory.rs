@@ -1576,12 +1576,20 @@ async fn test_delivery_origin_sent_cache_and_record_job_resends_keep_origin() {
                     before,
                     "accepted idempotence"
                 );
+                *protocol.delivery_check.lock().unwrap() =
+                    Some(Arc::new(|delivery| Ok(!delivery.resend())));
                 wallet.hold_queued(&bob).await.unwrap();
                 wallet.resend(signed.msg_id()).await.unwrap();
                 let resent = listed_origin(&wallet, &signed).await;
                 assert_eq!(resent.origin, origin);
                 assert!(resent.resend && resent.waits());
+                assert!(!resent.may_send, "the gate sees the accepted re-send");
                 wallet.release_queued(&bob).await.unwrap();
+                wallet.flush_message(signed.msg_id()).await.unwrap();
+                assert_eq!(p.bob.switch().entries_from(&alice), 1, "re-send held");
+                *protocol.delivery_check.lock().unwrap() =
+                    Some(Arc::new(|delivery| Ok(delivery.resend())));
+                assert!(listed_origin(&wallet, &signed).await.may_send);
                 wallet.flush_message(signed.msg_id()).await.unwrap();
                 assert_eq!(p.bob.switch().entries_from(&alice), 2);
             }
@@ -2583,4 +2591,66 @@ async fn test_delivery_view_rechecks_stale_timestamp_append_retry() {
 #[tokio::test]
 async fn test_delivery_view_allows_stale_timestamp_retry_when_permitted() {
     Box::pin(timestamp_retry(false)).await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_unaccepted_retries_preserve_attempt_kind() {
+    Box::pin(async {
+        for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            let alice = p.alice.identity().public();
+            shop.invite(&alice).await.unwrap();
+            let signed = wallet.sign_message(Pair::note(&p.bob, "attempt")).unwrap();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let calls = observed.clone();
+            *protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((delivery.origin(), delivery.resend()));
+                Ok(!delivery.resend())
+            }));
+            if origin == DeliveryOrigin::Original {
+                wallet.queue_signed(signed.clone()).await.unwrap();
+            } else {
+                wallet.queue_stored(signed.plaintext()).await.unwrap();
+            }
+            let queued = listed_origin(&wallet, &signed).await;
+            assert_eq!(
+                (queued.origin, queued.resend, queued.may_send),
+                (origin, false, true)
+            );
+            p.bob.switch().fail_next(Fault::Unreachable {
+                path: "/inbox".into(),
+                after: 0,
+            });
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&alice), 0);
+            assert!(matches!(
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+                Some(Delivery::Queued { .. })
+            ));
+            let retried = listed_origin(&wallet, &signed).await;
+            assert_eq!(
+                (retried.origin, retried.resend, retried.may_send),
+                (origin, false, true)
+            );
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&alice), 1);
+            assert!(matches!(
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+                Some(Delivery::Accepted { .. })
+            ));
+            let seen = observed.lock().unwrap();
+            assert!(!seen.is_empty());
+            assert!(
+                seen.iter().all(|entry| *entry == (origin, false)),
+                "{seen:?}"
+            );
+        }
+    })
+    .await;
 }

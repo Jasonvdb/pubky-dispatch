@@ -240,6 +240,7 @@ pub struct DeliveryView<'a> {
     message: &'a Message,
     plaintext: &'a MessagePlaintext,
     origin: DeliveryOrigin,
+    resend: bool,
     local: super::LocalView<'a>,
     cert: &'a AppCert,
     naming: &'a NamingKey,
@@ -273,6 +274,14 @@ impl<'a> DeliveryView<'a> {
     /// The current copy's retained origin, independently of acceptance or a re-send.
     pub fn origin(&self) -> DeliveryOrigin {
         self.origin
+    }
+
+    /// Whether this delivery is a re-send of a message this app retained as accepted.
+    ///
+    /// An unaccepted delivery retry is not a re-send. This is the same retained attempt
+    /// fact as [`QueuedMessage::resend`], independently of [`Self::origin`].
+    pub fn resend(&self) -> bool {
+        self.resend
     }
 
     /// Only the owning protocol's local state, as committed.
@@ -762,6 +771,10 @@ impl OutboxItem {
 
     fn complete(&self) -> bool {
         self.accepted_at_ms.is_some() && !self.resend && (self.record.is_none() || self.record_done)
+    }
+
+    fn is_resend(&self) -> bool {
+        self.accepted_at_ms.is_some() || self.resend_queued
     }
 
     /// Whether a delivery is owed: never accepted, or a re-send asked since.
@@ -1477,13 +1490,14 @@ impl App {
             }
             let holds = self.delivery_holds(&item).await?;
             let hash = item.plaintext()?.hash();
+            let resend = item.is_resend();
             result.push(QueuedMessage {
                 msg_id: item.msg_id,
                 to: item.to,
                 kind: item.kind,
                 hash,
                 origin: item.origin,
-                resend: item.accepted_at_ms.is_some() || item.resend_queued,
+                resend,
                 kept_batch,
                 held: holds.message,
                 counterparty_held: holds.counterparty,
@@ -2972,6 +2986,7 @@ impl App {
             message: &message,
             plaintext: &plaintext,
             origin: item.origin,
+            resend: item.is_resend(),
             local,
             cert: &self.state.cert,
             naming: &self.state.naming,

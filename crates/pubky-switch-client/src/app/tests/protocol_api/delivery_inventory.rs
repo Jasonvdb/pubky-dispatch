@@ -579,8 +579,9 @@ async fn test_delivery_view_rechecks_own_and_peer_append_retries() {
                     line.starts_with(&format!("POST {origin}")) && line.contains("/inbox")
                 })
                 .count();
+            let statuses = transport.statuses.lock().unwrap().clone();
             assert_eq!(
-                *transport.statuses.lock().unwrap(),
+                statuses,
                 [409],
                 "own={own} stale_key={stale_key} delivery={:?} requests={:?}",
                 wallet.delivery(signed.msg_id()).await.unwrap(),

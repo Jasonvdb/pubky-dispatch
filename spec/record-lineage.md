@@ -396,23 +396,23 @@ the barrier without this member, even in a cursor-only call: `409 conflict`.
 The completion and cursor move commit together, after every operation in the
 batch passed. Failure or an unknown outcome authorizes no local completion.
 
-An honest app supplies this member only after every retained record and required
-lineage, across all of its registered protocols, has been accounted for at the
-recovering service. It uploads what it holds before ordinary writes, as spec
+An honest app supplies this member only after every retained record, required
+lineage and standalone origin duty, across all of its registered protocols, has
+been accounted for at the recovering service. It uploads what it holds before ordinary writes, as spec
 12.6 requires, except for the independent current-birth submission in record
 origins 8. That exception does not complete this work or move its cursor. Partial pages, a failed upload, an omitted unreadable
 record, quota failure, a kept unknown record effect or unaccounted refused
 material do not complete this work. A retained value successfully uploaded as
 unresolved is accounted for: it prevents absence while leaving readers held.
 The app durably keeps its outstanding work before sending and resumes it after
-restart. Only the exact per-input `accounted_records` acknowledgment of wire
-7.4.14 accounts an uploaded item; a change list, zero rejection count or ignored
-no-op is insufficient. Canonical supersession can discharge an obsolete value
+restart. Only the exact per-input `accounted_records` or `accounted_origins`
+acknowledgment of wire 7.4.14 for its concrete input kind accounts an uploaded
+item; a change list, zero rejection count or ignored no-op is insufficient. Canonical supersession can discharge an obsolete value
 only after all of its required restrictive lineage/origin facts are represented.
 It does not require indefinite storage of obsolete bytes.
 
-A backup includes the whole immutable record evidence still held by the app,
-including outstanding work whose source record or discovery page was replaced.
+A backup includes the whole immutable record and standalone origin evidence
+still held by the app, including outstanding work whose source record or discovery page was replaced.
 Snapshot and restore validate the complete bounded set; a read, validation or
 capacity failure refuses the operation rather than omitting a duty. An in-place
 restore also preserves outstanding evidence acquired after the backup, without

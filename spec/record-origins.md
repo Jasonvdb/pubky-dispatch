@@ -457,6 +457,86 @@ and provider-loss stale-generation responses retain their distinct wire 6.4
 meaning; an unknown old effect is not proved never applied by either a fresh
 zero read or a generic conflict.
 
+### 7.1 Standalone restrictive recovery
+
+The `origins` member of wire 7.4.14 carries whole `record_origin` parts in the
+exact form above, at most 2,048 bytes each. It does not require or synthesize a
+record operation or certificate. Parts share the upload's 16 MiB body bound.
+Attached origin evidence remains part of its indivisible record input.
+
+Verify each statement against the exact identity-signed `lost_identity` named
+by its `identity_hash`, for this account and the barrier's original lost
+generation. Its service signature, snapshot, canonical slot hash and declared
+parent key must agree. For a standalone part `key == origin_key == parent key`.
+A statement read through a child key is not such a part; the client obtains the
+parent-key statement under the existing scope rules before submitting it alone.
+Different source-document hashes require separate requests. A newer document
+of the same generation cannot replace the exact signing context.
+
+Process valid record and standalone inputs together in the same account
+transaction. Before acknowledgment, merge their restrictive slots as follows.
+Parent key, collection, policy hash and birth restriction must match. Two known
+read scopes must match; an unknown scope may acquire its verified value. Unknown
+form may become verified known recovered form. Two known forms must agree on
+lineage, original reference, origin binding and the complete child declaration.
+A matching vacant child may become initialized. Two initialized forms must agree
+on every initialization reference, lineage, value hash and binding. Preserve
+initialization and take the logical OR of retired/recovered flags; a newly
+recovered known slot is always recovered. Compatible less informative evidence
+may be represented by the stronger slot already held. Never replace known facts
+with unknown or overwrite an incompatible immutable fact. An incompatible input
+is refused and unaccounted, retaining the existing slot unchanged. No partial
+record/slot effect from that refused input is committed.
+
+A new restrictive slot uses the same non-recycling allocator and reservation as
+Section 2.1. An existing slot consumes no second allocation. Capacity failure
+leaves that whole input unaccounted. A record and a standalone part naming one
+slot cannot evade the common checks or allocate it twice. Final accounting is
+against the final transaction state, including every later input in the same
+request, with the same exact-input meaning as `accounted_records`.
+
+The required `accounted_origins` response array contains strictly increasing,
+unique indices within this request's `origins` array. Invalid, unverifiable,
+incompatible, capacity-refused or ignored parts have no index. An empty array
+is required when the stage ignores them. The authenticated request ID, exact
+source/head reconciliation and atomic local ticket accounting of wire 7.4.14
+apply equally. An acknowledgment does not grant clean origin authority or
+complete a witness by itself.
+
+### 7.2 Discovery and retained duties
+
+The collection listing of wire 7.4.9 includes a required `origins` array of
+`record_origin` parts for every allocated parent key in that collection whose
+retained parent read scope the caller holds, including unknown and retired slots
+and slots without a current record. A part's statement describes the same
+account snapshot as the page. The existing `records` array still omits deleted
+values. Both arrays are ordered by ASCII base64url parent/record key. Pagination
+uses their union of distinct keys: `after` excludes that key from both arrays,
+`limit` counts each key once, and `next` is the last included key when more
+remain. A key's record and origin part stay on the same page. Their combined
+bytes count toward `max_page_bytes`; the first complete key is included even
+when it exceeds that page target. An empty origins array is explicit. This
+listing grants no read scope beyond the existing direct-view rules.
+
+An upload that changes a standalone slot includes its parent key in
+`changes.records`, even if no record exists. That signal requires an origin-aware
+reread. A retired-origin answer is retained restrictive evidence, not a missing
+record that clears the work. Overflow, catch-up and missed-item fallback must
+finish the origin-complete collection listing before discarding its pending
+reread obligation. An unavailable scope or read cannot be treated as evidence of
+an absent slot. Ordinary origin and initializer record observations also retain
+their checked slot evidence with the record observation.
+
+Before releasing an observation, the client retains the complete checked part
+and exact signed source identity document needed to verify its statement, in
+the same durable transaction as its read progress. If these cannot be obtained
+and checked, the evidence obligation remains unresolved. Retention is independent
+of current record payloads and survives their replacement or removal. Whole-work
+identity distinguishes record units from standalone origin parts and binds all
+carried evidence and the exact source association. Snapshot, in-place restore,
+request selection, ticket consumption and witness completion include both kinds
+under record lineage 7; a standalone part is never encoded as an invented op.
+
 ## 8. Client submission during earlier recovery
 
 There is one exception to upload-before-write and draining all kept batches.

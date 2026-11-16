@@ -21,6 +21,12 @@ use crate::testing::Fault;
 enum Mode {
     /// The sample protocol's effect.
     Plain,
+    /// The sample protocol's local effect without remote operations.
+    Local,
+    /// Reject the message in the receive callback.
+    Drop,
+    /// Reject the message's body before the receive callback.
+    RejectBody,
     /// Eight operations: more than one batch takes, stored and not tried again.
     Wide,
     /// The store fails for the entry: stored and tried again.
@@ -91,6 +97,9 @@ impl Protocol for ParkingProtocol {
     }
 
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        if *self.mode.lock().unwrap() == Mode::RejectBody {
+            return Err("the message is not needed".into());
+        }
         self.sample.check_body(message)
     }
 
@@ -103,6 +112,17 @@ impl Protocol for ParkingProtocol {
         let mode = *self.mode.lock().unwrap();
         match mode {
             Mode::Plain => self.sample.receive(message, cx),
+            Mode::Drop => Outcome::Drop {
+                reason: "the message is not needed".into(),
+            },
+            Mode::RejectBody => unreachable!(),
+            Mode::Local => {
+                let Outcome::Apply(mut effect) = self.sample.receive(message, cx) else {
+                    unreachable!()
+                };
+                effect.ops.clear();
+                Outcome::Apply(effect)
+            }
             Mode::Wide => {
                 self.sample.received.lock().unwrap().push((
                     message.seq,
@@ -1173,4 +1193,1151 @@ async fn test_parked_backup_of_a_kept_effect_leaves_the_live_store_to_settle_it(
     let app = load_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
     assert!(app.state.pending_effect.is_none());
     assert!(!app.state.seen.contains(&seq));
+}
+
+async fn stored_copies(w: &World, app: &mut App, protocol: &ParkingProtocol) -> Message {
+    let (_, message) = parked_as(w, app, protocol, Mode::Wide).await;
+    protocol.set(Mode::Wide);
+    let mut different = message.clone();
+    different
+        .body
+        .insert("text".into(), Value::from("another body"));
+    resend(w, app, &different);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.parked_entries().await.unwrap().len(), 2);
+    message
+}
+
+#[tokio::test]
+async fn test_parked_processing_retires_all_copies_with_local_effect() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (before, _) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    let (_, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    protocol.set(Mode::Wide);
+    resend(&w, &app, &message);
+    app.receive(None).await.unwrap();
+    let (after, _) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    let duties = app.unacknowledged_events().await.unwrap();
+    let handed = protocol.handed();
+    protocol.set(Mode::Local);
+    resend(&w, &app, &message);
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        reasons(&mut app).await,
+        vec![
+            (before.stored_id, ParkReason::TooManyOperations),
+            (after.stored_id, ParkReason::TooManyOperations),
+        ]
+    );
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+    assert_eq!(protocol.handed(), handed + 1);
+    assert!(processed(&app, &message).await);
+    assert!(
+        app.forget_processed(w.bob.public(), &message.msg_id, &[])
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_parked_processing_retires_conflicting_copies_after_effect_settles() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    protocol.set(Mode::Plain);
+    resend(&w, &app, &message);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(app.parked_entries().await.unwrap().len(), 2);
+    assert!(!processed(&app, &message).await);
+    let applied = w.effects();
+    let mut app = load_on(&w, &protocol, w.store.clone()).await;
+    app.receive(None).await.unwrap();
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    assert_eq!(w.effects(), applied);
+    assert!(processed(&app, &message).await);
+}
+
+#[tokio::test]
+async fn test_parked_processing_from_a_retry_retires_other_copies() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    protocol.set(Mode::Rejected);
+    resend(&w, &app, &message);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.parked_entries().await.unwrap().len(), 2);
+    protocol.set(Mode::Local);
+    app.receive(None).await.unwrap();
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    assert!(processed(&app, &message).await);
+}
+
+#[tokio::test]
+async fn test_parked_processed_copy_waiting_for_sender_is_dropped() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Local);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, message) = w.note(app.app_id(), "kept");
+    app.receive(None).await.unwrap();
+    w.homeserver.set_down(true);
+    w.clock.advance_ms(11 * 60_000);
+    let seq = resend(&w, &app, &message);
+    let report = app.receive(None).await.unwrap();
+    assert!(has(
+        &report.events,
+        |e| matches!(e, AppEvent::Duplicate { seq: got, conflicting: false } if *got == seq)
+    ));
+    assert!(app.state.held.is_empty());
+    assert!(app.parked_entries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (entry, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    assert!(!processed(&app, &message).await);
+    assert!(
+        !app.forget_processed(
+            w.bob.public(),
+            &message.msg_id,
+            &[LocalWrite::Put {
+                key: b"evicted".to_vec(),
+                value: b"yes".to_vec(),
+            }]
+        )
+        .await
+        .expect("an absent pair permits locals beside ordinary stored input")
+    );
+    assert!(listed(&mut app, entry.stored_id).await.is_some());
+    assert_eq!(
+        app.protocol_get(b"evicted").await.unwrap(),
+        Some(b"yes".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_parked_processing_retires_copies_atomically_at_every_commit() {
+    for stop_after in [false, true] {
+        for n in 1..=8 {
+            let w = World::new();
+            let protocol = ParkingProtocol::new(Mode::Wide);
+            let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+            let message = stored_copies(&w, &mut app, &protocol).await;
+            protocol.set(Mode::Local);
+            resend(&w, &app, &message);
+            let fault = Arc::new(FaultStore::new(
+                w.store.clone(),
+                if stop_after {
+                    StoreFault::StopAfter(n)
+                } else {
+                    StoreFault::StopBefore(n)
+                },
+            ));
+            let mut app = load_on(&w, &protocol, fault).await;
+            let _ = app.receive(None).await;
+            let mut app = load_on(&w, &protocol, w.store.clone()).await;
+            let applied = processed(&app, &message).await;
+            assert_eq!(
+                app.parked_entries().await.unwrap().len(),
+                if applied { 0 } else { 2 },
+                "commit {n}, after {stop_after}"
+            );
+            let local = app
+                .reader()
+                .get_raw(format!("p/notes/{}", message.msg_id).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(
+                local.is_some(),
+                applied,
+                "the processed pair and local effect share the completion commit"
+            );
+            app.receive(None).await.unwrap();
+            assert!(app.parked_entries().await.unwrap().is_empty());
+            assert!(processed(&app, &message).await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_parked_processing_keeps_the_same_id_from_another_sender() {
+    let w = World::new();
+    let phone = app_keys("phone");
+    let phone_app = w.join("phone").await;
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    let mut own = message.clone();
+    own.kind = "sample.notice".into();
+    own.from = pubky_switch_core::message::Sender::of_app(w.alice.public(), &phone);
+    let cert = phone_app.cert().clone();
+    let seq = w
+        .switch
+        .send_plaintext(
+            w.alice.public(),
+            &cert,
+            &own.sign(&phone).unwrap(),
+            &[app.app_id()],
+        )
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let other = app.stored_id_at(seq).unwrap();
+    protocol.set(Mode::Local);
+    resend(&w, &app, &message);
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |event| matches!(
+        event,
+        AppEvent::Duplicate {
+            conflicting: true,
+            ..
+        }
+    )));
+    assert_eq!(
+        reasons(&mut app).await,
+        vec![(other, ParkReason::TooManyOperations)]
+    );
+}
+
+#[tokio::test]
+async fn test_parked_processed_pair_drops_unchecked_changed_bytes_without_conflict() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Local);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, message) = w.note(app.app_id(), "kept");
+    app.receive(None).await.unwrap();
+    let keys = app_keys("unlisted-app");
+    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["scope-a"]);
+    let mut changed = message.clone();
+    changed.from = pubky_switch_core::message::Sender::of_app(w.bob.public(), &keys);
+    changed.body.insert("text".into(), Value::from("changed"));
+    w.homeserver.set_down(true);
+    w.clock.advance_ms(11 * 60_000);
+    let seq = w
+        .switch
+        .send_plaintext(
+            w.bob.public(),
+            &cert,
+            &changed.sign(&keys).unwrap(),
+            &[app.app_id()],
+        )
+        .unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(has(
+        &report.events,
+        |e| matches!(e, AppEvent::MessageDropped { seq: got, check: 9, .. } if *got == seq)
+    ));
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::Duplicate {
+            conflicting: true,
+            ..
+        }
+    )));
+    assert!(app.state.held.is_empty());
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    assert_eq!(protocol.handed(), 1);
+}
+
+#[tokio::test]
+async fn test_parked_processing_refused_effect_keeps_copies_until_success() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    protocol.set(Mode::Plain);
+    resend(&w, &app, &message);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: pubky_switch_core::http::ErrorCode::QuotaExceeded,
+        current: serde_json::json!({}),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(app.parked_entries().await.unwrap().len(), 3);
+    assert!(!processed(&app, &message).await);
+    protocol.set(Mode::Local);
+    app.receive(None).await.unwrap();
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    assert!(processed(&app, &message).await);
+}
+
+#[tokio::test]
+async fn test_parked_processing_backup_keeps_unknown_effect_and_copies() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    protocol.set(Mode::Plain);
+    resend(&w, &app, &message);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let applied = w.effects();
+    restored.receive(None).await.unwrap();
+    let entries = restored.parked_entries().await.unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.reason == ParkReason::Uncertain)
+            .count(),
+        1
+    );
+    assert_eq!(w.effects(), applied);
+    assert!(matches!(
+        restored
+            .forget_processed(w.bob.public(), &message.msg_id, &[])
+            .await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    app.receive(None).await.unwrap();
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    assert_eq!(w.effects(), applied);
+}
+
+async fn rejected_completion(mode: Mode) {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    let duties = app.unacknowledged_events().await.unwrap();
+    protocol.set(mode);
+    resend(&w, &app, &message);
+    app.receive(None).await.unwrap();
+    assert!(
+        app.parked_entries().await.unwrap().is_empty(),
+        "rejection completes all eligible copies"
+    );
+    assert!(processed(&app, &message).await);
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+    assert_eq!(w.effects(), 0);
+}
+
+#[tokio::test]
+async fn test_parked_drop_completion_retires_other_copies() {
+    rejected_completion(Mode::Drop).await;
+}
+
+#[tokio::test]
+async fn test_parked_body_rejection_retires_other_copies() {
+    rejected_completion(Mode::RejectBody).await;
+}
+
+#[tokio::test]
+async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
+    for after in [false, true] {
+        let w = World::new();
+        let protocol = ParkingProtocol::new(Mode::Wide);
+        let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+        let (entry, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+        let duties = app.unacknowledged_events().await.unwrap();
+        app.protocol_commit(&[LocalWrite::Put {
+            key: b"retained".to_vec(),
+            value: b"old".to_vec(),
+        }])
+        .await
+        .unwrap();
+        let fault = Arc::new(FaultStore::new(
+            w.store.clone(),
+            if after {
+                StoreFault::FailAfter(1)
+            } else {
+                StoreFault::FailBefore(1)
+            },
+        ));
+        let mut app = load_on(&w, &protocol, fault.clone()).await;
+        let local = [
+            LocalWrite::Put {
+                key: b"evicted".to_vec(),
+                value: b"yes".to_vec(),
+            },
+            LocalWrite::Delete {
+                key: b"retained".to_vec(),
+            },
+        ];
+        let result = app
+            .forget_processed(w.bob.public(), &message.msg_id, &local)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Store(
+                    StoreError::Unknown | StoreError::Unavailable
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            fault.commits(),
+            1,
+            "the local decision reached its atomic commit"
+        );
+        let restored = load_on(&w, &protocol, w.store.clone()).await;
+        assert_eq!(
+            restored.protocol_get(b"evicted").await.unwrap().is_some(),
+            after
+        );
+        assert_eq!(
+            restored.protocol_get(b"retained").await.unwrap().is_none(),
+            after,
+            "the retained value and its drop mark change in one local decision"
+        );
+        assert!(!processed(&restored, &message).await);
+        assert!(
+            !app.forget_processed(w.bob.public(), &message.msg_id, &local)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            app.protocol_get(b"evicted").await.unwrap(),
+            Some(b"yes".to_vec())
+        );
+        assert!(listed(&mut app, entry.stored_id).await.is_some());
+        assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+        let backup = app.backup_layered().await.unwrap();
+        let mut restored = App::restore(
+            w.env_on(Arc::new(MemoryStore::new())),
+            protocol,
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        assert!(listed(&mut restored, entry.stored_id).await.is_some());
+        assert!(!processed(&restored, &message).await);
+        assert_eq!(
+            restored.protocol_get(b"evicted").await.unwrap(),
+            Some(b"yes".to_vec())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, message) = w.note(app.app_id(), "pending");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(!processed(&app, &message).await);
+    let local = [LocalWrite::Put {
+        key: b"evicted".to_vec(),
+        value: b"yes".to_vec(),
+    }];
+    assert!(
+        matches!(
+            app.forget_processed(w.bob.public(), &message.msg_id, &local)
+                .await,
+            Err(AppError::Refused(Refusal::NotNow(_)))
+        ),
+        "pending effect protects the absent pair"
+    );
+    assert!(app.protocol_get(b"evicted").await.unwrap().is_none());
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        protocol,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let entry = restored.parked_entries().await.unwrap().pop().unwrap();
+    assert_eq!(entry.reason, ParkReason::Uncertain);
+    assert!(
+        matches!(
+            restored
+                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .await,
+            Err(AppError::Refused(Refusal::NotNow(_)))
+        ),
+        "uncertainty protects its held pair"
+    );
+    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    w.clock.advance_ms(super::super::PROCESSED_RETENTION_MS + 1);
+    restored.receive(None).await.unwrap();
+    assert!(
+        !processed(&restored, &message).await,
+        "the ordinary retention path removes the pair"
+    );
+    assert!(
+        matches!(
+            restored
+                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .await,
+            Err(AppError::Refused(Refusal::NotNow(_)))
+        ),
+        "uncertainty still protects locals after pair retention"
+    );
+    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(listed(&mut restored, entry.stored_id).await.is_some());
+}
+
+#[tokio::test]
+async fn test_parked_completion_keeps_release_ended_and_existing_duties() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    protocol.set(Mode::Plain);
+    resend(&w, &app, &message);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let entry = restored
+        .parked_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.reason == ParkReason::Uncertain)
+        .unwrap();
+    let duties = restored.unacknowledged_events().await.unwrap();
+    restored
+        .release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    protocol.set(Mode::RetryFirstStoredRun);
+    resend(&w, &restored, &message);
+    restored.receive(None).await.unwrap();
+    assert!(
+        restored.parked_entries().await.unwrap().is_empty(),
+        "the completed copy retires the released sibling"
+    );
+    let owed = restored.unacknowledged_events().await.unwrap();
+    assert!(
+        duties.iter().all(|duty| owed.contains(duty)),
+        "earlier duties stay owed"
+    );
+    assert!(
+        has(
+            &owed,
+            |event| matches!(event, AppEvent::ReleasedDuplicate { stored_id, .. } if *stored_id == entry.stored_id)
+        ),
+        "retired release keeps its durable completion notice"
+    );
+}
+
+#[tokio::test]
+async fn test_parked_completion_keeps_an_independently_uncertain_copy() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+    let (_, mut message) = w.note(app.app_id(), "uncertain");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let original = restored.parked_entries().await.unwrap().pop().unwrap();
+    assert_eq!(original.reason, ParkReason::Uncertain);
+    w.clock.advance_ms(super::super::PROCESSED_RETENTION_MS + 1);
+    restored.receive(None).await.unwrap();
+    assert!(!processed(&restored, &message).await);
+    // A newly signed copy after pair retention is judged by the protocol's own state.
+    message.created_at_ms = w.clock.now_ms();
+    message
+        .body
+        .insert("text".into(), Value::from("a new copy"));
+    protocol.set(Mode::Local);
+    resend(&w, &restored, &message);
+    restored.receive(None).await.unwrap();
+    assert!(
+        processed(&restored, &message).await,
+        "the eligible new copy completed"
+    );
+    let kept = listed(&mut restored, original.stored_id).await;
+    assert_eq!(
+        kept,
+        Some(original),
+        "completion cannot resolve an independently uncertain effect"
+    );
+}
+
+#[tokio::test]
+async fn test_parked_move_settlement_retires_prior_copies() {
+    use super::moves::{NEXT, Router, freeze_for, next_key, publish_at};
+
+    let w = World::new();
+    let router = Router::of(&w);
+    let protocol = ParkingProtocol::new(Mode::Wide);
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(
+        router.env(&w, w.store.clone()),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let message = stored_copies(&w, &mut app, &protocol).await;
+    let stored = app.parked_entries().await.unwrap();
+    let duties = app.unacknowledged_events().await.unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored
+            .iter()
+            .all(|entry| entry.reason == ParkReason::TooManyOperations)
+    );
+    assert!(!processed(&app, &message).await);
+
+    protocol.set(Mode::Plain);
+    let seq = resend(&w, &app, &message);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    app.ready_local().await.unwrap();
+    assert_eq!(app.parked_entries().await.unwrap(), stored);
+    assert!(!processed(&app, &message).await);
+    let pending = app.state.pending_effect.as_ref().unwrap();
+    assert_eq!(pending.seq, seq);
+    assert_eq!(pending.stored, None);
+    let effects = w.effects();
+    assert_eq!(effects, 1);
+
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |event| matches!(
+        event,
+        AppEvent::ProviderFollowed { generation: 2 }
+    )));
+    assert!(has(&report.events, |event| matches!(
+        event,
+        AppEvent::MessageReceived { seq: got, .. } if *got == seq
+    )));
+    assert!(app.state.pending_effect.is_none());
+    assert!(processed(&app, &message).await);
+    assert_eq!(w.effects(), effects);
+    assert_eq!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap(),
+        Some(b"parked note".to_vec())
+    );
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+
+    let me = app.app_id();
+    let mut loaded = App::load(
+        router.env(&w, w.store.clone()),
+        protocol,
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert!(processed(&loaded, &message).await);
+    assert!(
+        loaded.parked_entries().await.unwrap().is_empty(),
+        "provider settlement retires eligible prior copies with its completed local effect"
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionPoint {
+    Effect,
+    Provider,
+}
+
+/// Observe the separate effect and provider transactions and fail exactly the chosen one.
+struct CompletionStore {
+    inner: Arc<dyn StateStore>,
+    pair: Vec<u8>,
+    fault: Mutex<StoreFault>,
+    at: CompletionPoint,
+    completed: Mutex<Vec<crate::store::WriteBatch>>,
+    providers: Mutex<Vec<crate::store::WriteBatch>>,
+}
+
+impl CompletionStore {
+    fn new(
+        inner: Arc<dyn StateStore>,
+        message: &Message,
+        fault: StoreFault,
+        at: CompletionPoint,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            pair: crate::app::state::key::processed(&message.from.identity, &message.msg_id)
+                .into_bytes(),
+            fault: Mutex::new(fault),
+            at,
+            completed: Mutex::new(Vec::new()),
+            providers: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl StateStore for CompletionStore {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
+        use crate::store::Write;
+        let puts = |wanted: &[u8]| {
+            batch
+                .writes()
+                .iter()
+                .any(|write| matches!(write, Write::Put { key, .. } if key == wanted))
+        };
+        let point = if puts(&self.pair) {
+            self.completed.lock().unwrap().push(batch.clone());
+            Some(CompletionPoint::Effect)
+        } else if puts(crate::app::state::key::META.as_bytes()) {
+            self.providers.lock().unwrap().push(batch.clone());
+            Some(CompletionPoint::Provider)
+        } else {
+            None
+        };
+        if point != Some(self.at) {
+            return self.inner.commit(batch);
+        }
+        let fault = std::mem::replace(&mut *self.fault.lock().unwrap(), StoreFault::None);
+        match fault {
+            StoreFault::FailBefore(1) => Err(StoreError::Unavailable),
+            StoreFault::FailAfter(1) => {
+                self.inner.commit(batch)?;
+                Err(StoreError::Unknown)
+            }
+            StoreFault::None => self.inner.commit(batch),
+            _ => panic!("the completion store fails only its selected transaction"),
+        }
+    }
+}
+
+struct PendingCompletion {
+    world: World,
+    router: super::moves::Router,
+    protocol: Arc<ParkingProtocol>,
+    app: App,
+    message: Message,
+    store: Arc<dyn StateStore>,
+}
+
+impl PendingCompletion {
+    async fn new() -> Self {
+        let world = World::new();
+        let router = super::moves::Router::of(&world);
+        let protocol = ParkingProtocol::new(Mode::Wide);
+        let store: Arc<dyn StateStore> = world.store.clone();
+        let request = world.approve(&app_keys("wallet"), &["scope-a"]);
+        let mut app = App::join(
+            router.env(&world, store.clone()),
+            protocol.clone(),
+            World::config(),
+            request,
+        )
+        .await
+        .unwrap();
+        let message = stored_copies(&world, &mut app, &protocol).await;
+        Self {
+            world,
+            router,
+            protocol,
+            app,
+            message,
+            store,
+        }
+    }
+
+    async fn send_without_answer(&mut self) {
+        self.protocol.set(Mode::Plain);
+        resend(&self.world, &self.app, &self.message);
+        self.world
+            .switch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(self.app.receive(None).await.is_err());
+        self.app.ready_local().await.unwrap();
+        assert!(self.app.state.pending_effect.is_some());
+        assert!(!processed(&self.app, &self.message).await);
+    }
+
+    fn publish_move(&self) {
+        use super::moves::{NEXT, freeze_for, next_key, publish_at};
+        let key = next_key();
+        self.world
+            .switch
+            .freeze(&freeze_for(&self.world, &key, 2))
+            .unwrap();
+        let next = self.world.switch.import_into(key.to_bytes());
+        self.router.add(NEXT, &next);
+        publish_at(
+            &self.world,
+            &next,
+            Inbox::new(NEXT, key.verifying_key().to_bytes()),
+            2,
+            None,
+        );
+    }
+
+    async fn reload(&mut self, store: Arc<dyn StateStore>) {
+        self.app = App::load(
+            self.router.env(&self.world, store),
+            self.protocol.clone(),
+            World::config(),
+            self.app.app_id(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn add_uncertain_copy(&mut self) -> ParkedSummary {
+        self.send_without_answer().await;
+        let backup = self.app.backup_layered().await.unwrap();
+        self.store = Arc::new(MemoryStore::new());
+        self.app = App::restore(
+            self.router.env(&self.world, self.store.clone()),
+            self.protocol.clone(),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        self.app.receive(None).await.unwrap();
+        let copy = self
+            .app
+            .parked_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.reason == ParkReason::Uncertain)
+            .unwrap();
+        self.world
+            .clock
+            .advance_ms(crate::app::PROCESSED_RETENTION_MS + 1);
+        self.app.receive(None).await.unwrap();
+        assert!(!processed(&self.app, &self.message).await);
+        self.message.created_at_ms = self.world.clock.now_ms();
+        copy
+    }
+}
+
+#[tokio::test]
+async fn test_provider_completion_preserves_independent_uncertainty() {
+    let mut pending = PendingCompletion::new().await;
+    let uncertain = pending.add_uncertain_copy().await;
+    pending.send_without_answer().await;
+    let duties = pending.app.unacknowledged_events().await.unwrap();
+    let effects = pending.world.effects();
+    pending.publish_move();
+    pending.app.receive(None).await.unwrap();
+    pending.reload(pending.store.clone()).await;
+    assert!(processed(&pending.app, &pending.message).await);
+    assert!(pending.app.state.pending_effect.is_none());
+    assert_eq!(pending.world.effects(), effects);
+    assert_eq!(
+        pending.app.parked_entries().await.unwrap(),
+        vec![uncertain],
+        "provider completion preserves the independently uncertain copy only"
+    );
+    assert_eq!(pending.app.unacknowledged_events().await.unwrap(), duties);
+}
+
+#[tokio::test]
+async fn test_provider_completion_release_remains_owed() {
+    let mut pending = PendingCompletion::new().await;
+    let uncertain = pending.add_uncertain_copy().await;
+    // The effect's pre-send reservation includes this later host release.
+    pending.send_without_answer().await;
+    pending
+        .app
+        .release_parked(uncertain.stored_id, &uncertain.hash)
+        .await
+        .unwrap();
+    let duties = pending.app.unacknowledged_events().await.unwrap();
+    let store = CompletionStore::new(
+        pending.store.clone(),
+        &pending.message,
+        StoreFault::None,
+        CompletionPoint::Effect,
+    );
+    pending.reload(store.clone()).await;
+    pending.publish_move();
+    pending.app.receive(None).await.unwrap();
+    pending.reload(pending.store.clone()).await;
+    assert!(
+        pending.app.parked_entries().await.unwrap().is_empty(),
+        "provider completion retires the released copy"
+    );
+    let owed = pending.app.unacknowledged_events().await.unwrap();
+    assert!(duties.iter().all(|duty| owed.contains(duty)));
+    assert!(
+        has(
+            &owed,
+            |event| matches!(event, AppEvent::ReleasedDuplicate { stored_id, .. }
+        if *stored_id == uncertain.stored_id)
+        ),
+        "provider retirement keeps the release-ended duty"
+    );
+    let batches = store.completed.lock().unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    use crate::store::Write;
+    assert!(
+        !batch
+            .writes()
+            .iter()
+            .any(|write| matches!(write, Write::Put { key, .. } if key == b"meta")),
+        "effect completion precedes the provider transaction"
+    );
+    assert!(
+        batch
+            .writes()
+            .iter()
+            .any(|write| matches!(write, Write::Put { key, .. } if key.starts_with(b"p/notes/")))
+    );
+    assert!(
+        batch
+            .writes()
+            .iter()
+            .any(|write| matches!(write, Write::Delete { key, .. } if key.starts_with(b"parked/")))
+    );
+    assert!(
+        batch
+            .writes()
+            .iter()
+            .any(|write| matches!(write, Write::Put { key, .. } if key.starts_with(b"duty/")))
+    );
+    let retirement: u64 = batch
+        .writes()
+        .iter()
+        .filter(|write| match write {
+            Write::Delete { key, .. } => key.starts_with(b"parked/") || key.starts_with(b"sretry/"),
+            Write::Put { key, .. } => {
+                key.starts_with(b"duty/") || key == crate::app::state::key::DUTY_NEXT.as_bytes()
+            }
+            _ => false,
+        })
+        .map(Write::size)
+        .sum();
+    assert!(retirement > 0);
+    assert!(
+        batch
+            .writes()
+            .iter()
+            .any(|write| matches!(write, Write::Delete { key, .. }
+        if key == crate::app::state::key::PENDING_EFFECT.as_bytes()))
+    );
+    assert_eq!(store.providers.lock().unwrap().len(), 1);
+    assert!(batch.size() <= crate::store::MAX_BATCH_BYTES);
+}
+
+#[tokio::test]
+async fn test_provider_completion_failure_and_unknown_are_atomic() {
+    for at in [CompletionPoint::Effect, CompletionPoint::Provider] {
+        for fault in [StoreFault::FailBefore(1), StoreFault::FailAfter(1)] {
+            for fresh in [false, true] {
+                let mut pending = PendingCompletion::new().await;
+                let released = pending.add_uncertain_copy().await;
+                pending.send_without_answer().await;
+                pending
+                    .app
+                    .release_parked(released.stored_id, &released.hash)
+                    .await
+                    .unwrap();
+                let effects = pending.world.effects();
+                let before = pending.app.parked_entries().await.unwrap();
+                let duties = pending.app.unacknowledged_events().await.unwrap();
+                let cursor_to = pending
+                    .app
+                    .state
+                    .pending_effect
+                    .as_ref()
+                    .unwrap()
+                    .cursor_to
+                    .unwrap();
+                let store =
+                    CompletionStore::new(pending.store.clone(), &pending.message, fault, at);
+                pending.reload(store.clone()).await;
+                pending.publish_move();
+                let error = pending.app.receive(None).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    AppError::Store(StoreError::Unavailable | StoreError::Unknown)
+                ));
+                assert_eq!(
+                    store.completed.lock().unwrap().len(),
+                    1,
+                    "the effect commit was reached"
+                );
+                assert_eq!(
+                    store.providers.lock().unwrap().len(),
+                    usize::from(at == CompletionPoint::Provider),
+                    "the provider commit follows successful effect completion"
+                );
+                let mut loaded = App::load(
+                    pending.router.env(&pending.world, store.clone()),
+                    pending.protocol.clone(),
+                    World::config(),
+                    pending.app.app_id(),
+                )
+                .await
+                .unwrap();
+                let effect_done =
+                    at == CompletionPoint::Provider || matches!(fault, StoreFault::FailAfter(_));
+                let provider_done =
+                    at == CompletionPoint::Provider && matches!(fault, StoreFault::FailAfter(_));
+                assert_eq!(processed(&loaded, &pending.message).await, effect_done);
+                assert_eq!(
+                    loaded
+                        .protocol_get(format!("notes/{}", pending.message.msg_id).as_bytes())
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    effect_done
+                );
+                assert_eq!(
+                    loaded.parked_entries().await.unwrap(),
+                    if effect_done { vec![] } else { before },
+                    "pair, local effect and eligible retirement share the standalone completion"
+                );
+                assert_eq!(
+                    loaded.state.meta.generation,
+                    if provider_done { 2 } else { 1 }
+                );
+                assert_eq!(loaded.state.pending_effect.is_none(), effect_done);
+                if effect_done {
+                    assert!(
+                        loaded.state.cursor.at_service >= cursor_to,
+                        "completion preserves the applied pending cursor move"
+                    );
+                }
+                let owed = loaded.unacknowledged_events().await.unwrap();
+                assert!(duties.iter().all(|duty| owed.contains(duty)));
+                assert_eq!(
+                    has(
+                        &owed,
+                        |event| matches!(event, AppEvent::ReleasedDuplicate { stored_id, .. }
+                    if *stored_id == released.stored_id)
+                    ),
+                    effect_done,
+                    "the release-ended duty shares the completion commit"
+                );
+                if fresh {
+                    pending.app = loaded;
+                }
+                pending.app.receive(None).await.unwrap();
+                assert!(pending.app.parked_entries().await.unwrap().is_empty());
+                assert!(processed(&pending.app, &pending.message).await);
+                assert_eq!(
+                    pending.world.effects(),
+                    effects,
+                    "recovery never repeats the remote effect"
+                );
+                // A failed effect commit retries it; a committed effect is never written again.
+                let expected = if at == CompletionPoint::Effect
+                    && matches!(fault, StoreFault::FailBefore(_))
+                {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    store.completed.lock().unwrap().len(),
+                    expected,
+                    "a durable local completion is not repeated"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_provider_loss_completion_retires_prior_copies() {
+    let mut pending = PendingCompletion::new().await;
+    pending.send_without_answer().await;
+    let store = CompletionStore::new(
+        pending.store.clone(),
+        &pending.message,
+        StoreFault::FailBefore(1),
+        CompletionPoint::Effect,
+    );
+    pending.reload(store.clone()).await;
+    pending.publish_move();
+    assert!(pending.app.receive(None).await.is_err());
+    assert_eq!(store.completed.lock().unwrap().len(), 1);
+    // The old authenticated chain is retained, but neither completion nor the provider
+    // transaction committed. A declared loss supersedes the follow (Switch spec 12.6).
+    pending.reload(pending.store.clone()).await;
+    assert_eq!(pending.app.state.meta.generation, 1);
+    assert!(pending.app.state.pending_effect.is_some());
+    let key = super::moves::next_key();
+    let next = ScriptedSwitch::recovering(
+        &pending.world.alice,
+        key.to_bytes(),
+        pending.world.clock.clone(),
+        3,
+        1,
+    )
+    .unwrap();
+    pending.router.add(super::moves::NEXT, &next);
+    super::moves::publish_at(
+        &pending.world,
+        &next,
+        Inbox::new(super::moves::NEXT, key.verifying_key().to_bytes()),
+        3,
+        Some(1),
+    );
+    pending.world.switch.lock().not_hosted_unpinned = true;
+    pending.app.refresh_identity().await.unwrap();
+    pending.app.receive(None).await.unwrap();
+    pending.reload(pending.store.clone()).await;
+    assert_eq!(pending.app.state.meta.generation, 3);
+    assert!(processed(&pending.app, &pending.message).await);
+    assert!(pending.app.state.pending_effect.is_none());
+    assert!(
+        pending.app.parked_entries().await.unwrap().is_empty(),
+        "ordinary loss settlement retires eligible prior copies"
+    );
+    assert_eq!(pending.world.effects(), 1);
 }

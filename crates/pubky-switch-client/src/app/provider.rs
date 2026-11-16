@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
 use super::events::{AppEvent, Duty};
-use super::feed::{ReceiveReport, processed_writes};
+use super::feed::ReceiveReport;
 use super::identity;
 use super::kept::{Ended, KeptBatchDrop};
 use super::state::{Tx, key};
@@ -1166,6 +1166,7 @@ impl App {
         doc: &IdentityDoc,
         mv: &mut MoveRecord,
     ) -> Result<(), AppError> {
+        self.complete_applied_effect().await?;
         let old = self.state.meta.clone();
         let mut tx = self.tx()?;
         let gen_key = keys::generation(old.generation);
@@ -1230,14 +1231,44 @@ impl App {
         Ok(())
     }
 
+    /// Complete only an effect the retained authenticated chain proves applied, before
+    /// changing provider state. Reuse the ordinary effect completion and its pre-send
+    /// outcome budget, keeping lifecycle keys and batches in the following transaction
+    /// (Switch spec 11, 12.5 "Kept batches", 12.6). An uncertain effect stays unanswered.
+    pub(crate) async fn complete_applied_effect(&mut self) -> Result<(), AppError> {
+        let Some(pending) = self.state.pending_effect.clone() else {
+            return Ok(());
+        };
+        let batch = Batch::from_body(pending.body.clone())?;
+        if !batch
+            .id()
+            .is_some_and(|id| self.applied_by_old_service(&id))
+        {
+            return Ok(());
+        }
+        // The applied batch carried this cursor move. No new request is sent here.
+        if let Some(to) = pending.cursor_to {
+            self.state.cursor.at_service = self.state.cursor.at_service.max(to);
+        }
+        self.commit_effect(&pending, &batch, &[]).await?;
+        self.events.push(AppEvent::MessageReceived {
+            seq: pending.seq,
+            kind: pending.kind,
+            msg_id: pending.msg_id,
+            sender: pending.sender,
+        });
+        Ok(())
+    }
+
     /// At a provider change, what the app signed for the generation it leaves and kept
     /// unanswered (Switch spec 12.5 step 2, 12.6, 13.5), into `tx`. Called once the app
     /// signs for the new generation, while the chain view is still the old service's: a
     /// batch whose ID that chain holds was applied there, though its answer was lost.
     ///
-    /// - **`pending/effect`:** applied, its outcome commits now, so its entry isn't
-    ///   processed again and an effect without conditions is never applied twice; otherwise
-    ///   it goes, and its entry is read again and its effect signed anew.
+    /// Known-applied received effects complete first in [`App::complete_applied_effect`],
+    /// before the caller starts this lifecycle transaction.
+    /// - **`pending/effect`:** still unanswered, it goes after a loss and its entry is read
+    ///   again; an attempt in it is never signed again.
     /// - **`opq/<batch_id>`:** applied, what it settles commits and it goes; otherwise its
     ///   operations are signed again for the new generation, their bytes under a new wire
     ///   batch ID, and stay kept under the ID the batch was first kept under (`kept.rs`),
@@ -1262,65 +1293,15 @@ impl App {
         let resend_first = carry == Carry::ResendFirst;
         let window_now = self.kept_window_now();
         let answer_decides = |kept_ms: Option<u64>| answer_decides(window_now, kept_ms);
-        if let Some(pending) = self.state.pending_effect.clone() {
-            let applied = Batch::from_body(pending.body.clone())?
-                .id()
-                .is_some_and(|id| self.applied_by_old_service(&id));
-            // A kept effect stays to be sent again whatever its age: an answer that can't
-            // decide parks its entry instead of building the effect again
-            // (`feed.rs`).
-            let stays = !applied && resend_first;
-            if !stays {
-                tx.delete(key::PENDING_EFFECT)?;
-                self.state.pending_effect = None;
-            }
-            // After a loss, an effect the old chain doesn't show applied goes, and its entry
-            // is read again; an `attempt` in it is never signed again, so it is reported as
-            // a kept batch's is (Switch spec 12.6 step 5).
-            if !applied && carry == Carry::AfterLoss {
+        // Known-applied effects were completed before this lifecycle transaction began.
+        // An unknown effect keeps the existing resend/loss behavior (Switch spec 12.5, 12.6).
+        if let Some(pending) = self.state.pending_effect.clone()
+            && !resend_first
+        {
+            tx.delete(key::PENDING_EFFECT)?;
+            self.state.pending_effect = None;
+            if carry == Carry::AfterLoss {
                 self.attempts_dropped(&Batch::from_body(pending.body.clone())?, tx)?;
-            }
-            if applied {
-                let now = self.now();
-                // What its operations settle without their proofs, such as a list change.
-                let settles = super::batch::PendingBatch {
-                    deadlines: pending.deadlines.clone(),
-                    ..super::batch::PendingBatch::default()
-                };
-                for op in Batch::from_body(pending.body.clone())?.ops() {
-                    self.settle_op(op, None, &settles, tx).await?;
-                }
-                processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
-                tx.local(&pending.local)?;
-                for key in &pending.forget {
-                    tx.delete(key)?;
-                }
-                // Processed: a count of the store's retries at it goes with it.
-                if pending.stored.is_some() {
-                    self.unpark(pending.stored, tx)?;
-                } else if self.state.retries.remove(&pending.seq).is_some() {
-                    tx.delete(&key::retry(pending.seq))?;
-                }
-                if pending.stored.is_some() {
-                    // Stored before, and passed then.
-                } else if pending.past_held {
-                    tx.put(&key::seen(pending.seq), &())?;
-                    self.state.seen.insert(pending.seq);
-                } else {
-                    let cursor = &mut self.state.cursor;
-                    cursor.seq = cursor.seq.max(pending.seq);
-                    cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
-                }
-                if let Some(to) = pending.cursor_to {
-                    let cursor = &mut self.state.cursor;
-                    cursor.at_service = cursor.at_service.max(to);
-                }
-                events.push(AppEvent::MessageReceived {
-                    seq: pending.seq,
-                    kind: pending.kind,
-                    msg_id: pending.msg_id,
-                    sender: pending.sender,
-                });
             }
         }
         for (id, pending) in self.kept_batches().await? {

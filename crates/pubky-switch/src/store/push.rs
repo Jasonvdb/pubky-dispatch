@@ -3,7 +3,7 @@
 //!
 //! A registration names its push key by key store ID; the secret half stays in the key store
 //! (`crate::keys`). Every push key the database lets go is owed deleting first, in
-//! `erased_keys` with the reason `push`, in the transaction that lets it go, and the key store
+//! `erased_keys`, in the transaction that lets it go, and the key store
 //! deletes it after the commit ([`Store::lock_owed_key`]):
 //!
 //! - **A minted key** is owed before it exists ([`Store::owe_push_key`]), and the start that
@@ -86,8 +86,8 @@ async fn owe(
     at_ms: u64,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
-         VALUES ($1, $2, $3, 'push') ON CONFLICT (key_id) DO NOTHING",
+        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) \
+         VALUES ($1, $2, $3) ON CONFLICT (key_id) DO NOTHING",
     )
     .bind(key.as_str())
     .bind(account)
@@ -208,7 +208,7 @@ impl AccountTxn {
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         // Waits for a sweep that holds the row; one that deleted the key deleted the row.
-        let claimed = sqlx::query("DELETE FROM erased_keys WHERE key_id = $1 AND reason = 'push'")
+        let claimed = sqlx::query("DELETE FROM erased_keys WHERE key_id = $1")
             .bind(registration.push_key.as_str())
             .execute(self.conn())
             .await

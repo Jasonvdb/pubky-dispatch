@@ -1,12 +1,11 @@
 //! What an account holds of its identity: the newest `identity.json` with the proof of the
-//! delivery that took it, the app limit, the pending key, and the App IDs kept for good
+//! delivery that took it, the app limit, and the App IDs kept for good
 //! (Switch wire 3.3, 3.7, 9.1). Every read and write runs in the request's transaction.
 
 use pubky_switch_core::sig::SignedDoc;
 use sqlx::Row;
 
 use super::{AccountTxn, StoreError, to_db};
-use crate::keys::KeyId;
 
 /// A signed document in its carrying form, as the store keeps it.
 pub(super) fn encode_doc(doc: &SignedDoc) -> Result<Vec<u8>, StoreError> {
@@ -80,31 +79,6 @@ impl AccountTxn {
                 .await
                 .map_err(StoreError::from_db)?;
         serde_json::from_slice(&bytes).map_err(|_| StoreError::Corrupt("announced_limits"))
-    }
-
-    /// The pending key of the next generation, if an enrollment asked for one.
-    pub async fn pending_key(&mut self) -> Result<Option<KeyId>, StoreError> {
-        let id = self.head().id.clone();
-        let key: Option<String> =
-            sqlx::query_scalar("SELECT pending_key FROM accounts WHERE id = $1")
-                .bind(id)
-                .fetch_one(self.conn())
-                .await
-                .map_err(StoreError::from_db)?;
-        key.map(|key| KeyId::parse(&key).map_err(|_| StoreError::Corrupt("pending_key")))
-            .transpose()
-    }
-
-    /// Keep `key` as the pending key of the next generation.
-    pub async fn set_pending_key(&mut self, key: &KeyId) -> Result<(), StoreError> {
-        let id = self.head().id.clone();
-        sqlx::query("UPDATE accounts SET pending_key = $2 WHERE id = $1")
-            .bind(id)
-            .bind(key.as_str())
-            .execute(self.conn())
-            .await
-            .map_err(StoreError::from_db)?;
-        Ok(())
     }
 
     /// The App IDs the account keeps for good: revoked, departed, or named by an

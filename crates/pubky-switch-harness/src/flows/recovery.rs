@@ -52,13 +52,40 @@ pub(super) fn recovered(
     }))
 }
 
+/// An error as `Debug` shows it, without the switch's `message`s: a message is for people,
+/// not for programs (Switch wire 7.6), and the two switches word theirs apart, so the
+/// trace keeps none, here as in an answer's body.
+pub(super) fn shown_without_messages(error: &impl std::fmt::Debug) -> String {
+    const MESSAGE: &str = "message: \"";
+    let shown = format!("{error:?}");
+    let mut kept = String::with_capacity(shown.len());
+    let mut rest = shown.as_str();
+    while let Some(at) = rest.find(MESSAGE) {
+        kept.push_str(&rest[..at]);
+        let text = &rest[at + MESSAGE.len()..];
+        // The message ends at the first quote `Debug` didn't escape.
+        let mut escaped = false;
+        let end = text
+            .char_indices()
+            .find(|&(_, c)| {
+                let ends = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                ends
+            })
+            .map_or(text.len(), |(index, _)| index + 1);
+        rest = text[end..].strip_prefix(", ").unwrap_or(&text[end..]);
+    }
+    kept.push_str(rest);
+    kept
+}
+
 /// How a party's call ended, for the trace: the error's kinds and the status a switch
 /// refused with, never its text.
 pub(super) fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
         Err(error) => {
-            let shown = format!("{error:?}");
+            let shown = shown_without_messages(error);
             let kinds: Vec<&str> = shown
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
@@ -587,17 +614,19 @@ async fn read_notes(
 }
 
 /// A recovery in place: alice's service still serves, and her signer declares its
-/// generation lost there. The enrollment is answered with a pending key for the next
-/// generation, and the version naming it starts the account afresh under that key. The
-/// first enrollment of the run, whose answer named the key now retired, is then sent again
-/// as a retry still on its way: the switch answers it `409 conflict`. The wallet follows the
+/// generation lost there. The enrollment is answered with the service's one key, and the
+/// version naming it starts the account afresh. The first enrollment of the run is then
+/// sent again as a retry still on its way: the service's key is still the one its answer
+/// named, so it gets that answer again, `200` (Switch wire 3.7: "The same enrollment again
+/// gets the same answer, byte for byte, while the service's key is the one that answer
+/// named"). The wallet follows the
 /// recovery at the same origin; it manages the lists, so its upload, which carries no
 /// contact, ends the staged admission, and the signer, asked to end it, finds nothing to
 /// end and sends no call. The signer then signs on at the service.
 ///
 /// Calls: `POST /v1/enroll` at a serving account, `PUT /v1/{id}/identity` with a recovery's
-/// first document under a pending key, `POST /v1/enroll` with an enrollment a generation
-/// change retired, and `POST /v1/{id}/recovery/upload` with empty `lists.contacts` from an
+/// first document, `POST /v1/enroll` with an enrollment answered before the generation
+/// started, and `POST /v1/{id}/recovery/upload` with empty `lists.contacts` from an
 /// app holding `lists.manage`, which ends staged admission.
 ///
 /// # Errors
@@ -627,13 +656,10 @@ pub async fn provider_loss_in_place(world: &World) -> FlowResult {
         "the first enrollment, sent again",
         &json!({ "status": retried.status }),
     );
-    // The key its answer named is retired: `409 conflict`, which only the operator's key
-    // can sign, the account's being the one in question (Switch wire 3.7, 7.4.1).
-    let enrollment = "{alice} POST /v1/enroll";
-    expect_answer(world, enrollment, 409, "conflict")?;
-    let signed_with = world.last_answer(enrollment).map(|[_, _, key]| key);
-    if signed_with.as_deref() != Some("the operator key") {
-        return Err(format!("the conflict is signed with {signed_with:?}").into());
+    // The service's key is still the one its answer named: the same answer again (Switch
+    // wire 3.7).
+    if retried.status != 200 {
+        return Err(format!("the first enrollment again was answered {}", retried.status).into());
     }
     world.advance_ms(STEP_MS);
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
@@ -725,19 +751,21 @@ pub async fn provider_loss_refused(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// An enrollment that takes three sends, the first two refused in transit. The first is
-/// answered `400` and the second `409 conflict`, each in the service's place by something
-/// that holds none of its keys, so neither refusal is a switch's: the flow shows what the
-/// signer does with them, and the one enrollment that arrives. The signer takes neither for
-/// the service's word. After the `400` it sends the same
-/// enrollment again; after the `409` it signs a new one, which the service answers, and the
-/// recovery completes.
+/// An enrollment that takes four sends, the first three refused in transit (Switch wire
+/// 7.4.1 Errors). Each is answered in the service's place by something that holds none of
+/// its keys: a `400`, a `503 unavailable` and a `200` no key signs. The signer hasn't
+/// pinned the new service's key, so it can check none of them and takes none for the
+/// service's word; an enrollment error changes nothing, and the signer sends the same
+/// enrollment again. After the `400` it does so in the same run; the `503` and the answer
+/// that doesn't verify end the run, and the next run sends the same bytes. The fourth send
+/// reaches the service, and the recovery completes.
 ///
-/// Calls: `POST /v1/enroll` three times, the first two never reaching the service.
+/// Calls: `POST /v1/enroll` four times, the first three never reaching the service.
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, or a fault met no request.
+/// When a step that should succeed against any switch fails, the signer signs another
+/// enrollment or sends it other than four times, or a fault met no request.
 pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -746,22 +774,49 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
 
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
-    world.refuse("POST", "/v1/enroll", 400, "bad_request");
-    world.refuse("POST", "/v1/enroll", 409, "conflict");
     let (sent, enrollments) = (world.requests_sent(), world.enrollments_sent());
-    let doc = signer
+    world.refuse("POST", "/v1/enroll", 400, "bad_request");
+    world.refuse("POST", "/v1/enroll", 503, "unavailable");
+    let declared = signer
         .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
-        .await?;
+        .await;
     world.outcome(
-        "the signer recovered at its third enrollment",
-        &recovered(&doc, &signer)?,
+        "the signer declared the loss, its enrollment refused twice",
+        &json!({ "ended": ended(&declared), "signer": status(&signer)? }),
     );
-    // Three sends: the same enrollment twice, around the `400`, and a new one after the
-    // `409` (Switch wire 7.4.1). The recovery's other calls are the delivery and the reads
-    // after it.
+    if declared.is_ok() {
+        return Err("the declaration completed after a 503".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    world.refuse("POST", "/v1/enroll", 200, "ok");
+    let unverified = signer.resume().await;
+    world.outcome(
+        "the signer's next run, its enrollment answered unsigned",
+        &json!({ "ended": ended(&unverified), "signer": status(&signer)? }),
+    );
+    if unverified.is_ok() {
+        return Err("the recovery completed on an answer no key signs".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let resumed = signer.resume().await;
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds no identity document")?;
+    world.outcome(
+        "the signer recovered at its fourth send",
+        &json!({ "ended": ended(&resumed), "recovered": recovered(&doc, &signer)? }),
+    );
+    resumed?;
+    if doc.inbox().url != RECOVERY_ORIGIN {
+        return Err(format!("the newest version names {}", doc.inbox().url).into());
+    }
+    // One enrollment, sent four times: an error changes nothing (Switch wire 7.4.1). The
+    // recovery's other calls are the delivery and the reads after it.
     let new_enrollments = world.enrollments_sent() - enrollments;
-    if new_enrollments != 2 {
-        return Err(format!("{new_enrollments} different enrollments were sent, not 2").into());
+    if new_enrollments != 1 {
+        return Err(format!("{new_enrollments} different enrollments were sent, not 1").into());
     }
     let trace = world.trace();
     let sends = trace
@@ -771,8 +826,8 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
         .skip(sent)
         .filter(|line| line.label == "{alice} POST /v1/enroll")
         .count();
-    if sends != 3 {
-        return Err(format!("the enrollment took {sends} sends, not 3").into());
+    if sends != 4 {
+        return Err(format!("the enrollment took {sends} sends, not 4").into());
     }
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
@@ -1010,14 +1065,14 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
 
 /// A restore in the middle of a recovery in place (Switch spec 12.6 step 1, 12.8, Switch
 /// wire 3.13). alice's service still serves, and her signer declares its generation lost
-/// there. The enrollment is answered with a pending key, and the recovery's first document
-/// doesn't arrive. The install is gone then; a new one is restored from the signer backup
-/// on the Homeserver, which holds that document. The restore delivers it, which starts the
-/// account afresh under the pending key, and then the version naming the new install. The
-/// wallet follows the recovery, and the new install signs on.
+/// there. The enrollment is answered with the service's one key, and the recovery's first
+/// document doesn't arrive. The install is gone then; a new one is restored from the signer
+/// backup on the Homeserver, which holds that document. The restore delivers it, which
+/// starts the account afresh, and then the version naming the new install. The wallet
+/// follows the recovery, and the new install signs on.
 ///
-/// Calls: `PUT /v1/{id}/identity` naming a pending key, sent by a restored install, and the
-/// version naming that install after it.
+/// Calls: `PUT /v1/{id}/identity` with a recovery's first document, sent by a restored
+/// install, and the version naming that install after it.
 ///
 /// # Errors
 ///
@@ -1106,12 +1161,13 @@ pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
 /// A recovery refused at the origin the identity was enrolled at (Switch spec 12.6 step 1,
 /// Switch wire 3.3, 7.4.1). alice lists two apps. Her provider loses what it held and
 /// serves again at the same origin, empty, and now takes one app an account. Her signer
-/// declares the loss there: the service knows no account for her, so the enrollment is
-/// answered with a new account's key, not the one the signer had pinned for this origin.
-/// The recovery's first document lists two apps and is refused, under that new key. The
-/// signer takes the refusal for the service's word: it shows the recovery as refused
-/// there and sends nothing more. Declared again at another service, the recovery
-/// completes.
+/// declares the loss there: the service knows no account for her, so the enrollment makes
+/// a new one, answered with the service's one key, the one the signer had pinned for this
+/// origin ("A service signs with one key for all its accounts", Switch wire 3.3 "Service
+/// keys"; the world keeps the origin's key). The recovery's first document lists two apps
+/// and is refused, under that key. The signer takes the refusal for the service's word: it
+/// shows the recovery as refused there and sends nothing more. Declared again at another
+/// service, the recovery completes.
 ///
 /// Calls: `POST /v1/enroll` at an origin whose service lost the account, and `PUT
 /// /v1/{id}/identity` refused there for the app limit (`400 bad_request`), signed with the
@@ -1119,9 +1175,9 @@ pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, the refusal isn't the
-/// service's under the new account's key, or the signer doesn't end as refused there, or
-/// sends something after it.
+/// When a step that should succeed against any switch fails, the refusal isn't signed with
+/// the service's one key, or the signer doesn't end as refused there, or sends something
+/// after it.
 pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -1144,16 +1200,11 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
         "the service, empty at the same origin, refused the recovery",
         &json!({ "ended": ended(&refused), "signer": status(&signer)? }),
     );
-    // The refusal is the service's own, signed with the key its enrollment answer named:
-    // the account's key number two of the run, whose document was never taken.
+    // The refusal is the service's own, signed with the key its enrollment answer named,
+    // the service's one key, which the signer had pinned for this origin: it reads the
+    // refusal under it at once, and sends nothing more.
     let delivery = "{alice} PUT /v1/{alice}/identity";
     expect_answer(world, delivery, 400, "bad_request")?;
-    // The signer read this origin under the key it had pinned for it, the lost
-    // generation's. The first refusal comes under another key, so the signer asks once
-    // whether the pinned key still serves: a read of the apps, which the new account, not
-    // serving yet, answers under its own key. That ends the pin, and the delivery goes
-    // again, read under the key the enrollment named, to the same refusal.
-    let apps = "{alice} GET /v1/{alice}/apps";
     let sent: Vec<(String, String)> = world
         .trace()
         .lines
@@ -1165,12 +1216,7 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
             (line.label.clone(), status)
         })
         .collect();
-    let expected = [
-        ("{alice} POST /v1/enroll", "200"),
-        (delivery, "400"),
-        (apps, "503"),
-        (delivery, "400"),
-    ];
+    let expected = [("{alice} POST /v1/enroll", "200"), (delivery, "400")];
     let as_expected = sent.len() == expected.len()
         && sent
             .iter()
@@ -1178,11 +1224,10 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
             .all(|((label, status), (wanted, answered))| label == wanted && status == answered);
     if !as_expected {
         return Err(format!(
-            "the declaration sent {sent:?}: no read of the apps between two refused deliveries"
+            "the declaration sent {sent:?}, not the enrollment and one refused delivery"
         )
         .into());
     }
-    expect_answer(world, apps, 503, "staged")?;
     // An answer the trace names no key for counts as none.
     let key_of = |label: &str| {
         world
@@ -1194,15 +1239,12 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
     let refused_under = key_of(delivery);
     let shown = signer.status();
     if refused_under != enrolled_under
-        || key_of(apps) != enrolled_under
-        || refused_under.as_deref() == Some("the operator key")
         || refused_under.is_none()
         || !matches!(&shown, SignerStatus::RecoveryRefused { origin } if origin == ORIGIN)
     {
         return Err(format!(
-            "the refusal is signed with {refused_under:?}, the read of the apps with {:?}, \
-             the enrollment's answer with {enrolled_under:?}, and the signer is {shown:?}",
-            key_of(apps)
+            "the refusal is signed with {refused_under:?}, the enrollment's answer with \
+             {enrolled_under:?}, and the signer is {shown:?}"
         )
         .into());
     }

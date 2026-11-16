@@ -225,7 +225,11 @@ async fn test_directory_vector() {
             .headers
             .get("switch-signature")
             .and_then(|value| value.to_str().ok()),
-        vector_answer()["request_signature"].as_str()
+        named(
+            &vectors("http.json")["requests"],
+            vector_answer()["request"].as_str().expect("request")
+        )["headers"]["switch-signature"]
+            .as_str()
     );
     assert_matches(&replay.service.handle(request).await, &vector_answer());
     replay.db.drop_database().await.expect("drop");

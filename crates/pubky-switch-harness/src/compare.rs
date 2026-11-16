@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_differences_find_an_answer_signed_with_another_key() {
-        // Which key signed an answer is a fact like any other: the operator's key where the
+        // Which key signed an answer is a fact like any other: a switch's key where the
         // other run shows the account's is a difference, and so is no key at all.
         let label = "{alice} PUT /v1/{alice}/identity";
         let signed_with = |key: &str| {
@@ -438,8 +438,8 @@ mod tests {
                 &[("status", "400"), ("answer signed with", key)],
             )])
         };
-        let account = signed_with("the account's service key of generation 1");
-        let found = differences(&account, &signed_with("the operator key"));
+        let account = signed_with("service key number 1");
+        let found = differences(&account, &signed_with("the switch's key"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].fact, "answer signed with");
         let unsigned = trace(vec![line(label, &[("status", "400")])]);

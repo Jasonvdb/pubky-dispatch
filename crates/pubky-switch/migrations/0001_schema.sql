@@ -17,8 +17,6 @@ CREATE TABLE accounts (
     identity_key    BYTEA    NOT NULL CHECK (octet_length(identity_key) = 32),
     -- The generation the account serves (Switch spec 12.6).
     generation      BIGINT   NOT NULL CHECK (generation >= 0),
-    -- The ID of the generation's service key in the key store.
-    service_key     TEXT     NOT NULL,
     -- The last seq given out in this generation, shared by inbox entries and chain items
     -- (Switch spec 6.3).
     last_seq        BIGINT   NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
@@ -32,9 +30,6 @@ CREATE TABLE accounts (
     -- The limits announced at the first enrollment, as the answer writes them; every later
     -- enrollment announces the same (Switch wire 3.7).
     announced_limits BYTEA   NOT NULL,
-    -- The key store ID of the next generation's pending key, once an enrollment at the
-    -- serving account asked for one (Switch wire 3.7).
-    pending_key     TEXT,
     -- The newest identity.json the account holds, in its carrying form (Switch wire 2.2).
     identity_doc    BYTEA,
     -- The transition proof of the delivery that took it, in its carrying form; null for a
@@ -120,27 +115,20 @@ CREATE TABLE chain_items (
 CREATE INDEX chain_items_by_doc_app ON chain_items (account_id, doc_app)
     WHERE doc_app IS NOT NULL;
 
--- The enrollments an account answered, so the same enrollment again gets the same answer
--- (Switch wire 3.7): by the document hash of the signed enrollment, the key that answered it.
--- At most max_enrollments per account are kept; the oldest drops (Switch wire 9.1), and the
--- answer to the enrollment that created the account is never dropped.
+-- The enrollments an account answered (Switch wire 3.7, 9.1): by the document hash of the
+-- signed enrollment. Every answer names the service key and the limits the account announced,
+-- so the same enrollment again gets the same answer, built again. At most max_enrollments per
+-- account are kept; the oldest drops, and the answer to the enrollment that created the
+-- account is never dropped.
 CREATE TABLE enrollment_answers (
     account_id       TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     enrollment_hash  BYTEA   NOT NULL CHECK (octet_length(enrollment_hash) = 32),
-    -- The key store ID of the service key the answer named.
-    service_key      TEXT    NOT NULL,
     -- When it was first answered, in service time.
     answered_at_ms   BIGINT  NOT NULL CHECK (answered_at_ms >= 0),
     -- The order answers were kept in; the oldest drops first.
     kept_order       BIGINT  GENERATED ALWAYS AS IDENTITY,
     -- The answer to the enrollment that created the account.
     creating         BOOLEAN NOT NULL,
-    -- An answer may drop only while the service would build it again byte for byte (Switch
-    -- wire 3.7, 9.1): one naming the pending key, which every later enrollment at the
-    -- serving account gets too. Every other answer is kept as long as the account: the
-    -- creating enrollment's and every one given while the account was staged, which named
-    -- the account's key, where a rebuild at the serving account would name the pending key.
-    rebuildable      BOOLEAN NOT NULL,
     PRIMARY KEY (account_id, enrollment_hash)
 );
 CREATE UNIQUE INDEX enrollment_answers_one_creating ON enrollment_answers (account_id)
@@ -524,44 +512,23 @@ CREATE TABLE handovers (
     body            BYTEA   NOT NULL
 );
 
--- The key store entries owed deleting (Switch wire 7.4.16): an erased account's service key
--- with its mark, and a pending key of the next generation. Written in the same transaction
--- that deletes the account, so the deletion is owed durably the moment the account is gone;
--- the service deletes each key, records the erasure in the key store's ledger (spec 6.5),
--- then drops the row: at once, and again at start for any a failure or a crash left. No
--- foreign key: the account is gone by then.
+-- The push keys owed deleting (Switch wire 8.1): one a start minted, owed until the
+-- committed registration names it, and one a replacement, a removal, a recovery in place or
+-- an erasure let go, owed until the key store deletes it. Written in the transaction that
+-- lets the key go, so its deletion is owed durably the moment nothing names it; the service
+-- deletes each key, then drops the row: at once, and again at start for any a failure or a
+-- crash left. No foreign key: the account may be gone by then.
 CREATE TABLE erased_keys (
     key_id          TEXT    PRIMARY KEY,
     account_id      TEXT    NOT NULL,
-    erased_at_ms    BIGINT  NOT NULL CHECK (erased_at_ms >= 0),
-    -- Why a key is owed deleting: an erasure, whose deletion the key store's ledger records
-    -- (spec 6.5); a generation change that retired it, at an account that lives on; or a
-    -- push key (Switch wire 8.1), one a start minted, owed until the committed registration
-    -- names it, and one a replacement or a removal let go, owed until the key store deletes
-    -- it, whose deletion records no erasure.
-    reason          TEXT    NOT NULL DEFAULT 'erasure'
-        CHECK (reason IN ('erasure', 'retired', 'push'))
-);
--- Whether an identity's erased account still owes keys: read when a request finds no account
--- for the identity, so the operator's 404 waits until they are gone.
-CREATE INDEX erased_keys_by_account ON erased_keys (account_id);
-
--- The enrollments the account answered with a key a generation change has since retired: by
--- their hash, with the generation of the key the answer named. The same enrollment again is
--- `409 conflict`, so its signer enrolls anew (Switch wire 3.7). Kept as the answers they
--- replace were: at most max_enrollments per account, the oldest dropping.
-CREATE TABLE retired_enrollments (
-    account_id       TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-    enrollment_hash  BYTEA   NOT NULL CHECK (octet_length(enrollment_hash) = 32),
-    generation       BIGINT  NOT NULL CHECK (generation >= 1),
-    retired_order    BIGINT  GENERATED ALWAYS AS IDENTITY,
-    PRIMARY KEY (account_id, enrollment_hash)
+    erased_at_ms    BIGINT  NOT NULL CHECK (erased_at_ms >= 0)
 );
 
--- The `revoked_apps` of every enrollment answered with the pending key, held with that key:
--- they join the account's tombstones when the delivery naming it starts the new generation,
--- and count for nothing if none does (Switch wire 3.7).
-CREATE TABLE pending_revoked_apps (
+-- The `revoked_apps` of every enrollment answered at a serving account since its current
+-- generation began (Switch wire 3.7): they join the account's tombstones when a delivery
+-- starts the next generation (3.3), and count for nothing if none does. Held whatever
+-- enrollment answers drop past max_enrollments (9.1).
+CREATE TABLE held_revoked_apps (
     account_id  TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     app_id      BYTEA   NOT NULL CHECK (octet_length(app_id) = 16),
     PRIMARY KEY (account_id, app_id)
@@ -648,4 +615,12 @@ CREATE TABLE chain_retention (
     CHECK ((checkpoint IS NULL) = (checkpoint_seq IS NULL)),
     CHECK ((dropped_seq IS NULL) = (dropped_chain_hash IS NULL)),
     CHECK (dropped_seq IS NULL OR dropped_seq <= checkpoint_seq)
+);
+
+-- Outcomes of external erasure attempts survive account deletion. Only the exact attempt
+-- token and binding can publish completed evidence outside database backups (wire 7.3).
+CREATE TABLE erasure_outcomes (
+    identity TEXT PRIMARY KEY,
+    attempt BYTEA NOT NULL CHECK (octet_length(attempt) BETWEEN 1 AND 4096),
+    committed BOOLEAN NOT NULL
 );

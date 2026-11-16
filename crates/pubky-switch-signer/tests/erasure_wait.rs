@@ -1,5 +1,5 @@
-//! The erasure's wait for the operator's `404` to hold, after a request in doubt (Switch wire
-//! 7.4.16, spec 12.7 step 5): what counts, what ends it, and what the signer sends meanwhile.
+//! The erasure's wait for a `404` the pinned key didn't sign to hold, after a request in doubt
+//! (Switch wire 7.4.16, spec 12.7 step 5): what counts, what ends it, and what the signer sends meanwhile.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -147,7 +147,9 @@ async fn test_erasure_wait_signed_error_to_the_check_ends_the_wait() {
         code: ErrorCode::Unavailable,
         current: serde_json::Value::Null,
     });
+    *world.homeserver.down.lock().unwrap() = true;
     signer.resume().await.unwrap_err();
+    *world.homeserver.down.lock().unwrap() = false;
     let status_after_signed = signer.status();
     intermediary.store(true, Ordering::SeqCst);
     world.clock.advance_ms(22 * H);
@@ -567,9 +569,8 @@ async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
     let flaky = FlakyStore::new(store.clone());
-    let mut signer = Signer::open(world.env(flaky.clone()), world.keyring())
-        .await
-        .unwrap();
+    let (env, _) = world.env_with_unsigned_404s(flaky.clone());
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/erase".into(),
     });
@@ -579,9 +580,8 @@ async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     flaky.fail(false);
     drop(signer);
     world.clock.advance_ms(24 * H);
-    let mut signer = Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
+    let (env, _) = world.env_with_unsigned_404s(store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erasing);
     let now = world.clock.now_ms();
     assert_eq!(
@@ -595,7 +595,10 @@ async fn test_erasure_wait_alarm_during_the_wait_keeps_since_and_concludes() {
     // The wait runs; an equivocation on the Homeserver raises the alarm on the in-doubt
     // path (the erasure and `since` kept); the user clears it; a run 24 h after T0 ends it.
     let world = World::new();
-    let (mut signer, _, _) = with_an_app(&world).await;
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let (env, _) = world.env_with_unsigned_404s(store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/erase".into(),
     });
@@ -698,7 +701,7 @@ async fn test_erasure_wait_retry_404_after_a_signed_check_starts_a_fresh_wait() 
 #[tokio::test]
 async fn test_erasure_wait_signed_error_to_the_retry_ends_the_wait() {
     // T0: 404. T0+2h: signed check, the retry gets a signed 503: the wait is over, the
-    // mark cleared. T0+24h: 404 again: a fresh wait.
+    // request remains in doubt. T0+24h: 404 again starts a fresh wait.
     let world = World::new();
     let (mut signer, _, intermediary, _t0, _) = waiting_behind_an_intermediary(&world).await;
     world.clock.advance_ms(2 * H);
@@ -712,12 +715,15 @@ async fn test_erasure_wait_signed_error_to_the_retry_ends_the_wait() {
     assert_eq!(signer.status(), SignerStatus::Erasing);
     intermediary.store(true, Ordering::SeqCst);
     world.clock.advance_ms(22 * H);
-    // No request in doubt now: the 404 to the check is an error, not the wait.
-    signer.resume().await.unwrap_err();
-    assert!(!matches!(
+    let since_ms = world.clock.now_ms();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms })
+    );
+    assert_eq!(
         signer.status(),
-        SignerStatus::Erased | SignerStatus::ErasedUnconfirmed { .. }
-    ));
+        SignerStatus::ErasedUnconfirmed { since_ms }
+    );
 }
 
 #[tokio::test]

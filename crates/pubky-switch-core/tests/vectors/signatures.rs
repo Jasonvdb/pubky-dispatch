@@ -249,13 +249,8 @@ fn independent_fields(label: &str, signature: &str) -> Vec<Vec<u8>> {
         }
         labels::sig::HTTP_RESPONSE => {
             let r = by_signature(&http_vectors["responses"], "signature");
-            let request_signature = r["request_signature"].as_str().map(b64n::<64>);
-            http::response_fields(
-                u16::try_from(int(&r, "status")).unwrap(),
-                request_signature.as_ref(),
-                &header_of(&r, http::header::SERVER_TIME).unwrap(),
-                st(&r, "body").as_bytes(),
-            )
+            let received = crate::http::answered(&keys, &http_vectors, &r);
+            http::response_fields(&crate::http::parts_of(&r, &received))
         }
         labels::sig::PUSH => {
             let w = &http_vectors["webhook"];

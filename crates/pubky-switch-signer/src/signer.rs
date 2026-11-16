@@ -1023,12 +1023,12 @@ impl Signer {
         Ok(matches!(read, Ok(_) | Err(ClientError::Switch { .. })))
     }
 
-    /// Where the clients of the enrolled switch go. While a recovery declared in place goes
-    /// to the service that served the lost generation, its answers are checked with the key
-    /// it served that generation with, but the `200` of the delivery that starts the new
-    /// generation, which the client checks with the pending key the version names (Switch
-    /// wire 3.13, 7.4.2): no answer under a third key is taken, and none under the earlier
-    /// key as the new generation's.
+    /// Where the clients of the enrolled switch go. While a recovery declared in place, after
+    /// the service changed its key (Switch spec 12.5), goes to the service that served the
+    /// lost generation, its answers are checked with the key it served that generation with,
+    /// but the `200` of the delivery that starts the new generation, which the client checks
+    /// with the new key the version names (Switch wire 3.13, 7.4.2): no answer under a third
+    /// key is taken, and none under the earlier key as the new generation's.
     fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
         let serving = self
             .state
@@ -1086,6 +1086,7 @@ impl Signer {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
+            created: Some(answer.created),
         });
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
@@ -1275,41 +1276,49 @@ impl Signer {
     /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
     /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
     /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
-    /// it is; the next answer the pinned key signs clears it, an error included. Never raised
-    /// once the account is erased. Nothing else changes: an unauthenticated `404` with no
-    /// request in doubt is never an erasure (Switch wire 7.4.16).
+    /// it is; the next answer the pinned key signs clears it, an error included. The signed
+    /// `404` of an identity the service doesn't host, with no erasure of this install's in
+    /// progress, is the service's word that it holds no account: it raises
+    /// [`Alert::ServiceHoldsNoAccount`], which any other answer the pinned key signs clears
+    /// (Switch wire 7.3 step 2, 7.4.16). Neither is raised once the account is erased.
+    /// Nothing else changes: a `404` with no request in doubt is never an erasure (Switch
+    /// wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
         let read = self.service_client()?.apps().await;
         // The device clock when the answer came, before the alert's commit below, so a step
         // judging the clock against the answer's time isn't off by that commit.
         let device_ms = self.env.clock.now_ms();
-        let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
-        // Any answer the pinned key signs, an error included, shows the account hosted: it
-        // clears the alert, and ends an erasure's wait for the operator's `404` to hold, here
-        // where it arrives, whatever the step that read it does next (Switch wire 7.3 step 2,
-        // 7.4.16).
+        let judged = !erasing && !self.state.erased;
+        // Any answer the pinned key signs, an error included, shows the switch answering for
+        // the account under that key: it clears the alert for an unsigned `404`, and ends an
+        // erasure's wait for one to hold, here where it arrives, whatever the step that read
+        // it does next (Switch wire 7.3 step 2, 7.4.16).
         let signed = matches!(
             &read,
             Ok(_) | Err(ClientError::Switch { .. } | ClientError::InvalidResponse(_))
         );
-        let raise = match &read {
-            _ if signed && raised => Some(false),
-            Err(ClientError::BadServiceSignature { status: 404 })
-                if !raised && !erasing && !self.state.erased =>
-            {
-                Some(true)
-            }
-            _ => None,
-        };
+        // The signed `404` of an identity the service doesn't host is its word that it holds
+        // no account, never an answer that shows one hosted (Switch wire 7.3 step 2, 7.4.16).
+        let not_held = read.as_ref().err().is_some_and(ClientError::is_not_hosted);
+        let unsigned_404 = matches!(&read, Err(ClientError::BadServiceSignature { status: 404 }));
         let mut state = self.state.clone();
-        match raise {
-            Some(true) => state.alert(Alert::AccountNotHosted),
-            Some(false) => state
+        if signed {
+            state
                 .alerts
-                .retain(|alert| *alert != Alert::AccountNotHosted),
-            None => {}
+                .retain(|alert| *alert != Alert::AccountNotHosted);
+        }
+        if signed && !not_held {
+            state
+                .alerts
+                .retain(|alert| *alert != Alert::ServiceHoldsNoAccount);
+        }
+        if judged && unsigned_404 {
+            state.alert(Alert::AccountNotHosted);
+        }
+        if judged && not_held {
+            state.alert(Alert::ServiceHoldsNoAccount);
         }
         // Whether the end of a staged admission is owed is the switch's to say (Switch wire
         // 7.4.12 `recovery`), so a restore or a take-over finds it too: owed while the wait is
@@ -1504,14 +1513,10 @@ impl Signer {
                 }
                 Err(error.into())
             }
-            Err(
-                error @ ClientError::Switch {
-                    status: 400 | 413, ..
-                },
-            ) => {
-                // A definite refusal, a `400` or a `413 too_large` (Switch wire 7.1): the same
-                // bytes would be refused again. The version stays spent (`signed_through`). A
-                // renewal it carried didn't happen, and the user is told in the same commit.
+            Err(error) if delivery_refused_for_good(&error) => {
+                // A definite refusal: the same bytes would be refused again. The version stays
+                // spent (`signed_through`). A renewal it carried didn't happen, and the user is
+                // told in the same commit.
                 let mut state = self.state.clone();
                 self.note_refused_renewals(&mut state, &doc)?;
                 self.commit(state, None).await?;
@@ -2146,9 +2151,54 @@ pub(crate) struct SwitchRead {
     pub(crate) device_ms: u64,
 }
 
+/// Whether a delivery's refusal is for good, so the same bytes would be refused again: a
+/// `400`, or a `413 too_large` that binds the delivery as sent, its body included, or a body
+/// over the call's cap, which the client refuses before sending it (Switch wire 7.1). A `413`
+/// given before the body was read binds no body and is final for nothing.
+fn delivery_refused_for_good(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Switch {
+            status: 400 | 413,
+            ..
+        } | ClientError::BodyOverCap { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_delivery_refused_for_good_takes_only_what_binds_the_bytes() {
+        let switch = |status: u16, code: ErrorCode| ClientError::Switch {
+            status,
+            code,
+            message: String::new(),
+            current: serde_json::Value::Null,
+            known_version: None,
+            retry_after: None,
+        };
+        for error in [
+            switch(400, ErrorCode::BadRequest),
+            switch(413, ErrorCode::TooLarge),
+            ClientError::BodyOverCap { cap: 1 },
+        ] {
+            assert!(delivery_refused_for_good(&error), "{error:?}");
+        }
+        for error in [
+            ClientError::BodyUnread {
+                status: 413,
+                code: ErrorCode::TooLarge,
+                retry_after: None,
+            },
+            switch(409, ErrorCode::Conflict),
+            switch(503, ErrorCode::Unavailable),
+            ClientError::BadServiceSignature { status: 400 },
+        ] {
+            assert!(!delivery_refused_for_good(&error), "{error:?}");
+        }
+    }
 
     #[test]
     fn test_identity_cap_keeps_its_headroom() {

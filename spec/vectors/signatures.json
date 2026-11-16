@@ -309,12 +309,16 @@
           "name": "u64(status)"
         },
         {
-          "hex": "701b0d51655b16d43e1b4d62cda16ecec809e5f0c6271b1b2c93c327eb0cf006",
-          "name": "BLAKE3(request signature)"
+          "hex": "158777159a345f3efa1f34597a77e4d8fba2091d83f92baca888ec8ccfa951c7",
+          "name": "BLAKE3(received request)"
         },
         {
           "hex": "323032362d30312d30315430303a30353a30302e3235305a",
           "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "head field"
         },
         {
           "hex": "c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
@@ -323,8 +327,8 @@
       ],
       "label": "pubky-switch/v1/http-response",
       "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
-      "signature": "vZEvjUQYGWHCQt80Mo0-CRz9HY33Kke-hQyMD5VPhldwiOqbFPE0xes23ke0YV3kkfsMlldUAKeJdjmmX33MCA",
-      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020701b0d51655b16d43e1b4d62cda16ecec809e5f0c6271b1b2c93c327eb0cf00600000018323032362d30312d30315430303a30353a30302e3235305a00000020c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
+      "signature": "dkThMx0qobAUpM_iePS0UiD6i9RG1jVhNTIcDt8xDliYud1bEFjZX4WNUzc0EFRQ2FAoEs9J-jJYc3KAxA6MAw",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020158777159a345f3efa1f34597a77e4d8fba2091d83f92baca888ec8ccfa951c700000018323032362d30312d30315430303a30353a30302e3235305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee34500000020c27896d09360f965a1d1dd19130a1c86b11d1935094072bd52f33489afbc2e07",
       "signer": "service key"
     },
     {

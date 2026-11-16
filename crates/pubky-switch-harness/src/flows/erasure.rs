@@ -1,7 +1,10 @@
 //! The account's erasure, when the user stops using the Switch (Switch spec 12.7, Switch
 //! wire 7.4.16).
 
+use std::sync::Arc;
+
 use pubky_switch_client::app::{App, AppEvent};
+use pubky_switch_client::store::MemoryStore;
 use pubky_switch_signer::{Signer, SignerStatus, UserConfirmed};
 use serde_json::{Value, json};
 
@@ -11,10 +14,6 @@ use super::messaging::joined;
 use super::recovery::{expect_staged, expect_upload, follow_recovery};
 use super::{ORIGIN, STEP_MS};
 use crate::{FlowResult, World};
-
-/// How long the operator's `404` must hold, after an erasure in doubt, before the signer
-/// takes the erasure as done (Switch wire 7.4.16, Switch spec 12.7 step 5).
-const CONFIRMATION_MS: u64 = 24 * 3_600_000;
 
 /// Where the signer stands in an erasure in doubt, for the trace: how its run ended, its
 /// state, since when it holds the account as erased but unconfirmed, as far into the flow
@@ -53,7 +52,7 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
         Err(error) => {
-            let shown = format!("{error:?}");
+            let shown = super::recovery::shown_without_messages(error);
             let kinds: Vec<&str> = shown
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
@@ -63,14 +62,6 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
         }
     }
 }
-
-/// How long an app must meet the operator's `404` and a missing `identity.json`, at reads
-/// spread over that time, before it takes its account as erased: the same 24 hours (Switch
-/// spec 12.7 step 5).
-const APP_WAIT_MS: u64 = CONFIRMATION_MS;
-
-/// The least time between two reads the app's wait counts: it takes five, so four of these.
-const APP_SPACING_MS: u64 = APP_WAIT_MS / 4;
 
 /// One read of an app whose account was erased, for the trace: how it ended, the events it
 /// raised, where the app stands with its service, and whether the identity's
@@ -133,16 +124,15 @@ fn gone(raised: bool, expected: bool, step: &str) -> FlowResult {
 
 /// What the world shows of the identity once its signer closed the account: the signer's
 /// own state, whether its `identity.json` is still on the Homeserver, what anyone reading
-/// the public `identity.json` from the switch gets, an app's wait, and the signer's next
-/// run.
+/// the public `identity.json` from the switch gets, an app's next reads, and the signer's
+/// next run.
 ///
-/// The app's wait (Switch spec 12.7 step 5): nothing authenticates an erasure, so the app
-/// takes its account as gone only once the operator's `404` and a missing `identity.json`
-/// have both held at five reads at least 6 hours apart, over 24 hours. The flow deletes
+/// The app's next read meets the service's `404` saying that it doesn't host the identity,
+/// signed with the service key the app pinned and bound to its own request, and a missing
+/// `identity.json`: "Both together are an erasure, at once" (Switch spec 12.7 step 5,
+/// Switch wire 7.4.16 Afterwards), so that read raises `AccountGone`. The flow deletes
 /// nothing itself: the file is missing because the signer's erasure took it off the
-/// Homeserver. Four reads 6 hours apart raise nothing, nor does one a step short of 24
-/// hours; the read 24 hours after the first raises `AccountGone`, and a read after that
-/// asks the switch nothing.
+/// Homeserver. A read after that asks the switch nothing.
 async fn afterwards(
     world: &World,
     name: &str,
@@ -164,28 +154,7 @@ async fn afterwards(
         &json!({ "status": public.status }),
     );
 
-    let step = format!("{name}: an app's next read, the first of its wait");
-    let raised = read_once_erased(world, &step, app, identity).await?;
-    gone(raised, false, &step)?;
-    // A check for a move in between asks the public `identity.json` of the switch: it meets
-    // the `404` too.
-    let check = app.check_for_move().await;
-    world.outcome(
-        &format!("{name}: the app's check for a move"),
-        &json!({ "ended": ended(&check), "events": events(&app.take_events()) }),
-    );
-    for hours in [6, 12, 18] {
-        world.advance_ms(APP_SPACING_MS);
-        let step = format!("{name}: the app's read {hours} hours on");
-        let raised = read_once_erased(world, &step, app, identity).await?;
-        gone(raised, false, &step)?;
-    }
-    world.advance_ms(APP_SPACING_MS - STEP_MS);
-    let step = format!("{name}: the app's read short of 24 hours on");
-    let raised = read_once_erased(world, &step, app, identity).await?;
-    gone(raised, false, &step)?;
-    world.advance_ms(STEP_MS);
-    let step = format!("{name}: the app's read 24 hours on, the account is gone");
+    let step = format!("{name}: an app's next read, the account is gone");
     let raised = read_once_erased(world, &step, app, identity).await?;
     gone(raised, true, &step)?;
     world.advance_ms(STEP_MS);
@@ -202,14 +171,16 @@ async fn afterwards(
 }
 
 /// The signer closes the identity's account: `identity.json` leaves the Homeserver, the
-/// switch erases the account, and every later call is answered by the operator's `404`.
+/// switch erases the account, and every later call is answered by the not-hosted `404`,
+/// signed with the service key.
 ///
-/// An app of the identity then waits its own 24 hours before it takes the account as gone.
+/// An app of the identity takes the account as gone at its next read (Switch spec 12.7
+/// step 5).
 ///
 /// Calls: `POST /v1/{id}/erase` (`200`), then the public `GET /v1/{id}/identity` and an
-/// own app's `GET /v1/{id}/feed` at each read of its wait, each answered `404` with the
-/// operator key. The signer, holding the account as erased, sends nothing at its next run,
-/// nor does the app once it took the account as gone.
+/// own app's `GET /v1/{id}/feed`, each answered `404` with the service key. The signer,
+/// holding the account as erased, sends nothing at its next run, nor does the app once it
+/// took the account as gone.
 ///
 /// # Errors
 ///
@@ -238,15 +209,14 @@ pub async fn erasure(world: &World) -> FlowResult {
 }
 
 /// The erasure's answer is lost: the signer's call fails with the erasure in doubt. Its
-/// next run meets the operator's `404`, which nobody can authenticate, and holds the account
-/// as erased but unconfirmed; a run short of 24 hours later still does; the first run 24
-/// hours after that first `404` concludes the account is erased (Switch wire 7.4.16, Switch
-/// spec 12.7 step 5). The erasure is never sent again. An app of the identity then waits
-/// its own 24 hours, as in [`erasure`].
+/// next run meets the not-hosted `404` its pinned key signed, which "confirms the erasure at
+/// once" (Switch wire 7.4.16 "The signer's `404`", Switch spec 12.7 step 5): the account is
+/// erased, and the erasure is never sent again. An app of the identity then takes the
+/// account as gone, as in [`erasure`].
 ///
-/// Calls: `POST /v1/{id}/erase` with its answer lost; then the signer's read at each of
-/// its three runs, answered `404` with the operator key; then the calls of [`erasure`]
-/// after its `200`.
+/// Calls: `POST /v1/{id}/erase` with its answer lost; then the signer's read at its next
+/// run, answered `404` with the service key; then the calls of [`erasure`] after its
+/// `200`.
 ///
 /// # Errors
 ///
@@ -275,32 +245,8 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     let first = signer.resume().await;
     world.outcome(
-        "the signer's next run meets the operator's 404: erased, unconfirmed",
+        "the signer's next run meets the signed 404: erased",
         &in_doubt(world, started_ms, &signer, &first, &alice.public())?,
-    );
-    standing(
-        &signer,
-        "erased, unconfirmed",
-        matches!(signer.status(), SignerStatus::ErasedUnconfirmed { .. }),
-    )?;
-    // One step short of 24 hours after that first `404`.
-    world.advance_ms(CONFIRMATION_MS - STEP_MS);
-    let early = signer.resume().await;
-    world.outcome(
-        "a run short of 24 hours later: still unconfirmed",
-        &in_doubt(world, started_ms, &signer, &early, &alice.public())?,
-    );
-    standing(
-        &signer,
-        "erased, unconfirmed",
-        matches!(signer.status(), SignerStatus::ErasedUnconfirmed { .. }),
-    )?;
-    // 24 hours after it.
-    world.advance_ms(STEP_MS);
-    let done = signer.resume().await;
-    world.outcome(
-        "the run 24 hours after the first 404: erased",
-        &in_doubt(world, started_ms, &signer, &done, &alice.public())?,
     );
     standing(
         &signer,
@@ -325,9 +271,9 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
 
 /// An erased account enrolled again at the same origin (Switch spec 12.7 step 4, Switch
 /// wire 7.4.16, 7.4.1). alice's signer closes her account, and the service deletes
-/// everything it held for her, its key for the account too. Her signer then declares the
-/// loss at the same origin. The service knows no account for her, so the enrollment makes
-/// a new one under a new key, which signs that answer and every answer after it. The
+/// everything it held for her, her account's mark too. Her signer then declares the loss at
+/// the same origin. The service knows no account for her, so the enrollment makes a new one
+/// with a new (0, 0) mark, under the service's one key, the erased account's too. The
 /// account starts as after a provider loss: its first document is the next generation's,
 /// at a higher version, naming the erased one as lost. Her wallet follows the recovery
 /// there, and the signer signs on.
@@ -338,8 +284,7 @@ pub async fn erasure_answer_lost(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the new account answers
-/// under the erased account's key or the operator's, or doesn't start at the next
-/// generation.
+/// under another key than the switch's one key, or doesn't start at the next generation.
 pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -375,8 +320,8 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
             "signer": status(&signer)?,
         }),
     );
-    // The new account's own key signs: the one its enrollment answer named, never the
-    // erased account's nor the operator's.
+    // The switch's one key signs for the new account, as it did for the erased one
+    // (Switch wire 7.1).
     // An answer the trace names no key for counts as none.
     let named =
         |answer: Option<[String; 3]>| answer.map(|[_, _, key]| key).filter(|key| !key.is_empty());
@@ -387,10 +332,9 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     if doc.generation() != before.generation() + 1
         || doc.body().recovery_from != Some(before.generation())
         || doc.version() <= before.version()
-        || delivered_under.as_deref() != Some("the account's service key of generation 2")
+        || delivered_under.as_deref() != Some("service key number 1")
         || enrolled_under.is_none()
-        || enrolled_under.as_deref() == Some("the operator key")
-        || enrolled_under == erased_key
+        || enrolled_under != erased_key
     {
         return Err(format!(
             "the new account starts at generation {} from {:?}, its enrollment answered \
@@ -416,5 +360,153 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
         "the signer signed on",
         &json!({ "version_steps": next.version() - doc.version(), "signer": status(&signer)? }),
     );
+    Ok(())
+}
+
+/// A signed unavailable answer preserves the erasure in progress. Reads expose only
+/// established outcomes; an unknown attempt is resolved by the signer's exact retry.
+///
+/// # Errors
+///
+/// When a retained outcome is misreported or the authorized retry cannot finish.
+pub async fn erasure_outcome(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+) -> FlowResult {
+    Box::pin(erasure_outcome_after_reply(world, outcome, false)).await
+}
+
+/// An unavailable erasure answer is lost, then the signer restarts and retries.
+///
+/// # Errors
+///
+/// When the unresolved outcome or its exact retry is misreported.
+pub async fn erasure_outcome_answer_lost(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+) -> FlowResult {
+    Box::pin(erasure_outcome_after_reply(world, outcome, true)).await
+}
+
+async fn erasure_outcome_after_reply(
+    world: &World,
+    outcome: pubky_switch_client::testing::ErasureOutcome,
+    lose_reply: bool,
+) -> FlowResult {
+    use pubky_switch_client::testing::ErasureOutcome;
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let mut signer = Box::pin(Signer::create(env, world.keyring(&alice)?, ORIGIN)).await?;
+    Box::pin(signer.resume()).await?;
+    world.advance_ms(STEP_MS);
+    let (_wallet, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    world.fail_next_erasure(ORIGIN, &alice, outcome).await?;
+    if lose_reply {
+        world.lose_answer("POST", "/erase");
+    }
+    let first = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
+    if first.is_ok() {
+        return Err("an unfinished erasure answered success".into());
+    }
+    world.outcome("the erasure is unavailable", &ended(&first));
+    let read = world
+        .request("GET", ORIGIN, &format!("/v1/{}/identity", alice.key().id()))
+        .await?;
+    let expected = match outcome {
+        ErasureOutcome::Unresolved | ErasureOutcome::UnresolvedAbsent => 503,
+        ErasureOutcome::Committed => 404,
+        ErasureOutcome::Rejected => 200,
+    };
+    if read.status != expected {
+        return Err(format!(
+            "pending erasure read: {} instead of {expected}",
+            read.status
+        )
+        .into());
+    }
+    if expected != 200 && read.header(pubky_switch_core::http::header::HEAD).is_some() {
+        return Err("an unresolved or erased account carried a head".into());
+    }
+    world.outcome(
+        "the retained outcome was read",
+        &json!({"status": read.status}),
+    );
+    // The pending operation must survive reopening the same durable signer state.
+    drop(signer);
+    let mut signer = Signer::open(world.signer_env(&alice, store)?, world.keyring(&alice)?).await?;
+    world.advance_ms(STEP_MS);
+    let resumed = Box::pin(signer.resume()).await;
+    world.outcome("the signer resumed the erasure", &ended(&resumed));
+    resumed?;
+    standing(
+        &signer,
+        "erased",
+        matches!(signer.status(), SignerStatus::Erased),
+    )?;
+    Ok(())
+}
+
+/// An unrelated unavailable read grants no authority to unpublish or erase.
+///
+/// # Errors
+///
+/// When the signer deletes state without first establishing ownership.
+pub async fn erasure_unavailable_before_authorization(world: &World) -> FlowResult {
+    use pubky_switch_client::{Credentials, SwitchClient};
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let created = world.now_ms();
+    let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let (_wallet, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    let published = world.files().identity_doc(&alice.public());
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds its document")?;
+    let client = SwitchClient::new(
+        ORIGIN,
+        alice.public(),
+        Credentials::Signer {
+            identity: alice.public(),
+            key: Arc::new(pubky_switch_core::keys::IdentityKey::from_secret(
+                alice.key().secret_bytes(),
+            )),
+        },
+        Some(doc.inbox().service_key),
+        world.transport(),
+        world.clock().clone(),
+    )?;
+    // A request outside this signer's flow left uncertainty. It does not authorize
+    // this signer to delete Homeserver records or acquire an erasure intent from a 503.
+    world
+        .fail_next_erasure(
+            ORIGIN,
+            &alice,
+            pubky_switch_client::testing::ErasureOutcome::Unresolved,
+        )
+        .await?;
+    let first = client.erase(Some(created), Some(doc.hash())).await;
+    if first.is_ok() {
+        return Err("the external attempt answered success".into());
+    }
+    let result = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
+    world.outcome("unavailable before authorization", &ended(&result));
+    if result.is_ok()
+        || !matches!(signer.status(), SignerStatus::Signing)
+        || published != world.files().identity_doc(&alice.public())
+    {
+        return Err("an unavailable ownership read authorized erasure".into());
+    }
+    // The authorizing caller can repeat its exact request; the local signer still
+    // holds no unanswered erasure and takes the resulting 404 only as not hosted.
+    client.erase(Some(created), Some(doc.hash())).await?;
+    let result = Box::pin(signer.close_account(UserConfirmed::shown_and_confirmed())).await;
+    if result.is_ok()
+        || !matches!(signer.status(), SignerStatus::Signing)
+        || published != world.files().identity_doc(&alice.public())
+    {
+        return Err("another caller's completed erasure authorized local deletion".into());
+    }
     Ok(())
 }

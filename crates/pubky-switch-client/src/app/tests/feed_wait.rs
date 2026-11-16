@@ -387,26 +387,25 @@ async fn test_feed_wait_after_a_failed_read_is_read_now_without_a_request() {
 
 #[tokio::test]
 async fn test_feed_wait_held_across_a_recovery_in_place_is_read_now() {
-    // The held read gets the operator's `503` with no head (Switch wire 7.4.4): the
-    // handle wakes once, sends nothing more, and the host's read follows the recovery.
+    // The held read is answered at the new generation, `403 not_current` with no head for
+    // an app the fresh account holds no record of (Switch wire 7.4.4): the handle wakes
+    // once, sends nothing more, and the host's read follows the recovery.
     let s = Setup::new(true);
     let mut app = s.join("wallet").await;
     let waiting = tokio::spawn(app.feed_wait(25).wait());
     held(&s.w, 1).await;
-    let pending = SigningKey::from_bytes(&seed("service/alice/in-place"));
+    let key = s.w.switch.service_key();
     let prev = s.w.switch.identity_doc().unwrap().hash();
     let doc =
         s.w.signer
             .sign_next(|body| {
                 body.generation = 2;
-                body.inbox = Inbox::new(ORIGIN, pending.verifying_key().to_bytes());
+                body.inbox = Inbox::new(ORIGIN, key);
                 body.recovery_from = Some(1);
             })
             .unwrap();
     let sent = s.gate.waits().len();
-    s.w.switch
-        .recover_in_place(pending.clone(), &doc, prev)
-        .unwrap();
+    s.w.switch.recover_in_place(&doc, prev).unwrap();
     let woken = tokio::time::timeout(Duration::from_secs(10), waiting)
         .await
         .expect("the held read is answered")

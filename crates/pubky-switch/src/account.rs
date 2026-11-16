@@ -561,7 +561,7 @@ fn start_or_notice(
 
 /// Whether a delivery starts a recovery above the held document and mark (Switch wire
 /// 7.3, Table 2), for routing and the final check before replacing account state.
-fn recovery_starts_above(floor: u64, generation: u64, from: Option<u64>) -> bool {
+pub(crate) fn recovery_starts_above(floor: u64, generation: u64, from: Option<u64>) -> bool {
     generation > floor && from.is_some_and(|from| generation.checked_sub(1) == Some(from))
 }
 

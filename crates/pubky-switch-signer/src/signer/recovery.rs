@@ -49,8 +49,8 @@ use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{DeliverStep, Flow, Service, SignerState};
 
-/// How many times in all a run sends a recovery's enrollment, the same or a new one, before
-/// its failure is shown (Switch wire 7.4.1).
+/// How many times in all a run sends a recovery's enrollment, the same bytes each time,
+/// before its failure is shown (Switch wire 7.4.1).
 const ENROLL_TRIES: u32 = 3;
 
 impl Signer {
@@ -122,8 +122,7 @@ impl Signer {
         // there with the same bytes, goes on. A new enrollment there could find the first
         // version taken, and a second at the same generation refused for good.
         // Declared again at a service an earlier declaration enrolled at: one that took that
-        // version serves it, and would answer a new enrollment with a pending key, so it is
-        // read first under the key it was answered with.
+        // version serves it, so it is read first under the key it was answered with.
         // The backup is judged first: an install that took over shows there, and its version
         // must never be superseded by an earlier one the pre-read would take.
         let goes_to = self.recovery_goes_to(origin);
@@ -423,21 +422,41 @@ impl Signer {
         let doc = IdentityDoc::sign(&key, body)?;
         drop(key);
         let mut state = self.state.clone();
+        // An answer naming another key than the one pinned for this service is taken only
+        // within a step the user started, this declaration among them, and the new key is
+        // shown, never followed silently: the key an enrollment answer names is trusted on
+        // first use (Switch wire 7.4.1 "Which key signs", spec 12.5).
+        if let Some(pinned) = self
+            .pinned_for(origin)
+            .filter(|pinned| *pinned != answer.service_key)
+        {
+            state.alert(Alert::ServiceKeyTaken {
+                origin: origin.to_owned(),
+                pinned,
+                service_key: answer.service_key,
+            });
+        }
         let service = Service {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
+            created: Some(answer.created),
         };
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
         }
-        // In place, the service may still serve the lost generation under its key there
-        // (Switch wire 7.4.2). A key kept from an earlier declaration or a restore stays, for
-        // whichever origin it was kept for, since only the service at that origin is read
-        // under it. Otherwise it is taken from a signed copy of the lost generation naming
-        // this origin: the version the recovery builds on, or, when that is a restored
-        // recovery's own version, the Homeserver's copy, as the restore takes it (Switch wire
-        // 3.13). A delivery whose answer shows that key no longer serves drops it.
+        // In place, the service keeps the one key it served the lost generation with, which
+        // its enrollment answers name again (Switch wire 3.7, 7.4.1), and the signer checks
+        // every answer with that key, the delivery's and its refusal's alike (Switch wire
+        // 7.4.2 "Which key signs the answer", spec 12.6 step 1). Only where the service
+        // changed its key since (Switch spec 12.5) does it still serve the lost generation
+        // under the key it had, until it takes the version: that key is then kept, read as
+        // below. A key kept from an earlier declaration or a restore stays, for whichever
+        // origin it was kept for, since only the service at that origin is read under it.
+        // Otherwise it is taken from a signed copy of the lost generation naming this origin:
+        // the version the recovery builds on, or, when that is a restored recovery's own
+        // version, the Homeserver's copy, as the restore takes it (Switch wire 3.13). A
+        // delivery whose answer shows that key no longer serves drops it.
         state.recovery_serving = match self.state.recovery_serving.clone() {
             Some(kept) => Some(kept),
             None => {
@@ -447,11 +466,14 @@ impl Signer {
                     self.lost_generations_key_on_homeserver(origin, lost, base.version())
                         .await?
                 };
-                earlier.map(|service_key| Service {
-                    origin: origin.to_owned(),
-                    service_key,
-                    limits: answer.limits,
-                })
+                earlier
+                    .filter(|earlier| *earlier != answer.service_key)
+                    .map(|service_key| Service {
+                        origin: origin.to_owned(),
+                        service_key,
+                        limits: answer.limits,
+                        created: Some(answer.created),
+                    })
             }
         };
         state.service = Some(service);
@@ -489,18 +511,29 @@ impl Signer {
             .map(|copy| copy.inbox().service_key))
     }
 
+    /// The key this install pinned for the service at `origin`: the enrolled service's, else
+    /// the one an earlier declaration's enrollment there answered, the newest first; `None`
+    /// for a service it never enrolled at (Switch wire 7.4.1).
+    fn pinned_for(&self, origin: &str) -> Option<[u8; 32]> {
+        self.state
+            .service
+            .iter()
+            .chain(self.state.recovery_services.iter().rev())
+            .find(|service| service.origin == origin)
+            .map(|service| service.service_key)
+    }
+
     /// Enroll at the service at `origin` with `signed`, as the errors of `POST /enroll` ask
-    /// (Switch wire 3.7, 7.4.1). They are the operator's, which no client can check, so none
-    /// is the service's word:
+    /// (Switch wire 3.7, 7.4.1 Errors). A service whose key this install pinned is asked with
+    /// it, which checks its errors; one it didn't pin can't be checked, and none of its errors
+    /// is the service's word. Either way an error changes nothing:
     ///
     /// - a `400` sends the same enrollment again;
-    /// - a `409 conflict` means enroll again: one with a new nonce is signed, kept in the
-    ///   flow and sent;
-    /// - after [`ENROLL_TRIES`] sends in all in this run, either one ends the flow: the
-    ///   failure is shown, and the recovery waits to be declared again
+    /// - after [`ENROLL_TRIES`] sends in all in this run, it ends the flow: the failure is
+    ///   shown, and the recovery waits to be declared again
     ///   ([`crate::SignerStatus::RecoveryRefused`]), which enrolls afresh.
     ///
-    /// Any other failure keeps the flow, for the next run.
+    /// Any other failure keeps the flow, for the next run, which sends the same bytes.
     async fn enroll_for_recovery(
         &mut self,
         origin: &str,
@@ -509,13 +542,12 @@ impl Signer {
         let identity = self.state.identity;
         let target = Target {
             origin,
-            pinned: None,
+            pinned: self.pinned_for(origin),
             identity,
         };
-        let mut signed = signed.clone();
+        let enrollment = Enrollment::verify(signed, &identity, origin)?;
         let mut sends = 0;
         loop {
-            let enrollment = Enrollment::verify(&signed, &identity, origin)?;
             sends += 1;
             let error = match RequestClient::new(&self.env, &target, &self.keyring)?
                 .enroll(&enrollment)
@@ -524,35 +556,19 @@ impl Signer {
                 Ok(answer) => return Ok(answer),
                 Err(error) => error,
             };
-            let more = sends < ENROLL_TRIES;
-            match error {
-                ClientError::BadServiceSignature { status: 409 } if more => {
-                    signed = self.enroll_anew(origin, &enrollment).await?;
-                }
-                ClientError::BadServiceSignature { status: 400 } if more => {}
-                ClientError::BadServiceSignature { status: 400 | 409 } => {
-                    self.commit(self.state.clone(), None).await?;
-                    return Err(error.into());
-                }
-                error => return Err(error.into()),
+            let refused = matches!(
+                error,
+                ClientError::BadServiceSignature { status: 400 }
+                    | ClientError::Switch { status: 400, .. }
+            );
+            if !refused {
+                return Err(error.into());
+            }
+            if sends >= ENROLL_TRIES {
+                self.commit(self.state.clone(), None).await?;
+                return Err(error.into());
             }
         }
-    }
-
-    /// A new enrollment for `enrollment`'s, with a new nonce, committed as the flow's, so a
-    /// retry after a crash sends its bytes (Switch wire 3.7 "enroll again").
-    async fn enroll_anew(&mut self, origin: &str, enrollment: &Enrollment) -> Result<SignedDoc> {
-        let mut body = enrollment.body().clone();
-        body.nonce = pubky_switch_core::enc::random_bytes()?;
-        let key = gate::recovery_key(&self.keyring, &self.state)?;
-        let anew = Enrollment::sign(&key, body)?;
-        drop(key);
-        let flow = Flow::Recover {
-            origin: origin.to_owned(),
-            enrollment: anew.signed().clone(),
-        };
-        self.commit(self.state.clone(), Some(flow)).await?;
-        Ok(anew.signed().clone())
     }
 
     /// Complete at the new service every revocation the recovery's version still lists the
@@ -623,7 +639,8 @@ impl Signer {
                 source: Source::Switch,
                 ..
             }
-            | Alert::AccountNotHosted => false,
+            | Alert::AccountNotHosted
+            | Alert::ServiceHoldsNoAccount => false,
             Alert::RevocationPending { app_id, .. } | Alert::RevocationUnconfirmed { app_id } => {
                 doc.listed_cert(app_id).is_some()
             }

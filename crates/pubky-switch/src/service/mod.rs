@@ -160,6 +160,9 @@ pub struct Service {
     /// Where webhooks connect in tests.
     #[cfg(any(test, feature = "test-util"))]
     relay_route: Option<webhooks::RelayRoute>,
+    /// Whether test relays require an explicit route to a loopback listener.
+    #[cfg(any(test, feature = "test-util"))]
+    isolated_relays: bool,
     /// A pause before the next mark move, for tests of what lands between a commit and
     /// its move.
     #[cfg(any(test, feature = "test-util"))]
@@ -433,6 +436,8 @@ impl Service {
             #[cfg(any(test, feature = "test-util"))]
             relay_route: None,
             #[cfg(any(test, feature = "test-util"))]
+            isolated_relays: false,
+            #[cfg(any(test, feature = "test-util"))]
             mark_move_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
             feed_sign_pause: parking_lot::Mutex::default(),
@@ -469,6 +474,21 @@ impl Service {
     #[must_use]
     pub fn with_relay_route(mut self, route: webhooks::RelayRoute) -> Self {
         self.relay_route = Some(route);
+        self
+    }
+
+    /// The service registering test relays without DNS and delivering only through an
+    /// explicit [`Self::with_relay_route`] to loopback listeners. Without a route,
+    /// delivery is refused. Later resolver or route changes retain this restriction.
+    ///
+    /// Relay names resolve to a documentation address, accepted only in this mode;
+    /// production relay validation is unchanged (Switch wire 8.1, 8.2).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_isolated_relays(mut self) -> Self {
+        self.isolated_relays = true;
+        self.resolver =
+            Arc::new(|_host| Box::pin(async { Ok(vec![push::ISOLATED_RELAY_ADDRESS]) }));
         self
     }
 

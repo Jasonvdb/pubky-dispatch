@@ -5,7 +5,7 @@
 //! routing, the body caps, the refusals before the handler, and the handler's processing
 //! order (Switch wire 7.1 to 7.4). No socket is opened.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -18,7 +18,7 @@ use pubky_switch::keys::FileKeyStore;
 use pubky_switch::limits::Limits;
 use pubky_switch::marks::{AccountMark, Advance, MarkRead, MarkStore};
 use pubky_switch::retire::{self, RetireOptions};
-use pubky_switch::service::{Resolver, Service};
+use pubky_switch::service::Service;
 use pubky_switch::store::Store;
 use pubky_switch::store::testing::{
     REQUIRE_DB_ENV, TEST_DATABASE_URL_ENV, TestDatabase, test_database,
@@ -39,21 +39,8 @@ const MAX_ANSWER_BYTES: usize = 256 * 1024 * 1024;
 /// one network source (Switch wire 9.4).
 const PEER: ([u8; 4], u16) = ([127, 0, 0, 1], 4000);
 
-/// The address every relay host resolves to at the service: a public one, as a relay URL
-/// must resolve only to public addresses (Switch wire 8.1, 8.2), and the documentation
-/// ranges aren't public there. Nothing connects to it: no world runs the service's webhook
-/// delivery, and a flow that delivered would have to route it in process through
-/// `Service::with_relay_route`.
-const RELAY_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14));
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// A resolver that answers [`RELAY_ADDRESS`] for every host, so a flow's relay URL needs no
-/// DNS name.
-fn relay_resolver() -> Resolver {
-    Arc::new(|_host: String| Box::pin(async { Ok(vec![RELAY_ADDRESS]) }))
 }
 
 /// The service's clock, read from the test clock the client and the signer use, so one clock
@@ -221,7 +208,7 @@ fn open_service(
     let marks = MarkStore::open(key_dir).map_err(|error| HarnessError::Setup(error.to_string()))?;
     Ok(
         Service::new(origin.to_owned(), store.clone(), keys, marks, time, limits)
-            .with_resolver(relay_resolver()),
+            .with_isolated_relays(),
     )
 }
 

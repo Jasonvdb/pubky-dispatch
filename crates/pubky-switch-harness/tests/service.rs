@@ -230,3 +230,21 @@ async fn test_service_dropped_without_close_drops_its_database() {
     assert!(unwound.is_err());
     assert!(!database_exists(&name).await, "{name} was left behind");
 }
+
+/// Push registration uses a synthetic relay destination without enabling network delivery.
+#[tokio::test]
+async fn test_service_push_registration_uses_isolated_relays() {
+    let trace = Box::pin(run(
+        Backend::Service,
+        pubky_switch_harness::flows::push_registration,
+    ))
+    .await
+    .expect("the isolated relay registration flow");
+    let Some(trace) = trace else {
+        return;
+    };
+    assert!(trace.lines.iter().any(|line| {
+        line.call == Some("put_push")
+            && line.facts.get("status").is_some_and(|value| value == "200")
+    }));
+}

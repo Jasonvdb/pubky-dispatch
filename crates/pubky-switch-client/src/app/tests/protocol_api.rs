@@ -56,6 +56,10 @@ enum Mode {
     OtherWriteScope,
     /// A write of `inbox` with a value that isn't JSON.
     NotJson,
+    /// Complete the input's local handling without a processed pair.
+    Consume,
+    /// Keep the input in admission custody without its staged local write.
+    AwaitAdmission,
 }
 
 /// What one call of the receive step saw.
@@ -174,6 +178,18 @@ impl Protocol for ApiProtocol {
         }
         let outcome = match mode {
             Mode::Plain => self.items.receive(message, cx),
+            Mode::Consume | Mode::AwaitAdmission => {
+                cx.local(LocalWrite::Put {
+                    key: format!("notes/{msg_id}").into_bytes(),
+                    value: b"1".to_vec(),
+                })
+                .unwrap();
+                if mode == Mode::Consume {
+                    Outcome::Consume
+                } else {
+                    Outcome::AwaitAdmission
+                }
+            }
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
                 let held = cx.record(&inbox()).unwrap();
                 seen.held = held.as_ref().map(|r| r.version);

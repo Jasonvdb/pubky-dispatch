@@ -1617,3 +1617,130 @@ async fn test_delivery_lifecycle_expiry_commits_producers_with_its_notice() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn test_hold_message_current_input_completion_preserves_delivery_hold() {
+    Box::pin(async {
+        for mode in [Mode::Consume, Mode::AwaitAdmission] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(mode);
+            let peer = ApiProtocol::new(Mode::Plain);
+            let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+            let mut shop = p.join(&p.bob, "shop", &peer).await;
+            wallet.invite(&p.bob.identity().public()).await.unwrap();
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let signed = wallet.sign_message(Pair::note(&p.bob, "held")).unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            assert!(
+                wallet
+                    .hold_message("sample", signed.msg_id())
+                    .await
+                    .unwrap()
+            );
+            let (incoming, delivery) = shop.send(Pair::note(&p.alice, "input")).await.unwrap();
+            assert!(matches!(delivery, Delivery::Accepted { .. }));
+            wallet.receive(None).await.unwrap();
+            assert!(protocol.seen().iter().any(|seen| seen.msg_id == incoming));
+            let local = wallet
+                .protocol_get("sample", format!("notes/{incoming}").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(local, (mode == Mode::Consume).then(|| b"1".to_vec()));
+            assert!(
+                !wallet
+                    .reader()
+                    .exists(&crate::app::state::key::processed(
+                        &p.bob.identity().public(),
+                        &incoming
+                    ))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                wallet.parked_entries().await.unwrap().len(),
+                usize::from(mode == Mode::AwaitAdmission)
+            );
+            wallet.flush_outbox().await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+            assert_eq!(
+                wallet.held_messages("sample").await.unwrap(),
+                [signed.msg_id()]
+            );
+            wallet
+                .release_message("sample", signed.msg_id())
+                .await
+                .unwrap();
+            assert!(matches!(
+                wallet.flush_message(signed.msg_id()).await.unwrap(),
+                Some(Delivery::Accepted { .. })
+            ));
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_hold_message_backup_keeps_admission_custody_and_notice() {
+    Box::pin(async {
+        for in_place in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::AwaitAdmission);
+            let peer = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p.join_on(&p.alice, "wallet", protocol.clone(), store.clone()).await;
+            let mut shop = p.join(&p.bob, "shop", &peer).await;
+            wallet.invite(&p.bob.identity().public()).await.unwrap();
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let (expired, delivery) = shop.send(Pair::note(&p.alice, "old input")).await.unwrap();
+            assert!(matches!(delivery, Delivery::Accepted { .. }));
+            wallet.receive(None).await.unwrap();
+            assert_eq!(wallet.parked_entries().await.unwrap().len(), 1);
+            p.clock.advance_ms(crate::app::MAX_UNVERIFIED_AGE_MS + 1);
+            wallet.receive(None).await.unwrap();
+            wallet.receive(None).await.unwrap();
+            let old_notice = wallet.unacknowledged_events().await.unwrap().into_iter().find_map(|event| match event {
+                AppEvent::StoredEntryDropped { message, receipt, notice_id, .. } if message.msg_id == expired => Some((message, receipt, notice_id)),
+                _ => None,
+            }).unwrap();
+            assert!(wallet.parked_entries().await.unwrap().is_empty());
+            let (waiting, delivery) = shop.send(Pair::note(&p.alice, "current input")).await.unwrap();
+            assert!(matches!(delivery, Delivery::Accepted { .. }));
+            wallet.receive(None).await.unwrap();
+            let custody = wallet.parked_entries().await.unwrap();
+            assert_eq!(custody.len(), 1);
+            let receipt = wallet.stored_at(custody[0].seq).unwrap().receipt;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "held output")).unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            assert!(wallet.hold_message("sample", signed.msg_id()).await.unwrap());
+            let backup = wallet.backup().await.unwrap();
+            drop(wallet);
+            let target = if in_place { store } else { Arc::new(MemoryStore::new()) };
+            let mut restored = App::restore(p.env(&p.alice, target), protocol.clone(), config(), &backup).await.unwrap();
+            assert_eq!(restored.held_messages("sample").await.unwrap(), [signed.msg_id()]);
+            let custody = restored.parked_entries().await.unwrap();
+            assert_eq!(custody.len(), 1);
+            assert_eq!(restored.stored_at(custody[0].seq).unwrap().receipt, receipt);
+            let restored_notice = restored.unacknowledged_events().await.unwrap().into_iter().find_map(|event| match event {
+                AppEvent::StoredEntryDropped { id, message, receipt, notice_id, .. } if message.msg_id == expired => Some((id, (message, receipt, notice_id))),
+                _ => None,
+            });
+            assert_eq!(restored_notice.as_ref().map(|(_, notice)| notice), Some(&old_notice), "the backup retains the exact owed notice beside the held delivery");
+            let (id, _) = restored_notice.unwrap();
+            restored.ack_event_with("sample", id, &[LocalWrite::Put { key: b"handled-drop".to_vec(), value: vec![1] }]).await.unwrap();
+            assert_eq!(restored.protocol_get("sample", b"handled-drop").await.unwrap(), Some(vec![1]));
+            assert!(!restored.unacknowledged_events().await.unwrap().iter().any(|event| matches!(event, AppEvent::StoredEntryDropped { message, .. } if message.msg_id == expired)));
+            *protocol.mode.lock().unwrap() = Mode::Consume;
+            p.clock.advance_ms(10_000);
+            restored.receive(None).await.unwrap();
+            assert!(restored.parked_entries().await.unwrap().is_empty());
+            assert!(!restored.reader().exists(&crate::app::state::key::processed(&p.bob.identity().public(), &waiting)).await.unwrap());
+            restored.flush_outbox().await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+            assert_eq!(restored.held_messages("sample").await.unwrap(), [signed.msg_id()]);
+            restored.release_message("sample", signed.msg_id()).await.unwrap();
+            assert!(matches!(restored.flush_message(signed.msg_id()).await.unwrap(), Some(Delivery::Accepted { .. })));
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+        }
+    }).await;
+}

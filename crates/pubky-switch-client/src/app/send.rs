@@ -2818,26 +2818,49 @@ impl App {
             if self.delivery_waits(item).await? {
                 return Ok(Delivered::Tried(Tried::Held));
             }
-            let result = if own {
-                let result = self
-                    .client
-                    .append(
-                        sealed.envelope.as_bytes().to_vec(),
-                        sealed.apps_version,
-                        None,
-                    )
-                    .await;
-                self.take(result).await
+            let peer = if own {
+                None
             } else {
-                let client = self.peer_client(&to, &doc)?;
-                client
-                    .append(
-                        sealed.envelope.as_bytes().to_vec(),
-                        sealed.apps_version,
-                        invite.as_deref(),
-                    )
-                    .await
-                    .map_err(AppError::from)
+                Some(self.peer_client(&to, &doc)?)
+            };
+            let started = peer
+                .as_ref()
+                .unwrap_or(&self.client)
+                .start_append(
+                    sealed.envelope.as_bytes().to_vec(),
+                    sealed.apps_version,
+                    if own { None } else { invite.as_deref() },
+                )
+                .await;
+            let started = if own {
+                self.take(started).await
+            } else {
+                started.map_err(AppError::from)
+            };
+            let result = match started {
+                Ok(call) => {
+                    if call.needs_retry() {
+                        // Keep the first authenticated response before another decision;
+                        // a withheld timestamp retry is not a failed or accepted delivery.
+                        if own {
+                            self.keep_observations().await?;
+                        }
+                        if self.delivery_waits(item).await? {
+                            return Ok(Delivered::Tried(Tried::Held));
+                        }
+                    }
+                    let answer = peer
+                        .as_ref()
+                        .unwrap_or(&self.client)
+                        .finish_append(call)
+                        .await;
+                    if own {
+                        self.take(answer).await
+                    } else {
+                        answer.map_err(AppError::from)
+                    }
+                }
+                Err(error) => Err(error),
             };
             match result {
                 Ok(answer) => return Ok(Delivered::Tried(Tried::Accepted(answer))),

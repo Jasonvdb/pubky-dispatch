@@ -2384,3 +2384,203 @@ async fn test_delivery_view_status_errors_match_app_and_hold() {
         }
     }).await;
 }
+
+async fn timestamp_retry(hold_after_response: bool) {
+    Box::pin(async {
+        for own in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let recipient = if own { &p.alice } else { &p.bob };
+            let mut shop = p.join(recipient, "shop", &protocol).await;
+            if !own {
+                shop.invite(&p.alice.identity().public()).await.unwrap();
+            }
+            let message = |text: &str| {
+                OutgoingMessage::new(
+                    recipient.identity().public(),
+                    if own { "sample.notice" } else { "sample.note" },
+                    json!({"text": text}).as_object().unwrap().clone(),
+                )
+            };
+            assert!(matches!(
+                wallet.send(message("directory")).await.unwrap().1,
+                Delivery::Accepted { .. }
+            ));
+            let signed = wallet.sign_message(message("retry")).unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            wallet
+                .protocol_commit(
+                    "sample",
+                    &[fact_write(
+                        signed.msg_id(),
+                        &delivery_fact(&wallet, signed.plaintext()),
+                    )],
+                )
+                .await
+                .unwrap();
+            protocol
+                .require_send_fact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            recipient.switch().fail_next(Fault::Error {
+                path: "/inbox".into(),
+                code: ErrorCode::StaleTimestamp,
+                current: json!({"server_time": pubky_switch_core::time::rfc3339(p.clock.now_ms())}),
+            });
+            let id = wallet.app_id();
+            drop(wallet);
+            let local =
+                crate::app::protocols::qualified_key("sample", &delivery_key(signed.msg_id()));
+            let fault = Arc::new(DeliveryReadFault {
+                inner: store,
+                key: [b"p/".as_slice(), local.as_slice()].concat(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let origin = if own { SWITCH_ORIGIN } else { BOB_ORIGIN };
+            let transport = Arc::new(UnavailableAfterAppend {
+                router: p.router.clone(),
+                fault: fault.clone(),
+                origin: origin.into(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+                statuses: Mutex::new(Vec::new()),
+            });
+            let mut wallet = App::load(
+                p.alice.env_with(
+                    fault.clone(),
+                    if hold_after_response {
+                        transport.clone() as Arc<dyn Transport>
+                    } else {
+                        p.router.clone() as Arc<dyn Transport>
+                    },
+                ),
+                protocol,
+                config(),
+                id,
+            )
+            .await
+            .unwrap();
+            let before = recipient
+                .switch()
+                .entries_from(&p.alice.identity().public());
+            let attempts_before = p
+                .router
+                .log()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(&format!("POST {origin}")) && line.contains("/inbox")
+                })
+                .count();
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            let attempts_after = p
+                .router
+                .log()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(&format!("POST {origin}")) && line.contains("/inbox")
+                })
+                .count();
+            if !hold_after_response {
+                assert_eq!(
+                    (
+                        attempts_after - attempts_before,
+                        recipient
+                            .switch()
+                            .entries_from(&p.alice.identity().public())
+                            - before
+                    ),
+                    (2, 1),
+                    "the permitted timestamp retry is accepted once, own={own}"
+                );
+                assert!(matches!(
+                    wallet.delivery(signed.msg_id()).await.unwrap(),
+                    Some(Delivery::Accepted { .. })
+                ));
+                continue;
+            }
+            let statuses = transport.statuses.lock().unwrap().clone();
+            assert_eq!(
+                statuses,
+                [401],
+                "own={own} delivery={:?} requests={:?}",
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+                p.router.log()
+            );
+            assert!(fault.fail.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                (
+                    attempts_after - attempts_before,
+                    recipient
+                        .switch()
+                        .entries_from(&p.alice.identity().public())
+                        - before,
+                ),
+                (1, 0),
+                "read_unavailable={} fault_reads={} delivery={:?}",
+                fault.fail.load(std::sync::atomic::Ordering::SeqCst),
+                fault.reads.load(std::sync::atomic::Ordering::SeqCst),
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+            );
+            assert_eq!(
+                recipient
+                    .switch()
+                    .entries_from(&p.alice.identity().public()),
+                before
+            );
+            assert!(fault.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            let held = wallet.delivery(signed.msg_id()).await.unwrap();
+            assert!(
+                matches!(
+                    &held,
+                    Some(Delivery::Queued {
+                        tries: 1,
+                        last_error: None,
+                        undeliverable_since_ms: None,
+                        ..
+                    })
+                ),
+                "{held:?}"
+            );
+            let item: Value = wallet
+                .reader()
+                .get(&format!("out/{}", signed.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(item["sealed"].is_object());
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            let again: Value = wallet
+                .reader()
+                .get(&format!("out/{}", signed.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                again, item,
+                "the held round preserves cached bytes and the earlier try"
+            );
+            fault.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(
+                recipient
+                    .switch()
+                    .entries_from(&p.alice.identity().public()),
+                before + 1
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_rechecks_stale_timestamp_append_retry() {
+    Box::pin(timestamp_retry(true)).await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_allows_stale_timestamp_retry_when_permitted() {
+    Box::pin(timestamp_retry(false)).await;
+}

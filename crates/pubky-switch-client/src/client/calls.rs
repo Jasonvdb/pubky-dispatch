@@ -24,6 +24,15 @@ use super::{Auth, Body, CheckedResponse, SentRequest, SwitchClient, check_respon
 use crate::error::ClientError;
 use crate::transport::TimeoutClass;
 
+/// An append answer or the single authenticated timestamp retry, not yet sent.
+pub(crate) struct AppendCall(super::CallStep);
+
+impl AppendCall {
+    pub(crate) fn needs_retry(&self) -> bool {
+        matches!(self.0, super::CallStep::Retry(_))
+    }
+}
+
 /// What the proofs of a write answer must show (Switch wire 6.5).
 enum Expect<'a> {
     /// A service transition whose proof names `object`.
@@ -265,9 +274,21 @@ impl SwitchClient {
         apps_version: u64,
         invite_code: Option<&str>,
     ) -> Result<AppendAnswer, ClientError> {
+        let call = self
+            .start_append(envelope, apps_version, invite_code)
+            .await?;
+        self.finish_append(call).await
+    }
+
+    pub(crate) async fn start_append(
+        &self,
+        envelope: Vec<u8>,
+        apps_version: u64,
+        invite_code: Option<&str>,
+    ) -> Result<AppendCall, ClientError> {
         let path = self.path(&format!("inbox?apps_version={apps_version}"));
-        let checked = self
-            .call(
+        let step = self
+            .start_call(
                 "POST",
                 &path,
                 envelope,
@@ -279,6 +300,14 @@ impl SwitchClient {
                 },
             )
             .await?;
+        Ok(AppendCall(step))
+    }
+
+    pub(crate) async fn finish_append(
+        &self,
+        call: AppendCall,
+    ) -> Result<AppendAnswer, ClientError> {
+        let checked = self.finish_call(call.0).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.3: an append answer")?;
         AppendAnswer::read(Obj::of(&value, what)?)

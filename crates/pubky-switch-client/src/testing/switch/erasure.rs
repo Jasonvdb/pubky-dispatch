@@ -33,10 +33,16 @@ impl ScriptedSwitch {
 
 impl Inner {
     pub(super) fn erasure_fault(&mut self, created: u64) -> Option<Answer> {
+        let selected_account = self.account_binding().ok()?.association()
+            == pubky_switch_core::records::AccountAssociation::Account;
         let outcome = self.next_erasure_outcome.take()?;
         let attempt = Attempt {
             created,
-            identity_hash: self.doc.as_ref().map(IdentityDoc::hash),
+            identity_hash: self
+                .doc
+                .as_ref()
+                .filter(|_| selected_account)
+                .map(IdentityDoc::hash),
             at: self.now().max(created),
             outcome,
         };
@@ -114,6 +120,7 @@ impl Inner {
             app: None,
             cert: request.header(header::CERT).map(str::to_owned),
             invite_code: request.header(header::INVITE_CODE).map(str::to_owned),
+            created: request.header(header::CREATED).map(str::to_owned),
         };
         let target = RequestTarget {
             method: &request.method,

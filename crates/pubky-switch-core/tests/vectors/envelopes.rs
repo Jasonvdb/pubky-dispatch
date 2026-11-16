@@ -55,6 +55,7 @@ fn app_of<'a>(keys: &'a Keys, app_id: &[u8; 16]) -> &'a AppKeys {
 #[test]
 fn test_vectors_envelopes() {
     let keys = keys();
+    signer_handover_case(&keys);
     signer_backup_case(&keys);
     let v = load("envelopes.json");
     let members: Vec<&str> = v
@@ -610,6 +611,7 @@ fn alice_records(keys: &Keys, plaintext: &Value, prev: Option<[u8; 32]>) -> Sign
     SignerRecords::new(
         identity_key(keys, &alice),
         identity_named("alice identity.json", &alice),
+        crate::http::created_of(&load("http.json")),
         &revoked,
         &issued,
         limits,
@@ -617,6 +619,99 @@ fn alice_records(keys: &Keys, plaintext: &Value, prev: Option<[u8; 32]>) -> Sign
         prev,
     )
     .unwrap()
+}
+
+/// Alice's current records, sealed with the hand-over's fixed two-part entropy.
+fn signer_handover_case(keys: &Keys) {
+    use pubky_switch_core::sig;
+    let file = load("envelopes.json");
+    let mut case = file["signer_handover"].clone();
+    let plaintext: Value = serde_json::from_str(st(&case, "plaintext_json")).unwrap();
+    let records = alice_records(keys, &plaintext, None);
+    let json = records.to_json().unwrap();
+    let (first, second) = json.split_at(json.len() / 2);
+    let app = keys.app(st(&case, "app"));
+    let app_id = app_id_decode(&app.app_id).unwrap();
+    let key = identity_key(keys, &app.identity);
+    let cert = cert_named("phone certificate", &app.identity);
+    let randomness: Vec<_> = arr(&case, "parts")
+        .iter()
+        .map(|p| fixed(st(p, "cek_hex"), st(p, "nonce_hex"), st(p, "ikm_e_hex")))
+        .collect();
+    let handover = SignerHandover::seal_parts_with(
+        &key,
+        &app_id,
+        &cert.bundle_key(),
+        &[first, second],
+        &randomness,
+    )
+    .unwrap();
+    case["plaintext_json"] = Value::String(std::str::from_utf8(&json).unwrap().into());
+    case["handover"] = serde_json::to_value(&handover).unwrap();
+    for (index, part) in [first, second].iter().enumerate() {
+        case["parts"][index]["part"] = Value::String(std::str::from_utf8(part).unwrap().into());
+        case["parts"][index]["envelope_len"] = handover.envelopes()[index].len().into();
+    }
+    generated(
+        "envelopes.json",
+        &[(Place::Member("/signer_handover"), case)],
+    );
+
+    let count = 2u32.to_be_bytes();
+    let fields: [&[u8]; 5] = [
+        &app.identity,
+        &app_id,
+        &count,
+        &handover.envelopes()[0],
+        &handover.envelopes()[1],
+    ];
+    crate::signatures::generated_case(
+        labels::sig::SIGNER_HANDOVER,
+        &[
+            "identity",
+            "app_id",
+            "u32_be(n)",
+            "envelope 1 bytes",
+            "envelope 2 bytes",
+        ],
+        &fields,
+        &handover.sig(),
+    );
+    let mut rejections = file["signer_handover_rejections"].clone();
+    let envelopes = handover.envelopes();
+    let wrong_count = 3u32.to_be_bytes();
+    let wrong_signature = sig::sign(
+        &ed25519_dalek::SigningKey::from_bytes(&keys.identity_secrets[&app.identity]),
+        labels::sig::SIGNER_HANDOVER,
+        &[
+            &app.identity,
+            &app_id,
+            &wrong_count,
+            &envelopes[0],
+            &envelopes[1],
+        ],
+    );
+    let bad = [
+        SignerHandover::from_parts(
+            vec![envelopes[1].clone(), envelopes[0].clone()],
+            handover.sig(),
+        ),
+        SignerHandover::from_parts(vec![envelopes[0].clone()], handover.sig()),
+        SignerHandover::from_parts(envelopes.to_vec(), wrong_signature),
+    ];
+    assert_eq!(arr(&rejections, "cases").len(), bad.len());
+    for (case, handover) in rejections["cases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(bad)
+    {
+        case["handover"] = serde_json::to_value(handover).unwrap();
+    }
+    generated(
+        "envelopes.json",
+        &[(Place::Member("/signer_handover_rejections"), rejections)],
+    );
 }
 
 /// `signer_handover` and `signer_handover_rejections` (Switch wire 3.12): alice's hand-over
@@ -803,7 +898,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
 /// sealed to her backup key with the seed `envelopes/signer_backup`, and signed with her
 /// identity key; and `signatures.json`'s case of the backup's label, which is this backup's.
 fn signer_backup_case(keys: &Keys) {
-    use pubky_switch_core::{enc, sig};
+    use pubky_switch_core::enc;
     let alice = keys.identity("alice");
     let key = identity_key(keys, &alice);
     let file = load("envelopes.json");
@@ -834,24 +929,7 @@ fn signer_backup_case(keys: &Keys) {
     let count = 1u32.to_be_bytes();
     let fields: [&[u8]; 3] = [&alice, &count, envelope];
     let names = ["identity", "u32_be(n)", "envelope 1 bytes"];
-    let signatures = load("signatures.json");
-    let index = arr(&signatures, "signatures")
-        .iter()
-        .position(|c| c["label"] == labels::sig::SIGNER_BACKUP)
-        .unwrap();
-    let mut held = arr(&signatures, "signatures")[index].clone();
-    held["fields"] = names
-        .iter()
-        .zip(fields)
-        .map(|(name, field)| serde_json::json!({ "hex": hex::encode(field), "name": name }))
-        .collect();
-    held["signature"] = Value::String(enc::b64(&backup.sig()));
-    held["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(
-        labels::sig::SIGNER_BACKUP,
-        &fields,
-    )));
-    let pointer = format!("/signatures/{index}");
-    generated("signatures.json", &[(Place::Element(&pointer), held)]);
+    crate::signatures::generated_case(labels::sig::SIGNER_BACKUP, &names, &fields, &backup.sig());
 }
 
 /// `signer_backup` (Switch wire 3.13): alice's backup in one part, opened with her key,

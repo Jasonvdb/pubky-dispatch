@@ -6,8 +6,8 @@ use pubky_switch_core::{
     enc::b64,
     http::IdentityDelivery,
     records::{
-        AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc, KeptProofs,
-        check_delivery,
+        AccountActivation, AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc,
+        KeptProofs, check_delivery,
     },
 };
 use serde_json::{Value, json};
@@ -283,7 +283,10 @@ impl Service {
         // keeps them from its start (Switch wire 3.3, 3.7).
         let kept = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
         let held_revoked = txn.held_revoked_apps().await.map_err(|e| store_error(&e))?;
-        let listed = |app: &[u8; 16]| held.is_some_and(|held| held.listed_cert(app).is_some());
+        let listed = |app: &[u8; 16]| {
+            txn.head().activation == AccountActivation::Ordinary
+                && held.is_some_and(|held| held.listed_cert(app).is_some())
+        };
         if doc.body().apps.iter().any(|app| {
             held_revoked.contains(&app.app_id)
                 || (kept.contains(&app.app_id) && !listed(&app.app_id))
@@ -441,18 +444,18 @@ impl Service {
         };
         let proof =
             self.sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?;
+        // An app it no longer makes current stops holding entries at once (Switch wire
+        // 7.4.2, 9.1). Read the old app set before retaining the new document's exclusions.
+        let release = self.release(trusted);
+        let current = super::batch::settle_change(txn, previous, Some(doc), None, time_ms, release)
+            .await
+            .map_err(|e| store_error(&e))?;
         txn.set_identity(&HeldIdentity {
             doc: doc.signed().clone(),
             proof: Some(proof.signed().clone()),
         })
         .await
         .map_err(|e| store_error(&e))?;
-        // An app it no longer makes current stops holding entries at once (Switch wire
-        // 7.4.2, 9.1).
-        let release = self.release(trusted);
-        let current = super::batch::settle_change(txn, previous, Some(doc), None, time_ms, release)
-            .await
-            .map_err(|e| store_error(&e))?;
         // After its chain item: an app it no longer makes current departs at it, its unread
         // entries no current app can open becoming unreadable items, and the shares change
         // (Switch wire 7.4.4).

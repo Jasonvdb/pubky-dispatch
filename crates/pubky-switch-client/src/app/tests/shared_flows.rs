@@ -5401,6 +5401,10 @@ fn scripted_page(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> Value {
 /// A `GET` of `rest` at alice's scripted switch: the status, the body and whether the answer
 /// carries the head.
 fn scripted_answer(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value, bool) {
+    use crate::transport::Header;
+    use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, header};
+
+    let path = format!("/v1/{}/{rest}", s.w.alice.id());
     let mut headers = vec![crate::transport::Header::new(
         pubky_switch_core::http::header::IDENTITY,
         &s.w.alice.id(),
@@ -5410,13 +5414,36 @@ fn scripted_answer(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value,
             pubky_switch_core::http::header::APP,
             &pubky_switch_core::enc::zbase32_encode(&app),
         ));
+    } else {
+        let created = pubky_switch_core::time::rfc3339(s.w.switch.created());
+        let fields = RequestHeaders {
+            identity: s.w.alice.id(),
+            timestamp: pubky_switch_core::time::rfc3339_seconds(s.w.clock.now_ms()),
+            created: Some(created.clone()),
+            ..RequestHeaders::default()
+        };
+        let signature = http::sign_request(
+            &s.w.alice,
+            &RequestTarget {
+                method: "GET",
+                path_and_query: &path,
+                body: &[],
+                origin: ORIGIN,
+            },
+            &fields,
+        );
+        headers.extend([
+            Header::new(header::TIMESTAMP, &fields.timestamp),
+            Header::new(header::CREATED, &created),
+            Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
+        ]);
     }
     let response =
         s.w.switch
             .handle(&crate::transport::Request {
                 method: "GET".into(),
                 origin: ORIGIN.into(),
-                path_and_query: format!("/v1/{}/{rest}", s.w.alice.id()),
+                path_and_query: path,
                 headers,
                 body: Vec::new(),
                 timeout: crate::transport::TimeoutClass::default(),

@@ -645,6 +645,7 @@ async fn test_renewal_a_resumed_batch_waits_for_the_backup_check() {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         world.other_install_version(&newest, [7; 16]),
+        world.backup().account_created(),
         &[],
         &[world.switch.app(&id).cert.unwrap()],
         Limits::default(),

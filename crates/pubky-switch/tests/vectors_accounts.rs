@@ -9,7 +9,7 @@
 //! `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
 // Test helpers fail the test on any error.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 mod support;
 
@@ -69,11 +69,33 @@ fn assert_chained(
 
 #[tokio::test]
 async fn test_vectors_accounts_replay() {
-    let Some(replay) = replay().await else { return };
+    let Some(mut replay) = replay().await else {
+        return;
+    };
     let http = vectors("http.json");
     let chain = vectors("chain.json");
     let documents = vectors("documents.json");
     let keys = vectors("keys.json");
+    let template = vector_request(named(&http["requests"], "signer: enrollment"));
+    let wrapper: Value = serde_json::from_slice(&template.body).expect("enrollment request");
+    let signed: SignedDoc =
+        serde_json::from_value(wrapper["enrollment"].clone()).expect("enrollment");
+    let fields: pubky_switch_core::records::EnrollmentBody =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment fields");
+    let pubky_switch_core::records::EnrollmentIntent::Create { observation } = fields.intent else {
+        panic!("the vector creates an account");
+    };
+    let observed = observation
+        .verify(&fields.identity, ORIGIN)
+        .expect("vector observation");
+    std::fs::write(
+        replay.key_dir().join("accounts/store-id"),
+        hex::encode(observed.body().store_id),
+    )
+    .expect("fixed store identity");
+    replay.marks =
+        pubky_switch::marks::MarkStore::open(replay.key_dir()).expect("fixed mark store");
+    replay.service = replay.restarted_with(pubky_switch::limits::Limits::default());
     let alice = alice(&keys);
     let alice_id = alice["pubky_id"].as_str().expect("id");
     let alice_key = pubky_key(alice_id).expect("key");

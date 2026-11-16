@@ -11,6 +11,7 @@ mod vector_protocol;
 use std::sync::{Arc, Mutex};
 
 use common::{TestHomeserver, Vault};
+use pubky_switch_client::client::{Credentials, SwitchClient};
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StoreHandle};
 use pubky_switch_client::testing::{Fault, ScriptedSwitch};
@@ -18,7 +19,10 @@ use pubky_switch_client::transport::MockTransport;
 use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
-use pubky_switch_core::records::{AppCert, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup};
+use pubky_switch_core::records::{
+    AppCert, Enrollment, EnrollmentBody, EnrollmentIntent, IdentityDoc, SIGNER_BACKUP_PATH,
+    SignerBackup,
+};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_signer::state::signer_namespace;
@@ -143,7 +147,7 @@ struct Alice {
 }
 
 impl Alice {
-    fn new(versions: &[&str]) -> Self {
+    async fn new(versions: &[&str]) -> Self {
         let keys = load("keys.json");
         let identity = named(&keys["identities"], "alice");
         let key = IdentityKey::from_secret(hex32(text(identity, "secret_hex")));
@@ -154,12 +158,54 @@ impl Alice {
             .find(|s| s["account"] == text(identity, "pubky_id"))
             .unwrap()
             .clone();
-        let clock = Arc::new(TestClock::new(VECTOR_START_MS));
-        let switch = ScriptedSwitch::new(
+        let records: Value = serde_json::from_str(text(
+            &load("envelopes.json")["signer_backup"],
+            "plaintext_json",
+        ))
+        .unwrap();
+        let created =
+            pubky_switch_core::time::parse_rfc3339(text(&records, "account_created")).unwrap();
+        let clock = Arc::new(TestClock::new(created));
+        let first = IdentityDoc::verify(&document(V1), &key.public()).unwrap();
+        let switch = ScriptedSwitch::unenrolled_at(
             &key,
             hex32(text(&service, "secret_hex")),
             Arc::clone(&clock),
+            &first.inbox().url,
         );
+        let transport = switch.transport();
+        let client = SwitchClient::new(
+            &first.inbox().url,
+            key.public(),
+            Credentials::Signer {
+                identity: key.public(),
+                key: Arc::new(key.clone()),
+            },
+            Some(first.inbox().service_key),
+            transport.clone(),
+            clock.clone(),
+        )
+        .unwrap();
+        let observation = client.observe_account().await.unwrap();
+        let enrollment = Enrollment::sign(
+            &key,
+            EnrollmentBody {
+                identity: key.public(),
+                origin: first.inbox().url.clone(),
+                nonce: [1; 16],
+                intent: EnrollmentIntent::Create {
+                    observation: observation.carried().clone(),
+                },
+                policy: first.body().policy,
+                identity_doc: None,
+                revoked_apps: None,
+            },
+        )
+        .unwrap();
+        let enrolled = client.enroll(&enrollment).await.unwrap();
+        assert_eq!(enrolled.created, created);
+        assert_eq!(switch.created(), created);
+        clock.set_ms(VECTOR_START_MS);
         for name in versions {
             let doc = IdentityDoc::verify(&document(name), &key.public()).unwrap();
             switch.deliver_identity(&doc).unwrap();
@@ -182,7 +228,7 @@ impl Alice {
                 .unwrap();
         }
         Self {
-            transport: switch.transport(),
+            transport,
             switch,
             homeserver: Arc::new(TestHomeserver::default()),
             clock,
@@ -378,7 +424,7 @@ fn test_vectors_backup_records_are_the_handovers_with_prev() {
 /// secret and backs up the vector's records with version 4.
 #[tokio::test]
 async fn test_vectors_new_signer_takes_over_from_the_vectors_handover() {
-    let alice = Alice::new(&[V1, V3]);
+    let alice = Alice::new(&[V1, V3]).await;
     alice.store_handover(None);
     let vault = empty_vault();
     let store = Arc::new(MemoryStore::new());
@@ -422,7 +468,7 @@ async fn test_vectors_new_signer_refuses_the_vectors_rejections() {
     assert!(!cases.is_empty());
     for case in cases {
         let name = text(case, "name");
-        let alice = Alice::new(&[V1, V3]);
+        let alice = Alice::new(&[V1, V3]).await;
         alice.store_handover(Some(&case["handover"]));
         let vault = empty_vault();
         let store = Arc::new(MemoryStore::new());
@@ -456,7 +502,7 @@ async fn test_vectors_new_signer_refuses_the_vectors_rejections() {
 /// it received is kept.
 #[tokio::test]
 async fn test_vectors_take_over_answered_with_the_vectors_abort_is_cancelled() {
-    let alice = Alice::new(&[V1, V3]);
+    let alice = Alice::new(&[V1, V3]).await;
     alice.store_handover(None);
     let vault = empty_vault();
     let store = Arc::new(MemoryStore::new());
@@ -517,7 +563,7 @@ async fn test_vectors_take_over_answered_with_the_vectors_abort_is_cancelled() {
 #[tokio::test]
 async fn test_vectors_restore_from_the_vectors_backup() {
     for (versions, first) in [(&[V1, V3][..], false), (&[V1][..], true)] {
-        let alice = Alice::new(versions);
+        let alice = Alice::new(versions).await;
         let backup = load("envelopes.json")["signer_backup"].clone();
         alice.homeserver.set(
             text(&backup, "path"),
@@ -555,7 +601,7 @@ async fn test_vectors_restore_from_the_vectors_backup() {
         );
     }
 
-    let alice = Alice::new(&[V1, V3, ABORT]);
+    let alice = Alice::new(&[V1, V3, ABORT]).await;
     let backup = load("envelopes.json")["signer_backup"].clone();
     alice.homeserver.set(
         text(&backup, "path"),

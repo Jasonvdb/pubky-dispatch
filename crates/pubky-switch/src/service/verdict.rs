@@ -7,7 +7,7 @@
 
 use pubky_switch_core::{
     chain::{ChainTip, ZERO_HASH},
-    records::IdentityBody,
+    records::{AccountActivation, AccountAssociation, AccountBinding, IdentityBody},
 };
 
 pub(super) use crate::account::recovery_starts_above;
@@ -41,6 +41,7 @@ impl Account {
         chain: Option<(u64, [u8; 32])>,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
+        activation: AccountActivation,
     ) -> Self {
         let named_key = doc
             .filter(|body| body.inbox.url == origin && holds(&body.inbox.service_key))
@@ -51,7 +52,9 @@ impl Account {
             seq,
             chain_hash,
         };
-        let state = if named_key.is_some() {
+        let state = if activation == AccountActivation::Recovery {
+            AccountState::StagedNoChain
+        } else if named_key.is_some() {
             AccountState::Serving(tip)
         } else if chain.is_some() {
             AccountState::StagedImport(tip)
@@ -60,6 +63,7 @@ impl Account {
         };
         Self {
             model: account::Account {
+                activation,
                 state,
                 created_at_ms,
                 document_generation: doc.map(|body| body.generation),
@@ -118,6 +122,15 @@ impl MarkInput {
     }
 }
 
+/// The checked current lifetime, without removing either physical input (Switch account
+/// binding 1.1).
+pub(super) fn account_binding(
+    account: Option<&Account>,
+    mark: &MarkInput,
+) -> pubky_switch_core::Result<AccountBinding> {
+    account::account_binding(account.map(|account| &account.model), &mark.model())
+}
+
 /// Everything [`judge`] reads.
 #[derive(Clone, Copy, Debug)]
 pub struct Inputs<'a> {
@@ -155,11 +168,25 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         erasure_at_ms: inputs.erasure_at_ms,
         retired: inputs.retired,
     });
+    let binding = account_binding(inputs.account, inputs.mark);
     let named_key = inputs
         .account
         .filter(|_| !decision.erase_account_again)
+        .filter(|_| {
+            !binding
+                .as_ref()
+                .is_ok_and(|binding| binding.association() != AccountAssociation::Account)
+        })
         .and_then(|account| account.named_key);
-    let mark_key = inputs.mark.mark().map(|mark| mark.key);
+    let mark_key = inputs
+        .mark
+        .mark()
+        .filter(|mark| {
+            binding
+                .as_ref()
+                .is_ok_and(|binding| binding.created() == Some(mark.created_at_ms))
+        })
+        .map(|mark| mark.key);
     let key = match decision.verdict {
         Verdict::NotHosted { .. } => inputs.current_key,
         Verdict::Unknown => named_key.unwrap_or(inputs.current_key),
@@ -240,7 +267,7 @@ mod tests {
     }
 
     fn mark(generation: u64, seq: u64, hash: u8) -> MarkInput {
-        MarkInput::Mark(mark_created(generation, seq, hash, 50))
+        MarkInput::Mark(mark_created(generation, seq, hash, 100))
     }
 
     fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> AccountMark {
@@ -267,6 +294,7 @@ mod tests {
     fn account(row: Row) -> Option<Account> {
         let staged = |state| Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
                 created_at_ms: 100,
                 document_generation: None,
@@ -276,6 +304,7 @@ mod tests {
         };
         let serving = |state| Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
                 created_at_ms: 100,
                 document_generation: Some(2),
@@ -405,6 +434,7 @@ mod tests {
         // A later generation's state over another hash there is a fork.
         let serving = Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::Serving(ChainTip {
                     generation: 2,
                     seq: 3,
@@ -443,7 +473,15 @@ mod tests {
     #[test]
     fn test_verdict_erased_again_no_mark() {
         for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-            assert_erased_again(mark, &[], NOT_HOSTED);
+            assert_erased_again(
+                mark,
+                &[],
+                if matches!(mark, MarkInput::NotAMark) {
+                    Verdict::Unknown
+                } else {
+                    NOT_HOSTED
+                },
+            );
         }
     }
 
@@ -488,7 +526,14 @@ mod tests {
     #[test]
     fn test_verdict_none_no_mark() {
         for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-            assert_eq!(verdict(Row::None, mark, &[]), NOT_HOSTED);
+            assert_eq!(
+                verdict(Row::None, mark, &[]),
+                if matches!(mark, MarkInput::NotAMark) {
+                    Verdict::Unknown
+                } else {
+                    NOT_HOSTED
+                }
+            );
         }
     }
 
@@ -533,7 +578,14 @@ mod tests {
     #[test]
     fn test_verdict_none_erased_no_mark() {
         for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-            assert_eq!(verdict(Row::NoneErased, mark, &[]), NOT_HOSTED);
+            assert_eq!(
+                verdict(Row::NoneErased, mark, &[]),
+                if matches!(mark, MarkInput::NotAMark) {
+                    Verdict::Unknown
+                } else {
+                    NOT_HOSTED
+                }
+            );
         }
     }
 
@@ -925,6 +977,7 @@ mod tests {
     fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generation() {
         let import = Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::StagedImport(tip(3, 7, 1)),
                 created_at_ms: 100,
                 document_generation: None,
@@ -960,6 +1013,7 @@ mod tests {
         // Its chain's generation, also above the document it holds.
         let with_document = Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 document_generation: Some(2),
                 ..import.model
             },
@@ -975,6 +1029,7 @@ mod tests {
         // Holding no chain, its document's; 0 while it holds neither.
         let staged = Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::StagedNoChain,
                 ..with_document.model
             },
@@ -983,6 +1038,7 @@ mod tests {
         assert_eq!(staged.generation(), 2);
         let empty = Account {
             model: account::Account {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 document_generation: None,
                 ..staged.model
             },
@@ -1089,7 +1145,14 @@ mod tests {
     #[test]
     fn test_verdict_rule_none_retired_without_a_mark_is_not_hosted() {
         for mark in [MarkInput::Missing, MarkInput::NotAMark] {
-            assert_eq!(verdict(Row::None, mark, &[0, 1, 2]), NOT_HOSTED);
+            assert_eq!(
+                verdict(Row::None, mark, &[0, 1, 2]),
+                if matches!(mark, MarkInput::NotAMark) {
+                    Verdict::Unknown
+                } else {
+                    NOT_HOSTED
+                }
+            );
         }
         assert_eq!(verdict(Row::None, mark(0, 0, 0), &[0]), lost(0, true));
     }
@@ -1172,6 +1235,7 @@ mod tests {
     fn route_of(verdict: Verdict, class: RequestClass) -> Route {
         let judgement = Judgement {
             decision: account::Judgement {
+                recovery_required: false,
                 erase_account_again: false,
                 verdict,
                 recovery_floor: BEHIND.generation,
@@ -1295,7 +1359,15 @@ mod tests {
         };
         let holds = |key: &[u8; 32]| *key == DOC_KEY || *key == CURRENT;
         let judged = |doc: Option<&IdentityBody>, chain| {
-            Account::judged("https://switch.example", holds, 2, chain, 5, doc)
+            Account::judged(
+                "https://switch.example",
+                holds,
+                2,
+                chain,
+                5,
+                doc,
+                AccountActivation::Ordinary,
+            )
         };
         let here = body("https://switch.example", DOC_KEY);
         let served = judged(Some(&here), Some((10, [1; 32])));
@@ -1855,5 +1927,37 @@ mod tests {
             answer(&judgement, &put(2, Some(1)), CURRENT).route,
             Route::StartAfresh
         );
+    }
+    #[test]
+    fn test_account_association_older_mark_uses_sql_key() {
+        let held = account(Row::Serving).expect("account");
+        let judgement = judge(&Inputs {
+            account: Some(&held),
+            mark: &MarkInput::Mark(mark_created(2, 10, 1, 50)),
+            stub_at_mark: None,
+            erasure_at_ms: None,
+            retired: &[],
+            current_key: CURRENT,
+        });
+        assert_eq!(judgement.key, DOC_KEY);
+        assert_eq!(
+            judgement.decision.verdict,
+            failing(2, NoticeReason::MarkLost, false, false)
+        );
+    }
+
+    #[test]
+    fn test_account_association_older_sql_uses_mark_key() {
+        let held = account(Row::Serving).expect("account");
+        let judgement = judge(&Inputs {
+            account: Some(&held),
+            mark: &MarkInput::Mark(mark_created(2, 10, 1, 200)),
+            stub_at_mark: None,
+            erasure_at_ms: None,
+            retired: &[],
+            current_key: CURRENT,
+        });
+        assert_eq!(judgement.key, MARK_KEY);
+        assert_eq!(judgement.decision.verdict, lost(2, false));
     }
 }

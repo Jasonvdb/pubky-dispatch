@@ -196,6 +196,9 @@ pub struct CheckedUrl {
 /// a switch origin, a port the policy doesn't allow, or an address literal that isn't
 /// public.
 pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
+    if matches!(use_, UrlUse::SwitchOrigin { .. }) && url.len() > MAX_ORIGIN_LEN {
+        return invalid("Switch wire 7.1: the switch origin exceeds its byte limit");
+    }
     let Some(rest) = url.strip_prefix("https://") else {
         return invalid("Switch wire 7.1: HTTPS URLs only");
     };
@@ -262,6 +265,9 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
 /// The most bytes a domain name may have in a URL the Switch takes (Switch wire 7.1).
 pub const MAX_DOMAIN_LEN: usize = 253;
 
+/// The most ASCII bytes in one domain label (Switch wire 7.1).
+pub const MAX_DOMAIN_LABEL_LEN: usize = 63;
+
 /// The longest origin a switch may have: `https://`, a domain name of [`MAX_DOMAIN_LEN`]
 /// bytes, longer than any IP literal, and a port of five digits (Switch wire 7.1).
 pub const MAX_ORIGIN_LEN: usize = "https://".len() + MAX_DOMAIN_LEN + ":65535".len();
@@ -278,7 +284,7 @@ pub const MAX_ORIGIN_LEN: usize = "https://".len() + MAX_DOMAIN_LEN + ":65535".l
 /// refused for the same reason.
 fn is_domain_name(host: &str) -> bool {
     let label_ok = |label: &str| {
-        (1..=63).contains(&label.len())
+        (1..=MAX_DOMAIN_LABEL_LEN).contains(&label.len())
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')

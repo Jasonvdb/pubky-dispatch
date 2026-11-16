@@ -74,6 +74,8 @@ impl Setup {
             self.alice.switch().transport(),
             self.clock.clone(),
         )
+        .unwrap()
+        .with_account_created(self.alice.switch().created())
         .unwrap();
         let answer = client.apps().await.unwrap();
         answer.apps.into_iter().find(|s| &s.app_id == app).unwrap()
@@ -160,7 +162,8 @@ async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
     use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
     use pubky_switch_core::keys::IdentityKey;
     use pubky_switch_core::records::{
-        Enrollment, EnrollmentBody, IdentityBody, IdentityDoc, IdentityPolicy, Inbox,
+        Enrollment, EnrollmentBody, EnrollmentIntent, IdentityBody, IdentityDoc, IdentityPolicy,
+        Inbox,
     };
     let key = IdentityKey::from_secret([31; 32]);
     let identity = key.public();
@@ -188,6 +191,14 @@ async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
         policy: IdentityPolicy::default(),
         identity_doc: None,
         revoked_apps: Some(vec![kept]),
+        intent: EnrollmentIntent::Create {
+            observation: client(None)
+                .observe_account()
+                .await
+                .unwrap()
+                .carried()
+                .clone(),
+        },
     };
     let enrollment = Enrollment::sign(&key, body).unwrap();
     let answer = client(None).enroll(&enrollment).await.unwrap();
@@ -201,7 +212,12 @@ async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
         .deliver_identity(&IdentityDoc::sign(&key, first).unwrap())
         .unwrap();
     clock.advance_ms(60_000);
-    let apps = client(Some(answer.service_key)).apps().await.unwrap();
+    let apps = client(Some(answer.service_key))
+        .with_account_created(answer.created)
+        .unwrap()
+        .apps()
+        .await
+        .unwrap();
     let status = apps.apps.iter().find(|s| s.app_id == kept).unwrap();
     assert!(!status.current);
     assert_eq!(status.revoked_at, Some(START_MS));
@@ -265,11 +281,13 @@ async fn test_scripted_apps_last_seen_stops_once_the_app_is_revoked() {
 async fn test_scripted_switches_at_two_origins_each_take_their_own_enrollment() {
     use pubky_switch_client::testing::ScriptedSwitch;
     use pubky_switch_core::keys::IdentityKey;
-    use pubky_switch_core::records::{Enrollment, EnrollmentBody, IdentityPolicy};
+    use pubky_switch_core::records::{
+        Enrollment, EnrollmentBody, EnrollmentIntent, IdentityPolicy,
+    };
     let clock = Arc::new(TestClock::new(START_MS));
-    let enroll = |key: &IdentityKey, switch: &Arc<ScriptedSwitch>, origin: &str, named: &str| {
+    let make_client = |key: &IdentityKey, switch: &Arc<ScriptedSwitch>, origin: &str| {
         let identity = key.public();
-        let client = SwitchClient::new(
+        SwitchClient::new(
             origin,
             identity,
             Credentials::Signer {
@@ -280,20 +298,22 @@ async fn test_scripted_switches_at_two_origins_each_take_their_own_enrollment() 
             switch.transport(),
             clock.clone(),
         )
-        .unwrap();
-        let enrollment = Enrollment::sign(
+        .unwrap()
+    };
+    let make_enrollment = |key: &IdentityKey, origin: &str, observation| {
+        Enrollment::sign(
             key,
             EnrollmentBody {
-                identity,
-                origin: named.to_owned(),
+                identity: key.public(),
+                origin: origin.to_owned(),
                 nonce: [1; 16],
                 policy: IdentityPolicy::default(),
                 identity_doc: None,
                 revoked_apps: None,
+                intent: EnrollmentIntent::Create { observation },
             },
         )
-        .unwrap();
-        async move { client.enroll(&enrollment).await }
+        .unwrap()
     };
     let (a, b) = (
         IdentityKey::from_secret([51; 32]),
@@ -302,10 +322,34 @@ async fn test_scripted_switches_at_two_origins_each_take_their_own_enrollment() 
     let (origin_a, origin_b) = ("https://a.switch.example", "https://b.switch.example");
     let at_a = ScriptedSwitch::unenrolled_at(&a, [53; 32], Arc::clone(&clock), origin_a);
     let at_b = ScriptedSwitch::unenrolled_at(&b, [54; 32], Arc::clone(&clock), origin_b);
-    // Each takes an enrollment that names its own origin, and refuses one naming the other.
-    assert!(enroll(&a, &at_a, origin_a, origin_b).await.is_err());
-    assert!(enroll(&a, &at_a, origin_a, origin_a).await.is_ok());
-    assert!(enroll(&b, &at_b, origin_b, origin_b).await.is_ok());
+    let client_a = make_client(&a, &at_a, origin_a);
+    let client_b = make_client(&b, &at_b, origin_b);
+    let enrollment_a = make_enrollment(
+        &a,
+        origin_a,
+        client_a.observe_account().await.unwrap().carried().clone(),
+    );
+    let enrollment_b = make_enrollment(
+        &b,
+        origin_b,
+        client_b.observe_account().await.unwrap().carried().clone(),
+    );
+    let other = ScriptedSwitch::unenrolled_at(&a, [55; 32], Arc::clone(&clock), origin_b);
+    let other_client = make_client(&a, &other, origin_b);
+    let other_enrollment = make_enrollment(
+        &a,
+        origin_b,
+        other_client
+            .observe_account()
+            .await
+            .unwrap()
+            .carried()
+            .clone(),
+    );
+    // The same identity's genuine enrollment for another origin is refused.
+    assert!(client_a.enroll(&other_enrollment).await.is_err());
+    assert!(client_a.enroll(&enrollment_a).await.is_ok());
+    assert!(client_b.enroll(&enrollment_b).await.is_ok());
 }
 
 impl Setup {
@@ -397,16 +441,45 @@ async fn test_scripted_apps_purge_at_the_recovery_upload_that_resolves_its_attem
     use serde_json::json;
     let s = Setup::new();
     let account = format!("/v1/{}", pubky_id(&s.alice.identity().public()));
-    let request = |method: &str, path: &str, app: Option<[u8; 16]>, body: Vec<u8>| Request {
-        method: method.into(),
-        origin: s.alice.origin().to_owned(),
-        path_and_query: format!("{account}/{path}"),
-        headers: app
-            .map(|app| Header::new(pubky_switch_core::http::header::APP, &zbase32_encode(&app)))
-            .into_iter()
-            .collect(),
-        body,
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+    let request = |method: &str, path: &str, app: Option<[u8; 16]>, body: Vec<u8>| {
+        use pubky_switch_client::clock::Clock;
+        use pubky_switch_core::http::{RequestHeaders, RequestTarget, header, sign_request};
+        use pubky_switch_core::time::{rfc3339, rfc3339_seconds};
+        let path = format!("{account}/{path}");
+        let headers = if let Some(app) = app {
+            vec![Header::new(header::APP, &zbase32_encode(&app))]
+        } else {
+            let fields = RequestHeaders {
+                identity: pubky_id(&s.alice.identity().public()),
+                timestamp: rfc3339_seconds(s.clock.now_ms()),
+                created: Some(rfc3339(s.alice.switch().created())),
+                ..RequestHeaders::default()
+            };
+            let signature = sign_request(
+                s.alice.identity().key(),
+                &RequestTarget {
+                    method,
+                    path_and_query: &path,
+                    body: &body,
+                    origin: s.alice.origin(),
+                },
+                &fields,
+            );
+            vec![
+                Header::new(header::IDENTITY, &fields.identity),
+                Header::new(header::TIMESTAMP, &fields.timestamp),
+                Header::new(header::CREATED, fields.created.as_deref().unwrap()),
+                Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
+            ]
+        };
+        Request {
+            method: method.into(),
+            origin: s.alice.origin().to_owned(),
+            path_and_query: path,
+            headers,
+            body,
+            timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        }
     };
     // The first document starts a recovery from the lost generation 1, delivered through
     // `PUT /identity` as the service takes it (Switch wire 7.4.2).

@@ -31,6 +31,7 @@ async fn test_changes_committed_change_wakes_its_account_only() {
     for id in [ID_A, ID_B] {
         db.store()
             .create_account(&NewAccount {
+                activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 id: id.into(),
                 identity_key: [1; 32],
                 generation: 1,
@@ -39,6 +40,7 @@ async fn test_changes_committed_change_wakes_its_account_only() {
                 identity_doc: None,
                 revoked_apps: Vec::new(),
                 enrollment_hash: [0; 32],
+                enrollment_store_id: [1; 16],
             })
             .await
             .expect("create");

@@ -21,8 +21,10 @@ use super::{StoreError, from_db, identity::decode_doc, to_db};
 
 /// The account's sequence as one page reads it, what the reader's authentication reads,
 /// and the documents current among the seqs the page may cover.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FeedSnapshot {
+    /// The current lifetime's activation requirement, read in this same snapshot.
+    pub activation: pubky_switch_core::records::AccountActivation,
     /// The generation the account serves.
     pub generation: u64,
     /// When the account was created, in service time.
@@ -223,7 +225,7 @@ pub(super) async fn read_feed(
         .await
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
-        "SELECT generation, last_seq, chain_seq, chain_hash, created_at_ms, stamped_time_ms, \
+        "SELECT generation, last_seq, chain_seq, chain_hash, created_at_ms, stamped_time_ms, activation_requirement, \
          identity_doc, r.checkpoint FROM accounts \
          LEFT JOIN chain_retention r ON r.account_id = accounts.id WHERE id = $1",
     )
@@ -265,6 +267,10 @@ pub(super) async fn read_feed(
     .await
     .map_err(StoreError::from_db)?;
     let mut snapshot = FeedSnapshot {
+        activation: pubky_switch_core::records::AccountActivation::parse(
+            row.try_get("activation_requirement")?,
+        )
+        .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
         generation,
         created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,

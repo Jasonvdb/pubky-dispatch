@@ -15,8 +15,8 @@ use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AppCert, DEFAULT_CERT_LIFETIME_MS, Enrollment, IdentityDoc, IdentityPolicy, Limits,
-    SignerBackup, SignerHandover, StoredPart,
+    AppCert, CarriedAccountObservation, DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentIntent,
+    IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
@@ -183,10 +183,29 @@ pub(crate) struct Service {
     pub(crate) service_key: [u8; 32],
     /// The limits the enrollment answer announced, which the switch gives only then.
     pub(crate) limits: Limits,
-    /// The account's creation time, as the enrollment answer or a `409` to an erasure since
-    /// named it, which an erasure names (Switch wire 3.7, 7.4.16); `None` where this install
-    /// holds none: after a restore or a hand-over, whose formats don't carry it.
-    pub(crate) created: Option<u64>,
+    /// The account's original creation, retained from enrollment or the authenticated
+    /// backup/hand-over with its document (Switch account-binding Sections 1 and 4).
+    pub(crate) created: u64,
+}
+
+impl Service {
+    fn check(&self) -> Result<()> {
+        if !pubky_switch_core::records::is_origin(&self.origin)
+            || self.created > pubky_switch_core::time::MAX_TIME_MS
+        {
+            return Err(RecordsFault::Invariant("invalid original account target").into());
+        }
+        Ok(())
+    }
+
+    /// Check the retained target against the identity-signed document it accompanies.
+    pub(crate) fn check_document(&self, doc: &IdentityDoc) -> Result<()> {
+        self.check()?;
+        if self.origin != doc.inbox().url || self.service_key != doc.inbox().service_key {
+            return Err(RecordsFault::Invariant("the document names another account").into());
+        }
+        Ok(())
+    }
 }
 
 /// The `identity.json` an account that answers the notice holds, as a signed `409` to an
@@ -204,6 +223,9 @@ pub(crate) struct ShownCopy {
 pub(crate) struct Newest {
     /// The document, as signed.
     pub(crate) doc: SignedDoc,
+    /// Its original account, retained with this exact document. A copy learned only from
+    /// another install may establish who signs without establishing an account binding.
+    pub(crate) account: Option<Service>,
     /// The document hash of the version it builds on; `None` for a first version and an
     /// adopted copy.
     pub(crate) prev: Option<[u8; 32]>,
@@ -405,6 +427,8 @@ pub(crate) struct SignerState {
 pub(crate) struct HandingOver {
     /// The new signer's App ID.
     pub(crate) to_app: [u8; 16],
+    /// The original account of the handed-over version and its pending requests.
+    pub(crate) account: Service,
     /// The version handed over, as signed: the newest the switch accepted from this install.
     pub(crate) doc: SignedDoc,
     /// The hand-over, sealed to the new signer's bundle key and signed once, and sent again
@@ -617,13 +641,34 @@ impl SignerState {
 
     /// Check the signed copies independently of the service and of caller-supplied keys.
     pub(crate) fn check_copies(&self) -> Result<()> {
-        self.newest_doc()?;
+        for service in self
+            .service
+            .iter()
+            .chain(self.recovery_serving.iter())
+            .chain(&self.recovery_services)
+        {
+            service.check()?;
+        }
+        if let Some(newest) = &self.newest {
+            let doc = stored_identity(&newest.doc, &self.identity)?;
+            if let Some(account) = &newest.account {
+                account.check_document(&doc)?;
+            } else if self.managed_by != Some(doc.body().signer)
+                || doc.body().signer == self.install
+            {
+                return Err(
+                    RecordsFault::Invariant("an owned version has no original account").into(),
+                );
+            }
+        }
         self.certificates()?;
         if let Some(base) = &self.recovery_base {
             stored_identity(base, &self.identity)?;
         }
         if let Some(handing) = &self.handing_over {
-            stored_identity(&handing.doc, &self.identity)?;
+            handing
+                .account
+                .check_document(&stored_identity(&handing.doc, &self.identity)?)?;
             handing
                 .handover
                 .verify(&self.identity, &handing.to_app)
@@ -667,6 +712,60 @@ pub(crate) enum DeliverStep {
     BackupWritten,
 }
 
+/// A distinct recovery's enrollment, before discovery or retained for exact retries
+/// (Switch account binding 2-3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum RecoveryEnrollment {
+    /// The authorized destination has not supplied its authenticated association yet.
+    Preparing {
+        nonce: [u8; 16],
+        policy: IdentityPolicy,
+        revoked_apps: Vec<[u8; 16]>,
+    },
+    /// The original observation and the complete signed action selected from it.
+    Ready {
+        observation: CarriedAccountObservation,
+        enrollment: SignedDoc,
+    },
+}
+
+impl RecoveryEnrollment {
+    /// Permanent exclusions are the retained tombstones outside the verified recovery base
+    /// (Switch spec 12.6 step 1). Later revocations of listed apps remain deferred work.
+    pub(crate) fn check_exclusions(&self, state: &SignerState, origin: &str) -> Result<()> {
+        let base = state
+            .recovery_base
+            .as_ref()
+            .ok_or(RecordsFault::Invariant("a recovery enrollment has no base"))?;
+        let base = stored_identity(base, &state.identity)?;
+        let mut expected: Vec<_> = state
+            .tombstones
+            .iter()
+            .copied()
+            .filter(|app| base.listed_cert(app).is_none())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut excluded = match self {
+            Self::Preparing { revoked_apps, .. } => revoked_apps.clone(),
+            Self::Ready { enrollment, .. } => {
+                Enrollment::verify(enrollment, &state.identity, origin)
+                    .map_err(SignerError::StoredData)?
+                    .revoked_apps()
+                    .to_vec()
+            }
+        };
+        excluded.sort_unstable();
+        if excluded != expected {
+            return Err(
+                RecordsFault::Invariant("recovery exclusions disagree with records").into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The flow in progress, with every artifact it signed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Flow {
@@ -674,8 +773,10 @@ pub(crate) enum Flow {
     Enroll {
         /// The switch origin.
         origin: String,
-        /// The signed enrollment, sent again until it is answered.
-        enrollment: SignedDoc,
+        /// The nonce retained before discovery.
+        nonce: [u8; 16],
+        /// The signed enrollment once discovery supplies its original observation.
+        enrollment: Option<SignedDoc>,
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
     },
@@ -685,13 +786,15 @@ pub(crate) enum Flow {
     Recover {
         /// The service's origin.
         origin: String,
-        /// The signed enrollment, sent again until it is answered.
-        enrollment: SignedDoc,
+        /// Preparation or the exact signed enrollment and its original target.
+        enrollment: RecoveryEnrollment,
     },
     /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
     /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
     /// batch by batch, then delivering the version.
     Renew {
+        /// The original target of the signed batches and version.
+        account: Service,
         /// The signed batches, each sent again with the same bytes until it is answered.
         batches: Vec<RenewBatch>,
         /// How many batches the switch took.
@@ -717,6 +820,8 @@ pub(crate) enum Flow {
     /// first `identity.json` and the app records leave the Homeserver, then the erasure is
     /// sent until it is answered.
     Erase {
+        /// The original authorized account, retained through unknown outcomes.
+        account: Service,
         /// The Homeserver's files are deleted.
         unpublished: bool,
         /// The App IDs whose grant reminder this erasure raised: withdrawn if it ends without
@@ -738,6 +843,8 @@ pub(crate) enum Flow {
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
+        /// The original target of this signed version, kept through every retry.
+        account: Service,
         /// The new version, as signed.
         doc: SignedDoc,
         /// The document hash of the version it builds on.
@@ -750,17 +857,77 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    pub(crate) fn check_state(&self, state: &SignerState) -> Result<()> {
+        self.check_copies(&state.identity)?;
+        if let Self::Recover { origin, enrollment } = self {
+            enrollment.check_exclusions(state, origin)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
         match self {
             Self::Enroll {
-                origin, enrollment, ..
+                origin,
+                nonce,
+                enrollment,
+                policy,
+            } => {
+                if !pubky_switch_core::records::is_origin(origin) {
+                    return Err(RecordsFault::Invariant("invalid enrollment origin").into());
+                }
+                if let Some(signed) = enrollment {
+                    let enrollment = Enrollment::verify(signed, identity, origin)
+                        .map_err(SignerError::StoredData)?;
+                    if enrollment.body().nonce != *nonce
+                        || enrollment.body().policy != *policy
+                        || !matches!(enrollment.body().intent, EnrollmentIntent::Create { .. })
+                    {
+                        return Err(RecordsFault::Invariant("another initial enrollment").into());
+                    }
+                }
             }
-            | Self::Recover { origin, enrollment } => {
-                Enrollment::verify(enrollment, identity, origin)
-                    .map_err(SignerError::StoredData)?;
+            Self::Recover { origin, enrollment } => {
+                if !pubky_switch_core::records::is_origin(origin) {
+                    return Err(RecordsFault::Invariant("invalid recovery origin").into());
+                }
+                match enrollment {
+                    RecoveryEnrollment::Preparing { revoked_apps, .. } => {
+                        if revoked_apps
+                            .windows(2)
+                            .any(|ids| matches!(ids, [a, b] if a >= b))
+                        {
+                            return Err(
+                                RecordsFault::Invariant("unordered recovery exclusions").into()
+                            );
+                        }
+                    }
+                    RecoveryEnrollment::Ready {
+                        observation,
+                        enrollment,
+                    } => {
+                        let observed = observation
+                            .verify(identity, origin)
+                            .map_err(SignerError::StoredData)?;
+                        let signed = Enrollment::verify(enrollment, identity, origin)
+                            .map_err(SignerError::StoredData)?;
+                        if signed.body().intent != observed.enrollment_intent()?
+                            || signed.body().identity_doc.is_some()
+                        {
+                            return Err(
+                                RecordsFault::Invariant("another recovery enrollment").into()
+                            );
+                        }
+                    }
+                }
             }
-            Self::Renew { batches, doc, .. } => {
-                stored_identity(doc, identity)?;
+            Self::Renew {
+                account,
+                batches,
+                doc,
+                ..
+            } => {
+                account.check_document(&stored_identity(doc, identity)?)?;
                 for batch in batches {
                     batch.read(identity)?;
                 }
@@ -777,13 +944,18 @@ impl Flow {
                     stored_identity(&delivery.doc, identity)?;
                 }
             }
-            Self::Deliver { doc, backup, .. } => {
-                stored_identity(doc, identity)?;
+            Self::Deliver {
+                account,
+                doc,
+                backup,
+                ..
+            } => {
+                account.check_document(&stored_identity(doc, identity)?)?;
                 if let Some(backup) = backup {
                     backup.verify(identity).map_err(SignerError::StoredData)?;
                 }
             }
-            Self::Erase { .. } => {}
+            Self::Erase { account, .. } => account.check()?,
         }
         Ok(())
     }
@@ -864,7 +1036,7 @@ pub(crate) async fn load(
     let flow = records.flow?;
     state.check_copies()?;
     if let Some(flow) = &flow {
-        flow.check_copies(identity)?;
+        flow.check_state(&state)?;
     }
     Ok(Some((state, flow)))
 }
@@ -911,7 +1083,7 @@ pub(crate) async fn save(
         RecordsFault::Invariant("the state to write contains an invalid signed copy")
     })?;
     if let Some(flow) = flow {
-        flow.check_copies(&state.identity).map_err(|_| {
+        flow.check_state(state).map_err(|_| {
             RecordsFault::Invariant("the flow to write contains an invalid signed copy")
         })?;
     }

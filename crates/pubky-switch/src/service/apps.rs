@@ -132,9 +132,9 @@ pub(crate) fn statuses(
             kept_id.is_none() && doc.is_some_and(|doc| doc.listed_cert(&id).is_some())
         };
         let (revoked_at, departed_at) = match kept_id.map(|kept| (kept.reason, kept.at_ms)) {
-            Some((KeptReason::Revoked | KeptReason::Enrolled, at)) => (Some(at), None),
-            Some((KeptReason::Departed, at)) => (None, Some(at)),
-            None => (None, None),
+            Some((KeptReason::Revoked | KeptReason::Enrolled, at)) => (at, None),
+            Some((KeptReason::Departed, at)) => (None, at),
+            Some((KeptReason::Document, _)) | None => (None, None),
         };
         let parts = view.parts.get(&id).map(Vec::as_slice).unwrap_or_default();
         let spans: Vec<StoredPart> = parts
@@ -307,7 +307,7 @@ mod tests {
         KeptAppId {
             app_id: [1; 16],
             reason,
-            at_ms: 0,
+            at_ms: Some(0),
             data_epoch: Some(2),
             rotated,
         }

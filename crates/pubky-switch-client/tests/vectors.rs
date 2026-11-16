@@ -416,6 +416,12 @@ async fn test_vectors_http_requests_reproduced_by_the_typed_calls() {
                 Arc::new(TestClock::new(now)),
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let client = match header_of(r, header::CREATED) {
+                Some(created) => client
+                    .with_account_created(parse_rfc3339(created).unwrap())
+                    .unwrap(),
+                None => client,
+            };
             let result = call(&client, r).await;
 
             let sent = transport.last_request().expect("the call went out");

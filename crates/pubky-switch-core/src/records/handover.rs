@@ -55,6 +55,7 @@ pub const MAX_BUNDLE_PARTS: usize = 2048;
 pub struct SignerRecords {
     key: IdentityKey,
     identity_doc: IdentityDoc,
+    account_created: u64,
     revoked_apps: Vec<[u8; 16]>,
     certs: Vec<AppCert>,
     limits: Limits,
@@ -83,6 +84,7 @@ struct RecordsIn {
     identity: String,
     identity_secret: Option<String>,
     identity_doc: SignedDoc,
+    account_created: String,
     revoked_apps: Vec<String>,
     certs: Vec<SignedDoc>,
     limits: Limits,
@@ -112,6 +114,7 @@ struct RecordsOut<'a> {
     #[serde(skip_serializing_if = "Option::is_none", with = "secret_b64")]
     identity_secret: Option<[u8; 32]>,
     identity_doc: &'a SignedDoc,
+    account_created: String,
     revoked_apps: Vec<String>,
     certs: Vec<&'a SignedDoc>,
     limits: &'a Limits,
@@ -147,7 +150,9 @@ impl SignerRecords {
     /// The records a signer hands over or backs up (Switch wire 3.12, 3.13).
     ///
     /// `identity_doc` is the newest `identity.json` a service accepted from the signer, or
-    /// for a backup the newest it signed. `certs` keeps exactly the certificates it
+    /// for a backup the newest it signed. `account_created` binds that exact document to
+    /// its original account at its authenticated inbox origin and key; it proves no
+    /// service acceptance. `certs` keeps exactly the certificates it
     /// references, those of its `apps` and `renewed`, from `issued`. `revoked_apps` is kept
     /// unique and ascending by text. `bundle_parts` keeps the parts stored for each listed
     /// app made for its listed certificate, each once. `prev` is a backup's: the document
@@ -158,15 +163,20 @@ impl SignerRecords {
     ///
     /// [`Error::Invalid`] when `identity_doc` is of another identity, a certificate it
     /// references isn't among `issued`, or more than 2,048 parts remain.
+    #[allow(clippy::too_many_arguments)] // Required records supplied together (wire 3.12).
     pub fn new(
         key: IdentityKey,
         identity_doc: IdentityDoc,
+        account_created: u64,
         revoked_apps: &[[u8; 16]],
         issued: &[AppCert],
         limits: Limits,
         bundle_parts: &[StoredPart],
         prev: Option<[u8; 32]>,
     ) -> Result<Self> {
+        if account_created > crate::time::MAX_TIME_MS {
+            return invalid("Switch wire 3.12: account creation is not representable");
+        }
         if identity_doc.identity() != key.public() {
             return invalid("Switch wire 3.12: identity_doc is of another identity");
         }
@@ -182,6 +192,7 @@ impl SignerRecords {
             bundle_parts,
             prev,
             identity_doc,
+            account_created,
             pending_distrust: Vec::new(),
         })
     }
@@ -240,6 +251,7 @@ impl SignerRecords {
     /// Check 2 and the records, from a plaintext whose check 1 held for `key`'s identity.
     fn from_wire(wire: &RecordsIn, key: IdentityKey) -> Result<Self> {
         let identity = &key.public();
+        let account_created = crate::http::parse_created(&wire.account_created)?;
         let identity_doc =
             IdentityDoc::verify(&wire.identity_doc, identity).map_err(|e| at_check(2, e))?;
         let all = wire
@@ -266,6 +278,7 @@ impl SignerRecords {
         Ok(Self {
             key,
             identity_doc,
+            account_created,
             revoked_apps,
             certs,
             limits: wire.limits,
@@ -303,6 +316,7 @@ impl SignerRecords {
             identity: self.key.public(),
             identity_secret,
             identity_doc: self.identity_doc.signed(),
+            account_created: crate::time::rfc3339(self.account_created),
             revoked_apps: self
                 .revoked_apps
                 .iter()
@@ -328,6 +342,12 @@ impl SignerRecords {
     /// old signer's high-water mark.
     pub fn identity_doc(&self) -> &IdentityDoc {
         &self.identity_doc
+    }
+
+    /// The original account creation bound to this exact identity document, in Unix
+    /// milliseconds (Switch wire 3.12-3.13). It proves neither acceptance nor current hosting.
+    pub fn account_created(&self) -> u64 {
+        self.account_created
     }
 
     /// The App IDs revoked or departed, kept for good, ascending by text.
@@ -1141,6 +1161,7 @@ mod tests {
         SignerRecords::new(
             identity(),
             d,
+            1_767_225_600_123,
             &[[2; 16], [1; 16], [2; 16]],
             &[other.clone(), mine.clone(), other],
             Limits::default(),
@@ -1148,6 +1169,107 @@ mod tests {
             prev,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_signer_records_creation_keeps_original_document_binding() {
+        let r = records(Some([4; 32]));
+        assert_eq!(r.account_created(), 1_767_225_600_123);
+        for backup in [false, true] {
+            let bytes = if backup {
+                r.to_backup_json().unwrap()
+            } else {
+                r.to_json().unwrap()
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["account_created"], "2026-01-01T00:00:00.123Z");
+            let read = if backup {
+                SignerRecords::parse_backup(&bytes, &identity()).unwrap()
+            } else {
+                SignerRecords::parse(&bytes, &identity().public()).unwrap()
+            };
+            assert_eq!(read.account_created(), r.account_created());
+            assert_eq!(read.identity_doc().hash(), r.identity_doc().hash());
+            assert_eq!(read.identity_doc().inbox(), r.identity_doc().inbox());
+        }
+        let sealed = SignerBackup::seal(&identity(), &r).unwrap();
+        let opened = sealed.open(&identity()).unwrap();
+        assert_eq!(opened.account_created(), r.account_created());
+        assert_eq!(opened.identity_doc().hash(), r.identity_doc().hash());
+    }
+
+    #[test]
+    fn test_signer_records_creation_is_required() {
+        for backup in [false, true] {
+            let r = records(None);
+            let bytes = if backup {
+                r.to_backup_json().unwrap()
+            } else {
+                r.to_json().unwrap()
+            };
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value.as_object_mut().unwrap().remove("account_created");
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let read = if backup {
+                SignerRecords::parse_backup(&bytes, &identity())
+            } else {
+                SignerRecords::parse(&bytes, &identity().public())
+            };
+            assert!(read.is_err());
+        }
+    }
+
+    #[test]
+    fn test_signer_records_creation_cannot_be_null() {
+        for backup in [false, true] {
+            let r = records(None);
+            let bytes = if backup {
+                r.to_backup_json().unwrap()
+            } else {
+                r.to_json().unwrap()
+            };
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["account_created"] = serde_json::Value::Null;
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let read = if backup {
+                SignerRecords::parse_backup(&bytes, &identity())
+            } else {
+                SignerRecords::parse(&bytes, &identity().public())
+            };
+            assert!(read.is_err());
+        }
+    }
+
+    #[test]
+    fn test_signer_records_creation_requires_canonical_milliseconds() {
+        let r = records(None);
+        for created in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.123+00:00",
+            "2026-01-01T00:00:00.12Z",
+            "2026-13-01T00:00:00.123Z",
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&r.to_backup_json().unwrap()).unwrap();
+            value["account_created"] = created.into();
+            assert!(
+                SignerRecords::parse_backup(&serde_json::to_vec(&value).unwrap(), &identity())
+                    .is_err()
+            );
+        }
+        assert!(
+            SignerRecords::new(
+                identity(),
+                r.identity_doc().clone(),
+                crate::time::MAX_TIME_MS + 1,
+                &[],
+                r.certs(),
+                Limits::default(),
+                &[],
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1163,6 +1285,7 @@ mod tests {
         let r = SignerRecords::new(
             identity(),
             d,
+            1_767_225_600_123,
             &[other.app_id(), [1; 16]],
             &[mine.clone(), other.clone()],
             Limits::default(),
@@ -1282,6 +1405,7 @@ mod tests {
             SignerRecords::new(
                 identity(),
                 d,
+                1_767_225_600_123,
                 &[],
                 &[certs().0],
                 Limits::default(),
@@ -1306,6 +1430,7 @@ mod tests {
             SignerRecords::new(
                 identity(),
                 doc(3, &[&mine]),
+                1_767_225_600_123,
                 &[],
                 &[],
                 Limits::default(),
@@ -1327,6 +1452,7 @@ mod tests {
             SignerRecords::new(
                 identity(),
                 doc(3, &[&mine]),
+                1_767_225_600_123,
                 &[],
                 std::slice::from_ref(&mine),
                 Limits::default(),
@@ -1717,8 +1843,17 @@ mod tests {
         let d = IdentityDoc::sign(&identity(), body).unwrap();
         let mut issued = vec![mine.clone(), other];
         issued.extend(renewed);
-        let r =
-            SignerRecords::new(identity(), d, &[], &issued, Limits::default(), &[], None).unwrap();
+        let r = SignerRecords::new(
+            identity(),
+            d,
+            1_767_225_600_123,
+            &[],
+            &issued,
+            Limits::default(),
+            &[],
+            None,
+        )
+        .unwrap();
         assert!(r.to_json().unwrap().len() > MAX_FRAMED_JSON_LEN);
         let handover = SignerHandover::seal(&identity(), &mine, &r).unwrap();
         assert_eq!(handover.envelopes().len(), 2);

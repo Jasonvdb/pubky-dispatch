@@ -18,7 +18,9 @@ use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
 use pubky_switch_client::{ClientError, Credentials, SwitchClient, TransportError};
 use pubky_switch_core::chain::ZERO_HASH;
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery, NoticeReason, RecoveryNotice};
-use pubky_switch_core::records::{Enrollment, EnrollmentBody, IdentityDoc, IdentityPolicy};
+use pubky_switch_core::records::{
+    Enrollment, EnrollmentBody, EnrollmentIntent, IdentityDoc, IdentityPolicy,
+};
 use serde_json::{Value, json};
 
 /// Alice's signer, her account serving at its first `identity.json`.
@@ -35,7 +37,11 @@ fn alice() -> TestSigner {
 
 /// The signer's client of its account, the switch's key pinned, through `transport`, with
 /// its own clock at `now_ms`.
-fn client_at(signer: &TestSigner, transport: Arc<dyn Transport>, now_ms: u64) -> SwitchClient {
+fn unbound_client_at(
+    signer: &TestSigner,
+    transport: Arc<dyn Transport>,
+    now_ms: u64,
+) -> SwitchClient {
     let key = signer.identity().key();
     SwitchClient::new(
         SWITCH_ORIGIN,
@@ -51,6 +57,18 @@ fn client_at(signer: &TestSigner, transport: Arc<dyn Transport>, now_ms: u64) ->
         Arc::new(TestClock::new(now_ms)) as Arc<dyn Clock>,
     )
     .unwrap()
+}
+
+fn client_at(signer: &TestSigner, transport: Arc<dyn Transport>, now_ms: u64) -> SwitchClient {
+    unbound_client_at(signer, transport, now_ms)
+        .with_account_created(signer.switch().created())
+        .unwrap()
+}
+
+fn bound_client(signer: &TestSigner, created: u64) -> SwitchClient {
+    unbound_client_at(signer, signer.switch().transport(), signer.clock().now_ms())
+        .with_account_created(created)
+        .unwrap()
 }
 
 fn client(signer: &TestSigner) -> SwitchClient {
@@ -113,7 +131,7 @@ fn start(signer: &TestSigner, generation: u64) -> IdentityDoc {
     })
 }
 
-fn enrollment(signer: &TestSigner, nonce: u8) -> Enrollment {
+fn enrollment(signer: &TestSigner, nonce: u8, intent: EnrollmentIntent) -> Enrollment {
     let key = signer.identity().key();
     Enrollment::sign(
         key,
@@ -121,6 +139,7 @@ fn enrollment(signer: &TestSigner, nonce: u8) -> Enrollment {
             identity: key.public(),
             origin: SWITCH_ORIGIN.to_owned(),
             nonce: [nonce; 16],
+            intent,
             policy: IdentityPolicy::default(),
             identity_doc: None,
             revoked_apps: None,
@@ -226,7 +245,16 @@ async fn test_marks_unreadable_store_is_unavailable_and_moves_nothing() {
     let error = client.apps().await.unwrap_err();
     assert_eq!(code(&error).0, 503);
     assert_eq!(code(&error).1, ErrorCode::Unavailable);
-    let error = client.enroll(&enrollment(&alice, 1)).await.unwrap_err();
+    let error = client
+        .enroll(&enrollment(
+            &alice,
+            1,
+            EnrollmentIntent::Existing {
+                created: switch.created(),
+            },
+        ))
+        .await
+        .unwrap_err();
     assert_eq!(code(&error).1, ErrorCode::Unavailable);
     assert_eq!(
         switch.mark(),
@@ -320,7 +348,20 @@ async fn test_marks_lost_account_is_taken_over_by_an_enrollment() {
     let held = alice.switch().identity_doc();
     assert!(held.is_none(), "nothing of the account is left");
     // The enrollment makes a staged account that takes the mark over, bounded by it.
-    let answer = client.enroll(&enrollment(&alice, 7)).await.unwrap();
+    alice.clock().advance_ms(1);
+    let observation = client.observe_account().await.unwrap();
+    let answer = client
+        .enroll(&enrollment(
+            &alice,
+            7,
+            EnrollmentIntent::Takeover {
+                created: switch.created(),
+                observation: observation.carried().clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let client = bound_client(&alice, answer.created);
     assert_eq!(answer.service_key, switch.service_key(), "the one key");
     assert_eq!(switch.mark(), Some(marked));
     assert_eq!(notice(&client.apps().await.unwrap_err()), behind(1, false));
@@ -364,10 +405,10 @@ async fn test_marks_erasure_goes_through_at_a_failing_account() {
     switch.restore_to(1);
     let created = switch.created();
     let held = switch.identity_doc().unwrap();
-    // Another document, or another creation time: `409 conflict`, carrying the creation time
-    // and the copy the account holds (Switch wire 7.4.16).
+    // A different document carries the held copy; a creation conflict carries only the
+    // current creation (Switch wire 7.4.16; Switch account binding 1).
     for (named_created, named) in [(created, [9; 32]), (created + 1, held.hash())] {
-        let error = client
+        let error = bound_client(&alice, named_created)
             .erase(Some(named_created), Some(named))
             .await
             .unwrap_err();
@@ -376,7 +417,10 @@ async fn test_marks_erasure_goes_through_at_a_failing_account() {
             (
                 409,
                 ErrorCode::Conflict,
-                checked(created, Some(json!(held.signed())))
+                checked(
+                    created,
+                    (named_created == created).then(|| json!(held.signed()))
+                )
             )
         );
     }
@@ -418,19 +462,15 @@ async fn test_marks_erasure_names_the_held_document() {
 }
 
 #[tokio::test]
-async fn test_marks_erasure_without_the_creation_time_learns_it() {
-    // A signer that holds no creation time, after a lost enrollment answer, sends none: the
-    // `409 conflict`, not a `400`, carries it, and the erasure naming it goes through
-    // (Switch wire 7.4.16).
+async fn test_marks_discovery_supplies_creation_for_authorized_erasure() {
     let alice = alice();
-    let client = client(&alice);
     let held = alice.switch().identity_doc().unwrap();
-    let error = client.erase(None, Some(held.hash())).await.unwrap_err();
-    let (status, refusal, current) = code(&error);
-    assert_eq!((status, refusal), (409, ErrorCode::Conflict));
-    assert_eq!(current, checked(alice.switch().created(), None));
-    let learned =
-        pubky_switch_core::time::parse_rfc3339(current["created"].as_str().unwrap()).unwrap();
+    let bootstrap = unbound_client_at(&alice, alice.switch().transport(), alice.clock().now_ms());
+    let observation = bootstrap.observe_account().await.unwrap();
+    let learned = observation.body().created.unwrap();
+    assert_eq!(learned, alice.switch().created());
+    assert!(!alice.switch().erased());
+    let client = bootstrap.with_account_created(learned).unwrap();
     client
         .erase(Some(learned), Some(held.hash()))
         .await
@@ -440,8 +480,8 @@ async fn test_marks_erasure_without_the_creation_time_learns_it() {
 
 #[tokio::test]
 async fn test_marks_erasure_replayed_at_a_later_account_is_conflict() {
-    // An erasure, then an enrollment within the same millisecond: the new account's creation
-    // time is after the erasure's record, which is no earlier than the creation it erased, so
+    // An erasure followed by a distinct authorized enrollment at a later trusted time:
+    // the new creation is after the erasure record and the erased creation, so
     // an erasure naming the first account's time, the first request again, is `409
     // conflict` carrying the new account's, and the new account and its mark stay; one
     // naming the new time erases it. Before the enrollment the same request is the
@@ -461,11 +501,31 @@ async fn test_marks_erasure_replayed_at_a_later_account_is_conflict() {
         code(&error),
         (404, ErrorCode::NotFound, json!({ "hosted": false }))
     );
-    let answer = client.enroll(&enrollment(&alice, 3)).await.unwrap();
+    alice.clock().advance_ms(1);
+    let observation = client.observe_account().await.unwrap();
+    let new_client = unbound_client_at(&alice, switch.transport(), alice.clock().now_ms());
+    let answer = new_client
+        .enroll(&enrollment(
+            &alice,
+            3,
+            EnrollmentIntent::Create {
+                observation: observation.carried().clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let client = bound_client(&alice, answer.created);
     let later = switch.created();
     assert_eq!(answer.created, later);
-    assert_eq!(later, switch.erasure_record().unwrap() + 1, "no wait");
-    let error = client.erase(Some(first), None).await.unwrap_err();
+    assert_eq!(
+        later,
+        switch.erasure_record().unwrap() + 1,
+        "the trusted clock is one millisecond past erasure"
+    );
+    let error = bound_client(&alice, first)
+        .erase(Some(first), None)
+        .await
+        .unwrap_err();
     assert_eq!(
         code(&error),
         (409, ErrorCode::Conflict, checked(later, None))
@@ -478,16 +538,27 @@ async fn test_marks_erasure_replayed_at_a_later_account_is_conflict() {
 
 #[tokio::test]
 async fn test_marks_enrollment_taking_a_mark_over_is_created_later() {
-    // An enrollment that takes a lost account's mark over, within the same millisecond as
-    // the account's creation, gets a creation time after it, and so does the next one: no
-    // two accounts of the identity have the same (Switch wire 7.3, The mark; Table 3).
+    // An explicitly authorized takeover uses trusted time after the marked creation;
+    // successive accounts never share a creation (Switch account binding 3).
     let alice = alice();
     let switch = alice.switch();
     let client = client(&alice);
     let mut earlier = switch.created();
     for nonce in [3, 4] {
         switch.lose_account();
-        let answer = client.enroll(&enrollment(&alice, nonce)).await.unwrap();
+        alice.clock().advance_ms(1);
+        let observation = client.observe_account().await.unwrap();
+        let answer = bound_client(&alice, earlier)
+            .enroll(&enrollment(
+                &alice,
+                nonce,
+                EnrollmentIntent::Takeover {
+                    created: earlier,
+                    observation: observation.carried().clone(),
+                },
+            ))
+            .await
+            .unwrap();
         assert_eq!(answer.created, earlier + 1);
         assert_eq!(switch.created(), answer.created);
         earlier = answer.created;
@@ -504,14 +575,13 @@ async fn test_marks_erasure_at_a_lost_identity_writes_the_record() {
     switch.lose_account();
     // Another creation time: `409 conflict`, carrying the mark's and `identity` `null`,
     // nothing written (Switch wire 7.4.16).
-    let error = client.erase(Some(created + 1), None).await.unwrap_err();
+    let error = bound_client(&alice, created + 1)
+        .erase(Some(created + 1), None)
+        .await
+        .unwrap_err();
     assert_eq!(
         code(&error),
-        (
-            409,
-            ErrorCode::Conflict,
-            checked(created, Some(Value::Null))
-        )
+        (409, ErrorCode::Conflict, checked(created, None))
     );
     assert_eq!(switch.erasure_record(), None);
     assert!(switch.mark().is_some());
@@ -535,7 +605,20 @@ async fn test_marks_enrollment_after_an_erasure_makes_a_new_account() {
         )
         .await
         .unwrap();
-    let answer = client.enroll(&enrollment(&alice, 3)).await.unwrap();
+    alice.clock().advance_ms(1);
+    let observation = client.observe_account().await.unwrap();
+    let new_client = unbound_client_at(&alice, switch.transport(), alice.clock().now_ms());
+    let answer = new_client
+        .enroll(&enrollment(
+            &alice,
+            3,
+            EnrollmentIntent::Create {
+                observation: observation.carried().clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let client = bound_client(&alice, answer.created);
     assert_eq!(answer.service_key, switch.service_key(), "the one key");
     assert_eq!(switch.mark(), Some((0, 0, ZERO_HASH)));
     // Staged: everything but the delivery that makes it serve is `503 staged`.
@@ -700,23 +783,16 @@ async fn test_one_key_earlier_answer_replayed_is_refused() {
         }),
         Arc::clone(alice.clock()) as Arc<dyn Clock>,
     )
+    .unwrap()
+    .with_account_created(alice.switch().created())
     .unwrap();
     client.apps().await.unwrap();
     // A second later, so the next request is signed anew.
     alice.clock().advance_ms(1_000);
     let held = alice.switch().identity_doc().unwrap().hash();
     let recovery = start(&alice, 2);
-    alice
-        .switch()
-        .transport()
-        .send(Request {
-            method: "PUT".into(),
-            origin: SWITCH_ORIGIN.into(),
-            path_and_query: format!("/v1/{}/identity", alice.identity().key().id()),
-            headers: Vec::new(),
-            body: delivery(&recovery, Some(held)).to_json(),
-            timeout: pubky_switch_client::transport::TimeoutClass::default(),
-        })
+    signer
+        .put_identity(&delivery(&recovery, Some(held)))
         .await
         .unwrap();
     assert_eq!(alice.switch().generation(), 2);
@@ -740,7 +816,13 @@ async fn test_scripted_erasure_pending_retry_checks_signature_creation_and_docum
         );
         for (created, hash) in [(created + 1, hash), (created, [9; 32])] {
             assert_eq!(
-                code(&client.erase(Some(created), Some(hash)).await.unwrap_err()).1,
+                code(
+                    &bound_client(&signer, created)
+                        .erase(Some(created), Some(hash))
+                        .await
+                        .unwrap_err()
+                )
+                .1,
                 ErrorCode::Conflict
             );
         }
@@ -755,7 +837,11 @@ async fn test_scripted_erasure_pending_retry_checks_signature_creation_and_docum
                 ),
                 pubky_switch_client::transport::Header::new(
                     pubky_switch_core::http::header::TIMESTAMP,
-                    &pubky_switch_core::time::rfc3339(signer.clock().now_ms()),
+                    &pubky_switch_core::time::rfc3339_seconds(signer.clock().now_ms()),
+                ),
+                pubky_switch_client::transport::Header::new(
+                    pubky_switch_core::http::header::CREATED,
+                    &pubky_switch_core::time::rfc3339(created),
                 ),
                 pubky_switch_client::transport::Header::new(
                     pubky_switch_core::http::header::SIGNATURE,
@@ -766,10 +852,11 @@ async fn test_scripted_erasure_pending_retry_checks_signature_creation_and_docum
             timeout: pubky_switch_client::transport::TimeoutClass::default(),
         };
         let answer = switch.handle(&bad).unwrap();
-        assert_eq!(answer.status, 401);
+        // The unresolved outcome has Table 2 precedence over failed authentication.
+        assert_eq!(answer.status, 503);
         assert_eq!(
             serde_json::from_slice::<Value>(&answer.body).unwrap()["code"],
-            "bad_signature"
+            "unavailable"
         );
         assert_eq!(
             code(&client.apps().await.unwrap_err()).1,

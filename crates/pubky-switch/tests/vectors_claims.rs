@@ -40,6 +40,7 @@ struct Account {
     key: SigningKey,
     apps: BTreeMap<String, ClaimsApp>,
     now: u64,
+    created: Option<u64>,
 }
 
 fn signed(value: &Value) -> SignedDoc {
@@ -56,6 +57,26 @@ fn first16(seed: [u8; 32]) -> [u8; 16] {
 impl Account {
     fn path(&self, rest: &str) -> String {
         format!("/v1/{}/{rest}", self.id)
+    }
+
+    fn signer_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> pubky_switch::http::SwitchRequest {
+        signed_request_with_headers(
+            &self.key,
+            pubky_switch_core::http::RequestHeaders {
+                identity: self.id.clone(),
+                timestamp: pubky_switch_core::time::rfc3339_seconds(self.now),
+                created: self.created.map(pubky_switch_core::time::rfc3339),
+                ..pubky_switch_core::http::RequestHeaders::default()
+            },
+            method,
+            path,
+            body,
+        )
     }
 
     /// A request from app `name`, signed at the service's time.
@@ -112,6 +133,7 @@ async fn set_up(replay: &Replay, claims: &Value) -> Account {
         key,
         apps: BTreeMap::new(),
         now: ms(claims["start_time"].as_str().expect("start")),
+        created: None,
     };
     replay.clock.set_wall_ms(account.now);
     for (name, app) in claims["apps"].as_object().expect("apps") {
@@ -143,6 +165,9 @@ async fn set_up(replay: &Replay, claims: &Value) -> Account {
         serde_json::from_slice(&template.body_bytes().expect("body")).expect("enrollment");
     let identity_key = account.key.verifying_key().to_bytes();
     fields.identity = identity_key;
+    fields.intent = pubky_switch_core::records::EnrollmentIntent::Create {
+        observation: account_observation(replay, &identity, account.now).await,
+    };
     fields.nonce = first16(seed("claims/enrollment/nonce"));
     fields.identity_doc = None;
     fields.revoked_apps = None;
@@ -170,6 +195,8 @@ async fn set_up(replay: &Replay, claims: &Value) -> Account {
     let enrolled: Value = serde_json::from_slice(&answer.body).expect("json");
     let service_key =
         unb64_array::<32>(enrolled["service_key"].as_str().expect("key")).expect("key");
+
+    account.created = Some(ms(json_of(&answer)["created"].as_str().expect("created")));
 
     // Version 1, listing A to E with their certificates, naming the drawn key.
     let mut body = IdentityBody::first(
@@ -200,15 +227,7 @@ async fn set_up(replay: &Replay, claims: &Value) -> Account {
     let path = account.path("identity");
     let answer = replay
         .service
-        .handle(signed_request(
-            &account.key,
-            &account.id,
-            None,
-            "PUT",
-            &path,
-            delivery,
-            account.now,
-        ))
+        .handle(account.signer_request("PUT", &path, delivery))
         .await;
     assert_eq!(
         answer.status,
@@ -396,15 +415,7 @@ async fn run(
                 let path = account.path(&format!("apps/{app}/revoke"));
                 let answer = replay
                     .service
-                    .handle(signed_request(
-                        &account.key,
-                        &account.id,
-                        None,
-                        "POST",
-                        &path,
-                        Vec::new(),
-                        account.now,
-                    ))
+                    .handle(account.signer_request("POST", &path, Vec::new()))
                     .await;
                 assert_eq!(
                     u64::from(answer.status),

@@ -116,6 +116,7 @@ async fn create_staged(replay: &Replay, id: &str, origin: Option<&str>) {
             .clone()
     });
     let account = NewAccount {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         id: id.into(),
         identity_key: identity.public(),
         generation: 1,
@@ -124,6 +125,7 @@ async fn create_staged(replay: &Replay, id: &str, origin: Option<&str>) {
         identity_doc: doc,
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
+        enrollment_store_id: replay.marks.identity().await.expect("store identity"),
     };
     assert!(
         replay
@@ -405,6 +407,7 @@ async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_cl
     let keys = vectors("keys.json");
     let identity = IdentityKey::from_secret(hex32(&support::alice(&keys)["secret_hex"]));
     let account = NewAccount {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         id: alice.clone(),
         identity_key: identity.public(),
         generation: 1,
@@ -413,6 +416,7 @@ async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_cl
         identity_doc: None,
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
+        enrollment_store_id: replay.marks.identity().await.expect("store identity"),
     };
     assert!(
         replay

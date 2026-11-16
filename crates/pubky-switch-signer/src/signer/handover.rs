@@ -149,11 +149,14 @@ impl Signer {
                 .ok_or(SignerError::Records(RecordsFault::Invariant(
                     "the target's certificate isn't held",
                 )))?;
-        let limits = self.service()?.limits;
+        let account = self.newest_account()?;
+        account.check_document(&doc)?;
+        let limits = account.limits;
         let handover = {
             let key = self.signing_key()?;
             key.seal_hand_over(
                 doc,
+                account.created,
                 &self.state.tombstones,
                 &issued,
                 limits,
@@ -166,6 +169,7 @@ impl Signer {
         let mut state = self.state.clone();
         state.handing_over = Some(HandingOver {
             to_app,
+            account,
             doc: newest.doc,
             handover,
             sent: HandOverSent::Pending,
@@ -217,6 +221,7 @@ impl Signer {
                 handing.abort = Some(doc.hash());
             }
             let flow = Flow::Deliver {
+                account: handing.account.clone(),
                 doc: doc.signed().clone(),
                 prev: Some(prev),
                 backup: None,
@@ -270,7 +275,13 @@ impl Signer {
         };
         let answer = {
             let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
-            self.signing_client(&key)?.put_handover(&stored).await
+            super::clients::SigningClient::new(
+                &self.env,
+                &self.service_target(&handing.account),
+                &key,
+            )?
+            .put_handover(&stored)
+            .await
         };
         let sent = match &answer {
             Ok(stored) if stored.app_id == handing.to_app => HandOverSent::Stored,
@@ -458,6 +469,7 @@ impl Signer {
             // 3.13 "When it is written").
             state.backup_owed = true;
             let flow = Flow::Deliver {
+                account: handing.account.clone(),
                 doc: take_back.doc.clone(),
                 prev: Some(take_back.prev),
                 backup: None,

@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use pubky_switch_core::{
     http::{ERASED_BODY, Uncompared, parse_erase_body},
-    records::IdentityDoc,
+    records::{AccountAssociation, IdentityDoc},
     time::rfc3339,
 };
 use serde_json::json;
@@ -83,10 +83,15 @@ impl Service {
         _time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let created = erasure_binding(request, held, judged)?;
+        let selected_account = judged
+            .account_binding()
+            .map_err(|_| ApiError::unavailable("account binding: unknown association"))?
+            .association()
+            == AccountAssociation::Account;
         let mut answer = Answer::ok(ERASED_BODY.to_vec());
         answer.deferred = Some(Deferred::Erase {
             created,
-            identity_hash: held.map(IdentityDoc::hash),
+            identity_hash: held.filter(|_| selected_account).map(IdentityDoc::hash),
         });
         Ok(answer)
     }
@@ -404,6 +409,7 @@ impl Service {
                 head.chain,
                 head.created_at_ms,
                 held.as_ref().map(IdentityDoc::body),
+                head.activation,
             );
             let judged = self.judge_with(identity, Some(account), inputs).await;
             let routed = verdict::answer(
@@ -411,7 +417,7 @@ impl Service {
                 &verdict::RequestClass::Erase,
                 self.current_key(),
             );
-            if !matches!(routed.route, Route::Erase { .. })
+            if !matches!(routed.route, Route::Erase { .. } | Route::EraseLost)
                 || judged.judgement.decision.erase_account_again
             {
                 return refuse(unavailable());
@@ -419,6 +425,9 @@ impl Service {
             let Some(signer) = self.signer_of(&routed.key) else {
                 return refuse(unavailable());
             };
+            if let Err(error) = erasure_binding(request, held.as_ref(), &judged) {
+                return Self::signed_error(&signer, asked, at, &error);
+            }
             let time_ms = txn.stamp(base_ms);
             let answer = match self.erase_answer(request, held.as_ref(), &judged, time_ms) {
                 Ok(answer) => answer,
@@ -451,16 +460,17 @@ impl Service {
         if matches!(judged.judgement.decision.verdict, verdict::Verdict::Unknown) {
             return refuse(unavailable());
         }
-        if judged
-            .created_at_ms()
-            .is_some_and(|created| created != attempt.created_at_ms)
-        {
+        let current_created = match judged.created_at_ms() {
+            Ok(created) => created,
+            Err(error) => return refuse(error),
+        };
+        if current_created.is_some_and(|created| created != attempt.created_at_ms) {
             return refuse(
                 ApiError::new(
                     ErrorCode::Conflict,
                     "7.4.16: the account was created at another time",
                 )
-                .with_current(json!({ "created": judged.created_at_ms().map(rfc3339) })),
+                .with_current(json!({ "created": current_created.map(rfc3339) })),
             );
         }
         let routed = verdict::answer(
@@ -802,10 +812,11 @@ impl Service {
 /// # Errors
 ///
 /// `400` for a body that isn't `{ "created": time, "identity_hash": b64(32) }`, both
-/// optional in shape; `409 conflict`, carrying `current.created`, for another creation time
-/// or none, another hash, a hash where the account holds no `identity.json`, or none where
-/// it holds one; at an account that answers the notice the `409` carries the copy it holds
-/// too, and at a lost identity `identity: null`.
+/// optional in shape, with creation required to agree with the signed header. A creation
+/// mismatch uses the common conflict (Switch account binding 1). A different hash, a hash
+/// where the account holds no `identity.json`, or none where it holds one is `409 conflict`.
+/// For a document conflict at an account that answers the notice, the `409` carries the
+/// held copy too, and at a lost identity `identity: null`.
 fn erasure_binding(
     request: &SwitchRequest,
     held: Option<&IdentityDoc>,
@@ -813,12 +824,18 @@ fn erasure_binding(
 ) -> Result<u64, ApiError> {
     let named = parse_erase_body(&request.body)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    super::account::check_creation(request, judged)?;
     let created = judged
-        .created_at_ms()
+        .created_at_ms()?
         .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
+    let selected_account = judged
+        .account_binding()
+        .map_err(|_| ApiError::unavailable("account binding: unknown association"))?
+        .association()
+        == AccountAssociation::Account;
     let conflict = |why: &'static str| {
         let mut current = json!({ "created": rfc3339(created) });
-        if judged.account.is_none() {
+        if !selected_account {
             current["identity"] = serde_json::Value::Null;
         } else if judged.answers_notice() {
             current["identity"] = json!(held.map(IdentityDoc::signed));
@@ -828,7 +845,7 @@ fn erasure_binding(
     if named.created != Some(created) {
         return Err(conflict("7.4.16: the account was created at another time"));
     }
-    if judged.account.is_none() {
+    if !selected_account {
         return Ok(created);
     }
     let matches = match (named.identity_hash, held) {

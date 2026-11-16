@@ -157,6 +157,13 @@ impl RestoreLocal {
                 }
             }
         }
+        if intact_flow
+            && let (Some(state), Some(flow)) = (&state, &flow)
+            && let Err(error) = flow.check_state(state)
+        {
+            local_damage(error)?;
+            damaged = true;
+        }
         if !damaged {
             return Err(if state.is_some() {
                 Refusal::AlreadySetUp
@@ -356,11 +363,12 @@ impl Signer {
             origin: doc.inbox().url.clone(),
             service_key: doc.inbox().service_key,
             limits: view.limits,
-            created: None,
+            created: view.account_created,
         };
         let target = Target {
             origin: &service.origin,
             pinned: Some(service.service_key),
+            created: Some(service.created),
             identity,
         };
         let mut serving = None;
@@ -423,7 +431,7 @@ impl Signer {
         } else {
             Vec::new()
         };
-        let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
+        let mut state = self.taken_records(&view, &answer, service.clone(), tombstones, cleanup);
         if let Some(local) = &local {
             if let Some(epoch) = local.epoch_through {
                 if epoch > doc.data_epoch().saturating_add(1) {
@@ -504,6 +512,7 @@ impl Signer {
             });
         }
         state.newest = Some(Newest {
+            account: Some(service.clone()),
             doc: doc.signed().clone(),
             prev: view.prev,
             published: false,
@@ -511,6 +520,7 @@ impl Signer {
         });
         // The version the backup holds goes first when the switch is at the one before.
         let deliver_first = first.map(|prev| Flow::Deliver {
+            account: service,
             doc: doc.signed().clone(),
             prev,
             backup: None,
@@ -539,7 +549,10 @@ impl Signer {
         let (next, flow) = self.next_version_closing(&key, |_| {})?;
         drop(key);
         let Flow::Deliver {
-            doc: signed, prev, ..
+            account,
+            doc: signed,
+            prev,
+            ..
         } = flow
         else {
             return Err(SignerError::Records(RecordsFault::Invariant(
@@ -551,6 +564,7 @@ impl Signer {
         state.backup_owed = true;
         state.owes_own_version = false;
         let flow = Flow::Deliver {
+            account,
             doc: signed,
             prev,
             backup: None,
@@ -684,6 +698,7 @@ impl Signer {
         let target = Target {
             origin: &origin,
             pinned: Some(serving),
+            created: Some(view.account_created),
             identity,
         };
         match RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
@@ -786,7 +801,7 @@ impl Signer {
             return Ok(());
         };
         // Sealed before the check, so only the check's read comes before the write.
-        let backup = self.seal_backup(&newest.doc, newest.prev)?;
+        let backup = self.seal_backup(&newest.doc, newest.prev, &self.newest_account()?)?;
         let bytes = serde_json::to_vec(&backup).map_err(|_| RecordsFault::Encode)?;
         let raised = match self.check_backup_write().await {
             Ok(raised) => raised,

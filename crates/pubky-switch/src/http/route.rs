@@ -12,6 +12,8 @@ pub const UNKNOWN_ROUTE_BODY_CAP: u64 = 64 * 1024;
 pub enum Call {
     /// `POST /v1/enroll`.
     Enroll,
+    /// `GET /v1/{id}/account`, authenticated account discovery.
+    GetAccount,
     /// `PUT /v1/{id}/identity`.
     PutIdentity,
     /// `GET /v1/{id}/identity`, the public read.
@@ -104,6 +106,7 @@ impl Call {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Enroll => "enroll",
+            Self::GetAccount => "get_account",
             Self::PutIdentity => "put_identity",
             Self::GetIdentity => "get_identity",
             Self::Append => "append",
@@ -183,6 +186,7 @@ pub fn route(method: &str, path_and_query: &str) -> Option<Route> {
     let (id, rest) = segments.split_first()?;
     let owned = |text: &&str| (*text).to_string();
     let call = match (method, rest) {
+        ("GET", ["account"]) => Call::GetAccount,
         ("PUT", ["identity"]) => Call::PutIdentity,
         ("GET", ["identity"]) => Call::GetIdentity,
         ("POST", ["inbox"]) => Call::Append,

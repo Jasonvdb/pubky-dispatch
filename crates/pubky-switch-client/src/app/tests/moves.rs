@@ -2230,6 +2230,8 @@ async fn signer_erases(w: &World) {
         w.switch.transport(),
         w.clock.clone(),
     )
+    .unwrap()
+    .with_account_created(w.switch.created())
     .unwrap();
     let held = w.switch.identity_doc().map(|doc| doc.hash());
     signer.erase(Some(w.switch.created()), held).await.unwrap();
@@ -4961,7 +4963,7 @@ async fn test_chain_hashes_behind_the_cursor_stay_bounded() {
 // -------------------------------------------------------------------------------------
 // The signer's view of kept proofs (Switch wire 3.3 "Service keys", 7.4.12)
 
-/// A signer's call at `switch`, unsigned, as the scripted switch takes it.
+/// A signer's call bound to the account held at `switch`.
 fn signer_call(
     w: &World,
     switch: &ScriptedSwitch,
@@ -4969,12 +4971,39 @@ fn signer_call(
     route: &str,
     body: Vec<u8>,
 ) -> (u16, serde_json::Value) {
+    use crate::transport::Header;
+    use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, header};
+
+    let origin = switch.lock().origin.clone();
+    let path = format!("/v1/{}/{route}", w.alice.id());
+    let created = pubky_switch_core::time::rfc3339(switch.created());
+    let fields = RequestHeaders {
+        identity: w.alice.id(),
+        timestamp: pubky_switch_core::time::rfc3339_seconds(w.clock.now_ms()),
+        created: Some(created.clone()),
+        ..RequestHeaders::default()
+    };
+    let signature = http::sign_request(
+        &w.alice,
+        &RequestTarget {
+            method,
+            path_and_query: &path,
+            body: &body,
+            origin: &origin,
+        },
+        &fields,
+    );
     let response = switch
         .handle(&crate::transport::Request {
             method: method.into(),
-            origin: ORIGIN.into(),
-            path_and_query: format!("/v1/{}/{route}", w.alice.id()),
-            headers: Vec::new(),
+            origin,
+            path_and_query: path,
+            headers: vec![
+                Header::new(header::IDENTITY, &fields.identity),
+                Header::new(header::TIMESTAMP, &fields.timestamp),
+                Header::new(header::CREATED, &created),
+                Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
+            ],
             body,
             timeout: crate::transport::TimeoutClass::default(),
         })

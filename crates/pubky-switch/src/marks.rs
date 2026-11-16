@@ -338,6 +338,26 @@ impl MarkStore {
         }
     }
 
+    /// The current readable mark-store identity, confirmed under its store lock.
+    /// This identifies a store; it does not prove an identity's prior account history
+    /// (Switch account binding 2).
+    ///
+    /// # Errors
+    ///
+    /// [`MarkStoreError::StoreUnreadable`] if the existing store cannot be confirmed.
+    pub async fn identity(&self) -> Result<[u8; 16], MarkStoreError> {
+        let inner = self.inner.clone();
+        blocking(move || {
+            let _writes = inner.writes.lock();
+            let id = inner.readable_locked()?;
+            hex::decode(id)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| MarkStoreError::StoreUnreadable("invalid store identity".into()))
+        })
+        .await
+    }
+
     /// The identity's mark: [`MarkRead::Missing`], [`MarkRead::NotAMark`] or the mark.
     ///
     /// # Errors
@@ -404,6 +424,42 @@ impl MarkStore {
                     ..mark
                 }),
                 MarkRead::Mark(_) | MarkRead::Missing | MarkRead::NotAMark => None,
+            })
+        })
+        .await
+    }
+
+    /// Replace an exact older lifetime only with the committed head of an authorized
+    /// recovery of the selected newer SQL lifetime (Switch account binding 3.2).
+    pub(crate) async fn recover_older(
+        &self,
+        identity: &str,
+        read: AccountMark,
+        store_id: [u8; 16],
+        head: ChainTip,
+        key: [u8; 32],
+        created_at_ms: u64,
+    ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
+        if !is_head(&head)
+            || head.generation <= read.generation
+            || created_at_ms <= read.created_at_ms
+            || created_at_ms > pubky_switch_core::time::MAX_TIME_MS
+        {
+            return Err(MarkStoreError::InvalidHead);
+        }
+        let gate = self.gate.clone();
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
+                (held == MarkRead::Mark(read)).then_some(AccountMark {
+                    generation: head.generation,
+                    seq: head.seq,
+                    chain_hash: head.chain_hash,
+                    key,
+                    created_at_ms,
+                })
             })
         })
         .await
@@ -1194,7 +1250,22 @@ impl Inner {
         identity: &str,
         next: impl FnOnce(MarkRead) -> Option<AccountMark>,
     ) -> Result<MarkWrite, MarkStoreError> {
+        self.write_sync_in_store(gate, identity, None, next)
+    }
+
+    fn write_sync_in_store(
+        &self,
+        gate: Option<&LockFreshness>,
+        identity: &str,
+        expected_store: Option<[u8; 16]>,
+        next: impl FnOnce(MarkRead) -> Option<AccountMark>,
+    ) -> Result<MarkWrite, MarkStoreError> {
         self.writing(gate, RecordScope::Identity(identity), |id| {
+            if expected_store.is_some_and(|expected| hex::encode(expected) != id) {
+                return Err(MarkStoreError::StoreUnreadable(
+                    "the store's identity changed".into(),
+                ));
+            }
             let held = self.load_mark(identity, id)?;
             match next(held) {
                 Some(mark) => {
@@ -2101,6 +2172,61 @@ mod tests {
                 .await
                 .expect("held"),
             MarkWrite::Unchanged(MarkRead::Mark(anew))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_recovery_requires_exact_older_record() {
+        let (_dir, store) = open();
+        let original = with_mark(&store, ALICE, head(1, 2, 3)).await;
+        let store_id = store.identity().await.expect("store identity");
+        store
+            .set_key(ALICE, [9; 32], 100)
+            .await
+            .expect("changed key");
+        let changed = store.read(ALICE).await.expect("read");
+        assert_eq!(
+            store
+                .recover_older(ALICE, original, store_id, head(2, 1, 4), KEY, 200)
+                .await
+                .expect("compare"),
+            MarkWrite::Unchanged(changed)
+        );
+        assert_eq!(store.read(ALICE).await.expect("read"), changed);
+        let MarkRead::Mark(current) = changed else {
+            panic!("readable mark");
+        };
+        store.retire(ALICE, 1).await.expect("retire");
+        assert!(
+            matches!(store.recover_older(ALICE, current, store_id, head(2, 1, 4), KEY, 200).await.expect("recover"), MarkWrite::Written(mark) if mark.created_at_ms == 200 && mark.generation == 2)
+        );
+        assert!(
+            store
+                .is_retired(ALICE, 1)
+                .await
+                .expect("retirement retained")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_recovery_requires_confirmed_store_identity() {
+        let (_dir, store) = open();
+        let original = with_mark(&store, ALICE, head(1, 2, 3)).await;
+        let store_id = store.identity().await.expect("store identity");
+        let mut other = store_id;
+        other[0] ^= 1;
+        assert!(
+            store
+                .recover_older(ALICE, original, other, head(2, 1, 4), KEY, 200)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.read(ALICE).await.expect("read"),
+            MarkRead::Mark(original)
+        );
+        assert!(
+            matches!(store.recover_older(ALICE, original, store_id, head(2, 1, 4), KEY, 200).await.expect("recover"), MarkWrite::Written(mark) if mark.created_at_ms == 200)
         );
     }
 

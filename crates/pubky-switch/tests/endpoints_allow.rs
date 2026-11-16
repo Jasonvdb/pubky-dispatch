@@ -724,6 +724,7 @@ async fn test_allow_waits_for_a_reader_without_the_lock() {
     replay_chain_through_revoke(&replay).await;
     // Another account's read holds the one reader.
     let other = pubky_switch::store::NewAccount {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
         id: "other".into(),
         identity_key: [9; 32],
         generation: 1,
@@ -732,6 +733,7 @@ async fn test_allow_waits_for_a_reader_without_the_lock() {
         identity_doc: None,
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
+        enrollment_store_id: replay.marks.identity().await.expect("store identity"),
     };
     assert!(
         replay

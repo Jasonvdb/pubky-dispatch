@@ -310,9 +310,14 @@ async fn test_records_stored_identity_and_certificate_fail_locally() {
 async fn test_records_enrollment_and_delivery_copies_fail_before_retry() {
     let world = World::new();
     let store = Arc::new(MemoryStore::new());
-    let signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+    let mut signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
         .await
         .unwrap();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/v1/enroll".into(),
+        after: 0,
+    });
+    assert!(matches!(signer.resume().await, Err(SignerError::Switch(_))));
     drop(signer);
     let enrolled = snapshot(&world, &store);
     let damaged = change(&enrolled, b"flow", |flow| {
@@ -396,6 +401,43 @@ async fn test_records_renewal_operation_authentication_precedes_retry() {
 }
 
 #[tokio::test]
+async fn test_records_erasure_requires_the_accepted_documents_account() {
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let original = snapshot(&world, &store);
+    for missing in [true, false] {
+        let damaged = change(&original, b"state", |state| {
+            assert!(state["service"].is_object());
+            let account = &mut state["newest"]["account"];
+            assert!(account.is_object());
+            if missing {
+                *account = Value::Null;
+            } else {
+                account["created"] = Value::from(u64::MAX);
+            }
+        });
+        replace(&world, &store, &damaged);
+        let sent = world.transport.requests().len();
+        let error = Signer::open(world.env(store.clone()), world.keyring())
+            .await
+            .unwrap_err();
+        let invariant = if missing {
+            "an owned version has no original account"
+        } else {
+            "invalid original account target"
+        };
+        assert_eq!(
+            error,
+            SignerError::Records(RecordsFault::Invariant(invariant))
+        );
+        assert_eq!(snapshot(&world, &store), damaged);
+        assert_eq!(world.transport.requests().len(), sent);
+        assert!(world.homeserver.deletes.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn test_records_recovery_base_and_enrollment_are_authenticated() {
     let world = World::new();
     let (signer, store) = world.enrolled().await;
@@ -422,7 +464,7 @@ async fn test_records_recovery_base_and_enrollment_are_authenticated() {
     let original = snapshot(&world, &store);
     for (key, path) in [
         (b"state".as_slice(), "/recovery_base"),
-        (b"flow", "/Recover/enrollment"),
+        (b"flow", "/Recover/enrollment/Ready/enrollment"),
     ] {
         let damaged = change(&original, key, |value| {
             break_signature(value.pointer_mut(path).unwrap())
@@ -1417,6 +1459,7 @@ async fn test_records_confirmed_restore_keeps_backup_epoch_warning() {
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         doc.clone(),
+        world.backup().account_created(),
         &[],
         &[cert],
         Limits::default(),
@@ -1453,4 +1496,316 @@ async fn test_records_confirmed_restore_keeps_backup_epoch_warning() {
         .await
         .unwrap();
     assert_eq!(next.data_epoch(), 3);
+}
+
+#[tokio::test]
+async fn test_signer_recovery_requires_its_original_observation() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    world.switch.lose_account();
+    world.clock.advance_ms(1000);
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(
+        signer
+            .declare_provider_loss(SWITCH_ORIGIN, UserConfirmed::shown_and_confirmed())
+            .await
+            .is_err()
+    );
+    drop(signer);
+    let original = snapshot(&world, &store);
+    let later = world.signer_client(None).observe_account().await.unwrap();
+    let damaged = change(&original, b"flow", |flow| {
+        flow["Recover"]["enrollment"]["Ready"]["observation"] =
+            serde_json::to_value(later.carried()).unwrap();
+    });
+    replace(&world, &store, &damaged);
+    let sent = world.transport.requests().len();
+    let error = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            error,
+            SignerError::Records(RecordsFault::Invariant("another recovery enrollment"))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(world.transport.requests().len(), sent);
+    assert_eq!(snapshot(&world, &store), damaged);
+    replace(&world, &store, &original);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(world.backup().account_created(), world.switch.created());
+}
+
+#[tokio::test]
+async fn test_signer_recovery_preparation_requires_ordered_exclusions() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    for secret in [[87; 32], [88; 32]] {
+        let app = App::with_keys(
+            AppKeys::from_secrets(secret, [89; 32]),
+            &["notes"],
+            None,
+            secret,
+        );
+        world.approve(&mut signer, &app).await;
+        signer
+            .revoke(
+                app.keys.app_id_bytes(),
+                None,
+                UserConfirmed::shown_and_confirmed(),
+            )
+            .await
+            .unwrap();
+    }
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/account".into(),
+        after: 0,
+    });
+    assert!(
+        signer
+            .declare_provider_loss(SWITCH_ORIGIN, UserConfirmed::shown_and_confirmed())
+            .await
+            .is_err()
+    );
+    drop(signer);
+    let original = snapshot(&world, &store);
+    let damaged = change(&original, b"flow", |flow| {
+        let excluded = &mut flow["Recover"]["enrollment"]["Preparing"]["revoked_apps"];
+        let mut ids: Vec<[u8; 16]> = serde_json::from_value(excluded.clone()).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] < ids[1]);
+        ids.reverse();
+        *excluded = serde_json::to_value(ids).unwrap();
+    });
+    replace(&world, &store, &damaged);
+    let sent = world.transport.requests().len();
+    let error = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            error,
+            SignerError::Records(RecordsFault::Invariant("unordered recovery exclusions"))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(world.transport.requests().len(), sent);
+    assert_eq!(snapshot(&world, &store), damaged);
+    replace(&world, &store, &original);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_signer_recovery_retains_permanent_exclusions() {
+    for ready in [false, true] {
+        let world = World::new();
+        let (mut signer, store) = world.enrolled().await;
+        let app = App::new(&["notes"], None, [91; 32]);
+        world.approve(&mut signer, &app).await;
+        let app_id = app.keys.app_id_bytes();
+        signer
+            .revoke(app_id, None, UserConfirmed::shown_and_confirmed())
+            .await
+            .unwrap();
+        drop(signer);
+        let origin = "https://replacement.example";
+        let service =
+            ScriptedSwitch::unenrolled_at(&world.key, [93; 32], world.clock.clone(), origin);
+        let transport = service.transport();
+        let mut env = world.env(store.clone());
+        env.transport = transport.clone();
+        let mut signer = Signer::open(env.clone(), world.keyring()).await.unwrap();
+        service.fail_next(Fault::Unreachable {
+            path: if ready { "/enroll" } else { "/account" }.into(),
+            after: 0,
+        });
+        assert!(
+            signer
+                .declare_provider_loss(origin, UserConfirmed::shown_and_confirmed())
+                .await
+                .is_err()
+        );
+        drop(signer);
+        let original = snapshot(&world, &store);
+        let state: Value =
+            serde_json::from_slice(&original.iter().find(|(key, _)| key == b"state").unwrap().1)
+                .unwrap();
+        let tombstones: Vec<[u8; 16]> =
+            serde_json::from_value(state["tombstones"].clone()).unwrap();
+        assert!(tombstones.contains(&app_id));
+        let base = serde_json::from_value(state["recovery_base"].clone()).unwrap();
+        let base =
+            pubky_switch_core::records::IdentityDoc::verify(&base, &world.key.public()).unwrap();
+        assert!(base.listed_cert(&app_id).is_none());
+        let damaged = change(&original, b"flow", |flow| {
+            let enrollment = &mut flow["Recover"]["enrollment"];
+            if ready {
+                let signed =
+                    serde_json::from_value(enrollment["Ready"]["enrollment"].clone()).unwrap();
+                let signed = pubky_switch_core::records::Enrollment::verify(
+                    &signed,
+                    &world.key.public(),
+                    origin,
+                )
+                .unwrap();
+                assert!(signed.revoked_apps().contains(&app_id));
+                let mut body = signed.body().clone();
+                body.revoked_apps = Some(Vec::new());
+                let changed =
+                    pubky_switch_core::records::Enrollment::sign(&world.key, body).unwrap();
+                enrollment["Ready"]["enrollment"] = serde_json::to_value(changed.signed()).unwrap();
+            } else {
+                let excluded: Vec<[u8; 16]> =
+                    serde_json::from_value(enrollment["Preparing"]["revoked_apps"].clone())
+                        .unwrap();
+                assert!(excluded.contains(&app_id));
+                enrollment["Preparing"]["revoked_apps"] = serde_json::json!([]);
+            }
+        });
+        assert_eq!(
+            original.iter().find(|(key, _)| key == b"state"),
+            damaged.iter().find(|(key, _)| key == b"state")
+        );
+        replace(&world, &store, &damaged);
+        let sent = transport.requests().len();
+        let error = Signer::open(env.clone(), world.keyring())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SignerError::Records(RecordsFault::Invariant(
+                    "recovery exclusions disagree with records"
+                ))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(transport.requests().len(), sent);
+        assert_eq!(snapshot(&world, &store), damaged);
+        // An unrelated invalid copy does not turn the inconsistent flow into permission
+        // to discard it through confirmed restoration.
+        let unusable = change(&damaged, b"state", |state| {
+            break_signature(&mut state["newest"]["doc"]);
+        });
+        replace(&world, &store, &unusable);
+        let error =
+            Signer::restore_over_unusable(env.clone(), world.keyring(), discard_confirmed())
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SignerError::Records(RecordsFault::Invariant(
+                    "recovery exclusions disagree with records"
+                ))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(transport.requests().len(), sent);
+        assert_eq!(snapshot(&world, &store), unusable);
+        replace(&world, &store, &original);
+        let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+        signer.resume().await.unwrap();
+        let sent = transport.requests();
+        let request = sent
+            .iter()
+            .rev()
+            .find(|r| r.path_and_query.ends_with("/enroll"))
+            .unwrap();
+        let enrollment = pubky_switch_core::records::Enrollment::from_request(
+            &request.body,
+            &world.key.public(),
+            origin,
+        )
+        .unwrap();
+        assert!(enrollment.revoked_apps().contains(&app_id));
+    }
+}
+
+#[tokio::test]
+async fn test_signer_recovery_defers_later_listed_revocations() {
+    for ready in [false, true] {
+        let world = World::new();
+        let (mut signer, store) = world.enrolled().await;
+        let app = App::new(&["notes"], None, [94; 32]);
+        world.approve(&mut signer, &app).await;
+        let app_id = app.keys.app_id_bytes();
+        world.switch.fail_next(Fault::Unreachable {
+            path: if ready { "/enroll" } else { "/account" }.into(),
+            after: 0,
+        });
+        assert!(
+            signer
+                .declare_provider_loss(SWITCH_ORIGIN, UserConfirmed::shown_and_confirmed(),)
+                .await
+                .is_err()
+        );
+        let before = snapshot(&world, &store);
+        assert!(matches!(
+            signer
+                .revoke(app_id, None, UserConfirmed::shown_and_confirmed(),)
+                .await,
+            Err(SignerError::Refused(Refusal::Recovering))
+        ));
+        drop(signer);
+        let retained = snapshot(&world, &store);
+        assert_eq!(
+            before.iter().find(|(key, _)| key == b"flow"),
+            retained.iter().find(|(key, _)| key == b"flow")
+        );
+        let state: Value =
+            serde_json::from_slice(&retained.iter().find(|(key, _)| key == b"state").unwrap().1)
+                .unwrap();
+        let tombstones: Vec<[u8; 16]> =
+            serde_json::from_value(state["tombstones"].clone()).unwrap();
+        assert!(tombstones.contains(&app_id));
+        let base = serde_json::from_value(state["recovery_base"].clone()).unwrap();
+        let base =
+            pubky_switch_core::records::IdentityDoc::verify(&base, &world.key.public()).unwrap();
+        assert!(base.listed_cert(&app_id).is_some());
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        signer.resume().await.unwrap();
+        let sent = world.transport.requests();
+        let request = sent
+            .iter()
+            .rev()
+            .find(|r| r.path_and_query.ends_with("/enroll"))
+            .unwrap();
+        let enrollment = pubky_switch_core::records::Enrollment::from_request(
+            &request.body,
+            &world.key.public(),
+            SWITCH_ORIGIN,
+        )
+        .unwrap();
+        assert!(!enrollment.revoked_apps().contains(&app_id));
+        if ready {
+            let flow: Value =
+                serde_json::from_slice(&before.iter().find(|(key, _)| key == b"flow").unwrap().1)
+                    .unwrap();
+            let signed = serde_json::from_value(
+                flow["Recover"]["enrollment"]["Ready"]["enrollment"].clone(),
+            )
+            .unwrap();
+            let original = pubky_switch_core::records::Enrollment::verify(
+                &signed,
+                &world.key.public(),
+                SWITCH_ORIGIN,
+            )
+            .unwrap();
+            assert_eq!(request.body, original.to_request_json().unwrap());
+        }
+    }
 }

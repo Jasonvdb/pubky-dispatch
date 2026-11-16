@@ -11,8 +11,9 @@ use pubky_switch_core::http::{self, ErrorCode, IdentityDelivery, header, sign_re
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp};
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentAnswer, EnrollmentBody,
-    IdentityBody, IdentityDoc, IdentityPolicy, Inbox, Limits,
+    AccountObservationBody, AppCert, AppCertBody, DEFAULT_CERT_LIFETIME_MS, Enrollment,
+    EnrollmentAnswer, EnrollmentBody, EnrollmentIntent, IdentityBody, IdentityDoc, IdentityPolicy,
+    Inbox, Limits,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -98,7 +99,11 @@ fn client_with(
     pinned: Option<[u8; 32]>,
     transport: Arc<MockTransport>,
 ) -> SwitchClient {
-    SwitchClient::new(
+    let signer = matches!(
+        credentials,
+        Credentials::Signer { .. } | Credentials::SignerRequests { .. }
+    );
+    let client = SwitchClient::new(
         ORIGIN,
         identity().public(),
         credentials,
@@ -106,7 +111,12 @@ fn client_with(
         transport,
         Arc::new(TestClock::new(NOW)),
     )
-    .unwrap()
+    .unwrap();
+    if signer {
+        client.with_account_created(0).unwrap()
+    } else {
+        client
+    }
 }
 
 /// A response to `request`, signed with `key` as the switch signs it (Switch wire 7.1).
@@ -246,6 +256,7 @@ fn enrollment(nonce: [u8; 16]) -> Enrollment {
             identity: identity().public(),
             origin: ORIGIN.into(),
             nonce,
+            intent: EnrollmentIntent::Existing { created: 0 },
             policy: IdentityPolicy::default(),
             identity_doc: None,
             revoked_apps: None,
@@ -975,6 +986,7 @@ fn test_signer_requests_credential_signs_a_request_that_verifies() {
     let headers = http::RequestHeaders {
         timestamp: pubky_switch_core::time::rfc3339_seconds(NOW),
         identity: pubky_id(&identity().public()),
+        created: Some(rfc3339(0)),
         ..http::RequestHeaders::default()
     };
     http::verify_request(&identity().public(), &target, &headers, &signature).unwrap();
@@ -1278,7 +1290,7 @@ async fn test_client_404_signed_with_an_unpinned_key_reads_as_unauthenticated() 
         ),
     );
     assert_eq!(
-        client.erase(None, None).await.unwrap_err(),
+        client.erase(Some(0), None).await.unwrap_err(),
         ClientError::BadServiceSignature { status: 404 }
     );
 }
@@ -1289,7 +1301,7 @@ async fn test_signer_and_app_calls_refuse_the_other_caller() {
     let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
     assert!(matches!(client.apps().await, Err(ClientError::Usage(_))));
     assert!(matches!(
-        client.erase(None, None).await,
+        client.erase(Some(0), None).await,
         Err(ClientError::Usage(_))
     ));
     let client = client_with(signer(), Some(service_public()), Arc::clone(&transport));
@@ -1466,7 +1478,7 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
             Some(service_public()),
             fixed(service_key(), status, body.clone()),
         );
-        let _ = client.erase(None, None).await;
+        let _ = client.erase(Some(0), None).await;
         assert_eq!(
             client.latest_compared_time(),
             None,
@@ -1828,7 +1840,14 @@ fn raw_request(method: &str, path: &str, bytes: usize) -> SignedRequest {
         origin: ORIGIN.into(),
         path_and_query: path.into(),
         headers: Vec::new(),
-        body: vec![0; bytes],
+        body: if method == "POST" && path == "/v1/enroll" {
+            let mut body =
+                serde_json::to_vec(&json!({ "enrollment": enrollment([4; 16]).signed() })).unwrap();
+            body.resize(bytes, b' ');
+            body
+        } else {
+            vec![0; bytes]
+        },
         timeout: TimeoutClass::Ordinary,
     })
 }
@@ -1837,6 +1856,7 @@ fn sign_raw_request(mut request: Request) -> SignedRequest {
     let headers = RequestHeaders {
         timestamp: rfc3339(NOW),
         identity: identity().id(),
+        created: Some(rfc3339(0)),
         ..RequestHeaders::default()
     };
     let target = RequestTarget {
@@ -1851,6 +1871,7 @@ fn sign_raw_request(mut request: Request) -> SignedRequest {
         Header::new(header::IDENTITY, &headers.identity),
         Header::new(header::TIMESTAMP, &headers.timestamp),
         Header::new(header::SIGNATURE, &b64(&signature)),
+        Header::new(header::CREATED, &rfc3339(0)),
     ];
     SignedRequest { request }
 }
@@ -2019,4 +2040,671 @@ fn test_response_malformed_time_preserves_binding_rejections() {
         }
     }
     assert_eq!(actual, expected, "all binding, head and time combinations");
+}
+
+fn unbound_signer(transport: Arc<MockTransport>, pin: Option<[u8; 32]>) -> SwitchClient {
+    SwitchClient::new(
+        ORIGIN,
+        identity().public(),
+        signer(),
+        pin,
+        transport,
+        Arc::new(TestClock::new(NOW)),
+    )
+    .unwrap()
+}
+
+fn observation(created: Option<u64>) -> AccountObservationBody {
+    AccountObservationBody {
+        identity: identity().public(),
+        origin: ORIGIN.into(),
+        service_key: service_public(),
+        store_id: [7; 16],
+        association: if created.is_some() {
+            pubky_switch_core::records::AccountAssociation::Account
+        } else {
+            pubky_switch_core::records::AccountAssociation::Absent
+        },
+        created,
+        erased_at: None,
+        observed_at: NOW,
+        expires_at: NOW + 300_000,
+    }
+}
+
+fn observation_reply(request: &Request, body: &AccountObservationBody) -> Response {
+    let json: Value = serde_json::from_slice(&body.to_json().unwrap()).unwrap();
+    respond(
+        &service_key(),
+        request,
+        200,
+        &serde_json::to_vec_pretty(&json).unwrap(),
+    )
+}
+
+fn sign_current_headers(mut request: Request) -> SignedRequest {
+    let headers = RequestHeaders {
+        timestamp: request.header(header::TIMESTAMP).unwrap().into(),
+        identity: request.header(header::IDENTITY).unwrap().into(),
+        created: request.header(header::CREATED).map(str::to_owned),
+        ..RequestHeaders::default()
+    };
+    let signature = http::sign_request(
+        &identity(),
+        &RequestTarget {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            body: &request.body,
+            origin: &request.origin,
+        },
+        &headers,
+    );
+    request.headers.retain(|h| h.name != header::SIGNATURE);
+    request
+        .headers
+        .push(Header::new(header::SIGNATURE, &b64(&signature)));
+    SignedRequest { request }
+}
+
+#[test]
+fn test_account_creation_is_fixed_for_signer_calls() {
+    let transport = Arc::new(MockTransport::new());
+    let client = unbound_signer(transport.clone(), Some(service_public()));
+    let path = client.path("apps");
+    assert!(matches!(
+        client.sign_request("GET", &path, Vec::new(), None),
+        Err(ClientError::Usage(_))
+    ));
+    let client = client.with_account_created(17).unwrap();
+    let signed = client.sign_request("GET", &path, Vec::new(), None).unwrap();
+    assert_eq!(
+        signed.request.header(header::CREATED),
+        Some(rfc3339(17).as_str())
+    );
+    let headers = RequestHeaders {
+        timestamp: signed.request.header(header::TIMESTAMP).unwrap().into(),
+        identity: identity().id(),
+        created: Some(rfc3339(17)),
+        ..RequestHeaders::default()
+    };
+    let target = RequestTarget {
+        method: "GET",
+        path_and_query: &path,
+        body: &[],
+        origin: ORIGIN,
+    };
+    let signature =
+        http::decode_signature(signed.request.header(header::SIGNATURE).unwrap()).unwrap();
+    http::verify_request(&identity().public(), &target, &headers, &signature).unwrap();
+    assert!(
+        http::verify_request(
+            &identity().public(),
+            &target,
+            &RequestHeaders {
+                created: Some(rfc3339(18)),
+                ..headers
+            },
+            &signature
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        client.with_account_created(17),
+        Err(ClientError::Usage(_))
+    ));
+    assert!(matches!(
+        unbound_signer(transport.clone(), None).with_account_created(MAX_TIME_MS + 1),
+        Err(ClientError::Usage(_))
+    ));
+    assert!(matches!(
+        client_with(app(), None, transport.clone()).with_account_created(17),
+        Err(ClientError::Usage(_))
+    ));
+    assert!(transport.requests().is_empty());
+}
+
+#[tokio::test]
+async fn test_raw_requests_keep_the_account_creation() {
+    let transport = fixed(service_key(), 200, json!({}));
+    let client = client_with(signer(), Some(service_public()), transport.clone());
+    let original = client
+        .sign_request("GET", &client.path("apps"), Vec::new(), None)
+        .unwrap()
+        .request;
+    for value in [
+        None,
+        Some(rfc3339(1)),
+        Some(String::new()),
+        Some("1970-01-01T00:00:00Z".into()),
+    ] {
+        let mut request = original.clone();
+        request.headers.retain(|h| h.name != header::CREATED);
+        if let Some(value) = value {
+            request.headers.push(Header::new(header::CREATED, &value));
+        }
+        assert!(client.send(sign_current_headers(request)).await.is_err());
+    }
+    let mut duplicate = original.clone();
+    duplicate
+        .headers
+        .push(Header::new(header::CREATED, &rfc3339(0)));
+    assert!(client.send(sign_current_headers(duplicate)).await.is_err());
+    let mut other_origin = original.clone();
+    other_origin.origin = "https://other.example".into();
+    assert!(
+        client
+            .send(sign_current_headers(other_origin))
+            .await
+            .is_err()
+    );
+    assert!(transport.requests().is_empty());
+    client.send(sign_current_headers(original)).await.unwrap();
+    assert_eq!(transport.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn test_account_discovery_preserves_authenticated_bytes() {
+    let body = observation(Some(42));
+    let expected = body.clone();
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        Ok(observation_reply(request, &body))
+    }));
+    for pin in [None, Some(service_public())] {
+        let client = unbound_signer(transport.clone(), pin)
+            .with_account_created(17)
+            .unwrap();
+        let found = client.observe_account().await.unwrap();
+        let sent = transport.last_request().unwrap();
+        let response = observation_reply(&sent, &expected);
+        assert_eq!(found.body(), &expected);
+        assert_eq!(found.carried().body, response.body);
+        assert_eq!(
+            found.carried().request_timestamp,
+            sent.header(header::TIMESTAMP).unwrap()
+        );
+        assert_eq!(
+            b64(&found.carried().request_signature),
+            sent.header(header::SIGNATURE).unwrap()
+        );
+        assert_eq!(
+            b64(&found.carried().sig),
+            response.header(header::SERVICE_SIGNATURE).unwrap()
+        );
+        assert_eq!(
+            found
+                .carried()
+                .verify(&identity().public(), ORIGIN)
+                .unwrap(),
+            found
+        );
+        assert_eq!(
+            sent.path_and_query,
+            format!("/v1/{}/account", identity().id())
+        );
+        assert!(sent.body.is_empty());
+        for name in [
+            header::CREATED,
+            header::APP,
+            header::CERT,
+            header::TRANSFER,
+            header::INVITE_CODE,
+        ] {
+            assert!(sent.header(name).is_none());
+        }
+        assert_eq!(client.pinned_key(), pin);
+        assert_eq!(client.last_server_time(), None);
+        assert_eq!(client.latest_server_time(), None);
+        assert_eq!(client.latest_compared_time(), None);
+        assert_eq!(
+            client
+                .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                .unwrap()
+                .request
+                .header(header::CREATED),
+            Some(rfc3339(17).as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_account_discovery_refuses_other_response_contexts() {
+    for case in [
+        "identity",
+        "origin",
+        "time",
+        "status",
+        "head",
+        "pin",
+        "signature",
+    ] {
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            let mut body = observation(None);
+            match case {
+                "identity" => body.identity = IdentityKey::from_secret([9; 32]).public(),
+                "origin" => body.origin = "https://other.example".into(),
+                "time" => {
+                    body.observed_at += 1;
+                    body.expires_at += 1;
+                }
+                _ => {}
+            }
+            let bytes = body.to_json().unwrap();
+            let mut response = if case == "head" {
+                let head = SignedHead::sign(
+                    &service_key(),
+                    &identity().public(),
+                    &ChainTip {
+                        generation: 1,
+                        seq: 1,
+                        chain_hash: [3; 32],
+                    },
+                );
+                respond_with_head(
+                    &service_key(),
+                    request,
+                    200,
+                    &bytes,
+                    Some(&head.to_header()),
+                )
+            } else {
+                respond(
+                    &service_key(),
+                    request,
+                    if case == "status" { 201 } else { 200 },
+                    &bytes,
+                )
+            };
+            if case == "signature" {
+                response
+                    .headers
+                    .retain(|h| h.name != header::SERVICE_SIGNATURE);
+            }
+            Ok(response)
+        }));
+        let pin = if case == "pin" {
+            SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes()
+        } else {
+            service_public()
+        };
+        let client = unbound_signer(transport, Some(pin));
+        assert!(client.observe_account().await.is_err(), "{case}");
+        assert_eq!(client.pinned_key(), Some(pin));
+        assert_eq!(client.last_server_time(), None);
+    }
+}
+
+#[tokio::test]
+async fn test_discovery_is_only_the_canonical_signer_read() {
+    let transport = Arc::new(MockTransport::new());
+    let client = client_with(app(), None, transport.clone());
+    assert!(matches!(
+        client.observe_account().await,
+        Err(ClientError::Usage(_))
+    ));
+    let client = unbound_signer(transport.clone(), Some(service_public()));
+    let path = client.path("account");
+    for (method, path, body, invite) in [
+        ("POST", path.clone(), Vec::new(), None),
+        ("GET", format!("{path}?x=1"), Vec::new(), None),
+        ("GET", path.clone(), Vec::new(), Some("invite")),
+    ] {
+        assert!(matches!(
+            client.sign_request(method, &path, body, invite),
+            Err(ClientError::Usage(_))
+        ));
+    }
+    assert!(matches!(
+        client.sign_request("GET", &path, vec![b'x'], None),
+        Err(ClientError::BodyOverCap { cap: 0 })
+    ));
+    let signed = client.sign_request("GET", &path, Vec::new(), None).unwrap();
+    for name in [
+        header::CREATED,
+        header::APP,
+        header::CERT,
+        header::TRANSFER,
+        header::INVITE_CODE,
+    ] {
+        let mut request = signed.request.clone();
+        request.headers.push(Header::new(
+            name,
+            if name == header::CREATED {
+                "1970-01-01T00:00:00.000Z"
+            } else {
+                "value"
+            },
+        ));
+        assert!(
+            client.send(SignedRequest { request }).await.is_err(),
+            "{name}"
+        );
+    }
+    assert!(transport.requests().is_empty());
+}
+
+#[tokio::test]
+async fn test_account_discovery_timestamp_retry_keeps_original_authentication() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(respond(&service_key(), request, 401, &serde_json::to_vec(&json!({ "code": "stale_timestamp", "message": "stale", "current": { "server_time": rfc3339(NOW + 600_000) } })).unwrap()))
+        } else {
+            Ok(observation_reply(request, &observation(None)))
+        }
+    }));
+    let client = unbound_signer(transport.clone(), Some(service_public()));
+    let found = client.observe_account().await.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(
+        requests[0].header(header::TIMESTAMP),
+        requests[1].header(header::TIMESTAMP)
+    );
+    assert_eq!(
+        found.carried().request_timestamp,
+        requests[1].header(header::TIMESTAMP).unwrap()
+    );
+    assert_eq!(
+        found.carried().request_signature,
+        http::decode_signature(requests[1].header(header::SIGNATURE).unwrap()).unwrap()
+    );
+    found
+        .carried()
+        .verify(&identity().public(), ORIGIN)
+        .unwrap();
+    assert_eq!(client.last_server_time(), None);
+    assert_eq!(client.latest_compared_time(), None);
+}
+
+#[tokio::test]
+async fn test_enrollment_timestamp_retry_keeps_the_signed_intent() {
+    for kind in ["create", "existing", "takeover"] {
+        let discovery = Arc::new(MockTransport::with_handler(move |request| {
+            let mut body = observation((kind != "create").then_some(0));
+            if kind == "takeover" {
+                body.association = pubky_switch_core::records::AccountAssociation::Mark;
+            }
+            Ok(observation_reply(request, &body))
+        }));
+        let found = unbound_signer(discovery, Some(service_public()))
+            .observe_account()
+            .await
+            .unwrap();
+        let intent = match kind {
+            "create" => EnrollmentIntent::Create {
+                observation: found.carried().clone(),
+            },
+            "takeover" => EnrollmentIntent::Takeover {
+                created: 0,
+                observation: found.carried().clone(),
+            },
+            _ => EnrollmentIntent::Existing { created: 0 },
+        };
+        let mut body = enrollment([4; 16]).body().clone();
+        body.intent = intent;
+        let enrollment = Enrollment::sign(&identity(), body).unwrap();
+        let created = if kind == "existing" { 0 } else { 42 };
+        let answer =
+            EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), created);
+        let bytes = answer.to_json().unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(respond(&service_key(), request, 401, &serde_json::to_vec(&json!({ "code": "stale_timestamp", "message": "stale", "current": { "server_time": rfc3339(NOW + 600_000) } })).unwrap()))
+            } else {
+                Ok(respond(&service_key(), request, 200, &bytes))
+            }
+        }));
+        let client = unbound_signer(transport.clone(), Some(service_public()));
+        assert_eq!(client.enroll(&enrollment).await.unwrap(), answer);
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].body, sent[1].body);
+        assert_ne!(
+            sent[0].header(header::TIMESTAMP),
+            sent[1].header(header::TIMESTAMP)
+        );
+        for request in &sent {
+            assert_eq!(
+                request.header(header::CREATED),
+                (kind != "create").then(|| rfc3339(0)).as_deref()
+            );
+            let value: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                read::doc(&value["enrollment"]).unwrap(),
+                *enrollment.signed()
+            );
+        }
+        assert_eq!(client.last_server_time(), None);
+        assert_eq!(client.latest_compared_time(), None);
+    }
+}
+
+#[tokio::test]
+async fn test_enrollment_and_erasure_require_the_original_creation() {
+    let transport = fixed(service_key(), 200, json!({ "erased": true }));
+    let client = client_with(signer(), Some(service_public()), transport.clone());
+    let mut body = enrollment([4; 16]).body().clone();
+    body.intent = EnrollmentIntent::Existing { created: 1 };
+    let other = Enrollment::sign(&identity(), body).unwrap();
+    assert!(matches!(
+        client.enroll(&other).await,
+        Err(ClientError::Usage(_))
+    ));
+    let body = serde_json::to_vec(&json!({ "enrollment": other.signed() })).unwrap();
+    let raw = sign_raw_request(Request {
+        method: "POST".into(),
+        origin: ORIGIN.into(),
+        path_and_query: "/v1/enroll".into(),
+        headers: Vec::new(),
+        body,
+        timeout: TimeoutClass::Ordinary,
+    });
+    assert!(matches!(client.send(raw).await, Err(ClientError::Usage(_))));
+    for created in [None, Some(1)] {
+        assert!(matches!(
+            client.erase(created, None).await,
+            Err(ClientError::Usage(_))
+        ));
+    }
+    assert!(transport.requests().is_empty());
+    client.erase(Some(0), None).await.unwrap();
+    let sent = transport.last_request().unwrap();
+    assert_eq!(sent.header(header::CREATED), Some(rfc3339(0).as_str()));
+    let value: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(value["created"], rfc3339(0));
+}
+
+fn timed_response(
+    request: &Request,
+    status: u16,
+    body: Value,
+    head: Option<&str>,
+    time: u64,
+) -> Response {
+    let body = serde_json::to_vec(&body).unwrap();
+    let server_time = rfc3339(time);
+    let sig = sign_response(
+        &service_key(),
+        &http::ResponseParts {
+            status,
+            request: SentRequest::of(request).received(true),
+            server_time: &server_time,
+            head,
+            body: &body,
+        },
+    );
+    let mut headers = vec![
+        Header::new(header::SERVER_TIME, &server_time),
+        Header::new(header::SERVICE_SIGNATURE, &b64(&sig)),
+    ];
+    if let Some(head) = head {
+        headers.push(Header::new(header::HEAD, head));
+    }
+    Response {
+        status,
+        headers,
+        body,
+    }
+}
+
+#[tokio::test]
+async fn test_creation_conflict_preserves_time_evidence() {
+    for time in [NOW - 600_000, NOW + 600_000] {
+        for (current, excluded) in [
+            (json!({ "created": rfc3339(1) }), true),
+            (json!({ "created": rfc3339(1), "other": true }), false),
+            (json!({ "created": "1970-01-01T00:00:00Z" }), false),
+            (json!({ "binding": "changed" }), false),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let transport = Arc::new(MockTransport::with_handler(move |request| {
+                Ok(
+                    match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => timed_response(request, 200, json!({}), None, NOW),
+                        1 => timed_response(
+                            request,
+                            409,
+                            json!({ "code": "conflict", "message": "different account", "current": current }),
+                            None,
+                            time,
+                        ),
+                        _ => timed_response(request, 200, json!({}), None, NOW - 1),
+                    },
+                )
+            }));
+            let client = client_with(signer(), Some(service_public()), transport.clone());
+            let request = || {
+                client
+                    .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                    .unwrap()
+            };
+            client.send(request()).await.unwrap();
+            let prior = client.latest_compared_time().unwrap();
+            assert_eq!(prior, NOW);
+            assert!(matches!(
+                client.send(request()).await,
+                Err(ClientError::Switch {
+                    code: ErrorCode::Conflict,
+                    ..
+                })
+            ));
+            assert_eq!(client.latest_compared_time(), (!excluded).then_some(time));
+            assert_eq!(
+                client.compared_times().map(|t| t.highest),
+                (!excluded).then_some(time)
+            );
+            assert_eq!(client.latest_server_time(), None);
+            assert_eq!(client.last_server_time(), Some(prior));
+            assert_eq!(client.pinned_key(), Some(service_public()));
+            client.send(request()).await.unwrap();
+            assert_eq!(client.latest_compared_time(), Some(prior - 1));
+            assert_eq!(client.latest_server_time(), Some(prior - 1));
+            assert!(
+                transport
+                    .requests()
+                    .iter()
+                    .all(|r| r.header(header::CREATED) == Some(rfc3339(0).as_str()))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_creation_conflict_requires_absent_raw_head() {
+    let head = SignedHead::sign(
+        &service_key(),
+        &identity().public(),
+        &ChainTip {
+            generation: 1,
+            seq: 1,
+            chain_hash: [3; 32],
+        },
+    )
+    .to_header();
+    for (head, valid) in [
+        (head, true),
+        (String::new(), false),
+        ("unparseable".into(), false),
+    ] {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(timed_response(request, 200, json!({}), None, NOW))
+            } else {
+                Ok(timed_response(
+                    request,
+                    409,
+                    json!({ "code": "conflict", "message": "different account", "current": { "created": rfc3339(1) } }),
+                    Some(&head),
+                    NOW + 600_000,
+                ))
+            }
+        }));
+        let client = client_with(signer(), Some(service_public()), transport);
+        let request = || {
+            client
+                .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                .unwrap()
+        };
+        client.send(request()).await.unwrap();
+        let result = client.send(request()).await;
+        if valid {
+            assert!(matches!(
+                result,
+                Err(ClientError::Switch {
+                    code: ErrorCode::Conflict,
+                    ..
+                })
+            ));
+            assert_eq!(client.latest_compared_time(), Some(NOW + 600_000));
+            assert_eq!(client.latest_server_time(), Some(NOW + 600_000));
+            assert_eq!(client.last_server_time(), Some(NOW + 600_000));
+        } else {
+            assert!(matches!(
+                result,
+                Err(ClientError::BadServiceSignature { status: 409 })
+            ));
+            assert_eq!(client.latest_compared_time(), None);
+            assert!(client.compared_times().is_none());
+            assert_eq!(client.latest_server_time(), None);
+            assert_eq!(client.last_server_time(), Some(NOW));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_raw_discovery_preserves_time_evidence() {
+    for time in [NOW - 600_000, NOW + 600_000] {
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            if request.path_and_query.ends_with("/account") {
+                let mut body = observation(Some(0));
+                body.observed_at = time;
+                body.expires_at = time + 300_000;
+                Ok(timed_response(
+                    request,
+                    200,
+                    serde_json::from_slice(&body.to_json().unwrap()).unwrap(),
+                    None,
+                    time,
+                ))
+            } else {
+                Ok(timed_response(request, 200, json!({}), None, NOW))
+            }
+        }));
+        let client = client_with(signer(), Some(service_public()), transport);
+        let request = |rest| {
+            client
+                .sign_request("GET", &client.path(rest), Vec::new(), None)
+                .unwrap()
+        };
+        client.send(request("apps")).await.unwrap();
+        client.send(request("account")).await.unwrap();
+        assert_eq!(client.last_server_time(), Some(NOW));
+        assert_eq!(client.latest_server_time(), None);
+        assert_eq!(client.latest_compared_time(), None);
+        assert!(client.compared_times().is_none());
+        assert_eq!(client.pinned_key(), Some(service_public()));
+    }
 }

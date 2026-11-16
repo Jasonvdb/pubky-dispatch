@@ -194,6 +194,7 @@ async fn test_signer_another_installs_backup_stops_signing_before_the_delivery()
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         theirs,
+        world.backup().account_created(),
         &[],
         &[],
         Limits::default(),
@@ -335,15 +336,16 @@ async fn crash_at(fault: Fault) -> (World, Signer) {
 
 #[tokio::test]
 async fn test_signer_enrollment_survives_a_crash_at_every_commit() {
-    // Set up, enrolled, backup sealed, backup written, delivered, published: six commits.
+    // Set up, observation kept, enrolled, backup sealed, backup written, delivered,
+    // published: seven commits.
     let world = World::new();
     let counting = Arc::new(FaultStore::new(Arc::new(MemoryStore::new()), Fault::None));
     let mut signer = Signer::create(world.env(counting.clone()), world.keyring(), SWITCH_ORIGIN)
         .await
         .unwrap();
     signer.resume().await.unwrap();
-    assert_eq!(counting.commits(), 6);
-    for n in 1..=7 {
+    assert_eq!(counting.commits(), 7);
+    for n in 1..=counting.commits() + 1 {
         for fault in [Fault::StopBefore(n), Fault::StopAfter(n)] {
             let (world, signer) = crash_at(fault).await;
             let doc = signer.identity_doc().unwrap().unwrap();
@@ -405,10 +407,10 @@ async fn test_signer_a_store_that_cant_tell_is_read_again() {
     // The commit of the signed version is applied but answers `Unknown`: the signer reads its
     // state again, so it goes on from what the store holds (Switch wire 2.1).
     let world = World::new();
-    // The enrollment takes six commits; the seventh is the new version's first.
+    // The enrollment takes seven commits; the eighth is the new version's first.
     let faulty = Arc::new(FaultStore::new(
         Arc::new(MemoryStore::new()),
-        Fault::FailAfter(7),
+        Fault::FailAfter(8),
     ));
     let mut signer = Signer::create(world.env(faulty), world.keyring(), SWITCH_ORIGIN)
         .await
@@ -813,6 +815,7 @@ fn own_newer(world: &World, doc: &IdentityDoc, version: u64) -> (IdentityDoc, Ve
     let records = SignerRecords::new(
         IdentityKey::from_secret(SECRET),
         newer.clone(),
+        world.backup().account_created(),
         &[],
         &[],
         Limits::default(),
@@ -1228,4 +1231,56 @@ async fn test_signer_too_large_before_the_body_isnt_final() {
         "the same version sent again"
     );
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_pending_delivery_keeps_the_original_account() {
+    use pubky_switch_client::{ClientError, testing::Fault as SwitchFault};
+    use pubky_switch_core::http::{ErrorCode, header};
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let created = world.switch.created();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    assert!(signer.set_record_max_age(Some(60)).await.is_err());
+    let original = world
+        .transport
+        .requests()
+        .into_iter()
+        .rfind(|request| request.method == "PUT" && request.path_and_query.ends_with("/identity"))
+        .unwrap();
+    assert_eq!(world.backup().account_created(), created);
+    drop(signer);
+    let replacement = world.create_after_erasure().await;
+    let start = world.transport.requests().len();
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    let requests = world.transport.requests();
+    assert_eq!(requests.len() - start, 1);
+    let retry = &requests[start];
+    assert_eq!(retry.body, original.body);
+    assert_eq!(
+        retry.header(header::CREATED),
+        original.header(header::CREATED)
+    );
+    assert_eq!(
+        retry.header(header::CREATED),
+        Some(pubky_switch_core::time::rfc3339(created).as_str())
+    );
+    assert_eq!(world.switch.created(), replacement);
+    assert!(world.switch.identity_doc().is_none());
+    assert_eq!(world.backup().account_created(), created);
 }

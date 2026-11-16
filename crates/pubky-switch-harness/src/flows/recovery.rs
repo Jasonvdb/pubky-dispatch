@@ -1169,9 +1169,9 @@ pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
 /// shows the recovery as refused there and sends nothing more. Declared again at another
 /// service, the recovery completes.
 ///
-/// Calls: `POST /v1/enroll` at an origin whose service lost the account, and `PUT
-/// /v1/{id}/identity` refused there for the app limit (`400 bad_request`), signed with the
-/// key the enrollment named.
+/// Calls: `GET /v1/{id}/account` and `POST /v1/enroll` at an origin whose service lost
+/// the account, and `PUT /v1/{id}/identity` refused there for the app limit
+/// (`400 bad_request`), signed with the key the enrollment named.
 ///
 /// # Errors
 ///
@@ -1216,7 +1216,11 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
             (line.label.clone(), status)
         })
         .collect();
-    let expected = [("{alice} POST /v1/enroll", "200"), (delivery, "400")];
+    let expected = [
+        ("{alice} GET /v1/{alice}/account", "200"),
+        ("{alice} POST /v1/enroll", "200"),
+        (delivery, "400"),
+    ];
     let as_expected = sent.len() == expected.len()
         && sent
             .iter()
@@ -1224,7 +1228,7 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
             .all(|((label, status), (wanted, answered))| label == wanted && status == answered);
     if !as_expected {
         return Err(format!(
-            "the declaration sent {sent:?}, not the enrollment and one refused delivery"
+            "the declaration sent {sent:?}; expected account observation, enrollment and one refused delivery"
         )
         .into());
     }

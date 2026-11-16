@@ -7,6 +7,7 @@
 use pubky_switch_core::{
     chain::ChainTip,
     http::{NoticeReason, RecoveryNotice},
+    records::{AccountActivation, AccountAssociation, AccountBinding, AccountMarkInput},
 };
 
 /// The mark facts used by the account verdict (Switch wire 7.3).
@@ -71,6 +72,8 @@ impl AccountState {
 /// An account, as [`judge`] needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Account {
+    /// Whether this current account must recover before it can activate.
+    pub activation: AccountActivation,
     /// What it holds.
     pub state: AccountState,
     /// When it was created, in Unix milliseconds.
@@ -110,12 +113,33 @@ pub enum MarkInput {
 }
 
 impl MarkInput {
+    fn binding_input(&self) -> AccountMarkInput {
+        match self {
+            Self::StoreUnreadable => AccountMarkInput::Unreadable,
+            Self::Missing => AccountMarkInput::Missing,
+            Self::NotAMark => AccountMarkInput::Malformed,
+            Self::Mark(mark) => AccountMarkInput::Created(mark.created_at_ms),
+        }
+    }
+
     fn mark(&self) -> Option<&Mark> {
         match self {
             Self::Mark(mark) => Some(mark),
             Self::StoreUnreadable | Self::Missing | Self::NotAMark => None,
         }
     }
+}
+
+/// Select the current lifetime while retaining the physical inputs for recovery bounds
+/// (Switch account binding 1.1).
+pub fn account_binding(
+    account: Option<&Account>,
+    mark: &MarkInput,
+) -> pubky_switch_core::Result<AccountBinding> {
+    AccountBinding::select(
+        account.map(|account| account.created_at_ms),
+        mark.binding_input(),
+    )
 }
 
 /// Everything [`judge`] reads.
@@ -174,6 +198,8 @@ pub enum Verdict {
 /// What [`judge`] finds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judgement {
+    /// The selected current account requires a durable higher recovery before activation.
+    pub recovery_required: bool,
     /// Table 1's first row: the account was created at or before the time of an erasure's
     /// record for the identity, and is erased again before anything is served or signed;
     /// `verdict` is that of the identity without it.
@@ -213,6 +239,7 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         // While the verdict is unknown no mark is created, moved or deleted, nor is an
         // account erased again.
         return Judgement {
+            recovery_required: false,
             erase_account_again: false,
             verdict: Verdict::Unknown,
             recovery_floor: 0,
@@ -228,17 +255,59 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         erase_account_again = true;
         account = None;
     }
-    let verdict = match account {
-        None => judge_without_account(inputs),
-        Some(account) => judge_account(account, inputs),
+    let recovery_floor = account
+        .map_or(0, |account| {
+            let retained_sql = if account.activation == AccountActivation::Recovery
+                || inputs
+                    .mark
+                    .mark()
+                    .is_some_and(|mark| mark.created_at_ms != account.created_at_ms)
+            {
+                account.enrolled_generation
+            } else {
+                0
+            };
+            account.document_generation.unwrap_or(0).max(retained_sql)
+        })
+        .max(inputs.mark.mark().map_or(0, |mark| mark.generation));
+    let binding = account_binding(account, inputs.mark);
+    let recovery_required = account
+        .is_some_and(|account| account.activation == AccountActivation::Recovery)
+        && binding
+            .as_ref()
+            .is_ok_and(|binding| binding.association() == AccountAssociation::Account);
+    let verdict = match binding {
+        Err(_) => Verdict::Unknown,
+        Ok(binding) => {
+            let effective_account =
+                account.filter(|_| binding.association() == AccountAssociation::Account);
+            let missing = MarkInput::Missing;
+            let effective_mark = if effective_account.is_some_and(|account| {
+                inputs
+                    .mark
+                    .mark()
+                    .is_some_and(|mark| mark.created_at_ms < account.created_at_ms)
+            }) {
+                &missing
+            } else {
+                inputs.mark
+            };
+            let effective = Inputs {
+                account: effective_account,
+                mark: effective_mark,
+                ..*inputs
+            };
+            match effective_account {
+                None => judge_without_account(&effective),
+                Some(account) => judge_account(account, &effective),
+            }
+        }
     };
     Judgement {
+        recovery_required,
         erase_account_again,
         verdict,
-        recovery_floor: account
-            .and_then(|account| account.document_generation)
-            .unwrap_or(0)
-            .max(inputs.mark.mark().map_or(0, |mark| mark.generation)),
+        recovery_floor,
     }
 }
 
@@ -289,7 +358,8 @@ fn judge_account(account: &Account, inputs: &Inputs<'_>) -> Verdict {
     let generation = account
         .generation()
         .max(mark.map_or(0, |mark| mark.generation));
-    let abort_allowed = account.state.is_staged()
+    let abort_allowed = account.activation == AccountActivation::Ordinary
+        && account.state.is_staged()
         && mark.is_none_or(|mark| mark.generation <= account.enrolled_generation);
     let notice = |reason, permanent| RecoveryNotice {
         generation,
@@ -304,6 +374,13 @@ fn judge_account(account: &Account, inputs: &Inputs<'_>) -> Verdict {
         notice: notice(NoticeReason::Behind, permanent),
         abort_allowed,
     };
+    if account.activation == AccountActivation::Recovery {
+        return if mark.is_none() {
+            failing(NoticeReason::MarkLost, retired)
+        } else {
+            bounded(retired)
+        };
+    }
     if state.is_none() {
         // Row "Staged, holding no chain".
         if retired {
@@ -465,6 +542,14 @@ pub enum Route {
 ///
 /// This computes a decision from supplied facts; it performs no request or state change.
 pub fn request_route(judgement: &Judgement, class: &RequestClass) -> Route {
+    if judgement.recovery_required && matches!(class, RequestClass::Move(_)) {
+        return match judgement.verdict {
+            Verdict::Bounded { notice, .. } | Verdict::Failing { notice, .. } => {
+                Route::Notice(notice)
+            }
+            _ => Route::Unavailable,
+        };
+    }
     route(&judgement.verdict, class, judgement.recovery_floor)
 }
 

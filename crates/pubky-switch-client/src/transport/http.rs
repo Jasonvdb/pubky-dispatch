@@ -54,7 +54,7 @@ pub struct HttpConfig {
     /// (Switch wire 7.1).
     pub extra_ports: Vec<u16>,
     /// The largest answer body read, in bytes; a larger one fails with
-    /// [`TransportError::TooLarge`].
+    /// [`TransportError::TooLarge`]. A smaller endpoint-specific bound still applies.
     pub max_response_bytes: u64,
 }
 
@@ -239,17 +239,23 @@ impl HttpTransport {
         let mut response = call.send().await.map_err(map_error)?;
         let status = response.status().as_u16();
         let headers = response_headers(status, response.headers())?;
-        if response
-            .content_length()
-            .is_some_and(|len| len > self.max_response_bytes)
-        {
-            return Err(TransportError::TooLarge(self.max_response_bytes));
+        let limit = pubky_switch_core::http::response_body_cap(
+            &request.method,
+            &request.path_and_query,
+            status,
+        )
+        .and_then(|cap| u64::try_from(cap).ok())
+        .map_or(self.max_response_bytes, |cap| {
+            self.max_response_bytes.min(cap)
+        });
+        if response.content_length().is_some_and(|len| len > limit) {
+            return Err(TransportError::TooLarge(limit));
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(map_error)? {
             let len = u64::try_from(body.len().saturating_add(chunk.len())).unwrap_or(u64::MAX);
-            if len > self.max_response_bytes {
-                return Err(TransportError::TooLarge(self.max_response_bytes));
+            if len > limit {
+                return Err(TransportError::TooLarge(limit));
             }
             body.extend_from_slice(&chunk);
         }
@@ -370,6 +376,124 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: TimeoutClass::Ordinary,
+        }
+    }
+
+    async fn read_answer(
+        path: &str,
+        config: HttpConfig,
+        answer: Vec<u8>,
+    ) -> Result<Response, TransportError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut read = [0; 8192];
+            let mut used = 0;
+            while !read[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut read[used..]).await.unwrap();
+                assert!(count > 0, "the request headers fit and finish");
+                used += count;
+            }
+            socket.write_all(&answer).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let transport = HttpTransport::without_address_checks_for_loopback_tests(config).unwrap();
+        let mut request = request(&origin);
+        request.path_and_query = path.into();
+        let result = transport.send(request).await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        result
+    }
+
+    fn chunked_answer(status: u16, bytes: usize) -> Vec<u8> {
+        let mut answer =
+            format!("HTTP/1.1 {status} Answer\r\ntransfer-encoding: chunked\r\n\r\n{bytes:x}\r\n")
+                .into_bytes();
+        answer.extend(vec![b'x'; bytes]);
+        answer.extend_from_slice(b"\r\n0\r\n\r\n");
+        answer
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_content_length_is_bounded() {
+        let cap = pubky_switch_core::records::MAX_ACCOUNT_OBSERVATION_BYTES;
+        let config = HttpConfig {
+            request_timeout_ms: 200,
+            ..HttpConfig::default()
+        };
+        let mut exact = format!("HTTP/1.1 200 OK\r\ncontent-length: {cap}\r\n\r\n").into_bytes();
+        exact.extend(vec![b'x'; cap]);
+        assert_eq!(
+            read_answer("/v1/x/account", config.clone(), exact)
+                .await
+                .unwrap()
+                .body
+                .len(),
+            cap
+        );
+        // No body arrives: the announced length alone must refuse before a body read.
+        let over = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", cap + 1);
+        assert_eq!(
+            read_answer("/v1/x/account", config, over.into_bytes()).await,
+            Err(TransportError::TooLarge(cap as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_chunks_are_bounded() {
+        let cap = pubky_switch_core::records::MAX_ACCOUNT_OBSERVATION_BYTES;
+        assert_eq!(
+            read_answer(
+                "/v1/x/account",
+                HttpConfig::default(),
+                chunked_answer(200, cap),
+            )
+            .await
+            .unwrap()
+            .body
+            .len(),
+            cap
+        );
+        assert_eq!(
+            read_answer(
+                "/v1/x/account",
+                HttpConfig::default(),
+                chunked_answer(200, cap + 1),
+            )
+            .await,
+            Err(TransportError::TooLarge(cap as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_discovery_preserves_smaller_and_other_limits() {
+        let cap = pubky_switch_core::records::MAX_ACCOUNT_OBSERVATION_BYTES;
+        let smaller = (cap / 2) as u64;
+        assert_eq!(
+            read_answer(
+                "/v1/x/account",
+                HttpConfig {
+                    max_response_bytes: smaller,
+                    ..HttpConfig::default()
+                },
+                chunked_answer(200, cap),
+            )
+            .await,
+            Err(TransportError::TooLarge(smaller))
+        );
+        for (path, status) in [("/v1/x/account", 503), ("/v1/x/directory", 200)] {
+            assert_eq!(
+                read_answer(path, HttpConfig::default(), chunked_answer(status, cap + 1))
+                    .await
+                    .unwrap()
+                    .body
+                    .len(),
+                cap + 1
+            );
         }
     }
 
@@ -684,6 +808,8 @@ mod tests {
                 ),
                 Arc::new(crate::clock::TestClock::new(now)),
             )
+            .unwrap()
+            .with_account_created(now)
             .unwrap()
         };
         let path = format!("/v1/{}/apps", identity.id());

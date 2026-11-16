@@ -88,6 +88,18 @@ fn enrollment(nonce: u8, revoked: Option<Vec<[u8; 16]>>) -> Vec<u8> {
 }
 
 async fn enroll(replay: &Replay, body: Vec<u8>, at_ms: u64) -> SwitchResponse {
+    let wrapper: Value = serde_json::from_slice(&body).expect("enrollment wrapper");
+    let signed: SignedDoc =
+        serde_json::from_value(wrapper["enrollment"].clone()).expect("enrollment");
+    let mut fields = Enrollment::verify(&signed, &alice_key().public(), ORIGIN)
+        .expect("enrollment template")
+        .body()
+        .clone();
+    fields.intent = new_alice_enrollment_intent(replay, at_ms).await;
+    let body = Enrollment::sign(&alice_key(), fields)
+        .expect("enrollment")
+        .to_request_json()
+        .expect("request");
     replay
         .service
         .handle(signer_request("POST", "/v1/enroll", body, at_ms))
@@ -296,7 +308,7 @@ async fn deliver(
     at_ms: u64,
 ) -> (SwitchResponse, Sent) {
     let path = format!("/v1/{}/identity", alice_id());
-    let request = signer_request(
+    let request = signer_request_at_creation(
         "PUT",
         &path,
         IdentityDelivery {
@@ -305,6 +317,7 @@ async fn deliver(
         }
         .to_json(),
         at_ms,
+        Some(created_at(replay).await),
     );
     let signature = signed_sent(&request);
     (replay.service.handle(request).await, signature)
@@ -370,7 +383,13 @@ async fn test_recovery_first_document_takes_its_generation() {
         chain(&replay).await,
         [(3, 1, "service".into()), (3, 2, "identity".into())]
     );
-    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    let request = signer_request_at_creation(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        at,
+        Some(created_at(&replay).await),
+    );
     let apps = replay.service.handle(request).await;
     assert_eq!(apps.status, 200);
     assert_eq!(

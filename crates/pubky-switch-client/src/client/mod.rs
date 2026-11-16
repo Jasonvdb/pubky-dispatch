@@ -4,9 +4,9 @@
 //! A [`SwitchClient`] acts with one set of [`Credentials`] on one account at one switch
 //! origin. It signs every request (Switch wire 7.1, 7.2) and checks every answer with the
 //! service key it pinned before it uses anything in it. Without a pinned key it sends only
-//! an enrollment, whose answer names the key, and the public read, checked with the key its
-//! verified `identity.json` names; every other call fails closed before it is sent (Switch
-//! wire 7.1, Switch spec 6.1).
+//! an enrollment, authenticated account discovery, and the public read. Their first-use
+//! rules establish which key checks the answer; every other call fails closed before it
+//! is sent (Switch wire 7.1, Switch spec 6.1, account-binding Section 2).
 //!
 //! - [`answers`]: the answer and body types of the calls.
 //! - [`Batch`]: signed operations kept with their exact request body, so a retry resends the
@@ -28,9 +28,9 @@ use pubky_switch_core::http::{
 };
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::labels;
-use pubky_switch_core::records::{AppCert, ExportTransfer, IdentityDoc};
+use pubky_switch_core::records::{AppCert, Enrollment, ExportTransfer, IdentityDoc};
 use pubky_switch_core::signing::{Signs, SignsRequests};
-use pubky_switch_core::time::{parse_rfc3339, rfc3339_seconds};
+use pubky_switch_core::time::{MAX_TIME_MS, parse_rfc3339, rfc3339, rfc3339_seconds};
 use serde_json::Value;
 
 use crate::clock::Clock;
@@ -464,7 +464,7 @@ pub(crate) fn parse_error(status: u16, body: &[u8]) -> ClientError {
 /// The `current.server_time` of a verified `401 stale_timestamp`: the service's time base,
 /// for the one retry's timestamp (Switch wire 7.1, 7.6). It isn't the identity's service
 /// time, and counts as no verified service time (Switch spec 10.1).
-fn stale_timestamp_hint(checked: &Result<CheckedResponse, ClientError>) -> Option<u64> {
+fn stale_timestamp_hint<T>(checked: &Result<T, ClientError>) -> Option<u64> {
     match checked {
         Err(ClientError::Switch {
             code: ErrorCode::StaleTimestamp,
@@ -527,6 +527,7 @@ fn is_token(text: &str) -> bool {
 pub struct SwitchClient {
     origin: String,
     account: [u8; 32],
+    created: Option<u64>,
     credentials: Credentials,
     pinned: Mutex<Option<[u8; 32]>>,
     last_server_time: Mutex<Option<u64>>,
@@ -541,6 +542,7 @@ impl std::fmt::Debug for SwitchClient {
         f.debug_struct("SwitchClient")
             .field("origin", &self.origin)
             .field("account", &pubky_id(&self.account))
+            .field("created", &self.created)
             .field("credentials", &self.credentials)
             .field("pinned", &self.pinned_key().map(|key| b64(&key)))
             .finish()
@@ -554,7 +556,8 @@ impl SwitchClient {
     /// `pinned_key` is the account's service key the caller pinned: from the `identity.json`
     /// naming the service or, for the signer, from its enrollment answer or the freeze naming
     /// the next service (Switch wire 7.1). Without one, the client sends only an enrollment
-    /// and the public read.
+    /// and authenticated account discovery, and the public read. Existing-account signer
+    /// calls also need [`Self::with_account_created`].
     ///
     /// # Errors
     ///
@@ -582,6 +585,7 @@ impl SwitchClient {
         Ok(Self {
             origin: origin.to_owned(),
             account,
+            created: None,
             credentials,
             pinned: Mutex::new(pinned_key),
             last_server_time: Mutex::new(None),
@@ -590,6 +594,25 @@ impl SwitchClient {
             transport,
             clock,
         })
+    }
+
+    /// Bind this signer's calls to the creation retained with its account or pending
+    /// operation (Switch account-binding Section 1). Answers never replace this binding.
+    /// Enrollment uses its own signed intent; discovery always omits the binding.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Usage`] for non-signer credentials, a client already bound, or a time
+    /// outside the wire grammar. Selecting another account requires another client.
+    pub fn with_account_created(mut self, created: u64) -> Result<Self, ClientError> {
+        self.signer_only()?;
+        if self.created.is_some() || created > MAX_TIME_MS {
+            return Err(ClientError::Usage(
+                "Switch account-binding 1: the account creation is fixed and representable".into(),
+            ));
+        }
+        self.created = Some(created);
+        Ok(self)
     }
 
     /// The switch origin.
@@ -655,7 +678,8 @@ impl SwitchClient {
     /// Timestamp): every answer checked with the pinned key, refusals included, but those
     /// that count in no comparison, `None` for them and for a call without a checked answer.
     /// Those are told from the answer and the call alone ([`http::uncompared`]): every answer
-    /// to the enrollment, the erasure and the public read; an answer that verifies only with
+    /// to enrollment, account discovery, erasure and the public read; a headless canonical
+    /// creation conflict; an answer that verifies only with
     /// the empty body field, given before the body was read (7.1); the notice, `503
     /// recovery_required` (7.6); every `503 unavailable`; and the `404` with `current: {
     /// "hosted": false }` of an identity the service doesn't host (7.3 step 2). Only these
@@ -704,14 +728,6 @@ impl SwitchClient {
                 .header(header::SERVER_TIME)
                 .and_then(|text| parse_rfc3339(text).ok())
         };
-        let time = match checked {
-            Ok(answer) => Some(answer.server_time_ms),
-            // An error answer verified with the pinned key carries the stamped time only once
-            // the request verified, which its head shows; a head it carries verified as the
-            // account's, or the answer would have failed (Switch wire 7.1).
-            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => shown(),
-            Err(_) => None,
-        };
         // Every checked answer but those that count in no comparison, told from the answer
         // and the call alone (Switch wire 7.1 Timestamp).
         let uncompared = |body, code, current| {
@@ -722,24 +738,38 @@ impl SwitchClient {
                 response.status,
                 code,
                 current,
+                response.header(header::HEAD).is_some(),
             )
         };
         let read = http::BodyField::Read(sent.body_hash);
-        let compared = match checked {
-            Ok(answer) => uncompared(read, None, None)
-                .is_none()
-                .then_some(answer.server_time_ms),
+        let class = match checked {
+            Ok(_) => uncompared(read, None, None),
             Err(ClientError::Switch { code, current, .. }) => {
                 uncompared(read, Some(*code), Some(current))
-                    .is_none()
-                    .then(shown)
-                    .flatten()
             }
             Err(ClientError::BodyUnread { code, .. }) => {
                 uncompared(http::BodyField::NotRead, Some(*code), None)
-                    .is_none()
-                    .then(shown)
-                    .flatten()
+            }
+            Err(_) => None,
+        };
+        let time = match checked {
+            _ if matches!(
+                class,
+                Some(http::Uncompared::AccountDiscovery | http::Uncompared::CreationConflict)
+            ) =>
+            {
+                None
+            }
+            Ok(answer) => Some(answer.server_time_ms),
+            // A verified error's present head proves its time is stamped for this account
+            // (Switch wire 7.1). Discovery and creation conflicts above carry the time base.
+            Err(ClientError::Switch { .. }) if response.header(header::HEAD).is_some() => shown(),
+            Err(_) => None,
+        };
+        let compared = match checked {
+            Ok(answer) => class.is_none().then_some(answer.server_time_ms),
+            Err(ClientError::Switch { .. } | ClientError::BodyUnread { .. }) => {
+                class.is_none().then(shown).flatten()
             }
             Err(_) => None,
         };
@@ -853,6 +883,12 @@ impl SwitchClient {
                 "Switch wire 1.7: an invite code is a base64url token".into(),
             ));
         }
+        let created = self.request_created(&method, path_and_query, &body)?;
+        if path_and_query == self.path("account") && auth.invite_code.is_some() {
+            return Err(ClientError::Usage(
+                "Switch account-binding 2: discovery carries no invite code".into(),
+            ));
+        }
         let timestamp = rfc3339_seconds(auth.timestamp_ms.unwrap_or_else(|| self.clock.now_ms()));
         let identity = pubky_id(&self.credentials.identity());
         let target = RequestTarget {
@@ -883,6 +919,7 @@ impl SwitchClient {
                     app: Some(keys.app_id()),
                     cert: (self.is_foreign() || auth.with_cert).then(|| cert.signed().compact()),
                     invite_code: auth.invite_code.map(str::to_owned),
+                    created: None,
                 };
                 let signature = self.credentials.sign(
                     labels::sig::HTTP,
@@ -896,6 +933,7 @@ impl SwitchClient {
                     timestamp: timestamp.clone(),
                     identity: identity.clone(),
                     invite_code: auth.invite_code.map(str::to_owned),
+                    created: created.map(rfc3339),
                     ..RequestHeaders::default()
                 };
                 let signature = self.credentials.sign(
@@ -998,6 +1036,7 @@ impl SwitchClient {
     /// Receive an answer without losing a protected header (Switch wire 7.1).
     async fn send_response(&self, request: Request) -> Result<Response, ClientError> {
         check_body_cap(&request.method, &request.path_and_query, &request.body)?;
+        self.check_request_binding(&request)?;
         self.transport
             .send(request)
             .await
@@ -1007,6 +1046,112 @@ impl SwitchClient {
                 }
                 error => error.into(),
             })
+    }
+
+    /// The creation selected by this request, never by an answer (account-binding 1-3).
+    fn request_created(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Option<u64>, ClientError> {
+        if http::is_public_read(method, path) {
+            return Ok(None);
+        }
+        let account_path = self.path("account");
+        if path.split('?').next() == Some(account_path.as_str()) {
+            self.signer_only()?;
+            if method != "GET" || path != account_path || !body.is_empty() {
+                return Err(ClientError::Usage(
+                    "Switch account-binding 2: discovery is the canonical empty GET".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        if self.signer_only().is_err() {
+            return Ok(None);
+        }
+        if method == "POST" && path == "/v1/enroll" {
+            let value: Value = pubky_switch_core::json::parse_json(body)?;
+            let signed = value.get("enrollment").and_then(read::doc).ok_or_else(|| {
+                ClientError::Usage("Switch wire 3.7: a signed enrollment is required".into())
+            })?;
+            let enrollment = Enrollment::verify(&signed, &self.account, &self.origin)?;
+            let created = enrollment.body().intent.created();
+            if self.created.is_some() && self.created != created {
+                return Err(ClientError::Usage(
+                    "Switch account-binding 3: the enrollment names another account creation"
+                        .into(),
+                ));
+            }
+            return Ok(created);
+        }
+        let created = self.created.ok_or_else(|| {
+            ClientError::Usage(
+                "Switch account-binding 1: the signer needs its account creation".into(),
+            )
+        })?;
+        if method == "POST" && path == self.path("erase") {
+            let value: Value = pubky_switch_core::json::parse_json(body)?;
+            if value
+                .get("created")
+                .and_then(Value::as_str)
+                .and_then(|text| http::parse_created(text).ok())
+                != Some(created)
+            {
+                return Err(ClientError::Usage(
+                    "Switch account-binding 1: erasure body and request creation must agree".into(),
+                ));
+            }
+        }
+        Ok(Some(created))
+    }
+
+    /// Public signed requests can be changed before `send`; check their actual binding.
+    fn check_request_binding(&self, request: &Request) -> Result<(), ClientError> {
+        if http::is_public_read(&request.method, &request.path_and_query) {
+            return Ok(());
+        }
+        let received = http::ReceivedHeaders::of(
+            request
+                .headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_bytes())),
+        );
+        if let Some(reason) = received.broken_rule() {
+            return Err(ClientError::Usage(format!("Switch wire {reason}")));
+        }
+        let expected =
+            self.request_created(&request.method, &request.path_and_query, &request.body)?;
+        let actual = request
+            .header(header::CREATED)
+            .map(http::parse_created)
+            .transpose()?;
+        if request.origin != self.origin || actual != expected {
+            return Err(ClientError::Usage(
+                "Switch account-binding 1: the request must retain its original account target"
+                    .into(),
+            ));
+        }
+        if request.path_and_query == self.path("account") {
+            let forbidden = [
+                header::APP,
+                header::CERT,
+                header::INVITE_CODE,
+                header::TRANSFER,
+            ];
+            if request.header(header::IDENTITY) != Some(pubky_id(&self.account).as_str())
+                || forbidden.iter().any(|name| request.header(name).is_some())
+                || request.header(header::TIMESTAMP).is_none()
+                || request.header(header::SIGNATURE).is_none()
+            {
+                return Err(ClientError::Usage(
+                    "Switch account-binding 2: discovery carries only identity authentication"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
@@ -1123,6 +1268,9 @@ fn push_request_headers(headers: &mut Vec<Header>, request: &RequestHeaders) {
     }
     if let Some(code) = &request.invite_code {
         headers.push(Header::new(header::INVITE_CODE, code));
+    }
+    if let Some(created) = &request.created {
+        headers.push(Header::new(header::CREATED, created));
     }
 }
 

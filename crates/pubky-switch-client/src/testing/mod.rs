@@ -395,7 +395,12 @@ mod tests {
         let path = format!("/v1/{}/directory", signer.identity().key().id());
         let answer = signer
             .switch()
-            .handle(&request(SWITCH_ORIGIN, &path))
+            .handle(&signer_request(
+                signer.identity().key(),
+                signer.switch().created(),
+                SWITCH_ORIGIN,
+                &path,
+            ))
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
         let shown: Vec<&str> = body["apps"]
@@ -420,6 +425,37 @@ mod tests {
             body: Vec::new(),
             timeout: crate::transport::TimeoutClass::default(),
         }
+    }
+
+    fn signer_request(identity: &IdentityKey, created: u64, origin: &str, path: &str) -> Request {
+        use crate::transport::Header;
+        use pubky_switch_core::http::{self, RequestHeaders, RequestTarget};
+
+        let created = pubky_switch_core::time::rfc3339(created);
+        let fields = RequestHeaders {
+            identity: identity.id(),
+            timestamp: pubky_switch_core::time::rfc3339_seconds(START_MS),
+            created: Some(created.clone()),
+            ..RequestHeaders::default()
+        };
+        let signature = http::sign_request(
+            identity,
+            &RequestTarget {
+                method: "GET",
+                path_and_query: path,
+                body: &[],
+                origin,
+            },
+            &fields,
+        );
+        let mut request = request(origin, path);
+        request.headers = vec![
+            Header::new(header::IDENTITY, &fields.identity),
+            Header::new(header::TIMESTAMP, &fields.timestamp),
+            Header::new(header::CREATED, &created),
+            Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
+        ];
+        request
     }
 
     #[test]
@@ -483,9 +519,23 @@ mod tests {
             code: pubky_switch_core::http::ErrorCode::Unavailable,
             current: json!(null),
         });
-        let failed = switch.handle(&request(SWITCH_ORIGIN, &path)).unwrap();
+        let failed = switch
+            .handle(&signer_request(
+                alice.key(),
+                switch.created(),
+                SWITCH_ORIGIN,
+                &path,
+            ))
+            .unwrap();
         assert_eq!(failed.status, 503);
-        let answered = switch.handle(&request(SWITCH_ORIGIN, &path)).unwrap();
+        let answered = switch
+            .handle(&signer_request(
+                alice.key(),
+                switch.created(),
+                SWITCH_ORIGIN,
+                &path,
+            ))
+            .unwrap();
         assert_eq!(answered.status, 200);
         assert!(answered.header(header::SERVICE_SIGNATURE).is_some());
     }
@@ -571,12 +621,38 @@ mod tests {
         let router = Router::new();
         router.add_switch(SWITCH_ORIGIN, &switch);
         let path = format!("/v1/{}/directory", alice.key().id());
-        let answer = router.send(request(SWITCH_ORIGIN, &path)).await.unwrap();
+        let answer = router
+            .send(signer_request(
+                alice.key(),
+                switch.created(),
+                SWITCH_ORIGIN,
+                &path,
+            ))
+            .await
+            .unwrap();
         assert_eq!(answer.status, 200);
-        let error = router.send(request(PEER_ORIGIN, &path)).await.unwrap_err();
+        let error = router
+            .send(signer_request(
+                alice.key(),
+                switch.created(),
+                PEER_ORIGIN,
+                &path,
+            ))
+            .await
+            .unwrap_err();
         assert!(matches!(error, TransportError::Connect(_)), "{error:?}");
         router.remove(SWITCH_ORIGIN);
-        assert!(router.send(request(SWITCH_ORIGIN, &path)).await.is_err());
+        assert!(
+            router
+                .send(signer_request(
+                    alice.key(),
+                    switch.created(),
+                    SWITCH_ORIGIN,
+                    &path
+                ))
+                .await
+                .is_err()
+        );
         assert_eq!(router.log().len(), 3);
     }
 

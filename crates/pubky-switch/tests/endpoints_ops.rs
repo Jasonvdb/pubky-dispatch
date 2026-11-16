@@ -62,7 +62,7 @@ fn ops_path() -> String {
 
 /// alice's account with the wallet registered, as `chain.json`'s seqs 1 to 4 leave it.
 async fn registered(limits: Limits, time_required: bool) -> Option<Replay> {
-    let replay = replay_with_time(limits, time_required).await?;
+    let mut replay = replay_with(limits.clone()).await?;
     serve_alice(&replay).await;
     let chain = vectors("chain.json");
     let item = &chain["items"].as_array().expect("items")[2];
@@ -79,6 +79,13 @@ async fn registered(limits: Limits, time_required: bool) -> Option<Replay> {
     let (status, body) = post_app(&replay, "wallet", &ops, None, &at).await;
     assert_eq!(status, 200, "registered: {body}");
     set_time(&replay.clock, AT);
+    if time_required {
+        replay.time = std::sync::Arc::new(pubky_switch::time::TrustedTime::new(
+            pubky_switch::time::TrustedTimeConfig::default(),
+            replay.clock.clone(),
+        ));
+        replay.service = replay.restarted_with(limits);
+    }
     Some(replay)
 }
 
@@ -591,12 +598,8 @@ async fn test_ops_unverified_app_takes_no_lock_and_changes_nothing() {
 async fn test_ops_unverified_app_at_a_staged_account_gets_no_head() {
     let Some(replay) = replay().await else { return };
     // Enrolled, with no identity.json yet: staged.
-    let http = vectors("http.json");
     set_time(&replay.clock, AT);
-    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
-    let mut enrollment = enrollment;
-    let body = enrollment.body.clone();
-    enrollment = signer_request("POST", "/v1/enroll", body.to_vec(), ms(AT));
+    let enrollment = fresh_alice_enrollment(&replay, ms(AT)).await;
     assert_eq!(replay.service.handle(enrollment).await.status, 200);
     let (status, body, head) = answer_of(replay.service.handle(forged(AT)).await);
     assert_ne!(status, 503, "{body}");

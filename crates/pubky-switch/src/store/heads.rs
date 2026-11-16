@@ -14,6 +14,8 @@ use super::{StoreError, from_db, to_db};
 /// An account's head as the database holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredHead {
+    /// The current account's persisted activation requirement.
+    pub activation: pubky_switch_core::records::AccountActivation,
     /// The identity's Pubky ID.
     pub id: String,
     /// The identity's Ed25519 public key.
@@ -93,7 +95,7 @@ pub async fn stub_hash_at(
 /// The heads of the accounts `ids` names that are there now, in the order of their IDs.
 pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<StoredHead>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, identity_key, generation, chain_seq, chain_hash, created_at_ms, \
+        "SELECT id, identity_key, generation, chain_seq, chain_hash, created_at_ms, activation_requirement, \
          identity_doc FROM accounts WHERE id = ANY($1) ORDER BY id",
     )
     .bind(ids)
@@ -121,6 +123,10 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
                 generation: from_db(row.try_get("generation")?, "generation")?,
                 chain,
                 created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
+                activation: pubky_switch_core::records::AccountActivation::parse(
+                    row.try_get("activation_requirement")?,
+                )
+                .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
                 identity_doc: row.try_get("identity_doc")?,
             })
         })

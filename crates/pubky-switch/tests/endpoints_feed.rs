@@ -1434,7 +1434,47 @@ async fn change_feed_account(replay: &Replay, change: FeedChange, at: &str) {
         ),
     }
     if matches!(change, FeedChange::EnrollAgain) {
-        serve_alice(replay).await;
+        let now = ms(at) + 1;
+        replay.clock.set_wall_ms(now);
+        let enrollment = fresh_alice_enrollment(replay, now).await;
+        let enrolled = replay.service.handle(enrollment).await;
+        assert_eq!(
+            enrolled.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&enrolled.body)
+        );
+        let created = ms(body(&enrolled)["created"].as_str().expect("creation"));
+        let first: SignedDoc = serde_json::from_value(
+            named(
+                &vectors("documents.json")["documents"],
+                "alice identity.json, first delivery (version 1)",
+            )["signed"]
+                .clone(),
+        )
+        .expect("first identity");
+        let mut prev = None;
+        for identity in [first, held_identity()] {
+            let hash = identity.doc_hash().expect("hash");
+            let delivery = pubky_switch_core::http::IdentityDelivery { identity, prev };
+            let delivered = replay
+                .service
+                .handle(signer_request_at_creation(
+                    "PUT",
+                    &format!("/v1/{}/identity", alice_id()),
+                    delivery.to_json(),
+                    now,
+                    Some(created),
+                ))
+                .await;
+            assert_eq!(
+                delivered.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&delivered.body)
+            );
+            prev = Some(hash);
+        }
         let later = mark_of(replay).await;
         assert!(later.created_at_ms > original.created_at_ms);
         assert_eq!(later.generation, original.generation);
@@ -1819,11 +1859,12 @@ async fn test_feed_account_erased_again_uses_remaining_mark_verdict() {
         mark_of(&replay).await.created_at_ms > erased_at,
         "later mark stays"
     );
-    let retry = Box::pin(replay.service.handle(signer_request(
+    let retry = Box::pin(replay.service.handle(signer_request_at_creation(
         "GET",
         &format!("/v1/{}/apps", alice_id()),
         Vec::new(),
         ms(&revoke_time()),
+        Some(erased_at + 1),
     )))
     .await;
     replay.db.drop_database().await.expect("drop");
@@ -1835,13 +1876,18 @@ async fn test_feed_account_erased_again_uses_remaining_mark_verdict() {
     );
     assert_eq!(
         answer.status,
-        503,
-        "locked path ignores remaining lost mark: {}",
+        409,
+        "old creation must conflict before the lost-account verdict: {}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert_eq!(body(&answer)["code"], "recovery_required");
-    assert_eq!(body(&answer)["current"]["reason"], "behind");
-    assert_eq!(body(&answer), body(&retry));
+    assert_eq!(body(&answer)["code"], "conflict");
+    assert_eq!(
+        body(&answer)["current"],
+        json!({"created": pubky_switch_core::time::rfc3339(erased_at + 1)})
+    );
+    assert_eq!(body(&retry)["code"], "recovery_required");
+    assert_eq!(body(&retry)["current"]["reason"], "behind");
+    assert!(header_text(&retry, header::HEAD).is_none());
     assert!(header_text(&answer, header::HEAD).is_none());
 }
 
@@ -2272,4 +2318,93 @@ async fn test_feed_failed_deletion_with_unwritable_record_preserves_account() {
     );
     assert_eq!(record, None);
     assert_eq!(read.status, 200);
+}
+
+async fn signer_waiting_for_later_mark(lost_sql: bool) {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let old = mark_of(&replay).await;
+    let later_created = old.created_at_ms + 1;
+    let query = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let sent = Sent::of(&query);
+    let (answer, ()) = tokio::join!(Box::pin(replay.service.handle(query)), async {
+        until_account_lock_waits(&replay).await;
+        if lost_sql {
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(alice_id())
+                .execute(txn.conn())
+                .await
+                .expect("lost SQL");
+            replay
+                .marks
+                .take(&alice_id(), old, old.key, later_created)
+                .await
+                .expect("later mark");
+        } else {
+            // A restored older SQL row beside the later lifetime's staged mark
+            // (Switch account binding 1.1).
+            replay
+                .marks
+                .delete(&alice_id())
+                .await
+                .expect("old mark erased");
+            replay
+                .marks
+                .create_zero(&alice_id(), old.key, later_created)
+                .await
+                .expect("later zero mark");
+        }
+        txn.commit().await.expect("release lock");
+    });
+    assert_eq!(
+        answer.status,
+        409,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(body(&answer)["code"], "conflict");
+    assert_eq!(
+        body(&answer)["current"],
+        json!({"created": pubky_switch_core::time::rfc3339(later_created)})
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    let mark = mark_of(&replay).await;
+    assert_eq!(mark.created_at_ms, later_created);
+    assert_eq!(mark.seq, if lost_sql { old.seq } else { 0 });
+    let stored = replay.db.store().lookup(&alice_id()).await.expect("lookup");
+    if lost_sql {
+        assert!(stored.is_none());
+    } else {
+        let stored = stored.expect("older SQL retained");
+        assert_eq!(stored.created_at_ms, old.created_at_ms);
+        assert_eq!(stored.chain, Some((old.seq, old.chain_hash)));
+    }
+    assert_eq!(
+        replay.marks.erasure(&alice_id()).await.expect("erasure"),
+        None
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_signer_waiting_for_later_zero_mark_keeps_creation_binding() {
+    Box::pin(signer_waiting_for_later_mark(false)).await;
+}
+
+#[tokio::test]
+async fn test_signer_waiting_for_lost_row_keeps_creation_binding() {
+    Box::pin(signer_waiting_for_later_mark(true)).await;
 }

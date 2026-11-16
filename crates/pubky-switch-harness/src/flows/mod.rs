@@ -383,7 +383,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
 /// that has no flow here, and when a flow named here doesn't send its call.
 pub fn flow_of(call: &Call) -> Option<&'static str> {
     match call {
-        Call::Enroll | Call::PutIdentity | Call::GetIdentity | Call::GetApps => Some("enrollment"),
+        Call::GetAccount | Call::Enroll | Call::PutIdentity | Call::GetIdentity | Call::GetApps => {
+            Some("enrollment")
+        }
         Call::Ops | Call::Feed | Call::GetKeys(_) | Call::GetAllow => Some("join"),
         Call::Append | Call::PutPeers | Call::Directory => Some("messaging"),
         Call::GetClaim(_) => Some("claim"),

@@ -130,6 +130,26 @@ fn header_of(r: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A label's fixed case, produced by the document, envelope or HTTP generator.
+pub(super) fn generated_case(label: &str, names: &[&str], fields: &[&[u8]], signature: &[u8; 64]) {
+    assert_eq!(names.len(), fields.len());
+    let signatures = load("signatures.json");
+    let index = arr(&signatures, "signatures")
+        .iter()
+        .position(|c| c["label"] == label)
+        .unwrap();
+    let mut held = arr(&signatures, "signatures")[index].clone();
+    held["fields"] = names
+        .iter()
+        .zip(fields)
+        .map(|(name, field)| serde_json::json!({ "hex": hex::encode(field), "name": name }))
+        .collect();
+    held["signature"] = Value::String(pubky_switch_core::enc::b64(signature));
+    held["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(label, fields)));
+    let pointer = format!("/signatures/{index}");
+    generated("signatures.json", &[(Place::Element(&pointer), held)]);
+}
+
 /// The fields of a signature, rebuilt from the vector object that carries it rather than
 /// from the hex the case lists.
 fn independent_fields(label: &str, signature: &str) -> Vec<Vec<u8>> {
@@ -243,6 +263,7 @@ fn independent_fields(label: &str, signature: &str) -> Vec<Vec<u8>> {
                     app: header_of(&r, http::header::APP),
                     cert: header_of(&r, http::header::CERT),
                     invite_code: header_of(&r, http::header::INVITE_CODE),
+                    created: header_of(&r, http::header::CREATED),
                 };
                 http::request_fields(&target, &headers)
             }

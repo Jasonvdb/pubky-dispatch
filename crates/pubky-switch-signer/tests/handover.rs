@@ -1653,6 +1653,7 @@ fn backup_of(world: &World, doc: &IdentityDoc) -> Vec<u8> {
     let records = SignerRecords::new(
         world.key.clone(),
         doc.clone(),
+        world.backup().account_created(),
         held.revoked_apps(),
         held.certs(),
         *held.limits(),

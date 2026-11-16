@@ -34,6 +34,7 @@ mod claim_codec;
 mod connect;
 mod documents;
 mod enrollments;
+pub use enrollments::EnrollmentReceipt;
 mod erasure;
 mod feed;
 mod handover;
@@ -496,7 +497,7 @@ impl Store {
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
             "SELECT generation, chain_seq, chain_hash, stamped_time_ms, created_at_ms, \
-             identity_doc FROM accounts WHERE id = $1",
+             identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -518,6 +519,10 @@ impl Store {
         };
         let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
         Ok(Some(FoundAccount {
+            activation: pubky_switch_core::records::AccountActivation::parse(
+                row.try_get("activation_requirement")?,
+            )
+            .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
             generation: from_db(row.try_get("generation")?, "generation")?,
             chain,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
@@ -747,6 +752,8 @@ async fn connect_first(
 /// An account found by [`Store::lookup`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoundAccount {
+    /// The persisted activation requirement of the selected account lifetime.
+    pub activation: pubky_switch_core::records::AccountActivation,
     /// The generation it holds.
     pub generation: u64,
     /// Its newest chain item's `seq` and the chain hash there; `None` before the first.

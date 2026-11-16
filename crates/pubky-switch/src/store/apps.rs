@@ -18,6 +18,8 @@ pub enum KeptReason {
     Departed,
     /// An enrollment's `revoked_apps` named it.
     Enrolled,
+    /// A verified identity document excludes it, without a known local event.
+    Document,
 }
 
 /// An App ID the account keeps for good.
@@ -27,8 +29,8 @@ pub struct KeptAppId {
     pub app_id: [u8; 16],
     /// Why.
     pub reason: KeptReason,
-    /// When it was revoked or departed, or the enrollment that named it.
-    pub at_ms: u64,
+    /// The local event's time; absent only for a document-derived exclusion.
+    pub at_ms: Option<u64>,
     /// The newest document's data epoch then, which its rotation goes above; `None` for an
     /// enrollment's.
     pub data_epoch: Option<u64>,
@@ -97,8 +99,29 @@ fn reason(text: &str) -> Result<KeptReason, StoreError> {
         "revoked" => Ok(KeptReason::Revoked),
         "departed" => Ok(KeptReason::Departed),
         "enrolled" => Ok(KeptReason::Enrolled),
+        "document" => Ok(KeptReason::Document),
         _ => Err(StoreError::Corrupt("a kept App ID's reason")),
     }
+}
+
+/// Preserve verified document exclusions without assigning a local event to them.
+pub(super) async fn note_removed(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    doc: &IdentityDoc,
+) -> Result<(), StoreError> {
+    for removed in &doc.body().removed {
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason) \
+             VALUES ($1, $2, 'document') ON CONFLICT DO NOTHING",
+        )
+        .bind(account)
+        .bind(removed.app_id.as_slice())
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::from_db)?;
+    }
+    Ok(())
 }
 
 /// Record that `doc` lists each of `apps` for the first time: their `keys_through` starts at
@@ -222,12 +245,20 @@ impl AccountTxn {
             let app: Vec<u8> = row.try_get("app_id")?;
             let reason_text: String = row.try_get("reason")?;
             let data_epoch: Option<i64> = row.try_get("data_epoch")?;
+            let reason = reason(&reason_text)?;
+            let at: Option<i64> = row.try_get("at_ms")?;
+            let rotated: bool = row.try_get("rotated")?;
+            if (reason == KeptReason::Document) != at.is_none()
+                || (reason == KeptReason::Document && (data_epoch.is_some() || rotated))
+            {
+                return Err(StoreError::Corrupt("a kept App ID's event provenance"));
+            }
             kept.push(KeptAppId {
                 app_id: app_id(&app)?,
-                reason: reason(&reason_text)?,
-                at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
+                reason,
+                at_ms: at.map(|at| from_db(at, "at_ms")).transpose()?,
                 data_epoch: data_epoch.map(|e| from_db(e, "data_epoch")).transpose()?,
-                rotated: row.try_get("rotated")?,
+                rotated,
             });
         }
         Ok(kept)

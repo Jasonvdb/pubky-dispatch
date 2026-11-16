@@ -358,6 +358,62 @@ impl World {
         (signer, store)
     }
 
+    /// The real signer transport, optionally bound to an established account.
+    pub fn signer_client(&self, created: Option<u64>) -> pubky_switch_client::SwitchClient {
+        let client = pubky_switch_client::SwitchClient::new(
+            SWITCH_ORIGIN,
+            self.key.public(),
+            pubky_switch_client::Credentials::Signer {
+                identity: self.key.public(),
+                key: Arc::new(self.key.clone()),
+            },
+            Some(self.switch.service_key()),
+            self.transport.clone(),
+            self.clock.clone(),
+        )
+        .unwrap();
+        match created {
+            Some(created) => client.with_account_created(created).unwrap(),
+            None => client,
+        }
+    }
+
+    /// Erase through the authenticated endpoint, then create a distinct staged account.
+    pub async fn create_after_erasure(&self) -> u64 {
+        use pubky_switch_core::records::{
+            Enrollment, EnrollmentBody, EnrollmentIntent, IdentityPolicy,
+        };
+        let created = self.switch.created();
+        let following = self.switch.identity_doc().as_ref().map(IdentityDoc::hash);
+        self.signer_client(Some(created))
+            .erase(Some(created), following)
+            .await
+            .unwrap();
+        self.clock.advance_ms(1000);
+        let client = self.signer_client(None);
+        let observation = client.observe_account().await.unwrap();
+        assert_eq!(observation.body().created, None);
+        let enrollment = Enrollment::sign(
+            &self.key,
+            EnrollmentBody {
+                identity: self.key.public(),
+                origin: SWITCH_ORIGIN.into(),
+                nonce: [80; 16],
+                intent: EnrollmentIntent::Create {
+                    observation: observation.carried().clone(),
+                },
+                policy: IdentityPolicy::default(),
+                identity_doc: None,
+                revoked_apps: None,
+            },
+        )
+        .unwrap();
+        let answer = client.enroll(&enrollment).await.unwrap();
+        assert!(answer.created > created);
+        assert!(self.switch.identity_doc().is_none());
+        answer.created
+    }
+
     /// The backup on the Homeserver, opened.
     pub fn backup(&self) -> SignerRecords {
         let bytes = self.homeserver.file(SIGNER_BACKUP_PATH).expect("a backup");

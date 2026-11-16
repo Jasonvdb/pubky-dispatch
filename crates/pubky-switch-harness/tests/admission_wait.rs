@@ -23,7 +23,7 @@ struct Admission {
 }
 impl Protocol for Admission {
     fn name(&self) -> String {
-        "tasks".into()
+        "notes".into()
     }
     fn has_keys(&self, scope: &str) -> bool {
         self.base.has_keys(scope)
@@ -144,7 +144,7 @@ async fn flow(world: &World) -> Vec<u8> {
         "the incoming transition enforces the sender bound on both services"
     );
     assert_eq!(
-        wallet.protocol_get("tasks", b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         None,
         "admission commits no callback-staged local effect"
     );
@@ -159,7 +159,7 @@ async fn flow(world: &World) -> Vec<u8> {
     assert_eq!(Some(notices[0].1.clone()), first);
     wallet
         .ack_event_with(
-            "tasks",
+            "notes",
             notices[0].0,
             &[LocalWrite::Put {
                 key: b"handled".to_vec(),
@@ -178,7 +178,7 @@ async fn flow(world: &World) -> Vec<u8> {
     .await
     .unwrap();
     assert_eq!(
-        restored.protocol_get("tasks", b"handled").await.unwrap(),
+        restored.protocol_get("notes", b"handled").await.unwrap(),
         Some(vec![1])
     );
     assert_eq!(restored.parked_entries().await.unwrap().len(), 64);
@@ -200,7 +200,7 @@ async fn flow(world: &World) -> Vec<u8> {
         "completion retires all admitted custody"
     );
     let completed = restored
-        .protocol_get("tasks", b"completed")
+        .protocol_get("notes", b"completed")
         .await
         .unwrap()
         .unwrap();

@@ -4341,4 +4341,162 @@ mod tests {
             "retirement includes the release-ended notice and deletions"
         );
     }
+
+    struct OwnerEffect(crate::testing::TestProtocol);
+
+    impl super::super::Protocol for OwnerEffect {
+        fn name(&self) -> String {
+            self.0.name()
+        }
+        fn has_keys(&self, scope: &str) -> bool {
+            self.0.has_keys(scope)
+        }
+        fn sent_between_own_apps(&self, kind: &str) -> bool {
+            self.0.sent_between_own_apps(kind)
+        }
+        fn check_scopes(
+            &self,
+            message: &pubky_switch_core::message::Message,
+            sender: &pubky_switch_core::records::AppCert,
+            own: &pubky_switch_core::records::AppCert,
+        ) -> Result<(), String> {
+            self.0.check_scopes(message, sender, own)
+        }
+        fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+            self.0.accepts(cert)
+        }
+        fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+            self.0.check_body(message)
+        }
+        fn missed(
+            &self,
+            missed: &super::super::MissedEntries,
+        ) -> Result<Vec<LocalWrite>, StoreFailure> {
+            self.0.missed(missed)
+        }
+        fn resend_needed(
+            &self,
+            needed: &super::super::ResendNeeded,
+        ) -> Result<Vec<LocalWrite>, StoreFailure> {
+            self.0.resend_needed(needed)
+        }
+        fn receive(&self, message: &ReceivedMessage, _: &mut ReceiveContext<'_>) -> Outcome {
+            Outcome::Apply(Effect {
+                ops: vec![(
+                    Vec::new(),
+                    pubky_switch_core::ops::OpKind::AllowPut {
+                        pubky: message.sender,
+                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                    },
+                )],
+                local: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_processed_copy_reservation_keeps_long_owner_and_refuses_roster_change() {
+        use crate::app::{Protocol, ProtocolSet};
+        use crate::store::StateStore;
+        use crate::testing::{ProtocolSpec, TestProtocol};
+        use std::sync::Arc;
+        let world = World::new();
+        let name = "a".repeat(32);
+        let kind = format!("{name}.item");
+        let owner = Arc::new(OwnerEffect(TestProtocol::new(ProtocolSpec {
+            name: name.clone(),
+            accepts: vec![kind.clone()],
+            ..ProtocolSpec::default()
+        })));
+        let request = world.approve(&crate::app::tests::app_keys("wallet"), &[&name]);
+        let mut app = App::join(world.env(), owner.clone(), World::config(), request)
+            .await
+            .unwrap();
+        let (seq, message) = world
+            .switch
+            .send(
+                &world.bob,
+                &world.bob_keys,
+                &world.bob_cert,
+                &kind,
+                serde_json::json!({}),
+                &[app.app_id()],
+            )
+            .unwrap();
+        world
+            .switch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        world.clock.advance_ms(31 * DAY_MS);
+        world.switch.lock().batches.clear();
+        app.receive(None).await.unwrap();
+        let id = app.stored_id_at(seq).unwrap();
+        let entry = app
+            .parked_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.stored_id == id)
+            .unwrap();
+        assert_eq!(entry.reason, ParkReason::Uncertain);
+        let reserved = app
+            .retirement_bytes(&world.bob.public(), &message.msg_id, None)
+            .unwrap();
+        let me = app.app_id();
+        drop(app);
+        let other = Arc::new(TestProtocol::new(ProtocolSpec {
+            name: "another".into(),
+            ..ProtocolSpec::default()
+        }));
+        let protocols = ProtocolSet::new(vec![owner.clone() as Arc<dyn Protocol>, other]).unwrap();
+        let before = world
+            .store
+            .scan(&crate::store::client_namespace(&me), b"", None, u32::MAX)
+            .unwrap();
+        assert!(
+            matches!(
+                App::load(world.env(), protocols, World::config(), me).await,
+                Err(AppError::Refused(Refusal::Usage(_)))
+            ),
+            "load cannot grow an unresolved outcome by adding recipients"
+        );
+        assert_eq!(
+            world
+                .store
+                .scan(&crate::store::client_namespace(&me), b"", None, u32::MAX)
+                .unwrap(),
+            before
+        );
+        let mut app = App::load(world.env(), owner, World::config(), me)
+            .await
+            .unwrap();
+        app.release_parked(id, &entry.hash).await.unwrap();
+        let mut tx = app.tx().unwrap();
+        app.retire_processed(
+            &world.bob.public(),
+            &message.msg_id,
+            entry.hash,
+            None,
+            &mut tx,
+        )
+        .unwrap();
+        assert!(
+            reserved >= tx.size(),
+            "the original reservation covers the encoded owner and later release"
+        );
+        app.commit(tx).await.unwrap();
+        let events = app.unacknowledged_events().await.unwrap();
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                AppEvent::ReleasedDuplicate { id, .. } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            app.event_owners(id).unwrap(),
+            [name],
+            "new registration cannot enlarge the retained input's owner set"
+        );
+    }
 }

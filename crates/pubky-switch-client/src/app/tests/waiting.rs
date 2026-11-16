@@ -41,7 +41,7 @@ impl Admission {
 
 impl Protocol for Admission {
     fn name(&self) -> String {
-        "tasks".into()
+        "sample".into()
     }
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
@@ -76,11 +76,11 @@ impl Protocol for Admission {
             return self.sample.receive(m, cx);
         }
         if let Mode::Key(data_epoch) = *self.mode.lock().unwrap()
-            && !cx.holds_scope_key("scope-a", data_epoch)
+            && !cx.holds_scope_key("sample-a", data_epoch)
         {
             return Outcome::AwaitKey { data_epoch };
         }
-        if m.message.body["text"] == "key" && !cx.holds_scope_key("scope-a", 2) {
+        if m.message.body["text"] == "key" && !cx.holds_scope_key("sample-a", 2) {
             return Outcome::AwaitKey { data_epoch: 2 };
         }
         if let Some(id) = m.message.body.get("forget").and_then(Value::as_str) {
@@ -145,7 +145,7 @@ impl Protocol for Admission {
 }
 
 async fn wallet(w: &World, p: &Arc<Admission>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env(), p.clone(), World::config(), request)
         .await
         .unwrap();
@@ -213,7 +213,9 @@ async fn test_admission_discards_staged_effects_and_allows_independent_progress(
         "admission discards even the staged local-bound marker"
     );
     assert_eq!(
-        app.protocol_get("tasks", b"admission-write").await.unwrap(),
+        app.protocol_get("sample", b"admission-write")
+            .await
+            .unwrap(),
         None,
         "admission commits no staged local write"
     );
@@ -250,7 +252,9 @@ async fn test_admission_discards_the_context_missing_key_marker() {
         "admission discards the staged missing-key marker"
     );
     assert_eq!(
-        app.protocol_get("tasks", b"admission-write").await.unwrap(),
+        app.protocol_get("sample", b"admission-write")
+            .await
+            .unwrap(),
         None
     );
     assert!(!pair(&app, &w, &message).await);
@@ -393,12 +397,12 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
                 value: vec![1],
             }];
             assert!(
-                app.ack_event_with("tasks", id, &local).await.is_err(),
+                app.ack_event_with("sample", id, &local).await.is_err(),
                 "inspection/loading is not delivery"
             );
             app.unacknowledged_events().await.unwrap();
             assert!(
-                app.ack_event_with("tasks", id, &local).await.is_err(),
+                app.ack_event_with("sample", id, &local).await.is_err(),
                 "the selected commit fault is reached"
             );
             if reload {
@@ -409,7 +413,7 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
             }
             let kept = app.unacknowledged_events().await.unwrap();
             assert_eq!(
-                app.protocol_get("tasks", b"handled").await.unwrap(),
+                app.protocol_get("sample", b"handled").await.unwrap(),
                 after.then_some(vec![1]),
                 "local handling and exact acknowledgment have the same durable outcome"
             );
@@ -419,18 +423,20 @@ async fn test_admission_acknowledgment_is_exact_atomic_and_never_absence_success
             );
             assert_eq!(kept.iter().any(|e| e.id() == Some(id)), !after);
             if !after {
-                app.ack_event_with("tasks", id, &local).await.unwrap();
+                app.ack_event_with("sample", id, &local).await.unwrap();
             }
             let replacement = [LocalWrite::Put {
                 key: b"handled".to_vec(),
                 value: vec![2],
             }];
             assert!(
-                app.ack_event_with("tasks", id, &replacement).await.is_err(),
+                app.ack_event_with("sample", id, &replacement)
+                    .await
+                    .is_err(),
                 "an absent event always refuses"
             );
             assert_eq!(
-                app.protocol_get("tasks", b"handled").await.unwrap(),
+                app.protocol_get("sample", b"handled").await.unwrap(),
                 Some(vec![1])
             );
         }
@@ -551,8 +557,8 @@ impl StateStore for CustodyFault {
         let custody = batch.writes().iter().any(|write| {
             matches!(write,
             crate::store::Write::Put { key, value, .. } if key.starts_with(b"duty/")
-                && crate::app::state::decode::<crate::app::events::Duty>(value).is_ok_and(|duty|
-                    matches!(duty, crate::app::events::Duty::StoredEntryDropped { .. })))
+                && crate::app::state::decode::<crate::app::events::KeptDuty>(value).is_ok_and(|duty|
+                    matches!(duty.duty, crate::app::events::Duty::StoredEntryDropped { .. })))
         });
         if custody && self.armed.load(Ordering::SeqCst) && !self.fired.swap(true, Ordering::SeqCst)
         {
@@ -580,8 +586,8 @@ impl StateStore for CustodyFault {
         let custody = batch.writes().iter().any(|write| {
             matches!(write,
             crate::store::Write::Put { key, value, .. } if key.starts_with(b"duty/")
-                && crate::app::state::decode::<crate::app::events::Duty>(value).is_ok_and(|duty|
-                    matches!(duty, crate::app::events::Duty::StoredEntryDropped { .. })))
+                && crate::app::state::decode::<crate::app::events::KeptDuty>(value).is_ok_and(|duty|
+                    matches!(duty.duty, crate::app::events::Duty::StoredEntryDropped { .. })))
         });
         if custody && self.armed.load(Ordering::SeqCst) && !self.fired.swap(true, Ordering::SeqCst)
         {
@@ -609,7 +615,7 @@ async fn test_admission_custody_failure_keeps_payload_notice_and_cursor_atomic()
                 armed: AtomicBool::new(false),
                 fired: AtomicBool::new(false),
             });
-            let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+            let request = w.approve(&app_keys("wallet"), &["sample-a"]);
             let mut app = App::join(w.env_on(store.clone()), p.clone(), World::config(), request)
                 .await
                 .unwrap();
@@ -677,14 +683,14 @@ async fn test_admission_acknowledgment_refusals_do_not_write_locals() {
         key: b"refused".to_vec(),
         value: vec![1; MAX_STEP_LOCAL_BYTES + 1],
     }];
-    assert!(app.ack_event_with("tasks", id, &huge).await.is_err());
+    assert!(app.ack_event_with("sample", id, &huge).await.is_err());
     let local = [LocalWrite::Put {
         key: b"refused".to_vec(),
         value: vec![1],
     }];
     let foreign = EventId::new([99; 16], id.counter());
-    assert!(app.ack_event_with("tasks", foreign, &local).await.is_err());
-    assert_eq!(app.protocol_get("tasks", b"refused").await.unwrap(), None);
+    assert!(app.ack_event_with("sample", foreign, &local).await.is_err());
+    assert_eq!(app.protocol_get("sample", b"refused").await.unwrap(), None);
     assert!(
         app.pending_duty_events()
             .await
@@ -758,14 +764,14 @@ async fn test_admission_restore_deduplicates_exact_notices_and_rejects_conflicts
         value: vec![1],
     }];
     restored
-        .ack_event_with("tasks", notices[0].0, &local)
+        .ack_event_with("sample", notices[0].0, &local)
         .await
         .unwrap();
     let mut replay = App::restore(w.env(), p.clone(), World::config(), &backup)
         .await
         .unwrap();
     assert_eq!(
-        replay.protocol_get("tasks", b"handled").await.unwrap(),
+        replay.protocol_get("sample", b"handled").await.unwrap(),
         None
     );
     assert_eq!(

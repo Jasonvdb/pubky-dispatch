@@ -28,7 +28,7 @@ struct Completing {
 
 impl Protocol for Completing {
     fn name(&self) -> String {
-        "tasks".into()
+        "notes".into()
     }
     fn has_keys(&self, scope: &str) -> bool {
         self.base.has_keys(scope)
@@ -178,7 +178,7 @@ async fn flow(world: &World) -> Vec<u8> {
         .unwrap();
     wallet.receive(None).await.unwrap();
     assert_eq!(
-        wallet.protocol_get("tasks", b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         Some(vec![1]),
         "feed local decision commits"
     );
@@ -196,14 +196,14 @@ async fn flow(world: &World) -> Vec<u8> {
     sender.resend(&current).await.unwrap();
     wallet.receive(None).await.unwrap();
     assert_eq!(
-        wallet.protocol_get("tasks", b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         Some(vec![2]),
         "consumed message is delivered after reload"
     );
     sender.resend(&prior).await.unwrap();
     wallet.receive(None).await.unwrap();
     assert_eq!(
-        wallet.protocol_get("tasks", b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         Some(vec![3]),
         "forgotten prior pair is delivered again"
     );
@@ -222,7 +222,7 @@ async fn flow(world: &World) -> Vec<u8> {
     protocol.mode.store(2, Ordering::SeqCst);
     wallet.receive(None).await.unwrap();
     assert_eq!(
-        wallet.protocol_get("tasks", b"completed").await.unwrap(),
+        wallet.protocol_get("notes", b"completed").await.unwrap(),
         Some(vec![4]),
         "stored decision commits"
     );
@@ -233,7 +233,7 @@ async fn flow(world: &World) -> Vec<u8> {
     sender.resend(&stored).await.unwrap();
     wallet.receive(None).await.unwrap();
     let result = wallet
-        .protocol_get("tasks", b"completed")
+        .protocol_get("notes", b"completed")
         .await
         .unwrap()
         .unwrap();
@@ -333,7 +333,7 @@ async fn duplicate_flow(world: &World) -> Vec<u8> {
         assert!(
             !wallet
                 .forget_processed(
-                    "tasks",
+                    "notes",
                     bob.public(),
                     &message,
                     &[LocalWrite::Put {
@@ -345,7 +345,7 @@ async fn duplicate_flow(world: &World) -> Vec<u8> {
                 .expect("absent pair permits local decision")
         );
         assert_eq!(
-            wallet.protocol_get("tasks", b"absent").await.unwrap(),
+            wallet.protocol_get("notes", b"absent").await.unwrap(),
             Some(b"kept".to_vec())
         );
         assert_eq!(wallet.parked_entries().await.unwrap(), stored);
@@ -390,7 +390,7 @@ async fn duplicate_flow(world: &World) -> Vec<u8> {
         assert!(
             wallet
                 .forget_processed(
-                    "tasks",
+                    "notes",
                     bob.public(),
                     &message,
                     &[LocalWrite::Delete {
@@ -403,14 +403,14 @@ async fn duplicate_flow(world: &World) -> Vec<u8> {
         );
         assert!(
             wallet
-                .protocol_get("tasks", b"absent")
+                .protocol_get("notes", b"absent")
                 .await
                 .unwrap()
                 .is_none()
         );
     }
     let result = wallet
-        .protocol_get("tasks", b"processed")
+        .protocol_get("notes", b"processed")
         .await
         .unwrap()
         .unwrap();

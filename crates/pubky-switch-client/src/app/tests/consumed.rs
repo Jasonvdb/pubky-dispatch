@@ -49,7 +49,7 @@ impl Consuming {
 
 impl Protocol for Consuming {
     fn name(&self) -> String {
-        "tasks".into()
+        "sample".into()
     }
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
@@ -140,7 +140,7 @@ impl Protocol for Consuming {
 }
 
 async fn wallet(w: &World, p: &Arc<Consuming>, store: Arc<dyn StateStore>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(w.env_on(store), p.clone(), World::config(), request)
         .await
         .unwrap();
@@ -180,7 +180,7 @@ async fn pair(app: &App, w: &World, m: &Message) -> bool {
 }
 
 async fn consumed(app: &App) -> Option<Vec<u8>> {
-    app.protocol_get("tasks", b"consumed").await.unwrap()
+    app.protocol_get("sample", b"consumed").await.unwrap()
 }
 
 #[tokio::test]
@@ -208,14 +208,14 @@ async fn test_consume_feed_locals_forgets_and_resend() {
     );
     assert!(!pair(&app, &w, &old).await, "the prior pair is forgotten");
     assert_eq!(
-        app.protocol_get("tasks", format!("notes/{}", old.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", old.msg_id).as_bytes())
             .await
             .unwrap(),
         None
     );
     assert!(app.cursor().seq >= copy);
     assert_eq!(
-        app.protocol_get("tasks", key::CURSOR.as_bytes())
+        app.protocol_get("sample", key::CURSOR.as_bytes())
             .await
             .unwrap(),
         Some(b"local".to_vec())
@@ -367,7 +367,7 @@ async fn test_consume_commit_failure_keeps_locals_pairs_and_stored_retry_togethe
         }
         let id = app.stored_id_at(seq);
         p.set(Mode::Consume);
-        fault.fail_put_once(b"p/tasks/consumed");
+        fault.fail_put_once(b"p/sample/consumed");
         assert!(app.receive(None).await.is_err());
         assert_eq!(consumed(&app).await, None);
         assert!(
@@ -413,7 +413,7 @@ async fn test_consume_local_bound_is_atomic() {
             + usize::from(over);
         let (seq, message) = note(&w, &app, json!({"text":"sized", "bytes":bytes}));
         app.receive(None).await.unwrap();
-        let value = app.protocol_get("tasks", b"sized").await.unwrap();
+        let value = app.protocol_get("sample", b"sized").await.unwrap();
         if over {
             assert_eq!(
                 value, None,
@@ -455,7 +455,7 @@ impl StateStore for CompletionFailure {
     fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         let completion = batch.writes().iter().any(
-            |w| matches!(w, crate::store::Write::Put { key, .. } if key == b"p/tasks/consumed"),
+            |w| matches!(w, crate::store::Write::Put { key, .. } if key == b"p/sample/consumed"),
         );
         if completion && !self.fired.swap(true, Ordering::SeqCst) {
             if self.after {
@@ -483,7 +483,7 @@ impl StateStore for CompletionFailure {
     ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
         use std::sync::atomic::Ordering;
         let completion = batch.writes().iter().any(
-            |w| matches!(w, crate::store::Write::Put { key, .. } if key == b"p/tasks/consumed"),
+            |w| matches!(w, crate::store::Write::Put { key, .. } if key == b"p/sample/consumed"),
         );
         if completion && !self.fired.swap(true, Ordering::SeqCst) {
             if self.after {

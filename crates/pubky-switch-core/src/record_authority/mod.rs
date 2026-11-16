@@ -5,11 +5,14 @@
 //! initial authority, certificate standing, continuity or recovery completeness. A reader
 //! also needs the request-bound current response and the complete record lineage checks
 //! (Switch record lineage 4). These types do not perform account state transitions.
+//! The recovery witness model proposes cursor/completion changes without committing them;
+//! it does not establish record absence or enable an operation or endpoint.
 
 mod lineage;
 mod lineage_statement;
 mod origin;
 mod policy;
+mod recovery;
 mod reference;
 mod statement;
 
@@ -25,6 +28,9 @@ pub use origin::{
     initial_value_hash,
 };
 pub use policy::{ChildDeclaration, OriginDeclaration, ProtectedPolicy, Protection};
+pub use recovery::{
+    RecordRecovery, RecoveryBarrier, RecoveryCursor, RecoveryCursorProposal, WitnessExclusions,
+};
 pub use reference::ApplicationRef;
 pub use statement::{
     MAX_ORIGIN_OBJECT_BYTES, MAX_ORIGIN_STATEMENT_BYTES, OriginEvidence, OriginStatement,

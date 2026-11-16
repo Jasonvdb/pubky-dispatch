@@ -32,10 +32,14 @@
 //! - **Listing** runs at join, after a restore, after a `missed` item, and after a certificate
 //!   taken that reads a collection the one before didn't (Switch spec 8.2, 8.3).
 
+mod collection;
+
+pub use collection::{Collection, PolicyFamily, RecordTarget};
+
 use pubky_switch_core::chain::{ChainEnvelope, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ident::{Policy, collection_id, record_key_from_blinded};
+use pubky_switch_core::ident::{Policy, record_key_from_blinded};
 use pubky_switch_core::ops::{Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp};
 use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, Standing};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
@@ -219,175 +223,6 @@ fn cert_key(app_id: &[u8; 16], cert_hash: &[u8; 32]) -> String {
         pubky_switch_core::enc::zbase32_encode(app_id),
         b64(cert_hash)
     )
-}
-
-/// Which policies a collection's records may have (Switch spec 3.3, 10.3).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PolicyFamily {
-    /// The fixed policy alone.
-    #[default]
-    Fixed,
-    /// The fixed policy, whose read scope is a name, and one policy per sub-scope of that
-    /// name: for `<sub>`, the read scope `<name>:<sub>`, and the write scopes with `<name>`
-    /// narrowed to `<name>:<sub>` and the others kept. An app holding `<name>` reads every
-    /// member, one holding only `<name>:<sub>` its own (Switch spec 3.3, 8.2).
-    SubScopes,
-}
-
-/// A collection of a protocol and its fixed policy (Switch spec 10.3). The collection name
-/// is the protocol's opaque string. One name may come with several policies, such as one per
-/// sub-scope: either each as a collection of its own here, or as one collection with the
-/// family [`PolicyFamily::SubScopes`], which lists and reads every member the app holds
-/// the read scope of.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Collection {
-    /// The collection name.
-    pub name: String,
-    /// The fixed policy; with [`PolicyFamily::SubScopes`], the name scope's.
-    pub policy: Policy,
-    /// The policies besides the fixed one.
-    pub family: PolicyFamily,
-}
-
-impl Collection {
-    /// A collection with its fixed policy alone.
-    pub fn new(name: &str, policy: Policy) -> Self {
-        Self {
-            name: name.to_owned(),
-            policy,
-            family: PolicyFamily::Fixed,
-        }
-    }
-
-    /// A collection with the name scope's `policy` and one policy per sub-scope
-    /// ([`PolicyFamily::SubScopes`]).
-    pub fn with_sub_scopes(name: &str, policy: Policy) -> Self {
-        Self {
-            name: name.to_owned(),
-            policy,
-            family: PolicyFamily::SubScopes,
-        }
-    }
-
-    /// The collection ID of `identity` (Switch spec 13.3).
-    pub fn id(&self, identity: &[u8; 32]) -> [u8; 32] {
-        collection_id(&self.name, identity)
-    }
-
-    /// The policy of sub-scope `sub` ([`PolicyFamily::SubScopes`]).
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Usage`] for a collection without sub-scope policies, a fixed read scope
-    /// that isn't a name, or a `sub` that isn't a sub-scope (Switch spec 3.3).
-    pub fn sub_scope_policy(&self, sub: &str) -> Result<Policy, AppError> {
-        let name = self.policy.read_scope.as_str();
-        if self.family != PolicyFamily::SubScopes
-            || !pubky_switch_core::scopes::is_name(name)
-            || !pubky_switch_core::scopes::is_sub(sub)
-        {
-            return Err(Refusal::Usage(
-                "Switch spec 3.3: no sub-scope policy of this collection for that sub-scope".into(),
-            )
-            .into());
-        }
-        let narrowed = format!("{name}:{sub}");
-        let writes: Vec<&str> = self
-            .policy
-            .write_scopes
-            .iter()
-            .map(|scope| {
-                if scope == name {
-                    narrowed.as_str()
-                } else {
-                    scope.as_str()
-                }
-            })
-            .collect();
-        Ok(Policy::new(&narrowed, &writes))
-    }
-
-    /// The collection of sub-scope `sub` alone: its records, read and written under that
-    /// sub-scope's policy, for a [`RecordTarget`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Collection::sub_scope_policy`].
-    pub fn sub_scope(&self, sub: &str) -> Result<Collection, AppError> {
-        Ok(Collection::new(&self.name, self.sub_scope_policy(sub)?))
-    }
-
-    /// Which member of the family `policy` is: `Some(None)` for the fixed policy,
-    /// `Some(Some(sub))` for the policy of sub-scope `sub`, `None` for a policy the
-    /// collection doesn't have.
-    pub fn member(&self, policy: &Policy) -> Option<Option<String>> {
-        if *policy == self.policy {
-            return Some(None);
-        }
-        if self.family != PolicyFamily::SubScopes {
-            return None;
-        }
-        let (name, sub) = pubky_switch_core::scopes::split(&policy.read_scope)?;
-        let sub = sub?;
-        if name != self.policy.read_scope {
-            return None;
-        }
-        let expected = self.sub_scope_policy(sub).ok()?;
-        (expected == *policy).then(|| Some(sub.to_owned()))
-    }
-
-    /// Whether a record may have `policy` in this collection.
-    pub fn admits(&self, policy: &Policy) -> bool {
-        self.member(policy).is_some()
-    }
-
-    /// Whether a certificate scope `scope` reads a member of the collection: its read
-    /// scope, or, in a sub-scope family, one of its sub-scopes (Switch spec 3.3, 10.3).
-    pub(crate) fn read_by_scope(&self, scope: &str) -> bool {
-        scope == self.policy.read_scope
-            || (self.family == PolicyFamily::SubScopes
-                && pubky_switch_core::scopes::split(scope)
-                    .is_some_and(|(name, sub)| sub.is_some() && name == self.policy.read_scope))
-    }
-
-    /// Whether a certificate holds the read scope of any member, so its app lists the
-    /// collection (Switch spec 8.3).
-    pub fn readable_by(&self, cert: &AppCert) -> bool {
-        if cert.holds_scope(&self.policy.read_scope) {
-            return true;
-        }
-        self.family == PolicyFamily::SubScopes
-            && cert.scopes().iter().any(|scope| {
-                pubky_switch_core::scopes::split(scope)
-                    .is_some_and(|(name, sub)| sub.is_some() && name == self.policy.read_scope)
-            })
-    }
-}
-
-/// A record by its collection and natural key, which the naming key blinds (Switch spec
-/// 13.3). Its `Debug` shows no natural key.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RecordTarget {
-    /// The collection and its fixed policy.
-    pub collection: Collection,
-    /// The natural key, the protocol's bytes.
-    pub natural_key: Vec<u8>,
-}
-
-impl std::fmt::Debug for RecordTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RecordTarget({}, ..)", self.collection.name)
-    }
-}
-
-impl RecordTarget {
-    /// The record of `natural_key` in `collection`.
-    pub fn new(collection: Collection, natural_key: &[u8]) -> Self {
-        Self {
-            collection,
-            natural_key: natural_key.to_vec(),
-        }
-    }
 }
 
 /// What a record holds, as the app reads it. Its `Debug` shows only the size.
@@ -1999,17 +1834,6 @@ impl App {
         }))
     }
 
-    /// The protocol's collection a write names, by its collection ID and a policy of the
-    /// collection's family: the member it names.
-    fn collection_of(&self, put: &RecordPut) -> Option<Collection> {
-        let identity = self.state.meta.identity;
-        self.protocol
-            .collections()
-            .into_iter()
-            .find(|c| c.id(&identity) == put.collection && c.admits(&put.policy))
-            .map(|c| Collection::new(&c.name, put.policy.clone()))
-    }
-
     /// The writer's certificates whose key verifies the operation: the record view's, and
     /// those the app knows, its own and the ones kept from the directory and the feed,
     /// those `tx` keeps included; the own directory is read again once for a writer the app
@@ -2700,13 +2524,6 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(&pending_name_key(key), &collection.name)?;
         self.commit(tx).await
-    }
-
-    pub(crate) fn collection_of_name(&self, collection: &Collection) -> bool {
-        self.protocol
-            .collections()
-            .iter()
-            .any(|c| c.name == collection.name && c.admits(&collection.policy))
     }
 }
 

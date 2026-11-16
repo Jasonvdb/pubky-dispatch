@@ -37,10 +37,13 @@ pub enum SignerError {
     /// The host's store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The signer's own records in the store don't read: they are corrupt or of another
-    /// version.
-    #[error("the signer's records don't read: {0}")]
-    Records(String),
+    /// Reading or constructing the signer's local records failed.
+    #[error("signer records: {0}")]
+    Records(#[from] RecordsFault),
+    /// A signed artifact kept in the signer's records no longer verifies or parses.
+    /// This is distinct from invalid caller input or an invalid network answer.
+    #[error("stored signer data: {0}")]
+    StoredData(#[source] pubky_switch_core::Error),
     /// Another install is the identity's signer, as the newest `identity.json` or the backup
     /// names it, so this one signs nothing until the user has it take over (Switch spec 4.3,
     /// 12.8).
@@ -62,6 +65,52 @@ pub enum SignerError {
         /// The signer ID the switch's copy names.
         install: [u8; 16],
     },
+}
+
+/// Which of the signer's two atomic local records could not be decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerRecord {
+    /// The signer's state.
+    State,
+    /// The exact flow kept for retry.
+    Flow,
+}
+
+/// A failure of the signer's local record format or of constructing its next write.
+///
+/// A failed host read or commit is instead [`SignerError::Store`]. A refused write or
+/// internal invariant does not mean the existing records can be discarded.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecordsFault {
+    /// A current local record could not be decoded. No stored value appears in the error.
+    #[error("{record:?} cannot be decoded at line {line} column {column}")]
+    Undecodable {
+        /// The record being read.
+        record: SignerRecord,
+        /// The decoder's one-based line.
+        line: usize,
+        /// The decoder's column.
+        column: usize,
+    },
+    /// The current state header is invalid.
+    #[error("invalid state header")]
+    InvalidHeader,
+    /// The state belongs to a different identity than its namespace.
+    #[error("state belongs to another identity")]
+    OtherIdentity,
+    /// A flow is present without the state committed together with it.
+    #[error("flow without state")]
+    Incomplete,
+    /// The bounded write batch refused a write before calling the host store.
+    #[error("{0}")]
+    WriteRefused(pubky_switch_client::store::BatchError),
+    /// Serializing a local record or signed artifact failed.
+    #[error("records cannot be encoded")]
+    Encode,
+    /// An internal requirement failed; this is not evidence of unreadable stored data.
+    #[error("{0}")]
+    Invariant(&'static str),
 }
 
 /// A body a version of `identity.json` must fit in (Switch wire 3.7, 7.1).
@@ -207,8 +256,8 @@ pub enum Refusal {
     #[error("refused: the erasure may have reached the switch")]
     ErasureUnanswered,
     /// The account looks erased: after a request in doubt, a check or a retry met an unsigned
-    /// `404` at `since_ms`, by the device clock, which may be the operator's and which nobody
-    /// can authenticate, and no answer the pinned key signs has come since. The erasure is
+    /// `404` at `since_ms`, by the device clock, which may be an intermediary's and which
+    /// nobody can authenticate, and no answer the pinned key signs has come since. The erasure is
     /// done at the first run 24 hours on that meets the `404` again; an answer the pinned key
     /// signs before that, an error included, ends the wait, and the next `404` starts it
     /// again (Switch wire 7.4.16, spec 12.7 step 5). No answer, and an unsigned answer other

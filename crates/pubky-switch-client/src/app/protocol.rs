@@ -91,10 +91,27 @@ pub struct OpaqueRule {
     pub member: String,
 }
 
+/// The original observation of an inbox input in a verified feed response (Switch spec
+/// 8.2). This is retained metadata, not a portable signed proof of acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntryReceipt {
+    /// The inbox entry's ID.
+    #[serde(with = "pubky_switch_core::enc::serde_b64")]
+    pub entry_id: [u8; 16],
+    /// The pinned service key that verified the feed response.
+    #[serde(with = "pubky_switch_core::enc::serde_b64")]
+    pub service_key: [u8; 32],
+    /// The time stamped on that response, in Unix milliseconds. A retained input keeps
+    /// this value through retries, reload and restore; a later answer does not replace it.
+    pub read_at_ms: u64,
+}
+
 /// A message that passed the recipient checks 1 to 9 (Switch wire 5.1), handed to the
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
+    /// The original verified feed observation of this input.
+    pub receipt: EntryReceipt,
     /// The `seq` the entry was read at, in [`ReceivedMessage::generation`]. A stored
     /// entry's handle is its local ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
@@ -519,12 +536,35 @@ pub enum Outcome {
     /// Only an entry read from the feed is passed so. For an entry stored locally
     /// ([`ReceivedMessage::parked`], a released one included) a `Pass` changes nothing: it
     /// stays stored, with what it counts, and is tried again at a later read; a protocol done
-    /// with it returns [`Outcome::Drop`]. No entry whose effect the app must keep is asked
-    /// about: one whose effect was applied is a duplicate before its receive step (check
+    /// with it returns [`Outcome::Drop`] or [`Outcome::Consume`]. No entry whose effect the
+    /// app must keep is asked about: one whose effect was applied is a duplicate before its receive step (check
     /// 9), and a kept effect goes again before the feed is read; after `409 conflict` on the
     /// effect's batch ([`ReceivedMessage::conflict`]) nothing of it was applied, so a `Pass`
     /// then passes the entry.
     Pass,
+    /// Consume this input and commit only the context's local writes and eligible forgets
+    /// of earlier processed pairs, atomically (Switch spec 11). No processed pair is added
+    /// for this message: a re-sent copy is delivered again. A feed entry is passed; a
+    /// stored input, including an eligible released input, is removed with its retry state.
+    /// Duties already owed remain owed. An unanswered or uncertain effect is never offered
+    /// to the receive step for this decision.
+    ///
+    /// No remote operation is part of this outcome. Operations added to the context are
+    /// discarded; only its local writes and forgets are used. They share the same
+    /// [`MAX_STEP_LOCAL_BYTES`] bound as an [`Outcome::Apply`], and an over-bound step is
+    /// stored and passed as too large without committing any of its local changes.
+    Consume,
+    /// This input has not been admitted because the protocol's ordinary retained-state
+    /// rule cannot remove its required victim (Switch spec 8.2). All operations, local
+    /// writes and processed-pair forgets staged by this callback are discarded. No pair
+    /// is added. Before its cursor passes, the input or its payload-free drop notice is
+    /// kept in the same transaction as the shared waiting-pool selection.
+    ///
+    /// Only this input enters custody; already admitted protocol payloads and protected
+    /// effects remain unchanged. A later scheduled retry runs the decision again against
+    /// current state, retaining the input's original receipt and storage order. This is
+    /// neither a storage failure nor an immediate request to repeat the read.
+    AwaitAdmission,
     /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
     /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
     /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data
@@ -809,9 +849,10 @@ pub trait Protocol: Send + Sync {
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. A protocol that needs
-    /// nothing of the app's state ignores `cx`. What `cx` added goes only with
-    /// [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an [`Outcome::Retry`],
-    /// an [`Outcome::Pass`] or an [`Outcome::AwaitKey`] discards it. After an
+    /// nothing of the app's state ignores `cx`. What `cx` added goes with
+    /// [`Outcome::Apply`], or its local writes and forgets alone with [`Outcome::Consume`];
+    /// an [`Outcome::Drop`], an [`Outcome::Need`], an [`Outcome::Retry`], an [`Outcome::Pass`]
+    /// or an [`Outcome::AwaitKey`] discards it. After an
     /// [`Outcome::Need`] the app reads what it names and calls this again, the answers in
     /// [`ReceiveContext::switch_claim`]. A step that can't finish because the protocol's
     /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`]: a read

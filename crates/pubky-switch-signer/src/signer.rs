@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::clock::Clock;
-use pubky_switch_client::store::StoreHandle;
+use pubky_switch_client::store::{OwnedStoreHandle, StoreHandle};
 use pubky_switch_client::transport::Transport;
 use pubky_switch_client::{ClientError, StoreError};
 use pubky_switch_core::enc::{pubky_id, random_bytes};
@@ -44,7 +44,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
 
 use crate::alert::{Alert, Source};
-use crate::error::{Refusal, Result, SignerError, SizedBody};
+use crate::error::{RecordsFault, Refusal, Result, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
 use crate::key::{BackupView, IdentityKeyring, SigningKey};
 use crate::protocol::Protocols;
@@ -72,6 +72,7 @@ pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use renewal::{CertChange, RunDue};
+pub use restore::RecordsDiscarded;
 pub use revocation::UserConfirmed;
 pub use takeover::ReceivingApp;
 
@@ -213,12 +214,13 @@ fn status_of(state: &SignerState) -> SignerStatus {
 
 /// The signer of one identity, on one install.
 pub struct Signer {
+    store: OwnedStoreHandle,
     env: SignerEnv,
     keyring: IdentityKeyring,
     state: SignerState,
     flow: Option<Flow>,
-    /// A commit answered that the store can't tell whether it applied: the records and the
-    /// flow are read again before the next step.
+    /// Set before a possibly committing await: cancellation or an ambiguous answer requires
+    /// the records and flow to be read again before the next step.
     unsure: bool,
     /// What the [`Signer::run_due`] in progress left because a bound cut it short.
     left: RunDue,
@@ -233,7 +235,10 @@ impl std::fmt::Debug for Signer {
         f.debug_struct("Signer")
             .field("identity", &pubky_id(&self.state.identity))
             .field("status", &self.status())
-            .field("high_water", &self.high_water().map(|h| h.version))
+            .field(
+                "high_water",
+                &self.high_water().map(|h| h.map(|mark| mark.version)),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -251,14 +256,18 @@ impl Signer {
     /// or random generator failure.
     pub async fn create(env: SignerEnv, keyring: IdentityKeyring, origin: &str) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::set_up(&env.store, &identity).await? {
+        let mut store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        if state::set_up(&store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
         let state = SignerState::new(identity, install);
         let enrollment = {
-            let key = gate::signing_key(&keyring, &state)?;
+            let key = gate::signing_key(&keyring, &state, &store)?;
             let body = EnrollmentBody {
                 identity,
                 origin: origin.to_owned(),
@@ -276,8 +285,9 @@ impl Signer {
             enrollment: enrollment.signed().clone(),
             policy,
         };
-        state::save(&env.store, &state, Some(&flow)).await?;
+        state::save(&mut store, &state, Some(&flow)).await?;
         Ok(Self {
+            store,
             env,
             keyring,
             state,
@@ -297,11 +307,25 @@ impl Signer {
     /// don't read, or the store's error.
     pub async fn open(env: SignerEnv, keyring: IdentityKeyring) -> Result<Self> {
         let identity = keyring.public_key();
-        let (state, flow) = state::load(&env.store, &identity)
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        Self::open_owned(env, keyring, store).await
+    }
+
+    async fn open_owned(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        store: OwnedStoreHandle,
+    ) -> Result<Self> {
+        let identity = keyring.public_key();
+        let (state, flow) = state::load(&store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
         let handed_over = state.handed_over_to;
         let mut signer = Self {
+            store,
             env,
             keyring,
             state,
@@ -519,18 +543,18 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`SignerError::InvalidData`] when the stored copy no longer verifies.
+    /// [`SignerError::StoredData`] when the stored copy no longer verifies.
     pub fn identity_doc(&self) -> Result<Option<IdentityDoc>> {
         self.state.newest_doc()
     }
 
     /// The high-water mark; `None` before the first delivery.
-    pub fn high_water(&self) -> Option<HighWater> {
-        self.state
-            .newest_doc()
-            .ok()
-            .flatten()
-            .map(|doc| HighWater::of(&doc))
+    ///
+    /// # Errors
+    ///
+    /// [`SignerError::StoredData`] when the stored newest document no longer verifies.
+    pub fn high_water(&self) -> Result<Option<HighWater>> {
+        Ok(self.state.newest_doc()?.map(|doc| HighWater::of(&doc)))
     }
 
     /// The alerts the user hasn't cleared, oldest first.
@@ -864,7 +888,9 @@ impl Signer {
             .version()
             .max(self.state.signed_through)
             .checked_add(1)
-            .ok_or_else(|| SignerError::Records("the version can't go higher".into()))?;
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the version can't go higher",
+            )))?;
         let mut body = base.body().clone();
         body.version = version;
         body.signer = self.state.install;
@@ -913,9 +939,10 @@ impl Signer {
     ) -> Result<()> {
         if flow.is_none() {
             // A flow that ended without its version delivered leaves no certificate or claim.
-            state.prune_unreferenced();
+            state.prune_unreferenced()?;
         }
-        match state::save(&self.env.store, &state, flow.as_ref()).await {
+        self.unsure = true;
+        match state::save(&mut self.store, &state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
                 self.flow = flow;
@@ -933,8 +960,9 @@ impl Signer {
 
     /// After a commit the store couldn't tell about, read the records and the flow again.
     async fn refresh(&mut self) -> Result<()> {
+        self.store.drain().await?;
         if self.unsure {
-            let (state, flow) = state::load(&self.env.store, &self.state.identity)
+            let (state, flow) = state::load(&self.store, &self.state.identity)
                 .await?
                 .ok_or(Refusal::NotSetUp)?;
             self.state = state;
@@ -948,18 +976,40 @@ impl Signer {
         Ok(())
     }
 
+    fn check_owned_state(&self) -> Result<()> {
+        self.store.ownership()?;
+        if self.unsure {
+            return Err(StoreError::Unknown.into());
+        }
+        Ok(())
+    }
+
+    async fn delete_records(&mut self) -> Result<()> {
+        self.unsure = true;
+        state::delete(&mut self.store, &self.state.identity).await?;
+        self.unsure = false;
+        Ok(())
+    }
+
     fn service(&self) -> Result<Service> {
         self.state
             .service
             .clone()
-            .ok_or_else(|| SignerError::Records("no switch before the enrollment".into()))
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "no switch before the enrollment",
+            )))
     }
 
     /// A client of the switch the identity is enrolled at, for requests: it signs no
     /// operation ([`crate::key::IdentityKeyring::request_signer`]).
     fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
-        RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
+        RequestClient::new(
+            &self.env,
+            &self.service_target(&service),
+            &self.keyring,
+            &self.store,
+        )
     }
 
     /// What the call in progress may still do: a full budget when none was taken.
@@ -1017,18 +1067,18 @@ impl Signer {
             pinned: Some(service.service_key),
             identity: self.state.identity,
         };
-        let read = RequestClient::new(&self.env, &target, &self.keyring)?
+        let read = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .apps()
             .await;
         Ok(matches!(read, Ok(_) | Err(ClientError::Switch { .. })))
     }
 
-    /// Where the clients of the enrolled switch go. While a recovery declared in place goes
-    /// to the service that served the lost generation, its answers are checked with the key
-    /// it served that generation with, but the `200` of the delivery that starts the new
-    /// generation, which the client checks with the pending key the version names (Switch
-    /// wire 3.13, 7.4.2): no answer under a third key is taken, and none under the earlier
-    /// key as the new generation's.
+    /// Where the clients of the enrolled switch go. While a recovery declared in place, after
+    /// the service changed its key (Switch spec 12.5), goes to the service that served the
+    /// lost generation, its answers are checked with the key it served that generation with,
+    /// but the `200` of the delivery that starts the new generation, which the client checks
+    /// with the new key the version names (Switch wire 3.13, 7.4.2): no answer under a third
+    /// key is taken, and none under the earlier key as the new generation's.
     fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
         let serving = self
             .state
@@ -1052,7 +1102,7 @@ impl Signer {
     /// The identity key for this call's signing steps, through the signing gate
     /// ([`gate::signing_key`]).
     pub(crate) fn signing_key(&self) -> Result<SigningKey> {
-        gate::signing_key(&self.keyring, &self.state)
+        gate::signing_key(&self.keyring, &self.state, &self.store)
     }
 
     /// Enroll at the switch, then sign the first `identity.json` naming it (Switch spec 4.3
@@ -1064,13 +1114,14 @@ impl Signer {
         policy: IdentityPolicy,
     ) -> Result<()> {
         let identity = self.state.identity;
-        let enrollment = Enrollment::verify(signed, &identity, origin)?;
+        let enrollment =
+            Enrollment::verify(signed, &identity, origin).map_err(SignerError::StoredData)?;
         let target = Target {
             origin,
             pinned: None,
             identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .enroll(&enrollment)
             .await?;
         let key = self.signing_key()?;
@@ -1086,6 +1137,7 @@ impl Signer {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
+            created: Some(answer.created),
         });
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
@@ -1129,7 +1181,7 @@ impl Signer {
                 backup
             }
         };
-        let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
+        let bytes = serde_json::to_vec(&backup).map_err(|_| RecordsFault::Encode)?;
         let raised = self.check_backup_write().await?;
         let mut state = self.state.clone();
         if let Some(alert) = raised {
@@ -1240,7 +1292,7 @@ impl Signer {
             };
         };
         let signer = copy.body().signer;
-        let mark = self.high_water().map_or(0, |h| h.version);
+        let mark = self.high_water()?.map_or(0, |h| h.version);
         // Another install's copy below the mark is one this install signed over already.
         if signer != self.state.install && copy.version() >= mark {
             return self.managed_by(signer).await;
@@ -1275,41 +1327,49 @@ impl Signer {
     /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
     /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
     /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
-    /// it is; the next answer the pinned key signs clears it, an error included. Never raised
-    /// once the account is erased. Nothing else changes: an unauthenticated `404` with no
-    /// request in doubt is never an erasure (Switch wire 7.4.16).
+    /// it is; the next answer the pinned key signs clears it, an error included. The signed
+    /// `404` of an identity the service doesn't host, with no erasure of this install's in
+    /// progress, is the service's word that it holds no account: it raises
+    /// [`Alert::ServiceHoldsNoAccount`], which any other answer the pinned key signs clears
+    /// (Switch wire 7.3 step 2, 7.4.16). Neither is raised once the account is erased.
+    /// Nothing else changes: a `404` with no request in doubt is never an erasure (Switch
+    /// wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
         let read = self.service_client()?.apps().await;
         // The device clock when the answer came, before the alert's commit below, so a step
         // judging the clock against the answer's time isn't off by that commit.
         let device_ms = self.env.clock.now_ms();
-        let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
-        // Any answer the pinned key signs, an error included, shows the account hosted: it
-        // clears the alert, and ends an erasure's wait for the operator's `404` to hold, here
-        // where it arrives, whatever the step that read it does next (Switch wire 7.3 step 2,
-        // 7.4.16).
+        let judged = !erasing && !self.state.erased;
+        // Any answer the pinned key signs, an error included, shows the switch answering for
+        // the account under that key: it clears the alert for an unsigned `404`, and ends an
+        // erasure's wait for one to hold, here where it arrives, whatever the step that read
+        // it does next (Switch wire 7.3 step 2, 7.4.16).
         let signed = matches!(
             &read,
             Ok(_) | Err(ClientError::Switch { .. } | ClientError::InvalidResponse(_))
         );
-        let raise = match &read {
-            _ if signed && raised => Some(false),
-            Err(ClientError::BadServiceSignature { status: 404 })
-                if !raised && !erasing && !self.state.erased =>
-            {
-                Some(true)
-            }
-            _ => None,
-        };
+        // The signed `404` of an identity the service doesn't host is its word that it holds
+        // no account, never an answer that shows one hosted (Switch wire 7.3 step 2, 7.4.16).
+        let not_held = read.as_ref().err().is_some_and(ClientError::is_not_hosted);
+        let unsigned_404 = matches!(&read, Err(ClientError::BadServiceSignature { status: 404 }));
         let mut state = self.state.clone();
-        match raise {
-            Some(true) => state.alert(Alert::AccountNotHosted),
-            Some(false) => state
+        if signed {
+            state
                 .alerts
-                .retain(|alert| *alert != Alert::AccountNotHosted),
-            None => {}
+                .retain(|alert| *alert != Alert::AccountNotHosted);
+        }
+        if signed && !not_held {
+            state
+                .alerts
+                .retain(|alert| *alert != Alert::ServiceHoldsNoAccount);
+        }
+        if judged && unsigned_404 {
+            state.alert(Alert::AccountNotHosted);
+        }
+        if judged && not_held {
+            state.alert(Alert::ServiceHoldsNoAccount);
         }
         // Whether the end of a staged admission is owed is the switch's to say (Switch wire
         // 7.4.12 `recovery`), so a restore or a take-over finds it too: owed while the wait is
@@ -1356,7 +1416,7 @@ impl Signer {
             Some(signed) => Some(IdentityDoc::verify(signed, &self.state.identity)?),
             None => None,
         };
-        match self.judge_copy(copy.as_ref()) {
+        match self.judge_copy(copy.as_ref())? {
             Ok(Verdict::AtMark) => {
                 // The switch's own copy, authenticated with its pinned key and verified for
                 // the identity, is the mark's document: it confirms the switch as a delivery
@@ -1419,18 +1479,18 @@ impl Signer {
     /// no identity secret (Switch spec 12.8).
     fn seal_backup(&self, doc: &SignedDoc, prev: Option<[u8; 32]>) -> Result<SignerBackup> {
         let identity = self.state.identity;
-        let doc = IdentityDoc::verify(doc, &identity)?;
+        let doc = state::stored_identity(doc, &identity)?;
         let issued = self
             .state
             .certs
             .iter()
-            .map(|cert| AppCert::verify(cert, &identity))
+            .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let limits = self.service()?.limits;
         // Sealing signs the backup, so it takes the gated key: a recovery's, while one is
         // delivered (Switch spec 12.6 step 1).
         let key = if self.state.recovering {
-            gate::recovery_key(&self.keyring, &self.state)?
+            gate::recovery_key(&self.keyring, &self.state, &self.store)?
         } else {
             self.signing_key()?
         };
@@ -1504,14 +1564,10 @@ impl Signer {
                 }
                 Err(error.into())
             }
-            Err(
-                error @ ClientError::Switch {
-                    status: 400 | 413, ..
-                },
-            ) => {
-                // A definite refusal, a `400` or a `413 too_large` (Switch wire 7.1): the same
-                // bytes would be refused again. The version stays spent (`signed_through`). A
-                // renewal it carried didn't happen, and the user is told in the same commit.
+            Err(error) if delivery_refused_for_good(&error) => {
+                // A definite refusal: the same bytes would be refused again. The version stays
+                // spent (`signed_through`). A renewal it carried didn't happen, and the user is
+                // told in the same commit.
                 let mut state = self.state.clone();
                 self.note_refused_renewals(&mut state, &doc)?;
                 self.commit(state, None).await?;
@@ -1531,25 +1587,21 @@ impl Signer {
         delivered_at: Option<u64>,
     ) -> Result<()> {
         let mut state = self.state.clone();
-        let verified = IdentityDoc::verify(&doc, &state.identity);
+        let delivered = IdentityDoc::verify(&doc, &state.identity)?;
         // A recovery's version, the only delivery while one is declared: the new service's
         // account is the one served from here (Switch spec 12.6 step 1). Whether the end of
         // its staged admission is owed, the next `GET /apps` says, publication's check first.
-        if state.recovering
-            && let Ok(delivered) = &verified
-        {
-            Self::recovered_in(&mut state, delivered);
+        if state.recovering {
+            Self::recovered_in(&mut state, &delivered);
         }
-        if let (Some(at), Ok(delivered)) = (delivered_at, &verified) {
+        if let Some(at) = delivered_at {
             for app in &delivered.body().apps {
                 if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
                     state.listed_at.push((app.app_id, at));
                 }
             }
         }
-        if let Ok(delivered) = &verified
-            && let Some(handing) = state.handing_over.clone()
-        {
+        if let Some(handing) = state.handing_over.clone() {
             // The abort or the take-back won: the hand-over is over, and this install signs
             // again, so an alert that another install manages the identity no longer holds
             // (Switch wire 3.12).
@@ -1569,7 +1621,7 @@ impl Signer {
         // A refused renewal is told of until a renewal the user asked for is delivered for
         // the app, or a version removing it: an automatic renewal keeps the scopes the user
         // may have asked to remove (Switch spec 3.2).
-        if let Ok(delivered) = &verified {
+        {
             let renewed_by_user = std::mem::take(&mut state.user_renewals);
             let before = state.newest_doc()?;
             let asked = state.asked_renewals.clone();
@@ -1652,7 +1704,7 @@ impl Signer {
         if let Some(copy) = copy.as_ref().filter(|copy| self.own_recovery_version(copy)) {
             return self.own_recovery_held(copy.clone()).await;
         }
-        match self.judge_copy(copy.as_ref()) {
+        match self.judge_copy(copy.as_ref())? {
             Err(alert) => self.alarm(alert).await,
             Ok(Verdict::Newer) => match copy {
                 Some(copy) => self.adopt(copy, Source::Switch).await,
@@ -1713,36 +1765,39 @@ impl Signer {
     /// Judge a copy of `identity.json` from the switch against the high-water mark (Switch
     /// spec 4.3, Switch wire 3.3 "Never back"): an older copy, or none under a mark, is a
     /// rollback, and another body at the mark's version is equivocation.
-    fn judge_copy(&self, copy: Option<&IdentityDoc>) -> std::result::Result<Verdict, Alert> {
-        let Some(high) = self.high_water() else {
-            return Ok(Verdict::Newer);
+    fn judge_copy(
+        &self,
+        copy: Option<&IdentityDoc>,
+    ) -> Result<std::result::Result<Verdict, Alert>> {
+        let Some(high) = self.high_water()? else {
+            return Ok(Ok(Verdict::Newer));
         };
         let Some(copy) = copy else {
-            return Err(Alert::Rollback {
+            return Ok(Err(Alert::Rollback {
                 source: Source::Switch,
                 version: None,
                 generation: None,
                 high_water_version: high.version,
-            });
+            }));
         };
         if copy.version() < high.version || copy.generation() < high.generation {
-            return Err(Alert::Rollback {
+            return Ok(Err(Alert::Rollback {
                 source: Source::Switch,
                 version: Some(copy.version()),
                 generation: Some(copy.generation()),
                 high_water_version: high.version,
-            });
+            }));
         }
         if copy.version() == high.version {
             if copy.body_hash() != high.body_hash {
-                return Err(Alert::Equivocation {
+                return Ok(Err(Alert::Equivocation {
                     source: Source::Switch,
                     version: high.version,
-                });
+                }));
             }
-            return Ok(Verdict::AtMark);
+            return Ok(Ok(Verdict::AtMark));
         }
-        Ok(Verdict::Newer)
+        Ok(Ok(Verdict::Newer))
     }
 
     /// Take a strictly newer copy from `source`, ending the flow (Switch spec 4.3). Another
@@ -1762,12 +1817,12 @@ impl Signer {
         let signer = copy.body().signer;
         if self.state.handing_over.is_some() {
             if source == Source::Switch {
-                if let Some(prev) = self.own_hand_over_delivery(&copy) {
+                if let Some(prev) = self.own_hand_over_delivery(&copy)? {
                     return self
                         .delivered(copy.signed().clone(), Some(prev), None)
                         .await;
                 }
-                if self.succeeded_by(&copy) {
+                if self.succeeded_by(&copy)? {
                     return self.succeeded(&copy).await;
                 }
             }
@@ -1807,7 +1862,7 @@ impl Signer {
         state.alert(Alert::RecordsBehind {
             source,
             version,
-            high_water_version: self.high_water().map_or(0, |h| h.version),
+            high_water_version: self.high_water()?.map_or(0, |h| h.version),
         });
         self.commit(state, self.erasure_kept()).await?;
         Err(Refusal::RecordsBehind { version }.into())
@@ -1868,12 +1923,11 @@ impl Signer {
         if !newest.published {
             return Ok(false);
         }
-        let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
+        let mine = state::stored_identity(&newest.doc, &self.state.identity)?;
         if self.judge_homeserver(&mine).await? {
             return Ok(false);
         }
-        let bytes =
-            serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
+        let bytes = serde_json::to_vec(&newest.doc).map_err(|_| RecordsFault::Encode)?;
         let _ = self.env.homeserver.put(IDENTITY_PATH, bytes).await;
         Ok(true)
     }
@@ -1895,7 +1949,7 @@ impl Signer {
         // since: it goes out only while this install still signs and the Homeserver holds
         // nothing newer (Switch spec 4.3).
         self.switch_at_mark().await?;
-        let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
+        let mine = state::stored_identity(&newest.doc, &self.state.identity)?;
         let already = self.judge_homeserver(&mine).await?;
         // A recovery's version, the one version delivered while an alarm may be held, waits
         // for the user to clear it, as a publication over another body does (Switch spec 12.6
@@ -1904,8 +1958,7 @@ impl Signer {
             return Ok(());
         }
         if !already {
-            let bytes =
-                serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
+            let bytes = serde_json::to_vec(&newest.doc).map_err(|_| RecordsFault::Encode)?;
             self.env
                 .homeserver
                 .put(IDENTITY_PATH, bytes)
@@ -2008,25 +2061,13 @@ pub(super) fn measures(
 }
 
 /// The measure of the version signed as `doc`, built on `prev`, that comes nearest its cap,
-/// for the near-limit alert ([`measures`]). A document that doesn't verify, which no caller
-/// passes, is measured as its delivery alone: the alert never stops a delivery from being
-/// recorded.
+/// for the near-limit alert ([`measures`]).
 pub(super) fn version_size(
     state: &SignerState,
     doc: &SignedDoc,
     prev: Option<[u8; 32]>,
 ) -> Result<Measure> {
-    let Ok(verified) = IdentityDoc::verify(doc, &state.identity) else {
-        let delivery = IdentityDelivery {
-            identity: doc.clone(),
-            prev,
-        };
-        return Ok(Measure {
-            body: SizedBody::Delivery,
-            bytes: delivery.to_json().len(),
-            limit: identity_limit().unwrap_or(usize::MAX),
-        });
-    };
+    let verified = IdentityDoc::verify(doc, &state.identity)?;
     measures(state, verified.body(), prev)?
         .into_iter()
         // The larger share of its cap, compared without division.
@@ -2035,7 +2076,9 @@ pub(super) fn version_size(
                 .saturating_mul(b.limit)
                 .cmp(&b.bytes.saturating_mul(a.limit))
         })
-        .ok_or_else(|| SignerError::Records("no body to measure the version in".into()))
+        .ok_or(SignerError::Records(RecordsFault::Invariant(
+            "no body to measure the version in",
+        )))
 }
 
 /// Room kept under the cap for what a later version adds to one measured now without any
@@ -2146,9 +2189,187 @@ pub(crate) struct SwitchRead {
     pub(crate) device_ms: u64,
 }
 
+/// Whether a delivery's refusal is for good, so the same bytes would be refused again: a
+/// `400`, or a `413 too_large` that binds the delivery as sent, its body included, or a body
+/// over the call's cap, which the client refuses before sending it (Switch wire 7.1). A `413`
+/// given before the body was read binds no body and is final for nothing.
+fn delivery_refused_for_good(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Switch {
+            status: 400 | 413,
+            ..
+        } | ClientError::BodyOverCap { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LocalFiles(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+
+    impl Homeserver for LocalFiles {
+        fn get(
+            &self,
+            path: &str,
+        ) -> pubky_switch_client::transport::BoxFuture<
+            '_,
+            std::result::Result<Option<Vec<u8>>, pubky_switch_client::TransportError>,
+        > {
+            let value = self.0.lock().unwrap().get(path).cloned();
+            Box::pin(async move { Ok(value) })
+        }
+        fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> pubky_switch_client::transport::BoxFuture<
+            '_,
+            std::result::Result<(), pubky_switch_client::TransportError>,
+        > {
+            self.0.lock().unwrap().insert(path.into(), bytes);
+            Box::pin(async { Ok(()) })
+        }
+        fn delete(
+            &self,
+            path: &str,
+        ) -> pubky_switch_client::transport::BoxFuture<
+            '_,
+            std::result::Result<(), pubky_switch_client::TransportError>,
+        > {
+            self.0.lock().unwrap().remove(path);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct LocalVault(std::sync::Mutex<Option<[u8; 32]>>);
+
+    impl crate::SecretVault for LocalVault {
+        fn load(&self) -> std::result::Result<Option<crate::IdentitySecret>, crate::VaultError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .map(crate::IdentitySecret::from_bytes))
+        }
+        fn add(
+            &self,
+            secret: &crate::IdentitySecret,
+        ) -> std::result::Result<crate::AddOutcome, crate::VaultError> {
+            let mut held = self.0.lock().unwrap();
+            if held.is_some() {
+                return Ok(crate::AddOutcome::Occupied);
+            }
+            *held = Some(*secret.as_bytes());
+            Ok(crate::AddOutcome::Stored)
+        }
+        fn delete(&self) -> std::result::Result<(), crate::VaultError> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct Tasks;
+
+    impl crate::Protocol for Tasks {
+        fn name(&self) -> &str {
+            "tasks"
+        }
+        fn scopes(&self) -> Vec<crate::ScopeDef> {
+            vec![crate::ScopeDef::unkeyed("tasks")]
+        }
+        fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn permissions(&self, _: &[&str]) -> Vec<pubky_switch_core::scopes::Permission> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stored_mark_failure_propagates_without_pruning_records() {
+        use pubky_switch_client::clock::TestClock;
+        use pubky_switch_client::store::{MemoryStore, StateStore};
+        use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
+        use pubky_switch_core::keys::IdentityKey;
+
+        let identity = IdentityKey::from_secret([31; 32]);
+        let clock = Arc::new(TestClock::new(1_767_225_600_000));
+        let switch = ScriptedSwitch::unenrolled(&identity, [32; 32], clock.clone());
+        let store = Arc::new(MemoryStore::new());
+        let env = SignerEnv {
+            store: StoreHandle::inline(store.clone()),
+            clock,
+            transport: switch.transport(),
+            homeserver: Arc::new(LocalFiles(std::sync::Mutex::default())),
+            protocols: Protocols::new(vec![Arc::new(Tasks)]).unwrap(),
+        };
+        let keyring =
+            IdentityKeyring::open(Arc::new(LocalVault(std::sync::Mutex::new(Some([31; 32])))))
+                .unwrap();
+        let mut signer = Signer::create(env, keyring, SWITCH_ORIGIN).await.unwrap();
+        signer.resume().await.unwrap();
+        let original = signer.state.clone();
+        let mark = signer.high_water().unwrap().unwrap();
+        let ns = state::signer_namespace(&identity.public());
+        let durable = store.scan(&ns, b"", None, 10).unwrap();
+        signer.state.newest.as_mut().unwrap().doc.sig = pubky_switch_core::enc::b64(&[0; 64]);
+        assert!(matches!(
+            signer.high_water(),
+            Err(SignerError::StoredData(_))
+        ));
+        let damaged = signer.state.clone();
+        assert!(matches!(
+            signer.state.prune_unreferenced(),
+            Err(SignerError::StoredData(_))
+        ));
+        assert_eq!(signer.state, damaged);
+        assert_eq!(
+            state::save(&mut signer.store, &damaged, None)
+                .await
+                .unwrap_err(),
+            SignerError::Records(RecordsFault::Invariant(
+                "the state to write contains an invalid signed copy"
+            ))
+        );
+        assert_eq!(store.scan(&ns, b"", None, 10).unwrap(), durable);
+        signer.state = original;
+        assert_eq!(signer.high_water().unwrap(), Some(mark));
+        signer.state.prune_unreferenced().unwrap();
+        assert_eq!(signer.high_water().unwrap(), Some(mark));
+    }
+
+    #[test]
+    fn test_delivery_refused_for_good_takes_only_what_binds_the_bytes() {
+        let switch = |status: u16, code: ErrorCode| ClientError::Switch {
+            status,
+            code,
+            message: String::new(),
+            current: serde_json::Value::Null,
+            known_version: None,
+            retry_after: None,
+        };
+        for error in [
+            switch(400, ErrorCode::BadRequest),
+            switch(413, ErrorCode::TooLarge),
+            ClientError::BodyOverCap { cap: 1 },
+        ] {
+            assert!(delivery_refused_for_good(&error), "{error:?}");
+        }
+        for error in [
+            ClientError::BodyUnread {
+                status: 413,
+                code: ErrorCode::TooLarge,
+                retry_after: None,
+            },
+            switch(409, ErrorCode::Conflict),
+            switch(503, ErrorCode::Unavailable),
+            ClientError::BadServiceSignature { status: 400 },
+        ] {
+            assert!(!delivery_refused_for_good(&error), "{error:?}");
+        }
+    }
 
     #[test]
     fn test_identity_cap_keeps_its_headroom() {

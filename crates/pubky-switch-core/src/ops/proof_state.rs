@@ -3,9 +3,10 @@
 use crate::chain::ProofState;
 use crate::claims::ClaimView;
 use crate::error::{Result, invalid};
+use crate::record_authority::ApplicationRef;
 use crate::shared::RecordState;
 
-use super::{OpKind, RecordVersion};
+use super::{OpKind, RecordVersion, SignedOp};
 
 /// The state after an operation that its proof shows, where the operation alone doesn't give
 /// it (Switch wire 6.5).
@@ -44,15 +45,25 @@ pub enum StateAfter {
 ///
 /// [`crate::Error::Invalid`] if `after` isn't the kind the operation needs, or a
 /// `cert.put`'s certificate doesn't decode.
-pub fn proof_state(op: &OpKind, after: &StateAfter) -> Result<ProofState> {
-    Ok(match (op, after) {
+pub fn proof_state(op: &SignedOp, after: &StateAfter) -> Result<ProofState> {
+    Ok(match (&op.body().kind, after) {
         (OpKind::RecordPut(put), StateAfter::Record(version)) => {
+            if version.generation != op.body().generation {
+                return invalid("Switch wire 6.5: the record application is of another generation");
+            }
             // The record the switch holds after the write decides `deleted`, so the proof
             // and the record can't disagree (Switch wire 6.2).
             let record = RecordState::after(put, version.generation, version.version);
+            let revision = ApplicationRef {
+                generation: version.generation,
+                seq: version.version,
+                item_hash: op.item_hash()?,
+            };
+            revision.check()?;
             ProofState::Record {
                 version: record.version,
                 deleted: record.deleted,
+                revision,
             }
         }
         (OpKind::Claim(_), StateAfter::Claim(view)) => ProofState::Claim(view.to_value()),

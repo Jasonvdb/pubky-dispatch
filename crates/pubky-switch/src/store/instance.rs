@@ -192,8 +192,9 @@ pub struct InstanceLock {
     pid: i32,
     timing: LockTiming,
     /// When the check that last confirmed the lock was sent, or when the take that was
-    /// granted the lock asked for it: the session held the lock at least until then.
-    confirmed: Stamp,
+    /// granted the lock asked for it: the session held the lock at least until then. Shared
+    /// with the request path's [`LockFreshness`].
+    confirmed: std::sync::Arc<parking_lot::Mutex<Stamp>>,
     clock: Clock,
 }
 
@@ -273,7 +274,7 @@ impl InstanceLock {
                 conn: Some(conn),
                 pid,
                 timing,
-                confirmed: asked,
+                confirmed: std::sync::Arc::new(parking_lot::Mutex::new(asked)),
                 clock: clock.clone(),
             }),
             Err(error) => {
@@ -347,13 +348,13 @@ impl InstanceLock {
         loop {
             // Measured before the sleep too: a pause since the lock was asked for, or since
             // the last confirmed check was sent, stops it at once.
-            let since = self.confirmed.until((self.clock)());
+            let since = self.confirmed().until((self.clock)());
             if since > overdue {
                 return (InstanceLockLost::Overdue(since), self);
             }
             tokio::time::sleep(every.saturating_sub(since)).await;
             let sent = (self.clock)();
-            let since = self.confirmed.until(sent);
+            let since = self.confirmed().until(sent);
             let Some(left) = overdue.checked_sub(since) else {
                 return (InstanceLockLost::Overdue(since), self);
             };
@@ -364,11 +365,11 @@ impl InstanceLock {
                 Ok(Ok(true)) => {
                     // An answer that waited out a pause of this process says nothing about
                     // the time since it was sent.
-                    let since = self.confirmed.until((self.clock)());
+                    let since = self.confirmed().until((self.clock)());
                     if since > overdue {
                         return (InstanceLockLost::Overdue(since), self);
                     }
-                    self.confirmed = sent;
+                    *self.confirmed.lock() = sent;
                 }
                 Ok(Ok(false)) | Err(_) => return (InstanceLockLost::Unconfirmed, self),
                 Ok(Err(failure)) => {
@@ -376,6 +377,66 @@ impl InstanceLock {
                     return (InstanceLockLost::Unconfirmed, self);
                 }
             }
+        }
+    }
+}
+
+impl InstanceLock {
+    /// When the lock was last confirmed.
+    fn confirmed(&self) -> Stamp {
+        *self.confirmed.lock()
+    }
+
+    /// A cheap shared view of when the lock was last confirmed, for the request path: it
+    /// follows every check [`InstanceLock::keep`] confirms.
+    pub fn freshness(&self) -> LockFreshness {
+        LockFreshness {
+            confirmed: self.confirmed.clone(),
+            overdue: self.timing.overdue(),
+            clock: self.clock.clone(),
+        }
+    }
+}
+
+/// When the instance lock was last confirmed, read on both clocks as the keeper reads them:
+/// a request refuses a commit that gives out a `seq`, signs a head or moves a mark once the
+/// last confirmed check is older than two checks ([`LockFreshness::is_fresh`]), so no such
+/// commit lands while another process may hold the lock (Switch spec 6.5).
+#[derive(Clone)]
+pub struct LockFreshness {
+    confirmed: std::sync::Arc<parking_lot::Mutex<Stamp>>,
+    overdue: Duration,
+    clock: Clock,
+}
+
+impl std::fmt::Debug for LockFreshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFreshness")
+            .field("confirmed", &*self.confirmed.lock())
+            .field("overdue", &self.overdue)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LockFreshness {
+    /// Whether the lock was confirmed within the last two checks, on both clocks.
+    pub fn is_fresh(&self) -> bool {
+        self.confirmed.lock().until((self.clock)()) <= self.overdue
+    }
+
+    /// A view whose lock was last confirmed `ago` before now, checked every `timing`, for
+    /// tests of what a stale lock refuses.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn confirmed_ago(ago: Duration, timing: LockTiming) -> Self {
+        let now = Stamp::now();
+        let then = Stamp {
+            monotonic: now.monotonic.checked_sub(ago).unwrap_or(now.monotonic),
+            wall: now.wall.checked_sub(ago).unwrap_or(now.wall),
+        };
+        Self {
+            confirmed: std::sync::Arc::new(parking_lot::Mutex::new(then)),
+            overdue: timing.overdue(),
+            clock: system_clock(),
         }
     }
 }
@@ -682,7 +743,7 @@ mod tests {
             conn: None,
             pid: original.pid,
             timing: original.timing,
-            confirmed: original.confirmed,
+            confirmed: std::sync::Arc::new(parking_lot::Mutex::new(original.confirmed())),
             clock: original.clock.clone(),
         };
         let original_keeper = tokio::spawn(async move { original.keep().await.0 });
@@ -702,14 +763,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_store_instance_lock_freshness_follows_the_keeper() {
+        // Fresh while the keeper confirms the lock; stale once the last confirmed check is
+        // older than two checks, as when the keeper has stopped.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let held = db.store().hold_instance_lock(fast()).await.expect("lock");
+        let freshness = held.freshness();
+        assert!(freshness.is_fresh());
+        let keeper = tokio::spawn(async move { held.keep().await });
+        tokio::time::sleep(fast().overdue() + fast().every).await;
+        assert!(freshness.is_fresh(), "the keeper confirmed it meanwhile");
+        keeper.abort();
+        let _ = keeper.await;
+        tokio::time::sleep(fast().overdue() + fast().every).await;
+        assert!(!freshness.is_fresh(), "nothing confirmed it since");
+        assert!(!LockFreshness::confirmed_ago(fast().overdue() * 2, fast()).is_fresh());
+        assert!(LockFreshness::confirmed_ago(Duration::ZERO, fast()).is_fresh());
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
     async fn test_store_instance_lock_keeper_stops_after_a_pause() {
         // The process was paused longer than two checks: the server may have closed the
         // session and another process taken the lock, so the keeper stops without asking.
         let Some(db) = crate::store::testing::test_database().await else {
             return;
         };
-        let mut held = db.store().hold_instance_lock(fast()).await.expect("lock");
-        held.confirmed.monotonic = Instant::now() - fast().overdue() - fast().every;
+        let held = db.store().hold_instance_lock(fast()).await.expect("lock");
+        held.confirmed.lock().monotonic = Instant::now() - fast().overdue() - fast().every;
         let lost = tokio::time::timeout(Duration::from_secs(20), async { held.keep().await.0 })
             .await
             .expect("the keeper stops");

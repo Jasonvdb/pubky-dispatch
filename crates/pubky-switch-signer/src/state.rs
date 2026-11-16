@@ -10,18 +10,20 @@
 //! holds the hand-over as the switch served it, sealed to the new signer's bundle key, until
 //! the secret it carries is in the vault (Switch wire 3.12).
 
-use pubky_switch_client::store::{StoreHandle, WriteBatch};
+use pubky_switch_client::client::Batch;
+use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
+use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AppCert, DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup,
-    SignerHandover, StoredPart,
+    AppCert, DEFAULT_CERT_LIFETIME_MS, Enrollment, IdentityDoc, IdentityPolicy, Limits,
+    SignerBackup, SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use crate::alert::Alert;
-use crate::error::{Result, SignerError};
+use crate::error::{RecordsFault, Result, SignerError, SignerRecord};
 
 /// The version of the records' layout.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -181,6 +183,19 @@ pub(crate) struct Service {
     pub(crate) service_key: [u8; 32],
     /// The limits the enrollment answer announced, which the switch gives only then.
     pub(crate) limits: Limits,
+    /// The account's creation time, as the enrollment answer or a `409` to an erasure since
+    /// named it, which an erasure names (Switch wire 3.7, 7.4.16); `None` where this install
+    /// holds none: after a restore or a hand-over, whose formats don't carry it.
+    pub(crate) created: Option<u64>,
+}
+
+/// The `identity.json` an account that answers the notice holds, as a signed `409` to an
+/// erasure showed it in `current.identity`, judged as every copy (Switch wire 7.4.16, spec
+/// 4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ShownCopy {
+    /// Its document hash; `None` where the account holds none.
+    pub(crate) hash: Option<[u8; 32]>,
 }
 
 /// The newest `identity.json` a service accepted from this signer, or that it adopted: its
@@ -351,16 +366,17 @@ pub(crate) struct SignerState {
     pub(crate) recovery_origin: Option<String>,
     /// Each service an earlier declaration of the recovery in progress enrolled at, with
     /// the key its enrollment answered: declared again there, the signer reads under that
-    /// key whether the earlier version was taken, since a service that took it answers
-    /// another enrollment with a pending key, and the version's refusal with the first
-    /// (Switch wire 3.7, 7.4.2).
+    /// key whether the earlier version was taken, since a service that took it may have
+    /// changed its key since (Switch wire 3.7, 7.4.2, spec 12.5).
     pub(crate) recovery_services: Vec<Service>,
-    /// A recovery declared in place, at the service that served the lost generation: that
-    /// service, under the key it served the lost generation with. Until it takes the
-    /// recovery's version it signs every answer with that key, but the `200` of the delivery
-    /// that starts the new generation, which the pending key the version names signs (Switch
-    /// wire 3.13, 7.4.1, 7.4.2). So the signer pins this key while the recovery goes there,
-    /// and the delivery's `200` alone is checked with the pending key. Kept through
+    /// A recovery declared in place, at the service that served the lost generation, after
+    /// that service changed its key (Switch spec 12.5): that service, under the key it served
+    /// the lost generation with. None where it kept its one key, which the version names
+    /// (Switch wire 3.7). Until it takes the recovery's version it signs every answer with
+    /// that key, but the `200` of the delivery that starts the new generation, which the new
+    /// key the version names signs (Switch wire 3.13, 7.4.1, 7.4.2). So the signer pins this
+    /// key while the recovery goes there, and the delivery's `200` alone is checked with the
+    /// new key. Kept through
     /// declarations at other origins, since only the service at its own origin is read under
     /// it; when none is kept, taken from a signed copy of the lost generation naming the
     /// declared origin: the version the recovery builds on, or the Homeserver's copy when that
@@ -484,17 +500,16 @@ impl SignerState {
     /// certificates it references: a version that wasn't delivered leaves none of its own
     /// behind, nor counts as a renewal the app left untaken. A declared recovery's base
     /// counts as the newest version too, since the recovery's version is built on it.
-    pub(crate) fn prune_unreferenced(&mut self) {
+    pub(crate) fn prune_unreferenced(&mut self) -> Result<()> {
         let identity = self.identity;
         let docs: Vec<IdentityDoc> = self
-            .newest_doc()
-            .ok()
-            .flatten()
+            .newest_doc()?
             .into_iter()
             .chain(
                 self.recovery_base
                     .as_ref()
-                    .and_then(|base| IdentityDoc::verify(base, &identity).ok()),
+                    .map(|base| stored_identity(base, &identity))
+                    .transpose()?,
             )
             .collect();
         let referenced = |hash: &[u8; 32]| {
@@ -503,13 +518,18 @@ impl SignerState {
                     || doc.body().renewed.iter().any(|r| &r.cert == hash)
             })
         };
-        self.certs
-            .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
+        self.certs = self
+            .certificates()?
+            .into_iter()
+            .filter(|cert| referenced(&cert.hash()))
+            .map(|cert| cert.signed().clone())
+            .collect();
         self.untaken_renewals.retain(|(_, cert)| referenced(cert));
         self.claims.retain(|claim| {
             docs.iter()
                 .any(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
         });
+        Ok(())
     }
 
     /// The `distrust_from` the user picked for each revocation asked for, which the records
@@ -584,9 +604,35 @@ impl SignerState {
     pub(crate) fn newest_doc(&self) -> Result<Option<IdentityDoc>> {
         self.newest
             .as_ref()
-            .map(|n| IdentityDoc::verify(&n.doc, &self.identity))
+            .map(|n| stored_identity(&n.doc, &self.identity))
             .transpose()
-            .map_err(SignerError::from)
+    }
+
+    pub(crate) fn certificates(&self) -> Result<Vec<AppCert>> {
+        self.certs
+            .iter()
+            .map(|cert| AppCert::verify(cert, &self.identity).map_err(SignerError::StoredData))
+            .collect()
+    }
+
+    /// Check the signed copies independently of the service and of caller-supplied keys.
+    pub(crate) fn check_copies(&self) -> Result<()> {
+        self.newest_doc()?;
+        self.certificates()?;
+        if let Some(base) = &self.recovery_base {
+            stored_identity(base, &self.identity)?;
+        }
+        if let Some(handing) = &self.handing_over {
+            stored_identity(&handing.doc, &self.identity)?;
+            handing
+                .handover
+                .verify(&self.identity, &handing.to_app)
+                .map_err(SignerError::StoredData)?;
+            if let Some(take_back) = &handing.take_back {
+                stored_identity(&take_back.doc, &self.identity)?;
+            }
+        }
+        Ok(())
     }
 
     /// Add `alert` unless it is held already.
@@ -676,14 +722,19 @@ pub(crate) enum Flow {
         /// The App IDs whose grant reminder this erasure raised: withdrawn if it ends without
         /// erasing the account.
         reminded: Vec<[u8; 16]>,
-        /// An erasure request went out and no answer came back: it may have landed, so the
-        /// operator's `404` now means it did, once it has held for 24 hours (Switch wire
-        /// 7.4.16).
+        /// An erasure request went out with no definitive application result: it may have
+        /// landed (including after signed unavailable), so the
+        /// signed `404` of an identity the service doesn't host now means it did, and an
+        /// unsigned `404` does once it has held for 24 hours (Switch wire 7.4.16).
         unanswered: bool,
-        /// The device time a check first met the operator's `404` after the request in
+        /// The device time a check first met an unsigned `404` after the request in
         /// doubt, kept until an answer the pinned key signs: erased but unconfirmed, the
         /// erasure done at the first run 24 hours on (Switch wire 7.4.16, spec 12.7 step 5).
         first_404_ms: Option<u64>,
+        /// The copy a signed `409` at an account that answers the notice showed it to hold,
+        /// which the erasure names in place of the mark's, its retries included; `None`
+        /// until one did (Switch wire 7.4.16).
+        shown: Option<ShownCopy>,
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
@@ -698,6 +749,46 @@ pub(crate) enum Flow {
     },
 }
 
+impl Flow {
+    pub(crate) fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
+        match self {
+            Self::Enroll {
+                origin, enrollment, ..
+            }
+            | Self::Recover { origin, enrollment } => {
+                Enrollment::verify(enrollment, identity, origin)
+                    .map_err(SignerError::StoredData)?;
+            }
+            Self::Renew { batches, doc, .. } => {
+                stored_identity(doc, identity)?;
+                for batch in batches {
+                    batch.read(identity)?;
+                }
+            }
+            Self::TakingOver {
+                handover,
+                app_id,
+                delivery,
+            } => {
+                handover
+                    .verify(identity, app_id)
+                    .map_err(SignerError::StoredData)?;
+                if let Some(delivery) = delivery {
+                    stored_identity(&delivery.doc, identity)?;
+                }
+            }
+            Self::Deliver { doc, backup, .. } => {
+                stored_identity(doc, identity)?;
+                if let Some(backup) = backup {
+                    backup.verify(identity).map_err(SignerError::StoredData)?;
+                }
+            }
+            Self::Erase { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 /// One signed batch of a renewal or an epoch's completion, and the key bundle parts it stores.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RenewBatch {
@@ -705,6 +796,30 @@ pub(crate) struct RenewBatch {
     pub(crate) bytes: Bytes,
     /// The key bundle parts it stores (Switch wire 3.5).
     pub(crate) parts: Vec<StoredPart>,
+}
+
+impl RenewBatch {
+    /// Read and authenticate the exact operations this signer kept before sending them.
+    pub(crate) fn read(&self, identity: &[u8; 32]) -> Result<Batch> {
+        let batch = Batch::from_body(self.bytes.0.clone()).map_err(|_| {
+            SignerError::StoredData(pubky_switch_core::Error::Invalid(
+                "stored renewal batch does not parse".into(),
+            ))
+        })?;
+        for op in batch.ops() {
+            SignedOp::verify(op.signed(), identity, identity, None).map_err(|_| {
+                SignerError::StoredData(pubky_switch_core::Error::Invalid(
+                    "stored renewal operation does not verify for the signer".into(),
+                ))
+            })?;
+        }
+        Ok(batch)
+    }
+}
+
+/// Verify an identity document read from the signer's own state or flow.
+pub(crate) fn stored_identity(signed: &SignedDoc, identity: &[u8; 32]) -> Result<IdentityDoc> {
+    IdentityDoc::verify(signed, identity).map_err(SignerError::StoredData)
 }
 
 /// Bytes kept as they were signed, stored in base64url.
@@ -716,13 +831,11 @@ pub(crate) struct Bytes(
 
 /// Delete the records and the flow of `identity`, in one atomic write: once the identity was
 /// handed over, or a take-over was cancelled (Switch spec 12.8).
-pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<()> {
+pub(crate) async fn delete(store: &mut OwnedStoreHandle, identity: &[u8; 32]) -> Result<()> {
     let ns = signer_namespace(identity);
     let mut batch = WriteBatch::new();
     for key in [STATE_KEY, FLOW_KEY] {
-        batch
-            .delete(&ns, key)
-            .map_err(|e| SignerError::Records(e.to_string()))?;
+        batch.delete(&ns, key).map_err(RecordsFault::WriteRefused)?;
     }
     store.commit(batch).await?;
     Ok(())
@@ -730,7 +843,7 @@ pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<(
 
 /// Whether the store holds records for `identity` that a new set-up would replace: any but
 /// those of a hand-over that took effect, which are only waiting to be deleted.
-pub(crate) async fn set_up(store: &StoreHandle, identity: &[u8; 32]) -> Result<bool> {
+pub(crate) async fn set_up(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Result<bool> {
     Ok(load(store, identity)
         .await?
         .is_some_and(|(state, _)| state.handed_over_to.is_none()))
@@ -738,59 +851,102 @@ pub(crate) async fn set_up(store: &StoreHandle, identity: &[u8; 32]) -> Result<b
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.
 pub(crate) async fn load(
-    store: &StoreHandle,
+    store: &OwnedStoreHandle,
     identity: &[u8; 32],
 ) -> Result<Option<(SignerState, Option<Flow>)>> {
-    let ns = signer_namespace(identity);
-    let Some(bytes) = store.get(&ns, STATE_KEY).await? else {
+    let records = read(store, identity).await?;
+    let Some(state) = records.state? else {
+        if !matches!(records.flow, Ok(None)) {
+            return Err(RecordsFault::Incomplete.into());
+        }
         return Ok(None);
     };
-    let state: SignerState = decode(&bytes)?;
-    if state.v != SCHEMA_VERSION || &state.identity != identity {
-        return Err(SignerError::Records(
-            "another layout version or identity".into(),
-        ));
+    let flow = records.flow?;
+    state.check_copies()?;
+    if let Some(flow) = &flow {
+        flow.check_copies(identity)?;
     }
-    let flow = store
-        .get(&ns, FLOW_KEY)
-        .await?
-        .map(|bytes| decode(&bytes))
-        .transpose()?;
     Ok(Some((state, flow)))
+}
+
+/// Independently decoded current records, read together while the namespace is owned.
+/// A decoded state has the current header and requested identity; its copies are not yet
+/// authenticated. Only the explicit confirmed restore may retain it after a copy fails.
+pub(crate) struct ReadRecords {
+    pub(crate) state: Result<Option<SignerState>>,
+    pub(crate) flow: Result<Option<Flow>>,
+}
+
+pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Result<ReadRecords> {
+    if store.namespace() != signer_namespace(identity) {
+        return Err(RecordsFault::Invariant("another store namespace").into());
+    }
+    let bytes = store.get(STATE_KEY).await?;
+    let flow = store.get(FLOW_KEY).await?;
+    let state = bytes
+        .map(|bytes| {
+            let state: SignerState = decode(&bytes, SignerRecord::State)?;
+            if state.v != SCHEMA_VERSION {
+                return Err(RecordsFault::InvalidHeader.into());
+            }
+            if &state.identity != identity {
+                return Err(RecordsFault::OtherIdentity.into());
+            }
+            Ok(state)
+        })
+        .transpose();
+    let flow = flow
+        .map(|bytes| decode(&bytes, SignerRecord::Flow))
+        .transpose();
+    Ok(ReadRecords { state, flow })
 }
 
 /// Commit the records and the flow together, in one atomic write.
 pub(crate) async fn save(
-    store: &StoreHandle,
+    store: &mut OwnedStoreHandle,
     state: &SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {
+    state.check_copies().map_err(|_| {
+        RecordsFault::Invariant("the state to write contains an invalid signed copy")
+    })?;
+    if let Some(flow) = flow {
+        flow.check_copies(&state.identity).map_err(|_| {
+            RecordsFault::Invariant("the flow to write contains an invalid signed copy")
+        })?;
+    }
     let ns = signer_namespace(&state.identity);
     let mut batch = WriteBatch::new();
     batch
         .put(&ns, STATE_KEY, encode(state)?)
-        .map_err(|e| SignerError::Records(e.to_string()))?;
+        .map_err(RecordsFault::WriteRefused)?;
     match flow {
         Some(flow) => batch
             .put(&ns, FLOW_KEY, encode(flow)?)
-            .map_err(|e| SignerError::Records(e.to_string()))?,
+            .map_err(RecordsFault::WriteRefused)?,
         None => batch
             .delete(&ns, FLOW_KEY)
-            .map_err(|e| SignerError::Records(e.to_string()))?,
+            .map_err(RecordsFault::WriteRefused)?,
     };
     store.commit(batch).await?;
     Ok(())
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| SignerError::Records(e.to_string()))
+    serde_json::to_vec(value).map_err(|_| RecordsFault::Encode.into())
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
+fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], record: SignerRecord) -> Result<T> {
     // The decoder's message can quote the stored value, which may hold signed records:
     // only the position is kept.
-    serde_json::from_slice(bytes)
-        .map_err(|e| SignerError::Records(format!("at line {} column {}", e.line(), e.column())))
+    serde_json::from_slice(bytes).map_err(|e| {
+        RecordsFault::Undecodable {
+            record,
+            line: e.line(),
+            column: e.column(),
+        }
+        .into()
+    })
 }
 
 #[cfg(test)]
@@ -805,7 +961,7 @@ mod tests {
             "a new identity's records start unpublished"
         );
         assert_eq!(state.cert_lifetime_ms, DEFAULT_CERT_LIFETIME_MS);
-        let read: SignerState = decode(&encode(&state).unwrap()).unwrap();
+        let read: SignerState = decode(&encode(&state).unwrap(), SignerRecord::State).unwrap();
         assert_eq!(read, state);
     }
 

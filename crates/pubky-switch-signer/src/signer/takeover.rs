@@ -122,8 +122,12 @@ impl Signer {
         vault: Arc<dyn SecretVault>,
     ) -> Result<Self> {
         let identity = app.cert.identity();
+        let mut store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
         let app_id = app.cert.app_id();
-        if state::set_up(&env.store, &identity).await? {
+        if state::set_up(&store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         // A vault that holds another secret could never take this one: found before anything
@@ -159,14 +163,15 @@ impl Signer {
             origin: app.origin.clone(),
             service_key: app.service_key,
             limits,
+            created: None,
         });
         let flow = Flow::TakingOver {
             handover: stored.handover,
             app_id,
             delivery: None,
         };
-        state::save(&env.store, &state, Some(&flow)).await?;
-        let (mut signer, records) = Self::taking_over(env, state, flow, vault, &app.keys)?;
+        state::save(&mut store, &state, Some(&flow)).await?;
+        let (mut signer, records) = Self::taking_over(env, store, state, flow, vault, &app.keys)?;
         signer.prepare_take_over(records).await?;
         signer.resume().await?;
         Ok(signer)
@@ -189,7 +194,11 @@ impl Signer {
         keys: &AppKeys,
         vault: Arc<dyn SecretVault>,
     ) -> Result<Self> {
-        let (state, flow) = state::load(&env.store, &identity)
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        let (state, flow) = state::load(&store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
         let Some(flow @ Flow::TakingOver { .. }) = flow else {
@@ -198,11 +207,11 @@ impl Signer {
                 return Err(Refusal::NotTakingOver.into());
             }
             let keyring = IdentityKeyring::open(vault)?;
-            let mut signer = Self::open(env, keyring).await?;
+            let mut signer = Self::open_owned(env, keyring, store).await?;
             signer.resume().await?;
             return Ok(signer);
         };
-        let (mut signer, records) = Self::taking_over(env, state, flow, vault, keys)?;
+        let (mut signer, records) = Self::taking_over(env, store, state, flow, vault, keys)?;
         let unsigned = matches!(signer.flow, Some(Flow::TakingOver { delivery: None, .. }));
         if unsigned {
             signer.prepare_take_over(records).await?;
@@ -217,6 +226,7 @@ impl Signer {
     /// hand-over, and the records it carries.
     fn taking_over(
         env: SignerEnv,
+        store: pubky_switch_client::store::OwnedStoreHandle,
         state: SignerState,
         flow: Flow,
         vault: Arc<dyn SecretVault>,
@@ -232,6 +242,7 @@ impl Signer {
         let (keyring, records) =
             IdentityKeyring::received(vault, handover, &state.identity, app_id, &bundle_secret)?;
         let signer = Self {
+            store,
             env,
             keyring,
             state,
@@ -270,7 +281,7 @@ impl Signer {
             // Nothing was sent: the old signer still holds the identity.
             drop(records);
             self.keyring.forget_held();
-            state::delete(&self.env.store, &identity).await?;
+            self.delete_records().await?;
             self.flow = None;
             self.state.taking_over = false;
             return Err(Refusal::StaleHandOver.into());
@@ -290,7 +301,7 @@ impl Signer {
         let (body, prev) = take_over_body(&records, self.state.install)?;
         drop(records);
         let doc = {
-            let key = gate::taking_over_key(&self.keyring, &state)?;
+            let key = gate::taking_over_key(&self.keyring, &state, &self.store)?;
             IdentityDoc::sign(&key, body)?
         };
         state.signed_through = doc.version();
@@ -337,7 +348,7 @@ impl Signer {
                     code: ErrorCode::StaleIdentity,
                     current,
                     ..
-                }) => match self.read_409(&current, &delivery.doc) {
+                }) => match self.read_409(&current, &delivery.doc)? {
                     Answer409::Won => {}
                     Answer409::Lost { install } => return self.take_over_lost(install).await,
                     Answer409::Unsure => {
@@ -402,36 +413,35 @@ impl Signer {
     }
 
     /// Judge the `current` of a `409 stale_identity` answering the delivery `own`.
-    fn read_409(&self, current: &Value, own: &SignedDoc) -> Answer409 {
+    fn read_409(&self, current: &Value, own: &SignedDoc) -> Result<Answer409> {
+        let own_version = state::stored_identity(own, &self.state.identity)?.version();
         let Some(copy) = current
             .get("identity")
             .and_then(|doc| serde_json::from_value::<SignedDoc>(doc.clone()).ok())
             .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok())
         else {
-            return Answer409::Unsure;
+            return Ok(Answer409::Unsure);
         };
         if copy.signed() == own {
-            return Answer409::Won;
+            return Ok(Answer409::Won);
         }
-        let own_version =
-            IdentityDoc::verify(own, &self.state.identity).map_or(u64::MAX, |doc| doc.version());
         if copy.version() < own_version {
-            return Answer409::Unsure;
+            return Ok(Answer409::Unsure);
         }
         // At or above the delivery's version: another install's got ahead; this install's own
         // means its delivery won earlier and it signed on, as after a resend of stale bytes.
         if copy.body().signer == self.state.install {
-            return Answer409::Won;
+            return Ok(Answer409::Won);
         }
-        Answer409::Lost {
+        Ok(Answer409::Lost {
             install: copy.body().signer,
-        }
+        })
     }
 
     /// The take-over lost to `install`'s version: delete the records and the flow, with the
     /// hand-over, and drop the received secret, never in the vault.
     async fn take_over_lost(&mut self, install: [u8; 16]) -> Result<()> {
-        state::delete(&self.env.store, &self.state.identity).await?;
+        self.delete_records().await?;
         self.keyring.forget_held();
         self.flow = None;
         self.state.taking_over = false;

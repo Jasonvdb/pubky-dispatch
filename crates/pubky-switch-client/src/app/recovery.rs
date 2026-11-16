@@ -430,6 +430,7 @@ impl App {
 
     /// Start following the loss `doc` declares, in one commit before any call.
     pub(crate) async fn start_loss(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+        self.complete_applied_effect().await?;
         let lost = self.state.meta.generation;
         let generation = doc.generation();
         let old_key = self.state.meta.service_key;
@@ -444,7 +445,7 @@ impl App {
             .state
             .service_time
             .filter(|time| time.key == old_key)
-            .map(|time| time.offset_ms);
+            .and_then(|time| time.offset_ms);
         // Switch spec 3.6, 12.6 step 1: `n` higher than every `n` the app registered.
         let highest = self
             .state
@@ -814,7 +815,7 @@ impl App {
             self.state
                 .service_time
                 .filter(|time| time.key == new_key)
-                .map(|time| time.offset_ms),
+                .and_then(|time| time.offset_ms),
         ) {
             loss.clock_offset_ms = old.abs_diff(new);
         }

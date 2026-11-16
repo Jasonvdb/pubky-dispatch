@@ -21,7 +21,7 @@ const ORIGIN: &str = "https://switch.example";
 
 /// A service with no account, or `None` when no test database is configured.
 async fn switch(clock: Arc<TestClock>) -> Option<RealSwitch> {
-    RealSwitch::start(ORIGIN, clock, vec![[1; 32]], [2; 32], Limits::default())
+    RealSwitch::start(ORIGIN, clock, [1; 32], Limits::default())
         .await
         .expect("a service")
 }
@@ -54,7 +54,7 @@ async fn test_service_transport_takes_the_services_own_path() {
         transport.send(request(method, origin, path, body))
     };
 
-    // No such route: the operator's signed `404` (Switch wire 7.3 step 1).
+    // No such route: the `404` signed with the service key (Switch wire 7.3 step 1).
     let answer = ask("GET", ORIGIN, "/v1/someone/nowhere", Vec::new())
         .await
         .expect("an answer");
@@ -101,8 +101,8 @@ async fn test_service_transport_takes_the_services_own_path() {
     assert!(!database_exists(&name).await, "{name} was left behind");
 }
 
-/// A request the service's storage fails: the service answers `503 unavailable` under the
-/// operator key, and its log, which a run keeps, says that it was the database.
+/// A request the service's storage fails: the service answers `503 unavailable` under its
+/// service key, and its log, which a run keeps, says that it was the database.
 #[tokio::test]
 async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
     let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {
@@ -229,4 +229,22 @@ async fn test_service_dropped_without_close_drops_its_database() {
     }));
     assert!(unwound.is_err());
     assert!(!database_exists(&name).await, "{name} was left behind");
+}
+
+/// Push registration uses a synthetic relay destination without enabling network delivery.
+#[tokio::test]
+async fn test_service_push_registration_uses_isolated_relays() {
+    let trace = Box::pin(run(
+        Backend::Service,
+        pubky_switch_harness::flows::push_registration,
+    ))
+    .await
+    .expect("the isolated relay registration flow");
+    let Some(trace) = trace else {
+        return;
+    };
+    assert!(trace.lines.iter().any(|line| {
+        line.call == Some("put_push")
+            && line.facts.get("status").is_some_and(|value| value == "200")
+    }));
 }

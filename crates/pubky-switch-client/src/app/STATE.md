@@ -27,6 +27,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   seal for want of the current data epoch's key) commits nothing of its own either: after
   at most one fetch of the key bundle, its own commits, the entry goes under `parked/` as
   `AwaitingKey` with the page, and the cursor passes it (Switch spec 3.5, 8.2).
+- **An input waiting for admission has no effect** (`Outcome::AwaitAdmission`): all
+  callback-staged operations, locals and pair-forgets are discarded. The shared
+  sender/key/admission selector counts the incoming input before the cursor passes it.
+  Its retained payload or exact payload-free drop notice, all selected deletions and the
+  cursor/seen change commit together. A later due retry keeps its original local ID,
+  acceptance and first durable observed receipt. Capacity alone neither retries the input
+  again in that read nor prevents unrelated eligible inputs from proceeding.
 - **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
   takes the newer `identity.json` and key bundle, each in its own commit, and the batch
   sealed again is signed and kept under a new batch ID before it is first sent.
@@ -45,7 +52,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
-- **After a failed commit the app reloads** from the store before its next call.
+- **After a failed commit the app reloads** from the store before its next call. A
+  pending alarm and verified service-time evidence are first retried in one commit;
+  a failed or unknown outcome leaves them held in memory and stops the call. Every app
+  commit carries the pending alarm, including a compromise's required leave. Only a
+  confirmed successful write clears its pending status, so a reload cannot erase the
+  evidence that stopped the app (Switch spec 3.6, 4.3, 10.1). Before that first successful
+  write the evidence is held only in the running app, not promised durable across a crash.
 - **A kept batch or effect is never sent again past its window**, whatever the generation:
   30 days from its first send, less an hour, both ends in verified service time, erring
   older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and the
@@ -82,8 +95,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   the host since the app was loaded, by `take_events`, a call's report or
   `unacknowledged_events`. `pending_duty_events` inspects the same kept duties in ascending
   ID order after any automatic reload owed by a failed commit, without handing them over,
-  consuming the next report or extending acknowledgement eligibility. It adds no stored
-  state. The host still handles every delivered duty through an ID before acknowledging it.
+  consuming the next report or extending acknowledgement eligibility. Inspection adds no
+  stored queue of its own. The host still handles every delivered duty through an ID before
+  acknowledging it.
 - **Only the host's acknowledgement removes a duty event,** with one exception: the commit
   that takes an erased account back (`AccountBack`, Switch spec 12.7) removes the
   `AccountGone` events not yet acknowledged, which no longer hold. The app sets no cap on
@@ -91,6 +105,20 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   stalls, Switch spec 8.2), giving up undeliverable messages (Switch spec 11) or following
   a provider change (Switch spec 12.5, 12.6). A host acknowledges each one once its
   protocol has kept what it says.
+- **Exact acknowledgment and local handling are atomic:** `App::ack_event_with` removes
+  only the acknowledging protocol from the delivered, still-owed EventId and writes bounded qualified protocol locals in one commit.
+  Foreign, undelivered and absent IDs refuse without writes. After an unknown result the
+  caller uses its own durable handling marker; absence alone is not success.
+- **Both backups carry waiting custody and owed drop notices:** required common `waiting`
+  contains sender/key/admission payloads, retry position and metadata, held feed receipts
+  and exact notices. The protocol layer carries other parked inputs, including a pending
+  effect's uncertain copy. Restore validates signed custody bytes and structural notice
+  consistency before installing anything, selects bounds in the installation transaction,
+  and preserves snapshot payload semantics. In-place duties are retained; identical stable
+  notice IDs deduplicate only with identical content. An older restored layer owes its
+  backed-up notice again if it no longer carries the handling effect. A receipt records the
+  original authenticated page's time and key; it is not portable signature proof. A notice
+  has no plaintext with which to reverify the historical message signature.
 - **A restore is one commit:** the namespace cleared, the app's restored state and each
   registered protocol's backup layer under its `p/<name>/`, all checked before it, so a
   failure leaves none of them. A layer of a protocol not registered refuses the restore,
@@ -109,15 +137,14 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A layered backup reads one moment:** `App::backup_layered` is several store reads in
   sequence, and they agree because the call takes `&mut self`, so no call of the app commits
   between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
-  other process does. Before those reads it commits the bound's drops of entries stored
-  unverified, so it needs a writable store, and the drops stay committed if the backup is
-  then refused; an app halted by an alarm, left, or no longer current here skips them and
-  only reads. It makes no network call: the entry a kept effect (`pending/effect`) belongs
+  other process does. Before those reads it commits the shared waiting bounds, even while
+  an alarm stops intake, so it needs a writable store. Those drops stay committed if the
+  backup is then refused; the alarm remains intact. It makes no network call: the entry a kept effect (`pending/effect`) belongs
   to, stored or read from the feed, goes into the backup as `Uncertain`, its flags kept,
   with the processed pair of its message, since a restore never carries the kept effect;
   the live store keeps the effect as it is. An entry read from the feed takes a local ID the
-  live store reserves first by moving `parkid` on, on a halted app too (the backup's one
-  write of its own; its commit also keeps a service time not yet committed), so no later
+  live store reserves first by moving `parkid` on, on a halted app too (its commit also
+  keeps a service time not yet committed), so no later
   entry of the live store takes it.
 
 - **A backup carries the outbox:** every `out/` record as it stands, a message refused for
@@ -189,10 +216,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proc/<sender>/<msg_id>` | a processed message's kind, hash and time. Only the registered owner of its kind may forget it (any protocol when no registered protocol owns the kind) (`ReceiveContext::forget_processed`, in the step's commit with its other writes, or `App::forget_processed`, in one commit with the protocol's local writes): the pair and its `proct/` entry go, so a re-send is delivered again and nothing is left to prune; refused while the message's effect is kept (`pending/effect`) or an entry stored locally holds it | |
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
-| `held/<seq>` | an entry held because its sender can't be checked, since when | |
+| `held/<seq>` | an entry held because its sender cannot be checked or its callback retries: since when and its first durable observed receipt (entry ID, verifying service key and that page's authenticated time) | |
 | `retry/<seq>` | an entry on the feed whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; it goes once the entry is processed or stored to wait for a key, or moves to `sretry/<id>` when the entry is stored locally for another reason | |
 | `sretry/<id>` | the same count for the entry stored locally at local ID `id`, until it is processed, stored for good or stored again to wait for a key | |
-| `parked/<id>` | an entry stored locally and passed, keyed by its local ID, which never changes: the `seq` and generation it was read at, the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; a scope key the receive step waits for, with its data epoch (`AwaitingKey`) and how many scope keys the app held when its step last ran (`keys_at`), tried again only once the app holds every key of that epoch its certificate is given and holds another number of keys than then, so a key the certificate is never given runs its step again only when a key comes; one whose step waits again for the same epoch stays stored as it is, its count brought up to date, with no event; one whose step ran while a reopening was owed (`reopen`), such as after a key its page or its own fetch took, keeps no count; none is tried while a reopening is owed, which its step may read, so its count stays and it is due once the reopening is done: at the retries at the start of a read, or, for one a fetch later in the read brought the keys of, at the end of a read that doesn't stop and owes no listing, at most `PARKED_RETRIES_PER_READ` there, so one whose key never comes costs a read nothing; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again; one the host released after such a window, `Released`, tried again). The host forgets any one (`App::forget_parked`) while no unacknowledged duty event names it or another entry stored for its message, and no kept effect (`pending/effect`) is one of theirs: in one commit with those entries, their `sretry/` counts and, unless none of them had its sender's standing checked and read as a message, its processed pair if none is kept, so a re-send stays a duplicate. Or the host releases an uncertain one (`App::release_parked`), in one commit that removes its processed pair, and marks it `released`, which it keeps whatever it is stored for again, through a backup and a restore, so each later run is handed over as released; a run of it that ends as a duplicate keeps a `ReleasedDuplicate` duty event. Entries stored as `Unverifiable` or `AwaitingKey`, counted together, are bounded at the start of every read, before the retries, and before a layered backup of an app that is running, those stored before included (Switch spec 8.2): kept at most `MAX_UNVERIFIED_AGE_MS` (21 days) from acceptance on the highest verified service time, `MAX_UNVERIFIED_PER_SENDER` (64) per sender identity and `MAX_UNVERIFIED_TOTAL` (128) in all; one past a bound goes, accepted earliest, of its sender or, for the total, of the identity holding the most (of those holding as many, the one whose newest entry is newest), with its `sretry/` count and a `StoredEntryDropped` duty event in the same commit, at most `UNVERIFIED_DROPS_PER_COMMIT` (64) per commit. The entry a kept effect (`pending/effect`) belongs to is neither counted nor dropped until the effect settles. Entries stored for other reasons aren't counted | yes |
+| `parked/<id>` | an entry stored locally and passed, keyed by its local ID, which never changes: the `seq` and generation it was read at, the opened plaintext, sender, certificate, acceptance time, original observed receipt, reason (waiting for protocol admission, an unverifiable sender, a quota or a store failure of the receive step, tried again; a scope key the receive step waits for, with its data epoch (`AwaitingKey`) and how many scope keys the app held when its step last ran (`keys_at`), tried again only once the app holds every key of that epoch its certificate is given and holds another number of keys than then, so a key the certificate is never given runs its step again only when a key comes; one whose step waits again for the same epoch stays stored as it is, its count brought up to date, with no event; one whose step ran while a reopening was owed (`reopen`), such as after a key its page or its own fetch took, keeps no count; none is tried while a reopening is owed, which its step may read, so its count stays and it is due once the reopening is done: at the retries at the start of a read, or, for one a fetch later in the read brought the keys of, at the end of a read that doesn't stop and owes no listing, at most `PARKED_RETRIES_PER_READ` there, so one whose key never comes costs a read nothing; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again; one the host released after such a window, `Released`, tried again). The host forgets any one (`App::forget_parked`) while no unacknowledged duty event names it or another entry stored for its message, and no kept effect (`pending/effect`) is one of theirs: in one commit with those entries, their `sretry/` counts and, unless none of them had its sender's standing checked and read as a message, its processed pair if none is kept, so a re-send stays a duplicate. Or the host releases an uncertain one (`App::release_parked`), in one commit that removes its processed pair, and marks it `released`, which it keeps whatever it is stored for again, through a backup and a restore, so each later run is handed over as released; a run of it that ends as a duplicate keeps a `ReleasedDuplicate` duty event. Entries stored as `Unverifiable`, `AwaitingKey` or `AwaitingAdmission` share one pool. Bounds include each incoming input atomically, run locally before every read even when halted, before a layered backup, and during restore installation (Switch spec 8.2): kept at most `MAX_UNVERIFIED_AGE_MS` (21 days) from acceptance on the highest verified service time, `MAX_UNVERIFIED_PER_SENDER` (64) per sender identity and `MAX_UNVERIFIED_TOTAL` (128) in all; one past a bound goes, accepted earliest, of its sender or, for the total, of the identity holding the most (of those holding as many, the one whose newest entry is newest), with its `sretry/` count and a `StoredEntryDropped` duty event in the same commit, at most `UNVERIFIED_DROPS_PER_COMMIT` (64) per upkeep commit; an incoming selection is indivisible. The entry a kept effect (`pending/effect`) belongs to is neither counted nor dropped until the effect settles. Entries stored for other reasons aren't counted | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `parkn` | where the retries of entries stored locally stand in their round: its number and the next local ID. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in; each read tries at most `PARKED_RETRIES_PER_READ`, in local ID order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
 | `parkid` | the local ID the next entry stored locally takes: it only goes up, and is never below one past the highest `parked/` key, so no ID is used twice in one store. A backup carries it; a restore starts past the backup's, the one of the store it restores in place (past that store's `parked/` and `sretry/` keys when its counter doesn't read), and every ID a carried duty event names | |
@@ -210,12 +237,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `hcur` | the last restore's check of the cursor the service holds (Switch spec 12.4 "The held cursor"): the backup's committed position, when the restore ran, and the verdict (`HeldCursor`), settled at the first page that isn't a frozen service's read once the own `identity.json` was confirmed after the restore, `Unknown` at once if a batch carrying a cursor move is sent first; written in the restore's commit and in the settling page's, and deleted with `restore` when reconciliation ends with the key check done. A clean verdict turns ahead when a later page reports a cursor ahead of the furthest position the app committed or sent, for an app whose devices don't share its cursor, and reads unknown once the backup's generation is no longer of the current sequence | |
 | `hgap` | the generation and held `seq` of the last gap ahead handed to the protocol as a `missed` item, in the commit of the page that handed it, so each higher report is handed once | |
 | `leave` | a leave in progress or done, committed before a publishing app deletes its Homeserver record: from then on nothing is published, across a restart too. A two-step leave calls `leave` only once the delete is made; an immediate leave and a compromise's call it whatever the delete's outcome, the call's mode deciding, so also after a two-step leave whose delete failed | |
-| `service_time` | the highest service time verified, its key, the offset from the device clock | |
+| `service_time` | the highest comparable service time verified, its key, and the optional offset from the latest stamped answer | |
 | `protos` | the names of the protocols the app was set up with, written by a join and a restore: a load refuses a set of protocols that lacks one of them or registers another, before it writes anything | |
 | `p/<name>/...` | the local state of the protocol `name` (`LocalWrite`): every write a protocol hands over, through a callback, a batch (`OpBatch::for_protocol`), `App::protocol_commit` or `App::forget_processed`, is qualified where it enters the app, and kept so in `pending/effect` and `opq/`, so one protocol's writes, a `DeletePrefix` of its whole key space included, never reach another's | the protocol's |
 | `rcd` | the protocols that ended the reconcile mode under way (`App::end_reconcile_for`); the mode ends, and `rcd` goes, when the last registered protocol ends it. Deleted in every commit that starts the mode: a restore (with the namespace), the commit that starts a provider loss, and the read's commit that continues from a checkpoint with continuity unverified, so every protocol reconciles again | |
 | `rexp` | the expiry each protocol asked of the app's record, by name, `null` for none (`App::set_protocol_member`, `App::renew_record`), written in the commit that keeps the record it signs, or alone when the record doesn't change: the record's `expires_at` is the earliest of them, `null` while none asked for one (Switch spec 4.2, wire 3.2). An earliest at or before now refuses the call (`Refusal::Usage`, naming the protocol that asked for it), nothing signed or sent, until that protocol asks for a later one; the calling protocol's own ask, when later than now, is kept alone meanwhile, so the record's `expires_at` may be behind `rexp` until it is signed again, and two protocols whose expiries lapsed renew in turn. An ask at or before now is refused, naming its protocol, and kept nowhere. A backup carries it (`record_expiries`), and a restore writes it back, refusing one of a protocol it doesn't register | |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`) with the protocols it is for (`to`, written by every writer: the protocol of the kind or the stored entry it names, of the kept batch, or of the call whose writes were refused; every registered protocol otherwise), written in the commit of the change it reports, until each of them acknowledges it (`App::ack_events_for` takes one name out, rewriting the event or removing it with the last; `App::ack_events` removes it for all); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), entry stored unverified or waiting for a key that was dropped past their bounds (`StoredEntryDropped`, with the epoch it waited for), released entry that ran as a duplicate (`ReleasedDuplicate`), renewed certificate not taken (`CertificateRefused`, with `cert/refused`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges. One for no protocol, or for one not registered, which no acknowledgement could remove, is a corrupt store: the load fails (`StoreError::Corrupt`); a restore in place carries it only for the registered protocols it names, and leaves one for none of them behind, counted | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`) with its remaining protocol recipients, written in the commit of the change it reports, until the host acknowledges it (`App::ack_events` or exact `App::ack_event_with`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), entry waiting for sender standing, a key or admission that was dropped past the shared bounds (`StoredEntryDropped`, with its exact message identity, waiting reason, original observed receipt and stable notice ID, without payload or any claim that another copy/effect is absent), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -283,7 +310,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned
   `404` and no published `identity.json` at every try, counted at 5 tries at least 6 hours
-  apart by the app's clock, which `erasing` times. Any answer the account's key signs, or a
+  apart by the app's clock, which `erasing` times. Any answer the pinned service key signs, or a
   published `identity.json`, ends `erasing`. An erased account seen alive again, its
   `identity.json` published and listing the app, ends `gone`: its `push` setting is kept,
   no longer set, and the other devices' handles too; an app that isn't current drops both.

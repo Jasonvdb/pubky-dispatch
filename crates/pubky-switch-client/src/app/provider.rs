@@ -22,7 +22,7 @@
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
 //!   `403 not_current` answer from the service and generation the newest one names, while
 //!   it doesn't list the app with another certificate, means the app isn't current. A `404`
-//!   that the account's key didn't sign, while the identity publishes no `identity.json`,
+//!   that the pinned service key didn't sign, while the identity publishes no `identity.json`,
 //!   held at [`ERASURE_TRIES`] tries spread over [`ERASURE_WAIT_MS`], means its account is
 //!   gone. The app keeps that, stops and reports it; an erased account seen alive again
 //!   comes back.
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
 use super::events::{AppEvent, Duty};
-use super::feed::{ReceiveReport, processed_writes};
+use super::feed::ReceiveReport;
 use super::identity;
 use super::kept::{Ended, KeptBatchDrop};
 use super::state::{Tx, key};
@@ -193,7 +193,8 @@ pub(crate) enum TakeOver {
     ReadAgain,
 }
 
-/// What a `404` the account's key didn't sign means.
+/// What a `404` means that the pinned service key didn't sign, or that it signed for an identity
+/// the service doesn't host.
 enum Unknown {
     /// The account is gone.
     Gone,
@@ -432,6 +433,33 @@ impl App {
                 Ok(public) => public,
                 // An answer the pinned key didn't sign is looked into as at a read: a try
                 // of the erasure wait counts here too (Switch spec 12.7).
+                // The service's signed word that it doesn't host the identity is looked into
+                // the same way (Switch spec 12.7 step 5), but only from an answer to a
+                // request the app signed: the public read binds no timestamp, so its `404`
+                // verifies at any time (Switch wire 7.1 "Identical requests"). A page of no
+                // items asks.
+                Err(AppError::Switch(public)) if public.is_not_hosted() => {
+                    let signed = self
+                        .client
+                        .feed(FeedQuery {
+                            after: None,
+                            limit: Some(0),
+                            wait: None,
+                        })
+                        .await;
+                    let error = match self.take(signed).await {
+                        Err(AppError::Switch(error)) if error.is_not_hosted() => error,
+                        // Hosted after all, or no word: the read fails as it came.
+                        Ok(_) => return Err(AppError::Switch(public)),
+                        Err(error) => return Err(error),
+                    };
+                    self.reload_now().await?;
+                    return match self.not_hosted().await? {
+                        Unknown::Gone => Ok(ProviderStatus::Gone),
+                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Waiting(_) | Unknown::Unexplained => Err(AppError::Switch(error)),
+                    };
+                }
                 Err(error @ AppError::Switch(ClientError::BadServiceSignature { status })) => {
                     self.reload_now().await?;
                     return match self.unknown_account(status).await? {
@@ -569,8 +597,18 @@ impl App {
                 self.mark_gone(GoneReason::NotCurrent).await?;
                 Ok(TakeOver::Done(Ok(self.stopped_report())))
             }
+            AppError::Switch(not_hosted) if not_hosted.is_not_hosted() => {
+                // The service's signed word that it doesn't host the identity: the account is
+                // gone, or the identity went elsewhere. The own identity.json tells.
+                self.reload_now().await?;
+                match self.not_hosted().await? {
+                    Unknown::Gone => Ok(TakeOver::Done(Ok(self.stopped_report()))),
+                    Unknown::Moved => Ok(TakeOver::ReadAgain),
+                    Unknown::Waiting(_) | Unknown::Unexplained => Ok(TakeOver::Done(Err(error))),
+                }
+            }
             AppError::Switch(ClientError::BadServiceSignature { status }) => {
-                // An answer the pinned key didn't sign: the account's key changed, or the
+                // An answer the pinned key didn't sign: the pinned service key changed, or the
                 // account is gone. The own identity.json tells.
                 let status = *status;
                 self.reload_now().await?;
@@ -1044,22 +1082,24 @@ impl App {
         &mut self,
         answer: Result<(Option<u64>, Option<u64>), ClientError>,
     ) -> Result<(), AppError> {
-        match answer {
+        let code = match answer {
             Ok((heads, proofs)) => {
                 self.events.push(AppEvent::EvidenceUploaded {
                     heads: heads.unwrap_or(0),
                     proofs: proofs.unwrap_or(0),
                 });
-                Ok(())
+                return Ok(());
             }
-            Err(ClientError::Switch { code, .. }) => {
-                self.events.push(AppEvent::EvidenceRefused {
-                    code: code.as_str().to_owned(),
-                });
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
+            Err(ClientError::Switch { code, .. }) => code,
+            // The same bytes can never be sent; report the refusal and keep the evidence
+            // as after an authenticated too_large answer (Switch wire 7.1, 7.4.14).
+            Err(ClientError::BodyOverCap { .. }) => ErrorCode::TooLarge,
+            Err(error) => return Err(error.into()),
+        };
+        self.events.push(AppEvent::EvidenceRefused {
+            code: code.as_str().to_owned(),
+        });
+        Ok(())
     }
 
     /// Whether the newest own `identity.json` names the next generation: taken from the
@@ -1130,6 +1170,7 @@ impl App {
         doc: &IdentityDoc,
         mv: &mut MoveRecord,
     ) -> Result<(), AppError> {
+        self.complete_applied_effect().await?;
         let old = self.state.meta.clone();
         let mut tx = self.tx()?;
         let gen_key = keys::generation(old.generation);
@@ -1194,14 +1235,44 @@ impl App {
         Ok(())
     }
 
+    /// Complete only an effect the retained authenticated chain proves applied, before
+    /// changing provider state. Reuse the ordinary effect completion and its pre-send
+    /// outcome budget, keeping lifecycle keys and batches in the following transaction
+    /// (Switch spec 11, 12.5 "Kept batches", 12.6). An uncertain effect stays unanswered.
+    pub(crate) async fn complete_applied_effect(&mut self) -> Result<(), AppError> {
+        let Some(pending) = self.state.pending_effect.clone() else {
+            return Ok(());
+        };
+        let batch = Batch::from_body(pending.body.clone())?;
+        if !batch
+            .id()
+            .is_some_and(|id| self.applied_by_old_service(&id))
+        {
+            return Ok(());
+        }
+        // The applied batch carried this cursor move. No new request is sent here.
+        if let Some(to) = pending.cursor_to {
+            self.state.cursor.at_service = self.state.cursor.at_service.max(to);
+        }
+        self.commit_effect(&pending, &batch, &[]).await?;
+        self.events.push(AppEvent::MessageReceived {
+            seq: pending.seq,
+            kind: pending.kind,
+            msg_id: pending.msg_id,
+            sender: pending.sender,
+        });
+        Ok(())
+    }
+
     /// At a provider change, what the app signed for the generation it leaves and kept
     /// unanswered (Switch spec 12.5 step 2, 12.6, 13.5), into `tx`. Called once the app
     /// signs for the new generation, while the chain view is still the old service's: a
     /// batch whose ID that chain holds was applied there, though its answer was lost.
     ///
-    /// - **`pending/effect`:** applied, its outcome commits now, so its entry isn't
-    ///   processed again and an effect without conditions is never applied twice; otherwise
-    ///   it goes, and its entry is read again and its effect signed anew.
+    /// Known-applied received effects complete first in [`App::complete_applied_effect`],
+    /// before the caller starts this lifecycle transaction.
+    /// - **`pending/effect`:** still unanswered, it goes after a loss and its entry is read
+    ///   again; an attempt in it is never signed again.
     /// - **`opq/<batch_id>`:** applied, what it settles commits and it goes; otherwise its
     ///   operations are signed again for the new generation, their bytes under a new wire
     ///   batch ID, and stay kept under the ID the batch was first kept under (`kept.rs`),
@@ -1226,73 +1297,16 @@ impl App {
         let resend_first = carry == Carry::ResendFirst;
         let window_now = self.kept_window_now();
         let answer_decides = |kept_ms: Option<u64>| answer_decides(window_now, kept_ms);
-        if let Some(pending) = self.state.pending_effect.clone() {
-            let applied = Batch::from_body(pending.body.clone())?
-                .id()
-                .is_some_and(|id| self.applied_by_old_service(&id));
-            // A kept effect stays to be sent again whatever its age: an answer that can't
-            // decide parks its entry instead of building the effect again
-            // (`feed.rs`).
-            let stays = !applied && resend_first;
-            if !stays {
-                tx.delete(key::PENDING_EFFECT)?;
-                self.state.pending_effect = None;
-            }
-            // After a loss, an effect the old chain doesn't show applied goes, and its entry
-            // is read again; an `attempt` in it is never signed again, so it is reported as
-            // a kept batch's is (Switch spec 12.6 step 5).
-            if !applied && carry == Carry::AfterLoss {
+        // Known-applied effects were completed before this lifecycle transaction began.
+        // An unknown effect keeps the existing resend/loss behavior (Switch spec 12.5, 12.6).
+        if let Some(pending) = self.state.pending_effect.clone()
+            && !resend_first
+        {
+            tx.delete(key::PENDING_EFFECT)?;
+            self.state.pending_effect = None;
+            if carry == Carry::AfterLoss {
                 let to = self.owners_of_kind(&pending.kind);
                 self.attempts_dropped(&Batch::from_body(pending.body.clone())?, to, tx)?;
-            }
-            if applied {
-                let now = self.now();
-                // What its operations settle without their proofs, such as a list change.
-                let settles = super::batch::PendingBatch {
-                    deadlines: pending.deadlines.clone(),
-                    ..super::batch::PendingBatch::default()
-                };
-                for op in Batch::from_body(pending.body.clone())?.ops() {
-                    self.settle_op(op, None, &settles, tx).await?;
-                }
-                processed_writes(
-                    tx,
-                    &pending.sender,
-                    &pending.msg_id,
-                    &pending.kind,
-                    pending.hash,
-                    now,
-                )?;
-                tx.local(&pending.local)?;
-                for key in &pending.forget {
-                    tx.delete(key)?;
-                }
-                // Processed: a count of the store's retries at it goes with it.
-                if pending.stored.is_some() {
-                    self.unpark(pending.stored, tx)?;
-                } else if self.state.retries.remove(&pending.seq).is_some() {
-                    tx.delete(&key::retry(pending.seq))?;
-                }
-                if pending.stored.is_some() {
-                    // Stored before, and passed then.
-                } else if pending.past_held {
-                    tx.put(&key::seen(pending.seq), &())?;
-                    self.state.seen.insert(pending.seq);
-                } else {
-                    let cursor = &mut self.state.cursor;
-                    cursor.seq = cursor.seq.max(pending.seq);
-                    cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
-                }
-                if let Some(to) = pending.cursor_to {
-                    let cursor = &mut self.state.cursor;
-                    cursor.at_service = cursor.at_service.max(to);
-                }
-                events.push(AppEvent::MessageReceived {
-                    seq: pending.seq,
-                    kind: pending.kind,
-                    msg_id: pending.msg_id,
-                    sender: pending.sender,
-                });
             }
         }
         for (id, pending) in self.kept_batches().await? {
@@ -1823,7 +1837,7 @@ impl App {
         Ok(true)
     }
 
-    /// An answer the account's key didn't sign. A newer own `identity.json` is followed: a
+    /// An answer the pinned service key didn't sign. A newer own `identity.json` is followed: a
     /// key change or a move the app hadn't seen yet. For a `404`, the account may be erased
     /// (Switch spec 12.7): it is gone once the identity has published no `identity.json` at
     /// every try for [`ERASURE_WAIT_MS`], unless the verified own copy the app holds names a
@@ -1855,6 +1869,33 @@ impl App {
             Ok(None) => {
                 self.clear_erasing().await?;
                 Ok(Unknown::Unexplained)
+            }
+            Err(_) => Ok(Unknown::Unexplained),
+        }
+    }
+
+    /// The `404` the pinned key signed for an identity the service doesn't host, bound to the
+    /// app's own request (Switch wire 7.3 step 2). With no `identity.json` published, the two
+    /// together are an erasure, at once (Switch spec 12.7 step 5, wire 7.4.16 "Afterwards"),
+    /// unless the verified own copy the app holds names a later generation than it follows,
+    /// which is followed instead. A published `identity.json` that still names the service
+    /// ends nothing: the service counts as unreachable, and the call fails as it came. A
+    /// Homeserver it can't reach changes nothing.
+    async fn not_hosted(&mut self) -> Result<Unknown, AppError> {
+        let identity = self.state.meta.identity;
+        match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+            Ok(None) if self.provider_superseded() => Ok(Unknown::Moved),
+            Ok(None) => {
+                self.mark_gone(GoneReason::Erased).await?;
+                Ok(Unknown::Gone)
+            }
+            Ok(Some(doc)) => {
+                self.take_own_copy(doc).await?;
+                if self.state.own_doc.generation() > self.state.meta.generation {
+                    Ok(Unknown::Moved)
+                } else {
+                    Ok(Unknown::Unexplained)
+                }
             }
             Err(_) => Ok(Unknown::Unexplained),
         }

@@ -737,4 +737,187 @@ mod tests {
                 .unwrap();
         }
     }
+
+    struct AdmissionProtocol {
+        inner: Arc<TestProtocol>,
+        admitted: AtomicBool,
+    }
+
+    impl pubky_switch_client::app::Protocol for AdmissionProtocol {
+        fn name(&self) -> String {
+            self.inner.name()
+        }
+        fn has_keys(&self, scope: &str) -> bool {
+            self.inner.has_keys(scope)
+        }
+        fn sent_between_own_apps(&self, kind: &str) -> bool {
+            self.inner.sent_between_own_apps(kind)
+        }
+        fn check_scopes(
+            &self,
+            message: &pubky_switch_core::message::Message,
+            sender: &pubky_switch_core::records::AppCert,
+            own: &pubky_switch_core::records::AppCert,
+        ) -> Result<(), String> {
+            self.inner.check_scopes(message, sender, own)
+        }
+        fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+            self.inner.accepts(cert)
+        }
+        fn check_body(
+            &self,
+            message: &pubky_switch_client::app::ReceivedMessage,
+        ) -> Result<(), String> {
+            self.inner.check_body(message)
+        }
+        fn missed(
+            &self,
+            missed: &pubky_switch_client::app::MissedEntries,
+        ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+        {
+            self.inner.missed(missed)
+        }
+        fn resend_needed(
+            &self,
+            needed: &pubky_switch_client::app::ResendNeeded,
+        ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
+        {
+            self.inner.resend_needed(needed)
+        }
+        fn receive(
+            &self,
+            message: &pubky_switch_client::app::ReceivedMessage,
+            cx: &mut pubky_switch_client::app::ReceiveContext<'_>,
+        ) -> pubky_switch_client::app::Outcome {
+            use pubky_switch_client::app::{LocalWrite, Outcome};
+            cx.local(LocalWrite::Put {
+                key: b"completed".to_vec(),
+                value: message.message.msg_id.as_bytes().to_vec(),
+            })
+            .unwrap();
+            if self.admitted.load(Ordering::SeqCst) {
+                Outcome::Consume
+            } else {
+                Outcome::AwaitAdmission
+            }
+        }
+    }
+
+    async fn admission_with_two_owners(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let mut alice_signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+        let mut bob_signer = Box::pin(enroll(world, &bob, ORIGIN)).await?;
+        let tasks = Arc::new(AdmissionProtocol {
+            inner: sample_protocol(TASKS),
+            admitted: AtomicBool::new(false),
+        });
+        let chat = sample_protocol(CHAT);
+        let protocols = ProtocolSet::new(vec![tasks.clone(), chat.clone()])?;
+        let mut wallet = Box::pin(joined_with_both(
+            world,
+            &alice,
+            &mut alice_signer,
+            "wallet",
+            protocols.clone(),
+        ))
+        .await?;
+        let (shop_tasks, shop_chat) = both();
+        let mut shop = Box::pin(joined_with_both(
+            world,
+            &bob,
+            &mut bob_signer,
+            "shop",
+            set_of(&shop_tasks, &shop_chat)?,
+        ))
+        .await?;
+        wallet.add_contact(&bob.public()).await?;
+        let mut ids = Vec::new();
+        for owner in [TASKS, CHAT] {
+            let (id, delivery) = shop
+                .send(OutgoingMessage::new(
+                    alice.public(),
+                    &format!("{owner}.item"),
+                    serde_json::Map::new(),
+                ))
+                .await?;
+            assert!(matches!(
+                delivery,
+                pubky_switch_client::app::Delivery::Accepted { .. }
+            ));
+            ids.push(id);
+            world.advance_ms(STEP_MS);
+        }
+        wallet.receive(None).await?;
+        let stored = wallet.parked_entries().await?;
+        assert_eq!(
+            stored.len(),
+            1,
+            "one owner waits while the ready owner completes"
+        );
+        let original = wallet
+            .parked_entry(stored[0].stored_id)
+            .await?
+            .unwrap()
+            .receipt;
+        assert_eq!(wallet.protocol_get(TASKS, b"completed").await?, None);
+        assert_eq!(chat.received().len(), 1);
+        assert_eq!(
+            wallet.protocol_get(CHAT, ids[1].as_bytes()).await?,
+            Some(b"chat.item".to_vec())
+        );
+        let backup = wallet.backup_layered().await?;
+        let mut restored = Box::pin(App::restore(
+            world.app_env(Arc::new(MemoryStore::new())),
+            protocols,
+            AppConfig::default(),
+            &backup,
+        ))
+        .await?;
+        assert_eq!(
+            restored
+                .parked_entry(stored[0].stored_id)
+                .await?
+                .unwrap()
+                .receipt,
+            original
+        );
+        world.advance_ms(STEP_MS);
+        restored.refresh_identity().await?;
+        tasks.admitted.store(true, Ordering::SeqCst);
+        restored.receive(None).await?;
+        assert!(restored.parked_entries().await?.is_empty());
+        assert_eq!(
+            restored.protocol_get(TASKS, b"completed").await?,
+            Some(ids[0].as_bytes().to_vec())
+        );
+        assert_eq!(restored.protocol_get(CHAT, b"completed").await?, None);
+        assert_eq!(
+            restored.protocol_get(CHAT, ids[1].as_bytes()).await?,
+            Some(b"chat.item".to_vec())
+        );
+        world.outcome("owner admission and completion", &json!({"stored_before":1,"stored_after":0,"chat_completed":true,"receipt_retained":true}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_protocol_admission_and_completion_agree_at_both_switches() {
+        let scripted = Box::pin(run_here(Backend::Scripted, admission_with_two_owners))
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(service) = Box::pin(run_here(Backend::Service, admission_with_two_owners))
+            .await
+            .unwrap()
+        else {
+            return;
+        };
+        let verdict = crate::compare::judge(
+            "protocol admission",
+            crate::compare::differences(&service, &scripted),
+            crate::allowed::ALLOWED,
+        );
+        assert!(verdict.agrees(), "{verdict}");
+    }
 }

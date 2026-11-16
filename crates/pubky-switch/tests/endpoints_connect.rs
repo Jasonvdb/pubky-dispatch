@@ -46,6 +46,21 @@ fn doc(name: &str) -> SignedDoc {
         .expect("document")
 }
 
+/// The document hash of the newest `identity.json` alice's account holds.
+async fn held_identity_hash(replay: &Replay) -> [u8; 32] {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let bytes: Vec<u8> = sqlx::query_scalar("SELECT identity_doc FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("held");
+    let held: SignedDoc = serde_json::from_slice(&bytes).expect("document");
+    held.doc_hash().expect("hash")
+}
+
 fn bob() -> [u8; 32] {
     let keys = vectors("keys.json");
     let bob = keys["identities"]
@@ -1286,26 +1301,9 @@ async fn test_connect_erasure_forgets_the_connect_counts() {
     assert!(pending(&ask(&replay).await));
     let before = replay.service.counted_at(&alice_id());
     assert!(before > 0);
-    let keys = vectors("keys.json");
-    let service_key: [u8; 32] = pubky_switch_core::enc::unb64(
-        keys["service_keys"]
-            .as_array()
-            .expect("service keys")
-            .iter()
-            .find(|s| s["account"] == alice_id().as_str())
-            .expect("alice's service key")["public"]
-            .as_str()
-            .expect("public"),
-    )
-    .expect("key")
-    .try_into()
-    .expect("32 bytes");
-    let erase = signer_request(
-        "POST",
-        &format!("/v1/{}/erase", alice_id()),
-        pubky_switch_core::http::erase_body(&service_key, None),
-        ms(&at()),
-    );
+    // The erasure names the newest identity.json the account holds (Switch wire 7.4.16).
+    let held = held_identity_hash(&replay).await;
+    let erase = erasure_of(&replay, &alice_id(), Some(&held), ms(&at())).await;
     let erased = replay.service.handle(erase).await;
     assert_eq!(
         erased.status,

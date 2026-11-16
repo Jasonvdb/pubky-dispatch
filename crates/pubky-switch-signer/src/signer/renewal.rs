@@ -36,7 +36,6 @@
 //! The signer writes only `key_bundle.put` and `cert.put` (Switch spec 13.5).
 
 use pubky_switch_client::ClientError;
-use pubky_switch_client::client::Batch;
 use pubky_switch_client::client::answers::AppStatus;
 
 use pubky_switch_core::ops::{KeyBundlePut, OpKind};
@@ -50,7 +49,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
 use crate::alert::{Alert, RenewalSkip};
-use crate::error::{Refusal, Result, SignerError};
+use crate::error::{RecordsFault, Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
 use crate::state::{AskedRenewal, Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
@@ -139,7 +138,9 @@ impl Signer {
             .held_certs()?
             .into_iter()
             .find(|cert| cert.hash() == listed)
-            .ok_or_else(|| SignerError::Records("the listed certificate isn't held".into()))?;
+            .ok_or(SignerError::Records(RecordsFault::Invariant(
+                "the listed certificate isn't held",
+            )))?;
         let scopes = change.scopes.unwrap_or_else(|| old.scopes().to_vec());
         let terms = self.env.protocols.terms(&scopes)?;
         let now = self.env.clock.now_ms();
@@ -213,7 +214,9 @@ impl Signer {
         let last = if rotates {
             current
                 .checked_add(1)
-                .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the data epoch can't go higher",
+                )))?
         } else {
             current
         };
@@ -350,9 +353,9 @@ impl Signer {
                 continue;
             }
             let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
-                return Err(SignerError::Records(
-                    "a listed certificate isn't held".into(),
-                ));
+                return Err(SignerError::Records(RecordsFault::Invariant(
+                    "a listed certificate isn't held",
+                )));
             };
             let unowned = self.env.protocols.unowned(cert.scopes());
             if !unowned.is_empty() {
@@ -443,9 +446,9 @@ impl Signer {
         flow: Flow,
     ) -> Result<()> {
         let Flow::Deliver { prev, .. } = flow else {
-            return Err(SignerError::Records(
-                "a version without its delivery".into(),
-            ));
+            return Err(SignerError::Records(RecordsFault::Invariant(
+                "a version without its delivery",
+            )));
         };
         state.signed_through = state.signed_through.max(doc.version());
         for alert in alerts {
@@ -498,7 +501,7 @@ impl Signer {
         for (index, batch) in batches.iter().enumerate().skip(sent) {
             // Before each batch, not once: another install may take over between two.
             self.ensure_signer().await?;
-            let signed = Batch::from_body(batch.bytes.0.clone())?;
+            let signed = batch.read(&self.state.identity)?;
             match client.submit(&signed).await {
                 Ok(_) => {
                     // Each stored part replaces those whose range it overlaps (Switch wire
@@ -552,9 +555,7 @@ impl Signer {
         state: &mut SignerState,
         doc: &SignedDoc,
     ) -> Result<()> {
-        let Ok(refused) = IdentityDoc::verify(doc, &state.identity) else {
-            return Ok(());
-        };
+        let refused = crate::state::stored_identity(doc, &state.identity)?;
         let Some(newest) = state.newest_doc()? else {
             return Ok(());
         };
@@ -603,12 +604,11 @@ impl Signer {
     /// Every certificate the signer holds, verified.
     pub(super) fn held_certs(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
-        Ok(self
-            .state
+        self.state
             .certs
             .iter()
-            .map(|cert| AppCert::verify(cert, &identity))
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .map(|cert| AppCert::verify(cert, &identity).map_err(SignerError::StoredData))
+            .collect::<std::result::Result<Vec<_>, _>>()
     }
 
     /// The apps whose closing delivery the signer owes: open renewals in the newest version
@@ -630,16 +630,16 @@ impl Signer {
 
     /// Whether the newest version is one whose delivery, retried, gave no service time: the
     /// closing it owes waits for a later version's delivery.
-    fn closing_stalled(&self) -> bool {
-        self.state.closing_unavailable.is_some()
-            && self.state.closing_unavailable == self.high_water().map(|h| h.version)
+    fn closing_stalled(&self) -> Result<bool> {
+        Ok(self.state.closing_unavailable.is_some()
+            && self.state.closing_unavailable == self.high_water()?.map(|h| h.version))
     }
 
     /// Whether a closing delivery is owed and can be made now: the signing gate lets it
     /// through ([`super::gate::refusal`]).
     pub(super) fn owes_closing(&self) -> Result<bool> {
         Ok(super::gate::refusal(&self.state).is_none()
-            && !self.closing_stalled()
+            && !self.closing_stalled()?
             && !self.owed()?.is_empty())
     }
 
@@ -663,7 +663,7 @@ impl Signer {
             return Ok(false);
         }
         let owed = self.owed()?;
-        let stalled = self.closing_stalled() || super::gate::refusal(&self.state).is_some();
+        let stalled = self.closing_stalled()? || super::gate::refusal(&self.state).is_some();
         let mut state = self.state.clone();
         state
             .alerts
@@ -685,7 +685,7 @@ impl Signer {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(false);
         };
-        let version = self.high_water().map_or(0, |h| h.version);
+        let version = self.high_water()?.map_or(0, |h| h.version);
         let Some(delivered_at) = newest.delivered_at else {
             let mut state = self.state.clone();
             if self.state.time_asked == Some(version) {

@@ -21,6 +21,7 @@ use super::error::Refusal;
 use super::events::Duty;
 use super::events::{AppEvent, ParkReason};
 use super::feed::processed_writes;
+use super::protocol::EntryReceipt;
 use super::state::{ParkedEntry, Processed, Tx, key};
 use super::{App, AppError, AppState};
 use crate::error::StoreError;
@@ -52,6 +53,8 @@ pub struct ParkedSummary {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ParkedMessage {
+    /// The original verified feed observation, unchanged by local retries.
+    pub receipt: EntryReceipt,
     /// The entry's local ID, which never changes.
     pub stored_id: u64,
     /// The `seq` the entry was read at, in [`ParkedMessage::generation`].
@@ -207,6 +210,7 @@ impl App {
             let message = Message::parse(plaintext.json(), &opaque).ok();
             let retry = self.state.stored_retries.get(&id).copied();
             Ok(Some(ParkedMessage {
+                receipt: stored.receipt,
                 stored_id: id,
                 seq: stored.seq,
                 generation: stored.generation,

@@ -14,6 +14,7 @@ use crate::error::{Error, Result, invalid};
 use crate::ident::Policy;
 use crate::json::{Doc, parse_json_as};
 use crate::labels;
+use crate::record_authority::ApplicationRef;
 use crate::records::KeyBundle;
 use crate::sealed::SealedValue;
 use crate::sig::SignedDoc;
@@ -200,6 +201,17 @@ impl BatchRef {
 /// 10.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Condition {
+    /// The exact current application, lineage and deletion state (Switch record lineage 1).
+    RecordCurrent {
+        /// The record key.
+        key: [u8; 32],
+        /// The tracked lineage, or `None` for a current-only record.
+        lineage_id: Option<[u8; 32]>,
+        /// The application being compared.
+        revision: ApplicationRef,
+        /// Whether that application deletes the record.
+        deleted: bool,
+    },
     /// The record's current version is `version`; a record that doesn't exist, or whose key
     /// the service forgot, is at version 0, and `version: 0` holds only then.
     RecordVersion {
@@ -226,9 +238,25 @@ pub enum Condition {
 }
 
 impl Condition {
-    pub(crate) fn to_json(self) -> Vec<u8> {
+    pub(crate) fn to_json(self) -> Result<Vec<u8>> {
         let mut outer = Obj::new();
         match self {
+            Condition::RecordCurrent {
+                key,
+                lineage_id,
+                revision,
+                deleted,
+            } => {
+                let mut o = Obj::new();
+                o.str("key", &b64(&key));
+                match lineage_id {
+                    Some(id) => o.str("lineage_id", &b64(&id)),
+                    None => o.null("lineage_id"),
+                };
+                o.raw("revision", &revision.to_json()?)
+                    .raw("deleted", if deleted { b"true" } else { b"false" });
+                outer.raw("record_current", &o.finish());
+            }
             Condition::RecordVersion { key, version } => {
                 let mut o = Obj::new();
                 o.str("key", &b64(&key))
@@ -252,7 +280,7 @@ impl Condition {
                 outer.raw("server_time_in", &o.finish());
             }
         }
-        outer.finish()
+        Ok(outer.finish())
     }
 
     /// Read one condition: an object with one member, whose inner object has only that
@@ -261,7 +289,12 @@ impl Condition {
         let what = "a condition";
         only(
             value,
-            &["record_version", "claim_step", "server_time_in"],
+            &[
+                "record_current",
+                "record_version",
+                "claim_step",
+                "server_time_in",
+            ],
             what,
         )?;
         let Some(object) = value.as_object() else {
@@ -269,6 +302,23 @@ impl Condition {
         };
         if object.len() != 1 {
             return invalid("Switch wire 6.3: a condition has exactly one member");
+        }
+        if let Some(inner) = value.get("record_current") {
+            let what = "record_current";
+            only(inner, &["key", "lineage_id", "revision", "deleted"], what)?;
+            let lineage_id = match inner.get("lineage_id") {
+                Some(Value::Null) => None,
+                Some(_) => Some(req_b64n::<32>(inner, "lineage_id", what)?),
+                None => return invalid("Switch record lineage 1: lineage_id is missing"),
+            };
+            return Ok(Condition::RecordCurrent {
+                key: req_b64n::<32>(inner, "key", what)?,
+                lineage_id,
+                revision: ApplicationRef::read(req(inner, "revision", what)?)?,
+                deleted: req(inner, "deleted", what)?.as_bool().ok_or_else(|| {
+                    Error::Invalid("Switch record lineage 1: deleted isn't a boolean".into())
+                })?,
+            });
         }
         if let Some(inner) = value.get("record_version") {
             let what = "record_version";
@@ -792,7 +842,11 @@ impl OpBody {
         o.int("generation", self.generation)
             .raw("batch", &self.batch.to_json());
         if !self.conditions.is_empty() {
-            let conditions: Vec<Vec<u8>> = self.conditions.iter().map(|c| c.to_json()).collect();
+            let conditions: Vec<Vec<u8>> = self
+                .conditions
+                .iter()
+                .map(|c| c.to_json())
+                .collect::<Result<_>>()?;
             o.raw("conditions", &array(&conditions));
         }
         o.str("op", self.kind.name());
@@ -867,6 +921,7 @@ impl OpBody {
         let mut ints = vec![self.generation, self.batch.count];
         for c in &self.conditions {
             match c {
+                Condition::RecordCurrent { revision, .. } => revision.check()?,
                 Condition::RecordVersion { version, .. } => {
                     ints.extend([version.generation, version.version]);
                 }
@@ -1426,5 +1481,64 @@ mod tests {
         let two = serde_json::json!({"claim_step": {"claim_key": b64(&[1; 32]), "step": 0}, "server_time_in": {"start": null, "end": null}});
         assert!(Condition::read(&two).is_err());
         assert!(Condition::read(&serde_json::json!({})).is_err());
+    }
+    #[test]
+    fn test_record_current_signed_condition_shape() {
+        let writer = app();
+        let mut fields = body(attempt());
+        fields.conditions = vec![Condition::RecordCurrent {
+            key: [3; 32],
+            lineage_id: None,
+            revision: ApplicationRef {
+                generation: 2,
+                seq: 9,
+                item_hash: [8; 32],
+            },
+            deleted: true,
+        }];
+        let signed = SignedOp::sign(&writer, fields.clone()).unwrap();
+        let checked = SignedOp::verify(
+            signed.signed(),
+            &writer.signing_public(),
+            &fields.identity,
+            fields.app_id.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(checked.body(), &fields);
+        let original: Value = serde_json::from_slice(&fields.to_json().unwrap()).unwrap();
+        for case in 0..8 {
+            let mut changed = original.clone();
+            let current = &mut changed["conditions"][0]["record_current"];
+            match case {
+                0 => {
+                    current.as_object_mut().unwrap().remove("lineage_id");
+                }
+                1 => current["revision"]["extra"] = Value::Bool(true),
+                2 => current["deleted"] = Value::String("true".into()),
+                3 => current["revision"]["seq"] = Value::from(0),
+                4 => current["revision"]["generation"] = Value::from(crate::json::MAX_INT + 1),
+                5 => current["revision"]["item_hash"] = Value::String("AA".into()),
+                6 => current["lineage_id"] = Value::String("AA".into()),
+                _ => {
+                    current.as_object_mut().unwrap().remove("revision");
+                }
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            let sig = writer.sign_fields(labels::sig::OP, &[&fields.identity, &bytes]);
+            let signed = SignedDoc::from_parts(&bytes, &sig);
+            let error = SignedOp::verify(
+                &signed,
+                &writer.signing_public(),
+                &fields.identity,
+                fields.app_id.as_ref(),
+            )
+            .unwrap_err();
+            assert_eq!(error.status(), 400, "case {case}: {error:?}");
+        }
+        let Condition::RecordCurrent { revision, .. } = &mut fields.conditions[0] else {
+            unreachable!()
+        };
+        revision.seq = 0;
+        assert!(SignedOp::sign(&writer, fields).is_err());
     }
 }

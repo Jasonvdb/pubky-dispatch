@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use pubky_switch_client::client::SentRequest;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_client::transport::{Request, TimeoutClass};
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{header, verify_response};
+use pubky_switch_core::http::{ResponseParts, header, verify_response};
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
 use pubky_switch_signer::Signer;
 use serde_json::json;
@@ -56,6 +58,14 @@ pub async fn enrollment(world: &World) -> FlowResult {
     // writer may order as it likes (Switch wire 1.1): deliberately so, while both switches
     // write it this way, so that a change of either shows here.
     let path = format!("/v1/{}/identity", alice.key().id());
+    let sent = SentRequest::of(&Request {
+        method: "GET".into(),
+        origin: ORIGIN.into(),
+        path_and_query: path.clone(),
+        headers: Vec::new(),
+        body: Vec::new(),
+        timeout: TimeoutClass::default(),
+    });
     let answer = world.request("GET", ORIGIN, &path).await?;
     let mut expected = b"{\"identity\":".to_vec();
     expected.extend_from_slice(&serde_json::to_vec(delivered.signed())?);
@@ -72,10 +82,13 @@ pub async fn enrollment(world: &World) -> FlowResult {
         .ok_or("the public read carries no service time")?;
     verify_response(
         &delivered.inbox().service_key,
-        answer.status,
-        None,
-        server_time,
-        &answer.body,
+        &ResponseParts {
+            status: answer.status,
+            request: sent.received(true),
+            server_time,
+            head: answer.header(header::HEAD),
+            body: &answer.body,
+        },
         &signature,
     )?;
     world.advance_ms(STEP_MS);
@@ -117,7 +130,7 @@ fn shown_alert(alert: &pubky_switch_signer::Alert) -> String {
 /// What a signer shows of itself, for the trace.
 pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let doc = signer.identity_doc()?;
-    let high_water = signer.high_water();
+    let high_water = signer.high_water()?;
     Ok(json!({
         // The status's name: what it carries, such as another install's ID, differs from
         // run to run.
@@ -131,4 +144,179 @@ pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::
         "high_water_generation": high_water.map(|mark| mark.generation),
         "alerts": signer.alerts().iter().map(shown_alert).collect::<Vec<_>>(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Backend;
+    use pubky_switch_client::client::{Credentials, SwitchClient};
+    use pubky_switch_client::transport::Header;
+    use pubky_switch_core::enc::{b64, zbase32_encode};
+    use pubky_switch_core::keys::IdentityKey;
+
+    #[tokio::test]
+    async fn test_public_identity_headers_scripted() {
+        check_public_headers(Backend::Scripted, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_public_identity_headers_service() {
+        check_public_headers(Backend::Service, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_public_identity_app_header_keeps_last_seen_scripted() {
+        check_public_headers(Backend::Scripted, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_public_identity_app_header_keeps_last_seen_service() {
+        check_public_headers(Backend::Service, true).await;
+    }
+
+    async fn check_public_headers(backend: Backend, seen_only: bool) {
+        let result = Box::pin(crate::run_here(backend, async |world: &World| {
+            Box::pin(public_headers(world, seen_only)).await
+        }))
+        .await;
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+    }
+
+    async fn public_headers(world: &World, seen_only: bool) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let (app, _) =
+            super::super::messaging::joined(world, &alice, &mut signer, "wallet").await?;
+        let service_key = signer
+            .identity_doc()?
+            .ok_or("no identity")?
+            .inbox()
+            .service_key;
+        let client = SwitchClient::new(
+            ORIGIN,
+            alice.public(),
+            Credentials::Signer {
+                identity: alice.public(),
+                key: Arc::new(IdentityKey::from_secret(alice.key().secret_bytes())),
+            },
+            Some(service_key),
+            world.transport(),
+            world.clock().clone(),
+        )?;
+        let before = client
+            .apps()
+            .await?
+            .apps
+            .into_iter()
+            .find(|status| status.app_id == app.app_id())
+            .ok_or("registered app missing")?
+            .last_seen;
+        world.advance_ms(STEP_MS);
+        let id = alice.key().id();
+        let path = format!("/v1/{id}/identity");
+        let bare = Request {
+            method: "GET".into(),
+            origin: ORIGIN.into(),
+            path_and_query: path,
+            headers: Vec::new(),
+            body: Vec::new(),
+            timeout: TimeoutClass::default(),
+        };
+        let baseline = world.transport().send(bare.clone()).await?;
+        let cases = if seen_only {
+            vec![vec![
+                Header::new(header::IDENTITY, &id),
+                Header::new(header::APP, &zbase32_encode(&app.app_id())),
+            ]]
+        } else {
+            vec![
+                vec![Header::new(header::IDENTITY, &id)],
+                vec![Header::new(header::TIMESTAMP, "2000-01-01T00:00:00Z")],
+                vec![
+                    Header::new(header::IDENTITY, &id),
+                    Header::new(header::APP, &zbase32_encode(&[99; 16])),
+                ],
+                vec![
+                    Header::new(header::IDENTITY, &id),
+                    Header::new(header::APP, &zbase32_encode(&app.app_id())),
+                ],
+                vec![
+                    Header::new(header::APP, "bad"),
+                    Header::new(header::APP, "bad"),
+                ],
+                vec![
+                    Header::new(header::SIGNATURE, "bad"),
+                    Header::new(header::CERT, ""),
+                    Header::new(header::TIMESTAMP, "never"),
+                ],
+            ]
+        };
+        let mut responses = Vec::new();
+        for headers in cases {
+            let request = Request {
+                headers,
+                ..bare.clone()
+            };
+            assert_eq!(
+                pubky_switch_core::http::received_request(
+                    &SentRequest::of(&request).received(true)
+                ),
+                pubky_switch_core::http::received_request(&SentRequest::of(&bare).received(true))
+            );
+            responses.push(world.transport().send(request).await?);
+        }
+        let after = client
+            .apps()
+            .await?
+            .apps
+            .into_iter()
+            .find(|status| status.app_id == app.app_id())
+            .ok_or("registered app missing")?
+            .last_seen;
+        if seen_only {
+            assert_eq!(after, before, "public headers do not mark an app seen");
+            return Ok(());
+        }
+        let outcomes: Vec<_> = responses
+            .iter()
+            .map(|answer| {
+                (
+                    answer.status,
+                    answer.body == baseline.body,
+                    answer.header(header::HEAD).is_none(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![(baseline.status, true, true); responses.len()]
+        );
+        assert_eq!(baseline.status, 200);
+        assert!(baseline.header(header::HEAD).is_none());
+        for answer in responses {
+            let signature = unb64_array::<64>(
+                answer
+                    .header(header::SERVICE_SIGNATURE)
+                    .ok_or("no signature")?,
+            )?;
+            verify_response(
+                &service_key,
+                &ResponseParts {
+                    status: answer.status,
+                    request: SentRequest::of(&bare).received(true),
+                    server_time: answer.header(header::SERVER_TIME).ok_or("no time")?,
+                    head: answer.header(header::HEAD),
+                    body: &answer.body,
+                },
+                &signature,
+            )?;
+            world.outcome(
+                "public read",
+                &json!({"status": answer.status, "signature": b64(&signature)}),
+            );
+        }
+        Ok(())
+    }
 }

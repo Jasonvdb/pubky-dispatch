@@ -183,6 +183,11 @@ fn record_proof(op: &SignedOp, version: RecordVersion, time: u64) -> SignedDoc {
     let state = ProofState::Record {
         version,
         deleted: false,
+        revision: crate::record_authority::ApplicationRef {
+            generation: op.body().generation,
+            seq: version.version,
+            item_hash: op.item_hash().unwrap(),
+        },
     };
     proof_of(op, version.version, time, b64(&[30; 32]), &state)
 }
@@ -388,6 +393,11 @@ fn test_upload_out_of_range_proof_counts_as_none() {
         let state = ProofState::Record {
             version,
             deleted: false,
+            revision: crate::record_authority::ApplicationRef {
+                generation: op.body().generation,
+                seq: 60,
+                item_hash: op.item_hash().unwrap(),
+            },
         };
         let proof = proof_of(&op, 60, NOW, b64(&[30; 32]), &state);
         let checked = check(&body_with(vec![uploaded(&op, Some(proof))], vec![]), &[]);
@@ -682,4 +692,79 @@ fn test_upload_claim_view_says_rebuilt_only_when_it_is() {
     let value = rebuilt.to_value();
     assert_eq!(value["rebuilt"], json!(true));
     assert_eq!(ClaimView::from_value(&value).unwrap(), rebuilt);
+}
+
+fn record_proofs_with_other_references(original: &TransitionProof) -> Vec<TransitionProof> {
+    (0..5)
+        .map(|case| {
+            let mut body = original.body().clone();
+            match case {
+                0 => {
+                    body.state.as_object_mut().unwrap().remove("revision");
+                }
+                1 => body.state["revision"]["generation"] = json!(LOST + 1),
+                2 => body.state["revision"]["seq"] = json!(49),
+                3 => body.state["revision"]["item_hash"] = json!(b64(&[9; 32])),
+                _ => body.state["revision"]["extra"] = Value::Null,
+            }
+            let changed = TransitionProof::sign(&lost_key(), &identity().public(), body).unwrap();
+            TransitionProof::verify(
+                changed.signed(),
+                &lost_key().verifying_key().to_bytes(),
+                &identity().public(),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn test_record_current_proved_version_checks_the_reference() {
+    let op = record_op(LOST);
+    let proof = record_proof(&op, RecordVersion::new(LOST, 50), NOW);
+    let original = TransitionProof::verify(
+        &proof,
+        &lost_key().verifying_key().to_bytes(),
+        &identity().public(),
+    )
+    .unwrap();
+    assert_eq!(
+        proved_version(&original, LOST, RecordVersion::new(LOST, 10)),
+        Some(RecordVersion::new(LOST, 50))
+    );
+    for changed in record_proofs_with_other_references(&original) {
+        assert_eq!(
+            proved_version(&changed, LOST, RecordVersion::new(LOST, 10)),
+            None
+        );
+    }
+}
+
+#[test]
+fn test_record_current_upload_proof_cannot_supply_another_reference() {
+    let op = record_op(LOST);
+    let proof = record_proof(&op, RecordVersion::new(LOST, 50), NOW);
+    let original = TransitionProof::verify(
+        &proof,
+        &lost_key().verifying_key().to_bytes(),
+        &identity().public(),
+    )
+    .unwrap();
+    let valid = check(&body_with(vec![uploaded(&op, Some(proof))], vec![]), &[]);
+    assert_eq!(
+        version_of(&valid),
+        UploadVersion::proved(RecordVersion::new(LOST, 50))
+    );
+    for changed in record_proofs_with_other_references(&original) {
+        let checked = check(
+            &body_with(vec![uploaded(&op, Some(changed.signed().clone()))], vec![]),
+            &[],
+        );
+        assert_eq!(checked.records.len(), 1);
+        assert_eq!((checked.unverified, checked.distrusted), (0, 0));
+        assert_eq!(
+            version_of(&checked),
+            UploadVersion::bound(LOST, RecordVersion::new(LOST, 10)).unwrap()
+        );
+    }
 }

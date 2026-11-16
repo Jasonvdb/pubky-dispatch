@@ -19,6 +19,7 @@ use crate::labels;
 use crate::ops::body::{Obj, quote};
 use crate::ops::read::{opt, req, req_app_id, req_b64n, req_int, req_pubky, req_str, req_time};
 use crate::ops::{BatchRef, RecordVersion, SignedOp};
+use crate::record_authority::ApplicationRef;
 use crate::records::Inbox;
 use crate::sig::{self, SignedDoc};
 use crate::signing::Signs;
@@ -669,6 +670,8 @@ pub enum ProofState {
         version: RecordVersion,
         /// The write is a delete.
         deleted: bool,
+        /// The exact application and full signed operation hash (Switch record lineage 5).
+        revision: ApplicationRef,
     },
     /// `allow.put`, `allow.delete`.
     Allow {
@@ -729,10 +732,19 @@ impl ProofState {
     pub fn to_value(&self) -> Value {
         match self {
             ProofState::Claim(view) => view.clone(),
-            ProofState::Record { version, deleted } => json!({
+            ProofState::Record {
+                version,
+                deleted,
+                revision,
+            } => json!({
                 "generation": version.generation,
                 "version": version.version,
                 "deleted": deleted,
+                "revision": {
+                    "generation": revision.generation,
+                    "seq": revision.seq,
+                    "item_hash": b64(&revision.item_hash),
+                },
             }),
             ProofState::Allow { kind, present } => {
                 json!({ "kind": kind.as_str(), "present": present })
@@ -907,6 +919,34 @@ impl TransitionProof {
         &self.signed
     }
 
+    /// Read a record proof's exact application and check it against its authenticated stub
+    /// and resulting version (Switch wire 6.5, Switch record lineage 5).
+    /// This does not establish lineage or a receiving upload's application.
+    ///
+    /// # Errors
+    ///
+    /// [`ChainError::Proof`] when the record state is malformed or contradicts the stub.
+    pub fn record_revision(&self) -> std::result::Result<ApplicationRef, ChainError> {
+        let bad =
+            || ChainError::Proof("Switch wire 6.5: the record state isn't its application".into());
+        let state = &self.body.state;
+        let revision =
+            ApplicationRef::read(state.get("revision").ok_or_else(bad)?).map_err(|_| bad())?;
+        let env = &self.envelope;
+        if env.item_type != ItemType::Op
+            || revision.generation != env.generation
+            || revision.seq != env.seq
+            || revision.item_hash != env.item_hash
+            || self.body.version != Some(env.seq)
+            || state.get("generation").and_then(Value::as_u64) != Some(env.generation)
+            || state.get("version").and_then(Value::as_u64) != Some(env.seq)
+            || state.get("deleted").and_then(Value::as_bool).is_none()
+        {
+            return Err(bad());
+        }
+        Ok(revision)
+    }
+
     /// Check that the proof is the given operation's (Switch wire 6.5 "Binding"): its stub's
     /// `item_hash` is the operation's, the stub is an operation's in the operation's batch
     /// and generation, and its `object` is the operation's.
@@ -934,6 +974,16 @@ impl TransitionProof {
             return Err(ChainError::Proof(
                 "Switch wire 6.5: the proof names another object".into(),
             ));
+        }
+        if let crate::ops::OpKind::RecordPut(put) = &body.kind {
+            self.record_revision()?;
+            if self.body.state.get("deleted").and_then(Value::as_bool)
+                != Some(put.value_sealed.looks_like_delete())
+            {
+                return Err(ChainError::Proof(
+                    "Switch wire 6.5: the record state doesn't describe its write".into(),
+                ));
+            }
         }
         Ok(())
     }

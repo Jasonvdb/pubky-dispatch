@@ -1227,7 +1227,7 @@ pub(crate) async fn lost_world_beside(
         Some(1),
     );
     // The old service is unreachable.
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     Lost {
         w,
         router,
@@ -1502,6 +1502,11 @@ async fn store_entries(
         for n in chunk {
             let id = n + 1;
             let stored = crate::app::state::ParkedEntry {
+                receipt: crate::app::EntryReceipt {
+                    entry_id: [1; 16],
+                    service_key: [2; 32],
+                    read_at_ms: lost.w.clock.now_ms(),
+                },
                 seq: 3 + n,
                 generation: 1,
                 sender: lost.w.bob.public(),
@@ -1589,6 +1594,11 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
     let seq = note_at(&lost.w, &lost.next, me, "after the loss");
     let mut tx = app.tx().unwrap();
     let stored = crate::app::state::ParkedEntry {
+        receipt: crate::app::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: lost.note_at_ms,
+        },
         seq,
         generation: 1,
         sender: lost.w.bob.public(),
@@ -2158,7 +2168,7 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
     app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
         .await
         .unwrap();
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     // While the identity still publishes its identity.json, the unsigned 404 explains
     // nothing: the error stands, an answer that doesn't verify, and the app isn't stopped.
     let result = app.receive(None).await;
@@ -2205,12 +2215,110 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
     assert!(app.push_record().await.unwrap().is_some());
 }
 
+/// The signer erases alice's account at the switch (Switch wire 7.4.16): from then on the
+/// switch answers every call for her with the `404` of an identity it doesn't host, signed
+/// with its service key.
+async fn signer_erases(w: &World) {
+    let signer = crate::client::SwitchClient::new(
+        ORIGIN,
+        w.alice.public(),
+        crate::client::Credentials::Signer {
+            identity: w.alice.public(),
+            key: Arc::new(IdentityKey::from_secret(w.alice.secret_bytes())),
+        },
+        Some(w.switch.service_key()),
+        w.switch.transport(),
+        w.clock.clone(),
+    )
+    .unwrap();
+    let held = w.switch.identity_doc().map(|doc| doc.hash());
+    signer.erase(Some(w.switch.created()), held).await.unwrap();
+    assert!(w.switch.erased());
+}
+
+#[tokio::test]
+async fn test_public_read_not_hosted_is_asked_again_with_a_signed_read() {
+    // The public read binds no timestamp, so its `404` with `current: { "hosted": false }`
+    // verifies at any time, a replayed one included: the app takes the service's word only
+    // from a request it signed (Switch wire 7.1 "Identical requests"). While the account is
+    // served, a missing identity.json ends nothing; once it is erased, it does.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    w.switch.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let checked = app.check_for_move().await;
+    assert!(
+        matches!(&checked, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{checked:?}"
+    );
+    assert!(
+        app.state.gone.is_none(),
+        "not gone on the public read alone"
+    );
+    signer_erases(&w).await;
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erased_account_signed_404_and_no_identity_is_gone_at_once() {
+    // The signed `404` of an identity the switch doesn't host and a missing identity.json
+    // together are an erasure, at once: the first read stops with `AccountGone` (Switch spec
+    // 12.7 step 5, wire 7.4.16 "Afterwards").
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    signer_erases(&w).await;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::AccountGone { .. })),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erased_account_signed_404_with_identity_published_ends_nothing() {
+    // A signed `404` while identity.json still names the service ends nothing: the service
+    // counts as unreachable, the call fails as it came, and no wait starts (Switch spec 12.7
+    // step 5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    signer_erases(&w).await;
+    for _ in 0..2 {
+        let result = app.receive(None).await;
+        assert!(
+            matches!(&result, Err(AppError::Switch(error)) if error.is_not_hosted()),
+            "{result:?}"
+        );
+        assert!(app.state.gone.is_none());
+        assert!(app.state.erasing.is_none());
+    }
+    let checked = app.check_for_move().await;
+    assert!(
+        matches!(&checked, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{checked:?}"
+    );
+    assert!(app.state.gone.is_none());
+}
+
 #[tokio::test]
 async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     // The public read meets the same unsigned 404: each spaced try counts in the wait's
     // record, and fails as the wait's outcome.
@@ -2238,11 +2346,11 @@ async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
         let mut app = lists_app(&w, &router).await;
         let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
         // One coincident blip starts the wait.
-        w.switch.lock().erased = true;
+        w.switch.lock().not_hosted_unpinned = true;
         w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
         unreachable_read(&mut app).await;
         assert!(app.state.erasing.is_some());
-        w.switch.lock().erased = false;
+        w.switch.lock().not_hosted_unpinned = false;
         match clear {
             // identity.json shows again.
             0 => {
@@ -2268,7 +2376,7 @@ async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
         assert!(app.state.erasing.is_none(), "case {clear}");
         // A second blip a day later starts the wait again, and concludes nothing.
         w.clock.advance_ms(crate::app::provider::ERASURE_WAIT_MS);
-        w.switch.lock().erased = true;
+        w.switch.lock().not_hosted_unpinned = true;
         w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
         unreachable_read(&mut app).await;
         assert_eq!(app.state.erasing.map(|e| e.tries), Some(1), "case {clear}");
@@ -2287,13 +2395,13 @@ async fn test_erasure_wait_starts_over_on_a_signed_503() {
     let mut app = join(&w, &router).await;
     let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
     // Hour 0: an unsigned 404 and no identity.json.
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     unreachable_read(&mut app).await;
     assert!(app.state.erasing.is_some());
     // Hour 12: a `503` signed with the account's key, an error the pinned key verifies.
     w.clock.advance_ms(12 * 3_600_000);
-    w.switch.lock().erased = false;
+    w.switch.lock().not_hosted_unpinned = false;
     w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
     w.switch.fail_next(Fault::Error {
         path: "feed".into(),
@@ -2305,7 +2413,7 @@ async fn test_erasure_wait_starts_over_on_a_signed_503() {
     assert!(app.state.erasing.is_none());
     // Hour 24: another unsigned 404 starts the wait afresh.
     w.clock.advance_ms(12 * 3_600_000);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     unreachable_read(&mut app).await;
     let now = w.clock.now_ms();
@@ -2321,7 +2429,7 @@ async fn test_erasure_wait_isnt_concluded_by_a_clock_jump() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     unreachable_read(&mut app).await;
     // The clock jumps a week ahead: that counts one try, and the tries right after it add
@@ -2347,7 +2455,7 @@ async fn erased_holding_v2(w: &World, router: &Router) -> (App, Vec<u8>) {
     w.next_doc(|_| {});
     app.refresh_identity().await.unwrap();
     assert_eq!(app.state.own_doc.version(), 2);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     erasure_tries_but_the_last(w, &mut app).await;
     w.clock
@@ -2403,7 +2511,7 @@ async fn test_erased_account_seen_alive_again_comes_back() {
     let mut app = join(&w, &router).await;
     let me = app.app_id();
     let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     erasure_tries_but_the_last(&w, &mut app).await;
     w.clock
@@ -2411,7 +2519,7 @@ async fn test_erased_account_seen_alive_again_comes_back() {
     assert!(app.receive(None).await.unwrap().stopped);
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
     // It was a fault: the account and its identity.json are there again.
-    w.switch.lock().erased = false;
+    w.switch.lock().not_hosted_unpinned = false;
     w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
     let seq = w.note(me, "after the fault").0;
     let report = app.receive(None).await.unwrap();
@@ -2433,7 +2541,7 @@ async fn test_erased_account_back_drops_its_unacknowledged_account_gone() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     erasure_tries_but_the_last(&w, &mut app).await;
     w.clock
@@ -2443,7 +2551,7 @@ async fn test_erased_account_back_drops_its_unacknowledged_account_gone() {
         e,
         AppEvent::AccountGone { .. }
     )));
-    w.switch.lock().erased = false;
+    w.switch.lock().not_hosted_unpinned = false;
     w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(e, AppEvent::AccountBack)));
@@ -3954,6 +4062,11 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         kept_ms: lost.note_at_ms,
         forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
+            receipt: crate::app::EntryReceipt {
+                entry_id: [1; 16],
+                service_key: [2; 32],
+                read_at_ms: lost.w.clock.now_ms(),
+            },
             cert: app.cert().signed().clone(),
             plaintext: Vec::new(),
             context: None,
@@ -4001,6 +4114,11 @@ async fn keep_an_effect(
         )
         .unwrap();
     let entry = crate::app::state::KeptEntry {
+        receipt: crate::app::EntryReceipt {
+            entry_id: [1; 16],
+            service_key: [2; 32],
+            read_at_ms: w.clock.now_ms(),
+        },
         cert: w.bob_cert.signed().clone(),
         plaintext: b"kept".to_vec(),
         context: None,
@@ -4028,6 +4146,7 @@ async fn keep_an_effect(
         .unwrap();
     if parked {
         let stored = crate::app::state::ParkedEntry {
+            receipt: entry.receipt,
             seq,
             generation: 1,
             sender: w.bob.public(),
@@ -4786,7 +4905,7 @@ async fn test_unsigned_404_with_a_newer_own_document_is_followed_not_erased() {
         app.refresh_identity().await.unwrap(),
         crate::app::IdentityRefresh::Newer { .. }
     ));
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     let over = app
         .take_over(Err(AppError::Switch(ClientError::BadServiceSignature {
@@ -5341,7 +5460,7 @@ async fn test_restore_meeting_a_loss_asks_about_a_later_registration() {
         2,
         Some(1),
     );
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     // The device follows the loss, registering a fresh key there.
     app.refresh_identity().await.unwrap();
     app.receive(None).await.unwrap();
@@ -5743,4 +5862,161 @@ pub(super) async fn writes_kept_during_a_freeze_reach_the_next_service() {
         .collect();
     assert_eq!(order, pubkys, "each once, in the order kept");
     assert_eq!(w.switch.applied().len(), old_ops);
+}
+
+#[tokio::test]
+async fn test_loss_upload_over_cap_reports_refusal_after_reload() {
+    Box::pin(loss_upload_with_records(40)).await;
+}
+
+#[tokio::test]
+async fn test_loss_upload_within_cap_completes_after_reload() {
+    Box::pin(loss_upload_with_records(1)).await;
+}
+
+async fn loss_upload_with_records(count: usize) {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+
+    const CAP: usize = 16 * 1024 * 1024;
+    let store = Arc::new(MemoryStore::new());
+    let w = World::new();
+    let router = Router::of(&w);
+    let protocol = Arc::new(LossProtocol::default());
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&protocol) as Arc<dyn Protocol>,
+        &[],
+    )
+    .await;
+    let value = json!({"items": [], "pad": "x".repeat(200_000)})
+        .to_string()
+        .into_bytes();
+    for n in 0..count {
+        let target = crate::app::RecordTarget::new(
+            super::shared_flows::items(),
+            format!("record-{n}").as_bytes(),
+        );
+        app.put_record(&target, &value, vec![]).await.unwrap();
+    }
+    let kept = app.shared_evidence().await.unwrap();
+    let records: Vec<UploadedOp> = kept
+        .ops
+        .iter()
+        .map(|op| UploadedOp {
+            op: op.op.clone(),
+            cert: op.cert.clone(),
+            proof: op.proof.clone(),
+        })
+        .collect();
+    assert_eq!(records.len(), count);
+    for record in &records {
+        let cert = AppCert::verify(&record.cert, &w.alice.public()).unwrap();
+        pubky_switch_core::ops::SignedOp::verify_with_cert(&record.op, &cert, &w.alice.public())
+            .unwrap();
+        assert!(record.proof.is_some());
+    }
+    let bytes = RecoveryUpload {
+        records,
+        ..RecoveryUpload::default()
+    }
+    .to_json()
+    .len();
+    let too_large = count == 40;
+    assert_eq!(
+        bytes > CAP,
+        too_large,
+        "the aggregate, not one operation, exceeds the cap"
+    );
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    drop(app);
+    let load = || {
+        App::load(
+            router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+            Arc::clone(&protocol) as Arc<dyn Protocol>,
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+    };
+    let mut app = load().await.unwrap();
+    app.refresh_identity().await.unwrap();
+    let first = app.receive(None).await;
+    let first_done = app.recovery_info().await.unwrap().unwrap().steps_done;
+    assert_eq!(
+        app.shared_evidence().await.unwrap(),
+        kept,
+        "retained signed evidence survives"
+    );
+    drop(app);
+    let mut app = load().await.unwrap();
+    let second = app.receive(None).await;
+    assert_eq!(
+        app.shared_evidence().await.unwrap(),
+        kept,
+        "reload preserves retained evidence"
+    );
+    let sent = router
+        .log()
+        .iter()
+        .filter(|line| line.contains("/recovery/upload"))
+        .count();
+    assert_eq!(
+        sent,
+        usize::from(!too_large),
+        "a local cap refusal sends nothing"
+    );
+    assert_eq!(
+        next.lock().shared.records.len(),
+        if too_large { 0 } else { count }
+    );
+    assert!(
+        first_done,
+        "an upload refused for good must let recovery continue: {first:?}; retry: {second:?}"
+    );
+    let first = first.unwrap();
+    assert_eq!(
+        has(&first.events, |event| matches!(event,
+            AppEvent::EvidenceRefused { code } if code == "too_large"
+        )),
+        too_large
+    );
+    second.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    assert_eq!(protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_upload_refusal_keeps_unread_answers_retryable() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    for code in [
+        ErrorCode::TooLarge,
+        ErrorCode::RateLimited,
+        ErrorCode::NotFound,
+    ] {
+        let error = ClientError::BodyUnread {
+            status: code.status(),
+            code,
+            retry_after: None,
+        };
+        app.events.clear();
+        assert_eq!(
+            app.uploaded(Err(error.clone())),
+            Err(AppError::Switch(error))
+        );
+        assert!(app.events.is_empty());
+    }
 }

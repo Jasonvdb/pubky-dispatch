@@ -738,7 +738,7 @@ async fn test_restore_in_place_refuses_a_backup_at_a_lower_generation() {
     let five = IdentityDoc::sign(&world.key, body).unwrap();
     world.switch.deliver_identity(&five).unwrap();
     signer.set_record_max_age(Some(60)).await.unwrap_err();
-    assert_eq!(signer.high_water().unwrap().generation, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().generation, 2);
     let mut body = first.body().clone();
     body.version = 6;
     body.signer = [7; 16];
@@ -823,6 +823,7 @@ async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
         .unwrap();
     // The removal is done, so `revoke` answers `Ok`; only the cleanup's commit stopped.
     let _ = signer.revoke(id, None, confirmed()).await;
+    drop(signer);
     let mut signer = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();
@@ -1293,4 +1294,131 @@ async fn test_restore_brings_back_no_refused_renewal() {
         restored.identity_doc().unwrap().unwrap().listed_cert(&id),
         listed
     );
+}
+
+#[tokio::test]
+async fn test_restore_first_commit_keeps_the_take_over_owed() {
+    use pubky_switch_client::StoreError;
+    use pubky_switch_client::store::{Fault, FaultStore};
+
+    for deliver_backup_first in [false, true] {
+        let world = World::new();
+        let (mut old, _) = world.enrolled().await;
+        if deliver_backup_first {
+            world.switch.fail_next(SwitchFault::Unreachable {
+                path: "/identity".into(),
+                after: 0,
+            });
+            old.set_record_max_age(Some(60)).await.unwrap_err();
+        }
+        let backup = world.backup().identity_doc().clone();
+        drop(old);
+        let store = Arc::new(MemoryStore::new());
+        let fault = Arc::new(FaultStore::new(store.clone(), Fault::FailAfter(1)));
+        assert_eq!(
+            Signer::restore_new(world.env(fault), world.keyring(), confirmed())
+                .await
+                .unwrap_err(),
+            SignerError::Store(StoreError::Unknown)
+        );
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        signer.resume().await.unwrap();
+        let restored = signer.identity_doc().unwrap().unwrap();
+        assert_eq!(restored.version(), backup.version() + 1);
+        assert_eq!(restored.body().signer, signer.install_id());
+        assert_eq!(
+            world.switch.identity_doc().unwrap().signed(),
+            restored.signed()
+        );
+        assert_eq!(world.backup().identity_doc().signed(), restored.signed());
+    }
+}
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_the_local_epoch_floor() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let reduce = || CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(a.keys.app_id_bytes(), reduce())
+        .await
+        .unwrap_err();
+    assert_eq!(world.backup().identity_doc().data_epoch(), 1);
+    signer.restore(confirmed()).await.unwrap();
+    let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
+    assert_eq!(renewed.data_epoch(), 3);
+}
+
+#[tokio::test]
+async fn test_restore_refuses_a_backup_below_the_readable_epoch_floor() {
+    use pubky_switch_client::store::StateStore;
+    use pubky_switch_signer::state::signer_namespace;
+
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let reduce = || CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    signer.renew(a.keys.app_id_bytes(), reduce()).await.unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(b.keys.app_id_bytes(), reduce())
+        .await
+        .unwrap_err();
+    let current = snapshot(&world);
+    assert_eq!(current.0.data_epoch(), 2);
+    let ns = signer_namespace(&world.key.public());
+    let kept = store.scan(&ns, b"", None, 10).unwrap();
+
+    // Another real install has signed more versions without rotating its keys. Its
+    // otherwise current backup cannot erase the epoch this install already spent.
+    let other = World::new();
+    let (mut other_signer, _) = other.enrolled().await;
+    while other_signer.high_water().unwrap().unwrap().version <= current.0.version() + 2 {
+        let version = other_signer.high_water().unwrap().unwrap().version;
+        other_signer
+            .set_record_max_age(Some(60 + version))
+            .await
+            .unwrap();
+    }
+    let lower_epoch = snapshot(&other);
+    assert_eq!(lower_epoch.0.data_epoch(), 1);
+    put_back(&world, &lower_epoch);
+    let requests = world.transport.requests().len();
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+    assert_eq!(store.scan(&ns, b"", None, 10).unwrap(), kept);
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        current.0.signed()
+    );
+    assert!(
+        world.transport.requests()[requests..]
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+
+    put_back(&world, &current);
+    signer.restore(confirmed()).await.unwrap();
+    let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
+    assert_eq!(renewed.data_epoch(), 4);
 }

@@ -13,7 +13,7 @@ pub mod apply;
 pub mod state;
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, TransitionProof},
+    chain::{ItemType, ProofBody},
     enc::{app_id_bytes, unb64_array, zbase32_decode},
     http::{self as wire_http, RequestTarget},
     ops::{
@@ -979,7 +979,6 @@ impl Service {
         applied: &[Applied],
         time_ms: u64,
     ) -> Result<Vec<SignedDoc>, Stop> {
-        let identity = txn.head().identity_key;
         let mut proofs = Vec::with_capacity(ops.len());
         for (op, applied) in ops.iter().zip(applied) {
             let body = op.body();
@@ -995,12 +994,13 @@ impl Service {
                 .kind
                 .proof_object(body.app_id.as_ref())
                 .ok_or_else(temporary)?;
-            let proof = TransitionProof::sign(
-                signer,
-                &identity,
-                ProofBody::new(stub.clone(), object, &applied.state),
-            )
-            .map_err(|_| temporary())?;
+            let proof = self
+                .sign_proof(
+                    txn,
+                    signer,
+                    ProofBody::new(stub.clone(), object, &applied.state),
+                )
+                .map_err(|_| temporary())?;
             // The item keeps its proof, which the feed shows with it (Switch wire 7.5).
             txn.append_chain_item(&NewChainItem {
                 seq,
@@ -1149,6 +1149,7 @@ async fn save(
             };
             txn.put_record(&StoredRecord {
                 state: record.state.clone(),
+                revision: record.revision,
                 value_bytes: record.value_bytes,
                 writer: record.writer,
                 cert: record.cert.clone(),

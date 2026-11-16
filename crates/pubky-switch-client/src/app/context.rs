@@ -808,13 +808,14 @@ impl<'a> ReceiveContext<'a> {
     }
 
     /// Forget the processed pair of `msg_id` from `sender`, with the outcome: deleted in the
-    /// step's commit, with its local writes, and only with [`super::Outcome::Apply`], as
-    /// they are. For a protocol that gives up what an earlier message brought, so that a
+    /// step's commit, with its local writes, with [`super::Outcome::Apply`] or
+    /// [`super::Outcome::Consume`], as they are. For a protocol that gives up what an earlier message brought, so that a
     /// re-sent copy of it is delivered again from the next read on (`forget.rs`); the
     /// protocol must then not apply that copy twice itself, since the message's sender can
     /// replay it at will, every copy delivered (Switch spec 11). Returns whether a pair is held:
     /// one that isn't, another sender's or an unknown `msg_id`, is a no-op, and so is the
-    /// message of this step, whose pair the outcome writes.
+    /// message of this step, whose pair is not yet held. Ordinary stored inputs without a
+    /// pair stay stored and permit local writes; pending or uncertain effects still refuse.
     ///
     /// The keys a forget deletes count against [`MAX_STEP_LOCAL_BYTES`] with the step's
     /// local writes, each as a delete of its key would ([`local_writes_bytes`]).
@@ -822,8 +823,8 @@ impl<'a> ReceiveContext<'a> {
     /// # Errors
     ///
     /// [`Refusal::NotNow`] while the message's effect is kept to be sent, or an entry stored
-    /// locally holds it; [`Refusal::Usage`] when another registered protocol owns the
-    /// message's kind, or when the forget would take the step past
+    /// locally holds its pair or an uncertain effect; [`Refusal::Usage`] when another
+    /// registered protocol owns the message kind, or when the forget would take the step past
     /// [`MAX_STEP_LOCAL_BYTES`], as for [`ReceiveContext::local`]: nothing is added, and an
     /// effect the step then applies is stored and passed as too large; a store failure.
     pub fn forget_processed(&mut self, sender: [u8; 32], msg_id: &str) -> Result<bool, AppError> {

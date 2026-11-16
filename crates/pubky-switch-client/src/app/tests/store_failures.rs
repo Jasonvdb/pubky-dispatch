@@ -2005,6 +2005,31 @@ impl StateStore for DutyCounting {
         self.kept.lock().unwrap().push(kept);
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        let kept = batch
+            .writes()
+            .iter()
+            .filter(|write| {
+                matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"duty/"))
+            })
+            .count();
+        self.kept.lock().unwrap().push(kept);
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 #[tokio::test]

@@ -15,7 +15,10 @@
 //!   ([`ServiceLog::request_failures`]).
 //!
 //! A line that is about no request fails no run: the store trying its first connection
-//! again, or the change listener connecting again. It is shown beside a failed flow's error.
+//! again, or the change listener connecting again. Nor does the service's alert to its
+//! operator that an account answers the recovery notice (Switch wire 7.3, Table 1): a flow
+//! that puts an account in that state holds each answer to the notice itself. Either is
+//! shown beside a failed flow's error.
 //!
 //! The log is kept for one thread: a flow, the service it calls and the service's change
 //! listener all run on the flow's thread ([`on_flow_stack`](crate::on_flow_stack)).
@@ -29,6 +32,10 @@ use tracing::{Event, Level, Metadata, Subscriber, span};
 /// The service's module that answers requests: a line from it, or from a module of it, is
 /// about a request.
 const REQUESTS: &str = "pubky_switch::service";
+
+/// What the service's alert to its operator holds when an account answers the recovery
+/// notice: what Table 1 of Switch wire 7.3 judges, no failure of a request.
+const NOTICE_ALERT: &str = " alert=\"behind_mark\"";
 
 /// What a line holds when the database server failed a request, and no statement did:
 ///
@@ -112,7 +119,7 @@ impl Logged {
                 .target
                 .strip_prefix(REQUESTS)
                 .is_some_and(|rest| rest.starts_with("::"));
-        if !request {
+        if !request || self.fields.contains(NOTICE_ALERT) {
             About::Other
         } else if SERVER_FAILED.iter().any(|text| self.fields.contains(text)) {
             About::Server
@@ -275,7 +282,7 @@ mod tests {
         tracing::info!(target: "pubky_switch::service", "served");
         tracing::warn!(target: "pubky_switch_other::service", "another crate's");
         tracing::warn!(target: "sqlx::query", "a slow statement");
-        tracing::error!(target: "pubky_switch::keys", failure = %"no such file", "the operator key");
+        tracing::error!(target: "pubky_switch::keys", failure = %"no such file", "the service key");
         drop(keeping);
         tracing::error!(target: "pubky_switch::service", "after it");
 
@@ -284,7 +291,7 @@ mod tests {
             [
                 "WARN pubky_switch::service: storage error=database: pool timed out while \
                  waiting for an open connection",
-                "ERROR pubky_switch::keys: the operator key failure=no such file",
+                "ERROR pubky_switch::keys: the service key failure=no such file",
             ]
         );
     }
@@ -328,6 +335,14 @@ mod tests {
             "change notifications"
         );
         tracing::warn!(target: "pubky_switch::services", error = %"the account is busy", "storage");
+        // The alert that an account answers the recovery notice.
+        tracing::error!(
+            target: "pubky_switch::service::marking",
+            alert = "behind_mark",
+            account = "someone",
+            reason = "behind",
+            "the account answers the recovery notice"
+        );
         drop(keeping);
 
         let database = log.database_failures();
@@ -341,7 +356,7 @@ mod tests {
                 "WARN pubky_switch::service: storage error=corrupt account state: a chain item",
             ]
         );
-        assert_eq!(log.lines().len(), 11);
+        assert_eq!(log.lines().len(), 12);
     }
 
     #[test]

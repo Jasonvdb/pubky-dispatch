@@ -17,8 +17,9 @@ thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 hex.workspace = true
-pubky-switch-client = { workspace = true, features = ["test-support"] }
+pubky-switch-client = { workspace = true, features = ["test-support", "tokio"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

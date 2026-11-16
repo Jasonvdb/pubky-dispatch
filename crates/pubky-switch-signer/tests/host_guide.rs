@@ -77,6 +77,8 @@ const COVERED: &[&str] = &[
     "Source",
     "RenewalSkip",
     "SignerError",
+    "RecordsFault",
+    "SignerRecord",
     "Refusal",
     "SizedBody",
     "KeyError",

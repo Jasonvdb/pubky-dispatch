@@ -2873,23 +2873,6 @@ async fn test_app_restore_asks_again_for_a_full_bundle_read_and_dropped() {
 // `crates/pubky-switch/tests/endpoints_keys.rs`.
 
 #[tokio::test]
-async fn test_scripted_keys_passed_parts_go_when_the_next_part_is_stored() {
-    let w = World::new();
-    let app = w.join("wallet").await;
-    let me = app.app_id();
-    let cert = app.cert().clone();
-    w.next_doc(|body| body.data_epoch = 2);
-    // Epoch 1's part, passed before the switch dropped parts at cursor moves.
-    let first = store_part(&w, me, &cert, 1, 1);
-    w.switch.set_cursor_unchecked(me, first);
-    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
-    // The next part stored: the passed part goes there.
-    store_part(&w, me, &cert, 2, 2);
-    assert_eq!(w.switch.bundles_of(&me), vec![(2, 2)]);
-    assert_eq!(w.switch.keys_through_of(&me), Some(1));
-}
-
-#[tokio::test]
 async fn test_scripted_keys_a_request_stays_in_force_until_the_completing_part_is_passed() {
     let w = World::new();
     let app = w.join("wallet").await;
@@ -3472,6 +3455,84 @@ async fn test_app_service_time_going_back_is_an_alarm() {
 }
 
 #[tokio::test]
+async fn test_app_service_time_leaves_out_only_the_time_base_answers() {
+    // Each answer verified with the pinned key counts in the comparison of service times,
+    // a refusal without the head included, but those that count in none: the notice, every
+    // `503 unavailable`, the not-hosted `404` and an answer given before the body was read.
+    // A service that shows an earlier time on any other is misbehaviour (Switch spec 10.1,
+    // wire 7.1 Timestamp).
+    let earlier = START + HOUR / 2;
+    let after_a_read = || async {
+        let w = World::new();
+        let mut app = w.join("wallet").await;
+        w.clock.advance_ms(HOUR);
+        app.receive(None).await.unwrap();
+        // The time base goes back.
+        w.clock.set_ms(earlier);
+        (w, app)
+    };
+    let not_an_alarm = |what: &str, result: Result<crate::app::ReceiveReport, AppError>| {
+        assert!(
+            !matches!(result, Err(AppError::Alarm(_))),
+            "{what}: {result:?}"
+        );
+    };
+    // The notice.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lose_mark();
+    not_an_alarm("the notice", app.receive(None).await);
+    // The `404` of an identity the switch doesn't host.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lose_account();
+    w.switch.lose_mark();
+    not_an_alarm("not hosted", app.receive(None).await);
+    // An answer given before the body was read.
+    let (w, mut app) = after_a_read().await;
+    w.switch.fail_next(Fault::BeforeTheBody {
+        path: "/feed".into(),
+        code: ErrorCode::TooLarge,
+    });
+    not_an_alarm("before the body", app.receive(None).await);
+    // The `503` of a mark store that can't be read.
+    let (w, mut app) = after_a_read().await;
+    w.switch.set_mark_store_unreadable(true);
+    not_an_alarm("the store can't be read", app.receive(None).await);
+    // Any `503 unavailable`, at a time earlier than the app verified: a temporary failure
+    // tells nothing of the account's state, such as one when the account can't be looked
+    // up, at the time base.
+    let (w, mut app) = after_a_read().await;
+    w.switch.lock().stamped_ms = earlier;
+    w.switch.fail_next(Fault::Error {
+        path: "/feed".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    not_an_alarm("unavailable", app.receive(None).await);
+    // A `401`, answered before the request verified and without the head, a `429`, a `503
+    // staged` and a plain `404`, each at a time earlier than the app verified: the service
+    // went back.
+    for (code, current) in [
+        (ErrorCode::BadSignature, json!(null)),
+        (ErrorCode::RateLimited, json!(null)),
+        (ErrorCode::Staged, json!(null)),
+        (ErrorCode::NotFound, json!(null)),
+    ] {
+        let (w, mut app) = after_a_read().await;
+        w.switch.lock().stamped_ms = earlier;
+        w.switch.fail_next(Fault::Error {
+            path: "/feed".into(),
+            code,
+            current,
+        });
+        let error = app.receive(None).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Alarm(Alarm::ServiceTimeBackwards { .. })),
+            "{code:?}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -3536,6 +3597,25 @@ impl StateStore for SlowStore {
         self.clock
             .advance_ms(self.delay_ms.load(std::sync::atomic::Ordering::SeqCst));
         self.inner.commit(batch)
+    }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        self.clock
+            .advance_ms(self.delay_ms.load(std::sync::atomic::Ordering::SeqCst));
+        self.inner.commit_if(ns, owner, batch)
     }
 }
 
@@ -7705,7 +7785,7 @@ async fn reader_owing_a_deny_change_at_a_loss(
     assert_eq!(reader.owed_protocol_calls().await.unwrap(), 1);
     kinds.log.lock().unwrap().clear();
     let next = super::moves::third_recovering(w, &router, 2, 1);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     (reader, kinds, router, next)
 }
 
@@ -8737,7 +8817,7 @@ async fn test_deny_list_loss_at_a_told_gaps_position_tells_the_new_list() {
     let z = [0x5a; 32];
     restored.deny(&z).await.unwrap();
     let _next = super::moves::third_recovering(&w, &router, 2, 1);
-    w.switch.lock().erased = true;
+    w.switch.lock().not_hosted_unpinned = true;
     restored.refresh_identity().await.unwrap();
     for _ in 0..5 {
         let _ = restored.receive(None).await;
@@ -9204,4 +9284,98 @@ async fn test_deny_list_gap_told_without_its_list_after_lists_too_large_is_owed_
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_alarm_equivocation_survives_failed_commit_without_dirty_time() {
+    use crate::app::state::key;
+    let w = World::new();
+    let app = Box::pin(w.join("wallet")).await;
+    let id = app.app_id();
+    let mut body = app.own_identity().body().clone();
+    body.data_epoch += 1;
+    let other = IdentityDoc::sign(&w.alice, body).unwrap();
+    drop(app);
+    let fault = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = Box::pin(App::load(
+        w.env_on(fault.clone()),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    w.homeserver.publish(&other).unwrap();
+    fault.fail_put_once(key::ALARM.as_bytes());
+    let expected = Alarm::Equivocation {
+        version: other.version(),
+    };
+    assert_eq!(
+        Box::pin(app.refresh_identity()).await.unwrap_err(),
+        AppError::Alarm(expected.clone())
+    );
+    assert_eq!(app.alarm(), Some(&expected));
+    assert!(!app.service_time_dirty);
+    assert_eq!(app.reader().get::<Alarm>(key::ALARM).await.unwrap(), None);
+    Box::pin(app.pending_duty_events()).await.unwrap();
+    assert_eq!(app.alarm(), Some(&expected));
+    assert_eq!(
+        app.reader().get::<Alarm>(key::ALARM).await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    assert_eq!(app.may_attempt(true), Err(Refusal::Stopped));
+    drop(app);
+    let loaded = Box::pin(w.load(id)).await;
+    assert_eq!(loaded.alarm(), Some(&expected));
+}
+
+#[tokio::test]
+async fn test_alarm_compromise_leave_keeps_a_failed_alarm_write() {
+    use crate::app::state::key;
+    let w = World::new();
+    let app = Box::pin(w.join("wallet")).await;
+    let id = app.app_id();
+    let thief = ReceiveKey::from_secret(1, [42; 32]);
+    let record = ReceiveKeyRecord::sign(
+        &app_keys("wallet"),
+        app.cert(),
+        ReceiveKeyBody::new(app.cert(), &thief),
+    )
+    .unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    drop(app);
+    let fault = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = Box::pin(App::load(
+        w.env_on(fault.clone()),
+        w.protocol.clone(),
+        World::config(),
+        id,
+    ))
+    .await
+    .unwrap();
+    fault.fail_put_once(key::ALARM.as_bytes());
+    let error = Box::pin(app.receive(None)).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+    assert!(w.switch.app(&id).departed);
+    let expected = app.alarm().cloned().unwrap();
+    assert_eq!(
+        app.reader().get::<Alarm>(key::ALARM).await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+    drop(app);
+    let loaded = Box::pin(w.load(id)).await;
+    assert_eq!(loaded.alarm(), Some(&expected));
+    assert_eq!(loaded.may_attempt(true), Err(Refusal::Stopped));
 }

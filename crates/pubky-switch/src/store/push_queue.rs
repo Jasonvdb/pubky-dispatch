@@ -84,7 +84,7 @@ pub const HOLD_LOCK_TIMEOUT_MS: u64 = 1_000;
 pub const CLAIM_TIMEOUT_MS: u64 = 2_000;
 
 /// The advisory lock every claim takes (the module's doc), apart from every other
-/// advisory lock of the service, as `store::keying` derives its keys.
+/// advisory lock of the service: its key is the hash of its own label.
 fn claims_lock_key() -> i64 {
     let digest = pubky_switch_core::enc::hash(b"pubky-switch/push-claims");
     let mut bytes = [0u8; 8];
@@ -128,8 +128,6 @@ pub struct HeldRegistration {
     pub identity: Option<SignedDoc>,
     /// The account's identity key.
     pub identity_key: [u8; 32],
-    /// The account's service key.
-    pub service_key: KeyId,
 }
 
 impl std::fmt::Debug for HeldRegistration {
@@ -290,7 +288,7 @@ impl Store {
             .await
             .map_err(StoreError::from_db)?;
         let row = sqlx::query(
-            "SELECT r.relay_url, a.identity_doc, a.identity_key, a.service_key \
+            "SELECT r.relay_url, a.identity_doc, a.identity_key \
              FROM push_registrations r JOIN accounts a ON a.id = r.account_id \
              WHERE r.account_id = $1 \
              AND r.app_id = $2 AND r.push_key_id = $3 AND $4 = ANY(r.handles) \
@@ -309,7 +307,6 @@ impl Store {
         };
         let identity: Option<Vec<u8>> = row.try_get("identity_doc")?;
         let identity_key: Vec<u8> = row.try_get("identity_key")?;
-        let service_key: String = row.try_get("service_key")?;
         Ok(Some(HeldRegistration {
             relay_url: row.try_get("relay_url")?,
             identity: identity
@@ -318,8 +315,6 @@ impl Store {
             identity_key: identity_key
                 .try_into()
                 .map_err(|_| StoreError::Corrupt("accounts.identity_key"))?,
-            service_key: KeyId::parse(&service_key)
-                .map_err(|_| StoreError::Corrupt("accounts.service_key"))?,
             _tx: tx,
         }))
     }

@@ -978,14 +978,20 @@ mod tests {
             deny: Some(vec![[6; 32]]),
         };
         let mut changes = pubky_switch_core::recovery::UploadChanges::default();
-        inner.shared.merge_upload(
-            &pubky_switch_core::recovery::CheckedUpload::default(),
-            Some(&lists),
-            (100, 100),
-            1,
-            1,
-            &mut changes,
-        );
+        inner
+            .shared
+            .merge_upload(
+                &pubky_switch_core::recovery::CheckedUpload::default(),
+                Some(&lists),
+                (100, 100),
+                pubky_switch_core::ops::Position {
+                    generation: 1,
+                    seq: 1,
+                },
+                1,
+                &mut changes,
+            )
+            .expect("upload lists");
         assert!(
             inner.shared.connect.is_empty(),
             "{:?}",

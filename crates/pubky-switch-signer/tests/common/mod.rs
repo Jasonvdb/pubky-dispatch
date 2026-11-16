@@ -208,6 +208,28 @@ impl StateStore for FlakyStore {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+    ) -> Result<pubky_switch_client::store::AcquireOutcome, pubky_switch_client::store::StoreError>
+    {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+        batch: pubky_switch_client::store::WriteBatch,
+    ) -> Result<pubky_switch_client::store::CommitOutcome, pubky_switch_client::store::StoreError>
+    {
+        if *self.failing.lock().unwrap() {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 /// The path the test protocol adds to the grant of an app holding `notes_tags`.
@@ -284,6 +306,31 @@ impl World {
 
     pub fn env(&self, store: Arc<dyn StateStore>) -> SignerEnv {
         self.env_with(store, Protocols::new(vec![Arc::new(Notes)]).unwrap())
+    }
+
+    /// The env, behind a transport that strips the signature from the switch's `404` answers
+    /// once it erased the account, as an intermediary answering for it would: a `404` the
+    /// signer can't check (Switch wire 7.4.16 "The signer's `404`"). Returns that transport
+    /// too, which sees every request.
+    pub fn env_with_unsigned_404s(
+        &self,
+        store: Arc<dyn StateStore>,
+    ) -> (SignerEnv, Arc<MockTransport>) {
+        let switch = Arc::clone(&self.switch);
+        let transport = Arc::new(MockTransport::with_handler(move |request| {
+            let response = switch.handle(request)?;
+            if response.status == 404 && switch.erased() {
+                return Ok(pubky_switch_client::transport::Response {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+            Ok(response)
+        }));
+        let mut env = self.env(store);
+        env.transport = transport.clone();
+        (env, transport)
     }
 
     /// The env with `protocols` registered in place of the test protocol.

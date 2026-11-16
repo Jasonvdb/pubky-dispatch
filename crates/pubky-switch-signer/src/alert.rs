@@ -241,16 +241,40 @@ pub enum Alert {
     /// clears itself at the first run that finds them agreeing.
     ClockOff,
     /// The switch answers `GET /apps` with a `404` its pinned key didn't sign, while no
-    /// erasure of this install's is in progress: the operator's answer for an identity the
-    /// service doesn't host, or an intermediary's. This install can't tell which, so it
+    /// erasure of this install's is in progress: an intermediary's, or the service's own
+    /// under a key it changed to (Switch spec 12.5). This install can't tell which, so it
     /// deletes and changes nothing, and signs nothing while the switch can't be read (Switch
     /// wire 7.3 step 2, 7.4.16). The account may have been erased from another copy of this
     /// install; the way out is the user's, a restore or an enrollment elsewhere. It clears
     /// itself at the next check whose `GET /apps` gets an answer the pinned key signs, an
-    /// error included, since only a hosted account's key signs one; an unsigned answer or no
-    /// answer leaves it. Every signing step checks first, so it outlasts the switch's
+    /// error included; an unsigned answer or no answer leaves it. Every signing step checks first, so it outlasts the switch's
     /// recovery by one check at most. Never raised once the account is erased.
     AccountNotHosted,
+    /// The switch says, under the key this install pinned, that it holds no account for the
+    /// identity: `GET /apps` got its signed `404 not_found` with `current: { "hosted": false
+    /// }`, which the service gives only for an account it doesn't hold, while no erasure of
+    /// this install's is in progress (Switch wire 7.3 step 2, 7.4.16 "The signer's `404`").
+    /// The service lost the account, or it was erased from another copy of this install.
+    /// This install deletes and changes nothing, and signs nothing while the switch answers
+    /// so; the way out is the user's: a provider loss declared at this service or another
+    /// (Switch spec 12.6), or a restore. It clears itself at the next `GET /apps` the pinned
+    /// key signs with any other answer, and once a recovery's version is delivered. Never
+    /// raised once the account is erased.
+    ServiceHoldsNoAccount,
+    /// A provider loss declaration the user started enrolled at a service whose key this
+    /// install had pinned, and the enrollment answer named another key: the service changed
+    /// its key (Switch spec 12.5). The signer took the new key, which the recovery's version
+    /// names, as it does only within a step the user started, and shows it here: the key an
+    /// enrollment answer names is trusted on first use, tied to the origin only by the HTTPS
+    /// connection (Switch wire 7.4.1 "Which key signs").
+    ServiceKeyTaken {
+        /// The service's origin.
+        origin: String,
+        /// The key pinned for it before.
+        pinned: [u8; 32],
+        /// The key taken.
+        service_key: [u8; 32],
+    },
     /// A removed app's Pubky grants still let it write its Homeserver paths. Each approved
     /// request made one, and each names the app's record path
     /// `/pub/pubky-switch/v1/apps/<app_id>.json`. The signer doesn't revoke grants itself:
@@ -380,6 +404,8 @@ impl Alert {
             | Self::IdentityNearLimit { .. }
             | Self::ClockOff
             | Self::AccountNotHosted
+            | Self::ServiceHoldsNoAccount
+            | Self::ServiceKeyTaken { .. }
             | Self::BackupNotWritten
             | Self::KeyNotInstalled
             | Self::TakeOverRefused

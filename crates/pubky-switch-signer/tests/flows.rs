@@ -39,7 +39,7 @@ async fn test_signer_enrollment_delivers_then_publishes_the_first_version() {
     assert_eq!(doc.inbox().service_key, world.switch.service_key());
     assert_eq!(doc.body().signer, signer.install_id());
     // Delivered, then published: both copies are the signer's high-water mark.
-    let high = signer.high_water().unwrap();
+    let high = signer.high_water().unwrap().unwrap();
     assert_eq!((high.version, high.doc_hash), (1, doc.hash()));
     assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
     assert_eq!(world.published().unwrap().signed(), doc.signed());
@@ -91,11 +91,14 @@ async fn test_signer_create_refuses_an_origin_that_isnt_a_switch_origin() {
 async fn test_signer_open_keeps_the_install_and_the_high_water_mark() {
     let world = World::new();
     let (signer, store) = world.enrolled().await;
+    let install = signer.install_id();
+    let high = signer.high_water().unwrap();
+    drop(signer);
     let opened = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
-    assert_eq!(opened.install_id(), signer.install_id());
-    assert_eq!(opened.high_water(), signer.high_water());
+    assert_eq!(opened.install_id(), install);
+    assert_eq!(opened.high_water().unwrap(), high);
     assert_eq!(opened.status(), SignerStatus::Signing);
 }
 
@@ -108,7 +111,10 @@ async fn test_signer_new_version_builds_on_the_newest() {
     assert_eq!(second.version(), 2);
     assert_eq!(second.body().record_max_age, Some(2_592_000));
     assert_eq!(second.body().signer, signer.install_id());
-    assert_eq!(signer.high_water().unwrap().doc_hash, second.hash());
+    assert_eq!(
+        signer.high_water().unwrap().unwrap().doc_hash,
+        second.hash()
+    );
     assert_eq!(
         world.switch.identity_doc().unwrap().signed(),
         second.signed()
@@ -131,7 +137,7 @@ async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
     // Nothing reached the switch: the backup comes first (Switch wire 3.13).
     assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
     assert_eq!(world.distinct_requests("PUT", "/identity"), 1);
-    assert_eq!(signer.high_water().unwrap().version, 1);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 1);
     // Once the Homeserver takes writes again, the same version goes out.
     *world.homeserver.failing_puts.lock().unwrap() = false;
     signer.resume().await.unwrap();
@@ -168,7 +174,7 @@ async fn test_signer_a_newer_version_by_another_install_stops_signing() {
             .contains(&Alert::ManagedByOtherInstall { install: other })
     );
     // The newer copy is adopted as the high-water mark, and this install signs nothing more.
-    assert_eq!(signer.high_water().unwrap().version, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 2);
     let error = signer
         .set_connect_requests(Default::default())
         .await
@@ -213,7 +219,7 @@ async fn test_signer_own_earlier_backup_doesnt_stop_signing() {
     // The backup of version 1 names this install: the next version goes out.
     signer.set_record_max_age(Some(86_400)).await.unwrap();
     signer.set_record_max_age(None).await.unwrap();
-    assert_eq!(signer.high_water().unwrap().version, 3);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 3);
 }
 
 #[tokio::test]
@@ -247,7 +253,7 @@ async fn test_signer_an_older_copy_at_the_switch_is_a_rollback_alarm() {
     assert_eq!(error, SignerError::Alarm(alert.clone()));
     assert!(signer.alerts().contains(&alert));
     // The high-water mark doesn't go back.
-    assert_eq!(signer.high_water().unwrap().version, 2);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 2);
 }
 
 #[tokio::test]
@@ -269,7 +275,10 @@ async fn test_signer_another_body_at_the_high_water_version_is_equivocation() {
         version: 2,
     };
     assert_eq!(error, SignerError::Alarm(alert.clone()));
-    assert_eq!(signer.high_water().unwrap().doc_hash, second.hash());
+    assert_eq!(
+        signer.high_water().unwrap().unwrap().doc_hash,
+        second.hash()
+    );
 }
 
 #[tokio::test]
@@ -379,6 +388,7 @@ async fn test_signer_a_failed_commit_sends_nothing_it_didnt_commit() {
     assert_eq!(world.backup().identity_doc().version(), 1);
     // A restart finds the store as committed, and the next change is signed once.
     flaky.fail(false);
+    drop(signer);
     let mut restarted = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();
@@ -427,6 +437,7 @@ async fn test_signer_never_signs_a_version_twice_after_a_dropped_flow() {
         );
     }
     // And once more after a restart.
+    drop(signer);
     let mut restarted = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
@@ -531,6 +542,7 @@ async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
                     .unwrap();
             signer.resume().await.unwrap();
             let faulty = Arc::new(FaultStore::new(memory.clone(), fault));
+            drop(signer);
             let mut signer = Signer::open(world.env(faulty), world.keyring())
                 .await
                 .unwrap();
@@ -538,6 +550,7 @@ async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
             for _ in 0..3 {
                 let _ = signer.resume().await;
             }
+            drop(signer);
             let mut restarted = Signer::open(world.env(memory), world.keyring())
                 .await
                 .unwrap();
@@ -616,6 +629,7 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
     // A new version takes five commits: signed, backup sealed and written, delivered,
     // published. The store stops before the fifth.
     let faulty = Arc::new(FaultStore::new(memory.clone(), Fault::StopBefore(5)));
+    drop(signer);
     let mut signer = Signer::open(world.env(faulty), world.keyring())
         .await
         .unwrap();
@@ -628,6 +642,7 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
         pubky_switch_core::records::IDENTITY_PATH,
         serde_json::to_vec(theirs.signed()).unwrap(),
     );
+    drop(signer);
     let mut restarted = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();
@@ -955,7 +970,7 @@ async fn test_signer_a_homeserver_copy_at_a_higher_generation_but_lower_version_
     );
     let changed = signer.set_record_max_age(Some(3_600)).await.unwrap();
     assert_eq!(changed.version(), 3);
-    assert_eq!(signer.high_water().unwrap().version, 3);
+    assert_eq!(signer.high_water().unwrap().unwrap().version, 3);
     assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Signing);
     assert_eq!(world.published().unwrap().signed(), changed.signed());
 }
@@ -1144,10 +1159,9 @@ async fn test_signer_run_never_republishes_over_another_body_or_a_newer_copy() {
 }
 
 #[tokio::test]
-async fn test_signer_too_large_is_a_definite_refusal() {
-    // The switch answers a delivery `413 too_large` (Switch wire 7.1): the same bytes would be
-    // refused again, so the delivery ends, its version spent, and signing goes on instead of
-    // retrying it for ever.
+async fn test_signer_too_large_that_binds_the_body_is_final() {
+    // A `413 too_large` that binds the delivery as sent, its body included, refuses those
+    // bytes for good: the version stays spent and isn't sent again (Switch wire 7.1).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     world
@@ -1161,7 +1175,41 @@ async fn test_signer_too_large_is_a_definite_refusal() {
     assert!(
         matches!(
             error,
-            SignerError::Switch(ClientError::Switch {
+            SignerError::Switch(ClientError::Switch { status: 413, .. })
+        ),
+        "{error:?}"
+    );
+    let refused = world.sent_docs().last().unwrap().clone();
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        world
+            .sent_docs()
+            .iter()
+            .filter(|doc| doc.version() == refused.version())
+            .count(),
+        1,
+        "the refused version isn't sent again"
+    );
+}
+
+#[tokio::test]
+async fn test_signer_too_large_before_the_body_isnt_final() {
+    // A `413 too_large` the switch gave before it read the body binds no body: it may answer
+    // a request whose length was changed on the way, so the delivery isn't refused for good.
+    // Its version isn't spent: the next run delivers the same bytes (Switch wire 7.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world
+        .switch
+        .fail_next(pubky_switch_client::testing::Fault::BeforeTheBody {
+            path: "/identity".into(),
+            code: pubky_switch_core::http::ErrorCode::TooLarge,
+        });
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::BodyUnread {
                 status: 413,
                 code: pubky_switch_core::http::ErrorCode::TooLarge,
                 ..
@@ -1169,7 +1217,15 @@ async fn test_signer_too_large_is_a_definite_refusal() {
         ),
         "{error:?}"
     );
-    let next = signer.set_record_max_age(Some(60)).await.unwrap();
-    assert_eq!(next.body().record_max_age, Some(60));
+    let refused = world.sent_docs().last().unwrap().clone();
+    signer.run_due().await.unwrap();
+    let sent = world.sent_docs();
+    assert_eq!(
+        sent.iter()
+            .filter(|doc| doc.version() == refused.version())
+            .count(),
+        2,
+        "the same version sent again"
+    );
     world.assert_no_version_sent_twice();
 }

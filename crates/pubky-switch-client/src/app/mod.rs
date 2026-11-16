@@ -76,7 +76,7 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ParkReason, RefusedCall,
+    EventIdError, ParkReason, RefusedCall, StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
@@ -86,11 +86,12 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite,
-    MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
-    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
-    Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason,
-    StoreFailure, WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
+    DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
+    LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
+    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
+    ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state, encode_local_state,
+    local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -411,6 +412,8 @@ pub struct AppBackup {
     /// The local ID the next entry stored locally takes (`parkid`), so a restore gives out
     /// none the app gave out before the backup, whether or not the backup carries its entry.
     stored_next: u64,
+    /// Unprocessed custody and its owed drop notices, independent of a protocol layer.
+    waiting: unverified::WaitingOut,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -639,6 +642,8 @@ pub struct App {
     reload: bool,
     /// The service time record changed and goes with the next commit.
     service_time_dirty: bool,
+    /// The held alarm still needs a confirmed durable commit.
+    alarm_dirty: bool,
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     /// The listed certificates the own directory answered a read for, to judge a record
@@ -839,6 +844,7 @@ fn uncertain_copy(
     Ok((
         reserved.ok_or_else(missing)?,
         ParkedEntry {
+            receipt: pending.entry.receipt,
             seq: pending.seq,
             generation: pending.generation,
             sender: pending.sender,
@@ -1043,6 +1049,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1210,6 +1217,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1245,6 +1253,7 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
             };
+            app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
@@ -1435,6 +1444,7 @@ impl App {
                 .collect(),
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
+            waiting: unverified::WaitingOut::of(state),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
@@ -1511,6 +1521,7 @@ impl App {
     /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
+        backup.waiting.notices = unverified::waiting_notices(reader).await?;
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -1574,12 +1585,11 @@ impl App {
     /// tolerance). While they add up to more than the batch size, every layered backup is
     /// refused, with [`AppEvent::BackupRefused`] for the host, until they drain: entries
     /// stored locally as they are processed, processed pairs as they age out. It applies the
-    /// bounds on entries stored unverified first, as a read does (Switch spec 8.2), so the
-    /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
-    /// what they drop. So it needs a writable store, and the drops stay committed even if
-    /// the backup is then refused. An app a read wouldn't run on (stopped by an alarm, left,
-    /// or no longer current here) skips the bounds, and its backup only reads the store but
-    /// for the one counter write below.
+    /// shared sender/key/admission bounds first, as a read does (Switch spec 8.2), even
+    /// while an alarm stops intake. Pending and independently uncertain inputs stay
+    /// protected. The backup carries retained waiting payloads and their owed drop
+    /// notices. It needs a writable store, and drops remain committed if the backup is
+    /// then refused; local bookkeeping never clears the alarm.
     ///
     /// It makes no network call. A kept effect isn't settled first, and a restore never
     /// carries one: the backup holds the effect's entry as what it is once the effect is
@@ -1610,18 +1620,13 @@ impl App {
     /// [`AppEvent::BackupRefused`]).
     pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
-            // The bounds on entries stored unverified first, as at a read, so a pile stored
-            // during the last read doesn't go into the backup (Switch spec 8.2). An app a read
-            // wouldn't run on, halted by an alarm, left, or no longer current here, commits
-            // nothing: its backup is taken read-only, the entries as they are.
+            // Local waiting bounds precede backup, including while an alarm stops intake
+            // (Switch spec 8.2). The common commit preserves the alarm.
             self.ready_local().await?;
-            let halted = self.refuse_when_halted().is_err() || self.not_current_here().is_some();
-            if !halted {
-                self.bound_unverified().await?;
-            }
+            self.bound_unverified().await?;
             // The local ID the copy of a kept effect's feed entry takes is reserved in the
-            // live store first, for a halted app too: the backup's only write of its own
-            // there (its commit also keeps a service time not yet committed), which changes
+            // live store first, for a halted app too (its commit also keeps a service
+            // time not yet committed), which changes
             // nothing a read or the protocol sees. Without it, the next entry the
             // live store stored would take the same ID, and a restore in place would install
             // the copy under an ID its carried duty events give another message.
@@ -1643,7 +1648,14 @@ impl App {
             let mut backup = self.backup_of(&state)?;
             self.carry_outbox(&reader, &mut backup).await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
-            let mut parked = state.parked.clone();
+            let waiting_ids: BTreeSet<u64> =
+                backup.waiting.entries.iter().map(|(id, _)| *id).collect();
+            let mut parked: BTreeMap<_, _> = state
+                .parked
+                .iter()
+                .filter(|(id, _)| !waiting_ids.contains(id))
+                .map(|(id, entry)| (*id, entry.clone()))
+                .collect();
             let mut seen = state.seen.clone();
             if let Some(pending) = &state.pending_effect {
                 // A restore never carries a kept effect, so the backup holds its entry as
@@ -1964,6 +1976,21 @@ impl App {
                     return Err(invalid("its feed progress and protocol layers disagree"));
                 }
             }
+            backup.waiting.validate(backup, &cert, &protocols)?;
+            let ns = client_namespace(&meta.app_id);
+            // A restore in place keeps the store's event epoch and counter, and what the store
+            // holds of what the app still owes its protocol: the duty events not
+            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
+            // on another device or wiped, starts a new epoch at the first counter. A store
+            // that can't be read fails the restore (`STATE.md`, "What the app owes its
+            // protocol").
+            let old = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let mut carried = Self::kept_for_protocol(&old, &protocols)
+                .await?
+                .unwrap_or_default();
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
@@ -1982,7 +2009,7 @@ impl App {
                     }
                 }
             }
-            let (seen, parked, processed) = match &backup.beyond_cursor {
+            let (mut seen, mut parked, processed) = match &backup.beyond_cursor {
                 Some(layer) => (
                     layer.seen.iter().copied().collect::<BTreeSet<u64>>(),
                     layer.parked.iter().cloned().collect::<BTreeMap<_, _>>(),
@@ -2004,6 +2031,21 @@ impl App {
                 ),
                 None => (BTreeSet::new(), BTreeMap::new(), Vec::new()),
             };
+            for (id, entry) in &backup.waiting.entries {
+                parked.insert(*id, entry.clone());
+                if entry.generation == backup.cursor.generation {
+                    seen.insert(entry.seq);
+                }
+            }
+            for notice in &backup.waiting.notices {
+                if let events::Duty::StoredEntryDropped {
+                    seq, generation, ..
+                } = &notice.duty
+                    && *generation == backup.cursor.generation
+                {
+                    seen.insert(*seq);
+                }
+            }
             // An entry the cursor passed needs no mark.
             let seen: BTreeSet<u64> = seen
                 .into_iter()
@@ -2037,11 +2079,11 @@ impl App {
                 device: backup.device,
                 cursor,
                 chain: Some(chain),
-                held: BTreeMap::new(),
-                retries: BTreeMap::new(),
-                stored_retries: BTreeMap::new(),
+                held: backup.waiting.held.iter().copied().collect(),
+                retries: backup.waiting.feed_retries.iter().copied().collect(),
+                stored_retries: backup.waiting.retries.iter().copied().collect(),
                 next_stored_id: next_stored_id(None, &parked),
-                parked_round: state::ParkedRound::default(),
+                parked_round: backup.waiting.round,
                 seen,
                 asked: BTreeSet::new(),
                 parked,
@@ -2079,20 +2121,6 @@ impl App {
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
-            let ns = client_namespace(&meta.app_id);
-            // A restore in place keeps the store's event epoch and counter, and what the store
-            // holds of what the app still owes its protocol: the duty events not
-            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
-            // on another device or wiped, starts a new epoch at the first counter. A store
-            // that can't be read fails the restore (`STATE.md`, "What the app owes its
-            // protocol").
-            let old = Reader {
-                ns: ns.clone(),
-                store: env.store.clone(),
-            };
-            let carried = Self::kept_for_protocol(&old, &protocols)
-                .await?
-                .unwrap_or_default();
             // Every restore takes the backup's owed calls, each checked as a carried one is
             // and keeping only the protocols registered here; one that isn't whole, or is
             // owed to none of them, is left behind and counted. The restore replaces each
@@ -2102,6 +2130,31 @@ impl App {
             // owners are both values' (`to`), the rest of the value the store's
             // ([`union_owners`]).
             let from_backup = Self::owed_of_backup(backup, &protocols);
+            let mut waiting_notices = Vec::new();
+            for notice in &backup.waiting.notices {
+                unverified::merge_notice(&mut waiting_notices, notice.clone())?;
+            }
+            // An identical notice keeps every outstanding owner from both snapshots.
+            for (key, value) in &mut carried.values {
+                if !key.starts_with(key::DUTY_PREFIX) {
+                    continue;
+                }
+                let mut held: events::KeptDuty =
+                    serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                if !matches!(held.duty, events::Duty::StoredEntryDropped { .. }) {
+                    continue;
+                }
+                let id = unverified::notice_id(&held.duty)?;
+                if let Some(index) = waiting_notices.iter().position(|notice| {
+                    unverified::notice_id(&notice.duty).is_ok_and(|other| other == id)
+                }) {
+                    let notice = waiting_notices.remove(index);
+                    let mut joined = vec![held];
+                    unverified::merge_notice(&mut joined, notice)?;
+                    held = joined.remove(0);
+                    *value = serde_json::to_value(held).map_err(|_| corrupt())?;
+                }
+            }
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -2151,6 +2204,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -2194,7 +2248,15 @@ impl App {
             let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
+                // Age and capacity selection use the backup's verified observation, never
+                // the restoring device's clock. Selection joins the installation commit.
+                let drops = app.waiting_drops_at(None, backup.taken_service_ms);
+                let change = app.waiting_change(None, None, &drops)?;
+                change.stage(&mut app, &mut tx)?;
                 app.write_all(&mut tx).await?;
+                for notice in &waiting_notices {
+                    app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                }
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(
                         &mut tx,
@@ -2363,6 +2425,16 @@ impl App {
         for (id, parked) in &s.parked {
             tx.put(&key::parked(*id), parked)?;
         }
+        for (seq, held) in &s.held {
+            tx.put(&key::held(*seq), held)?;
+        }
+        for (seq, retry) in &s.retries {
+            tx.put(&key::retry(*seq), retry)?;
+        }
+        for (id, retry) in &s.stored_retries {
+            tx.put(&key::stored_retry(*id), retry)?;
+        }
+        tx.put(key::PARKED_NEXT, &s.parked_round)?;
         tx.put(key::STORED_NEXT, &s.next_stored_id)?;
         tx.put(key::JOIN, &s.join)?;
         if let Some(check) = &s.restore_cursor {
@@ -2510,12 +2582,16 @@ impl App {
         Ok(())
     }
 
-    /// How far apart the device clock and the service's are (Switch spec 10.1), `None`
-    /// before any verified answer.
+    /// The greater of the last sampled clock difference and the verified service time's
+    /// lead over the device clock (Switch spec 10.1). Without a stamped sample, this is
+    /// only a lower bound; `None` before any comparable answer.
     pub fn clock_skew_ms(&self) -> Option<u64> {
         let time = self.state.service_time?;
         let ahead = time.highest_ms.saturating_sub(self.now());
-        Some(time.offset_ms.unsigned_abs().max(ahead))
+        Some(
+            time.offset_ms
+                .map_or(ahead, |offset| offset.unsigned_abs().max(ahead)),
+        )
     }
 
     /// The protocol `protocol` finished its reconciliation (Switch spec 12.4 step 2.4):
@@ -2776,10 +2852,10 @@ impl App {
     /// for the registered protocols it names, and leaves one for none of them behind,
     /// counted.
     fn kept_duty_owned(&self, kept: &events::KeptDuty) -> Result<(), AppError> {
-        if kept.to.is_empty() || kept.to.iter().any(|name| !self.protocols.contains(name)) {
-            return Err(corrupt());
+        if matches!(kept.duty, events::Duty::StoredEntryDropped { .. }) {
+            unverified::notice_id(&kept.duty)?;
         }
-        Ok(())
+        kept.check_owners(&self.protocols)
     }
 
     /// The duty events kept, as [`App::kept_duties`] lists them, their owners noted for
@@ -2830,12 +2906,7 @@ impl App {
     pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            if up_to.epoch() != self.state.duty_epoch.epoch {
-                return Err(Refusal::Usage(
-                    "an event ID of another store: nothing acknowledged".into(),
-                )
-                .into());
-            }
+            self.check_event_store(up_to)?;
             // Only what the host was handed: a kept event it never took stays.
             let through = up_to.counter().min(self.duty_handed);
             let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
@@ -2900,6 +2971,78 @@ impl App {
             Ok(())
         })
         .await
+    }
+
+    /// Acknowledge exactly one delivered, still-owed event with bounded protocol-local
+    /// writes in the same commit (Switch spec 8.2, 11). No other event is acknowledged.
+    ///
+    /// After an unknown commit outcome, reload durable local handling state before acting
+    /// again. An absent event always refuses; absence alone is not proof it was handled.
+    /// A handler can keep its own idempotence marker with these writes, keyed by the
+    /// notice's stable identity when delivery IDs may change across restore.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for an absent, foreign or undelivered ID or oversized local writes;
+    /// [`Refusal::Left`] for nonempty local writes after the keys were deleted; a store error.
+    /// On refusal neither the acknowledgment nor the local writes is applied.
+    pub async fn ack_event_with(
+        &mut self,
+        protocol: &str,
+        id: EventId,
+        local: &[LocalWrite],
+    ) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.check_registered(protocol)?;
+        self.check_event_store(id)?;
+        let at = key::duty(id.counter());
+        let mut kept: events::KeptDuty = self.reader().get(&at).await?.ok_or_else(|| {
+            AppError::from(Refusal::Usage(
+                "the event is absent or was not delivered".into(),
+            ))
+        })?;
+        self.kept_duty_owned(&kept)?;
+        if id.counter() > self.duty_handed || !kept.to.iter().any(|name| name == protocol) {
+            return Err(Refusal::Usage("the event is absent or was not delivered".into()).into());
+        }
+        if local_writes_bytes(local) > MAX_STEP_LOCAL_BYTES {
+            return Err(
+                Refusal::Usage("the local acknowledgment exceeds its byte bound".into()).into(),
+            );
+        }
+        if !local.is_empty()
+            && self
+                .state
+                .leave
+                .is_some_and(|leave| leave.keys_deleted_ms.is_some())
+        {
+            return Err(Refusal::Left.into());
+        }
+        let mut tx = self.tx()?;
+        tx.local(&protocols::qualify(protocol, local.to_vec()))?;
+        kept.to.retain(|name| name != protocol);
+        if kept.to.is_empty() {
+            tx.delete(&at)?;
+        } else {
+            tx.put(&at, &kept)?;
+        }
+        self.commit(tx).await?;
+        if kept.to.is_empty() {
+            self.duty_owners.remove(&id.counter());
+        } else {
+            self.duty_owners.insert(id.counter(), kept.to);
+        }
+        Ok(())
+    }
+
+    fn check_event_store(&self, id: EventId) -> Result<(), AppError> {
+        if id.epoch() != self.state.duty_epoch.epoch {
+            return Err(Refusal::Usage(
+                "an event ID of another store: nothing acknowledged".into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
@@ -2971,6 +3114,7 @@ impl App {
     /// message of the entry stored locally it names; every protocol otherwise.
     fn duty_to(&self, duty: &events::Duty) -> Vec<String> {
         let kind = match duty {
+            events::Duty::StoredEntryDropped { message, .. } => Some(message.kind.clone()),
             events::Duty::EffectRefused { kind, .. }
             | events::Duty::EffectUncertain { kind, .. } => Some(kind.clone()),
             _ => duty
@@ -3012,6 +3156,9 @@ impl App {
             });
             match read {
                 Ok((n, mut kept)) => {
+                    if matches!(kept.duty, events::Duty::StoredEntryDropped { .. }) {
+                        unverified::notice_id(&kept.duty)?;
+                    }
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
                     if let Some(id) = kept.duty.stored_id() {
                         carried.stored_past = carried.stored_past.max(id.saturating_add(1));
@@ -3023,11 +3170,13 @@ impl App {
                         carried.lost_duties = carried.lost_duties.saturating_add(1);
                         continue;
                     }
+                    kept.check_owners(protocols)?;
                     let value = serde_json::to_value(&kept).map_err(|_| corrupt())?;
                     carried
                         .values
                         .push((format!("{}{rest}", key::DUTY_PREFIX), value));
                 }
+                Err(error) if unverified::waiting_record(&bytes) => return Err(error),
                 Err(_) => carried.lost_duties = carried.lost_duties.saturating_add(1),
             }
         }
@@ -3477,9 +3626,21 @@ impl App {
     /// Commit; after a failure the app reads its state again before going on.
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
-        match tx.commit(&self.env.store).await {
+        let result = async {
+            // An alarm may be raised after this transaction was built. Carry its exact
+            // evidence in every commit until one confirms it durable (Switch spec 10.1).
+            if self.alarm_dirty
+                && let Some(alarm) = &self.state.alarm
+            {
+                tx.put(key::ALARM, alarm)?;
+            }
+            tx.commit(&self.env.store).await
+        }
+        .await;
+        match result {
             Ok(()) => {
                 self.service_time_dirty = false;
+                self.alarm_dirty = false;
                 self.queue_duties(duties);
                 Ok(())
             }
@@ -3509,7 +3670,11 @@ impl App {
         self.time_fresh_at = None;
         let told = self.reload || !self.told_loaded;
         if self.reload {
+            // Keep verified time and a pending alarm before replacing memory with the
+            // stored state. A failed retry leaves both held and stops this call.
+            self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
+            self.validate_waiting_state()?;
             self.client = Self::client_for(
                 &self.env,
                 &self.state.meta,
@@ -3583,14 +3748,11 @@ impl App {
     pub(crate) async fn raise(&mut self, alarm: Alarm) -> AppError {
         if self.state.alarm.is_none() {
             self.state.alarm = Some(alarm.clone());
+            self.alarm_dirty = true;
             self.events.push(AppEvent::Alarm(alarm.clone()));
-            let tx = self.tx().and_then(|mut tx| {
-                tx.put(key::ALARM, &alarm)?;
-                Ok(tx)
-            });
-            if let Ok(tx) = tx {
-                // A failed commit leaves the alarm in memory; the app is stopped either way
-                // and raises it again on reload from the same evidence.
+            if let Ok(tx) = self.tx() {
+                // Keep the pending evidence after any failure, including an unknown
+                // outcome; a later commit retries it before any reload can discard it.
                 let _ = self.commit(tx).await;
             }
         }
@@ -3609,6 +3771,9 @@ impl App {
         if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
             self.clear_erasing().await?;
         }
+        if result.is_err() {
+            self.keep_observations().await?;
+        }
         match result {
             Ok(value) => Ok(value),
             Err(ClientError::Chain(error)) => Err(self
@@ -3620,55 +3785,72 @@ impl App {
         }
     }
 
-    /// The service time of the latest checked answer (Switch spec 10.1): the highest is
-    /// kept with its key, and its offset from the device clock; an earlier one from the
-    /// same key is misbehaviour, returned as the alarm.
-    fn note_service_time(&mut self) -> Option<Alarm> {
-        // Only the latest call's own stamped time: a refusal answered before the request
-        // verified carries the last committed time, and measures nothing (Switch wire 7.1).
-        let time = self.client.latest_server_time()?;
-        let now = self.now();
-        self.time_fresh_at = Some(now);
-        let key = self.state.meta.service_key;
-        let offset = i64::try_from(time)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX));
-        let mut alarm = None;
-        let record = match self.state.service_time {
-            Some(held) if held.key == key => {
-                if time < held.highest_ms {
-                    alarm = Some(Alarm::ServiceTimeBackwards {
-                        highest: held.highest_ms,
-                        signed: time,
-                    });
-                }
-                ServiceTime {
-                    key,
-                    highest_ms: held.highest_ms.max(time),
-                    offset_ms: offset,
-                }
-            }
-            _ => ServiceTime {
-                key,
-                highest_ms: time,
-                offset_ms: offset,
-            },
-        };
-        if time > now.saturating_add(SERVICE_TIME_AHEAD_MS)
-            || offset.unsigned_abs() > CLOCK_TOLERANCE_MS
-        {
-            let event = AppEvent::ClockSkew {
-                skew_ms: offset.unsigned_abs(),
-            };
-            if !self.events.contains(&event) {
-                self.events.push(event);
-            }
+    /// Keep comparison and alarm evidence even when no other state needs a commit.
+    async fn keep_observations(&mut self) -> Result<(), AppError> {
+        if self.service_time_dirty || self.alarm_dirty {
+            let tx = self.tx()?;
+            self.commit(tx).await?;
         }
+        Ok(())
+    }
+
+    /// Keep every comparable answer, independently of the latest stamped clock sample
+    /// (Switch spec 10.1). The first backward answer of an internal retry also counts.
+    fn note_service_time(&mut self) -> Option<Alarm> {
+        let compared = self.client.compared_times()?;
+        let key = self.state.meta.service_key;
+        let held = self.state.service_time.filter(|held| held.key == key);
+        let backwards = held
+            .filter(|held| compared.first < held.highest_ms)
+            .map(|held| (held.highest_ms, compared.first))
+            .or(compared.backwards);
+        let alarm =
+            backwards.map(|(highest, signed)| Alarm::ServiceTimeBackwards { highest, signed });
+        let highest_ms = held.map_or(compared.highest, |held| {
+            held.highest_ms.max(compared.highest)
+        });
+        // A headless refusal supplies a lower bound, never a clock-offset sample: on an
+        // idle account its last committed time may be days old (Switch wire 7.1).
+        let stamped = self
+            .client
+            .latest_compared_time()
+            .and(self.client.latest_server_time());
+        let offset_ms = match stamped {
+            Some(time) => {
+                let now = self.now();
+                self.time_fresh_at = Some(now);
+                Some(
+                    i64::try_from(time)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::try_from(now).unwrap_or(i64::MAX)),
+                )
+            }
+            None => held.and_then(|held| held.offset_ms),
+        };
+        let record = ServiceTime {
+            key,
+            highest_ms,
+            offset_ms,
+        };
         if self.state.service_time != Some(record) {
             self.state.service_time = Some(record);
             self.service_time_dirty = true;
         }
+        // The same bound governs automatic attempts and their warning. A headless answer
+        // can prove the service ahead without measuring an offset (Switch spec 10.1).
+        self.warn_clock_skew();
         alarm
+    }
+
+    fn warn_clock_skew(&mut self) {
+        if let Some(skew_ms) = self.clock_skew_ms()
+            && skew_ms > CLOCK_TOLERANCE_MS
+        {
+            let event = AppEvent::ClockSkew { skew_ms };
+            if !self.events.contains(&event) {
+                self.events.push(event);
+            }
+        }
     }
 
     /// `POST /ops` with a batch whose body the caller committed: the answer's head goes to

@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use pubky_switch_core::{
     chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, SignedHead, ZERO_HASH},
+    http::Uncompared,
     ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
@@ -18,13 +19,18 @@ use serde_json::Value;
 use super::{
     Answer, Service,
     batch::{Stop, VerifiedApp, check_own_app},
-    keyed::Signing,
+    marking::MarkMove,
+    signed::{AnswerTime, Asked, LaterTime, sign_answer},
+    verdict::{self, RequestClass, Route},
 };
 use crate::{
     changes::ChangeHub,
-    http::error::{ApiError, ErrorCode},
-    keys::{KeyId, KeyStoreError, Mark, ServiceSigner, check_mark},
-    store::{CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
+    http::{
+        SwitchResponse,
+        error::{ApiError, ErrorCode},
+    },
+    keys::{ServiceSigner, sign_head},
+    store::{AccountHead, AccountTxn, CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
 /// Positions one page examines at most, before it runs on to the end of a batch (Switch
@@ -101,13 +107,14 @@ impl FeedQuery {
 }
 
 /// A feed read taken under the lock, whose page is read after it. The reader is checked
-/// again for every page, in the snapshot the page comes from: a long-poll that outlives the
-/// app's standing, its certificate or the account's key answers as a fresh request would.
+/// again for every page, in the snapshot the page comes from, and the account and its mark
+/// judged again: a long-poll that outlives the app's standing, its certificate or the
+/// account's verdict answers as a fresh request would.
 #[derive(Debug)]
 pub(super) struct FeedRead {
-    account: String,
-    identity_key: [u8; 32],
-    service_key: KeyId,
+    account: AccountHead,
+    /// The key the verdict answered the request with.
+    key: [u8; 32],
     /// The reader, with the signing key its request verified with.
     reader: VerifiedApp,
     query: FeedQuery,
@@ -126,21 +133,30 @@ impl FeedRead {
 /// How a feed read that can't answer with a page is answered.
 #[derive(Debug)]
 pub(super) enum FeedStop {
-    /// The account is gone: `404`, signed with the operator key (Switch wire 7.3 step 2).
-    Gone,
-    /// The account's key changed since the request: a temporary failure, signed with the
-    /// operator key, since the request's key is retired.
-    Retired,
+    /// The snapshot observed erasure intent: complete it and judge again before answering.
+    AccountChanged,
+    /// The verdict of the account and its mark, judged from a page's snapshot, answers in
+    /// place of the page: the not-hosted `404`, the notice or the `503` of an unknown
+    /// verdict, signed with `key`, without a head (Switch wire 7.3): the first two at the
+    /// time base when it answers, the last, which commits nothing, at the last time the read
+    /// saw the service commit for the identity (Switch wire 7.1 Timestamp).
+    Verdict {
+        /// The key the verdict answers with.
+        key: [u8; 32],
+        /// The answer.
+        error: Box<ApiError>,
+        /// The time it carries.
+        at: LaterTime,
+    },
     /// An error answer.
     Refused(Box<PageRefusal>),
 }
 
 /// An error answer to a feed read, at `time_ms`. A refusal decided from a page's snapshot
 /// carries that snapshot's head, the newest the service read (Switch wire 7.1), once the
-/// key's mark has moved to it, as a page's does; any other with `head` carries the head the
+/// mark has moved to it, as a page's does; any other with `head` carries the head the
 /// request itself committed, which the mark covers already. So no refusal shows a head the
-/// mark is behind (Switch wire 7.3 step 10). The mark's `503` and an unauthenticated
-/// reader's `401` carry none.
+/// mark is behind (Switch wire 7.3 step 10). An unauthenticated reader's `401` carries none.
 #[derive(Debug)]
 pub(super) struct PageRefusal {
     /// The error.
@@ -153,20 +169,15 @@ pub(super) struct PageRefusal {
     pub(super) time_ms: u64,
 }
 
-/// The head of the snapshot a refusal was decided from, signed inside its answer's proof.
+/// The head of the snapshot a refusal was decided from, at or past the mark, with the key
+/// the verdict judged from that snapshot answers with.
 #[derive(Debug)]
 pub(super) struct SnapshotHead {
     tip: ChainTip,
-    /// The key's mark, read before the snapshot.
-    key_mark: Option<Mark>,
+    /// The creation time of the account the snapshot shows, whose mark the head moves.
+    created_at_ms: u64,
     identity_key: [u8; 32],
-}
-
-impl SnapshotHead {
-    /// The head, unless the key's mark is past it.
-    pub(super) fn sign(&self, signing: &Signing<'_>) -> Option<SignedHead> {
-        signing.head(self.key_mark.as_ref(), &self.identity_key, &self.tip)
-    }
+    signer: ServiceSigner,
 }
 
 impl FeedStop {
@@ -187,16 +198,6 @@ pub(crate) enum Shown {
     Full { context: Option<Value> },
     /// Its stub only.
     Stub,
-}
-
-/// A read whose account no longer names its key, by the operator's answer `error`: gone, as an
-/// account the service doesn't host, or its key retired (Switch wire 7.4.16).
-fn gone_or_retired(error: &ApiError) -> FeedStop {
-    if error.code == ErrorCode::NotFound {
-        FeedStop::Gone
-    } else {
-        FeedStop::Retired
-    }
 }
 
 fn corrupt(what: &'static str) -> StoreError {
@@ -398,8 +399,7 @@ enum Reader {
     /// Checked again from each snapshot, as a fresh request (Switch wire 7.2).
     Checked {
         identity_key: [u8; 32],
-        service_key: String,
-        /// The service key's public key and the service's origin, for the staged gate.
+        /// The key the verdict answers with and the service's origin, for the staged gate.
         service_public: [u8; 32],
         origin: String,
         verified: VerifiedApp,
@@ -435,8 +435,6 @@ pub(crate) struct PageBuilder {
     error: Option<StoreError>,
     /// Why the reader may not read this snapshot, as a fresh request would be refused.
     refusal: Option<Stop>,
-    /// The key changed since the request.
-    retired: bool,
     /// The service time the page answers at: the later of the request's and the
     /// snapshot's.
     time_ms: u64,
@@ -470,7 +468,6 @@ impl PageBuilder {
             cut: false,
             error: None,
             refusal: None,
-            retired: false,
             time_ms: 0,
         }
     }
@@ -558,7 +555,7 @@ impl PageReader for PageBuilder {
     }
 
     /// Check the reader against the snapshot as a fresh request is checked (Switch wire 7.2):
-    /// the account's key unchanged; the certificate it is checked against, with the key its
+    /// the certificate it is checked against, with the key its
     /// request verified with; unexpired at the page's service time; not revoked or departed,
     /// listed and carried by its record. Its scopes and permissions are that certificate's.
     fn begin(&mut self, snapshot: &FeedSnapshot) -> bool {
@@ -570,7 +567,6 @@ impl PageReader for PageBuilder {
             }
             Reader::Checked {
                 identity_key,
-                service_key,
                 service_public,
                 origin,
                 verified,
@@ -581,10 +577,6 @@ impl PageReader for PageBuilder {
                 // an empty page a few seconds past the certificate's expiry; nothing new
                 // reaches the app, and any commit after the expiry refuses it.
                 self.time_ms = (*time_ms).max(snapshot.stamped_time_ms);
-                if snapshot.service_key != *service_key {
-                    self.retired = true;
-                    return false;
-                }
                 let doc = match snapshot
                     .identity_doc
                     .as_ref()
@@ -724,9 +716,8 @@ impl Service {
     /// read; the page is read once the lock is gone ([`FeedRead`]).
     pub(super) fn feed(
         &self,
-        account: &str,
-        identity_key: [u8; 32],
-        service_key: &KeyId,
+        account: &AccountHead,
+        key: [u8; 32],
         writer: Option<&AppCert>,
         query: &Result<BTreeMap<String, String>, crate::http::route::QueryError>,
         time_ms: u64,
@@ -743,9 +734,8 @@ impl Service {
         let query = FeedQuery::parse(query)?;
         let mut answer = Answer::ok(Vec::new());
         answer.deferred = Some(super::Deferred::Feed(Box::new(FeedRead {
-            account: account.to_string(),
-            identity_key,
-            service_key: service_key.clone(),
+            account: account.clone(),
+            key,
             reader: VerifiedApp::reading(reader.app_id(), reader.signing_key()),
             query,
             time_ms,
@@ -757,21 +747,17 @@ impl Service {
     /// at once when it shows an item or more follow, or without `wait`; otherwise when the
     /// account changes or `wait` seconds pass, with the page as it is then (Switch wire
     /// 7.4.4).
-    pub(super) async fn feed_page(
-        &self,
-        read: &FeedRead,
-        signer: &ServiceSigner,
-    ) -> Result<Answered, FeedStop> {
+    pub(super) async fn feed_page(&self, read: &FeedRead) -> Result<Answered, FeedStop> {
         // The latest service time a read of this wait has seen: no answer is signed at an
         // earlier one, so a refusal after a wait never shows the service's time going back
         // behind a page the same client was answered meanwhile (Switch spec 10.1).
         let latest = std::sync::atomic::AtomicU64::new(read.time_ms);
         let polled = long_poll(
             &self.changes,
-            &read.account,
+            &read.account.id,
             Duration::from_secs(read.query.wait),
             || async {
-                let answered = match self.read_page(read, signer).await {
+                let answered = match self.read_page(read).await {
                     Ok(answered) => answered,
                     Err(FeedStop::Refused(mut refusal)) => {
                         refusal.time_ms = refusal
@@ -792,72 +778,263 @@ impl Service {
         .await;
         let answered = match polled {
             Ok(answered) => answered,
-            // A refusal from a snapshot moves the mark to its head first, as a page does; if
-            // it can't, the refusal carries the request's own head instead.
+            // A refusal from a snapshot moves the mark to its head first, as a page does,
+            // with the key the snapshot's verdict answers with; if it can't, or the instance
+            // lock isn't confirmed now, after the wait, the refusal carries the request's own
+            // head instead, which its commit covers (Switch spec 6.5). Where the account was
+            // erased meanwhile, no head of it goes out: the request's is the erased
+            // account's too.
             Err(FeedStop::Refused(mut refusal)) => {
-                if let Some(snapshot) = &refusal.snapshot
-                    && snapshot.tip.seq > 0
-                {
-                    let mark = Mark::from(snapshot.tip);
-                    match self.keys.advance_mark(&read.service_key, mark).await {
-                        Ok(_) | Err(KeyStoreError::NotFound) => {}
-                        Err(_) => refusal.snapshot = None,
+                if let Some(snapshot) = &refusal.snapshot {
+                    let moved = if !self.lock_is_fresh() {
+                        MarkMove::Failed
+                    } else if snapshot.tip.seq == 0 {
+                        MarkMove::Done
+                    } else {
+                        self.move_mark(
+                            &read.account.id,
+                            snapshot.tip,
+                            super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
+                            snapshot.created_at_ms,
+                            false,
+                        )
+                        .await
+                    };
+                    match moved {
+                        MarkMove::Done => {}
+                        MarkMove::Failed => refusal.snapshot = None,
+                        MarkMove::AccountGone => {
+                            return Err(FeedStop::refused(temporary(), false, refusal.time_ms));
+                        }
                     }
                 }
                 return Err(FeedStop::Refused(refusal));
             }
             Err(stop) => return Err(stop),
         };
-        // The key's mark moves to the page's head first, so no head goes out that the mark
-        // is behind, also when the page shows a commit whose own request hasn't moved it
-        // yet (Switch wire 7.3 step 10).
-        if let Some(mark) = answered.mark {
-            match self.keys.advance_mark(&read.service_key, mark).await {
-                // Erased once the page was read, its key deleted: never answered with it
-                // (Switch wire 7.4.16).
-                Ok(_) | Err(KeyStoreError::NotFound) => {}
-                Err(_) => return Err(FeedStop::refused(temporary(), true, answered.time_ms)),
+        // A page signs a head: not while another process may hold the database, checked now,
+        // after the wait (Switch spec 6.5).
+        if !self.lock_is_fresh() {
+            tracing::error!("the instance lock isn't confirmed: no page signed");
+            return Err(FeedStop::refused(temporary(), false, answered.time_ms));
+        }
+        // The mark moves to the page's head first, with the key the page is signed with, so
+        // no head goes out that the mark is behind, also when the page shows a commit whose
+        // own request hasn't moved it yet (Switch wire 7.3 step 10).
+        // Where the account was erased meanwhile, the request's own head is the erased
+        // account's too: the refusal carries none.
+        if answered.head.tip.seq > 0 {
+            match self
+                .move_mark(
+                    &read.account.id,
+                    answered.head.tip,
+                    super::PublicKeyBytes::public_key_bytes(&answered.head.signer),
+                    answered.head.created_at_ms,
+                    false,
+                )
+                .await
+            {
+                MarkMove::Done => {}
+                MarkMove::Failed => {
+                    return Err(FeedStop::refused(temporary(), true, answered.time_ms));
+                }
+                MarkMove::AccountGone => {
+                    return Err(FeedStop::refused(temporary(), false, answered.time_ms));
+                }
             }
         }
-        // Signed by the caller under its proof (keyed.rs): only while the account still names
-        // the key the read loaded, whatever its mark did (7.4.16).
         Ok(answered)
     }
 
-    /// One page from one snapshot, and its head, signed. The key's mark is read before the
-    /// snapshot, so the snapshot's head is at or past it unless the state went back.
-    async fn read_page(
+    /// Finish a page or a snapshot refusal under the account's lock. The page's data was
+    /// read from committed state and its mark moved before this turn; the lock keeps an
+    /// erasure or generation start from overtaking the checks and the signatures (Switch
+    /// wire 7.3 step 10). A head signed by the original request is reusable only at that
+    /// same account and generation.
+    pub(super) async fn feed_answer(
         &self,
         read: &FeedRead,
-        signer: &ServiceSigner,
-    ) -> Result<Answered, FeedStop> {
-        let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
-        let mark = match self.keys.mark(&read.service_key).await {
-            Ok(mark) => mark,
-            // An erasure deletes the account, then its key (Switch wire 7.4.16): a read that
-            // waited on an account erased meanwhile answers as for one the service doesn't
-            // host (7.3 step 2). Never with the key it loaded, which the erasure's answer was
-            // the last to use: an account found again, as after a new enrollment, or one that
-            // can't be looked up, gets the operator's temporary failure.
-            Err(KeyStoreError::NotFound) => {
-                return Err(
-                    match self
-                        .no_longer_keyed(&read.account, &read.service_key, false)
-                        .await
-                    {
-                        Some(error) => gone_or_retired(&error),
-                        None => fallback(temporary(), read.time_ms),
-                    },
+        result: Result<Answered, FeedStop>,
+        fallback_head: Option<SignedHead>,
+        asked: Asked<'_>,
+    ) -> SwitchResponse {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self.feed_sign_pause.lock().take();
+            if let Some(pause) = pause {
+                pause.wait().await;
+            }
+        }
+        let result = match result {
+            Err(FeedStop::AccountChanged) => {
+                return self
+                    .answer_after_account_change(
+                        &read.account.id,
+                        &RequestClass::Ordinary,
+                        asked,
+                        self.time.read().base_ms,
+                        Some(read.time_ms),
+                    )
+                    .await;
+            }
+            Err(FeedStop::Verdict { key, error, at }) => {
+                return self.keyed_error(&key, asked, at.at(|| self.time.read().base_ms), &error);
+            }
+            // No state is signed for a headless refusal. It can describe the new
+            // generation a held read woke to (Switch wire 7.4.4 "Long-poll").
+            Err(FeedStop::Refused(refusal)) if refusal.snapshot.is_none() && !refusal.head => {
+                return self.keyed_error(
+                    &read.key,
+                    asked,
+                    AnswerTime::Account(refusal.time_ms),
+                    &refusal.error,
                 );
             }
-            Err(_) => return Err(fallback(temporary(), read.time_ms)),
+            Err(FeedStop::Refused(refusal)) => Err(refusal),
+            Ok(page) => Ok(page),
         };
+        let failed = |at| self.keyed_error(&read.key, asked, at, &temporary());
+        let mut txn = match self.store.begin(&read.account.id).await {
+            Ok(Some(txn)) => txn,
+            Ok(None) | Err(_) => {
+                let base_ms = self.time.read().base_ms;
+                return failed(AnswerTime::TimeBase(base_ms, Uncompared::Unavailable));
+            }
+        };
+        let at = AnswerTime::Account(txn.head().stamped_time_ms);
+        let snapshot = match &result {
+            Ok(page) => Some(&page.head),
+            Err(refusal) => refusal.snapshot.as_ref(),
+        };
+        let generation = snapshot.map_or(read.account.generation, |head| head.tip.generation);
+        let created = snapshot.map_or(read.account.created_at_ms, |head| head.created_at_ms);
+        if created != read.account.created_at_ms
+            || txn.head().created_at_ms != created
+            || txn.head().generation != generation
+        {
+            return failed(at);
+        }
+        let held = match txn.held_identity().await {
+            Ok(held) => held,
+            Err(_) => return failed(at),
+        };
+        let body = held.as_ref().and_then(|held| held.doc.peek().ok());
+        let head = txn.head();
+        let account = self.account_input(
+            head.generation,
+            head.chain,
+            head.created_at_ms,
+            body.as_ref(),
+        );
+        let judged = self.judge(&read.account.id, Some(account)).await;
+        if judged.judgement.decision.erase_account_again {
+            let committed_ms = txn.head().stamped_time_ms;
+            drop(txn);
+            return self
+                .answer_after_account_change(
+                    &read.account.id,
+                    &RequestClass::Ordinary,
+                    asked,
+                    self.time.read().base_ms,
+                    Some(committed_ms),
+                )
+                .await;
+        }
+        let routed = verdict::answer(
+            &judged.judgement,
+            &RequestClass::Ordinary,
+            self.current_key(),
+        );
+        if let Some(response) = self.verdict_answer(
+            &read.account.id,
+            &routed,
+            asked,
+            self.time.read().base_ms,
+            Some(txn.head().stamped_time_ms),
+        ) {
+            return response;
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self.feed_locked_pause.lock().take();
+            if let Some(pause) = pause {
+                pause.wait().await;
+            }
+        }
+        let (answer, signer, time_ms) = match result {
+            Ok(page) => {
+                let Some(head) = self.feed_head(&txn, &page.head) else {
+                    return failed(at);
+                };
+                (page.answer(head), page.head.signer, page.time_ms)
+            }
+            Err(refusal) => {
+                let (head, signer) = match refusal.snapshot {
+                    Some(snapshot) => {
+                        let Some(head) = self.feed_head(&txn, &snapshot) else {
+                            return failed(at);
+                        };
+                        (Some(head), snapshot.signer)
+                    }
+                    None => {
+                        let Some(signer) = self.signer_of(&read.key) else {
+                            return failed(at);
+                        };
+                        (if refusal.head { fallback_head } else { None }, signer)
+                    }
+                };
+                (
+                    Answer::error(&refusal.error).with_head(head),
+                    signer,
+                    refusal.time_ms,
+                )
+            }
+        };
+        let at = AnswerTime::Account(time_ms.max(txn.head().stamped_time_ms));
+        let response = sign_answer(&signer, asked, at, answer);
+        // This turn changed no state; the snapshot's state and mark are already durable.
+        // Keep its lock through signing and finish the turn before releasing the answer.
+        if txn.commit().await.is_err() {
+            return failed(at.unavailable());
+        }
+        response
+    }
+
+    /// A snapshot head, signed only while its account still owns the generation and holds
+    /// exactly that chain head. No await separates the freshness check from signing (Switch
+    /// spec 6.5; wire 7.3 step 10).
+    fn feed_head(&self, txn: &AccountTxn, snapshot: &SnapshotHead) -> Option<SignedHead> {
+        let held = txn.head();
+        let tip = held.chain_tip();
+        if held.created_at_ms != snapshot.created_at_ms
+            || tip.generation != snapshot.tip.generation
+            || tip.seq != snapshot.tip.seq
+            || tip.chain_hash != snapshot.tip.chain_hash
+            || !self.lock_is_fresh()
+        {
+            return None;
+        }
+        Some(sign_head(
+            &snapshot.signer,
+            &snapshot.identity_key,
+            &snapshot.tip,
+        ))
+    }
+
+    /// One page from one snapshot, judged with the account's mark read before it (Switch
+    /// wire 7.3): so the snapshot's state is at or past the mark unless the state went back,
+    /// and each read of the wait answers the verdict a fresh request would get.
+    async fn read_page(&self, read: &FeedRead) -> Result<Answered, FeedStop> {
+        let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
+        let inputs = self.mark_inputs(&read.account.id).await;
+        if inputs.has_pending_erasure() {
+            return Err(FeedStop::AccountChanged);
+        }
         let budget = usize::try_from(self.limits.max_page_bytes).unwrap_or(usize::MAX);
         let mut builder = PageBuilder::with(
             Reader::Checked {
-                identity_key: read.identity_key,
-                service_key: read.service_key.as_str().to_string(),
-                service_public: super::PublicKeyBytes::public_key_bytes(signer),
+                identity_key: read.account.identity_key,
+                service_public: read.key,
                 origin: self.origin.clone(),
                 verified: read.reader.clone(),
                 time_ms: read.time_ms,
@@ -868,7 +1045,7 @@ impl Service {
         let snapshot = self
             .store
             .read_feed(
-                &read.account,
+                &read.account.id,
                 &read.reader.app_id(),
                 read.query.after,
                 POSITIONS_PER_PAGE,
@@ -876,11 +1053,67 @@ impl Service {
                 &mut builder,
             )
             .await
-            .map_err(|error| fallback(super::store_error(&error), read.time_ms))?
-            .ok_or(FeedStop::Gone)?;
-        if builder.retired {
-            return Err(FeedStop::Retired);
+            .map_err(|error| fallback(super::store_error(&error), read.time_ms))?;
+        let current = self.keys.current();
+        let account = snapshot.as_ref().map(|snapshot| {
+            let body = snapshot
+                .identity_doc
+                .as_ref()
+                .and_then(|doc| doc.peek::<pubky_switch_core::records::IdentityBody>().ok());
+            self.account_input(
+                snapshot.generation,
+                snapshot.chain,
+                snapshot.created_at_ms,
+                body.as_ref(),
+            )
+        });
+        let judged = self.judge_with(&read.account.id, account, inputs).await;
+        let routed = verdict::answer(
+            &judged.judgement,
+            &RequestClass::Ordinary,
+            super::PublicKeyBytes::public_key_bytes(&current),
+        );
+        if judged.judgement.decision.erase_account_again {
+            return Err(FeedStop::AccountChanged);
         }
+        let signer = match routed.route {
+            Route::Proceed { head: true } => self
+                .signer_of(&routed.key)
+                .ok_or_else(|| fallback(temporary(), read.time_ms))?,
+            Route::NotHosted => {
+                return Err(FeedStop::Verdict {
+                    key: routed.key,
+                    error: Box::new(super::marking::not_hosted()),
+                    at: LaterTime::TimeBase(Uncompared::NotHosted),
+                });
+            }
+            Route::Notice(notice) => {
+                return Err(FeedStop::Verdict {
+                    key: routed.key,
+                    error: Box::new(self.notice(&read.account.id, notice)),
+                    at: LaterTime::TimeBase(Uncompared::Notice),
+                });
+            }
+            Route::Unavailable
+            | Route::CreateAccount
+            | Route::TakeOverMark
+            | Route::Proceed { head: false }
+            | Route::StartAfresh
+            | Route::Conflict
+            | Route::JudgeActivation
+            | Route::Erase { .. }
+            | Route::EraseLost => {
+                return Err(FeedStop::Verdict {
+                    key: routed.key,
+                    error: Box::new(temporary()),
+                    at: LaterTime::Committed(builder.time_ms.max(read.time_ms)),
+                });
+            }
+        };
+        // Judged healthy: the account is there.
+        let Some(snapshot) = snapshot else {
+            return Err(fallback(temporary(), read.time_ms));
+        };
         let time_ms = builder.time_ms;
         let (seq, chain_hash) = snapshot.chain.unwrap_or((0, ZERO_HASH));
         let tip = ChainTip {
@@ -888,13 +1121,6 @@ impl Service {
             seq,
             chain_hash,
         };
-        // The head is signed only when the page is answered, inside its proof (keyed.rs);
-        // the key's mark is checked here, so each read of the wait refuses a state behind it.
-        let check = check_mark(mark.as_ref(), &Mark::from(tip));
-        if !check.allows_signing() {
-            self.note_mark_refusal(&read.account, check);
-            return Err(FeedStop::refused(behind_the_mark(), false, time_ms));
-        }
         match builder.refusal.take() {
             Some(Stop::Refused(error)) => {
                 return Err(FeedStop::Refused(Box::new(PageRefusal {
@@ -902,8 +1128,9 @@ impl Service {
                     head: true,
                     snapshot: Some(SnapshotHead {
                         tip,
-                        key_mark: mark,
-                        identity_key: read.identity_key,
+                        created_at_ms: snapshot.created_at_ms,
+                        identity_key: read.account.identity_key,
+                        signer: signer.clone(),
                     }),
                     time_ms,
                 })));
@@ -919,11 +1146,6 @@ impl Service {
         Ok(Answered {
             ready: !page.items.is_empty() || page.more,
             page,
-            mark: snapshot.chain.map(|(seq, chain_hash)| Mark {
-                generation: snapshot.generation,
-                seq,
-                chain_hash,
-            }),
             generation: snapshot.generation,
             // The caller's own cursor, from the page's snapshot (Switch spec 8.3, wire
             // 7.4.4). Its `seq` alone: a cooperative move and a key change in place continue
@@ -934,20 +1156,16 @@ impl Service {
                 .as_ref()
                 .and_then(|app| app.cursor)
                 .map_or(0, |cursor| cursor.seq),
-            tip,
+            head: SnapshotHead {
+                tip,
+                created_at_ms: snapshot.created_at_ms,
+                identity_key: read.account.identity_key,
+                signer,
+            },
             checkpoint: snapshot.checkpoint,
-            key_mark: mark,
-            identity_key: read.identity_key,
             time_ms,
         })
     }
-}
-
-/// The refusal of a page whose state is behind its key's mark (Switch wire 7.3 step 10).
-fn behind_the_mark() -> ApiError {
-    ApiError::unavailable(
-        "7.3: the state is behind its service key's mark; a new generation is needed",
-    )
 }
 
 /// A page read, before it is answered with its signed head.
@@ -955,30 +1173,22 @@ fn behind_the_mark() -> ApiError {
 pub(super) struct Answered {
     page: Page,
     ready: bool,
-    /// The head as a mark, `None` before the first chain item.
-    mark: Option<Mark>,
     generation: u64,
     /// The `seq` of the caller's cursor the service holds, 0 before its first move.
     cursor: u64,
-    /// The chain's head as the page shows it.
-    tip: ChainTip,
+    /// The snapshot whose head the page carries.
+    head: SnapshotHead,
     /// The latest checkpoint, which the page carries (Switch wire 7.4.4).
     checkpoint: Option<SignedHead>,
-    /// The key's mark when the page was read, which its head must not be behind.
-    key_mark: Option<Mark>,
-    identity_key: [u8; 32],
     time_ms: u64,
 }
 
 impl Answered {
     /// The page's answer at its service time, `{ items, next, scanned_through, more, cursor,
     /// head, checkpoint }` in the member order of the wire's example (Switch wire 7.4.4), with the
-    /// head, signed here inside the answer's proof, also in `Switch-Head`; `checkpoint` only
-    /// once there is one.
-    pub(super) fn answer(&self, signing: &Signing<'_>) -> (Answer, u64) {
-        let Some(head) = signing.head(self.key_mark.as_ref(), &self.identity_key, &self.tip) else {
-            return (Answer::error(&behind_the_mark()), self.time_ms);
-        };
+    /// head, already signed under the account's lock, also in `Switch-Head`; `checkpoint`
+    /// only once there is one.
+    fn answer(&self, head: SignedHead) -> Answer {
         let mut body = b"{\"items\":[".to_vec();
         for (index, item) in self.page.items.iter().enumerate() {
             if index > 0 {
@@ -1003,7 +1213,7 @@ impl Answered {
             body.extend_from_slice(&checkpoint.to_json());
         }
         body.push(b'}');
-        (Answer::ok(body).with_head(Some(head)), self.time_ms)
+        Answer::ok(body).with_head(Some(head))
     }
 }
 
@@ -1473,7 +1683,6 @@ mod tests {
         let identity = IdentityDoc::verify(&doc, &alice.public()).expect("doc");
         let app = held.cert().app_id();
         let mut snapshot = snapshot(7, 9, 9);
-        snapshot.service_key = "key".into();
         snapshot.stamped_time_ms = renewed_cert.issued_at() + 1;
         snapshot.identity_doc = Some(doc);
         snapshot.reader = Some(crate::store::StoredApp {
@@ -1494,7 +1703,6 @@ mod tests {
         let mut builder = PageBuilder::with(
             Reader::Checked {
                 identity_key: alice.public(),
-                service_key: "key".into(),
                 service_public: identity.inbox().service_key,
                 origin: identity.inbox().url.clone(),
                 verified: VerifiedApp::reading(app, held.cert().signing_key()),

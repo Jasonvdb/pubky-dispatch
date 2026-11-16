@@ -2,6 +2,7 @@
 //! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
 mod awaiting_key;
+mod consumed;
 mod feed_wait;
 mod flows;
 mod forget;
@@ -28,6 +29,7 @@ mod shared_flows;
 mod store_failures;
 mod unverified;
 mod uploads;
+mod waiting;
 mod writer_certs;
 
 use std::sync::{Arc, Mutex};

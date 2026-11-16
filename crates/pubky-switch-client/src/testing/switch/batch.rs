@@ -309,7 +309,7 @@ impl Inner {
                 seq: self.seq,
             };
             match &body.kind {
-                OpKind::RecordPut(put) => draft.shared.record_written(put, written),
+                OpKind::RecordPut(put) => draft.shared.record_written(put, written)?,
                 OpKind::Claim(fields) => draft.shared.claim_written(fields, written),
                 OpKind::AllowPut {
                     pubky,
@@ -475,7 +475,7 @@ impl Inner {
                 .ok_or_else(|| Refusal::bad_request("Switch wire 6.2: for an app only"))
         };
         let state = match &body.kind {
-            OpKind::RecordPut(put) => draft.shared.record_put(put, cx, generation, seq)?,
+            OpKind::RecordPut(_) => draft.shared.record_put(op, cx, generation, seq)?,
             OpKind::Claim(fields) => draft.shared.claim(fields, cx)?,
             OpKind::AllowPut { pubky, kind } => draft.shared.allow_put(pubky, *kind, cx),
             OpKind::AllowDelete { pubky, kind } => draft.shared.allow_delete(pubky, *kind),
@@ -636,7 +636,9 @@ impl Inner {
                 {
                     app.full_completed = Some(seq);
                 }
-                drop_passed_parts(draft, &target, full);
+                // No other part is dropped here: the part just stored is past every cursor,
+                // and what a cursor has passed and `keys_through` covers went at the move that
+                // passed it, or at the move that ended a request's force ([`Inner::submit`]).
                 seq
             }
         };
@@ -683,6 +685,25 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Move `app`'s cursor forward to `seq` as another instance of the app moving it would,
+    /// outside a batch: by a move's rules, its passed parts dropped and what it releases
+    /// released (Switch wire 6.2, spec 8.3). A position at or behind the cursor changes
+    /// nothing.
+    pub(in crate::testing) fn move_held_cursor(&mut self, app: [u8; 16], seq: u64) {
+        let mut draft = self.draft();
+        let held = &mut draft.apps.entry(app).or_default().cursor;
+        if seq <= *held {
+            return;
+        }
+        *held = seq;
+        let full = draft.apps.get(&app).is_some_and(in_force);
+        drop_passed_parts(&mut draft, &app, full);
+        self.commit(draft);
+        self.after_cursor_move();
+    }
+}
+
 /// Whether `app`'s full-bundle request is in force for dropping its parts (Switch wire 6.2):
 /// from the `POST /keys` until its cursor has passed the part that completed it, or the part
 /// that replaced that one.
@@ -692,8 +713,9 @@ fn in_force(app: &SwitchApp) -> bool {
 
 /// Drop `target`'s key bundle parts its cursor has passed and its `keys_through` covers,
 /// unless `full`, a full bundle requested, by the core's rule (Switch wire 6.2): at a
-/// `key_bundle.put` and at a `cursor.set`, as the service does. Where its `keys_through`
-/// starts rises to the height the dropped parts gave, so it keeps it.
+/// `cursor.set`, as the service does, the one writer that moves a cursor, passes a part or
+/// ends a request's force. Where its `keys_through` starts rises to the height the dropped
+/// parts gave, so it keeps it.
 fn drop_passed_parts(draft: &mut Draft, target: &[u8; 16], full: bool) {
     let Some(parts) = draft.bundles.get(target) else {
         return;

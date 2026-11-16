@@ -38,7 +38,7 @@ mod signer;
 pub mod state;
 
 pub use alert::{Alert, RenewalSkip, Source};
-pub use error::{Refusal, Result, SignerError, SizedBody};
+pub use error::{RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody};
 pub use homeserver::Homeserver;
 pub use key::{
     AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,
@@ -46,5 +46,5 @@ pub use key::{
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
 pub use signer::{
     AbortOutcome, AppReview, AppStanding, AppSummary, ApprovedRequest, CertChange, HighWater,
-    ReceivingApp, RunDue, Signer, SignerEnv, SignerStatus, UserConfirmed,
+    ReceivingApp, RecordsDiscarded, RunDue, Signer, SignerEnv, SignerStatus, UserConfirmed,
 };

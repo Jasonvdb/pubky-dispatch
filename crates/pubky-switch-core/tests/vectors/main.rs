@@ -21,6 +21,7 @@ mod http;
 mod identifiers;
 mod keys;
 mod operations;
+mod record_current;
 mod sealed;
 mod signatures;
 

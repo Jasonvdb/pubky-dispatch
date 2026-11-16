@@ -10,6 +10,7 @@ use pubky_switch::{
     config::Config,
     http,
     keys::{FileKeyStore, KeyStoreReadiness},
+    retire::{self, RetireOptions},
     service::Service,
     store::{Store, StoreReadiness},
     telemetry,
@@ -34,7 +35,7 @@ enum Command {
     Run,
     /// Check the configuration, and print it with every default written out.
     CheckConfig,
-    /// Compare every account's chain head with its service key's mark, reading only:
+    /// Judge every account against its mark, and every mark without an account, reading only:
     /// prints JSON lines, and exits 2 when an account needs attention.
     CheckMarks {
         /// Read this database instead of the configured one, against the same key store.
@@ -45,6 +46,16 @@ enum Command {
         /// Report every account, not only those that need attention.
         #[arg(long)]
         all: bool,
+    },
+    /// Retire a generation of an identity, one-way, once no state at or past its mark can
+    /// be brought back: its notice then says the loss is permanent. Only a failing account
+    /// this service serves, or a lost identity, at a generation above 0; refused while the
+    /// service runs on the key store. Prints a JSON line.
+    Retire {
+        /// The identity's Pubky ID.
+        identity: String,
+        /// The generation to retire: the mark's, or the account's where the mark is lost.
+        generation: u64,
     },
 }
 
@@ -75,7 +86,41 @@ fn main() -> ExitCode {
         Command::CheckMarks { replica, all } => {
             check_marks_command(&config, replica.as_deref(), all)
         }
+        Command::Retire {
+            identity,
+            generation,
+        } => retire_command(&config, &identity, generation),
         Command::Run => run(config),
+    }
+}
+
+fn retire_command(config: &Config, identity: &str, generation: u64) -> ExitCode {
+    use std::io::Write;
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "pubky-switch: retire: starting the runtime: {error}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let retired = RetireOptions::from_config(config, identity, generation)
+        .and_then(|options| runtime.block_on(retire::run(&options)))
+        .and_then(|retired| retired.to_json_line());
+    match retired {
+        Ok(line) => {
+            print!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "pubky-switch: retire: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -171,10 +216,12 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // serves anything.
     let _key_dir_lock = FileKeyStore::lock_dir(&key_dir)?;
     let keys = FileKeyStore::open(&key_dir)?;
+    let marks = pubky_switch::marks::MarkStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
     let instance = store
         .hold_instance_lock(pubky_switch::store::LockTiming::SERVICE)
         .await?;
+    let freshness = instance.freshness();
     // The database's lock lives with its session: once another session holds it, or it
     // can't be confirmed, this one stops (docs/configuration.md, "Topology").
     tokio::spawn(async move {
@@ -200,17 +247,20 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let api = match config.server.origin.clone() {
         Some(origin) => {
-            // Keys an erasure left owed, by a key store failure or a crash, go first (Switch
-            // wire 7.4.16), then accounts a restored database brought back after their
-            // erasure (spec 6.5), before the API listener takes a request.
+            // Push keys left owed, by a key store failure or a crash, go first (Switch wire
+            // 8.1), then accounts a restored database brought back after their erasure and
+            // the erasures' leftover marks (Switch wire 7.3, Table 1), before the API
+            // listener takes a request.
             let service = Arc::new(
                 Service::new(
                     origin.clone(),
                     store.clone(),
                     Arc::new(keys.clone()),
+                    marks,
                     time.clone(),
                     config.limits.clone(),
                 )
+                .with_lock_freshness(freshness)
                 .with_push(config.push.enabled)
                 .with_push_concurrency(config.push.concurrency)
                 .with_backup_retention_days(config.keys.backup_retention_days)

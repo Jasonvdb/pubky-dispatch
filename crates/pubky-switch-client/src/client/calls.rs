@@ -20,7 +20,7 @@ use super::answers::{
     WriteAnswer,
 };
 use super::read::{self, Obj};
-use super::{Auth, Body, CheckedResponse, SwitchClient, check_response, verify_head};
+use super::{Auth, Body, CheckedResponse, SentRequest, SwitchClient, check_response, verify_head};
 use crate::error::ClientError;
 use crate::transport::TimeoutClass;
 
@@ -154,17 +154,21 @@ impl SwitchClient {
     ///
     /// The answer is checked as the core checks it, and its response signature with the key
     /// it names. A client without a pinned key pins that key. One that holds a key keeps it:
-    /// at a serving account the answer names the pending key of the next generation, which
-    /// [`SwitchClient::put_identity`] pins once the delivery naming it is accepted.
+    /// at a serving account the answer names that key, unless the service changed its key
+    /// since (Switch spec 12.5), and then [`SwitchClient::put_identity`] pins the new one once
+    /// the delivery naming it is accepted.
     ///
     /// # Errors
     ///
     /// [`ClientError::Usage`] for an enrollment of another identity or origin;
     /// [`ClientError::BadServiceSignature`] for an answer that doesn't verify, among them
-    /// every error answer before the account exists, which the operator key signs;
+    /// every error answer to a client that holds no key, which can't check it;
     /// [`ClientError::Core`] for an answer that names another enrollment.
     pub async fn enroll(&self, enrollment: &Enrollment) -> Result<EnrollmentAnswer, ClientError> {
         self.signer_only()?;
+        // No answer to an enrollment counts in the comparison of service times, nor
+        // measures the clock (Switch wire 7.1 Timestamp).
+        self.forget_latest();
         if enrollment.body().identity != self.account() || enrollment.body().origin != self.origin()
         {
             return Err(ClientError::Usage(
@@ -179,31 +183,24 @@ impl SwitchClient {
             ..Auth::default()
         };
         let signed = self.build("POST", "/v1/enroll", body, Body::Json, auth)?;
-        let signature = signed.signature;
-        let response = self.transport().send(signed.request).await?;
+        let sent = SentRequest::of(&signed.request);
+        let response = self.send_response(signed.request).await?;
         let status = response.status;
         if !(200..300).contains(&status) {
-            // A serving account signs its errors with its key; anything else is the
-            // operator's, which no client knows (Switch wire 7.1, 7.4.1).
+            // Errors are signed with the service key: a client that pinned it checks them,
+            // one that holds none can't (Switch wire 7.1, 7.4.1 Errors).
             return Err(match self.pinned_key() {
-                Some(key) => {
-                    match check_response(&key, &self.account(), signature.as_ref(), &response) {
-                        Err(error) => error,
-                        Ok(_) => ClientError::BadServiceSignature { status },
-                    }
-                }
+                Some(key) => match check_response(&key, &self.account(), &sent, &response) {
+                    Err(error) => error,
+                    Ok(_) => ClientError::BadServiceSignature { status },
+                },
                 None => ClientError::BadServiceSignature { status },
             });
         }
         // The key that verifies the answer is the one it names (Switch wire 3.7).
         let answer = EnrollmentAnswer::from_json(&response.body)
             .map_err(|_| ClientError::BadServiceSignature { status })?;
-        check_response(
-            &answer.service_key,
-            &self.account(),
-            signature.as_ref(),
-            &response,
-        )?;
+        check_response(&answer.service_key, &self.account(), &sent, &response)?;
         answer.check(enrollment)?;
         if self.pinned_key().is_none() {
             self.pin(answer.service_key);
@@ -215,8 +212,9 @@ impl SwitchClient {
     /// naming the version it builds on. The answer's proof is checked as the delivery's.
     ///
     /// A delivery whose document names this origin with another service key than the pinned
-    /// one starts a generation under that pending key, which signs its `200`: the answer, its
-    /// proof and its head are checked with the pending key, which is pinned once they verify.
+    /// one starts a generation under that key, the service's new key after a key change
+    /// (Switch spec 12.5), which signs its `200`: the answer, its proof and its head are
+    /// checked with it, and it is pinned once they verify.
     /// Any other status is checked with the pinned key, which stays pinned (Switch wire
     /// 7.4.2 "Which key signs the answer").
     ///
@@ -229,7 +227,7 @@ impl SwitchClient {
     ) -> Result<WriteAnswer, ClientError> {
         self.signer_only()?;
         let pinned = self.key()?;
-        let pending = IdentityDoc::verify(&delivery.identity, &self.account())
+        let new_key = IdentityDoc::verify(&delivery.identity, &self.account())
             .ok()
             .filter(|doc| doc.inbox().url == self.origin())
             .map(|doc| doc.inbox().service_key)
@@ -241,15 +239,15 @@ impl SwitchClient {
                 delivery.to_json(),
                 Body::Json,
                 Auth {
-                    success_key: pending,
+                    success_key: new_key,
                     ..Auth::default()
                 },
             )
             .await?;
-        let key = pending.unwrap_or(pinned);
+        let key = new_key.unwrap_or(pinned);
         let answer =
             self.write_answer_under(&checked, Expect::Identity(&delivery.identity), &key)?;
-        if pending.is_some() {
+        if new_key.is_some() {
             self.pin(key);
         }
         Ok(answer)
@@ -296,8 +294,13 @@ impl SwitchClient {
         let checked = self.get(&query.path(), query.timeout()).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
-        let page = FeedPage::read(Obj::of(&value, what)?, &self.account())?;
         let key = self.key()?;
+        let page = FeedPage::read(
+            Obj::of(&value, what)?,
+            &self.account(),
+            checked.server_time_ms,
+            key,
+        )?;
         verify_head(&page.head, &key, &self.account())?;
         if let Some(checkpoint) = &page.checkpoint {
             verify_head(checkpoint, &key, &self.account())?;
@@ -828,21 +831,28 @@ impl SwitchClient {
         PublicIdentity::read(Obj::of(&value, what)?, &self.account())
     }
 
-    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming the pinned service key and,
-    /// when given, `identity_hash`, the document hash of the `identity.json` the erasure
-    /// follows: a switch holding another answers `409 conflict` and erases nothing.
+    /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming `created`, the account's
+    /// creation time its enrollment answer gave, or none for a signer that holds none, and
+    /// `identity_hash`, the document hash of the newest `identity.json` the account holds, or
+    /// none for an account that holds none: a switch that created the account at another time
+    /// or holds another document answers `409 conflict`, carrying `current.created`, and
+    /// erases nothing.
     ///
-    /// A signer whose `200` was lost gets, on a retry, the operator-signed `404` of an
-    /// account the service doesn't host, as
-    /// [`ClientError::BadServiceSignature`] with status 404; it takes that as the erasure
-    /// done (Switch wire 7.4.16).
+    /// A signer whose `200` was lost gets, on a retry, the `404` of an identity the service
+    /// doesn't host, signed with the key it pinned and bound to the retry
+    /// ([`ClientError::is_not_hosted`]); it takes that as the erasure done (Switch wire
+    /// 7.4.16).
     ///
     /// # Errors
     ///
     /// As every call.
-    pub async fn erase(&self, identity_hash: Option<[u8; 32]>) -> Result<(), ClientError> {
+    pub async fn erase(
+        &self,
+        created: Option<u64>,
+        identity_hash: Option<[u8; 32]>,
+    ) -> Result<(), ClientError> {
         self.signer_only()?;
-        let body = erase_body(&self.key()?, identity_hash.as_ref());
+        let body = erase_body(created, identity_hash.as_ref());
         let checked = self
             .send_json("POST", "erase", body, TimeoutClass::Ordinary)
             .await?;

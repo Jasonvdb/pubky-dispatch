@@ -531,6 +531,8 @@ mod tests {
             .collect();
         let last = items.last().map_or(from, FeedItem::seq);
         FeedPage {
+            server_time_ms: START,
+            service_key: [1; 32],
             items,
             next: Position {
                 generation: 1,

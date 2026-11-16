@@ -138,7 +138,17 @@ impl App {
                 for item in &page.items {
                     if let FeedItem::Entry(entry) = item
                         && entry.seq > cursor.seq
-                        && let Some(peeked) = self.peek_entry(entry, trusted).await?
+                        && let Some(peeked) = self
+                            .peek_entry(
+                                entry,
+                                trusted,
+                                super::protocol::EntryReceipt {
+                                    entry_id: entry.entry_id,
+                                    service_key: page.service_key,
+                                    read_at_ms: page.server_time_ms,
+                                },
+                            )
+                            .await?
                     {
                         report.items.push(peeked);
                     }
@@ -159,6 +169,7 @@ impl App {
         &self,
         entry: &EntryItem,
         trusted: bool,
+        receipt: super::protocol::EntryReceipt,
     ) -> Result<Option<Peeked>, AppError> {
         let generic = Ok(Some(Peeked::Generic { seq: entry.seq }));
         if !trusted {
@@ -212,6 +223,7 @@ impl App {
             return Ok(None);
         }
         let message = ReceivedMessage {
+            receipt,
             seq: entry.seq,
             generation: self.state.cursor.generation,
             sender: entry.sender,

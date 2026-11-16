@@ -514,16 +514,13 @@ impl Service {
         txn.use_invite(code, sender, &context, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
-        let identity = txn.head().identity_key;
         let transition = ServiceTransition::ConversationAdd {
             pubky: *sender,
             code_hash: *code,
             context: invite.context.clone(),
             at: time_ms,
         };
-        let signed = transition
-            .sign(signer, &identity)
-            .map_err(|_| temporary())?;
+        let signed = self.sign_transition(txn, signer, &transition)?;
         let item_bytes = signed.doc_bytes().map_err(|_| temporary())?;
         let item = item_hash(ItemType::Service, &item_bytes);
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;

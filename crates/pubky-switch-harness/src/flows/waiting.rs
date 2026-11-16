@@ -270,7 +270,8 @@ async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
 /// watch, her only app, has read its feed to the end and reads again with `wait`: nothing
 /// is pending, and the switch holds the read. The erasure, the account's first change since
 /// the read arrived, wakes it, and it is answered as for an account the switch doesn't
-/// host: the operator's `404`, never a page under the erased account's key.
+/// host: the not-hosted `404`, signed with the service key, never a page of the erased
+/// account.
 ///
 /// The flow notes that the read was held when the signer acted. How the read ended for
 /// the app isn't noted; the trace holds what the switch answered it.
@@ -419,14 +420,13 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
 
 /// A feed read held across a recovery in place (Switch wire 7.4.4, 3.3, Switch spec 12.6
 /// step 1). alice's watch reads its feed with a wait, and the switch holds the read. Her
-/// signer declares the service's generation lost there and recovers in place: the version
-/// that names the pending key starts the account afresh. That wakes the read. The account
-/// no longer names the key the read was held under, so the read is answered `503
-/// unavailable`, signed with the operator key and with no head. The watch can't take that
-/// answer as the account's. The new document's publication fails once, so the woken watch
-/// finds nothing to follow yet; once the signer's next run has published it, the watch
-/// learns the new key from alice's `identity.json` and follows the recovery: it registers
-/// again, reads the new sequence from its start, and uploads what it holds.
+/// signer declares the service's generation lost there and recovers in place: the next
+/// generation's version starts the account afresh. That wakes the read, which is answered
+/// from the account as it then is: the fresh account holds no record of the watch, so `403
+/// not_current`, with no head. The new document's publication fails once, so the woken
+/// watch finds nothing to follow yet; once the signer's next run has published it, the
+/// watch learns the new generation from alice's `identity.json` and follows the recovery:
+/// it registers again, reads the new sequence from its start, and uploads what it holds.
 ///
 /// Calls: `GET /v1/{id}/feed?wait=` held while the account recovers in place, and the
 /// feed read from the start of the next generation after it.
@@ -434,10 +434,9 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the switch answers the read
-/// without holding it or leaves it held, the read is answered otherwise than `503
-/// unavailable` under the operator key with no head, the watch takes that answer for more
-/// than a read that failed for its signature, or its next read isn't the new chain's
-/// first item.
+/// without holding it or leaves it held, the read is answered otherwise than `403
+/// not_current` under the one key with no head, the watch takes that answer for more than
+/// a refused read, or its next read isn't the new chain's first item.
 pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -506,8 +505,8 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
         )
         .into());
     }
-    // The held read is answered, not left held, and not under the account's key or a head:
-    // the account it was held for is the one the recovery replaced.
+    // The held read is answered, not left held, and without a head: the account it was
+    // held for is the one the recovery replaced, which holds no record of the watch.
     let held = {
         let trace = world.trace();
         let fact = |line: &crate::trace::Line, name: &str| line.facts.get(name).cloned();
@@ -523,13 +522,13 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
                 )
             })
     };
-    let unavailable = (
-        Some("503".to_owned()),
-        Some("text unavailable".to_owned()),
-        Some("the operator key".to_owned()),
+    let refused = (
+        Some("403".to_owned()),
+        Some("text not_current".to_owned()),
+        Some("service key number 1".to_owned()),
         Some("absent".to_owned()),
     );
-    if held.as_ref() != Some(&unavailable) || world.held_reads() != 0 {
+    if held.as_ref() != Some(&refused) || world.held_reads() != 0 {
         return Err(format!(
             "the held read was answered {held:?} (status, code, key, head), with {} reads \
              still held",
@@ -537,17 +536,14 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
         )
         .into());
     }
-    // The watch takes that answer for nothing of the account's: its read ends in an error,
-    // it raises no event, and it stands where it stood, in the generation it knew.
-    // The error is the answer's own: a `503` whose signature isn't the account's.
+    // The watch finds no newer document to follow yet: its read ends in the refusal, it
+    // raises no event, and it stands where it stood, in the generation it knew.
     let stands = watch.cursor().generation;
-    let unsigned_for_it = matches!(
+    let refused_it = matches!(
         report.as_ref().map_err(AppError::unkept),
-        Err(AppError::Switch(ClientError::BadServiceSignature {
-            status: 503
-        }))
+        Err(AppError::Switch(ClientError::Switch { status: 403, .. }))
     );
-    if !unsigned_for_it || !raised.is_empty() || stands != 1 {
+    if !refused_it || !raised.is_empty() || stands != 1 {
         return Err(format!(
             "the watch's read ended {} with the events {:?}, and it stands in generation \
              {stands}",

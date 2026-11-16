@@ -31,10 +31,6 @@ use crate::check::Checker;
 use crate::service::{RealSwitch, database_configured};
 use crate::trace::{Fault, Names, Recorder, Trace};
 
-/// The seed of the operator key every switch of a world signs with where it can't tie an
-/// answer to an account (Switch wire 7.1): the scripted switch's fixed one.
-const OPERATOR_SECRET: [u8; 32] = [42; 32];
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -59,9 +55,8 @@ pub struct World {
     checker: Arc<Checker>,
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
-    scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
-    /// How many switches each identity was given an account's key at, by Pubky ID.
-    homes: Mutex<std::collections::HashMap<String, u8>>,
+    /// The scripted switches, each with the origin it answers at.
+    scripted: Mutex<Vec<(String, Arc<ScriptedSwitch>)>>,
     /// The Homeserver writes and deletions to fail, each once.
     homeserver_faults: Arc<Mutex<Vec<HomeserverFault>>>,
 }
@@ -99,7 +94,6 @@ impl World {
         let names = Arc::new(Names::default());
         let router = Arc::new(Router::new());
         let checker = Arc::new(Checker::default());
-        checker.operator(IdentityKey::from_secret(OPERATOR_SECRET).public());
         let recorder = Arc::new(Recorder::new(
             router.clone() as Arc<dyn Transport>,
             names.clone(),
@@ -116,7 +110,6 @@ impl World {
             names,
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
-            homes: Mutex::new(std::collections::HashMap::new()),
             homeserver_faults: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -183,33 +176,29 @@ impl World {
         identities: &[&TestIdentity],
         limits: Limits,
     ) -> Result<(), HarnessError> {
-        // Each account's answers are verified with the service key its seed gives it here
-        // (an Ed25519 key, as an identity key is); a key an account takes later, as at a
-        // recovery in place, the checker learns from the enrollment that answers it.
-        let secrets: Vec<[u8; 32]> = identities
-            .iter()
-            .map(|identity| self.service_secret_at_next_switch(identity))
-            .collect();
-        for (identity, secret) in identities.iter().zip(&secrets) {
-            self.checker.account(
-                &identity.key().id(),
-                identity.public(),
-                IdentityKey::from_secret(*secret).public(),
-            );
+        // One service key for every account the switch hosts and every answer it can't tie
+        // to an account (Switch wire 7.1), its seed the origin's (an Ed25519 key, as an
+        // identity key is); a key an account takes later the checker learns from the
+        // enrollment that answers it.
+        let secret = self.seeds.seed(&format!("service/{origin}"));
+        let public = IdentityKey::from_secret(secret).public();
+        self.checker.switch_key(public);
+        for identity in identities {
+            self.checker
+                .account(&identity.key().id(), identity.public(), public);
         }
         match self.backend {
             Backend::Service => {
-                let switch =
-                    RealSwitch::start(origin, self.clock.clone(), secrets, OPERATOR_SECRET, limits)
-                        .await?
-                        .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
+                let switch = RealSwitch::start(origin, self.clock.clone(), secret, limits)
+                    .await?
+                    .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
                 self.router.add(origin, switch.transport());
                 lock(&self.services).push(switch);
             }
             Backend::Scripted => {
                 // A scripted switch holds one account: one per identity, behind one origin.
                 let mut accounts = Vec::with_capacity(identities.len());
-                for (identity, secret) in identities.iter().zip(secrets) {
+                for identity in identities {
                     let switch = ScriptedSwitch::unenrolled_at(
                         identity.key(),
                         secret,
@@ -235,24 +224,12 @@ impl World {
                     }));
                     switch.set_uploads_per_app_per_hour(limits.uploads_per_app_per_hour);
                     accounts.push((identity.key().id(), switch.holding_transport()));
-                    lock(&self.scripted).push(switch);
+                    lock(&self.scripted).push((origin.to_owned(), switch));
                 }
                 self.router.add(origin, Arc::new(Accounts { accounts }));
             }
         }
         Ok(())
-    }
-
-    /// The service key secret `identity`'s account takes at the next switch it is given
-    /// one at: its seed's at the first, and one derived from it at each later one, so an
-    /// identity that recovers at another service gets another key there.
-    fn service_secret_at_next_switch(&self, identity: &TestIdentity) -> [u8; 32] {
-        let mut homes = lock(&self.homes);
-        let nth = homes.entry(identity.key().id()).or_insert(0);
-        let mut secret = identity.service_secret();
-        secret[0] ^= *nth;
-        *nth = nth.saturating_add(1);
-        secret
     }
 
     /// The switch at `origin` is lost: every request to it fails to connect from now on, as
@@ -272,6 +249,211 @@ impl World {
             .collect();
         for store in stores {
             store.close().await;
+        }
+    }
+
+    /// The service at `origin`, out of the world's list while a change is made to it, and
+    /// put back after `change`, whatever it returned.
+    async fn change_service(
+        &self,
+        origin: &str,
+        change: impl AsyncFnOnce(&mut RealSwitch) -> Result<(), HarnessError>,
+    ) -> Result<(), HarnessError> {
+        let mut switch = {
+            let mut services = lock(&self.services);
+            let at = services
+                .iter()
+                .position(|switch| switch.origin() == origin)
+                .ok_or_else(|| HarnessError::Setup(format!("no service at {origin}")))?;
+            services.remove(at)
+        };
+        let changed = change(&mut switch).await;
+        lock(&self.services).push(switch);
+        changed
+    }
+
+    /// The scripted switch at `origin` that holds `identity`'s account.
+    fn scripted_switch(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<Arc<ScriptedSwitch>, HarnessError> {
+        lock(&self.scripted)
+            .iter()
+            .find(|(at, switch)| at == origin && switch.identity() == identity.public())
+            .map(|(_, switch)| switch.clone())
+            .ok_or_else(|| {
+                HarnessError::Setup(format!("no scripted account of the identity at {origin}"))
+            })
+    }
+
+    /// A restore of `identity`'s account at `origin` to a state one write behind its mark
+    /// (Switch wire 7.3, Table 3, "A restore of the state"): Table 1 judges the account
+    /// failing, `behind`. The scripted switch takes its state back one `seq`; the service,
+    /// stopped, finds its mark moved one `seq` past its state, and starts again.
+    ///
+    /// # Errors
+    ///
+    /// When the account has no mark that records a head, or the service can't be started
+    /// again.
+    pub async fn restore_behind_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.restore_behind_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                let switch = self.scripted_switch(origin, identity)?;
+                let (_, seq, _) = switch
+                    .mark()
+                    .filter(|(_, seq, _)| *seq > 0)
+                    .ok_or_else(|| HarnessError::Setup("no mark that records a head".into()))?;
+                switch.restore_to(seq - 1);
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s mark at `origin` records another chain hash at the state's pair (Switch
+    /// wire 7.3, Table 1): the account fails stop, `fork`. The service is stopped for it
+    /// and started again.
+    ///
+    /// # Errors
+    ///
+    /// When the account has no mark, or the service can't be started again.
+    pub async fn fork_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.fork_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.fork_mark();
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s mark at `origin` is lost from a mark store that reads (Switch wire 7.3,
+    /// Table 1): the account fails stop, `mark_lost`. The service is stopped for it and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When the mark can't be deleted, or the service can't be started again.
+    pub async fn lose_mark(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.lose_mark(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.lose_mark();
+                Ok(())
+            }
+        }
+    }
+
+    /// `identity`'s account at `origin` is lost, its mark staying, as after a restore to
+    /// before the enrollment or a lost database (Switch wire 7.3, Table 1, row "None"):
+    /// every call gets the notice, `behind` at the mark's generation, but the enrollment,
+    /// which takes the mark over, and the erasure. The service is stopped for it and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such account, or the service can't be started again.
+    pub async fn lose_account(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.lose_account(&id).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.lose_account();
+                Ok(())
+            }
+        }
+    }
+
+    /// The operator of `origin` retires `generation` for `identity` (Switch spec 6.5): the
+    /// notice says `permanent: true` from then on. The service is stopped for the
+    /// operator's step, which refuses unless the account fails stop or is lost, and
+    /// started again.
+    ///
+    /// # Errors
+    ///
+    /// When the service's step refuses or fails, or the service can't be started again.
+    pub async fn retire(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        generation: u64,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.retire(&id, generation).await)
+                    .await
+            }
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?.retire(generation);
+                Ok(())
+            }
+        }
+    }
+
+    /// Retain one authenticated erasure at a controlled outcome boundary in either backend.
+    ///
+    /// # Errors
+    ///
+    /// When the identity or service is not present in this world.
+    pub async fn fail_next_erasure(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        outcome: pubky_switch_client::testing::ErasureOutcome,
+    ) -> Result<(), HarnessError> {
+        use pubky_switch::service::ErasureOutcome as Real;
+        use pubky_switch_client::testing::ErasureOutcome as Scripted;
+        match self.backend {
+            Backend::Scripted => {
+                self.scripted_switch(origin, identity)?
+                    .fail_next_erasure(outcome);
+                Ok(())
+            }
+            Backend::Service => {
+                self.change_service(origin, async |switch| {
+                    switch.fail_next_erasure(match outcome {
+                        Scripted::Unresolved => Real::Unresolved,
+                        Scripted::UnresolvedAbsent => Real::UnresolvedAbsent,
+                        Scripted::Committed => Real::Committed,
+                        Scripted::Rejected => Real::Rejected,
+                    });
+                    Ok(())
+                })
+                .await
+            }
         }
     }
 
@@ -298,7 +480,7 @@ impl World {
             switch.sample_time();
         }
         // A read the scripted switch holds looks at the clock when told to.
-        for switch in lock(&self.scripted).iter() {
+        for (_, switch) in lock(&self.scripted).iter() {
             switch.release_held_reads();
         }
     }
@@ -532,7 +714,7 @@ impl World {
             .sum();
         let scripted: usize = lock(&self.scripted)
             .iter()
-            .map(|switch| switch.held_reads())
+            .map(|(_, switch)| switch.held_reads())
             .sum();
         service.saturating_add(scripted)
     }

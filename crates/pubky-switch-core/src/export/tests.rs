@@ -288,6 +288,7 @@ fn fixture_signed_by(write_signer: &AppKeys, attempt_signer: &AppKeys) -> Fixtur
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
                 deleted: false,
+                revision: record_revision(&stubs[3]),
             },
         ),
     )
@@ -2420,11 +2421,12 @@ fn test_activation_entry_proof_of_its_operations_generation() {
         &key2,
         &f.id,
         ProofBody::new(
-            stub,
+            stub.clone(),
             b64(&key),
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
                 deleted: false,
+                revision: record_revision(&stub),
             },
         ),
     )
@@ -3482,6 +3484,7 @@ fn test_activation_evidence() {
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
                 deleted: true,
+                revision: record_revision(&f.stubs[3]),
             },
         ),
     )
@@ -3497,6 +3500,7 @@ fn test_activation_evidence() {
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
                 deleted: false,
+                revision: record_revision(&f.stubs[3]),
             },
         ),
     )
@@ -3549,4 +3553,89 @@ fn test_activation_peers_and_floors() {
     let mut parts = f.parts.clone();
     parts.push(Part::Peer(PeerPart { doc: forged }));
     refused(f.run_with(&sorted(parts)), ErrorCode::BadSignature, "");
+}
+
+fn record_revision(stub: &crate::chain::Stub) -> crate::record_authority::ApplicationRef {
+    let env = stub.open().unwrap();
+    crate::record_authority::ApplicationRef {
+        generation: env.generation,
+        seq: env.seq,
+        item_hash: env.item_hash,
+    }
+}
+
+#[test]
+fn test_record_current_export_checks_the_applied_reference() {
+    let f = fixture();
+    f.run_with(&f.parts).unwrap();
+    let original = TransitionProof::peek(&f.record_proof).unwrap();
+    for case in 0..5 {
+        let mut body = original.body().clone();
+        match case {
+            0 => {
+                body.state.as_object_mut().unwrap().remove("revision");
+            }
+            1 => body.state["revision"]["generation"] = json!(9),
+            2 => body.state["revision"]["seq"] = json!(99),
+            3 => body.state["revision"]["item_hash"] = json!(b64(&[9; 32])),
+            _ => body.state["revision"]["extra"] = Value::Null,
+        }
+        let changed = TransitionProof::sign(&old_key(), &identity().public(), body).unwrap();
+        TransitionProof::verify(
+            changed.signed(),
+            &old_key().verifying_key().to_bytes(),
+            &identity().public(),
+        )
+        .unwrap();
+        let parts = f.with(|p| record_mut(p).proof = Some(changed.signed().clone()));
+        refused(
+            f.run_with(&parts),
+            ErrorCode::Conflict,
+            "its proof doesn't bind the current application",
+        );
+    }
+}
+
+#[test]
+fn test_record_current_export_checks_uploaded_proof_references() {
+    let mut f = fixture();
+    let original = TransitionProof::verify(
+        &f.record_proof,
+        &old_key().verifying_key().to_bytes(),
+        &f.id,
+    )
+    .unwrap();
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: original.clone(),
+    }];
+    f.run().unwrap();
+    for case in 0..5 {
+        let mut body = original.body().clone();
+        match case {
+            0 => {
+                body.state.as_object_mut().unwrap().remove("revision");
+            }
+            1 => body.state["revision"]["generation"] = json!(9),
+            2 => body.state["revision"]["seq"] = json!(99),
+            3 => body.state["revision"]["item_hash"] = json!(b64(&[9; 32])),
+            _ => body.state["revision"]["extra"] = Value::Null,
+        }
+        let changed = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+        let proof = TransitionProof::verify(
+            changed.signed(),
+            &old_key().verifying_key().to_bytes(),
+            &f.id,
+        )
+        .unwrap();
+        f.uploads.proofs = vec![UploadedProof {
+            app_id: app().app_id_bytes(),
+            proof,
+        }];
+        refused(
+            f.run(),
+            ErrorCode::Conflict,
+            "the record state isn't its application",
+        );
+    }
 }

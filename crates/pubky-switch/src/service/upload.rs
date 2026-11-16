@@ -9,8 +9,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use pubky_switch_core::chain::ServiceTransition;
+use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
 use pubky_switch_core::ops::{OpKind, SignedOp};
+use pubky_switch_core::record_authority::ApplicationRef;
 use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordMerge, UploadBody, UploadChanges,
@@ -21,7 +22,7 @@ use pubky_switch_core::shared::RecordState;
 use serde_json::json;
 
 use super::batch::{VerifiedApp, check_own_app};
-use super::recovery::{AdmissionEnd, chain_transition};
+use super::recovery::AdmissionEnd;
 use super::{Answer, Service, batch::refused, store_error};
 use crate::{
     http::error::ApiError,
@@ -93,16 +94,24 @@ impl Held {
 }
 
 /// The record an upload fills in or replaces, taken at the `upload` transition's `seq`.
-fn taken(record: &CheckedRecord, seq: u64) -> StoredRecord {
+fn taken(record: &CheckedRecord, generation: u64, seq: u64) -> Result<StoredRecord, ApiError> {
     let put = &record.put;
     let deleted = put.value_sealed.looks_like_delete();
-    StoredRecord {
+    Ok(StoredRecord {
         state: RecordState {
             key: put.key,
             collection: put.collection,
             policy: put.policy.clone(),
             version: record.uploaded.version.version,
             deleted,
+        },
+        revision: ApplicationRef {
+            generation,
+            seq,
+            item_hash: item_hash(
+                ItemType::Op,
+                &record.op.doc_bytes().map_err(|_| temporary())?,
+            ),
         },
         value_bytes: if deleted {
             0
@@ -117,7 +126,7 @@ fn taken(record: &CheckedRecord, seq: u64) -> StoredRecord {
             exact: record.uploaded.version.exact,
         },
         divergent: false,
-    }
+    })
 }
 
 /// A recovery upload's items judged before the account's lock, and what they were judged
@@ -381,7 +390,9 @@ impl Service {
             proofs: checked.proofs,
             at: time_ms,
         };
-        let proof = chain_transition(txn, signer, &transition, seq, time_ms).await?;
+        let proof = self
+            .chain_transition(txn, signer, &transition, seq, time_ms)
+            .await?;
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let body = json!({
             "result": changes.to_value(),
@@ -426,7 +437,7 @@ impl Service {
             let state = at.record.as_ref().map(|r| &r.state);
             match merge_checked_record(&at.view(), state, record, max) {
                 RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
-                    let new = taken(record, seq);
+                    let new = taken(record, txn.head().generation, seq)?;
                     txn.put_record(&new).await.map_err(stored)?;
                     *at = Held::of(Some(new), std::mem::take(&mut at.divergent))?;
                     changes.record(key);

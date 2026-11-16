@@ -467,9 +467,11 @@ Attached origin evidence remains part of its indivisible record input.
 Verify each statement against the exact identity-signed `lost_identity` named
 by its `identity_hash`, for this account and the barrier's original lost
 generation. Its service signature, snapshot, canonical slot hash and declared
-parent key must agree. For a standalone part `key == origin_key == parent key`.
-A statement read through a child key is not such a part; the client obtains the
-parent-key statement under the existing scope rules before submitting it alone.
+parent key must agree. The part's `origin_key` and statement's `origin_key` equal
+the slot's parent key. The statement's `key` is either that parent or the exact
+declared child of a known initialized slot. Thus a checked child-view statement
+can preserve its parent's restrictions after the child payload is forgotten,
+without obtaining parent read scope or inventing a parent-key statement.
 Different source-document hashes require separate requests. A newer document
 of the same generation cannot replace the exact signing context.
 

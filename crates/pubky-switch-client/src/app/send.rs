@@ -243,6 +243,9 @@ pub struct DeliveryView<'a> {
     local: super::LocalView<'a>,
     cert: &'a AppCert,
     naming: &'a NamingKey,
+    store: &'a dyn crate::store::StateStore,
+    ns: &'a str,
+    clock: &'a dyn crate::clock::Clock,
 }
 
 impl std::fmt::Debug for DeliveryView<'_> {
@@ -286,6 +289,29 @@ impl<'a> DeliveryView<'a> {
     /// gives it, without exposing the key.
     pub fn blind(&self, input: &[u8]) -> [u8; 32] {
         self.naming.blind(input)
+    }
+
+    /// The current host wall time in Unix milliseconds, sampled on each call.
+    ///
+    /// This is the app's [`crate::clock::Clock`], not a verified service time.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The current status of a known batch ID in this app, as [`App::kept_batch`] gives it.
+    ///
+    /// This reads app-wide metadata, without exposing the batch or another protocol's
+    /// local state. An absent or expired status is not evidence that nothing was sent.
+    /// No request, settlement or pruning is performed.
+    ///
+    /// # Errors
+    ///
+    /// A store failure, or a kept batch that doesn't read, as for [`App::kept_batch`].
+    pub fn kept_batch(
+        &self,
+        batch_id: [u8; 16],
+    ) -> Result<Option<super::KeptBatchStatus>, AppError> {
+        super::kept::read_kept_batch(self.store, self.ns, self.clock, batch_id)
     }
 }
 
@@ -2926,6 +2952,9 @@ impl App {
             local,
             cert: &self.state.cert,
             naming: &self.state.naming,
+            store: self.env.store.store().as_ref(),
+            ns: &self.ns,
+            clock: self.env.clock.as_ref(),
         };
         owner.protocol.may_send(&delivery).unwrap_or(false)
     }

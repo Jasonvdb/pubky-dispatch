@@ -440,6 +440,7 @@ impl Signer {
     ///
     /// [`SignerError::InvalidData`] when the stored newest document no longer verifies.
     pub fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>> {
+        self.check_owned_state()?;
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
             return Ok(None);
         };

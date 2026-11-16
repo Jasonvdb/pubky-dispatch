@@ -558,6 +558,37 @@ impl StateStore for CustodyFault {
         }
         self.inner.commit(batch)
     }
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, StoreError> {
+        let custody = batch.writes().iter().any(|write| {
+            matches!(write,
+            crate::store::Write::Put { key, value, .. } if key.starts_with(b"duty/")
+                && crate::app::state::decode::<crate::app::events::Duty>(value).is_ok_and(|duty|
+                    matches!(duty, crate::app::events::Duty::StoredEntryDropped { .. })))
+        });
+        if custody && self.armed.load(Ordering::SeqCst) && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            if self.after {
+                return match self.inner.commit_if(ns, owner, batch)? {
+                    crate::store::CommitOutcome::Applied => Err(StoreError::Unknown),
+                    result => Ok(result),
+                };
+            }
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 #[tokio::test]

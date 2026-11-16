@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{StateStore, StoreError, WriteBatch};
+use super::{AcquireOutcome, CommitOutcome, StateStore, StoreError, StoreOwner, WriteBatch};
 
 /// What a [`FaultStore`] does at its `n`th commit, counting from 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +165,33 @@ impl StateStore for FaultStore {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
+        self.committing(batch, |batch| {
+            self.inner.commit(batch).map(|()| CommitOutcome::Applied)
+        })
+        .map(drop)
+    }
+
+    fn acquire(&self, ns: &str, owner: StoreOwner) -> Result<AcquireOutcome, StoreError> {
+        self.check_running()?;
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: StoreOwner,
+        batch: WriteBatch,
+    ) -> Result<CommitOutcome, StoreError> {
+        self.committing(batch, |batch| self.inner.commit_if(ns, owner, batch))
+    }
+}
+
+impl FaultStore {
+    fn committing(
+        &self,
+        batch: WriteBatch,
+        apply: impl FnOnce(WriteBatch) -> Result<CommitOutcome, StoreError>,
+    ) -> Result<CommitOutcome, StoreError> {
         self.check_running()?;
         if let Ok(mut failing) = self.failing_put.lock()
             && let Some(prefix) = failing.as_ref()
@@ -200,17 +227,19 @@ impl StateStore for FaultStore {
                 self.stopped.store(true, Ordering::SeqCst);
                 Err(StoreError::Unavailable)
             }
-            Fault::FailAfter(at) if at == n => {
-                self.inner.commit(batch)?;
-                Err(StoreError::Unknown)
-            }
+            Fault::FailAfter(at) if at == n => match apply(batch)? {
+                CommitOutcome::Applied => Err(StoreError::Unknown),
+                CommitOutcome::NotOwner => Ok(CommitOutcome::NotOwner),
+            },
             Fault::StopAfter(at) if at == n => {
-                let applied = self.inner.commit(batch);
+                let applied = apply(batch);
                 self.stopped.store(true, Ordering::SeqCst);
-                applied?;
-                Err(StoreError::Unavailable)
+                match applied? {
+                    CommitOutcome::Applied => Err(StoreError::Unavailable),
+                    CommitOutcome::NotOwner => Ok(CommitOutcome::NotOwner),
+                }
             }
-            _ => self.inner.commit(batch),
+            _ => apply(batch),
         }
     }
 }
@@ -279,6 +308,25 @@ mod tests {
             held(store.inner().as_ref()),
             vec![b"1".to_vec(), b"2".to_vec()]
         );
+    }
+
+    #[test]
+    fn test_fault_store_preserves_conditional_non_application() {
+        let store = FaultStore::new(Arc::new(MemoryStore::new()), Fault::FailAfter(1));
+        let owner = StoreOwner::new().unwrap();
+        assert_eq!(
+            store.commit_if("ns", owner, put("bad")),
+            Ok(CommitOutcome::NotOwner)
+        );
+        assert!(held(&store).is_empty());
+        let AcquireOutcome::Acquired(_lease) = store.acquire("ns", owner).unwrap() else {
+            panic!("not acquired");
+        };
+        assert_eq!(
+            store.commit_if("ns", owner, put("good")),
+            Ok(CommitOutcome::Applied)
+        );
+        assert_eq!(held(&store), vec![b"good".to_vec()]);
     }
 
     #[test]

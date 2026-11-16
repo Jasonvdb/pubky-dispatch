@@ -328,7 +328,13 @@ async fn old_signer_answering(erasure: Option<Response>) -> OldSigner {
         homeserver: homeserver.clone(),
         protocols: Protocols::new(vec![Arc::new(VectorScopes::new())]).unwrap(),
     };
-    state::save(&env.store, &state, None).await.unwrap();
+    let mut owned = env
+        .store
+        .acquire(&state::signer_namespace(&state.identity))
+        .await
+        .unwrap();
+    state::save(&mut owned, &state, None).await.unwrap();
+    drop(owned);
     let vault = Arc::new(Vault(Mutex::new(Some(key.secret_bytes()))));
     let mut signer = Signer::open(env, IdentityKeyring::open(vault).unwrap())
         .await

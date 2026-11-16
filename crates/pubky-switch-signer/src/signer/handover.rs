@@ -56,7 +56,7 @@ use super::revocation::UserConfirmed;
 use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::state::{self, DeliverStep, Flow, HandOverSent, HandingOver, TakeBack};
+use crate::state::{DeliverStep, Flow, HandOverSent, HandingOver, TakeBack};
 
 /// What an abort of a hand-over came to (Switch wire 3.12).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,7 +202,7 @@ impl Signer {
             let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
             let (body, prev) = abort_body(&handed)?;
             let doc = {
-                let key = gate::hand_over_key(&self.keyring, &self.state)?;
+                let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
                 IdentityDoc::sign(&key, body)?
             };
             let mut state = self.state.clone();
@@ -266,7 +266,7 @@ impl Signer {
             handover: handing.handover.clone(),
         };
         let answer = {
-            let key = gate::hand_over_key(&self.keyring, &self.state)?;
+            let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
             self.signing_client(&key)?.put_handover(&stored).await
         };
         let sent = match &answer {
@@ -435,7 +435,7 @@ impl Signer {
                         })?;
                     body.signer = self.state.install;
                     let doc = {
-                        let key = gate::hand_over_key(&self.keyring, &self.state)?;
+                        let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;
                         IdentityDoc::sign(&key, body)?
                     };
                     TakeBack {
@@ -497,7 +497,7 @@ impl Signer {
     /// records. Both deletions are idempotent.
     pub(super) async fn delete_handed_over(&mut self, install: [u8; 16]) -> Result<()> {
         self.keyring.destroy()?;
-        state::delete(&self.env.store, &self.state.identity).await?;
+        self.delete_records().await?;
         self.flow = None;
         Err(SignerError::HandedOver { install })
     }

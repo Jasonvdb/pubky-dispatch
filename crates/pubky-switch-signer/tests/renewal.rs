@@ -1081,6 +1081,7 @@ async fn test_renewal_a_reductions_closing_survives_a_crash_at_every_commit() {
             let id = app.keys.app_id_bytes();
             world.clock.advance_ms(DAY_MS);
             let faulty: Arc<dyn StateStore> = Arc::new(FaultStore::new(memory.clone(), fault));
+            drop(signer);
             let mut signer = Signer::open(world.env(faulty), world.keyring())
                 .await
                 .unwrap();
@@ -1091,6 +1092,7 @@ async fn test_renewal_a_reductions_closing_survives_a_crash_at_every_commit() {
                 .identity_doc()
                 .is_some_and(|d| !renewals(&d, &id).is_empty());
             world.clock.advance_ms(DAY_MS);
+            drop(signer);
             let mut restarted = Signer::open(world.env(memory), world.keyring())
                 .await
                 .unwrap();
@@ -2282,10 +2284,12 @@ async fn test_run_due_step_reads_the_switch_again_after_delivering_an_owed_closi
         world.clock.advance_ms(DAY_MS);
         let faulty: Arc<dyn StateStore> =
             Arc::new(FaultStore::new(memory.clone(), Fault::StopAfter(n)));
+        drop(signer);
         let mut signer = Signer::open(world.env(faulty), world.keyring())
             .await
             .unwrap();
         let _ = signer.renew(id, reduce(&["notes"])).await;
+        drop(signer);
         let mut restarted = Signer::open(world.env(memory), world.keyring())
             .await
             .unwrap();

@@ -207,9 +207,11 @@ rules. No certificate history is invented or compacted by a statement.
 
 A reader verifies the statement with the key of the newest own `identity.json`
 it has revalidated, for that document's generation, identity and document hash.
-It binds an online statement to the authenticated response's head and request;
-a cached statement does not establish that its record is still current. It
-checks both hashes, the complete required node set and order, every operation's
+It binds an online statement to the authenticated response's head, request and
+required `account_created` context under wire 7.4.9. The statement's creation
+must equal that independently authenticated response member; copying it from
+the statement itself is not this check. A cached statement or response context
+does not establish that its record is still current. It checks both hashes, the complete required node set and order, every operation's
 item hash, signature and policy, and every certificate under wire 6.2. A
 statement dates a node only when `applied_at` is non-null and the statement is
 accepted under the cooperative continuity rules of Section 6. Missing

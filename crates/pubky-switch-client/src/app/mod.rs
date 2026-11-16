@@ -608,6 +608,8 @@ pub struct App {
     reload: bool,
     /// The service time record changed and goes with the next commit.
     service_time_dirty: bool,
+    /// The held alarm still needs a confirmed durable commit.
+    alarm_dirty: bool,
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     /// The listed certificates the own directory answered a read for, to judge a record
@@ -914,6 +916,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1062,6 +1065,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1855,6 +1859,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                alarm_dirty: false,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -2806,9 +2811,21 @@ impl App {
     /// Commit; after a failure the app reads its state again before going on.
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
-        match tx.commit(&self.env.store).await {
+        let result = async {
+            // An alarm may be raised after this transaction was built. Carry its exact
+            // evidence in every commit until one confirms it durable (Switch spec 10.1).
+            if self.alarm_dirty
+                && let Some(alarm) = &self.state.alarm
+            {
+                tx.put(key::ALARM, alarm)?;
+            }
+            tx.commit(&self.env.store).await
+        }
+        .await;
+        match result {
             Ok(()) => {
                 self.service_time_dirty = false;
+                self.alarm_dirty = false;
                 self.queue_duties(duties);
                 Ok(())
             }
@@ -2837,9 +2854,9 @@ impl App {
         // Each call takes a service time of its own before it judges a kept batch's age.
         self.time_fresh_at = None;
         if self.reload {
-            // A refusal's time may still be dirty after a failed commit. Keep it before
-            // replacing memory with the stored state; a second failure stops this call.
-            self.keep_service_time().await?;
+            // Keep verified time and a pending alarm before replacing memory with the
+            // stored state. A failed retry leaves both held and stops this call.
+            self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
                 &self.env,
@@ -2860,14 +2877,11 @@ impl App {
     pub(crate) async fn raise(&mut self, alarm: Alarm) -> AppError {
         if self.state.alarm.is_none() {
             self.state.alarm = Some(alarm.clone());
+            self.alarm_dirty = true;
             self.events.push(AppEvent::Alarm(alarm.clone()));
-            let tx = self.tx().and_then(|mut tx| {
-                tx.put(key::ALARM, &alarm)?;
-                Ok(tx)
-            });
-            if let Ok(tx) = tx {
-                // A failed commit leaves the alarm in memory; the app is stopped either way
-                // and raises it again on reload from the same evidence.
+            if let Ok(tx) = self.tx() {
+                // Keep the pending evidence after any failure, including an unknown
+                // outcome; a later commit retries it before any reload can discard it.
                 let _ = self.commit(tx).await;
             }
         }
@@ -2887,7 +2901,7 @@ impl App {
             self.clear_erasing().await?;
         }
         if result.is_err() {
-            self.keep_service_time().await?;
+            self.keep_observations().await?;
         }
         match result {
             Ok(value) => Ok(value),
@@ -2900,9 +2914,9 @@ impl App {
         }
     }
 
-    /// Keep comparison evidence even when a refusal has no other state to commit.
-    async fn keep_service_time(&mut self) -> Result<(), AppError> {
-        if self.service_time_dirty {
+    /// Keep comparison and alarm evidence even when no other state needs a commit.
+    async fn keep_observations(&mut self) -> Result<(), AppError> {
+        if self.service_time_dirty || self.alarm_dirty {
             let tx = self.tx()?;
             self.commit(tx).await?;
         }

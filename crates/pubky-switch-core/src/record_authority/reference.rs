@@ -28,7 +28,7 @@ impl ApplicationRef {
         Self::read(&parse_json(bytes)?)
     }
 
-    pub(super) fn read(value: &Value) -> Result<Self> {
+    pub(crate) fn read(value: &Value) -> Result<Self> {
         members(value, &["generation", "seq", "item_hash"])?;
         let reference = Self {
             generation: integer(member(value, "generation")?)?,
@@ -39,7 +39,7 @@ impl ApplicationRef {
         Ok(reference)
     }
 
-    pub(super) fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         positive(self.generation)?;
         positive(self.seq)?;
         Ok(())

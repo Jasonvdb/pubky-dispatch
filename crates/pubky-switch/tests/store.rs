@@ -564,23 +564,107 @@ fn shared_record(
     version: u64,
 ) -> pubky_switch::store::StoredRecord {
     use pubky_switch_core::{
-        ident::Policy, ops::RecordVersion, shared::RecordState, sig::SignedDoc,
+        chain::{ChainTip, ItemType, ProofBody, TransitionProof, ZERO_HASH},
+        enc::b64,
+        ident::Policy,
+        keys::{AppKeys, IdentityKey},
+        ops::{
+            BatchRef, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, StateAfter, proof_state,
+        },
+        record_authority::ApplicationRef,
+        records::{AppCert, AppCertBody},
+        sealed::SealedValue,
+        shared::RecordState,
     };
-    let doc = SignedDoc::from_parts(b"{}", &[0; 64]);
+    let identity = IdentityKey::from_secret([1; 32]);
+    let app = AppKeys::from_secrets([2; 32], [3; 32]);
+    let policy = Policy::new(read_scope, &["tasks"]);
+    let put = RecordPut {
+        key,
+        collection,
+        policy: policy.clone(),
+        expected_version: RecordVersion::NONE,
+        value_sealed: SealedValue::seal_with_nonce(
+            &identity.scope_key(1, read_scope),
+            &identity.public(),
+            1,
+            read_scope,
+            &key,
+            if deleted { b"" } else { b"{}" },
+            &[4; 24],
+        )
+        .expect("sealed record"),
+        id_inputs: None,
+    };
+    let op = SignedOp::sign(
+        &app,
+        OpBody {
+            identity: identity.public(),
+            app_id: Some(app.app_id_bytes()),
+            generation: 1,
+            batch: BatchRef {
+                id: [5; 16],
+                count: 1,
+            },
+            conditions: Vec::new(),
+            kind: OpKind::RecordPut(put),
+        },
+    )
+    .expect("signed record");
+    let revision = ApplicationRef {
+        generation: 1,
+        seq: version,
+        item_hash: op.item_hash().expect("item hash"),
+    };
+    let (stub, _) = ChainTip {
+        generation: 1,
+        seq: version - 1,
+        chain_hash: ZERO_HASH,
+    }
+    .append(
+        version,
+        T0,
+        ItemType::Op,
+        revision.item_hash,
+        Some(op.body().batch),
+    )
+    .expect("record stub");
+    let state = proof_state(&op, &StateAfter::Record(RecordVersion::new(1, version)))
+        .expect("record state");
+    let proof = TransitionProof::sign(
+        &ed25519_dalek::SigningKey::from_bytes(&[6; 32]),
+        &identity.public(),
+        ProofBody::new(stub, b64(&key), &state),
+    )
+    .expect("record proof");
+    let cert = AppCert::issue(
+        &identity,
+        AppCertBody::new(
+            identity.public(),
+            app.signing_public(),
+            app.bundle_public(),
+            vec![read_scope.into()],
+            &[],
+            T0 - 1,
+            T0 + 1_000,
+        ),
+    )
+    .expect("certificate");
     pubky_switch::store::StoredRecord {
         state: RecordState {
             key,
             collection,
-            policy: Policy::new(read_scope, &["tasks"]),
+            policy,
             version: RecordVersion::new(1, version),
             deleted,
         },
+        revision,
         value_bytes: if deleted { 0 } else { 2 },
-        writer: [3; 16],
-        cert: doc.clone(),
-        op: doc.clone(),
+        writer: app.app_id_bytes(),
+        cert: cert.signed().clone(),
+        op: op.signed().clone(),
         origin: pubky_switch::store::RecordOrigin::Written {
-            proof: doc,
+            proof: proof.signed().clone(),
             upload_base: None,
         },
         divergent: false,
@@ -820,6 +904,8 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
     let mut record = shared_record(key, [1; 32], "tasks", false, version);
     record.origin = pubky_switch::store::RecordOrigin::Uploaded { seq, exact: false };
+    record.revision.generation = 2;
+    record.revision.seq = seq;
     record
 }
 
@@ -987,8 +1073,9 @@ async fn test_store_record_origin_checks_refuse_mixed_rows() {
     let insert = |columns: &str, values: &str| {
         format!(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, deleted, value_bytes, writer, cert, op{columns}) VALUES \
-             ($1, $2, $2, 'tasks', '{{tasks}}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
+             generation, version, application_generation, application_seq, application_item_hash, \
+             deleted, value_bytes, writer, cert, op{columns}) VALUES \
+             ($1, $2, $2, 'tasks', '{{tasks}}', 1, 1, 1, 1, $2, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
         )
     };
     let cases = [
@@ -1084,8 +1171,9 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
     for i in 1u8..=3 {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'tasks', '{tasks}', 1, $4, true, 0, $5, '\\x', '\\x', '\\x')",
+             generation, version, application_generation, application_seq, application_item_hash, \
+             deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', 1, $4, 1, $4, $2, true, 0, $5, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([i; 32].as_slice())
@@ -1199,11 +1287,12 @@ async fn test_store_forget_compares_whole_positions() {
     let mut conn = PgConnection::connect_with(fx.db.options())
         .await
         .expect("conn");
-    for (key, generation, version) in [(1u8, 0i64, 100i64), (2, 1, 11)] {
+    for (key, generation, version) in [(1u8, 1i64, 100i64), (2, 2, 11)] {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'tasks', '{tasks}', $4, $5, true, 0, $6, '\\x', '\\x', '\\x')",
+             generation, version, application_generation, application_seq, application_item_hash, \
+             deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', $4, $5, $4, $5, $2, true, 0, $6, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([key; 32].as_slice())
@@ -1222,7 +1311,7 @@ async fn test_store_forget_compares_whole_positions() {
         .expect("begin")
         .expect("account");
     let through = pubky_switch_core::ops::Position {
-        generation: 1,
+        generation: 2,
         seq: 10,
     };
     assert_eq!(

@@ -3427,3 +3427,72 @@ async fn test_upload_reopened_tombstone_shows_its_earlier_entries_as_stubs() {
     }
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_record_current_uploaded_reference_survives_restart_and_refused_generation() {
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let upload_body =
+        json!({"lost_identity": lost.signed(), "records": [uploaded_op(8, Some(UPDATED))]});
+    let answer = upload(&replay, &upload_body, at).await;
+    assert_eq!(answer.status, 200, "{}", json_of(&answer));
+    let (key, _) = record_and_claim_keys();
+    let path = format!("/v1/{}/records/{key}?revision=1", alice_id());
+    let before = wallet_get(&replay, &format!("records/{key}?revision=1"), at).await;
+    let op =
+        SignedOp::peek(&serde_json::from_value(before["op"].clone()).expect("op")).expect("op");
+    assert_eq!(
+        before["revision"],
+        json!({"generation": 2, "seq": json_of(&answer)["head"]["seq"], "item_hash": pubky_switch_core::enc::b64(&op.item_hash().expect("item"))})
+    );
+    assert_eq!(
+        (before["generation"].clone(), before["version"].clone()),
+        (json!(1), json!(8))
+    );
+    let restarted = replay.restarted_with(pubky_switch::limits::Limits::default());
+    let read = restarted
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(read.status, 200, "{}", json_of(&read));
+    assert_eq!(json_of(&read), before);
+    // The record's application stays put when a generation change is refused.
+    let held = held(&replay).await;
+    let mut next = held.body().clone();
+    next.version += 1;
+    next.generation += 1;
+    next.inbox.service_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+        .verifying_key()
+        .to_bytes();
+    next.service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry {
+            generation: held.generation(),
+            key: held.inbox().service_key,
+        });
+    let next = IdentityDoc::sign(&alice_key(), next).expect("signed generation");
+    let request = signer_request(
+        "PUT",
+        &format!("/v1/{}/identity", alice_id()),
+        IdentityDelivery {
+            identity: next.signed().clone(),
+            prev: Some(held.hash()),
+        }
+        .to_json(),
+        at,
+    );
+    let sent = signed_sent(&request);
+    let refused = restarted.handle(request).await;
+    assert_eq!(
+        code(&refused),
+        (400, "bad_request".into()),
+        "{}",
+        json_of(&refused)
+    );
+    assert!(signed_by(&refused, &held.inbox().service_key, &sent));
+    assert_eq!(held.hash(), self::held(&replay).await.hash());
+    let read = restarted
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(read.status, 200);
+    assert_eq!(json_of(&read), before);
+    replay.db.drop_database().await.expect("drop");
+}

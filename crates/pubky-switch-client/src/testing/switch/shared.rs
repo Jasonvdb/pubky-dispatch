@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::chain::{ProofState, TransitionProof};
+use pubky_switch_core::chain::{ItemType, ProofState, TransitionProof, item_hash};
 use pubky_switch_core::claims::{
     Claim, ClaimFields, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
 };
@@ -12,16 +12,17 @@ use pubky_switch_core::enc::{b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::ops::{
-    AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, RecordPut, RecordVersion, Refusal,
-    SignedOp, check_invite_code_put,
+    AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion,
+    Refusal, SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
+use pubky_switch_core::record_authority::ApplicationRef;
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::recovery::{
     CheckedUpload, HeldRecord as MergeHeld, RecordMerge, UploadBase, UploadChanges, UploadLists,
     UploadVersion, merge_checked_record, merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_core::shared::{RecordState, check_record_put};
+use pubky_switch_core::shared::{CurrentRecord, RecordState, check_record_put};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
@@ -39,6 +40,8 @@ const MAX_DIVERGENT_UPLOADS: usize = 8;
 pub struct HeldRecord {
     /// The record's state after its newest write.
     pub state: RecordState,
+    /// The actual receiving application (Switch record lineage 1).
+    pub revision: ApplicationRef,
     /// The newest write's signed `record.put`.
     pub op: SignedDoc,
     /// The write's transition proof; `None` for a record taken from a recovery upload
@@ -168,6 +171,25 @@ pub(super) struct Before<'a> {
 }
 
 impl ConditionState for Before<'_> {
+    fn record_current(&self, key: &[u8; 32]) -> Option<CurrentRecord> {
+        self.shared.records.get(key).map(|held| CurrentRecord {
+            lineage_id: None,
+            revision: held.revision,
+            deleted: held.state.deleted,
+        })
+    }
+
+    fn record_view(&self, key: &[u8; 32]) -> Option<Value> {
+        self.shared.records.get(key).map(|held| {
+            record_view(
+                held,
+                self.cx.apps,
+                true,
+                self.shared.divergent.contains_key(key),
+            )
+        })
+    }
+
     fn record_version(&self, key: &[u8; 32]) -> RecordVersion {
         self.shared
             .records
@@ -234,6 +256,11 @@ fn record_view(
         "write_scopes": held.state.policy.write_scopes,
         "generation": held.state.version.generation,
         "version": held.state.version.version,
+        "revision": {
+            "generation": held.revision.generation,
+            "seq": held.revision.seq,
+            "item_hash": b64(&held.revision.item_hash),
+        },
         "seq": held.seq,
         "deleted": held.state.deleted,
         "writer": zbase32_encode(&held.writer),
@@ -254,11 +281,16 @@ impl Shared {
     /// `record.put` (Switch wire 6.2, Switch spec 10.3), by [`check_record_put`].
     pub(super) fn record_put(
         &self,
-        put: &RecordPut,
+        op: &SignedOp,
         cx: &OpContext<'_>,
         generation: u64,
         seq: u64,
     ) -> Result<ProofState, Refusal> {
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(Refusal::bad_request(
+                "Switch wire 6.2: a record write is required",
+            ));
+        };
         let held = self.records.get(&put.key);
         let divergent = self.divergent.contains_key(&put.key);
         let view = held.map(|h| record_view(h, cx.apps, true, divergent));
@@ -269,10 +301,8 @@ impl Shared {
             cx.may_read(&put.policy.read_scope),
             view.as_ref(),
         )?;
-        Ok(ProofState::Record {
-            version: RecordVersion::new(generation, seq),
-            deleted: put.value_sealed.looks_like_delete(),
-        })
+        proof_state(op, &StateAfter::Record(RecordVersion::new(generation, seq)))
+            .map_err(Refusal::from)
     }
 
     /// The generations the kept proofs name (Switch wire 3.3 "Service keys"): each held
@@ -311,7 +341,11 @@ impl Shared {
 
     /// Keep a written record with its proof. A write here clears the record's divergent
     /// uploads, and builds on the upload it replaces (Switch wire 7.4.14 "Writes at N win").
-    pub(super) fn record_written(&mut self, put: &RecordPut, written: Written<'_>) {
+    pub(super) fn record_written(
+        &mut self,
+        put: &RecordPut,
+        written: Written<'_>,
+    ) -> pubky_switch_core::Result<()> {
         let upload_base = self
             .records
             .get(&put.key)
@@ -327,6 +361,11 @@ impl Shared {
             put.key,
             HeldRecord {
                 state: RecordState::after(put, written.generation, written.seq),
+                revision: ApplicationRef {
+                    generation: written.generation,
+                    seq: written.seq,
+                    item_hash: written.op.item_hash()?,
+                },
                 op: written.op.signed().clone(),
                 proof: Some(written.proof.clone()),
                 writer: written.writer,
@@ -336,6 +375,7 @@ impl Shared {
                 upload_base,
             },
         );
+        Ok(())
     }
 
     /// Merge what counted in a recovery upload after a provider loss, as the service does
@@ -347,11 +387,25 @@ impl Shared {
         checked: &CheckedUpload,
         lists: Option<&UploadLists>,
         (max_contacts, max_deny): (u64, u64),
-        seq: u64,
+        position: Position,
         now: u64,
         changes: &mut UploadChanges,
-    ) {
-        for record in &checked.records {
+    ) -> pubky_switch_core::Result<()> {
+        let seq = position.seq;
+        let revisions = checked
+            .records
+            .iter()
+            .map(|record| {
+                let revision = ApplicationRef {
+                    generation: position.generation,
+                    seq,
+                    item_hash: item_hash(ItemType::Op, &record.op.doc_bytes()?),
+                };
+                revision.to_bytes()?;
+                Ok(revision)
+            })
+            .collect::<pubky_switch_core::Result<Vec<_>>>()?;
+        for (record, revision) in checked.records.iter().zip(revisions) {
             let key = record.put.key;
             let kept = self.divergent.get(&key).cloned().unwrap_or_default();
             let held = self.records.get(&key);
@@ -391,6 +445,7 @@ impl Shared {
                         key,
                         HeldRecord {
                             state,
+                            revision,
                             op: record.op.clone(),
                             proof: None,
                             writer: record.writer,
@@ -452,6 +507,7 @@ impl Shared {
                 }
             }
         }
+        Ok(())
     }
 
     /// A claim entry (Switch wire 6.8), by [`apply_entry`] with the default limits.

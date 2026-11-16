@@ -16,6 +16,7 @@ use pubky_switch_core::{
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
+    record_authority::ApplicationRef,
     records::{AppCert, AppRecord, ReceiveKeyRecord},
     scopes::Permission,
     shared::{RecordState, check_record_put},
@@ -76,7 +77,7 @@ pub fn apply(state: &mut OpsState, batch: &Batch<'_>) -> Result<Vec<Applied>, Re
         check_permission(&op.body().kind, writer)?;
         check_shape(op.body())?;
         let (after, only_for) = apply_op(state, batch, op, seq)?;
-        let proof = proof_state(&op.body().kind, &after).map_err(Refusal::from)?;
+        let proof = proof_state(op, &after).map_err(Refusal::from)?;
         applied.push(Applied {
             state: proof,
             only_for,
@@ -224,6 +225,11 @@ fn apply_op(
                 put.key,
                 HeldRecord {
                     state: record,
+                    revision: ApplicationRef {
+                        generation: state.generation,
+                        seq,
+                        item_hash: op.item_hash().map_err(Refusal::from)?,
+                    },
                     value_bytes: new_bytes,
                     writer: cert.app_id(),
                     cert: cert.signed().clone(),

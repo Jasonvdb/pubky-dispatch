@@ -445,3 +445,27 @@ async fn test_store_ownership_dropped_constructor_retains_running_commit() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_store_ownership_canceled_write_remains_pending_until_completion() {
+    let (release, released) = mpsc::channel();
+    let store = Arc::new(DelayedStore {
+        inner: MemoryStore::new(),
+        armed: AtomicBool::new(true),
+        after: false,
+        unknown: false,
+        fail_reads: AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        released: Mutex::new(released),
+    });
+    let handle = StoreHandle::blocking(store.clone());
+    let mut owner = handle.acquire("ns").await.unwrap();
+    let mut saving = Box::pin(owner.commit(batch("ns", b"committed")));
+    tokio::select! { () = store.entered.notified() => {}, result = &mut saving => panic!("write did not wait: {result:?}") }
+    drop(saving);
+    let mut draining = Box::pin(owner.drain());
+    poll_pending(draining.as_mut());
+    release.send(()).unwrap();
+    draining.await.unwrap();
+    assert_eq!(owner.get(b"a").await.unwrap(), Some(b"committed".to_vec()));
+}

@@ -1049,29 +1049,40 @@ pub(crate) mod tests {
     async fn test_signing_and_request_credentials_retain_store_ownership() {
         use pubky_switch_client::store::{MemoryStore, StoreHandle};
         let handle = StoreHandle::inline(Arc::new(MemoryStore::new()));
-        let owned = handle.acquire("signer-test").await.unwrap();
-        let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
-        let state = crate::state::SignerState::new(keyring.public_key(), [1; 16]);
-        let key = crate::signer::gate::signing_key(&keyring, &state, &owned).unwrap();
-        let signing = key.signer();
-        let requests = keyring.request_signer(owned.ownership().unwrap()).unwrap();
-        drop(owned);
-        assert!(matches!(
-            handle.acquire("signer-test").await,
-            Err(pubky_switch_client::StoreError::InUse)
-        ));
-        drop(key);
-        assert!(matches!(
-            handle.acquire("signer-test").await,
-            Err(pubky_switch_client::StoreError::InUse)
-        ));
-        drop(requests);
-        assert!(matches!(
-            handle.acquire("signer-test").await,
-            Err(pubky_switch_client::StoreError::InUse)
-        ));
-        drop(signing);
-        handle.acquire("signer-test").await.unwrap();
+        for drop_requests_first in [false, true] {
+            let owned = handle.acquire("signer-test").await.unwrap();
+            let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+            let state = crate::state::SignerState::new(keyring.public_key(), [1; 16]);
+            let key = crate::signer::gate::signing_key(&keyring, &state, &owned).unwrap();
+            drop(owned);
+            assert!(matches!(
+                handle.acquire("signer-test").await,
+                Err(pubky_switch_client::StoreError::InUse)
+            ));
+            let signing = key.signer();
+            let requests = keyring.request_signer(key._passed.ownership()).unwrap();
+            drop(key);
+            assert!(matches!(
+                handle.acquire("signer-test").await,
+                Err(pubky_switch_client::StoreError::InUse)
+            ));
+            if drop_requests_first {
+                drop(requests);
+                assert!(matches!(
+                    handle.acquire("signer-test").await,
+                    Err(pubky_switch_client::StoreError::InUse)
+                ));
+                drop(signing);
+            } else {
+                drop(signing);
+                assert!(matches!(
+                    handle.acquire("signer-test").await,
+                    Err(pubky_switch_client::StoreError::InUse)
+                ));
+                drop(requests);
+            }
+            handle.acquire("signer-test").await.unwrap();
+        }
     }
 
     #[test]

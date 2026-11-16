@@ -1001,6 +1001,9 @@ fn check_record_proof(
     {
         return Err(fail("its proof isn't the proof of its current write"));
     }
+    proof
+        .check_binds(op)
+        .map_err(|_| fail("its proof doesn't bind the current application"))?;
     let key = if env.generation == m.generation {
         Some(cx.enrolled.inbox().service_key)
     } else {
@@ -1657,6 +1660,10 @@ fn check_evidence(
             state.get("generation").and_then(Value::as_u64),
             state.get("version").and_then(Value::as_u64),
         ) {
+            uploaded
+                .proof
+                .record_revision()
+                .map_err(|e| conflict(format!("Switch wire 10.3: {e}")))?;
             let shown = RecordVersion::new(generation, version);
             let held = unb64_array::<32>(&body.object)
                 .ok()

@@ -319,6 +319,13 @@ struct State<'a> {
 }
 
 impl ConditionState for State<'_> {
+    fn record_current(&self, _: &[u8; 32]) -> Option<pubky_switch_core::shared::CurrentRecord> {
+        None
+    }
+    fn record_view(&self, _: &[u8; 32]) -> Option<Value> {
+        None
+    }
+
     fn record_version(&self, _: &[u8; 32]) -> RecordVersion {
         RecordVersion::NONE
     }

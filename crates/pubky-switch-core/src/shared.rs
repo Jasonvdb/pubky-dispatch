@@ -15,7 +15,20 @@ use crate::error::{Error, Result};
 use crate::http::ErrorCode;
 use crate::ident::Policy;
 use crate::ops::{RecordPut, RecordVersion, Refusal, SignedOp};
+use crate::record_authority::ApplicationRef;
 use crate::records::IdentityDoc;
+
+/// Exact current facts for a record condition (Switch record lineage 1).
+/// This comparison state establishes neither an absence origin nor reader authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CurrentRecord {
+    /// The tracked lineage, or `None` for a current-only record.
+    pub lineage_id: Option<[u8; 32]>,
+    /// The application at the service, distinct from an uploaded source version.
+    pub revision: ApplicationRef,
+    /// Whether the current application deletes the record.
+    pub deleted: bool,
+}
 
 /// A record as the service holds it (Switch spec 10.3): its key, collection and policy, fixed
 /// at creation, and its current version.
@@ -161,6 +174,9 @@ pub fn date_write(
         if !of_its_generation(env) {
             return bad("the proof's stub isn't of the operation's generation");
         }
+        checked
+            .check_binds(op)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
         if checked.body().object != b64(&put.key) {
             return bad("the proof's object isn't the record key");
         }
@@ -198,6 +214,9 @@ pub fn date_write(
     if !of_its_generation(checked.envelope()) {
         return bad("the proof's stub isn't of the operation's generation");
     }
+    checked
+        .check_binds(op)
+        .map_err(|e| Error::Invalid(e.to_string()))?;
     Ok(Dated {
         time: checked.envelope().server_time,
         version: None,
@@ -401,6 +420,11 @@ mod tests {
         let state = ProofState::Record {
             version: RecordVersion::new(generation, seq),
             deleted: false,
+            revision: ApplicationRef {
+                generation,
+                seq,
+                item_hash: op.item_hash().unwrap(),
+            },
         };
         let proof = TransitionProof::sign(
             service,
@@ -472,6 +496,95 @@ mod tests {
         assert!(
             error.to_string().contains("operation's generation"),
             "{error}"
+        );
+    }
+
+    fn changed_record_proofs(
+        proof: &crate::sig::SignedDoc,
+        service: &ed25519_dalek::SigningKey,
+    ) -> Vec<crate::sig::SignedDoc> {
+        let proof = TransitionProof::peek(proof).unwrap();
+        (0..7)
+            .map(|case| {
+                let mut body = proof.body().clone();
+                match case {
+                    0 => {
+                        body.state.as_object_mut().unwrap().remove("revision");
+                    }
+                    1 => body.state["revision"]["generation"] = serde_json::json!(9),
+                    2 => body.state["revision"]["seq"] = serde_json::json!(9),
+                    3 => body.state["revision"]["item_hash"] = serde_json::json!(b64(&[9; 32])),
+                    4 => body.state["revision"]["extra"] = Value::Null,
+                    5 => body.state["revision"]["seq"] = serde_json::json!(0),
+                    _ => body.state["deleted"] = Value::Bool(true),
+                }
+                TransitionProof::sign(service, &IdentityKey::from_secret([1; 32]).public(), body)
+                    .unwrap()
+                    .signed()
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_record_current_binding_checks_the_applied_reference() {
+        let service = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        let (op, proof) = written(2, 6, &service);
+        let key = service.verifying_key().to_bytes();
+        let id = IdentityKey::from_secret([1; 32]).public();
+        crate::chain::bind_answer(
+            std::slice::from_ref(&op),
+            std::slice::from_ref(&proof),
+            &key,
+            &id,
+        )
+        .unwrap();
+        for changed in changed_record_proofs(&proof, &service) {
+            // Each changed body has a genuine service signature; binding is the refusal.
+            TransitionProof::verify(&changed, &key, &id).unwrap();
+            assert!(matches!(
+                crate::chain::bind_answer(std::slice::from_ref(&op), &[changed], &key, &id),
+                Err(crate::chain::ChainError::Proof(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_record_current_dating_checks_the_applied_reference() {
+        let service = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        let key = service.verifying_key().to_bytes();
+        let doc = identity_doc(2, key, &[]);
+        let (op, proof) = written(2, 6, &service);
+        assert_eq!(
+            date_write(&proof, &op, &doc).unwrap().version,
+            Some(RecordVersion::new(2, 6))
+        );
+        for changed in changed_record_proofs(&proof, &service) {
+            assert!(date_write(&changed, &op, &doc).is_err());
+        }
+        let old_doc = identity_doc(3, [8; 32], &[(2, key)]);
+        assert_eq!(date_write(&proof, &op, &old_doc).unwrap().version, None);
+        for changed in changed_record_proofs(&proof, &service) {
+            assert!(date_write(&changed, &op, &old_doc).is_err());
+        }
+    }
+
+    #[test]
+    fn test_record_current_proof_producer_checks_application_position() {
+        use crate::ops::{StateAfter, proof_state};
+        let service = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        let (op, _) = written(2, 6, &service);
+        for version in [
+            RecordVersion::new(1, 6),
+            RecordVersion::new(2, 0),
+            RecordVersion::new(2, crate::json::MAX_INT + 1),
+        ] {
+            assert!(proof_state(&op, &StateAfter::Record(version)).is_err());
+        }
+        let state = proof_state(&op, &StateAfter::Record(RecordVersion::new(2, 6))).unwrap();
+        assert_eq!(
+            state.to_value()["revision"]["item_hash"],
+            b64(&op.item_hash().unwrap())
         );
     }
 

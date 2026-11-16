@@ -186,7 +186,7 @@ fn received_member(received: &Received) -> Value {
 /// `case` with the members its response signature decides, written again: the received
 /// request, the signed fields and bytes, the signature and `Switch-Service-Signature`,
 /// signed with the fixed secret of its `public_key` over what it holds (Switch wire 7.1).
-fn signed_case(keys: &Keys, file: &Value, case: Value) -> Value {
+pub(super) fn signed_case(keys: &Keys, file: &Value, case: Value) -> Value {
     let received = answered(keys, file, &case);
     signed_for(keys, case, &received)
 }

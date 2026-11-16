@@ -7,9 +7,11 @@
 //! sealed: nothing here opens or interprets them (Switch spec 1).
 
 use pubky_switch_core::{
+    chain::{ItemType, TransitionProof, item_hash},
     claims::{Claim, ClaimTally},
     ident::Policy,
-    ops::{BatchRecord, Position},
+    ops::{BatchRecord, OpKind, Position, SignedOp},
+    record_authority::ApplicationRef,
     recovery::UploadBase,
     shared::RecordState,
     sig::SignedDoc,
@@ -65,6 +67,8 @@ pub struct StoredBundlePart {
 pub struct StoredRecord {
     /// Its key, collection, policy, version and whether it is deleted.
     pub state: RecordState,
+    /// The exact receiving application, not the source version (Switch record lineage 1).
+    pub revision: ApplicationRef,
     /// The bytes its value counts against the storage quota.
     pub value_bytes: u64,
     /// The writing app.
@@ -80,6 +84,48 @@ pub struct StoredRecord {
     /// uploads the account keeps for its key. [`AccountTxn::put_record`] ignores it: a write
     /// made here clears them, and [`AccountTxn::add_divergent_upload`] adds one.
     pub divergent: bool,
+}
+
+impl StoredRecord {
+    fn check_revision(&self) -> Result<(), StoreError> {
+        let corrupt = || StoreError::Corrupt("a record's application contradicts its write");
+        self.revision.to_bytes().map_err(|_| corrupt())?;
+        let bytes = self.op.doc_bytes().map_err(|_| corrupt())?;
+        if self.revision.item_hash != item_hash(ItemType::Op, &bytes) {
+            return Err(corrupt());
+        }
+        let op = SignedOp::peek(&self.op).map_err(|_| corrupt())?;
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(corrupt());
+        };
+        if put.key != self.state.key
+            || put.collection != self.state.collection
+            || put.policy != self.state.policy
+            || put.value_sealed.looks_like_delete() != self.state.deleted
+            || op.body().generation != self.state.version.generation
+        {
+            return Err(corrupt());
+        }
+        let matches = match &self.origin {
+            RecordOrigin::Written { proof, .. } => {
+                self.revision.generation == self.state.version.generation
+                    && self.revision.seq == self.state.version.version
+                    && TransitionProof::peek(proof).ok().and_then(|p| {
+                        p.check_binds(&op)
+                            .ok()
+                            .and_then(|()| p.record_revision().ok())
+                    }) == Some(self.revision)
+            }
+            RecordOrigin::Uploaded { seq, .. } => {
+                self.revision.seq == *seq
+                    && self.revision.generation > self.state.version.generation
+            }
+        };
+        if !matches {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
 }
 
 /// Where a shared record's current write came from (Switch wire 7.4.14, 10.3).
@@ -446,6 +492,7 @@ impl AccountTxn {
     /// Store a shared record's newest write. A write made here clears the record's divergent
     /// uploads: it is a newer version at this service (Switch spec 12.6 step 3).
     pub async fn put_record(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
+        record.check_revision()?;
         let id = self.head().id.clone();
         let state = &record.state;
         // The write it replaces shows as its stub from now on (Switch wire 7.5).
@@ -481,14 +528,15 @@ impl AccountTxn {
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
-             upload_base_op_hash) \
+             upload_base_op_hash, application_generation, application_seq, application_item_hash) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19) \
+             $17, $18, $19, $20, $21, $22) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
              upload_base_generation = $17, upload_base_version = $18, \
-             upload_base_op_hash = $19",
+             upload_base_op_hash = $19, application_generation = $20, application_seq = $21, \
+             application_item_hash = $22",
         )
         .bind(id)
         .bind(state.key.as_slice())
@@ -509,6 +557,9 @@ impl AccountTxn {
         .bind(base_generation)
         .bind(base_version)
         .bind(base_hash)
+        .bind(to_db(record.revision.generation, "application_generation")?)
+        .bind(to_db(record.revision.seq, "application_seq")?)
+        .bind(record.revision.item_hash.as_slice())
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -1104,6 +1155,7 @@ impl AccountTxn {
 pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
      version_exact, upload_base_generation, upload_base_version, upload_base_op_hash, \
+     application_generation, application_seq, application_item_hash, \
      EXISTS (SELECT 1 FROM \
      divergent_uploads d WHERE d.account_id = shared_records.account_id \
      AND d.key = shared_records.key) AS divergent";
@@ -1145,7 +1197,7 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
             upload_base,
         }
     };
-    Ok(StoredRecord {
+    let record = StoredRecord {
         state: RecordState {
             key: array(&key, "record key")?,
             collection: array(&collection, "collection")?,
@@ -1160,12 +1212,25 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
             deleted: row.try_get("deleted")?,
         },
         value_bytes: from_db(row.try_get("value_bytes")?, "value_bytes")?,
+        revision: ApplicationRef {
+            generation: from_db(
+                row.try_get("application_generation")?,
+                "application_generation",
+            )?,
+            seq: from_db(row.try_get("application_seq")?, "application_seq")?,
+            item_hash: array(
+                &row.try_get::<Vec<u8>, _>("application_item_hash")?,
+                "application_item_hash",
+            )?,
+        },
         writer: array(&writer, "writer")?,
         cert: decode_doc(&cert, "record cert")?,
         op: decode_doc(&op, "record op")?,
         origin,
         divergent: row.try_get("divergent")?,
-    })
+    };
+    record.check_revision()?;
+    Ok(record)
 }
 
 /// The first `steps` entries of a claim, by step (Switch wire 7.4.8).

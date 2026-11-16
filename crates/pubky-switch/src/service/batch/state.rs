@@ -16,10 +16,11 @@ use pubky_switch_core::{
         AllowKind, Condition, ConditionState, Held, KeyBundlePut, OpKind, Position, RecordVersion,
         SignedOp,
     },
+    record_authority::ApplicationRef,
     records::{AppCert, AppRecord, IdentityDoc, ReceiveKeyRecord, Standing},
     recovery::UploadBase,
     scopes::Permission,
-    shared::RecordState,
+    shared::{CurrentRecord, RecordState},
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -50,6 +51,8 @@ pub struct HeldApp {
 pub struct HeldRecord {
     /// Its key, collection, policy, version and whether it is deleted.
     pub state: RecordState,
+    /// The exact receiving application (Switch record lineage 1).
+    pub revision: ApplicationRef,
     /// The bytes its value counts against the storage quota: its `ct`, 0 for a delete
     /// (Switch wire 9.1).
     pub value_bytes: u64,
@@ -115,6 +118,7 @@ impl From<crate::store::StoredRecord> for HeldRecord {
         use crate::store::RecordOrigin;
         Self {
             state: record.state,
+            revision: record.revision,
             value_bytes: record.value_bytes,
             writer: record.writer,
             cert: record.cert,
@@ -241,7 +245,7 @@ impl Needs {
             let body = op.body();
             for condition in &body.conditions {
                 match condition {
-                    Condition::RecordVersion { key, .. } => {
+                    Condition::RecordVersion { key, .. } | Condition::RecordCurrent { key, .. } => {
                         needs.records.insert(*key);
                     }
                     Condition::ClaimStep { claim_key, .. } => {
@@ -551,6 +555,11 @@ pub fn record_view(held: &HeldRecord) -> Value {
         "write_scopes": held.state.policy.write_scopes,
         "generation": held.state.version.generation,
         "version": held.state.version.version,
+        "revision": {
+            "generation": held.revision.generation,
+            "seq": held.revision.seq,
+            "item_hash": b64(&held.revision.item_hash),
+        },
         "seq": match held.origin {
             HeldOrigin::Uploaded { seq, .. } => seq,
             HeldOrigin::Written { .. } => held.state.version.version,
@@ -629,6 +638,18 @@ pub struct Before<'a> {
 }
 
 impl ConditionState for Before<'_> {
+    fn record_current(&self, key: &[u8; 32]) -> Option<CurrentRecord> {
+        self.state.records.get(key).map(|held| CurrentRecord {
+            lineage_id: None,
+            revision: held.revision,
+            deleted: held.state.deleted,
+        })
+    }
+
+    fn record_view(&self, key: &[u8; 32]) -> Option<Value> {
+        self.state.record_view(key)
+    }
+
     fn record_version(&self, key: &[u8; 32]) -> RecordVersion {
         self.state
             .records

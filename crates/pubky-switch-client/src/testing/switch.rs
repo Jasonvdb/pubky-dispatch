@@ -2962,10 +2962,13 @@ impl Inner {
             &checked,
             upload.lists.as_ref(),
             caps,
-            seq,
+            pubky_switch_core::ops::Position {
+                generation: self.tip.generation,
+                seq,
+            },
             now,
             &mut changes,
-        );
+        )?;
         self.purge_released(&claims_before);
         if upload.ends_staged_admission(cert) {
             self.admission_staged = false;

@@ -1,0 +1,507 @@
+//! Exact current-record conditions through signed requests (Switch wire 6.1 and 6.5).
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::sync::Arc;
+
+use pubky_switch_client::app::{App, AppConfig};
+use pubky_switch_client::client::{CheckedResponse, Credentials, SwitchClient};
+use pubky_switch_client::error::ClientError;
+use pubky_switch_client::store::MemoryStore;
+use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_core::chain::{TransitionProof, bind_answer};
+use pubky_switch_core::enc::{b64, pubky_id};
+use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
+use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::ops::{
+    Condition, IdInputs, OpKind, OpsRequest, RecordPut, RecordVersion, SignedOp, sign_batch,
+};
+use pubky_switch_core::record_authority::ApplicationRef;
+use pubky_switch_core::sealed::SealedValue;
+use pubky_switch_core::sig::SignedDoc;
+use pubky_switch_harness::parties::{Asking, NOTES, notes_protocol};
+use pubky_switch_harness::{Backend, World};
+use pubky_switch_signer::{Signer, UserConfirmed};
+use serde_json::{Value, json};
+
+const ORIGIN: &str = "https://switch.example";
+const COLLECTION: &str = "example.items";
+
+struct Writer {
+    who: TestIdentity,
+    keys: AppKeys,
+    client: SwitchClient,
+    epoch: u64,
+    generation: u64,
+    service_key: [u8; 32],
+    signer: Signer,
+    app: App,
+}
+
+async fn writer(world: &World) -> Writer {
+    let who = world.identity("alice").unwrap();
+    world.add_switch(ORIGIN, &[&who]).await.unwrap();
+    let mut signer = Box::pin(Signer::create(
+        world
+            .signer_env(&who, Arc::new(MemoryStore::new()))
+            .unwrap(),
+        world.keyring(&who).unwrap(),
+        ORIGIN,
+    ))
+    .await
+    .unwrap();
+    Box::pin(signer.resume()).await.unwrap();
+    let asking = Asking::new(world.app_keys(&who, "wallet").unwrap()).unwrap();
+    let checked = signer
+        .review(asking.request.signed(), &asking.auth)
+        .unwrap();
+    let approved = Box::pin(signer.approve(checked)).await.unwrap();
+    signer.claim_delivered(&approved.request).await.unwrap();
+    let mut app = Box::pin(App::join(
+        world.app_env(Arc::new(MemoryStore::new())),
+        notes_protocol(),
+        AppConfig::default(),
+        asking.join_request(who.public(), &approved).unwrap(),
+    ))
+    .await
+    .unwrap();
+    Box::pin(app.receive(None)).await.unwrap();
+    let service_key = app.own_identity().inbox().service_key;
+    let client = SwitchClient::new(
+        ORIGIN,
+        who.public(),
+        Credentials::App {
+            identity: who.public(),
+            keys: asking.keys.clone(),
+            cert: app.cert().clone(),
+        },
+        Some(service_key),
+        world.transport(),
+        world.clock().clone(),
+    )
+    .unwrap();
+    Writer {
+        who,
+        keys: asking.keys,
+        client,
+        epoch: app.data_epoch(),
+        generation: app.own_identity().generation(),
+        service_key,
+        signer,
+        app,
+    }
+}
+
+impl Writer {
+    fn put(&self, natural: &[u8], expected: RecordVersion, value: &[u8]) -> RecordPut {
+        let identity = self.who.key();
+        let naming = NamingKey::from_root(&identity.switch_root());
+        let blinded_key = naming.blind(natural);
+        let policy = Policy::new(NOTES, &[NOTES]);
+        let key = record_key_from_blinded(COLLECTION, &blinded_key, &policy.hash().unwrap());
+        RecordPut {
+            key,
+            collection: collection_id(COLLECTION, &self.who.public()),
+            policy,
+            expected_version: expected,
+            value_sealed: SealedValue::seal(
+                &identity.scope_key(self.epoch, NOTES),
+                &self.who.public(),
+                self.epoch,
+                NOTES,
+                &key,
+                value,
+            )
+            .unwrap(),
+            id_inputs: (expected == RecordVersion::NONE).then(|| IdInputs {
+                collection: COLLECTION.into(),
+                blinded_key,
+            }),
+        }
+    }
+
+    fn batch(&self, id: u8, entries: Vec<(Vec<Condition>, OpKind)>) -> Vec<SignedOp> {
+        sign_batch(
+            &self.keys,
+            &self.who.public(),
+            Some(self.keys.app_id_bytes()),
+            self.generation,
+            [id; 16],
+            entries,
+        )
+        .unwrap()
+    }
+
+    async fn post(&self, ops: &[SignedOp]) -> Result<CheckedResponse, ClientError> {
+        let path = format!("/v1/{}/ops", pubky_id(&self.who.public()));
+        let request = self
+            .client
+            .sign_request("POST", &path, OpsRequest::new(ops, None).to_json(), None)
+            .unwrap();
+        self.client.send(request).await
+    }
+
+    async fn get(&self, key: &[u8; 32]) -> CheckedResponse {
+        let path = format!(
+            "/v1/{}/records/{}?revision=1",
+            pubky_id(&self.who.public()),
+            b64(key)
+        );
+        self.client
+            .send(
+                self.client
+                    .sign_request("GET", &path, Vec::new(), None)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn proofs(&self, ops: &[SignedOp], answer: &CheckedResponse) -> Vec<ApplicationRef> {
+        let proofs: Vec<SignedDoc> =
+            serde_json::from_value(body(answer)["proofs"].clone()).unwrap();
+        bind_answer(ops, &proofs, &self.service_key, &self.who.public())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.record_revision().unwrap())
+            .collect()
+    }
+
+    async fn write(&self, id: u8, natural: &[u8], expected: RecordVersion, value: &[u8]) -> Value {
+        let put = self.put(natural, expected, value);
+        let key = put.key;
+        let ops = self.batch(id, vec![(Vec::new(), OpKind::RecordPut(put))]);
+        let answer = self.post(&ops).await.unwrap();
+        let revision = self.proofs(&ops, &answer)[0];
+        assert_eq!(revision.item_hash, ops[0].item_hash().unwrap());
+        let view = body(&self.get(&key).await);
+        assert_eq!(current(&view), revision);
+        assert_eq!(view["deleted"], value.is_empty());
+        view
+    }
+}
+
+fn body(answer: &CheckedResponse) -> Value {
+    serde_json::from_slice(&answer.body).unwrap()
+}
+fn current(view: &Value) -> ApplicationRef {
+    ApplicationRef::parse(&serde_json::to_vec(&view["revision"]).unwrap()).unwrap()
+}
+fn version(view: &Value) -> RecordVersion {
+    RecordVersion::new(
+        view["generation"].as_u64().unwrap(),
+        view["version"].as_u64().unwrap(),
+    )
+}
+fn guard(key: [u8; 32], view: &Value) -> Condition {
+    Condition::RecordCurrent {
+        key,
+        lineage_id: None,
+        revision: current(view),
+        deleted: view["deleted"].as_bool().unwrap(),
+    }
+}
+fn conflict(result: Result<CheckedResponse, ClientError>) -> Value {
+    match result {
+        Err(ClientError::Switch {
+            status: 409,
+            current,
+            ..
+        }) => current,
+        other => panic!("expected authenticated conflict, got {other:?}"),
+    }
+}
+
+async fn delete_repair(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let first = w.write(1, b"repair", RecordVersion::NONE, b"{}").await;
+    let a = w.write(2, b"repair", version(&first), b"").await;
+    let b = w.write(3, b"repair", version(&a), b"").await;
+    let put = w.put(b"repair", version(&b), b"{\"repaired\":true}");
+    let key = put.key;
+    let before = w.get(&key).await;
+    let stale = w.batch(
+        4,
+        vec![(vec![guard(key, &a)], OpKind::RecordPut(put.clone()))],
+    );
+    assert_eq!(conflict(w.post(&stale).await), json!({"record_view": b}));
+    let refused = w.get(&key).await;
+    assert_eq!(body(&refused), body(&before));
+    assert_eq!(refused.head, before.head);
+    let fresh = w.batch(5, vec![(vec![guard(key, &b)], OpKind::RecordPut(put))]);
+    let applied = w.post(&fresh).await.unwrap();
+    let reference = w.proofs(&fresh, &applied)[0];
+    assert_eq!(reference.item_hash, fresh[0].item_hash().unwrap());
+    assert_eq!(current(&body(&w.get(&key).await)), reference);
+}
+
+async fn pre_batch_and_atomicity(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let before = w.write(1, b"atomic", RecordVersion::NONE, b"{}").await;
+    let put = w.put(b"atomic", version(&before), b"{\"n\":2}");
+    let key = put.key;
+    let ops = w.batch(
+        2,
+        vec![
+            (Vec::new(), OpKind::RecordPut(put)),
+            (
+                vec![guard(key, &before)],
+                OpKind::DenyPut { pubky: [30; 32] },
+            ),
+        ],
+    );
+    w.post(&ops).await.unwrap();
+    let applied = w.get(&key).await;
+    let view = body(&applied);
+    assert_eq!(current(&view).item_hash, ops[0].item_hash().unwrap());
+    let ops = w.batch(
+        3,
+        vec![
+            (
+                vec![guard(key, &view)],
+                OpKind::RecordPut(w.put(b"atomic", version(&view), b"{\"n\":3}")),
+            ),
+            (
+                Vec::new(),
+                OpKind::RecordPut(w.put(b"missing", RecordVersion::new(w.generation, 99), b"{}")),
+            ),
+        ],
+    );
+    conflict(w.post(&ops).await);
+    let refused = w.get(&key).await;
+    assert_eq!(body(&refused), view);
+    assert_eq!(refused.head, applied.head);
+}
+
+async fn retry_and_race(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let initial = w.write(1, b"retry", RecordVersion::NONE, b"{}").await;
+    let put = w.put(b"retry", version(&initial), b"{\"n\":2}");
+    let key = put.key;
+    let a = w.batch(
+        2,
+        vec![(vec![guard(key, &initial)], OpKind::RecordPut(put.clone()))],
+    );
+    let b = w.batch(
+        3,
+        vec![(vec![guard(key, &initial)], OpKind::RecordPut(put))],
+    );
+    let (left, right) = tokio::join!(w.post(&a), w.post(&b));
+    let (ops, original) = match (left, right) {
+        (Ok(answer), refusal) => {
+            conflict(refusal);
+            (a, answer)
+        }
+        (refusal, Ok(answer)) => {
+            conflict(refusal);
+            (b, answer)
+        }
+        other => panic!("one guarded application must win: {other:?}"),
+    };
+    let won = body(&w.get(&key).await);
+    assert_eq!(current(&won), w.proofs(&ops, &original)[0]);
+    let later = w.write(4, b"retry", version(&won), b"{\"n\":3}").await;
+    let before_retry = w.get(&key).await;
+    let retry = w.post(&ops).await.unwrap();
+    assert_eq!(body(&retry)["proofs"], body(&original)["proofs"]);
+    assert_eq!(retry.head, before_retry.head);
+    let after_retry = w.get(&key).await;
+    assert_eq!(body(&after_retry), later);
+    assert_eq!(after_retry.head, before_retry.head);
+    let mut fresh = ops[0].body().clone();
+    fresh.batch.id = [5; 16];
+    conflict(w.post(&[SignedOp::sign(&w.keys, fresh).unwrap()]).await);
+}
+
+async fn lost_answer(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let initial = w.write(1, b"lost answer", RecordVersion::NONE, b"{}").await;
+    let put = w.put(b"lost answer", version(&initial), b"{\"n\":2}");
+    let key = put.key;
+    let ops = w.batch(
+        2,
+        vec![(vec![guard(key, &initial)], OpKind::RecordPut(put))],
+    );
+    world.lose_answer("POST", "/ops");
+    assert!(matches!(w.post(&ops).await, Err(ClientError::Transport(_))));
+    assert_eq!(world.faults_left(), 0);
+    let committed = w.get(&key).await;
+    assert_eq!(
+        current(&body(&committed)).item_hash,
+        ops[0].item_hash().unwrap()
+    );
+    let retry = w.post(&ops).await.unwrap();
+    assert_eq!(w.proofs(&ops, &retry)[0], current(&body(&committed)));
+    assert_eq!(retry.head, committed.head);
+    assert_eq!(body(&w.get(&key).await), body(&committed));
+}
+
+async fn upload(world: &World) {
+    let mut w = Box::pin(writer(world)).await;
+    let mut source = w.write(1, b"upload", RecordVersion::NONE, b"{}").await;
+    for n in 2..=8 {
+        source = w.write(n, b"upload", version(&source), b"{}").await;
+    }
+    let op: SignedOp =
+        SignedOp::peek(&serde_json::from_value(source["op"].clone()).unwrap()).unwrap();
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("record put")
+    };
+    let key = put.key;
+    let lost = w.app.own_identity().signed().clone();
+    let uploaded = json!({"op": op.signed(), "cert": w.app.cert().signed()});
+    let old_version = version(&source);
+    assert_ne!(op.item_hash().unwrap(), op.signed().doc_hash().unwrap());
+    world.lose_switch(ORIGIN);
+    let origin = "https://recovery.example";
+    world.add_switch(origin, &[&w.who]).await.unwrap();
+    Box::pin(
+        w.signer
+            .declare_provider_loss(origin, UserConfirmed::shown_and_confirmed()),
+    )
+    .await
+    .unwrap();
+    Box::pin(w.signer.end_staged_admission()).await.unwrap();
+    Box::pin(w.app.refresh_identity()).await.unwrap();
+    Box::pin(w.app.follow_provider()).await.unwrap();
+    w.generation = w.app.own_identity().generation();
+    w.epoch = w.app.data_epoch();
+    w.service_key = w.app.own_identity().inbox().service_key;
+    w.client = SwitchClient::new(
+        origin,
+        w.who.public(),
+        Credentials::App {
+            identity: w.who.public(),
+            keys: w.keys.clone(),
+            cert: w.app.cert().clone(),
+        },
+        Some(w.service_key),
+        world.transport(),
+        world.clock().clone(),
+    )
+    .unwrap();
+    let path = format!("/v1/{}/recovery/upload", pubky_id(&w.who.public()));
+    let send = |record: Value| {
+        w.client
+            .sign_request(
+                "POST",
+                &path,
+                serde_json::to_vec(&json!({"lost_identity": lost, "records": [record]})).unwrap(),
+                None,
+            )
+            .unwrap()
+    };
+    // First the source alone supplies its lower bound; then the proof makes it exact.
+    let first = w.client.send(send(uploaded.clone())).await.unwrap();
+    let view = body(&w.get(&key).await);
+    let transition: SignedDoc = serde_json::from_value(body(&first)["proof"].clone()).unwrap();
+    let proof = TransitionProof::verify(&transition, &w.service_key, &w.who.public()).unwrap();
+    assert_eq!(
+        current(&view),
+        ApplicationRef {
+            generation: w.generation,
+            seq: proof.envelope().seq,
+            item_hash: op.item_hash().unwrap()
+        }
+    );
+    assert_eq!(version(&view), old_version);
+    assert_ne!(current(&view).generation, old_version.generation);
+    assert_ne!(current(&view).seq, old_version.version);
+    assert!(view.get("proof").is_none());
+    let mut exact = uploaded.clone();
+    exact["proof"] = source["proof"].clone();
+    let answer = w.client.send(send(exact.clone())).await.unwrap();
+    let made_exact = body(&w.get(&key).await);
+    assert_eq!(current(&made_exact).seq, answer.head.as_ref().unwrap().seq);
+    assert_ne!(current(&made_exact), current(&view));
+    assert_eq!(version(&made_exact), old_version);
+    // An unchanged upload still makes its own transition, but no record application.
+    let again = w.client.send(send(exact)).await.unwrap();
+    assert!(
+        body(&again)["result"]["records"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(body(&w.get(&key).await), made_exact);
+    let mut other = op.body().clone();
+    other.batch.id = [65; 16];
+    let other = SignedOp::sign(&w.keys, other).unwrap();
+    assert_ne!(other.item_hash().unwrap(), op.item_hash().unwrap());
+    let mut divergent = uploaded.clone();
+    divergent["op"] = json!(other.signed());
+    let answer = w.client.send(send(divergent)).await.unwrap();
+    assert_eq!(body(&answer)["result"]["divergent"], json!([b64(&key)]));
+    assert_eq!(current(&body(&w.get(&key).await)), current(&made_exact));
+    let mut invalid = uploaded;
+    invalid["op"]["sig"] = json!(b64(&[0; 64]));
+    let answer = w.client.send(send(invalid)).await.unwrap();
+    assert_eq!(body(&answer)["result"]["unverified"], 1);
+    assert_eq!(current(&body(&w.get(&key).await)), current(&made_exact));
+    let own = w.write(9, b"upload", old_version, b"{\"new\":true}").await;
+    assert_eq!(current(&own).generation, w.generation);
+    assert_eq!(current(&own).seq, version(&own).version);
+    assert_ne!(current(&own).item_hash, current(&made_exact).item_hash);
+}
+
+macro_rules! backend_test {
+    ($name:ident, $backend:expr, $flow:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            let Some(world) = World::start($backend).unwrap() else {
+                return;
+            };
+            // The flow runs on this test's native stack, with no larger harness thread.
+            Box::pin($flow(&world)).await;
+            world.close().await.unwrap();
+        }
+    };
+}
+
+backend_test!(
+    test_record_current_delete_repair_service,
+    Backend::Service,
+    delete_repair
+);
+backend_test!(
+    test_record_current_delete_repair_scripted,
+    Backend::Scripted,
+    delete_repair
+);
+backend_test!(
+    test_record_current_pre_batch_atomicity_service,
+    Backend::Service,
+    pre_batch_and_atomicity
+);
+backend_test!(
+    test_record_current_pre_batch_atomicity_scripted,
+    Backend::Scripted,
+    pre_batch_and_atomicity
+);
+backend_test!(
+    test_record_current_retry_race_service,
+    Backend::Service,
+    retry_and_race
+);
+backend_test!(
+    test_record_current_retry_race_scripted,
+    Backend::Scripted,
+    retry_and_race
+);
+
+backend_test!(
+    test_record_current_lost_answer_service,
+    Backend::Service,
+    lost_answer
+);
+backend_test!(
+    test_record_current_lost_answer_scripted,
+    Backend::Scripted,
+    lost_answer
+);
+backend_test!(test_record_current_upload_service, Backend::Service, upload);
+backend_test!(
+    test_record_current_upload_scripted,
+    Backend::Scripted,
+    upload
+);

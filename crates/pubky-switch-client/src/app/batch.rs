@@ -408,6 +408,7 @@ impl App {
         }
         self.refuse_when_stopped()?;
         refuse_lifecycle_ops(batch.ops.iter().map(|(_, kind)| kind))?;
+        self.outbox_items(&batch.queued).await?;
         self.refuse_before_upload().await?;
         // At most one batch kept from an earlier call goes first; with more kept, this
         // one is kept behind them, so the call sends at most two batches.
@@ -617,11 +618,7 @@ impl App {
         let carry = (batch.ops.len() < MAX_BATCH_ENTRIES)
             .then_some(self.state.cursor.seq)
             .filter(|_| self.state.cursor.deferred_since_ms.is_some());
-        let queued = batch
-            .queued
-            .iter()
-            .map(|message| self.outbox_item(message))
-            .collect::<Result<Vec<_>, _>>()?;
+        let queued = self.outbox_items(&batch.queued).await?;
         let signed = self.sign_ops(batch.ops, carry)?;
         let id = signed
             .id()
@@ -1154,6 +1151,7 @@ impl App {
         batch: &Batch,
         resent: bool,
     ) -> Result<Submitted, AppError> {
+        super::send::validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let stamped;
         let unsent = pending;
         let first_send = pending.kept_ms.is_none();
@@ -1219,14 +1217,13 @@ impl App {
         pending: &PendingBatch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        super::send::validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         tx.local(&pending.local)?;
         // A message whose delivery the app gave up meanwhile, a copy `queue_stored` queued,
         // isn't queued again: the protocol was told it wasn't delivered.
         let now = self.now();
         for item in &pending.queued {
-            if !self.knows_message(item.msg_id()).await?
-                && !super::send::given_up(&self.reader(), item.msg_id(), now).await?
-            {
+            if super::send::kept_message_owed(&self.reader(), item.msg_id(), now).await? {
                 super::send::put_outbox_item(tx, item)?;
             }
         }

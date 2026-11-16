@@ -282,7 +282,7 @@ impl Protocol for Named {
         ))
     }
 
-    fn may_send(&self, message: &Message) -> bool {
+    fn may_send(&self, message: &Message, _origin: crate::app::DeliveryOrigin) -> bool {
         self.asked_send.lock().unwrap().push(message.kind.clone());
         !*self.holding.lock().unwrap()
     }

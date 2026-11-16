@@ -796,8 +796,10 @@ pub trait Protocol: Send + Sync {
     /// its conversation entry waits with it, its replay deadline still runs, and the
     /// messages of the app's other protocols go on. Asked only about the protocol's own
     /// messages; every message by default.
-    fn may_send(&self, message: &Message) -> bool {
-        let _ = message;
+    /// `origin` is the same retained local fact exposed by [`super::QueuedMessage`],
+    /// independent of acceptance, re-send status and permission to deliver.
+    fn may_send(&self, message: &Message, origin: super::DeliveryOrigin) -> bool {
+        let _ = (message, origin);
         true
     }
 

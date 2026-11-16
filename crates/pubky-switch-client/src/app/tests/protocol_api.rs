@@ -4,6 +4,7 @@
 //! service time, collections with a policy per sub-scope, and two identities messaging each
 //! other, each on its own scripted switch.
 
+mod delivery_inventory;
 mod delivery_lifecycle;
 
 use std::sync::{Arc, Mutex};
@@ -91,6 +92,8 @@ struct ApiProtocol {
     reject: Mutex<u32>,
     /// The body members it names opaque.
     opaque: Mutex<Vec<crate::app::OpaqueRule>>,
+    blocked_origin: Mutex<Option<crate::app::DeliveryOrigin>>,
+    send_origins: Mutex<Vec<(String, crate::app::DeliveryOrigin)>>,
 }
 
 impl ApiProtocol {
@@ -102,6 +105,8 @@ impl ApiProtocol {
             seen: Mutex::new(Vec::new()),
             reject: Mutex::new(0),
             opaque: Mutex::new(Vec::new()),
+            blocked_origin: Mutex::new(None),
+            send_origins: Mutex::new(Vec::new()),
         })
     }
 
@@ -119,6 +124,14 @@ fn text(result: Result<[u8; 32], AppError>) -> Result<(), String> {
 }
 
 impl Protocol for ApiProtocol {
+    fn may_send(&self, message: &Message, origin: crate::app::DeliveryOrigin) -> bool {
+        self.send_origins
+            .lock()
+            .unwrap()
+            .push((message.msg_id.clone(), origin));
+        *self.blocked_origin.lock().unwrap() != Some(origin)
+    }
+
     fn name(&self) -> String {
         "sample".into()
     }

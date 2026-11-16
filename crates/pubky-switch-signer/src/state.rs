@@ -10,7 +10,7 @@
 //! holds the hand-over as the switch served it, sealed to the new signer's bundle key, until
 //! the secret it carries is in the vault (Switch wire 3.12).
 
-use pubky_switch_client::store::{StoreHandle, WriteBatch};
+use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::records::{
     AppCert, DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup,
@@ -735,7 +735,7 @@ pub(crate) struct Bytes(
 
 /// Delete the records and the flow of `identity`, in one atomic write: once the identity was
 /// handed over, or a take-over was cancelled (Switch spec 12.8).
-pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<()> {
+pub(crate) async fn delete(store: &mut OwnedStoreHandle, identity: &[u8; 32]) -> Result<()> {
     let ns = signer_namespace(identity);
     let mut batch = WriteBatch::new();
     for key in [STATE_KEY, FLOW_KEY] {
@@ -749,7 +749,7 @@ pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<(
 
 /// Whether the store holds records for `identity` that a new set-up would replace: any but
 /// those of a hand-over that took effect, which are only waiting to be deleted.
-pub(crate) async fn set_up(store: &StoreHandle, identity: &[u8; 32]) -> Result<bool> {
+pub(crate) async fn set_up(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Result<bool> {
     Ok(load(store, identity)
         .await?
         .is_some_and(|(state, _)| state.handed_over_to.is_none()))
@@ -757,11 +757,13 @@ pub(crate) async fn set_up(store: &StoreHandle, identity: &[u8; 32]) -> Result<b
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.
 pub(crate) async fn load(
-    store: &StoreHandle,
+    store: &OwnedStoreHandle,
     identity: &[u8; 32],
 ) -> Result<Option<(SignerState, Option<Flow>)>> {
-    let ns = signer_namespace(identity);
-    let Some(bytes) = store.get(&ns, STATE_KEY).await? else {
+    if store.namespace() != signer_namespace(identity) {
+        return Err(SignerError::Records("another store namespace".into()));
+    }
+    let Some(bytes) = store.get(STATE_KEY).await? else {
         return Ok(None);
     };
     let state: SignerState = decode(&bytes)?;
@@ -771,7 +773,7 @@ pub(crate) async fn load(
         ));
     }
     let flow = store
-        .get(&ns, FLOW_KEY)
+        .get(FLOW_KEY)
         .await?
         .map(|bytes| decode(&bytes))
         .transpose()?;
@@ -780,7 +782,7 @@ pub(crate) async fn load(
 
 /// Commit the records and the flow together, in one atomic write.
 pub(crate) async fn save(
-    store: &StoreHandle,
+    store: &mut OwnedStoreHandle,
     state: &SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {

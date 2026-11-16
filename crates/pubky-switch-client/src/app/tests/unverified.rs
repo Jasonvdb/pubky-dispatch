@@ -122,6 +122,31 @@ impl StateStore for Counting {
         self.deleted.lock().unwrap().push(parked);
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        let parked = batch
+            .writes()
+            .iter()
+            .filter(
+                |write| matches!(write, Write::Delete { key, .. } if key.starts_with(b"parked/")),
+            )
+            .count();
+        self.deleted.lock().unwrap().push(parked);
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 /// A sender identity other than alice's, with one app.

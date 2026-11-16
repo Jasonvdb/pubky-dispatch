@@ -462,6 +462,35 @@ impl StateStore for CompletionFailure {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        use std::sync::atomic::Ordering;
+        let completion = batch
+            .writes()
+            .iter()
+            .any(|w| matches!(w, crate::store::Write::Put { key, .. } if key == b"p/consumed"));
+        if completion && !self.fired.swap(true, Ordering::SeqCst) {
+            if self.after {
+                self.inner.commit_if(ns, owner, batch)?;
+                return Err(StoreError::Unknown);
+            }
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 #[tokio::test]

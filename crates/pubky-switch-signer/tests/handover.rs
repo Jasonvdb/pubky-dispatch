@@ -858,6 +858,31 @@ impl StateStore for Failing {
         }
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+    ) -> Result<pubky_switch_client::store::AcquireOutcome, pubky_switch_client::store::StoreError>
+    {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: pubky_switch_client::store::StoreOwner,
+        batch: pubky_switch_client::store::WriteBatch,
+    ) -> Result<pubky_switch_client::store::CommitOutcome, pubky_switch_client::store::StoreError>
+    {
+        let mut left = self.left.lock().unwrap();
+        match left.as_mut() {
+            Some(0) => return Err(StoreError::Unavailable),
+            Some(n) => *n -= 1,
+            None => {}
+        }
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 #[tokio::test]
@@ -1081,6 +1106,7 @@ async fn test_hand_over_deletion_finishes_after_a_failure() {
     // The key comes back from elsewhere, and the install restores from the new signer's
     // backup: the marked records don't stand in the way.
     *world.vault.0.lock().unwrap() = Some(SECRET);
+    drop(old);
     let restored =
         Signer::restore_new(world.env(s.old_store.clone()), world.keyring(), confirmed())
             .await
@@ -1329,6 +1355,7 @@ async fn test_hand_over_served_again_never_costs_a_held_key() {
         .unwrap();
     assert_eq!(world.switch.stored_handover(), None);
     world.switch.store_handover_again(kept.clone());
+    drop(new);
     // On the install that signs: its records stand, and nothing is deleted.
     assert_eq!(
         Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
@@ -1352,7 +1379,6 @@ async fn test_hand_over_served_again_never_costs_a_held_key() {
     );
     assert!(vault_holds(&vault));
     assert!(holds_records(&store).await);
-    drop(new);
 }
 
 #[tokio::test]

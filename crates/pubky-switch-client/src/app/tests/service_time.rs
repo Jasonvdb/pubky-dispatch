@@ -853,6 +853,28 @@ impl StateStore for UnknownCommit {
             error => error,
         })
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.0.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        self.0
+            .commit_if(ns, owner, batch)
+            .map_err(|error| match error {
+                crate::store::StoreError::Unavailable => crate::store::StoreError::Unknown,
+                error => error,
+            })
+    }
 }
 
 async fn alarm_commit_case(

@@ -91,11 +91,14 @@ async fn test_signer_create_refuses_an_origin_that_isnt_a_switch_origin() {
 async fn test_signer_open_keeps_the_install_and_the_high_water_mark() {
     let world = World::new();
     let (signer, store) = world.enrolled().await;
+    let install = signer.install_id();
+    let high = signer.high_water();
+    drop(signer);
     let opened = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
-    assert_eq!(opened.install_id(), signer.install_id());
-    assert_eq!(opened.high_water(), signer.high_water());
+    assert_eq!(opened.install_id(), install);
+    assert_eq!(opened.high_water(), high);
     assert_eq!(opened.status(), SignerStatus::Signing);
 }
 
@@ -379,6 +382,7 @@ async fn test_signer_a_failed_commit_sends_nothing_it_didnt_commit() {
     assert_eq!(world.backup().identity_doc().version(), 1);
     // A restart finds the store as committed, and the next change is signed once.
     flaky.fail(false);
+    drop(signer);
     let mut restarted = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();
@@ -427,6 +431,7 @@ async fn test_signer_never_signs_a_version_twice_after_a_dropped_flow() {
         );
     }
     // And once more after a restart.
+    drop(signer);
     let mut restarted = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
@@ -531,6 +536,7 @@ async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
                     .unwrap();
             signer.resume().await.unwrap();
             let faulty = Arc::new(FaultStore::new(memory.clone(), fault));
+            drop(signer);
             let mut signer = Signer::open(world.env(faulty), world.keyring())
                 .await
                 .unwrap();
@@ -538,6 +544,7 @@ async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
             for _ in 0..3 {
                 let _ = signer.resume().await;
             }
+            drop(signer);
             let mut restarted = Signer::open(world.env(memory), world.keyring())
                 .await
                 .unwrap();
@@ -616,6 +623,7 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
     // A new version takes five commits: signed, backup sealed and written, delivered,
     // published. The store stops before the fifth.
     let faulty = Arc::new(FaultStore::new(memory.clone(), Fault::StopBefore(5)));
+    drop(signer);
     let mut signer = Signer::open(world.env(faulty), world.keyring())
         .await
         .unwrap();
@@ -628,6 +636,7 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
         pubky_switch_core::records::IDENTITY_PATH,
         serde_json::to_vec(theirs.signed()).unwrap(),
     );
+    drop(signer);
     let mut restarted = Signer::open(world.env(memory), world.keyring())
         .await
         .unwrap();

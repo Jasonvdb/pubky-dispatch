@@ -3573,6 +3573,25 @@ impl StateStore for SlowStore {
             .advance_ms(self.delay_ms.load(std::sync::atomic::Ordering::SeqCst));
         self.inner.commit(batch)
     }
+
+    fn acquire(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+    ) -> Result<crate::store::AcquireOutcome, crate::store::StoreError> {
+        self.inner.acquire(ns, owner)
+    }
+
+    fn commit_if(
+        &self,
+        ns: &str,
+        owner: crate::store::StoreOwner,
+        batch: crate::store::WriteBatch,
+    ) -> Result<crate::store::CommitOutcome, crate::store::StoreError> {
+        self.clock
+            .advance_ms(self.delay_ms.load(std::sync::atomic::Ordering::SeqCst));
+        self.inner.commit_if(ns, owner, batch)
+    }
 }
 
 #[tokio::test]

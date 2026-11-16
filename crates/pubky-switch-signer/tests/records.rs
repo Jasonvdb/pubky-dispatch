@@ -646,7 +646,7 @@ async fn test_records_confirmed_restore_uses_its_owned_current_read() {
 
 #[tokio::test]
 async fn test_records_confirmed_restore_checks_backup_before_replacement() {
-    use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+    use pubky_switch_core::records::{IDENTITY_PATH, SIGNER_BACKUP_PATH};
     let world = World::new();
     let (mut old, store) = world.enrolled().await;
     let backup = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
@@ -658,6 +658,10 @@ async fn test_records_confirmed_restore_checks_backup_before_replacement() {
     let damaged = unreadable_state(&snapshot(&world, &store));
     replace(&world, &store, &damaged);
     world.homeserver.set(SIGNER_BACKUP_PATH, backup.clone());
+    world.homeserver.set(
+        IDENTITY_PATH,
+        serde_json::to_vec(original_doc.signed()).unwrap(),
+    );
     assert_eq!(
         Signer::restore_over_unusable(
             world.env(store.clone()),
@@ -669,6 +673,10 @@ async fn test_records_confirmed_restore_checks_backup_before_replacement() {
         SignerError::Refused(Refusal::StaleBackup)
     );
     assert_eq!(snapshot(&world, &store), damaged);
+    world.homeserver.set(
+        IDENTITY_PATH,
+        serde_json::to_vec(current_doc.signed()).unwrap(),
+    );
     world
         .homeserver
         .files

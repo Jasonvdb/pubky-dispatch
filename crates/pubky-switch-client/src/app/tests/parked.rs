@@ -75,6 +75,10 @@ impl ParkingProtocol {
 }
 
 impl Protocol for ParkingProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -162,15 +166,11 @@ impl Protocol for ParkingProtocol {
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.sample.missed(missed)
     }
-
-    fn backup_name(&self) -> Option<String> {
-        Some("sample.parking".into())
-    }
 }
 
 /// Alice's wallet with `protocol`, on `store`.
 async fn wallet_on(w: &World, protocol: &Arc<ParkingProtocol>, store: Arc<dyn StateStore>) -> App {
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     App::join(w.env_on(store), protocol.clone(), World::config(), request)
         .await
         .unwrap()
@@ -820,7 +820,7 @@ async fn test_parked_forget_while_its_effect_is_kept_is_refused_until_a_read_set
 /// his that isn't listed: stored as unverifiable while his Homeserver can't be reached.
 async fn forged_copy(w: &World, app: &mut App, message: &Message) -> ParkedSummary {
     let keys = app_keys("removed-app");
-    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["scope-a"]);
+    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["sample-a"]);
     let mut forged = message.clone();
     forged.from = pubky_switch_core::message::Sender::of_app(w.bob.public(), &keys);
     forged
@@ -1167,9 +1167,9 @@ async fn test_parked_backup_of_a_kept_effect_leaves_the_live_store_to_settle_it(
     let backup = app.backup_layered().await.unwrap();
     assert!(
         backup
-            .protocol
+            .beyond_cursor
             .as_ref()
-            .is_some_and(|layer| layer.seen.contains(&seq)),
+            .is_some_and(|beyond| beyond.seen.contains(&seq)),
         "the backup's seen lacks the kept effect's seq"
     );
     assert_eq!(app.state.seen, seen_before);
@@ -1235,7 +1235,7 @@ async fn test_parked_processing_retires_all_copies_with_local_effect() {
     assert_eq!(protocol.handed(), handed + 1);
     assert!(processed(&app, &message).await);
     assert!(
-        app.forget_processed(w.bob.public(), &message.msg_id, &[])
+        app.forget_processed("sample", w.bob.public(), &message.msg_id, &[])
             .await
             .unwrap()
     );
@@ -1305,6 +1305,7 @@ async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
     assert!(!processed(&app, &message).await);
     assert!(
         !app.forget_processed(
+            "sample",
             w.bob.public(),
             &message.msg_id,
             &[LocalWrite::Put {
@@ -1317,7 +1318,7 @@ async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
     );
     assert!(listed(&mut app, entry.stored_id).await.is_some());
     assert_eq!(
-        app.protocol_get(b"evicted").await.unwrap(),
+        app.protocol_get("sample", b"evicted").await.unwrap(),
         Some(b"yes".to_vec())
     );
 }
@@ -1351,7 +1352,7 @@ async fn test_parked_processing_retires_copies_atomically_at_every_commit() {
             );
             let local = app
                 .reader()
-                .get_raw(format!("p/notes/{}", message.msg_id).as_bytes())
+                .get_raw(format!("p/sample/notes/{}", message.msg_id).as_bytes())
                 .await
                 .unwrap();
             assert_eq!(
@@ -1413,7 +1414,7 @@ async fn test_parked_processed_pair_drops_unchecked_changed_bytes_without_confli
     let (_, message) = w.note(app.app_id(), "kept");
     app.receive(None).await.unwrap();
     let keys = app_keys("unlisted-app");
-    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["scope-a"]);
+    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["sample-a"]);
     let mut changed = message.clone();
     changed.from = pubky_switch_core::message::Sender::of_app(w.bob.public(), &keys);
     changed.body.insert("text".into(), Value::from("changed"));
@@ -1500,7 +1501,7 @@ async fn test_parked_processing_backup_keeps_unknown_effect_and_copies() {
     assert_eq!(w.effects(), applied);
     assert!(matches!(
         restored
-            .forget_processed(w.bob.public(), &message.msg_id, &[])
+            .forget_processed("sample", w.bob.public(), &message.msg_id, &[])
             .await,
         Err(AppError::Refused(Refusal::NotNow(_)))
     ));
@@ -1545,10 +1546,13 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
         let (entry, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
         let duties = app.unacknowledged_events().await.unwrap();
-        app.protocol_commit(&[LocalWrite::Put {
-            key: b"retained".to_vec(),
-            value: b"old".to_vec(),
-        }])
+        app.protocol_commit(
+            "sample",
+            &[LocalWrite::Put {
+                key: b"retained".to_vec(),
+                value: b"old".to_vec(),
+            }],
+        )
         .await
         .unwrap();
         let fault = Arc::new(FaultStore::new(
@@ -1570,7 +1574,7 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
             },
         ];
         let result = app
-            .forget_processed(w.bob.public(), &message.msg_id, &local)
+            .forget_processed("sample", w.bob.public(), &message.msg_id, &local)
             .await;
         assert!(
             matches!(
@@ -1588,22 +1592,30 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         );
         let restored = load_on(&w, &protocol, w.store.clone()).await;
         assert_eq!(
-            restored.protocol_get(b"evicted").await.unwrap().is_some(),
+            restored
+                .protocol_get("sample", b"evicted")
+                .await
+                .unwrap()
+                .is_some(),
             after
         );
         assert_eq!(
-            restored.protocol_get(b"retained").await.unwrap().is_none(),
+            restored
+                .protocol_get("sample", b"retained")
+                .await
+                .unwrap()
+                .is_none(),
             after,
             "the retained value and its drop mark change in one local decision"
         );
         assert!(!processed(&restored, &message).await);
         assert!(
-            !app.forget_processed(w.bob.public(), &message.msg_id, &local)
+            !app.forget_processed("sample", w.bob.public(), &message.msg_id, &local)
                 .await
                 .unwrap()
         );
         assert_eq!(
-            app.protocol_get(b"evicted").await.unwrap(),
+            app.protocol_get("sample", b"evicted").await.unwrap(),
             Some(b"yes".to_vec())
         );
         assert!(listed(&mut app, entry.stored_id).await.is_some());
@@ -1620,7 +1632,7 @@ async fn test_parked_absent_pair_locals_commit_atomically_across_reload() {
         assert!(listed(&mut restored, entry.stored_id).await.is_some());
         assert!(!processed(&restored, &message).await);
         assert_eq!(
-            restored.protocol_get(b"evicted").await.unwrap(),
+            restored.protocol_get("sample", b"evicted").await.unwrap(),
             Some(b"yes".to_vec())
         );
     }
@@ -1641,13 +1653,18 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     }];
     assert!(
         matches!(
-            app.forget_processed(w.bob.public(), &message.msg_id, &local)
+            app.forget_processed("sample", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "pending effect protects the absent pair"
     );
-    assert!(app.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        app.protocol_get("sample", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     let backup = app.backup_layered().await.unwrap();
     let mut restored = App::restore(
         w.env_on(Arc::new(MemoryStore::new())),
@@ -1663,13 +1680,19 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     assert!(
         matches!(
             restored
-                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .forget_processed("sample", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "uncertainty protects its held pair"
     );
-    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        restored
+            .protocol_get("sample", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     w.clock.advance_ms(super::super::PROCESSED_RETENTION_MS + 1);
     restored.receive(None).await.unwrap();
     assert!(
@@ -1679,13 +1702,19 @@ async fn test_parked_forget_preserves_pending_and_uncertain_effect_locals() {
     assert!(
         matches!(
             restored
-                .forget_processed(w.bob.public(), &message.msg_id, &local)
+                .forget_processed("sample", w.bob.public(), &message.msg_id, &local)
                 .await,
             Err(AppError::Refused(Refusal::NotNow(_)))
         ),
         "uncertainty still protects locals after pair retention"
     );
-    assert!(restored.protocol_get(b"evicted").await.unwrap().is_none());
+    assert!(
+        restored
+            .protocol_get("sample", b"evicted")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(listed(&mut restored, entry.stored_id).await.is_some());
 }
 
@@ -1792,7 +1821,7 @@ async fn test_parked_move_settlement_retires_prior_copies() {
     let w = World::new();
     let router = Router::of(&w);
     let protocol = ParkingProtocol::new(Mode::Wide);
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
     let mut app = App::join(
         router.env(&w, w.store.clone()),
         protocol.clone(),
@@ -1849,7 +1878,7 @@ async fn test_parked_move_settlement_retires_prior_copies() {
     assert!(processed(&app, &message).await);
     assert_eq!(w.effects(), effects);
     assert_eq!(
-        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+        app.protocol_get("sample", format!("notes/{}", message.msg_id).as_bytes())
             .await
             .unwrap(),
         Some(b"parked note".to_vec())
@@ -2015,7 +2044,7 @@ impl PendingCompletion {
         let router = super::moves::Router::of(&world);
         let protocol = ParkingProtocol::new(Mode::Wide);
         let store: Arc<dyn StateStore> = world.store.clone();
-        let request = world.approve(&app_keys("wallet"), &["scope-a"]);
+        let request = world.approve(&app_keys("wallet"), &["sample-a"]);
         let mut app = App::join(
             router.env(&world, store.clone()),
             protocol.clone(),
@@ -2175,12 +2204,9 @@ async fn test_provider_completion_release_remains_owed() {
             .any(|write| matches!(write, Write::Put { key, .. } if key == b"meta")),
         "effect completion precedes the provider transaction"
     );
-    assert!(
-        batch
-            .writes()
-            .iter()
-            .any(|write| matches!(write, Write::Put { key, .. } if key.starts_with(b"p/notes/")))
-    );
+    assert!(batch.writes().iter().any(
+        |write| matches!(write, Write::Put { key, .. } if key.starts_with(b"p/sample/notes/"))
+    ));
     assert!(
         batch
             .writes()
@@ -2275,7 +2301,10 @@ async fn test_provider_completion_failure_and_unknown_are_atomic() {
                 assert_eq!(processed(&loaded, &pending.message).await, effect_done);
                 assert_eq!(
                     loaded
-                        .protocol_get(format!("notes/{}", pending.message.msg_id).as_bytes())
+                        .protocol_get(
+                            "sample",
+                            format!("notes/{}", pending.message.msg_id).as_bytes()
+                        )
                         .await
                         .unwrap()
                         .is_some(),

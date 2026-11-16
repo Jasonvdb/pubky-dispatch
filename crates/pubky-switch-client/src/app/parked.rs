@@ -114,6 +114,7 @@ impl std::fmt::Debug for ParkedMessage {
 struct Opened {
     plaintext: MessagePlaintext,
     msg_id: String,
+    kind: String,
 }
 
 /// `None` for stored bytes that don't read as a message with a `msg_id`.
@@ -121,7 +122,12 @@ fn opened(stored: &ParkedEntry) -> Option<Opened> {
     let plaintext = MessagePlaintext::decode(&stored.plaintext).ok()?;
     let json: Value = serde_json::from_slice(plaintext.json()).ok()?;
     let msg_id = json.get("msg_id")?.as_str()?.to_owned();
-    Some(Opened { plaintext, msg_id })
+    let kind = json.get("kind")?.as_str()?.to_owned();
+    Some(Opened {
+        plaintext,
+        msg_id,
+        kind,
+    })
 }
 
 /// The `msg_id` of the message an entry stored locally holds; `None` for stored bytes that
@@ -193,7 +199,7 @@ impl App {
             };
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
                 .map_err(|_| AppError::Store(StoreError::Corrupt))?;
-            let rules = self.protocol.opaque_members();
+            let rules = self.protocols.opaque_of_json(plaintext.json());
             let opaque: Vec<OpaqueMember<'_>> = rules
                 .iter()
                 .map(|rule| OpaqueMember {
@@ -328,7 +334,7 @@ impl App {
                 if !self.reader().exists(&pair).await? {
                     let now = self.now();
                     let hash = this.plaintext.hash();
-                    processed_writes(&mut tx, &sender, &this.msg_id, hash, now)?;
+                    processed_writes(&mut tx, &sender, &this.msg_id, &this.kind, hash, now)?;
                 }
             }
             self.commit(tx).await?;

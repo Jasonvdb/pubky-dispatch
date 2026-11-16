@@ -11,8 +11,11 @@ use std::collections::BTreeMap;
 use pubky_switch_core::message::{MessagePlaintext, VerifiedSender};
 use pubky_switch_core::records::{AppCert, DAY_MS};
 
-use super::events::{AppEvent, DropReason, Duty, EventId, ParkReason, StoredMessageIdentity};
-use super::protocol::{Protocol, Rules};
+use super::ProtocolSet;
+use super::events::{
+    AppEvent, DropReason, Duty, EventId, KeptDuty, ParkReason, StoredMessageIdentity,
+};
+use super::protocols::Rules;
 use super::state::{HeldEntry, ParkedEntry, ParkedRound, Reader, RetryEntry, Tx, key};
 use super::{App, AppError};
 use serde::{Deserialize, Serialize};
@@ -117,6 +120,7 @@ pub(crate) struct WaitingChange {
     feed: Option<u64>,
     next_stored_id: u64,
     next_duty: u64,
+    duty_owners: Vec<(u64, Vec<String>)>,
 }
 
 impl WaitingChange {
@@ -149,6 +153,7 @@ impl WaitingChange {
         }
         app.state.next_stored_id = self.next_stored_id;
         app.state.next_duty = self.next_duty;
+        app.duty_owners.extend(self.duty_owners);
         Ok(())
     }
 }
@@ -241,6 +246,7 @@ impl App {
             feed,
             next_stored_id: self.state.next_stored_id,
             next_duty: self.state.next_duty,
+            duty_owners: Vec::new(),
         };
         if let Some((id, stored)) = &change.candidate {
             if !stored.reason.bounded()
@@ -314,9 +320,15 @@ impl App {
                 .ok_or_else(super::corrupt)?;
             let event = EventId::new(self.state.duty_epoch.epoch, change.next_duty);
             let duty = self.waiting_notice(*id, stored, *reason, event)?;
-            change.tx.put(&key::duty(change.next_duty), &duty)?;
+            let to = self.duty_to(&duty);
+            let kept = KeptDuty {
+                to: to.clone(),
+                duty,
+            };
+            change.tx.put(&key::duty(change.next_duty), &kept)?;
+            change.duty_owners.push((change.next_duty, to));
             change.next_duty = change.next_duty.checked_add(1).ok_or_else(super::corrupt)?;
-            change.tx.report(duty.event(event));
+            change.tx.report(kept.duty.event(event));
             change.tx.delete(&key::parked(*id))?;
             change.tx.delete(&key::stored_retry(*id))?;
             change.removed.push(*id);
@@ -345,7 +357,7 @@ impl App {
             stored,
             &self.state.meta.identity,
             &self.state.cert,
-            self.protocol.as_ref(),
+            &self.protocols,
         )
     }
 
@@ -380,7 +392,7 @@ pub(super) struct WaitingOut {
     pub(super) round: ParkedRound,
     pub(super) held: Vec<(u64, HeldEntry)>,
     pub(super) feed_retries: Vec<(u64, RetryEntry)>,
-    pub(super) notices: Vec<Duty>,
+    pub(super) notices: Vec<KeptDuty>,
 }
 
 impl WaitingOut {
@@ -429,7 +441,7 @@ impl WaitingOut {
         &self,
         backup: &super::AppBackup,
         cert: &AppCert,
-        protocol: &dyn Protocol,
+        protocols: &ProtocolSet,
     ) -> Result<(), AppError> {
         let mut ids = std::collections::BTreeSet::new();
         for (id, stored) in &self.entries {
@@ -444,7 +456,7 @@ impl WaitingOut {
             {
                 return Err(super::corrupt());
             }
-            waiting_identity(stored, &backup.meta.identity, cert, protocol)?;
+            waiting_identity(stored, &backup.meta.identity, cert, protocols)?;
         }
         let mut retried = std::collections::BTreeSet::new();
         for (id, _) in &self.retries {
@@ -452,7 +464,7 @@ impl WaitingOut {
                 return Err(super::corrupt());
             }
         }
-        if let Some(layer) = &backup.protocol {
+        if let Some(layer) = &backup.beyond_cursor {
             for (id, stored) in &layer.parked {
                 if *id == 0
                     || *id >= backup.stored_next
@@ -468,14 +480,14 @@ impl WaitingOut {
             if *seq <= backup.cursor.seq
                 || !held.insert(*seq)
                 || backup
-                    .protocol
+                    .beyond_cursor
                     .as_ref()
                     .is_some_and(|layer| layer.seen.contains(seq))
                 || self.entries.iter().any(|(_, entry)| {
                     entry.generation == backup.cursor.generation && entry.seq == *seq
                 })
                 || self.notices.iter().any(|notice| {
-                    matches!(notice,
+                    matches!(&notice.duty,
                     Duty::StoredEntryDropped { seq: seen, generation, .. }
                     if *seen == *seq && *generation == backup.cursor.generation)
                 })
@@ -491,6 +503,7 @@ impl WaitingOut {
         }
         let mut notices = Vec::new();
         for notice in &self.notices {
+            notice.check_owners(protocols)?;
             merge_notice(&mut notices, notice.clone())?;
         }
         Ok(())
@@ -501,7 +514,7 @@ pub(super) fn waiting_identity(
     stored: &ParkedEntry,
     own: &[u8; 32],
     cert: &AppCert,
-    protocol: &dyn Protocol,
+    protocols: &ProtocolSet,
 ) -> Result<StoredMessageIdentity, AppError> {
     let sender = AppCert::verify(&stored.cert, &stored.sender).map_err(|_| super::corrupt())?;
     if sender.expired_at(stored.accepted_at_ms) || stored.accepted_at_ms > stored.receipt.read_at_ms
@@ -509,8 +522,8 @@ pub(super) fn waiting_identity(
         return Err(super::corrupt());
     }
     let plaintext = MessagePlaintext::decode(&stored.plaintext).map_err(|_| super::corrupt())?;
-    let opaque = protocol.opaque_members();
-    let rules = Rules::new(protocol, cert, &opaque);
+    let opaque = protocols.opaque_of_json(plaintext.json());
+    let rules = Rules::new(protocols, cert, &opaque);
     let message = plaintext
         .check(
             own,
@@ -560,15 +573,19 @@ pub(super) fn notice_id(duty: &Duty) -> Result<EventId, AppError> {
     Ok(*notice_id)
 }
 
-pub(super) fn merge_notice(notices: &mut Vec<Duty>, notice: Duty) -> Result<(), AppError> {
-    let id = notice_id(&notice)?;
-    for held in notices.iter() {
-        if notice_id(held)? == id {
-            return if held == &notice {
-                Ok(())
-            } else {
-                Err(super::corrupt())
-            };
+pub(super) fn merge_notice(notices: &mut Vec<KeptDuty>, notice: KeptDuty) -> Result<(), AppError> {
+    let id = notice_id(&notice.duty)?;
+    for held in notices.iter_mut() {
+        if notice_id(&held.duty)? == id {
+            if held.duty != notice.duty {
+                return Err(super::corrupt());
+            }
+            for name in notice.to {
+                if !held.to.contains(&name) {
+                    held.to.push(name);
+                }
+            }
+            return Ok(());
         }
     }
     notices.push(notice);
@@ -581,11 +598,13 @@ pub(super) fn waiting_record(bytes: &[u8]) -> bool {
     bytes.windows(tag.len()).any(|part| part == tag)
 }
 
-pub(super) async fn waiting_notices(reader: &Reader) -> Result<Vec<Duty>, AppError> {
+pub(super) async fn waiting_notices(reader: &Reader) -> Result<Vec<KeptDuty>, AppError> {
     let mut notices = Vec::new();
     for (_, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
-        match super::state::decode::<Duty>(&bytes) {
-            Ok(duty @ Duty::StoredEntryDropped { .. }) => merge_notice(&mut notices, duty)?,
+        match super::state::decode::<KeptDuty>(&bytes) {
+            Ok(kept) if matches!(kept.duty, Duty::StoredEntryDropped { .. }) => {
+                merge_notice(&mut notices, kept)?;
+            }
             Err(error) if waiting_record(&bytes) => return Err(error),
             _ => {}
         }

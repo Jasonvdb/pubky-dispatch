@@ -107,6 +107,15 @@ pub enum TransportError {
     /// The request couldn't be built, for example a header value that isn't text.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// An answer came with a header the response signature decides on,
+    /// `Switch-Service-Signature`, `Switch-Server-Time` or `Switch-Head`, more than once or
+    /// with a value that isn't printable ASCII, which the transport can't hand on exactly:
+    /// the client takes it as an answer whose signature doesn't verify (Switch wire 7.1).
+    #[error("an answer whose signed headers don't read, status {status}")]
+    UnreadableSignedHeader {
+        /// The HTTP status.
+        status: u16,
+    },
     /// Any other failure.
     #[error("transport: {0}")]
     Other(String),
@@ -138,14 +147,35 @@ pub enum ClientError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     /// The response signature didn't verify with the pinned service key, or the response
-    /// carried none, so nothing in it was used (Switch wire 7.1). An answer the service
-    /// signs with its operator key, such as the `404` for an account it doesn't host, comes
-    /// back this way: the status is kept, as a signer that erased an account reads that
-    /// `404` (Switch wire 7.4.16).
+    /// carried none, so nothing in it was used (Switch wire 7.1). An intermediary's answer,
+    /// or the service's own under a key it changed to (Switch spec 12.5), comes back this
+    /// way: the status is kept, as a signer whose erasure is in doubt counts such a `404`
+    /// (Switch wire 7.4.16 "The signer's `404`").
     #[error("the response signature didn't verify (status {status})")]
     BadServiceSignature {
         /// The response's HTTP status, unauthenticated.
         status: u16,
+    },
+    /// An error answer the service gave before it read the request's body: a `413
+    /// too_large`, a `429 rate_limited` or a `404 not_found`, its signature verified with the
+    /// pinned key and the empty body field. It binds the request without its body, so it may
+    /// answer a request whose length was changed on the way: it is final for nothing, and
+    /// the call failed as when no answer comes (Switch wire 7.1).
+    #[error("{code} before the body was read (status {status})")]
+    BodyUnread {
+        /// The HTTP status.
+        status: u16,
+        /// The error code, which fixes the status.
+        code: ErrorCode,
+        /// `retry_after` in seconds, on `429 rate_limited` (Switch wire 7.6).
+        retry_after: Option<u64>,
+    },
+    /// The request's body is over its call's cap (Switch wire 7.1 Body caps), so it wasn't
+    /// sent: a refusal for good, since the same bytes are over the cap every time.
+    #[error("the body is over its call's cap of {cap} bytes")]
+    BodyOverCap {
+        /// The call's cap, in bytes.
+        cap: usize,
     },
     /// The client holds no pinned service key, so the call wasn't sent: only an enrollment
     /// is sent without one (Switch wire 7.1, Switch spec 6.1).
@@ -179,12 +209,29 @@ impl ClientError {
         }
     }
 
-    /// The error code of an answer of the switch.
+    /// The error code of an answer of the switch; `None` for every other failure, an answer
+    /// given before the body was read ([`ClientError::BodyUnread`]) included.
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             ClientError::Switch { code, .. } => Some(*code),
             _ => None,
         }
+    }
+
+    /// Whether this is the service's word that it doesn't host the identity: `404
+    /// not_found` with `current: { "hosted": false }`, checked with the pinned service key,
+    /// which the service gives only for an account it doesn't hold, one never enrolled there
+    /// or one erased (Switch wire 7.3 step 2, 7.4.16 "Afterwards").
+    pub fn is_not_hosted(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Switch {
+                status: 404,
+                code: ErrorCode::NotFound,
+                current,
+                ..
+            } if *current == pubky_switch_core::http::not_hosted_current()
+        )
     }
 }
 
@@ -205,6 +252,23 @@ mod tests {
         assert_eq!(error.retry(), Some(Retry::AfterRetryAfter));
         assert_eq!(error.code(), Some(ErrorCode::RateLimited));
         assert_eq!(error.to_string(), "429 rate_limited: too many requests");
+    }
+
+    #[test]
+    fn test_client_error_not_hosted_is_only_the_signed_404() {
+        let not_found = |current: serde_json::Value| ClientError::Switch {
+            status: 404,
+            code: ErrorCode::NotFound,
+            message: "not found".into(),
+            current,
+            known_version: None,
+            retry_after: None,
+        };
+        assert!(not_found(pubky_switch_core::http::not_hosted_current()).is_not_hosted());
+        // The `404` of a missing object at a hosted account, and one nobody can check, aren't.
+        assert!(!not_found(serde_json::Value::Null).is_not_hosted());
+        assert!(!not_found(serde_json::json!({ "hosted": true })).is_not_hosted());
+        assert!(!ClientError::BadServiceSignature { status: 404 }.is_not_hosted());
     }
 
     #[test]

@@ -276,7 +276,7 @@ impl Signer {
                     "Switch wire 7.4.17: the hand-over is stored for another app".into(),
                 )));
             }
-            Err(ClientError::Switch { status, .. }) if definite(*status) => HandOverSent::Refused,
+            Err(error) if refused_for_good(error) => HandOverSent::Refused,
             Err(_) => HandOverSent::Pending,
         };
         if sent != HandOverSent::Pending {
@@ -503,8 +503,53 @@ impl Signer {
     }
 }
 
-/// Whether a refusal of `PUT /handover` with `status` is for good: the same bytes would be
-/// refused again. Refusals of the caller, rate limits and server errors aren't.
-fn definite(status: u16) -> bool {
-    matches!(status, 400 | 404 | 409 | 410 | 413 | 422)
+/// Whether a refusal of `PUT /handover` is for good: the same bytes would be refused again.
+/// Final only when the answer binds the request as sent, its body included, or for a body
+/// over its call's cap, which the client refuses before sending it (Switch wire 7.1).
+/// Refusals of the caller, rate limits and server errors aren't, nor is an answer given
+/// before the body was read.
+fn refused_for_good(error: &ClientError) -> bool {
+    match error {
+        ClientError::Switch { status, .. } => matches!(status, 400 | 404 | 409 | 410 | 413 | 422),
+        ClientError::BodyOverCap { .. } => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pubky_switch_core::http::ErrorCode;
+
+    #[test]
+    fn test_hand_over_refused_for_good_takes_only_what_binds_the_bytes() {
+        let switch = |status: u16, code: ErrorCode| ClientError::Switch {
+            status,
+            code,
+            message: String::new(),
+            current: serde_json::Value::Null,
+            known_version: None,
+            retry_after: None,
+        };
+        for error in [
+            switch(400, ErrorCode::BadRequest),
+            switch(409, ErrorCode::Conflict),
+            switch(413, ErrorCode::TooLarge),
+            ClientError::BodyOverCap { cap: 1 },
+        ] {
+            assert!(refused_for_good(&error), "{error:?}");
+        }
+        for error in [
+            ClientError::BodyUnread {
+                status: 413,
+                code: ErrorCode::TooLarge,
+                retry_after: None,
+            },
+            switch(401, ErrorCode::BadSignature),
+            switch(429, ErrorCode::RateLimited),
+            switch(503, ErrorCode::Unavailable),
+        ] {
+            assert!(!refused_for_good(&error), "{error:?}");
+        }
+    }
 }

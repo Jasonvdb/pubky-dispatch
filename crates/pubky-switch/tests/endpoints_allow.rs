@@ -714,7 +714,6 @@ async fn test_allow_reads_of_an_account_wait_their_turn() {
 
 #[tokio::test]
 async fn test_allow_waits_for_a_reader_without_the_lock() {
-    use pubky_switch::keys::KeyStore;
     let config = pubky_switch::store::DatabaseConfig {
         snapshot_readers: 1,
         ..Default::default()
@@ -724,12 +723,10 @@ async fn test_allow_waits_for_a_reader_without_the_lock() {
     };
     replay_chain_through_revoke(&replay).await;
     // Another account's read holds the one reader.
-    let key = replay.keys.generate().await.expect("a key");
     let other = pubky_switch::store::NewAccount {
         id: "other".into(),
         identity_key: [9; 32],
         generation: 1,
-        service_key: key.id,
         created_at_ms: 0,
         limits: pubky_switch_core::records::Limits::default(),
         identity_doc: None,

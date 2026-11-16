@@ -25,8 +25,8 @@ use super::{StoreError, from_db, identity::decode_doc, to_db};
 pub struct FeedSnapshot {
     /// The generation the account serves.
     pub generation: u64,
-    /// The generation's service key, by its key store ID.
-    pub service_key: String,
+    /// When the account was created, in service time.
+    pub created_at_ms: u64,
     /// The last service time the account stamped.
     pub stamped_time_ms: u64,
     /// The newest `identity.json` the account holds.
@@ -223,7 +223,7 @@ pub(super) async fn read_feed(
         .await
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
-        "SELECT generation, last_seq, chain_seq, chain_hash, service_key, stamped_time_ms, \
+        "SELECT generation, last_seq, chain_seq, chain_hash, created_at_ms, stamped_time_ms, \
          identity_doc, r.checkpoint FROM accounts \
          LEFT JOIN chain_retention r ON r.account_id = accounts.id WHERE id = $1",
     )
@@ -266,7 +266,7 @@ pub(super) async fn read_feed(
     .map_err(StoreError::from_db)?;
     let mut snapshot = FeedSnapshot {
         generation,
-        service_key: row.try_get("service_key")?,
+        created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
         identity_doc: identity_doc
             .map(|bytes| decode_doc(&bytes, "identity_doc"))

@@ -8,14 +8,16 @@
 //! rest of what the harness holds the means to check, on every answer of either switch:
 //!
 //! - the answer's signature (Switch wire 7.1), with the account's service key of its
-//!   generation, or the operator key for an answer the switch can't tie to an account. The
+//!   generation, or the switch's one key for an answer it can't tie to an account the run
+//!   knows. The
 //!   key of a generation is the one its `identity.json` names (`inbox.service_key`, Switch
 //!   wire 3.3), taken from the delivery the switch accepted, which must itself be answered
 //!   under that key; the key of the generation before is held no longer from then on.
-//!   Before its document is taken, a key is one the run brought: the service key a world
-//!   gives an account, or the one an enrollment's answer names and is signed with (Switch
-//!   wire 7.4.1). The trace says which signed, a generation's key or a key not delivered
-//!   yet by its number in the order the run brought them, so the two runs must agree on it;
+//!   Before its document is taken, a key is one the run brought: the one key of the switch
+//!   a world adds the account at, or the one an enrollment's answer names and is signed
+//!   with (Switch wire 7.4.1). The trace says which signed, a generation's key or a key
+//!   not delivered yet by its number in the order the run brought them, so the two runs
+//!   must agree on it;
 //! - every signed head, in `Switch-Head` and in a body's `head` (Switch wire 6.7): its
 //!   signature, with the key that signed the answer carrying it, its generation, and its
 //!   chain hash against the stub of its `seq` where the run showed one;
@@ -47,13 +49,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use pubky_switch_client::client::SentRequest;
 use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::chain::{
     ChainEnvelope, ItemType, ServiceTransition, SignedHead, Stub, TransitionProof, Verifier,
     ZERO_HASH,
 };
 use pubky_switch_core::enc::unb64_array;
-use pubky_switch_core::http::{header, request_signature_of, verify_response};
+use pubky_switch_core::http::{ErrorCode, ResponseParts, header, verify_response};
 use pubky_switch_core::records::IdentityDoc;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -83,8 +86,8 @@ fn start_of_a_sequence() -> BTreeMap<u64, Link> {
 /// An account the checker knows.
 struct Account {
     identity: [u8; 32],
-    /// How many service keys the run brought for the account so far.
-    brought: usize,
+    /// Keys in the order the run brought them, for stable names across generations.
+    keys: Vec<[u8; 32]>,
     /// The keys brought whose document no switch took yet, each with its number.
     named: Vec<(usize, [u8; 32])>,
     /// The generation whose document a switch took last, and the service key it names.
@@ -99,7 +102,7 @@ impl Account {
     fn new(identity: [u8; 32]) -> Self {
         Self {
             identity,
-            brought: 0,
+            keys: Vec::new(),
             named: Vec::new(),
             current: None,
             chain: start_of_a_sequence(),
@@ -112,25 +115,32 @@ impl Account {
         let held = self.current.is_some_and(|(_, current)| current == key)
             || self.named.iter().any(|(_, named)| *named == key);
         if !held {
-            self.brought = self.brought.saturating_add(1);
-            self.named.push((self.brought, key));
+            let number = match self.keys.iter().position(|known| *known == key) {
+                Some(index) => index + 1,
+                None => {
+                    self.keys.push(key);
+                    self.keys.len()
+                }
+            };
+            self.named.push((number, key));
         }
     }
 
-    /// The key `with` stands for, while the account holds it.
+    /// The key `with` verified with, even if another generation has since started.
     fn key_of(&self, with: SignedWith) -> Option<[u8; 32]> {
-        match with {
-            SignedWith::Generation(generation) => self
-                .current
-                .filter(|(current, _)| *current == generation)
-                .map(|(_, key)| key),
-            SignedWith::Brought(number) => self
-                .named
-                .iter()
-                .find(|(named, _)| *named == number)
-                .map(|(_, key)| *key),
-            SignedWith::OperatorKey => None,
-        }
+        let number = match with {
+            SignedWith::Generation(_, number) | SignedWith::Brought(number) => number,
+            SignedWith::SwitchKey => return None,
+        };
+        self.keys.get(number.checked_sub(1)?).copied()
+    }
+
+    fn key_number(&self, key: &[u8; 32]) -> Result<usize, String> {
+        self.keys
+            .iter()
+            .position(|known| known == key)
+            .map(|index| index + 1)
+            .ok_or_else(|| "the signing key has no name".to_owned())
     }
 
     /// A switch took `doc`: its generation's key is the one it names.
@@ -152,6 +162,7 @@ impl Account {
                 }
             }
             _ => {
+                self.bring(key);
                 self.current = Some((generation, key));
                 self.named.retain(|(_, named)| *named != key);
                 // A provider loss starts the sequence afresh (Switch wire 7.4.2); a rotation
@@ -171,8 +182,8 @@ impl Account {
 pub struct Checker {
     /// The accounts, by Pubky ID.
     accounts: Mutex<HashMap<String, Account>>,
-    /// The operator key of the run's switches.
-    operator_key: Mutex<Option<[u8; 32]>>,
+    /// The one key of each of the run's switches.
+    switch_keys: Mutex<Vec<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for Checker {
@@ -185,26 +196,22 @@ impl std::fmt::Debug for Checker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedWith {
     /// The account's service key of this generation: the one the generation's
-    /// `identity.json` names, which a switch took.
-    Generation(u64),
+    /// `identity.json` names, which a switch took; and its stable key number.
+    Generation(u64, usize),
     /// A service key the run brought whose document no switch took yet: its number, from
-    /// 1, in the order the run brought the account's keys.
+    /// 1, in the order the run brought them for the account.
     Brought(usize),
-    /// The operator key.
-    OperatorKey,
+    /// A switch's one key, for an answer about no account the run knows.
+    SwitchKey,
 }
 
 impl std::fmt::Display for SignedWith {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SignedWith::Generation(generation) => {
-                write!(f, "the account's service key of generation {generation}")
+            SignedWith::Generation(_, number) | SignedWith::Brought(number) => {
+                write!(f, "service key number {number}")
             }
-            SignedWith::Brought(number) => write!(
-                f,
-                "the account's service key number {number}, its document not taken yet"
-            ),
-            SignedWith::OperatorKey => write!(f, "the operator key"),
+            SignedWith::SwitchKey => write!(f, "the switch's key"),
         }
     }
 }
@@ -269,9 +276,13 @@ impl Checker {
         Some(())
     }
 
-    /// Answers the switch can't tie to an account are signed with `operator_key`.
-    pub fn operator(&self, operator_key: [u8; 32]) {
-        *lock(&self.operator_key) = Some(operator_key);
+    /// A switch of the run signs with `key`, the answers it can't tie to an account too
+    /// (Switch wire 7.1).
+    pub fn switch_key(&self, key: [u8; 32]) {
+        let mut keys = lock(&self.switch_keys);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
 
     /// Verify `answer`'s signature as the switch sent it, and take what it settles: the key
@@ -281,6 +292,34 @@ impl Checker {
     ///
     /// What is wrong with it.
     pub fn signature(&self, request: &Request, answer: &Response) -> Result<SignedWith, String> {
+        // As a client checks it (Switch wire 7.1): each header the signature decides on at
+        // most once, and a head that is there verifies as the account's with the key that
+        // signed the answer.
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME, header::HEAD] {
+            let count = answer
+                .headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case(name))
+                .count();
+            if count > 1 {
+                return Err(format!("the answer carries {name} {count} times"));
+            }
+        }
+        let head = answer
+            .header(header::HEAD)
+            .map(SignedHead::from_header)
+            .transpose()
+            .map_err(|_| "its Switch-Head doesn't read as a head".to_owned())?;
+        self.signed_with(request, answer, head.as_ref())
+    }
+
+    /// The key [`Checker::signature`] finds `answer`'s signature verifies with.
+    fn signed_with(
+        &self,
+        request: &Request,
+        answer: &Response,
+        head: Option<&SignedHead>,
+    ) -> Result<SignedWith, String> {
         let signature = answer
             .header(header::SERVICE_SIGNATURE)
             .and_then(|text| unb64_array::<64>(text).ok())
@@ -288,17 +327,44 @@ impl Checker {
         let server_time = answer
             .header(header::SERVER_TIME)
             .ok_or("the answer carries no service time")?;
-        let request_signature = request_signature_of(request.header(header::SIGNATURE));
+        // The request as the switch received it; the empty body field only for the answers
+        // a switch may give before it reads the body, without a head (Switch wire 7.1).
+        let sent = SentRequest::of(request);
+        let before_the_body = answer.header(header::HEAD).is_none()
+            && serde_json::from_slice::<Value>(&answer.body)
+                .ok()
+                .and_then(|body| body["code"].as_str().and_then(ErrorCode::parse))
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        ErrorCode::TooLarge | ErrorCode::RateLimited | ErrorCode::NotFound
+                    ) && code.status() == answer.status
+                });
+        let identity = account_id(request)
+            .and_then(|id| lock(&self.accounts).get(id).map(|account| account.identity));
         let verifies = |key: &[u8; 32]| {
-            verify_response(
-                key,
-                answer.status,
-                request_signature.as_ref(),
-                server_time,
-                &answer.body,
-                &signature,
-            )
-            .is_ok()
+            // A response cannot bring a key or start a generation until its present head
+            // verifies with that same key (Switch wire 7.1, 6.7).
+            if head.is_some_and(|head| {
+                identity.is_none_or(|identity| head.verify(key, &identity).is_err())
+            }) {
+                return false;
+            }
+            let with = |body_read: bool| {
+                verify_response(
+                    key,
+                    &ResponseParts {
+                        status: answer.status,
+                        request: sent.received(body_read),
+                        server_time,
+                        head: answer.header(header::HEAD),
+                        body: &answer.body,
+                    },
+                    &signature,
+                )
+                .is_ok()
+            };
+            with(true) || (before_the_body && with(false))
         };
         // An enrollment's answer brings its key with it.
         let _ = self.enrolled_key(request, answer, &verifies);
@@ -315,25 +381,29 @@ impl Checker {
                     );
                 }
                 account.take(&doc)?;
-                return Ok(SignedWith::Generation(doc.generation()));
+                return Ok(SignedWith::Generation(
+                    doc.generation(),
+                    account.key_number(&doc.inbox().service_key)?,
+                ));
             }
             if let Some((generation, key)) = account.current
                 && verifies(&key)
             {
-                return Ok(SignedWith::Generation(generation));
+                return Ok(SignedWith::Generation(
+                    generation,
+                    account.key_number(&key)?,
+                ));
             }
             if let Some((number, _)) = account.named.iter().find(|(_, key)| verifies(key)) {
                 return Ok(SignedWith::Brought(*number));
             }
         }
-        if let Some(operator) = *lock(&self.operator_key)
-            && verifies(&operator)
-        {
-            return Ok(SignedWith::OperatorKey);
+        if lock(&self.switch_keys).iter().any(verifies) {
+            return Ok(SignedWith::SwitchKey);
         }
         Err(
-            "the answer's signature verifies with neither the account's service key nor the \
-             operator key"
+            "the answer's signature verifies with neither the account's service key nor a \
+             switch's key"
                 .into(),
         )
     }
@@ -397,11 +467,11 @@ impl Found<'_> {
     }
 
     /// The service key to verify `what` at `at` with: the one that signed the answer. An
-    /// answer the operator key signed carries nothing a service key signs; one whose own
-    /// signature failed is reported for that already.
+    /// answer about no account the run knows carries no head or proof of an account; one
+    /// whose own signature failed is reported for that already.
     fn key_for(&mut self, what: &str, at: &str) -> Option<[u8; 32]> {
-        if self.key.is_none() && self.signed == Some(SignedWith::OperatorKey) {
-            self.violation(format!("{at}: {what} in an answer the operator key signed"));
+        if self.key.is_none() && self.signed == Some(SignedWith::SwitchKey) {
+            self.violation(format!("{at}: {what} in an answer about no account"));
         }
         self.key
     }
@@ -469,7 +539,7 @@ impl Found<'_> {
                 "{at}: the head's signature doesn't verify with the key that signed the answer"
             ));
         }
-        if let Some(SignedWith::Generation(generation)) = self.signed
+        if let Some(SignedWith::Generation(generation, _)) = self.signed
             && head.generation != generation
         {
             self.violation(format!(
@@ -661,10 +731,19 @@ mod tests {
         }
     }
 
-    /// An answer `service` signs.
-    fn answer(service: &IdentityKey, status: u16, body: &Value) -> Response {
+    /// An answer to `request` that `service` signs.
+    fn answer(request: &Request, service: &IdentityKey, status: u16, body: &Value) -> Response {
         let body = serde_json::to_vec(body).unwrap();
-        let signature = sign_response(service, status, None, TIME, &body);
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: None,
+                body: &body,
+            },
+        );
         Response {
             status,
             headers: vec![
@@ -679,7 +758,7 @@ mod tests {
     fn checker(service: &IdentityKey) -> Checker {
         let checker = Checker::default();
         checker.account(&alice().id(), alice().public(), service.public());
-        checker.operator(key(42).public());
+        checker.switch_key(key(42).public());
         checker
     }
 
@@ -711,13 +790,13 @@ mod tests {
             "identity",
             &document(generation, named, recovery_from),
         );
-        checker.signature(&put, &answer(by, 200, &json!({})))
+        checker.signature(&put, &answer(&put, by, 200, &json!({})))
     }
 
     /// What the checker finds wrong in an answer `service` signs with `body`.
     fn violations(checker: &Checker, service: &IdentityKey, body: &Value) -> Vec<String> {
         let get = request("GET", "feed", &json!(null));
-        let answer = answer(service, 200, body);
+        let answer = answer(&get, service, 200, body);
         let signed = checker.signature(&get, &answer).ok();
         checker.contents(&get, &answer, signed)
     }
@@ -752,7 +831,7 @@ mod tests {
         let enroll = request("POST", "enroll", &json!({}));
         let names_next = json!({ "service_key": b64(&next.public()) });
         // Signed with another key than the one it names: the named key isn't taken.
-        let forged = answer(&first, 200, &names_next);
+        let forged = answer(&enroll, &first, 200, &names_next);
         assert_eq!(
             checker.signature(&enroll, &forged),
             Ok(SignedWith::Brought(1))
@@ -760,24 +839,25 @@ mod tests {
         let get = request("GET", "apps", &json!(null));
         assert!(
             checker
-                .signature(&get, &answer(&next, 200, &json!({})))
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
                 .is_err(),
             "a key no verified enrollment answer named"
         );
         // Signed with the key it names: the run's second key.
-        let honest = answer(&next, 200, &names_next);
+        let honest = answer(&enroll, &next, 200, &names_next);
         assert_eq!(
             checker.signature(&enroll, &honest),
             Ok(SignedWith::Brought(2))
         );
         assert_eq!(
-            checker.signature(&get, &answer(&next, 200, &json!({}))),
+            checker.signature(&get, &answer(&get, &next, 200, &json!({}))),
             Ok(SignedWith::Brought(2))
         );
         // A refusal names no key.
         let refused = answer(
+            &enroll,
             &key(4),
-            409,
+            400,
             &json!({ "service_key": b64(&key(4).public()) }),
         );
         assert!(checker.signature(&enroll, &refused).is_err());
@@ -788,27 +868,52 @@ mod tests {
         let (first, next) = (key(2), key(3));
         let checker = checker(&first);
         let get = request("GET", "apps", &json!(null));
-        let signs =
-            |service: &IdentityKey| checker.signature(&get, &answer(service, 200, &json!({})));
+        let signs = |service: &IdentityKey| {
+            checker.signature(&get, &answer(&get, service, 200, &json!({})))
+        };
         assert_eq!(signs(&first), Ok(SignedWith::Brought(1)));
         assert_eq!(
             deliver(&checker, 1, &first, &first, None),
-            Ok(SignedWith::Generation(1))
+            Ok(SignedWith::Generation(1, 1))
         );
-        assert_eq!(signs(&first), Ok(SignedWith::Generation(1)));
+        assert_eq!(signs(&first), Ok(SignedWith::Generation(1, 1)));
         // The next generation's key, brought and not delivered: both sign for now.
         checker.account(&alice().id(), alice().public(), next.public());
         assert_eq!(signs(&next), Ok(SignedWith::Brought(2)));
-        assert_eq!(signs(&first), Ok(SignedWith::Generation(1)));
+        assert_eq!(signs(&first), Ok(SignedWith::Generation(1, 1)));
         assert_eq!(
             deliver(&checker, 2, &next, &next, Some(1)),
-            Ok(SignedWith::Generation(2))
+            Ok(SignedWith::Generation(2, 2))
         );
-        assert_eq!(signs(&next), Ok(SignedWith::Generation(2)));
+        assert_eq!(signs(&next), Ok(SignedWith::Generation(2, 2)));
         // The outgoing key is held no longer.
         assert!(signs(&first).is_err(), "the outgoing generation's key");
-        // The operator's answers stay the operator's.
-        assert_eq!(signs(&key(42)), Ok(SignedWith::OperatorKey));
+        // A switch's key, for no account the run knows, stays so.
+        assert_eq!(signs(&key(42)), Ok(SignedWith::SwitchKey));
+    }
+
+    #[test]
+    fn test_signature_name_stays_the_same_across_recovery() {
+        let service = key(2);
+        let checker = checker(&service);
+        let get = request("GET", "apps", &json!(null));
+        let refused = answer(&get, &service, 403, &json!({ "code": "not_current" }));
+        let name = || {
+            let with = checker.signature(&get, &refused).unwrap();
+            with.to_string()
+        };
+        let enrolled = name();
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        assert_eq!(name(), enrolled);
+        deliver(&checker, 2, &service, &service, Some(1)).unwrap();
+        assert_eq!(name(), enrolled);
+        let next = key(3);
+        checker.account(&alice().id(), alice().public(), next.public());
+        deliver(&checker, 3, &next, &next, Some(2)).unwrap();
+        let with = checker
+            .signature(&get, &answer(&get, &next, 403, &json!({})))
+            .unwrap();
+        assert_ne!(with.to_string(), enrolled);
     }
 
     #[test]
@@ -821,7 +926,7 @@ mod tests {
         assert!(wrong.is_err_and(|error| error.contains("its document names")));
         assert_eq!(
             deliver(&checker, 1, &first, &first, None),
-            Ok(SignedWith::Generation(1))
+            Ok(SignedWith::Generation(1, 1))
         );
         // Another key for a generation whose document is taken.
         checker.account(&alice().id(), alice().public(), third.public());
@@ -830,15 +935,15 @@ mod tests {
         // A document of a generation before the account's.
         assert_eq!(
             deliver(&checker, 2, &next, &next, Some(1)),
-            Ok(SignedWith::Generation(2))
+            Ok(SignedWith::Generation(2, 2))
         );
         let earlier = deliver(&checker, 1, &next, &next, None);
         assert!(earlier.is_err_and(|error| error.contains("generation 1 was taken")));
         // A refused delivery settles nothing.
         let put = request("PUT", "identity", &document(3, &third, Some(2)));
         assert_eq!(
-            checker.signature(&put, &answer(&next, 400, &json!({}))),
-            Ok(SignedWith::Generation(2))
+            checker.signature(&put, &answer(&put, &next, 400, &json!({}))),
+            Ok(SignedWith::Generation(2, 2))
         );
     }
 
@@ -870,14 +975,254 @@ mod tests {
             ahead.iter().any(|v| v.contains("a head of generation 2")),
             "{ahead:?}"
         );
-        // In an answer the operator key signed.
-        let operators = violations(&checker, &key(42), &head(&first, 1));
+        // In an answer about no account.
+        let unattached = violations(&checker, &key(42), &head(&first, 1));
         assert!(
-            operators
+            unattached
                 .iter()
-                .any(|v| v.contains("the operator key signed")),
-            "{operators:?}"
+                .any(|v| v.contains("in an answer about no account")),
+            "{unattached:?}"
         );
+    }
+
+    /// An answer to `request` that `service` signs carrying `head` as its `Switch-Head`.
+    fn answer_with_head(request: &Request, service: &IdentityKey, head: &str) -> Response {
+        let body = b"{}".to_vec();
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: Some(head),
+                body: &body,
+            },
+        );
+        Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, TIME),
+                Header::new(header::HEAD, head),
+            ],
+            body,
+        }
+    }
+
+    fn account_snapshot(checker: &Checker) -> Value {
+        let accounts = lock(&checker.accounts);
+        let account = accounts.get(&alice().id()).unwrap();
+        let chain: Vec<_> = account
+            .chain
+            .iter()
+            .map(|(seq, link)| json!([seq, link.chain_hash, link.prev]))
+            .collect();
+        json!({"current": account.current, "keys": account.keys,
+            "named": account.named, "chain_since": account.chain_since, "chain": chain})
+    }
+
+    fn answer_with_body_head(
+        request: &Request,
+        service: &IdentityKey,
+        body: &Value,
+        head: &str,
+    ) -> Response {
+        let mut response = answer(request, service, 200, body);
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: TIME,
+                head: Some(head),
+                body: &response.body,
+            },
+        );
+        response.headers = vec![
+            Header::new(header::SERVER_TIME, TIME),
+            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            Header::new(header::HEAD, head),
+        ];
+        response
+    }
+
+    #[test]
+    fn test_signature_rejected_enrollment_keeps_account_observations() {
+        rejected_enrollment("not a head");
+    }
+
+    #[test]
+    fn test_signature_wrong_enrollment_head_keeps_account_observations() {
+        rejected_enrollment(&head_from_another_key());
+    }
+
+    fn head_from_another_key() -> String {
+        SignedHead::sign(
+            &key(9),
+            &alice().public(),
+            &ChainTip {
+                generation: 2,
+                seq: 0,
+                chain_hash: ZERO_HASH,
+            },
+        )
+        .to_header()
+    }
+
+    fn rejected_enrollment(head: &str) {
+        let (first, next) = (key(2), key(3));
+        let checker = checker(&first);
+        let enroll = request("POST", "enroll", &json!({}));
+        let body = json!({"service_key": b64(&next.public())});
+        let before = account_snapshot(&checker);
+        let rejected = answer_with_body_head(&enroll, &next, &body, head);
+        assert!(checker.signature(&enroll, &rejected).is_err());
+        assert_eq!(account_snapshot(&checker), before);
+        let get = request("GET", "apps", &json!({}));
+        assert_eq!(
+            checker.signature(&get, &answer(&get, &first, 200, &json!({}))),
+            Ok(SignedWith::Brought(1))
+        );
+        assert!(
+            checker
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
+                .is_err()
+        );
+        assert_eq!(
+            checker.signature(&enroll, &answer(&enroll, &next, 200, &body)),
+            Ok(SignedWith::Brought(2))
+        );
+    }
+
+    #[test]
+    fn test_signature_rejected_delivery_keeps_account_observations() {
+        rejected_delivery("not a head");
+    }
+
+    #[test]
+    fn test_signature_wrong_delivery_head_keeps_account_observations() {
+        rejected_delivery(&head_from_another_key());
+    }
+
+    fn rejected_delivery(head: &str) {
+        let (first, next) = (key(2), key(3));
+        let checker = checker(&first);
+        deliver(&checker, 1, &first, &first, None).unwrap();
+        let chain = stubs(1, 2);
+        assert!(violations(&checker, &first, &shown(&[&chain[0], &chain[1]])).is_empty());
+        let before = account_snapshot(&checker);
+        let put = request("PUT", "identity", &document(2, &next, Some(1)));
+        let rejected = answer_with_body_head(&put, &next, &json!({}), head);
+        assert!(checker.signature(&put, &rejected).is_err());
+        assert_eq!(account_snapshot(&checker), before);
+        let get = request("GET", "apps", &json!({}));
+        assert_eq!(
+            checker.signature(&get, &answer(&get, &first, 200, &json!({}))),
+            Ok(SignedWith::Generation(1, 1))
+        );
+        assert!(
+            checker
+                .signature(&get, &answer(&get, &next, 200, &json!({})))
+                .is_err()
+        );
+        assert_eq!(
+            deliver(&checker, 2, &next, &next, Some(1)),
+            Ok(SignedWith::Generation(2, 2))
+        );
+    }
+
+    #[test]
+    fn test_signature_refuses_what_a_client_refuses() {
+        // As the client's check (Switch wire 7.1): a signed response header sent twice, and a
+        // head that doesn't verify as the account's, fail the answer.
+        let service = key(2);
+        let checker = checker(&service);
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        let get = request("GET", "feed", &json!(null));
+        let plain = answer(&get, &service, 200, &json!({}));
+        assert!(checker.signature(&get, &plain).is_ok());
+        for name in [header::SERVICE_SIGNATURE, header::SERVER_TIME] {
+            let mut repeated = plain.clone();
+            let copy = repeated.header(name).unwrap().to_owned();
+            repeated.headers.push(Header::new(name, &copy));
+            assert!(checker.signature(&get, &repeated).is_err(), "{name}");
+        }
+        let tip = ChainTip {
+            generation: 1,
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        };
+        let good = SignedHead::sign(&service, &alice().public(), &tip).to_header();
+        let headed = answer_with_head(&get, &service, &good);
+        assert!(checker.signature(&get, &headed).is_ok());
+        let mut doubled = headed.clone();
+        doubled.headers.push(Header::new(header::HEAD, &good));
+        assert!(checker.signature(&get, &doubled).is_err());
+        // Signed by another key, or not a head at all.
+        let forged = SignedHead::sign(&key(9), &alice().public(), &tip).to_header();
+        for head in [forged.as_str(), "not a head"] {
+            let answer = answer_with_head(&get, &service, head);
+            assert!(checker.signature(&get, &answer).is_err(), "{head}");
+        }
+    }
+
+    /// An answer to `request` that `service` signs over the empty body field, as one given
+    /// before the body is read.
+    fn unread_answer(
+        request: &Request,
+        service: &IdentityKey,
+        status: u16,
+        body: &Value,
+    ) -> Response {
+        let body = serde_json::to_vec(body).unwrap();
+        let signature = sign_response(
+            service,
+            &ResponseParts {
+                status,
+                request: SentRequest::of(request).received(false),
+                server_time: TIME,
+                head: None,
+                body: &body,
+            },
+        );
+        Response {
+            status,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, TIME),
+            ],
+            body,
+        }
+    }
+
+    #[test]
+    fn test_signature_takes_the_empty_body_field_only_before_the_body() {
+        // As the client's check (Switch wire 7.1): only a `413 too_large`, a `429
+        // rate_limited` and a `404 not_found` may verify over the empty body field, each with
+        // the status its code fixes; any other answer so signed fails.
+        let service = key(2);
+        let checker = checker(&service);
+        deliver(&checker, 1, &service, &service, None).unwrap();
+        let put = request("POST", "ops", &json!({ "ops": [] }));
+        let error = |code: &str| json!({ "code": code, "message": "m" });
+        for (status, code) in [
+            (413, "too_large"),
+            (429, "rate_limited"),
+            (404, "not_found"),
+        ] {
+            let answer = unread_answer(&put, &service, status, &error(code));
+            assert!(checker.signature(&put, &answer).is_ok(), "{code}");
+        }
+        for (status, body) in [
+            (200, json!({})),
+            (400, error("bad_request")),
+            (503, error("unavailable")),
+            (409, error("too_large")),
+            (404, error("rate_limited")),
+        ] {
+            let answer = unread_answer(&put, &service, status, &body);
+            assert!(checker.signature(&put, &answer).is_err(), "{status} {body}");
+        }
     }
 
     #[test]

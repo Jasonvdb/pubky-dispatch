@@ -6,12 +6,12 @@
 //! commits. Dropping it without committing, or a process that dies before the commit,
 //! rolls everything back.
 
-use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use super::{StoreError, from_db, to_db};
 use pubky_switch_core::sig::SignedDoc;
 
-use crate::keys::{KeyId, KeyStore, KeyStoreError, Mark, MarkCheck, check_mark};
+use crate::keys::KeyId;
 
 /// A new account, at enrollment (Switch wire 7.4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,8 +22,6 @@ pub struct NewAccount {
     pub identity_key: [u8; 32],
     /// The generation the account starts at.
     pub generation: u64,
-    /// The generation's service key.
-    pub service_key: KeyId,
     /// The service time of the enrollment.
     pub created_at_ms: u64,
     /// The limits the enrollment announces, kept for every later enrollment.
@@ -48,8 +46,6 @@ pub struct AccountHead {
     pub identity_key: [u8; 32],
     /// The generation the account serves.
     pub generation: u64,
-    /// The generation's service key.
-    pub service_key: KeyId,
     /// The last `seq` given out, shared by inbox entries and chain items; 0 before any.
     pub last_seq: u64,
     /// The newest chain item's `seq` and the chain hash there; `None` before the first.
@@ -74,19 +70,21 @@ impl AccountHead {
         }
     }
 
-    /// The chain head as a mark, `None` before the first chain item.
-    pub fn head_mark(&self) -> Option<Mark> {
-        self.chain.map(|(seq, chain_hash)| Mark {
-            generation: self.generation,
-            seq,
-            chain_hash,
-        })
+    /// The chain head, `None` before the first chain item: where the mark moves once it is
+    /// durable (Switch wire 7.3, "Moving it").
+    pub fn head_tip(&self) -> Option<pubky_switch_core::chain::ChainTip> {
+        self.chain
+            .map(|(seq, chain_hash)| pubky_switch_core::chain::ChainTip {
+                generation: self.generation,
+                seq,
+                chain_hash,
+            })
     }
 }
 
 /// A committed request: what it committed is durable, so an answer carrying a `seq`, a
-/// proof or a head may go out. Only [`AccountTxn::commit`] and
-/// [`AccountTxn::commit_marked`] make one.
+/// proof or a head may go out once the mark has moved to its head (Switch wire 7.3 step 10).
+/// Only [`AccountTxn::commit`] makes one.
 #[derive(Debug)]
 pub struct Committed {
     head: AccountHead,
@@ -99,6 +97,26 @@ impl Committed {
     }
 }
 
+/// An erasure that failed, retaining the account lock when its deletion was rolled back.
+/// The caller can withdraw its erasure record before another request judges that account
+/// (Switch wire 7.3, Table 3). A failed commit may have committed and retains no lock.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ErasureFailure {
+    #[source]
+    error: StoreError,
+    account: Option<Box<AccountTxn>>,
+}
+
+impl ErasureFailure {
+    /// The storage error and, when rollback succeeded, the still-locked account.
+    /// Without that account, the caller must acquire the identity lock and check whether
+    /// deletion committed before withdrawing its record.
+    pub fn into_parts(self) -> (StoreError, Option<Box<AccountTxn>>) {
+        (self.error, self.account)
+    }
+}
+
 /// Where a request's endpoint started, so a refusal can undo what it wrote
 /// ([`AccountTxn::rollback_to`]).
 #[derive(Debug)]
@@ -106,18 +124,6 @@ pub struct Savepoint {
     head: AccountHead,
     changed: bool,
     owed: usize,
-}
-
-/// Why a commit gave no [`Committed`].
-#[derive(Debug, thiserror::Error)]
-pub enum CommitError {
-    /// Nothing was committed.
-    #[error("not committed: {0}")]
-    NotCommitted(StoreError),
-    /// The state is committed, but the key's mark couldn't move to its head, so the head
-    /// mustn't go out. The answer is `503 unavailable`; a retry finds the committed state.
-    #[error("committed, but the key's mark didn't move: {0}")]
-    MarkNotMoved(KeyStoreError),
 }
 
 /// One request's transaction on one account, holding the account's lock.
@@ -160,13 +166,13 @@ impl std::fmt::Debug for AccountTxn {
     }
 }
 
-/// An account inserted and not committed yet: its creation time is raised past every erasure
-/// of its identity before it commits ([`Creation::commit`]), so a new account is never taken
-/// for one a restored database brought back (Switch spec 6.5).
+/// An account inserted under its identity's lock and not committed yet
+/// ([`super::IdentityLock::create`]): it commits at the creation time asked for, which the
+/// caller read under the same lock past every erasure's record and every mark it takes over
+/// (Switch wire 7.3, "The mark").
 pub struct Creation {
     tx: Transaction<'static, Postgres>,
     account: NewAccount,
-    erased_at_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for Creation {
@@ -177,45 +183,25 @@ impl std::fmt::Debug for Creation {
     }
 }
 
-/// Insert an account unless one exists: `None` if one does. The insert waits for an erasure
-/// of the identity still committing, at most `lock_timeout_ms` ([`StoreError::LockTimeout`],
-/// writing nothing); once it returns, the erasure the database still owes keys for is read,
-/// in the same transaction. The key store's ledger is read after it, by
-/// the caller: an erasure's owed rows go only once its ledger entry is recorded, so one of
-/// the two holds every erasure committed before the insert.
-pub(super) async fn begin_create(
-    pool: &PgPool,
+/// Insert an account in `tx`, which holds its identity's lock, unless one exists: `None` if
+/// one does.
+pub(super) async fn create(
+    mut tx: Transaction<'static, Postgres>,
     account: &NewAccount,
-    lock_timeout_ms: u64,
 ) -> Result<Option<Creation>, StoreError> {
     let identity_doc = account
         .identity_doc
         .as_ref()
         .map(super::identity::encode_doc)
         .transpose()?;
-    let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
-    // READ COMMITTED whatever the pool's default: the read after the insert takes a snapshot
-    // of its own, so it sees an erasure the insert waited for. The number is formatted, as
-    // `SET` takes no bind parameters.
-    sqlx::Executor::execute(
-        &mut *tx,
-        format!(
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-             SET LOCAL lock_timeout = {lock_timeout_ms}"
-        )
-        .as_str(),
-    )
-    .await
-    .map_err(StoreError::from_db)?;
     let created = sqlx::query(
-        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $5, $5, $6, $7) \
+        "INSERT INTO accounts (id, identity_key, generation, created_at_ms, \
+         stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $4, $5, $6) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(&account.id)
     .bind(account.identity_key.as_slice())
     .bind(to_db(account.generation, "generation")?)
-    .bind(account.service_key.as_str())
     .bind(to_db(account.created_at_ms, "created_at_ms")?)
     .bind(
         serde_json::to_vec(&account.limits)
@@ -229,43 +215,17 @@ pub(super) async fn begin_create(
     if created != 1 {
         return Ok(None);
     }
-    let erased_at: Option<i64> = sqlx::query_scalar(
-        "SELECT max(erased_at_ms) FROM erased_keys \
-         WHERE account_id = $1 AND reason = 'erasure'",
-    )
-    .bind(&account.id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(StoreError::from_db)?;
     Ok(Some(Creation {
         tx,
         account: account.clone(),
-        erased_at_ms: erased_at
-            .map(|at| from_db(at, "erased_at_ms"))
-            .transpose()?,
     }))
 }
 
 impl Creation {
-    /// Commit the account, created after `ledger_ms`, its identity's latest erasure in the
-    /// key store's ledger, and after any erasure the database still owes keys for: at the
-    /// time asked for, or 1 ms after the latest of those. The time it was created at.
-    pub async fn commit(mut self, ledger_ms: Option<u64>) -> Result<u64, StoreError> {
+    /// Commit the account, at the creation time asked for, and let its identity's lock go.
+    pub async fn commit(mut self) -> Result<(), StoreError> {
         let account = &self.account;
-        let floor = ledger_ms.max(self.erased_at_ms);
-        let created_at_ms = floor.map_or(account.created_at_ms, |at| {
-            account.created_at_ms.max(at.saturating_add(1))
-        });
-        if created_at_ms != account.created_at_ms {
-            sqlx::query(
-                "UPDATE accounts SET created_at_ms = $2, stamped_time_ms = $2 WHERE id = $1",
-            )
-            .bind(&account.id)
-            .bind(to_db(created_at_ms, "created_at_ms")?)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-        }
+        let created_at_ms = account.created_at_ms;
         for app_id in &account.revoked_apps {
             sqlx::query(
                 "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
@@ -292,15 +252,13 @@ impl Creation {
             &mut self.tx,
             &account.id,
             &account.enrollment_hash,
-            &account.service_key,
             created_at_ms,
             u64::MAX >> 1,
             true,
-            false,
         )
         .await?;
         self.tx.commit().await.map_err(StoreError::from_db)?;
-        Ok(created_at_ms)
+        Ok(())
     }
 }
 
@@ -311,7 +269,7 @@ impl AccountTxn {
         id: &str,
     ) -> Result<Option<Self>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, identity_key, generation, service_key, last_seq, chain_seq, chain_hash, \
+            "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, \
              stamped_time_ms, created_at_ms FROM accounts WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -322,7 +280,6 @@ impl AccountTxn {
             return Ok(None);
         };
         let identity_key: Vec<u8> = row.try_get("identity_key")?;
-        let service_key: String = row.try_get("service_key")?;
         let chain_seq: Option<i64> = row.try_get("chain_seq")?;
         let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
         let chain = match (chain_seq, chain_hash) {
@@ -339,8 +296,6 @@ impl AccountTxn {
             identity_key: <[u8; 32]>::try_from(identity_key.as_slice())
                 .map_err(|_| StoreError::Corrupt("identity_key"))?,
             generation: from_db(row.try_get("generation")?, "generation")?,
-            service_key: KeyId::parse(&service_key)
-                .map_err(|_| StoreError::Corrupt("service_key"))?,
             last_seq: from_db(row.try_get("last_seq")?, "last_seq")?,
             chain,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
@@ -405,21 +360,6 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Compare the account's chain head with its service key's mark. A state behind the
-    /// mark, or beside it, is lost committed state: the account fails stop with
-    /// `503 unavailable` until the signer starts a new generation (Switch spec 6.5,
-    /// Switch wire 7.3 step 10). Only a serving account is held to its mark.
-    pub async fn mark_check(&self, keys: &dyn KeyStore) -> Result<MarkCheck, KeyStoreError> {
-        let mark = keys.mark(&self.head.service_key).await?;
-        Ok(match (self.loaded.head_mark(), mark) {
-            (Some(head), mark) => check_mark(mark.as_ref(), &head),
-            (None, None) => MarkCheck::Unmarked,
-            // The key signed a head, and the state holds no chain at all.
-            (None, Some(mark)) if mark.generation == self.loaded.generation => MarkCheck::Behind,
-            (None, Some(_)) => MarkCheck::OtherGeneration,
-        })
-    }
-
     /// Note that this request changes the account, so its commit wakes the requests
     /// waiting on it ([`crate::changes`]). A request that gives out a `seq` or moves the
     /// chain head counts as a change without this; one that only stamps the time doesn't.
@@ -480,9 +420,8 @@ impl AccountTxn {
         &mut self.tx
     }
 
-    /// Commit the request. Once this returns, what it committed is durable, and the
-    /// answer may go out. For a staged account, or a request whose answer carries no head;
-    /// a serving account's answer with a head goes through [`AccountTxn::commit_marked`].
+    /// Commit the request. Once this returns, what it committed is durable; an answer that
+    /// carries a head goes out once the mark has moved to it (Switch wire 7.3 step 10).
     pub async fn commit(mut self) -> Result<Committed, StoreError> {
         // The documents this request superseded go with it (Switch wire 7.5).
         self.drop_stale_documents().await?;
@@ -566,19 +505,64 @@ impl AccountTxn {
     }
 
     /// Erase the account (Switch wire 7.4.16): delete its row, and with it every row of its
-    /// state, which all reference it with `ON DELETE CASCADE`; owe the deletion of its service
-    /// key, of a pending key of the next generation and of its apps' push keys (Switch wire
-    /// 8.1), in `erased_keys`, stamped `erased_at`; then commit. A request waiting on the account's changes wakes, and finds it gone. The
-    /// keys go after the commit ([`Store::erased_keys`]): a key deleted first, by an erasure
-    /// that then failed to commit, would leave an account no key can answer for.
-    ///
-    /// [`Store::erased_keys`]: super::Store::erased_keys
-    pub async fn erase(mut self, erased_at: u64) -> Result<(), StoreError> {
-        let pending_key = self.pending_key().await?;
-        // The push keys' deletion records no erasure: the service key's does (spec 6.5).
+    /// state, which all reference it with `ON DELETE CASCADE`; owe the deletion of its apps'
+    /// push keys (Switch wire 8.1) in `erased_keys`, stamped `erased_at`; then commit. A
+    /// request waiting on the account's changes wakes, and finds it gone. The push keys go
+    /// after the commit: a key deleted first, by an erasure that then failed to commit, would
+    /// leave a registration no key signs for.
+    pub async fn erase(self, erased_at: u64) -> Result<(), ErasureFailure> {
+        self.erase_with_outcome(erased_at, None, None).await
+    }
+
+    /// Delete and record the exact external attempt in the same commit.
+    pub(crate) async fn erase_recorded(
+        self,
+        attempt: &crate::marks::ErasureAttempt,
+        freshness: Option<&super::LockFreshness>,
+    ) -> Result<(), ErasureFailure> {
+        self.erase_with_outcome(attempt.erased_at_ms, Some(attempt), freshness)
+            .await
+    }
+
+    async fn erase_with_outcome(
+        mut self,
+        erased_at: u64,
+        attempt: Option<&crate::marks::ErasureAttempt>,
+        freshness: Option<&super::LockFreshness>,
+    ) -> Result<(), ErasureFailure> {
+        let savepoint = self.savepoint().await.map_err(|error| ErasureFailure {
+            error,
+            account: None,
+        })?;
+        let deleted = async {
+            super::erasure::require_fresh(freshness)?;
+            self.delete_account(erased_at).await?;
+            if let Some(attempt) = attempt {
+                super::erasure::record(&mut self.tx, &self.head.id, attempt, true).await?;
+                super::erasure::require_fresh(freshness)?;
+            }
+            Ok::<(), StoreError>(())
+        }
+        .await;
+        if let Err(error) = deleted {
+            let account = self
+                .rollback_to(savepoint)
+                .await
+                .ok()
+                .map(|()| Box::new(self));
+            return Err(ErasureFailure { error, account });
+        }
+        self.tx.commit().await.map_err(|error| ErasureFailure {
+            error: StoreError::from_db(error),
+            account: None,
+        })
+    }
+
+    /// Delete the account and owe its push keys, within the erasure's savepoint.
+    async fn delete_account(&mut self, erased_at: u64) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
-             SELECT push_key_id, account_id, $2, 'push' FROM push_registrations \
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) \
+             SELECT push_key_id, account_id, $2 FROM push_registrations \
              WHERE account_id = $1 ON CONFLICT (key_id) DO NOTHING",
         )
         .bind(&self.head.id)
@@ -595,53 +579,27 @@ impl AccountTxn {
         if deleted != 1 {
             return Err(StoreError::Corrupt("account row vanished under its lock"));
         }
-        for key in std::iter::once(&self.head.service_key).chain(pending_key.as_ref()) {
-            sqlx::query(
-                "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3) \
-                 ON CONFLICT (key_id) DO NOTHING",
-            )
-            .bind(key.as_str())
-            .bind(&self.head.id)
-            .bind(to_db(erased_at, "erased_at_ms")?)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-        }
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(crate::changes::CHANNEL)
             .bind(&self.head.id)
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;
-        self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(())
     }
 
-    /// Take `generation` and `service_key` as the account's position, its chain empty and no
-    /// `seq` given out yet, as at a generation change: the next chain item is the new
-    /// generation's first. What the store holds changes with the caller's own writes, in this
-    /// transaction; a rollback to a savepoint before it undoes both.
-    pub(super) fn start_head(&mut self, generation: u64, service_key: KeyId) {
+    /// Take `generation` as the account's position, its chain empty and no `seq` given out
+    /// yet, as at a generation start: the next chain item is the new generation's first.
+    /// What the store holds changes with the caller's own writes, in this transaction; a
+    /// rollback to a savepoint before it undoes both.
+    pub(super) fn start_head(&mut self, generation: u64) {
         self.head.generation = generation;
-        self.head.service_key = service_key;
         self.head.last_seq = 0;
         self.head.chain = None;
     }
 
-    /// Commit the request, then move the service key's mark to the committed chain head,
-    /// so the key never signs a state behind it. Only then may the answer, with its signed
-    /// head, go out (Switch wire 7.3 step 10).
-    ///
-    /// The order matters. A mark moved before the commit, by a commit that then failed,
-    /// would stop the account for good; a state committed before its mark moved is only
-    /// ahead of the mark, which is safe, and the next answer moves it.
-    pub async fn commit_marked(self, keys: &dyn KeyStore) -> Result<Committed, CommitError> {
-        let committed = self.commit().await.map_err(CommitError::NotCommitted)?;
-        if let Some(head) = committed.head.head_mark() {
-            keys.advance_mark(&committed.head.service_key, head)
-                .await
-                .map_err(CommitError::MarkNotMoved)?;
-        }
-        Ok(committed)
+    /// The account's position as this request loaded it, before its changes.
+    pub fn loaded(&self) -> &AccountHead {
+        &self.loaded
     }
 }

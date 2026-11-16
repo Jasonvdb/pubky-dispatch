@@ -634,14 +634,14 @@ pub(crate) struct LeaveState {
 }
 
 /// `service_time`: the highest service time verified, with the key that signed it, and
-/// the offset from the device clock at the latest answer (Switch spec 10.1).
+/// the optional offset from the latest stamped answer (Switch spec 10.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ServiceTime {
     #[serde(with = "serde_b64")]
     pub(crate) key: [u8; 32],
     pub(crate) highest_ms: u64,
-    /// Service time less device time at the latest verified answer.
-    pub(crate) offset_ms: i64,
+    /// Service time less device time at the latest stamped answer; absent until one.
+    pub(crate) offset_ms: Option<i64>,
 }
 
 /// A transaction: the writes of one commit, in the app's namespace, and the duty events

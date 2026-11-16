@@ -1,11 +1,10 @@
 //! A provider loss at this service (Switch spec 12.6; Switch wire 3.3, 3.7, 7.4.2): the
-//! recovery a generation begins with, the enrollments a generation change retires, and the
+//! recovery a generation begins with, the App IDs held for the next generation, and the
 //! account starting afresh.
 
 use sqlx::Row;
 
 use super::{AccountTxn, StoreError, from_db, identity::time_to_db, to_db};
-use crate::keys::KeyId;
 
 /// The recovery the generation the account serves began with (Switch wire 7.4.12
 /// `recovery`).
@@ -48,24 +47,18 @@ const GENERATION_STATE: &[&str] = &[
 ];
 
 /// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
-/// 3.7): the App IDs kept for good, the enrollment answers and the retired ones' records, and
-/// the keys owed deleting. The account's row stays too, its service time and the
-/// directory's two versions with it.
-pub const RECOVERY_KEEPS: &[&str] = &[
-    "kept_app_ids",
-    "enrollment_answers",
-    "retired_enrollments",
-    "erased_keys",
-];
+/// 3.7): the App IDs kept for good, the enrollment answers, and the push keys owed deleting.
+/// The account's row stays too, its service time and the directory's two versions with it.
+pub const RECOVERY_KEEPS: &[&str] = &["kept_app_ids", "enrollment_answers", "erased_keys"];
 
 /// Every table with an account column that a recovery in place empties: the generation's own state,
 /// `claim_entries` with their claims, `divergent_uploads` with their records, and
-/// `pending_revoked_apps`, which joins `kept_app_ids`.
+/// `held_revoked_apps`, which joins `kept_app_ids`.
 /// A table added later with an account column must be classed here or in
 /// [`RECOVERY_KEEPS`], which a test of every such table checks.
 pub fn recovery_clears() -> Vec<&'static str> {
     let mut tables = GENERATION_STATE.to_vec();
-    tables.extend(["claim_entries", "pending_revoked_apps"]);
+    tables.extend(["claim_entries", "held_revoked_apps"]);
     // A record's divergent uploads (Switch wire 7.4.14) go with their record.
     tables.push("divergent_uploads");
     tables
@@ -144,12 +137,12 @@ impl AccountTxn {
         Ok(true)
     }
 
-    /// The App IDs held with the pending key, from the `revoked_apps` of the enrollments it
-    /// answered (Switch wire 3.7).
-    pub async fn pending_revoked_apps(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
+    /// The App IDs held for the next generation: the `revoked_apps` of the enrollments
+    /// answered at the serving account since its current generation began (Switch wire 3.7).
+    pub async fn held_revoked_apps(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
         let id = self.head().id.clone();
         let rows: Vec<Vec<u8>> =
-            sqlx::query_scalar("SELECT app_id FROM pending_revoked_apps WHERE account_id = $1")
+            sqlx::query_scalar("SELECT app_id FROM held_revoked_apps WHERE account_id = $1")
                 .bind(id)
                 .fetch_all(self.conn())
                 .await
@@ -157,18 +150,18 @@ impl AccountTxn {
         rows.iter()
             .map(|app| {
                 <[u8; 16]>::try_from(app.as_slice())
-                    .map_err(|_| StoreError::Corrupt("pending revoked app_id"))
+                    .map_err(|_| StoreError::Corrupt("held revoked app_id"))
             })
             .collect()
     }
 
-    /// Hold `apps`, an enrollment's `revoked_apps` answered with the pending key, until the
-    /// delivery naming that key starts the new generation (Switch wire 3.7).
-    pub async fn hold_pending_revoked_apps(&mut self, apps: &[[u8; 16]]) -> Result<(), StoreError> {
+    /// Hold `apps`, an enrollment's `revoked_apps` answered at the serving account, until a
+    /// delivery starts the next generation (Switch wire 3.7).
+    pub async fn hold_revoked_apps(&mut self, apps: &[[u8; 16]]) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         for app in apps {
             sqlx::query(
-                "INSERT INTO pending_revoked_apps (account_id, app_id) VALUES ($1, $2) \
+                "INSERT INTO held_revoked_apps (account_id, app_id) VALUES ($1, $2) \
                  ON CONFLICT DO NOTHING",
             )
             .bind(&id)
@@ -180,22 +173,27 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// The generation of the key the account answered the enrollment with document hash
-    /// `hash` with, if a generation change has retired that key since (Switch wire 3.7).
-    pub async fn retired_enrollment(&mut self, hash: &[u8; 32]) -> Result<Option<u64>, StoreError> {
+    /// Join the App IDs held for the next generation to the account's tombstones, dated
+    /// `at_ms`, and hold none any more: a delivery starts the next generation (Switch wire
+    /// 3.3, 3.7).
+    pub async fn join_held_revoked_apps(&mut self, at_ms: u64) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let generation: Option<i64> = sqlx::query_scalar(
-            "SELECT generation FROM retired_enrollments \
-             WHERE account_id = $1 AND enrollment_hash = $2",
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+             SELECT account_id, app_id, 'enrolled', $2 FROM held_revoked_apps \
+             WHERE account_id = $1 ON CONFLICT DO NOTHING",
         )
-        .bind(id)
-        .bind(hash.as_slice())
-        .fetch_optional(self.conn())
+        .bind(&id)
+        .bind(time_to_db(at_ms)?)
+        .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        generation
-            .map(|g| from_db(g, "retired generation"))
-            .transpose()
+        sqlx::query("DELETE FROM held_revoked_apps WHERE account_id = $1")
+            .bind(&id)
+            .execute(self.conn())
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(())
     }
 
     /// Start the recovery of a staged account that holds no document, at the first
@@ -213,41 +211,29 @@ impl AccountTxn {
         if self.head().chain.is_some() {
             return Err(StoreError::Corrupt("a staged account with a chain"));
         }
-        let key = self.head().service_key.clone();
-        self.set_generation(generation, &key, recovery_from, at_ms, stages)
+        self.set_generation(generation, recovery_from, at_ms, stages)
             .await
     }
 
-    /// Start a recovery in place (Switch wire 3.3, 3.7): the account serves the next
-    /// generation under its pending key, `new_key`, and starts afresh. The caller holds the
-    /// account's row lock and has taken its keying lock exclusive
-    /// ([`AccountTxn::exclude_signers`]), so nothing signs with the outgoing key once this
-    /// commits.
+    /// Start the account afresh at `generation`, the recovery of `recovery_from` at `at_ms`
+    /// (Switch wire 3.3, 3.7, 7.3 Table 2): a provider loss in place, or the start a failing
+    /// or bounded account takes. Admission is staged when `stages` (Switch spec 12.6 step 2).
     ///
     /// It keeps the account's service time, the directory's `directory_version` and
     /// `apps_version`, which are columns of its row and never restart for an account (Switch
-    /// wire 7.4.10), its App IDs kept for good, joined by the `revoked_apps` held with the
-    /// pending key, and the enrollments it answered: those that
-    /// named the pending key now name the account's key; those that named the outgoing key
-    /// are kept by hash and generation alone ([`AccountTxn::retired_enrollment`]), at most
-    /// `max_enrollments`. Everything else of the generation goes (`GENERATION_STATE`),
-    /// and so does the held `identity.json`, which the caller replaces in the same
-    /// transaction. The outgoing key is owed deleting, retired, not erased: it goes after the
-    /// commit, as an erasure's keys do, and records no erasure; so are the push keys of the
-    /// registrations that go (Switch wire 8.1).
-    pub async fn start_recovery_in_place(
+    /// wire 7.4.10), its App IDs kept for good, joined by those held for the next generation,
+    /// and the enrollments it answered. Everything else of the generation goes
+    /// (`GENERATION_STATE`), and so does the held `identity.json`, which the caller replaces
+    /// in the same transaction. The push keys of the registrations that go are owed
+    /// deleting (Switch wire 8.1).
+    pub async fn start_afresh(
         &mut self,
-        new_key: &KeyId,
+        generation: u64,
         recovery_from: u64,
         at_ms: u64,
-        max_enrollments: u64,
         stages: bool,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let old_key = self.head().service_key.clone();
-        let generation = recovery_from
-            .checked_add(1)
-            .ok_or(StoreError::Corrupt("generation overflow"))?;
         // The push registrations go with the generation, their keys owed (Switch wire 8.1).
         self.drop_push_registrations(None).await?;
         for table in GENERATION_STATE {
@@ -257,109 +243,39 @@ impl AccountTxn {
                 .await
                 .map_err(StoreError::from_db)?;
         }
-        sqlx::query(
-            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
-             SELECT account_id, app_id, 'enrolled', $2 FROM pending_revoked_apps \
-             WHERE account_id = $1 ON CONFLICT DO NOTHING",
-        )
-        .bind(&id)
-        .bind(time_to_db(at_ms)?)
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        sqlx::query("DELETE FROM pending_revoked_apps WHERE account_id = $1")
+        self.join_held_revoked_apps(at_ms).await?;
+        sqlx::query("UPDATE accounts SET identity_doc = NULL, identity_proof = NULL WHERE id = $1")
             .bind(&id)
             .execute(self.conn())
             .await
             .map_err(StoreError::from_db)?;
-        // The retired answers' record, then their deletion, in this one commit (wire 3.7).
-        sqlx::query(
-            "INSERT INTO retired_enrollments (account_id, enrollment_hash, generation) \
-             SELECT account_id, enrollment_hash, $3 FROM enrollment_answers \
-             WHERE account_id = $1 AND service_key = $2 ORDER BY kept_order \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&id)
-        .bind(old_key.as_str())
-        .bind(to_db(recovery_from, "generation")?)
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        sqlx::query(
-            "DELETE FROM retired_enrollments WHERE account_id = $1 AND enrollment_hash IN ( \
-             SELECT enrollment_hash FROM retired_enrollments WHERE account_id = $1 \
-             ORDER BY retired_order DESC OFFSET $2)",
-        )
-        .bind(&id)
-        .bind(to_db(max_enrollments, "max_enrollments")?)
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        sqlx::query("DELETE FROM enrollment_answers WHERE account_id = $1 AND service_key = $2")
-            .bind(&id)
-            .bind(old_key.as_str())
-            .execute(self.conn())
-            .await
-            .map_err(StoreError::from_db)?;
-        // The pending key's answers are the account key's now, which a rebuild at the serving
-        // account wouldn't give: kept as long as the account.
-        sqlx::query(
-            "UPDATE enrollment_answers SET rebuildable = false \
-             WHERE account_id = $1 AND service_key = $2",
-        )
-        .bind(&id)
-        .bind(new_key.as_str())
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        sqlx::query(
-            "UPDATE accounts SET pending_key = NULL, identity_doc = NULL, identity_proof = NULL \
-             WHERE id = $1",
-        )
-        .bind(&id)
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        sqlx::query(
-            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms, reason) \
-             VALUES ($1, $2, $3, 'retired') ON CONFLICT (key_id) DO NOTHING",
-        )
-        .bind(old_key.as_str())
-        .bind(&id)
-        .bind(time_to_db(at_ms)?)
-        .execute(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
-        self.set_generation(generation, new_key, recovery_from, at_ms, stages)
+        self.set_generation(generation, recovery_from, at_ms, stages)
             .await
     }
 
-    /// Write `generation`, `key` and the recovery of `recovery_from` at `at_ms`, staging
-    /// admission when `stages`, to the account's row, and take them as its position, its
-    /// chain empty.
+    /// Write `generation` and the recovery of `recovery_from` at `at_ms`, staging admission
+    /// when `stages`, to the account's row, and take them as its position, its chain empty.
     async fn set_generation(
         &mut self,
         generation: u64,
-        key: &KeyId,
         recovery_from: u64,
         at_ms: u64,
         stages: bool,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "UPDATE accounts SET generation = $2, service_key = $3, recovery_from = $4, \
-             recovery_declared_at_ms = $5, admission_staged = $6 WHERE id = $1",
+            "UPDATE accounts SET generation = $2, recovery_from = $3, \
+             recovery_declared_at_ms = $4, admission_staged = $5 WHERE id = $1",
         )
         .bind(&id)
         .bind(to_db(generation, "generation")?)
-        .bind(key.as_str())
         .bind(to_db(recovery_from, "recovery_from")?)
         .bind(time_to_db(at_ms)?)
         .bind(stages)
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        self.start_head(generation, key.clone());
+        self.start_head(generation);
         Ok(())
     }
 }

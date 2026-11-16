@@ -3,9 +3,10 @@
 //! version drops it.
 //!
 //! The vectors' switch is at `seq` 41, past what `chain.json` replays here, so their answers
-//! are compared byte for byte but for `Switch-Head`, which the answer's signature doesn't
-//! cover: that is that switch's head. Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see
-//! `store::testing`.
+//! are compared byte for byte but for `Switch-Head`, that switch's head, and the response
+//! signature, which covers it: the signature is checked with the vector's service key over
+//! the head this switch sends (Switch wire 7.1). Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run
+//! them; see `store::testing`.
 
 // Test helpers fail the test on any error.
 #![allow(clippy::expect_used, clippy::panic)]
@@ -62,9 +63,10 @@ fn fetch_request() -> Value {
     )
 }
 
-/// The answer matches the vector byte for byte, its status, body, server time and
-/// signature, but for `Switch-Head`, which is the vectors' switch's (module doc).
-fn assert_matches_but_the_head(answer: &SwitchResponse, expected: &Value) {
+/// The answer to `request` matches the vector byte for byte, its status, body and server
+/// time, but for `Switch-Head`, which is the vectors' switch's, and the signature over it,
+/// which verifies with the vector's service key (module doc).
+fn assert_matches_but_the_head(answer: &SwitchResponse, request: &Value, expected: &Value) {
     let name = expected["name"].as_str().expect("name");
     assert_eq!(
         u64::from(answer.status),
@@ -77,11 +79,20 @@ fn assert_matches_but_the_head(answer: &SwitchResponse, expected: &Value) {
         "{name}"
     );
     for (name, value) in expected["headers"].as_object().expect("headers") {
-        if name != header::HEAD {
+        if name != header::HEAD && name != header::SERVICE_SIGNATURE {
             assert_eq!(header_text(answer, name), value.as_str(), "{name}");
         }
     }
     assert!(header_text(answer, header::HEAD).is_some(), "Switch-Head");
+    let key: [u8; 32] =
+        pubky_switch_core::enc::unb64(expected["public_key"].as_str().expect("key"))
+            .expect("b64")
+            .try_into()
+            .expect("32");
+    assert!(
+        signed_with(answer, &key, &Sent::of(&vector_request(request))),
+        "signed with the vector's service key"
+    );
 }
 
 /// The time the vectors' requests are answered at, which this account's requests are signed
@@ -301,6 +312,7 @@ async fn test_handover_vectors_store_and_fetch() {
         .await;
     assert_matches_but_the_head(
         &stored,
+        &store_request(),
         &http_case("responses", "signer: the hand-over stored for the phone"),
     );
     let expected = http_case(
@@ -317,7 +329,7 @@ async fn test_handover_vectors_store_and_fetch() {
         .service
         .handle(vector_request(&fetch_request()))
         .await;
-    assert_matches_but_the_head(&fetched, &expected);
+    assert_matches_but_the_head(&fetched, &fetch_request(), &expected);
     assert_eq!(fetched.body, phone_body());
     replay.db.drop_database().await.expect("drop");
 }
@@ -681,7 +693,7 @@ async fn test_handover_staged_account_is_unavailable() {
     let Some(replay) = replay().await else { return };
     let enrolled = http_case(
         "responses",
-        "signer: enrollment answer, signed with the new account's key",
+        "signer: enrollment answer, signed with the service key",
     );
     set_time(
         &replay.clock,

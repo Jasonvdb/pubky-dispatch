@@ -21,7 +21,7 @@ use pubky_switch_core::shared::RecordState;
 use serde_json::json;
 
 use super::batch::{VerifiedApp, check_own_app};
-use super::recovery::{AdmissionEnd, chain_transition};
+use super::recovery::AdmissionEnd;
 use super::{Answer, Service, batch::refused, store_error};
 use crate::{
     http::error::ApiError,
@@ -381,7 +381,9 @@ impl Service {
             proofs: checked.proofs,
             at: time_ms,
         };
-        let proof = chain_transition(txn, signer, &transition, seq, time_ms).await?;
+        let proof = self
+            .chain_transition(txn, signer, &transition, seq, time_ms)
+            .await?;
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let body = json!({
             "result": changes.to_value(),

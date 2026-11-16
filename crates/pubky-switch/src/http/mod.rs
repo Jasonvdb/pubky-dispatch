@@ -128,16 +128,63 @@ pub fn check_origin(origin: &str, allow_insecure: bool) -> Result<(), &'static s
 pub struct SwitchRequest {
     /// The route.
     pub route: Route,
-    /// The method, upper case.
+    /// The method, exactly as sent; a routed one is in upper case, as the routes name it.
     pub method: String,
     /// The path and query exactly as sent.
     pub path_and_query: String,
-    /// The headers.
+    /// The headers, as received.
     pub headers: HeaderMap,
-    /// The body, within its call's cap.
+    /// The body, read whole, within its call's cap.
     pub body: Bytes,
     /// The network source; `None` when the service can't tell it.
     pub source: Option<NetworkSource>,
+}
+
+impl SwitchRequest {
+    /// The signed request headers as received ([`SignedHeaders::of`]).
+    pub fn signed_headers(&self) -> SignedHeaders {
+        SignedHeaders::of(&self.headers)
+    }
+}
+
+/// The signed request headers of a request (Switch wire 7.1), its seven `Switch-*` request
+/// headers, each value exactly as received, its bytes, in the order received. The service
+/// reads them only through this type, never from the HTTP header map, so no conversion
+/// drops a value it can't read: a value repeated, empty or not printable ASCII is seen, and
+/// refused at routing ([`SignedHeaders::broken_rule`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignedHeaders(pubky_switch_core::http::ReceivedHeaders);
+
+impl SignedHeaders {
+    /// The one conversion of an HTTP header map into the signed request headers: every value
+    /// of each of the seven, as its bytes, so it represents each exactly.
+    pub fn of(map: &HeaderMap) -> Self {
+        SignedHeaders(pubky_switch_core::http::ReceivedHeaders::of(
+            map.iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        ))
+    }
+
+    /// The headers as a received request covers them (Switch wire 7.1).
+    pub fn received(&self) -> &pubky_switch_core::http::ReceivedHeaders {
+        &self.0
+    }
+
+    /// The header rule they break, as the reason of its `400 bad_request` (Switch wire 7.1
+    /// "Each header once, as text").
+    pub fn broken_rule(&self) -> Option<&'static str> {
+        self.0.broken_rule()
+    }
+
+    /// The text of the header `name`: `None` when it is absent, and also when it is
+    /// repeated, empty or not printable ASCII, which a request is refused for at routing
+    /// before anything reads it.
+    pub fn text(&self, name: &str) -> Option<&str> {
+        match self.0.values(name) {
+            [value] if self.0.broken_rule().is_none() => std::str::from_utf8(value).ok(),
+            _ => None,
+        }
+    }
 }
 
 /// An answer from the [`Handler`].
@@ -153,19 +200,31 @@ pub struct SwitchResponse {
 }
 
 /// A request the transport refuses before the handler runs it. The handler still answers
-/// it, so that the answer is signed like every other.
+/// it, so that the answer is signed like every other, over the request as received (Switch
+/// wire 7.1).
 #[derive(Debug)]
 pub enum Refusal {
-    /// No such route: `404`, signed with the operator key (Switch wire 7.3 step 1).
+    /// No such route: `404`, signed with the service key (Switch wire 7.3 step 1).
     UnknownRoute {
-        /// The request's signature header, if any, which the answer's signature covers.
+        /// The method, exactly as sent.
+        method: String,
+        /// The path and query exactly as sent.
+        path_and_query: String,
+        /// The request's headers.
         headers: HeaderMap,
+        /// The body, read whole within the cap of a request without a route.
+        body: Bytes,
     },
     /// A body over its call's cap: `413 too_large`, before the body is read (Switch wire 7.1).
     TooLarge {
         /// The route, if the request had one.
         route: Option<Route>,
-        /// The request's headers.
+        /// The method, exactly as sent.
+        method: String,
+        /// The path and query exactly as sent.
+        path_and_query: String,
+        /// The request's headers. The body isn't read, so the answer binds none (Switch wire
+        /// 7.1).
         headers: HeaderMap,
         /// The cap.
         cap: u64,
@@ -227,6 +286,8 @@ async fn dispatch(
             .handler
             .refuse(Refusal::TooLarge {
                 route: routed,
+                method,
+                path_and_query,
                 headers: parts.headers,
                 cap,
             })
@@ -239,6 +300,8 @@ async fn dispatch(
                     .handler
                     .refuse(Refusal::TooLarge {
                         route: routed,
+                        method,
+                        path_and_query,
                         headers: parts.headers,
                         cap,
                     })
@@ -249,7 +312,10 @@ async fn dispatch(
                     shared
                         .handler
                         .refuse(Refusal::UnknownRoute {
+                            method,
+                            path_and_query,
                             headers: parts.headers,
+                            body,
                         })
                         .await
                 }

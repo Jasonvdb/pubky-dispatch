@@ -159,6 +159,7 @@ impl Signer {
             origin: app.origin.clone(),
             service_key: app.service_key,
             limits,
+            created: None,
         });
         let flow = Flow::TakingOver {
             handover: stored.handover,

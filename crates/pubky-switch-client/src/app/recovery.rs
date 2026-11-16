@@ -436,7 +436,7 @@ impl App {
             .state
             .service_time
             .filter(|time| time.key == old_key)
-            .map(|time| time.offset_ms);
+            .and_then(|time| time.offset_ms);
         // Switch spec 3.6, 12.6 step 1: `n` higher than every `n` the app registered.
         let highest = self
             .state
@@ -776,7 +776,7 @@ impl App {
             self.state
                 .service_time
                 .filter(|time| time.key == new_key)
-                .map(|time| time.offset_ms),
+                .and_then(|time| time.offset_ms),
         ) {
             loss.clock_offset_ms = old.abs_diff(new);
         }

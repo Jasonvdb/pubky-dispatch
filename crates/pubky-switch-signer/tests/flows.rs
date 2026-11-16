@@ -1144,10 +1144,9 @@ async fn test_signer_run_never_republishes_over_another_body_or_a_newer_copy() {
 }
 
 #[tokio::test]
-async fn test_signer_too_large_is_a_definite_refusal() {
-    // The switch answers a delivery `413 too_large` (Switch wire 7.1): the same bytes would be
-    // refused again, so the delivery ends, its version spent, and signing goes on instead of
-    // retrying it for ever.
+async fn test_signer_too_large_that_binds_the_body_is_final() {
+    // A `413 too_large` that binds the delivery as sent, its body included, refuses those
+    // bytes for good: the version stays spent and isn't sent again (Switch wire 7.1).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     world
@@ -1161,7 +1160,41 @@ async fn test_signer_too_large_is_a_definite_refusal() {
     assert!(
         matches!(
             error,
-            SignerError::Switch(ClientError::Switch {
+            SignerError::Switch(ClientError::Switch { status: 413, .. })
+        ),
+        "{error:?}"
+    );
+    let refused = world.sent_docs().last().unwrap().clone();
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        world
+            .sent_docs()
+            .iter()
+            .filter(|doc| doc.version() == refused.version())
+            .count(),
+        1,
+        "the refused version isn't sent again"
+    );
+}
+
+#[tokio::test]
+async fn test_signer_too_large_before_the_body_isnt_final() {
+    // A `413 too_large` the switch gave before it read the body binds no body: it may answer
+    // a request whose length was changed on the way, so the delivery isn't refused for good.
+    // Its version isn't spent: the next run delivers the same bytes (Switch wire 7.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world
+        .switch
+        .fail_next(pubky_switch_client::testing::Fault::BeforeTheBody {
+            path: "/identity".into(),
+            code: pubky_switch_core::http::ErrorCode::TooLarge,
+        });
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::BodyUnread {
                 status: 413,
                 code: pubky_switch_core::http::ErrorCode::TooLarge,
                 ..
@@ -1169,7 +1202,15 @@ async fn test_signer_too_large_is_a_definite_refusal() {
         ),
         "{error:?}"
     );
-    let next = signer.set_record_max_age(Some(60)).await.unwrap();
-    assert_eq!(next.body().record_max_age, Some(60));
+    let refused = world.sent_docs().last().unwrap().clone();
+    signer.run_due().await.unwrap();
+    let sent = world.sent_docs();
+    assert_eq!(
+        sent.iter()
+            .filter(|doc| doc.version() == refused.version())
+            .count(),
+        2,
+        "the same version sent again"
+    );
     world.assert_no_version_sent_twice();
 }

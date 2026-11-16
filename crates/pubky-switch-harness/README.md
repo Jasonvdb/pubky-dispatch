@@ -64,16 +64,35 @@ A revocation whose answer was lost isn't sent again while the signer can read th
 reads the account's apps and finds it done.
 
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
-next read of the account's apps gets the operator's `404`, which nobody can authenticate, so
-it holds the account as erased but unconfirmed. It concludes the account is erased at its
-first run 24 hours after that `404`, every read in between having met it too. The flow moves
-the world's clock, which is the signer's device clock, by those 24 hours.
+next read of the account's apps gets the not-hosted `404`, signed with the service key it
+pinned and bound to its own request, which confirms the erasure at once.
 
-An app of an erased account waits too (Switch spec 12.7 step 5): its reads meet the
-operator's `404` and no `identity.json` on the Homeserver, which the signer's erasure took
-off, and it takes the account as gone at the fifth read, each at least 6 hours after the one
-before, 24 hours after the first. Both erasure flows run that wait, and a read short of the
-24 hours that raises nothing.
+An app of an erased account takes it as gone at its next read (Switch spec 12.7 step 5): the
+read meets the not-hosted `404`, signed with the service key the app pinned, and the
+Homeserver holds no `identity.json`, which the signer's erasure took off. Neither alone is
+enough; both together are an erasure, at once.
+
+## The recovery notice
+
+Five world controls put both switches in the state a restore or a loss leaves (Switch wire
+7.3, Tables 1 to 3; Switch spec 6.5). The scripted switch takes each with its own test
+control; the service is stopped, the change made with its own crates on its database and key
+directory, and started again, so it reads its marks and retirements anew:
+
+| Control | The scripted switch | The service, stopped | Table 1 |
+|---|---|---|---|
+| `World::restore_behind_mark` | `restore_to` one `seq` back | `MarkStore::advance` one `seq` past the state | failing, `behind` |
+| `World::fork_mark` | `fork_mark` | the mark written anew at its pair with another chain hash | failing, `fork` |
+| `World::lose_mark` | `lose_mark` | `MarkStore::delete` | failing, `mark_lost` |
+| `World::lose_account` | `lose_account` | the store's deletion of the account row, the mark kept | lost, `behind` |
+| `World::retire` | `retire` | the operator's step, `pubky_switch::retire::run` | permanent |
+
+The `recovery notice` flows have the wallet, the signer and a reader of the public
+`identity.json` call in each state, hold every answer to the signed `503 recovery_required`
+with the `current` Table 1 gives and no `Switch-Head`, and recover in place: the signer's
+start of the next generation with `recovery_from` makes the account serve, and the wallet
+follows it. At a lost account the enrollment takes the mark over, and the bounded account
+answers the notice until the start.
 
 ## Not covered
 
@@ -196,7 +215,7 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Eighty-three flows take about three minutes in a
+that ran the flows had less left. Eighty-eight flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
 

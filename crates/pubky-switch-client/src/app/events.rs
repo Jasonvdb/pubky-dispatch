@@ -533,10 +533,10 @@ pub enum AppEvent {
     /// The account is frozen for a move: writes wait for the next service (Switch spec
     /// 12.5).
     Moved,
-    /// The device clock and the service's differ by more than the clock tolerance:
-    /// automatic attempts pause (Switch spec 10.1).
+    /// A stamped clock difference or the verified service time's lead over the device
+    /// clock exceeds the tolerance: automatic attempts pause (Switch spec 10.1).
     ClockSkew {
-        /// The difference in milliseconds.
+        /// The difference or known forward lower bound, in milliseconds.
         skew_ms: u64,
     },
     /// A sender identity's `identity.json` was seen with two bodies at one version; the app

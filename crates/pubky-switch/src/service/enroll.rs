@@ -1,32 +1,28 @@
 //! `POST /v1/enroll` (Switch wire 3.7, 7.4.1).
 
-use std::sync::Arc;
-
 use pubky_switch_core::{
     Error as CoreError,
     enc::pubky_key,
-    http::{self as wire_http, RequestTarget, header},
+    http::{self as wire_http, RequestTarget, Uncompared, header},
     records::{Enrollment, EnrollmentAnswer, IdentityDoc, Limits as AnnouncedLimits},
     sig::SignedDoc,
 };
 
 use super::{
     Answer, Service,
-    erase::to_the_end,
-    keyed::Proof,
-    rules::{
-        AccountState, Caller, EnrollmentKey, decode_claim, enrollment_key, names_this_service,
-    },
+    rules::{Caller, decode_claim},
+    signed::{AnswerTime, Asked, sign_answer},
     store_error,
+    verdict::{self, RequestClass, Route, Verdict},
 };
 use crate::{
     http::{
         SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode},
     },
-    keys::{KeyId, KeyStore, ServiceKey},
     limits::{Limits, fixed},
-    store::{NewAccount, StoreError},
+    marks::{MarkRead, MarkWrite},
+    store::NewAccount,
 };
 
 /// The limits an enrollment answer announces (Switch wire 3.7).
@@ -65,70 +61,64 @@ pub fn read_enrollment(
     })
 }
 
-/// Why an enrollment created no account.
-enum Uncreated {
-    /// The erasure ledger couldn't be read: nothing was committed.
-    LedgerUnread,
-    /// The database failed or refused the creation.
-    Store(crate::store::StoreError),
+/// What an enrollment's answer names, and the service time it is answered at.
+struct Enrolled {
+    time_ms: u64,
+    limits: AnnouncedLimits,
+    /// The account's creation time (Switch wire 3.7).
+    created: u64,
 }
 
 impl Service {
-    /// `POST /v1/enroll`, from the signer. Errors before an account exists are signed with
-    /// the operator key; the answer with the key it names, without a head.
+    /// `POST /v1/enroll`, from the signer (Switch wire 3.7, 7.4.1): the answer, and every
+    /// error, signed with the service's current key, the one the answer names, without a
+    /// head.
     pub(super) async fn enroll(
         &self,
         request: &SwitchRequest,
         base_ms: u64,
-        request_signature: Option<[u8; 64]>,
+        signature: Asked<'_>,
     ) -> SwitchResponse {
-        let signature = request_signature.as_ref();
+        let current = self.keys.current();
+        // No answer to an enrollment shows an account's state: each counts in no comparison
+        // of service times, and one given before the identity is looked up carries the time
+        // base (Switch wire 7.1 Timestamp).
+        let at_base = AnswerTime::TimeBase(base_ms, Uncompared::Enrollment);
+        let refuse = |error: &ApiError| Self::signed_error(&current, signature, at_base, error);
         let (enrollment, identity_text) = match self.check_enrollment(request, base_ms) {
             Ok(checked) => checked,
-            Err(error) => return self.operator_answer(signature, base_ms, &error).await,
+            Err(error) => return refuse(&error),
         };
         match self
             .answer_enrollment(&enrollment, &identity_text, base_ms)
             .await
         {
-            Ok((key, time_ms, limits)) => {
-                let answer = EnrollmentAnswer::new(&enrollment, key.public, limits);
-                let body = match answer.to_json() {
-                    Ok(body) => body,
-                    Err(_) => {
-                        let error = ApiError::unavailable("7.6: a temporary failure");
-                        return self.operator_answer(signature, base_ms, &error).await;
-                    }
-                };
-                match self.keys.signer(&key.id).await {
-                    // Signed only while the account still has the key, as its service key or
-                    // its pending key: an erasure deletes both (7.4.16).
-                    Ok(signer) => {
-                        let proof = Proof::Checked {
-                            account: &identity_text,
-                            key: &key.id,
-                            pending: true,
-                        };
-                        match self
-                            .try_sign_keyed(proof, &signer, signature, |_| {
-                                (Answer::ok(body), time_ms)
-                            })
-                            .await
-                        {
-                            Ok(signed) => signed,
-                            Err(_) => {
-                                let error = ApiError::unavailable("7.6: a temporary failure");
-                                self.operator_answer(signature, base_ms, &error).await
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let error = ApiError::unavailable("7.6: a temporary failure");
-                        self.operator_answer(signature, base_ms, &error).await
-                    }
+            Ok(Enrolled {
+                time_ms,
+                limits,
+                created,
+            }) => {
+                // The one place the answer is built (Switch wire 3.7).
+                let answer = EnrollmentAnswer::new(
+                    &enrollment,
+                    super::PublicKeyBytes::public_key_bytes(&current),
+                    limits,
+                    created,
+                );
+                match answer.to_json() {
+                    Ok(body) => sign_answer(
+                        &current,
+                        signature,
+                        AnswerTime::Account(time_ms),
+                        Answer::ok(body),
+                    ),
+                    Err(_) => refuse(&ApiError::unavailable("7.6: a temporary failure")),
                 }
             }
-            Err(error) => self.operator_answer(signature, base_ms, &error).await,
+            // At the last time the service committed for the identity, since the refusal
+            // commits nothing, or the time base for an identity without an account (Switch
+            // wire 7.1 Timestamp).
+            Err((error, at)) => Self::signed_error(&current, signature, at, &error),
         }
     }
 
@@ -138,15 +128,14 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
     ) -> Result<(Enrollment, String), ApiError> {
-        let identity_text = request
-            .headers
-            .get(header::IDENTITY)
-            .and_then(|value| value.to_str().ok())
+        let headers = request.signed_headers();
+        let identity_text = headers
+            .text(header::IDENTITY)
             .ok_or_else(|| ApiError::bad_request("7.1: Switch-Identity is missing"))?
             .to_string();
         let identity = pubky_key(&identity_text)
             .map_err(|_| ApiError::bad_request("7.1: Switch-Identity isn't a Pubky ID"))?;
-        let claimed = decode_claim(&identity, &request.headers, base_ms)?;
+        let claimed = decode_claim(&identity, &headers, base_ms)?;
         if claimed.caller != Caller::Signer {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
@@ -170,148 +159,215 @@ impl Service {
         Ok((enrollment, identity_text))
     }
 
-    /// The key that answers the enrollment, the service time of the answer, and the limits
-    /// it announces: a new account's key, a staged account's own, or a serving account's
-    /// pending key, with the limits the account announced at its first enrollment.
+    /// What the enrollment's answer names, under the verdict of the identity's account and
+    /// mark (Switch wire 3.7, 7.3 Tables 2 and 3): a new account's, or an existing one's. A
+    /// refusal comes with the time it is answered at: the last time the service committed
+    /// for the identity, or the time base for an identity without an account (Switch wire
+    /// 7.1 Timestamp).
     async fn answer_enrollment(
         &self,
         enrollment: &Enrollment,
         identity_text: &str,
         base_ms: u64,
-    ) -> Result<(ServiceKey, u64, AnnouncedLimits), ApiError> {
+    ) -> Result<Enrolled, (ApiError, AnswerTime)> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
-        let enrollment_hash = enrollment.signed().doc_hash().map_err(|_| unavailable())?;
-        // An account a restored database brought back after its erasure goes first, so the
-        // enrollment makes a new account and answers nothing from the old one (Switch spec
-        // 6.5).
-        if let Some(found) = self
-            .store
-            .lookup(identity_text)
+        let at_base = AnswerTime::TimeBase(base_ms, Uncompared::Enrollment);
+        // An account that the first row of Table 1 erases again goes first, so the enrollment
+        // makes a new account and answers nothing from the old one; a leftover mark goes too.
+        let (found, judged) = self
+            .judge_at_step_two(identity_text)
             .await
-            .map_err(|e| store_error(&e))?
-        {
-            self.erase_if_restored(identity_text, found.created_at_ms)
-                .await?;
-        }
-        // An account that doesn't exist yet is made, then answered like any other.
-        if self
-            .store
-            .begin(identity_text)
-            .await
-            .map_err(|e| store_error(&e))?
-            .is_none()
-        {
-            let (store, keys) = (self.store.clone(), self.keys.clone());
-            let (id, identity_key) = (identity_text.to_string(), enrollment.body().identity);
-            let generation = enrollment.identity_doc().map_or(1, IdentityDoc::generation);
-            let limits = announced_limits(&self.limits);
-            let identity_doc = enrollment.identity_doc().map(|doc| doc.signed().clone());
-            let revoked_apps = enrollment.revoked_apps().to_vec();
-            // The key is made and the account created with it, or the key deleted when
-            // another enrollment made the account first or the database refused the
-            // creation, in a task of its own: a signer that hangs up between them leaves no
-            // key no account names. A creation whose result is lost may have committed, so
-            // its key stays.
-            let made = to_the_end(async move {
-                let key = keys.generate().await.ok()?;
-                let account = NewAccount {
-                    id,
-                    identity_key,
-                    generation,
-                    service_key: key.id.clone(),
-                    created_at_ms: base_ms,
-                    limits,
-                    identity_doc,
-                    revoked_apps,
-                    enrollment_hash,
-                };
-                // Created after every erasure of the identity, so it is never taken for one a
-                // restored database brought back (Switch spec 6.5): the database's owed
-                // erasure is read after the insert, then the ledger, in that order
-                // (`store::account::begin_create`). A ledger that can't be read creates
-                // nothing.
-                let created = match store.begin_create(&account).await {
-                    Ok(Some(creation)) => match keys.erasure(&account.id).await {
-                        Ok(ledger) => creation
-                            .commit(ledger)
-                            .await
-                            .map(Some)
-                            .map_err(Uncreated::Store),
-                        Err(failure) => {
-                            tracing::error!(%failure, "reading the erasure ledger");
-                            Err(Uncreated::LedgerUnread)
-                        }
-                    },
-                    Ok(None) => Ok(None),
-                    Err(error) => Err(Uncreated::Store(error)),
-                };
-                let unnamed = match &created {
-                    Ok(created) => created.is_none(),
-                    Err(Uncreated::LedgerUnread) => true,
-                    Err(Uncreated::Store(error)) => error.is_refused(),
-                };
-                if unnamed && let Err(failure) = keys.delete(&key.id).await {
-                    tracing::warn!(%failure, "dropping an unused service key");
+            .map_err(|error| (error, at_base))?;
+        // The last time the service committed for the identity, or the time base where it
+        // holds no account (Switch wire 7.1 Timestamp).
+        let committed = found
+            .as_ref()
+            .map_or(at_base, |found| AnswerTime::Account(found.stamped_time_ms));
+        let at = |error: ApiError| (error, committed);
+        let enrollment_hash = enrollment
+            .signed()
+            .doc_hash()
+            .map_err(|_| at(unavailable()))?;
+        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
+        match routed.route {
+            Route::CreateAccount | Route::TakeOverMark if found.is_none() => {
+                if let Some(created) = self
+                    .create_account(enrollment, identity_text, enrollment_hash, base_ms)
+                    .await
+                    .map_err(at)?
+                {
+                    return Ok(created);
                 }
-                Some((key, created))
-            })
-            .await
-            .flatten()
-            .ok_or_else(unavailable)?;
-            let (key, created) = made;
-            match created {
-                // Answered at the time it was created, which may be past `base_ms`.
-                Ok(Some(created_at_ms)) => return Ok((key, created_at_ms, limits)),
-                // Another enrollment made the account first: its key answers.
-                Ok(None) => {}
-                Err(Uncreated::LedgerUnread) => return Err(unavailable()),
-                Err(Uncreated::Store(error)) => return Err(store_error(&error)),
+                // Another enrollment made the account first: answered as at an account that
+                // exists.
             }
+            Route::Proceed { head: false } => {}
+            // While the mark store can't be read no mark is created (Switch wire 7.4.1).
+            Route::Unavailable => {
+                return Err(at(ApiError::unavailable(
+                    "7.4.1: the mark store can't be read",
+                )));
+            }
+            _ => return Err(at(unavailable())),
         }
+        self.enroll_at_account(enrollment, identity_text, enrollment_hash, base_ms)
+            .await
+            .map_err(|(error, under_lock)| {
+                (error, under_lock.map_or(committed, AnswerTime::Account))
+            })
+    }
+
+    /// Create the identity's account (Switch wire 7.3, Table 3), all under the identity's
+    /// lock, which every erasure and every other enrollment of the identity takes too: the
+    /// identity judged again, and the creation time read, there; the mark first, (0, 0)
+    /// durably with the current key and the creation time, then the account, at that same
+    /// time. A (0, 0) mark without an account, left by a crash between the two or a restore,
+    /// is taken, and so is a lost account's mark, whose head and retirements stay: the
+    /// account is then staged and bounded. An erasure's leftover mark is deleted first.
+    /// `None` when another enrollment made the account first.
+    async fn create_account(
+        &self,
+        enrollment: &Enrollment,
+        identity_text: &str,
+        enrollment_hash: [u8; 32],
+        base_ms: u64,
+    ) -> Result<Option<Enrolled>, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let mark_failure = |failure: crate::marks::MarkStoreError, what: &'static str| {
+            tracing::error!(%failure, what);
+            unavailable()
+        };
+        let mut lock = self
+            .store
+            .lock_identity(identity_text)
+            .await
+            .map_err(|e| store_error(&e))?;
+        if lock.has_account().await.map_err(|e| store_error(&e))? {
+            return Ok(None);
+        }
+        let inputs = self.mark_inputs(identity_text).await;
+        let judged = self.judge_with(identity_text, None, inputs).await;
+        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
+        match routed.route {
+            Route::CreateAccount | Route::TakeOverMark => {}
+            Route::Unavailable => {
+                return Err(ApiError::unavailable("7.4.1: the mark store can't be read"));
+            }
+            _ => return Err(unavailable()),
+        }
+        let key = self.current_key();
+        // Created after every erasure's record of the identity, so it is never taken for one
+        // a restored database brought back, and after the creation of any mark it takes over,
+        // so an erasure that named the earlier time never reaches it (Switch wire 7.3, Table 1
+        // and "The mark"). Read under the lock, so no record or mark changes before the
+        // account commits.
+        let created_at_ms = [
+            judged.erasure_at_ms,
+            judged.mark().map(|mark| mark.created_at_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(base_ms, |at, earlier| at.max(earlier.saturating_add(1)));
+        let leftover = matches!(
+            judged.judgement.decision.verdict,
+            Verdict::NotHosted { delete_mark: true }
+        );
+        if leftover && let Some(erased_at_ms) = judged.erasure_at_ms {
+            // An erasure's leftover isn't taken: it is deleted first (Table 3).
+            self.marks
+                .delete_created_by(identity_text, erased_at_ms)
+                .await
+                .map_err(|failure| mark_failure(failure, "deleting an erasure's leftover mark"))?;
+        }
+        let marked = match judged.mark() {
+            Some(held) if !leftover => self
+                .marks
+                .take(identity_text, *held, key, created_at_ms)
+                .await
+                .map_err(|failure| mark_failure(failure, "taking a mark over"))?,
+            _ => self
+                .marks
+                .create_zero(identity_text, key, created_at_ms)
+                .await
+                .map_err(|failure| mark_failure(failure, "writing a new account's mark"))?,
+        };
+        if !matches!(marked, MarkWrite::Written(_)) {
+            // Under the lock nothing else writes the mark: one changed meanwhile is a store
+            // that changed under the service.
+            return Err(unavailable());
+        }
+        let limits = announced_limits(&self.limits);
+        let account = NewAccount {
+            id: identity_text.to_string(),
+            identity_key: enrollment.body().identity,
+            generation: enrollment.identity_doc().map_or(1, IdentityDoc::generation),
+            created_at_ms,
+            limits,
+            identity_doc: enrollment.identity_doc().map(|doc| doc.signed().clone()),
+            revoked_apps: enrollment.revoked_apps().to_vec(),
+            enrollment_hash,
+        };
+        let creation = lock
+            .create(&account)
+            .await
+            .map_err(|e| store_error(&e))?
+            .ok_or_else(unavailable)?;
+        creation.commit().await.map_err(|e| store_error(&e))?;
+        // Answered at the time it was created, which may be past `base_ms`.
+        Ok(Some(Enrolled {
+            time_ms: created_at_ms,
+            limits,
+            created: created_at_ms,
+        }))
+    }
+
+    /// An enrollment at an account that exists (Switch wire 3.7, 7.3 Table 3), under the
+    /// identity's lock and the account's: it changes nothing by itself, but at a serving
+    /// account its `revoked_apps` are held for the next generation, and at a staged account
+    /// that no document names yet the mark's key becomes the key the answer names, durably
+    /// before the commit. A refusal comes with the time the account last committed, read
+    /// under its lock, or `None` where it came before the lock.
+    async fn enroll_at_account(
+        &self,
+        enrollment: &Enrollment,
+        identity_text: &str,
+        enrollment_hash: [u8; 32],
+        base_ms: u64,
+    ) -> Result<Enrolled, (ApiError, Option<u64>)> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let mut txn = self
             .store
             .begin(identity_text)
             .await
-            .map_err(|e| store_error(&e))?
-            .ok_or_else(unavailable)?;
-        let time_ms = txn.stamp(base_ms);
-        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
-        // The same enrollment again gets the same answer, whatever the account did since
-        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. An answer
-        // drops only while a rebuild would give it byte for byte: one naming the pending key,
-        // as long as that key is pending. Once a generation change has retired the key it
-        // named, a retry is `409 conflict`, so its signer enrolls anew.
-        if let Some(key_id) = txn
-            .enrollment_answer(&enrollment_hash)
+            .map_err(|e| (store_error(&e), None))?
+            .ok_or_else(|| (unavailable(), None))?;
+        let committed_ms = txn.head().stamped_time_ms;
+        let refused = |error: ApiError| (error, Some(committed_ms));
+        let enrolled = self
+            .enroll_under_lock(
+                &mut txn,
+                enrollment,
+                identity_text,
+                enrollment_hash,
+                base_ms,
+            )
             .await
-            .map_err(|e| store_error(&e))?
-        {
-            txn.commit().await.map_err(|e| store_error(&e))?;
-            let public = self
-                .keys
-                .public_key(&key_id)
-                .await
-                .map_err(|_| unavailable())?;
-            return Ok((ServiceKey { id: key_id, public }, time_ms, limits));
-        }
-        if txn
-            .retired_enrollment(&enrollment_hash)
-            .await
-            .map_err(|e| store_error(&e))?
-            .is_some()
-        {
-            txn.commit().await.map_err(|e| store_error(&e))?;
-            return Err(ApiError::new(
-                ErrorCode::Conflict,
-                "3.7: a generation change retired the key this enrollment's answer named",
-            ));
-        }
-        let account_key = txn.head().service_key.clone();
-        let account_public = self
-            .keys
-            .public_key(&account_key)
-            .await
-            .map_err(|_| unavailable())?;
+            .map_err(refused)?;
+        txn.commit().await.map_err(|e| refused(store_error(&e)))?;
+        Ok(enrolled)
+    }
+
+    /// [`Service::enroll_at_account`] under the account's lock, `txn`, which the caller
+    /// commits.
+    async fn enroll_under_lock(
+        &self,
+        txn: &mut crate::store::AccountTxn,
+        enrollment: &Enrollment,
+        identity_text: &str,
+        enrollment_hash: [u8; 32],
+        base_ms: u64,
+    ) -> Result<Enrolled, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let held = txn
             .held_identity()
             .await
@@ -319,132 +375,56 @@ impl Service {
             .map(|held| IdentityDoc::verify(&held.doc, &enrollment.body().identity))
             .transpose()
             .map_err(|_| unavailable())?;
-        let pending = txn.pending_key().await.map_err(|e| store_error(&e))?;
-        let state = AccountState {
-            serving: names_this_service(held.as_ref(), &self.origin, &account_public),
-            pending_key: pending.is_some(),
-        };
-        let choice = enrollment_key(Some(state));
-        // A staged account's answers name its own key, which a rebuild at the serving
-        // account wouldn't: each is kept as long as the account, so a staged account takes
-        // at most max_enrollments distinct enrollments, its creating one included.
-        let rebuildable = matches!(choice, EnrollmentKey::PendingKey { .. });
-        if !rebuildable
-            && txn
-                .kept_enrollment_answers()
-                .await
-                .map_err(|e| store_error(&e))?
-                >= self.limits.max_enrollments
+        // The account and its erasure authority may have changed while enrollment waited
+        // for the identity lock. Rejudge before stamping or keeping an enrollment answer
+        // (Switch wire 7.3 step 2, Tables 1-3).
+        let head = txn.head();
+        let account = self.account_input(
+            head.generation,
+            head.chain,
+            head.created_at_ms,
+            held.as_ref().map(IdentityDoc::body),
+        );
+        let judged = self.judge(identity_text, Some(account)).await;
+        let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
+        if judged.judgement.decision.erase_account_again
+            || routed.route != (Route::Proceed { head: false })
         {
-            return Err(ApiError::new(
-                ErrorCode::QuotaExceeded,
-                "3.7: a staged account takes at most max_enrollments enrollments",
-            )
-            .with_current(serde_json::json!({ "limit": "enrollments" })));
+            return Err(unavailable());
         }
-        // A pending key made here is deleted if the request ends, or is dropped, before its
-        // commit is under way ([`MadeKey`]).
-        let mut made = None;
-        let key_id: KeyId = match choice {
-            EnrollmentKey::NewAccount | EnrollmentKey::AccountKey => account_key,
-            EnrollmentKey::PendingKey { exists: true } => pending.ok_or_else(unavailable)?,
-            EnrollmentKey::PendingKey { exists: false } => {
-                let key = to_the_end(MadeKey::generate(self.keys.clone()))
-                    .await
-                    .flatten()
-                    .ok_or_else(unavailable)?;
-                txn.set_pending_key(key.id())
-                    .await
-                    .map_err(|e| store_error(&e))?;
-                let id = key.id().clone();
-                made = Some(key);
-                id
+        let time_ms = txn.stamp(base_ms);
+        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
+        // The account's creation time, read under the lock: the mark's, or the account's
+        // own where the mark is lost (Switch wire 3.7).
+        let created = match self.marks.read(identity_text).await {
+            Ok(MarkRead::Mark(mark)) => mark.created_at_ms,
+            Ok(MarkRead::Missing | MarkRead::NotAMark) => txn.head().created_at_ms,
+            Err(failure) => {
+                tracing::error!(%failure, "reading a mark");
+                return Err(ApiError::unavailable("7.4.1: the mark store can't be read"));
             }
         };
-        // An enrollment answered with the pending key: its `revoked_apps` join the account's
-        // tombstones if a delivery naming that key starts the next generation (wire 3.7).
-        if rebuildable {
-            txn.hold_pending_revoked_apps(enrollment.revoked_apps())
+        let key = self.current_key();
+        let serving = held.as_ref().is_some_and(|doc| {
+            doc.inbox().url == self.origin
+                && self.keys.signer_for(&doc.inbox().service_key).is_some()
+        });
+        if serving {
+            txn.hold_revoked_apps(enrollment.revoked_apps())
                 .await
                 .map_err(|e| store_error(&e))?;
         }
-        txn.keep_enrollment_answer(
-            &enrollment_hash,
-            &key_id,
-            time_ms,
-            self.limits.max_enrollments,
-            rebuildable,
-        )
-        .await
-        .map_err(|e| store_error(&e))?;
-        // The commit runs to its end in a task of its own, and the pending key made here is
-        // kept once it is under way, unless the database refused the commit: one whose result
-        // is lost may have landed.
-        to_the_end(async move {
-            let committed = txn.commit().await;
-            if let Some(made) = made
-                && !committed.as_ref().is_err_and(StoreError::is_refused)
-            {
-                made.keep();
-            }
-            committed
-        })
-        .await
-        .ok_or_else(unavailable)?
-        .map_err(|e| store_error(&e))?;
-        let public = self
-            .keys
-            .public_key(&key_id)
+        txn.keep_enrollment_answer(&enrollment_hash, time_ms, self.limits.max_enrollments)
             .await
-            .map_err(|_| unavailable())?;
-        Ok((ServiceKey { id: key_id, public }, time_ms, limits))
-    }
-}
-
-/// A service key made for one request: deleted from the key store by a task of its own when
-/// this drops, unless [`MadeKey::keep`] took it. Made in a task of its own
-/// ([`MadeKey::generate`] under [`to_the_end`]), so a request dropped while the key is
-/// written leaves no key behind: the task's output drops, and deletes it.
-struct MadeKey {
-    keys: Arc<dyn KeyStore>,
-    key: ServiceKey,
-    kept: bool,
-}
-
-impl MadeKey {
-    /// A new key; `None` when the key store fails.
-    async fn generate(keys: Arc<dyn KeyStore>) -> Option<Self> {
-        let key = keys.generate().await.ok()?;
-        Some(Self {
-            keys,
-            key,
-            kept: false,
+            .map_err(|e| store_error(&e))?;
+        if !serving && let Err(failure) = self.marks.set_key(identity_text, key, created).await {
+            tracing::error!(%failure, "a staged account's mark taking the current key");
+            return Err(unavailable());
+        }
+        Ok(Enrolled {
+            time_ms,
+            limits,
+            created,
         })
-    }
-
-    /// The key's ID.
-    fn id(&self) -> &KeyId {
-        &self.key.id
-    }
-
-    /// Keep the key: the request's commit names it, or may.
-    fn keep(mut self) {
-        self.kept = true;
-    }
-}
-
-impl Drop for MadeKey {
-    fn drop(&mut self) {
-        if self.kept {
-            return;
-        }
-        let (keys, id) = (self.keys.clone(), self.key.id.clone());
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(failure) = keys.delete(&id).await {
-                    tracing::warn!(%failure, "dropping an unused service key");
-                }
-            });
-        }
     }
 }

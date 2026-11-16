@@ -1,10 +1,18 @@
 //! Durable storage in PostgreSQL.
 //!
 //! **One account at a time.** Every request to an account runs in one database transaction
-//! that first locks the account's row ([`Store::begin`]), so one account's operations are
-//! serialized while other accounts proceed in parallel (Switch spec 6.5). What a request
-//! changes commits all at once or not at all: a batch that fails, or a process that dies
-//! before the commit, leaves no trace.
+//! that first takes its identity's lock, then locks the account's row ([`Store::begin`]), so
+//! one account's operations are serialized while other accounts proceed in parallel (Switch
+//! spec 6.5). What a request changes commits all at once or not at all: a batch that fails,
+//! or a process that dies before the commit, leaves no trace.
+//!
+//! **One identity at a time.** Everything that creates, takes over, deletes or re-keys an
+//! identity's mark or account runs under the identity's lock ([`Store::lock_identity`]), a
+//! transaction-level advisory lock on the identity, held until its transaction ends: an
+//! enrollment from the mark's write through the account's insert, an erasure from its
+//! record through the deletion's commit, and the deletion of a leftover mark. The order is
+//! always the same: the identity's lock first, then the account's row, so two of them never
+//! wait for each other (Switch wire 7.3, Table 3).
 //!
 //! **Durable, then answered** (Switch wire 7.3 step 10). A request's answer carries a `seq`,
 //! a transition proof or a signed head only once [`AccountTxn::commit`] has returned, which
@@ -14,9 +22,9 @@
 //! `remote_apply`, so a commit is durable on every replica that could be promoted; an
 //! asynchronous replica must never be promoted to serve writes (Switch spec 6.5).
 //!
-//! **The key's mark** (Switch spec 6.5) lives in the key store, apart from the database and
-//! its backups. [`AccountTxn::commit_marked`] moves it once the state is durable, and
-//! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
+//! **The account's mark** (Switch spec 6.5) lives beside the key store, apart from the
+//! database and its backups ([`crate::marks`]): the service moves it once a commit is
+//! durable, and judges every state against it (Switch wire 7.3, "Accounts and marks").
 
 mod account;
 mod allow;
@@ -26,13 +34,13 @@ mod claim_codec;
 mod connect;
 mod documents;
 mod enrollments;
+mod erasure;
 mod feed;
 mod handover;
 pub mod heads;
 mod identity;
 mod inbox;
 mod instance;
-mod keying;
 mod ops;
 mod peers;
 mod push;
@@ -54,7 +62,7 @@ use sqlx::{
 };
 
 pub use account::{
-    AccountHead, AccountTxn, CommitError, Committed, Creation, NewAccount, Savepoint,
+    AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
 };
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
@@ -64,8 +72,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::{InstanceLock, InstanceLockLost, LockTiming};
-pub use keying::{Keyed, keying_lock_key};
+pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
     StoredInvite, StoredListEntry, StoredRecord,
@@ -90,14 +97,10 @@ pub const DATABASE_URL_ENV: &str = "PUBKY_SWITCH_DATABASE_URL";
 pub struct ErasedKey {
     /// The key's ID in the key store.
     pub key: crate::keys::KeyId,
-    /// The erased account's Pubky ID.
+    /// The account that let it go.
     pub account: String,
-    /// When the account was erased, in its service time.
+    /// When it was let go, in the account's service time.
     pub erased_at_ms: u64,
-    /// The key wasn't erased with its account, so its deletion records no erasure: a service
-    /// key a generation change retired at an account that lives on (Switch wire 3.3), or a
-    /// push key (Switch wire 8.1).
-    pub retired: bool,
 }
 
 /// The schema migrations, applied in order.
@@ -246,6 +249,7 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// one (`XX`).
 fn refused_answer(error: bool, code: &str) -> bool {
     error
+        && code != "40003"
         && !["08", "57", "58", "XX"]
             .iter()
             .any(|class| code.starts_with(class))
@@ -422,28 +426,52 @@ impl Store {
         Ok(())
     }
 
-    /// Insert an account, to commit with [`Creation::commit`] once its identity's
-    /// ledger entry is read: `None`, changing nothing, when one exists for the identity
-    /// already. Waits at most `lock_timeout_ms` for an erasure of the identity still
-    /// committing ([`StoreError::LockTimeout`], changing nothing).
-    pub async fn begin_create(&self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
-        account::begin_create(&self.pool, account, self.lock_timeout_ms).await
+    /// Take `id`'s identity lock (the module's "One identity at a time"): a transaction
+    /// holding a transaction-level advisory lock on the identity until it ends. Waits at most
+    /// `lock_timeout_ms` for a request, an enrollment or an erasure of the identity that
+    /// holds it ([`StoreError::LockTimeout`]).
+    pub async fn lock_identity(&self, id: &str) -> Result<IdentityLock, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
+        // READ COMMITTED whatever the pool's default, so what is read under the lock includes
+        // everything committed before it was taken. `SET` takes no bind parameters; the
+        // values are numbers we format.
+        tx.execute(
+            format!(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
+                 SET LOCAL lock_timeout = {}; \
+                 SELECT pg_advisory_xact_lock({})",
+                self.lock_timeout_ms,
+                identity_lock_key(id)
+            )
+            .as_str(),
+        )
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(IdentityLock {
+            tx,
+            id: id.to_string(),
+        })
     }
 
-    /// For tests: create an account with no erasure ledger to read; `false`, changing
-    /// nothing, when one exists. The service creates through [`Store::begin_create`].
+    /// For tests: create an account; `false`, changing nothing, when one exists. The
+    /// service creates through [`IdentityLock::create`], once the mark is written.
     #[cfg(any(test, feature = "test-util"))]
     pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
-        match self.begin_create(account).await? {
-            Some(creation) => creation.commit(None).await.map(|_| true),
+        match self
+            .lock_identity(&account.id)
+            .await?
+            .create(account)
+            .await?
+        {
+            Some(creation) => creation.commit().await.map(|()| true),
             None => Ok(false),
         }
     }
 
-    /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).
+    /// The push keys owed deleting, oldest first (Switch wire 8.1).
     pub async fn erased_keys(&self) -> Result<Vec<ErasedKey>, StoreError> {
         let rows = sqlx::query(
-            "SELECT key_id, account_id, erased_at_ms, reason FROM erased_keys \
+            "SELECT key_id, account_id, erased_at_ms FROM erased_keys \
              ORDER BY erased_at_ms, key_id",
         )
         .fetch_all(&self.pool)
@@ -457,27 +485,18 @@ impl Store {
                         .map_err(|_| StoreError::Corrupt("erased_keys.key_id"))?,
                     account: row.try_get("account_id")?,
                     erased_at_ms: from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
-                    retired: row.try_get::<String, _>("reason")? != "erasure",
                 })
             })
             .collect()
     }
 
-    /// Whether an erased account of the identity `account` still owes the deletion of a key
-    /// (Switch wire 7.4.16).
-    pub async fn owes_erased_keys(&self, account: &str) -> Result<bool, StoreError> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM erased_keys WHERE account_id = $1)")
-            .bind(account)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(StoreError::from_db)
-    }
-
-    /// Look account `id` up without taking its lock: its service key and the service time
-    /// it last committed, for the checks that come before the lock (Switch wire 7.2 Order).
+    /// Look account `id` up without taking its lock: what the verdict of its account and
+    /// mark reads (Switch wire 7.3 step 2) and the service time it last committed, for the
+    /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT service_key, stamped_time_ms, created_at_ms FROM accounts WHERE id = $1",
+            "SELECT generation, chain_seq, chain_hash, stamped_time_ms, created_at_ms, \
+             identity_doc FROM accounts WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -486,16 +505,55 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
-        let service_key: String = row.try_get("service_key")?;
+        let chain_seq: Option<i64> = row.try_get("chain_seq")?;
+        let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
+        let chain = match (chain_seq, chain_hash) {
+            (Some(seq), Some(hash)) => Some((
+                from_db(seq, "chain_seq")?,
+                <[u8; 32]>::try_from(hash.as_slice())
+                    .map_err(|_| StoreError::Corrupt("chain_hash"))?,
+            )),
+            (None, None) => None,
+            _ => return Err(StoreError::Corrupt("chain head")),
+        };
+        let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
         Ok(Some(FoundAccount {
-            service_key: crate::keys::KeyId::parse(&service_key)
-                .map_err(|_| StoreError::Corrupt("service_key"))?,
+            generation: from_db(row.try_get("generation")?, "generation")?,
+            chain,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
+            identity_doc: doc
+                .map(|doc| identity::decode_doc(&doc, "identity_doc"))
+                .transpose()?,
         }))
     }
 
-    /// Of `erased`, identities with the time of an erasure the key store's ledger holds,
+    /// The chain hash of the stub account `id` still holds at `generation` and `seq`, if it
+    /// holds one: where it does, a state past the mark with another hash there is a fork
+    /// (Switch wire 7.3, Table 1).
+    pub async fn stub_hash_at(
+        &self,
+        id: &str,
+        generation: u64,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        let hash: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT chain_hash FROM chain_items WHERE account_id = $1 AND generation = $2 \
+             AND seq = $3",
+        )
+        .bind(id)
+        .bind(to_db(generation, "generation")?)
+        .bind(to_db(seq, "seq")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::from_db)?;
+        hash.map(|hash| {
+            <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| StoreError::Corrupt("chain_hash"))
+        })
+        .transpose()
+    }
+
+    /// Of `erased`, identities with the time of an erasure's record the mark store holds,
     /// those whose account here was created at or before that time: accounts a database
     /// restored from a backup brought back, to erase again before they serve (Switch spec
     /// 6.5). An account created after its identity's erasure is a new one and isn't listed.
@@ -587,16 +645,12 @@ impl Store {
         feed::read_feed(&self.pool, id, reader, after, positions, batch_tail, page).await
     }
 
-    /// Start a request to account `id`: a transaction holding the account's lock until it
-    /// commits or is dropped. `None` when there is no such account. Waits at most
-    /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
+    /// Start a request to account `id`: a transaction holding the identity's lock and the
+    /// account's, in that order, until it commits or is dropped. `None` when there is no
+    /// such account. Waits at most `lock_timeout_ms` for each lock
+    /// ([`StoreError::LockTimeout`]).
     pub async fn begin(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
-        // `SET LOCAL` takes no bind parameters; the value is a number we format.
-        tx.execute(format!("SET LOCAL lock_timeout = {}", self.lock_timeout_ms).as_str())
-            .await
-            .map_err(StoreError::from_db)?;
-        AccountTxn::lock(tx, id).await
+        self.lock_identity(id).await?.account().await
     }
 
     /// [`Store::begin`], with a transaction on the reader pool begun first, before the lock
@@ -693,17 +747,88 @@ async fn connect_first(
 /// An account found by [`Store::lookup`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoundAccount {
-    /// Its service key.
-    pub service_key: crate::keys::KeyId,
+    /// The generation it holds.
+    pub generation: u64,
+    /// Its newest chain item's `seq` and the chain hash there; `None` before the first.
+    pub chain: Option<(u64, [u8; 32])>,
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// When it was created, in service time.
     pub created_at_ms: u64,
+    /// The newest `identity.json` it holds, as signed; it was verified when it was taken.
+    pub identity_doc: Option<pubky_switch_core::sig::SignedDoc>,
 }
 
 /// The readiness check of the database: a round trip on a pooled connection.
 #[derive(Clone, Debug)]
 pub struct StoreReadiness(pub Store);
+
+/// The advisory lock key of `id`'s identity lock: the hash of a label of its own and the
+/// identity, apart from every other advisory lock of the service.
+fn identity_lock_key(id: &str) -> i64 {
+    let mut input = b"pubky-switch/identity-lock/".to_vec();
+    input.extend_from_slice(id.as_bytes());
+    let digest = pubky_switch_core::enc::hash(&input);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
+}
+
+/// An identity's lock ([`Store::lock_identity`]): held until it is dropped, committed, or
+/// handed to the account's transaction or a creation, which hold it on.
+pub struct IdentityLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    id: String,
+}
+
+impl std::fmt::Debug for IdentityLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityLock")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IdentityLock {
+    /// Lock the identity's account's row too, the lock held on in the account's
+    /// transaction; `None`, letting the identity's lock go, when there is no account.
+    pub async fn account(self) -> Result<Option<AccountTxn>, StoreError> {
+        AccountTxn::lock(self.tx, &self.id).await
+    }
+
+    /// Whether the identity has an account, read under the lock.
+    pub async fn has_account(&mut self) -> Result<bool, StoreError> {
+        let found: Option<i32> = sqlx::query_scalar("SELECT 1 FROM accounts WHERE id = $1")
+            .bind(&self.id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(found.is_some())
+    }
+
+    /// The creation time of the identity's account, read under the lock; `None` without an
+    /// account.
+    pub async fn account_created_at(&mut self) -> Result<Option<u64>, StoreError> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT created_at_ms FROM accounts WHERE id = $1")
+                .bind(&self.id)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
+        found.map(|at| from_db(at, "created_at_ms")).transpose()
+    }
+
+    /// Insert `account`, the identity's, the lock held on until [`Creation::commit`]: `None`,
+    /// changing nothing and letting the lock go, when one exists.
+    pub async fn create(self, account: &NewAccount) -> Result<Option<Creation>, StoreError> {
+        if account.id != self.id {
+            return Err(StoreError::Corrupt(
+                "an account created under another identity's lock",
+            ));
+        }
+        account::create(self.tx, account).await
+    }
+}
 
 impl ReadinessCheck for StoreReadiness {
     fn name(&self) -> &str {
@@ -756,7 +881,9 @@ mod tests {
         }
         // A lost connection, as PgBouncer answers one (`08P01`), a shutdown or an internal
         // error may follow a commit that landed, and so may a `FATAL` of any class.
-        for code in ["08P01", "08006", "57P01", "57014", "58030", "XX000"] {
+        for code in [
+            "08P01", "08006", "40003", "57P01", "57014", "58030", "XX000",
+        ] {
             assert!(!refused_answer(true, code), "{code}");
         }
         assert!(!refused_answer(false, "23505"));

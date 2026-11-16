@@ -19,8 +19,9 @@ pub struct AccountView<'a> {
     pub staged: bool,
     /// The service's origin.
     pub origin: &'a str,
-    /// The pending key of the next generation an enrollment here answered, if any.
-    pub pending_key: Option<[u8; 32]>,
+    /// The key an enrollment here answers, which the next generation in place names; `None`
+    /// where none starts in place (Switch wire 3.3, 3.7).
+    pub enrollment_key: Option<[u8; 32]>,
     /// The App IDs the service revoked or saw depart, and those enrollments named, kept for
     /// good.
     pub kept_app_ids: &'a [[u8; 16]],
@@ -157,14 +158,15 @@ pub fn check_delivery(
         return Ok(Delivery::Retry);
     }
     let (held_body, held_generation) = (held.body(), held.generation());
-    // In place, the next generation naming the pending key (Switch wire 3.3).
+    // In place, the next generation naming the key an enrollment here answers (Switch wire
+    // 3.3).
     let next_in_place = !account.staged
         && Some(body.generation) == held_generation.checked_add(1)
         && body.inbox.url == account.origin
-        && Some(body.inbox.service_key) == account.pending_key;
+        && Some(body.inbox.service_key) == account.enrollment_key;
     // A provider loss in place may follow a loss of the very versions it builds on, so its
     // `prev` isn't compared: a higher version than the one held is enough, the identity's
-    // signature, the pending key and the generation step bounding it (wire 3.3).
+    // signature, the enrollment's key and the generation step bounding it (wire 3.3).
     let recovers = next_in_place && body.recovery_from == Some(held_generation);
     if prev != Some(&held.hash()) && !recovers {
         return Err(DeliveryRefusal::StaleIdentity(
@@ -344,7 +346,7 @@ mod tests {
             app_limit: 32,
             staged: false,
             origin: ORIGIN,
-            pending_key: Some([9; 32]),
+            enrollment_key: Some([9; 32]),
             kept_app_ids: &[],
             kept_proofs: KeptProofs::default(),
         }

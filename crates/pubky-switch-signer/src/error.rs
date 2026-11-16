@@ -207,8 +207,8 @@ pub enum Refusal {
     #[error("refused: the erasure may have reached the switch")]
     ErasureUnanswered,
     /// The account looks erased: after a request in doubt, a check or a retry met an unsigned
-    /// `404` at `since_ms`, by the device clock, which may be the operator's and which nobody
-    /// can authenticate, and no answer the pinned key signs has come since. The erasure is
+    /// `404` at `since_ms`, by the device clock, which may be an intermediary's and which
+    /// nobody can authenticate, and no answer the pinned key signs has come since. The erasure is
     /// done at the first run 24 hours on that meets the `404` again; an answer the pinned key
     /// signs before that, an error included, ends the wait, and the next `404` starts it
     /// again (Switch wire 7.4.16, spec 12.7 step 5). No answer, and an unsigned answer other

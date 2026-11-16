@@ -1,7 +1,8 @@
 //! A provider loss at the service, against PostgreSQL (Switch spec 12.6; Switch wire 3.3,
-//! 3.7, 7.4.2, 7.4.12): the first document of a recovery at a new account, a recovery in
-//! place under the pending key, what the account keeps and drops, the enrollments it
-//! retires, and the outgoing key's last answer.
+//! 3.7, 7.3, 7.4.2, 7.4.12): the first document of a recovery at a new account, a recovery in
+//! place under the service key, what the account keeps and drops, the App IDs its
+//! enrollments hold for the next generation, the account's mark at a generation start, and
+//! the start a failing account takes.
 //!
 //! Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see `store::testing`.
 
@@ -11,9 +12,10 @@
 mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
-use pubky_switch::keys::{KeyId, KeyStore};
+use pubky_switch::marks::{AccountMark, MarkRead};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
+    chain::{ChainTip, SignedHead},
     claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
@@ -26,7 +28,7 @@ use serde_json::{Value, json};
 use sqlx::Connection;
 use support::*;
 
-/// An App ID an enrollment answered with the pending key names in its `revoked_apps`.
+/// An App ID an enrollment at the serving account names in its `revoked_apps`.
 const HELD_REVOKED: [u8; 16] = [7; 16];
 
 fn alice_id() -> String {
@@ -55,35 +57,15 @@ fn code(response: &SwitchResponse) -> (u16, String) {
 }
 
 /// Whether `response` is signed with `key` (Switch wire 7.1).
-fn signed_by(response: &SwitchResponse, key: &[u8; 32], request_signature: &[u8; 64]) -> bool {
-    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
-        header_text(response, header::SERVICE_SIGNATURE).expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64");
-    pubky_switch_core::http::verify_response(
-        key,
-        response.status,
-        Some(request_signature),
-        header_text(response, header::SERVER_TIME).expect("time"),
-        &response.body,
-        &signature,
-    )
-    .is_ok()
+fn signed_by(response: &SwitchResponse, key: &[u8; 32], sent: &Sent) -> bool {
+    signed_with(response, key, sent)
 }
 
-fn signature_of(request: &pubky_switch::http::SwitchRequest) -> [u8; 64] {
-    pubky_switch_core::enc::unb64(
-        request
-            .headers
-            .get(header::SIGNATURE)
-            .and_then(|value| value.to_str().ok())
-            .expect("signature"),
-    )
-    .expect("b64")
-    .try_into()
-    .expect("64")
+/// `request` as sent, which an answer to it binds (Switch wire 7.1); it carries a signature.
+fn signed_sent(request: &pubky_switch::http::SwitchRequest) -> Sent {
+    let sent = Sent::of(request);
+    assert!(sent.signed(), "signature");
+    sent
 }
 
 /// The vectors' enrollment with another nonce and `revoked_apps`.
@@ -139,6 +121,78 @@ async fn held(replay: &Replay) -> IdentityDoc {
     IdentityDoc::verify(&signed, &alice_key().public()).expect("verify")
 }
 
+/// A current signed document restored beside an earlier chain, whose mark is lost
+/// (Switch wire 7.3, Tables 1 and 2).
+async fn recovery_with_newer_document(candidate_generation: u64) {
+    let Some(replay) = replay().await else { return };
+    let (key, at) = serving_with_a_held_app(&replay).await;
+    let original = held(&replay).await;
+    let mut newer = original.body().clone();
+    newer.version += 1;
+    newer.generation = 3;
+    newer.recovery_from = Some(2);
+    let newer = IdentityDoc::sign(&alice_key(), newer).expect("signed document");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE accounts SET identity_doc = $2 WHERE id = $1")
+        .bind(alice_id())
+        .bind(serde_json::to_vec(newer.signed()).expect("document"))
+        .execute(&mut conn)
+        .await
+        .expect("restore newer document beside earlier chain");
+    conn.close().await.expect("close");
+    replay.marks.delete(&alice_id()).await.expect("mark lost");
+    let before_chain = chain(&replay).await;
+    let mut candidate = newer.body().clone();
+    candidate.version += 1;
+    candidate.generation = candidate_generation;
+    candidate.recovery_from = Some(candidate_generation - 1);
+    let candidate = IdentityDoc::sign(&alice_key(), candidate).expect("signed candidate");
+    replay.clock.set_wall_ms(at + 1_000);
+    let (answer, signature) = deliver(&replay, candidate.signed().clone(), None, at + 1_000).await;
+    assert!(signed_by(&answer, &key, &signature));
+    if candidate_generation <= newer.generation() {
+        assert!(
+            is_notice(&answer, 1, "mark_lost"),
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(held(&replay).await.hash(), newer.hash());
+        assert_eq!(chain(&replay).await, before_chain);
+        assert_eq!(
+            replay.marks.read(&alice_id()).await.expect("mark"),
+            MarkRead::Missing
+        );
+    } else {
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(held(&replay).await.hash(), candidate.hash());
+        let mark = mark_of(&replay).await;
+        assert_eq!((mark.generation, mark.seq), (4, 2));
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_start_below_held_document_gets_notice() {
+    Box::pin(recovery_with_newer_document(2)).await;
+}
+
+#[tokio::test]
+async fn test_recovery_start_equal_to_held_document_gets_notice() {
+    Box::pin(recovery_with_newer_document(3)).await;
+}
+
+#[tokio::test]
+async fn test_recovery_start_above_held_document_remains_available() {
+    Box::pin(recovery_with_newer_document(4)).await;
+}
+
 async fn scalar_i64(replay: &Replay, query: &str) -> i64 {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -152,17 +206,38 @@ async fn scalar_i64(replay: &Replay, query: &str) -> i64 {
     value
 }
 
-async fn service_key_id(replay: &Replay) -> KeyId {
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+/// alice's mark, which must read as one.
+#[allow(clippy::panic)]
+async fn mark_of(replay: &Replay) -> AccountMark {
+    match replay
+        .marks
+        .read(&alice_id())
         .await
-        .expect("conn");
-    let key: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
-        .bind(alice_id())
-        .fetch_one(&mut conn)
-        .await
-        .expect("key");
-    conn.close().await.expect("close");
-    KeyId::parse(&key).expect("key id")
+        .expect("the mark store")
+    {
+        MarkRead::Mark(mark) => mark,
+        other => panic!("no mark: {other:?}"),
+    }
+}
+
+/// The account's creation time, read from the database.
+async fn created_at(replay: &Replay) -> u64 {
+    u64::try_from(scalar_i64(replay, "SELECT created_at_ms FROM accounts WHERE id = $1").await)
+        .expect("a time")
+}
+
+/// The head an answer carries in its body.
+fn head_of(response: &SwitchResponse) -> SignedHead {
+    SignedHead::from_value(&json_of(response)["head"]).expect("head")
+}
+
+/// The notice `503 recovery_required` at `generation` with `reason`, not permanent, without
+/// a head (Switch wire 7.3, Table 2; 7.6).
+fn is_notice(response: &SwitchResponse, generation: u64, reason: &str) -> bool {
+    code(response) == (503, "recovery_required".into())
+        && json_of(response)["current"]
+            == json!({ "generation": generation, "reason": reason, "permanent": false })
+        && header_text(response, header::HEAD).is_none()
 }
 
 /// The account's chain items, as (generation, seq, item type).
@@ -195,12 +270,31 @@ fn next_generation(on: &IdentityDoc, key: [u8; 32], recovery_from: Option<u64>) 
         .clone()
 }
 
+/// A service key change after `on`: the next generation without `recovery_from`, naming
+/// `key` and keeping `on`'s generation's key for the proofs the account keeps (Switch wire
+/// 3.3).
+fn key_change(on: &IdentityDoc, key: [u8; 32]) -> SignedDoc {
+    let mut body: IdentityBody = on.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox.service_key = key;
+    body.service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry {
+            generation: on.generation(),
+            key,
+        });
+    IdentityDoc::sign(&alice_key(), body)
+        .expect("sign")
+        .signed()
+        .clone()
+}
+
 async fn deliver(
     replay: &Replay,
     doc: SignedDoc,
     prev: Option<[u8; 32]>,
     at_ms: u64,
-) -> (SwitchResponse, [u8; 64]) {
+) -> (SwitchResponse, Sent) {
     let path = format!("/v1/{}/identity", alice_id());
     let request = signer_request(
         "PUT",
@@ -212,14 +306,14 @@ async fn deliver(
         .to_json(),
         at_ms,
     );
-    let signature = signature_of(&request);
+    let signature = signed_sent(&request);
     (replay.service.handle(request).await, signature)
 }
 
 /// alice serving at generation 1 with the vectors' chain through the phone's revocation,
-/// then an enrollment answered with the pending key, naming [`HELD_REVOKED`]: the pending
-/// key's public key, and the time after.
-async fn serving_with_a_pending_key(replay: &Replay) -> ([u8; 32], u64) {
+/// then an enrollment at the serving account naming [`HELD_REVOKED`]: the key the answer
+/// names, the service key, and the time after.
+async fn serving_with_a_held_app(replay: &Replay) -> ([u8; 32], u64) {
     replay_chain_through_revoke(replay).await;
     let at = replay.clock.now_ms() + 60_000;
     set_time(&replay.clock, &rfc3339(at));
@@ -230,7 +324,9 @@ async fn serving_with_a_pending_key(replay: &Replay) -> ([u8; 32], u64) {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    (answered_key(&answer), at)
+    let key = answered_key(&answer);
+    assert_eq!(key, service_public(replay), "the current key");
+    (key, at)
 }
 
 #[tokio::test]
@@ -326,15 +422,14 @@ async fn test_recovery_first_document_needs_the_generation_less_one() {
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
-    // alice's provider loss at this same service: the next generation names the pending key
-    // and declares generation 1 lost. The account starts afresh under that key: none of
-    // generation 1's state stays, its tombstones and the held revoked App ID do, the chain
-    // starts with the `recovery` transition, and the answer and every later one are the new
-    // key's. The outgoing key is deleted, with no erasure recorded.
+async fn test_recovery_in_place_starts_afresh_under_the_service_key() {
+    // alice's provider loss at this same service: the next generation names the service key,
+    // the key its enrollments answer, and declares generation 1 lost. The account starts
+    // afresh: none of generation 1's state stays, its tombstones and the held App ID do, the
+    // chain starts with the `recovery` transition, and the answer and every later one are
+    // the service key's. No erasure is recorded (Switch wire 3.3, 3.7, 7.4.2).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let old_key = service_key_id(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let tombstones_before = scalar_i64(
         &replay,
         "SELECT count(*) FROM kept_app_ids WHERE account_id = $1",
@@ -353,7 +448,7 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
             .await
             .expect("a pending request");
     }
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, key, Some(1));
     let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(
         answer.status,
@@ -362,31 +457,13 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
         String::from_utf8_lossy(&answer.body)
     );
     assert!(
-        signed_by(&answer, &pending, &signature),
-        "the new key's answer"
-    );
-    let new_key = service_key_id(&replay).await;
-    assert_ne!(new_key, old_key);
-    assert_eq!(
-        replay.keys.public_key(&new_key).await.expect("key"),
-        pending
-    );
-    assert!(
-        replay.keys.public_key(&old_key).await.is_err(),
-        "the outgoing key is deleted"
+        signed_by(&answer, &key, &signature),
+        "the service key's answer"
     );
     assert_eq!(
-        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        replay.marks.erasure(&alice_id()).await.expect("ledger"),
         None,
         "no erasure recorded"
-    );
-    assert_eq!(
-        scalar_i64(
-            &replay,
-            "SELECT count(*) FROM erased_keys WHERE account_id = $1"
-        )
-        .await,
-        0
     );
     assert_eq!(
         chain(&replay).await,
@@ -427,22 +504,134 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
         )
         .await,
         tombstones_before + 1,
-        "the tombstones, and the App ID held with the pending key"
+        "the tombstones, and the App ID the enrollment held"
     );
     assert_eq!(
-        scalar_i64(
-            &replay,
-            "SELECT generation FROM accounts WHERE id = $1 AND pending_key IS NULL"
-        )
-        .await,
+        scalar_i64(&replay, "SELECT generation FROM accounts WHERE id = $1").await,
         2
     );
     let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    let read_signature = signature_of(&request);
+    let read_signature = signed_sent(&request);
     let apps = replay.service.handle(request).await;
     assert_eq!(apps.status, 200);
-    assert!(signed_by(&apps, &pending, &read_signature));
+    assert!(signed_by(&apps, &key, &read_signature));
     assert_eq!(json_of(&apps)["recovery"]["recovery_from"], 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head() {
+    // A delivery that starts a generation moves the account's mark to the new generation's
+    // first head, the one its answer carries, with the key the document names; the
+    // creation time stays (Switch wire 7.3, Table 3). An ordinary version before it moves
+    // the mark within generation 1.
+    let Some(replay) = replay().await else { return };
+    let (key, at) = serving_with_a_held_app(&replay).await;
+    let mark_before = mark_of(&replay).await;
+    assert_eq!(mark_before.generation, 1);
+    let before = held(&replay).await;
+    let mut ordinary: IdentityBody = before.body().clone();
+    ordinary.version += 1;
+    let ordinary = IdentityDoc::sign(&alice_key(), ordinary).expect("sign");
+    let (answer, _) = deliver(&replay, ordinary.signed().clone(), Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let moved = mark_of(&replay).await;
+    assert_eq!(
+        (moved.generation, moved.seq),
+        (1, mark_before.seq + 1),
+        "within the generation"
+    );
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&ordinary, key, Some(1)),
+        Some(ordinary.hash()),
+        at,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let head = head_of(&answer);
+    assert_eq!((head.generation, head.seq), (2, 2));
+    assert_eq!(
+        mark_of(&replay).await,
+        AccountMark {
+            generation: 2,
+            seq: 2,
+            chain_hash: head.chain_hash,
+            key,
+            created_at_ms: mark_before.created_at_ms,
+        }
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The App IDs alice's account holds for the next generation, and whether [`HELD_REVOKED`]
+/// is among its tombstones.
+async fn held_and_kept(replay: &Replay) -> (i64, i64) {
+    (
+        scalar_i64(
+            replay,
+            "SELECT count(*) FROM held_revoked_apps WHERE account_id = $1",
+        )
+        .await,
+        scalar_i64(
+            replay,
+            "SELECT count(*) FROM kept_app_ids WHERE account_id = $1 \
+             AND app_id = '\\x07070707070707070707070707070707'",
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_held_revoked_apps_join_the_tombstones_at_the_start() {
+    // At a serving account, the `revoked_apps` of every enrollment answered since its
+    // generation began are held with the account, and join its tombstones when a delivery
+    // starts the next generation; a delivery within the generation leaves them held (Switch
+    // wire 3.3, 3.7).
+    let Some(replay) = replay().await else { return };
+    let (key, at) = serving_with_a_held_app(&replay).await;
+    assert_eq!(
+        held_and_kept(&replay).await,
+        (1, 0),
+        "held, not a tombstone yet"
+    );
+    let before = held(&replay).await;
+    let mut ordinary: IdentityBody = before.body().clone();
+    ordinary.version += 1;
+    let ordinary = IdentityDoc::sign(&alice_key(), ordinary).expect("sign");
+    let (answer, _) = deliver(&replay, ordinary.signed().clone(), Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(held_and_kept(&replay).await, (1, 0), "still held");
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&ordinary, key, Some(1)),
+        Some(ordinary.hash()),
+        at,
+    )
+    .await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(held_and_kept(&replay).await, (0, 1), "a tombstone now");
+    // An enrollment at a staged account holds nothing: the account keeps its first
+    // enrollment's `revoked_apps`.
+    replay.db.drop_database().await.expect("drop");
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let at = ms("2026-01-01T00:00:00.000Z");
+    set_time(&replay.clock, "2026-01-01T00:00:00.000Z");
+    assert_eq!(enroll(&replay, enrollment(1, None), at).await.status, 200);
+    assert_eq!(
+        enroll(&replay, enrollment(2, Some(vec![HELD_REVOKED])), at)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(held_and_kept(&replay).await, (0, 0));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -475,7 +664,7 @@ async fn test_recovery_in_place_holds_no_cursor_of_the_lost_sequence() {
     // from the lost one, so the wallet's first page there reports 0, before any move of its
     // own, whatever it held at generation 1 (Switch spec 8.3, 12.6 step 1).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let keys = vectors("keys.json");
     let body = OpsRequest::new(
         &[],
@@ -500,7 +689,7 @@ async fn test_recovery_in_place_holds_no_cursor_of_the_lost_sequence() {
     let before = held(&replay).await;
     let (answer, _) = deliver(
         &replay,
-        next_generation(&before, pending, Some(1)),
+        next_generation(&before, key, Some(1)),
         Some(before.hash()),
         at,
     )
@@ -519,40 +708,48 @@ async fn test_recovery_in_place_holds_no_cursor_of_the_lost_sequence() {
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_answers_a_held_feed_read_503_as_the_operator() {
+async fn test_recovery_in_place_answers_a_held_feed_read_from_the_new_generation() {
     // A feed read held when the account recovers in place: the recovery's commit wakes it,
-    // and it is answered `503 unavailable` with the operator key, with no head: the
-    // outgoing key signs nothing more, and the new generation's state isn't the read's
-    // (Switch wire 7.4.4, spec 12.6 step 1).
+    // and it is answered from the account as it then is, at the new generation, which holds
+    // no record of the app yet: `403 not_current`, signed with the service key, with no
+    // head (Switch wire 7.4.4 "Long-poll", spec 12.6 step 1).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let tip = chain(&replay).await.last().map_or(0, |(_, seq, _)| *seq);
     let before = held(&replay).await;
     let (stop, task) = listen(&replay).await;
     let keys = vectors("keys.json");
     let path = format!("/v1/{}/feed?after=1:{tip}&wait=10", alice_id());
     let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), at);
-    let request_signature = signature_of(&request);
+    let sent = signed_sent(&request);
     let started = std::time::Instant::now();
     let waiting = replay.service.handle(request);
     let (answer, delivered) = tokio::join!(waiting, async {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         deliver(
             &replay,
-            next_generation(&before, pending, Some(1)),
+            next_generation(&before, key, Some(1)),
             Some(before.hash()),
             at,
         )
         .await
     });
     assert_eq!(delivered.0.status, 200, "the recovery");
-    // Exactly these members, and the two headers every answer carries: the scripted
-    // switch's answer is held to the same (the client's `held_reads` test).
-    assert_eq!(answer.status, 503);
     assert_eq!(
-        json_of(&answer),
-        json!({ "code": "unavailable", "message": "7.6: a temporary failure" })
+        code(&answer),
+        (403, "not_current".into()),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
     );
+    let mut members: Vec<String> = json_of(&answer)
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    members.sort_unstable();
+    assert_eq!(members, ["code", "message"]);
+    // The two headers every answer carries, and no head.
     let mut names: Vec<&str> = answer
         .headers
         .iter()
@@ -562,162 +759,45 @@ async fn test_recovery_in_place_answers_a_held_feed_read_503_as_the_operator() {
     assert_eq!(names, ["switch-server-time", "switch-service-signature"]);
     // Woken by the recovery, not by the end of its wait.
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    // Neither generation's key signs it: the operator's does.
-    assert!(signed_by(&answer, &operator_public(), &request_signature));
-    assert!(!signed_by(&answer, &pending, &request_signature));
+    assert!(signed_by(&answer, &key, &sent));
     let _ = stop.send(());
     task.await.expect("listener");
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_retires_the_outgoing_keys_enrollments() {
-    // After the change, the enrollment the outgoing key answered is `409 conflict`, signed
-    // with the operator key, so its signer enrolls anew; the one the pending key answered
-    // gets its answer again, the account's key now (Switch wire 3.7).
+async fn test_recovery_key_change_naming_the_same_key_is_400() {
+    // The next generation without `recovery_from` is a service key change: the key it
+    // names must be another than the ending generation's, else `400 bad_request`, and
+    // nothing changes, the mark included (Switch wire 3.3).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
-    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
-    assert_eq!(answer.status, 200);
-    let http = vectors("http.json");
-    // The enrollment that created the account, its same bytes again, at the time now.
-    let body = pubky_switch_core::enc::unb64(
-        named(&http["requests"], "signer: enrollment")["body_b64"]
-            .as_str()
-            .expect("body"),
-    )
-    .expect("b64");
-    let creating = signer_request("POST", "/v1/enroll", body, at);
-    let creating_signature = signature_of(&creating);
-    let retired = replay.service.handle(creating).await;
-    assert_eq!(code(&retired), (409, "conflict".into()));
-    assert!(signed_by(&retired, &operator_public(), &creating_signature));
-    let again = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
-    assert_eq!(again.status, 200);
-    assert_eq!(answered_key(&again), pending);
-    // A new enrollment at the serving account gets a pending key of the next generation.
-    let fresh = enroll(&replay, enrollment(5, None), at).await;
-    assert_eq!(fresh.status, 200);
-    assert_ne!(answered_key(&fresh), pending);
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_key_rotation_isnt_served() {
-    // The next generation under the pending key without `recovery_from`, keeping the
-    // outgoing generation's key for its kept proofs, is a key rotation, which isn't served:
-    // `503`, and nothing changes.
-    let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let old_key = service_key_id(&replay).await;
-    let old_public = replay.keys.public_key(&old_key).await.expect("key");
-    let before = held(&replay).await;
-    let mut body: IdentityBody = before.body().clone();
-    body.version += 1;
-    body.generation += 1;
-    body.inbox.service_key = pending;
-    body.service_keys
-        .push(pubky_switch_core::records::ServiceKeyEntry {
-            generation: 1,
-            key: old_public,
-        });
-    let rotation = IdentityDoc::sign(&alice_key(), body)
-        .expect("sign")
-        .signed()
-        .clone();
-    let (answer, _) = deliver(&replay, rotation, Some(before.hash()), at).await;
-    assert_eq!(code(&answer), (503, "unavailable".into()));
-    assert_eq!(service_key_id(&replay).await, old_key);
-    assert_eq!(held(&replay).await.hash(), before.hash());
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_in_place_a_signer_of_the_outgoing_key_waiting_signs_nothing() {
-    // A request that loaded the outgoing key comes to sign its answer while the change holds
-    // the keying lock: it waits, and once the change commits it signs nothing with that key
-    // (Switch wire 3.3, 7.4.16).
-    let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let old_key = service_key_id(&replay).await;
-    let store = replay.db.store().clone();
-    let mut txn = store
-        .begin(&alice_id())
-        .await
-        .expect("begin")
-        .expect("account");
-    let new_key = txn
-        .pending_key()
-        .await
-        .expect("pending")
-        .expect("a pending key");
-    txn.exclude_signers().await.expect("exclude");
-    txn.start_recovery_in_place(&new_key, 1, at, 8, true)
-        .await
-        .expect("start");
-    let waiting = {
-        let store = store.clone();
-        let key = old_key.clone();
-        tokio::spawn(async move { store.while_keyed(&alice_id(), &key, false, || ()).await })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(!waiting.is_finished(), "parked on the keying lock");
-    txn.commit().await.expect("commit");
-    let keyed = waiting.await.expect("join").expect("keyed");
-    assert!(
-        matches!(keyed, pubky_switch::store::Keyed::Rekeyed),
-        "nothing signed with the outgoing key"
-    );
+    let mark_before = mark_of(&replay).await;
+    let change = key_change(&before, key);
+    let (answer, _) = deliver(&replay, change, Some(before.hash()), at).await;
     assert_eq!(
-        replay.keys.public_key(&new_key).await.expect("key"),
-        pending
+        code(&answer),
+        (400, "bad_request".into()),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
     );
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_in_place_waits_for_a_signer_of_the_outgoing_key() {
-    // A request of the outgoing key is signing its answer, under the account's shared keying
-    // lock, when the recovery comes: the recovery takes that lock exclusive before it switches
-    // the key, so it waits until the signing is done, the outgoing key's last (Switch wire
-    // 3.3). The shared lock is held here on a connection of its own, as a keyed section holds
-    // it.
-    let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let before = held(&replay).await;
-    let mut signing = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("BEGIN")
-        .execute(&mut signing)
-        .await
-        .expect("begin");
-    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
-        .bind(pubky_switch::store::keying_lock_key(&alice_id()))
-        .execute(&mut signing)
-        .await
-        .expect("shared lock");
-    let recovery = next_generation(&before, pending, Some(1));
-    let replay = std::sync::Arc::new(replay);
-    let delivering = {
-        let replay = replay.clone();
-        tokio::spawn(async move { deliver(&replay, recovery, Some(before.hash()), at).await })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(
-        !delivering.is_finished(),
-        "the recovery waits for the signing"
+    assert_eq!(held(&replay).await.hash(), before.hash());
+    assert_eq!(mark_of(&replay).await, mark_before);
+    assert_eq!(
+        scalar_i64(&replay, "SELECT generation FROM accounts WHERE id = $1").await,
+        1
     );
-    sqlx::query("COMMIT")
-        .execute(&mut signing)
-        .await
-        .expect("commit");
-    let (answer, _) = delivering.await.expect("join");
+    // With `recovery_from` the generation that ends, the same key starts it: a provider
+    // loss in place.
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&before, key, Some(1)),
+        Some(before.hash()),
+        at,
+    )
+    .await;
     assert_eq!(answer.status, 200);
-    signing.close().await.expect("close");
-    let replay = std::sync::Arc::into_inner(replay).expect("one owner");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -752,9 +832,9 @@ async fn test_recovery_classes_every_account_table() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The account's state restored from before its key's newest head: its chain gone, the
-/// chain head and every `seq` back to none, while the key's mark stays where it was (Switch
-/// wire 7.3 step 10).
+/// The account's state restored from before its newest head: its chain gone, the chain
+/// head and every `seq` back to none, while its mark stays where it was (Switch wire 7.3,
+/// Table 3: a restore of the state leaves the mark).
 async fn restored_behind_the_mark(replay: &Replay) {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -776,97 +856,35 @@ async fn restored_behind_the_mark(replay: &Replay) {
 
 #[tokio::test]
 async fn test_recovery_in_place_gets_past_a_state_behind_the_mark() {
-    // The service's state was restored from before what the account's key signed: every
-    // request is `503`, a new generation needed. The recovery delivering it, naming the
-    // pending key, is exempt (Switch wire 7.3 step 10): it is answered with the new key, the
-    // outgoing key retired and the account started afresh.
+    // The service's state was restored from before what it signed for the account: the
+    // account fails stop, `behind`. The start of the next generation, naming the service
+    // key and `recovery_from` the generation less one, is the one delivery taken: the
+    // account starts afresh, whatever its `prev` names (Switch wire 3.3, 7.3 Table 2). Its
+    // document still lists the phone, revoked but not removed yet, as the version held
+    // does: taken, as at a provider loss in place (Switch wire 3.3, 3.7).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let old_key = service_key_id(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     restored_behind_the_mark(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
-    let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    assert!(is_notice(
+        &replay.service.handle(request).await,
+        1,
+        "behind"
+    ));
+    let recovery = next_generation(&before, key, Some(1));
+    let (answer, signature) = deliver(&replay, recovery, Some([3; 32]), at).await;
     assert_eq!(
         answer.status,
         200,
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(signed_by(&answer, &pending, &signature));
-    assert!(replay.keys.public_key(&old_key).await.is_err(), "retired");
+    assert!(signed_by(&answer, &key, &signature));
     assert_eq!(
         chain(&replay).await,
         [(2, 1, "service".into()), (2, 2, "identity".into())]
     );
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_exemption_from_the_mark_is_only_for_a_recovery() {
-    // Behind the mark, only the recovery under the pending key gets through (Switch wire 7.3
-    // step 10): an ordinary next version, a rotation without `recovery_from` and a recovery
-    // naming another key all get the `503` a new generation is needed, with no head; so does the signer's `GET /apps`, which is how it
-    // learns. The signer's enrollment is exempt: it gets the pending key.
-    let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let old_key = service_key_id(&replay).await;
-    let old_public = replay.keys.public_key(&old_key).await.expect("key");
-    let before = held(&replay).await;
-    restored_behind_the_mark(&replay).await;
-    let behind = |answer: &SwitchResponse| {
-        code(answer) == (503, "unavailable".into())
-            && json_of(answer)["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("a new generation is needed"))
-            && header_text(answer, header::HEAD).is_none()
-    };
-    let sign = |change: &dyn Fn(&mut IdentityBody)| {
-        let mut body: IdentityBody = before.body().clone();
-        body.version += 1;
-        change(&mut body);
-        IdentityDoc::sign(&alice_key(), body)
-            .expect("sign")
-            .signed()
-            .clone()
-    };
-    let ordinary = sign(&|body| body.record_max_age = Some(60));
-    let rotation = sign(&|body| {
-        body.generation += 1;
-        body.inbox.service_key = pending;
-        body.service_keys
-            .push(pubky_switch_core::records::ServiceKeyEntry {
-                generation: 1,
-                key: old_public,
-            });
-    });
-    let another_key = sign(&|body| {
-        body.generation += 1;
-        body.inbox.service_key = [9; 32];
-        body.recovery_from = Some(1);
-    });
-    for (what, doc, prev) in [
-        ("an ordinary version", ordinary, Some(before.hash())),
-        ("a rotation", rotation, Some(before.hash())),
-        (
-            "a recovery naming another key",
-            another_key,
-            Some(before.hash()),
-        ),
-    ] {
-        let (answer, _) = deliver(&replay, doc, prev, at).await;
-        assert!(
-            behind(&answer),
-            "{what}: {}",
-            String::from_utf8_lossy(&answer.body)
-        );
-    }
-    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    assert!(behind(&replay.service.handle(request).await));
-    let enrolled = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
-    assert_eq!(enrolled.status, 200);
-    assert_eq!(answered_key(&enrolled), pending);
-    assert_eq!(service_key_id(&replay).await, old_key, "nothing changed");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -975,9 +993,9 @@ async fn test_recovery_in_place_takes_a_first_receive_key_above_zero() {
     // registered (Switch spec 3.6, 12.6 step 1): its first record in the recovered generation
     // may carry any `n`, and each later one is one higher again.
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
@@ -990,10 +1008,11 @@ async fn test_recovery_in_place_takes_a_first_receive_key_above_zero() {
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_refuses_an_app_the_pending_enrollment_revoked() {
-    // The pending key's enrollments' `revoked_apps` are kept from the new generation's start,
-    // as at a new account that "never serves or lists them, also after a provider loss"
-    // (Switch wire 3.7): a recovery document that lists one is `400`, and nothing changes.
+async fn test_recovery_in_place_refuses_an_app_an_enrollment_held() {
+    // The `revoked_apps` a serving account's enrollments named are kept from the new
+    // generation's start, as at a new account that "never serves or lists them, also after
+    // a provider loss" (Switch wire 3.7): a recovery document that lists one is `400`, and
+    // nothing changes.
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = replay.clock.now_ms() + 60_000;
@@ -1009,14 +1028,15 @@ async fn test_recovery_in_place_refuses_an_app_the_pending_enrollment_revoked() 
     .expect("16");
     let answer = enroll(&replay, enrollment(3, Some(vec![wallet_id])), at).await;
     assert_eq!(answer.status, 200);
-    let pending = answered_key(&answer);
-    let old_key = service_key_id(&replay).await;
+    let key = answered_key(&answer);
     let before = held(&replay).await;
+    let mark_before = mark_of(&replay).await;
     assert!(before.body().apps.iter().any(|a| a.app_id == wallet_id));
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(code(&answer), (400, "bad_request".into()));
-    assert_eq!(service_key_id(&replay).await, old_key);
+    assert_eq!(held(&replay).await.hash(), before.hash());
+    assert_eq!(mark_of(&replay).await, mark_before);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1054,210 +1074,277 @@ async fn test_recovery_first_document_names_this_service() {
 }
 
 #[tokio::test]
-async fn test_recovery_in_place_drops_the_oldest_retired_enrollment() {
-    // At most `max_enrollments` retired enrollments are kept, the oldest dropping; the same
-    // enrollment again after its record dropped is answered as a new one (Switch wire 3.7).
-    // With a bound of 2: two staged enrollments retire at the first change, the pending one
-    // at the second, and the creating enrollment's record drops.
-    let limits = pubky_switch::limits::Limits {
-        max_enrollments: 2,
-        ..pubky_switch::limits::Limits::default()
-    };
-    let Some(replay) = replay_with(limits).await else {
-        return;
-    };
-    let at = ms("2026-01-01T00:00:00.000Z");
-    set_time(&replay.clock, "2026-01-01T00:00:00.000Z");
-    let first = enroll(&replay, enrollment(1, None), at).await;
-    assert_eq!(first.status, 200);
-    assert_eq!(enroll(&replay, enrollment(2, None), at).await.status, 200);
-    let key = answered_key(&first);
-    let version_1: SignedDoc = serde_json::from_value(
-        named(
-            &vectors("documents.json")["documents"],
-            "alice identity.json, first delivery (version 1)",
-        )["signed"]
-            .clone(),
-    )
-    .expect("doc");
-    let version_1 = IdentityDoc::verify(&version_1, &alice_key().public()).expect("verify");
-    let mut body = version_1.body().clone();
-    body.inbox.service_key = key;
-    body.inbox.url = ORIGIN.into();
-    let v1 = IdentityDoc::sign(&alice_key(), body).expect("sign");
-    let (answer, _) = deliver(&replay, v1.signed().clone(), None, at).await;
-    assert_eq!(answer.status, 200);
-    let p1 = enroll(&replay, enrollment(3, None), at).await;
-    let pending = answered_key(&p1);
-    let (answer, _) = deliver(
-        &replay,
-        next_generation(&v1, pending, Some(1)),
-        Some(v1.hash()),
-        at,
-    )
-    .await;
-    assert_eq!(answer.status, 200);
-    for nonce in [1, 2] {
-        let again = enroll(&replay, enrollment(nonce, None), at).await;
-        assert_eq!(code(&again), (409, "conflict".into()), "nonce {nonce}");
-    }
-    let p2 = enroll(&replay, enrollment(4, None), at).await;
-    let pending_2 = answered_key(&p2);
-    let generation_2 = held(&replay).await;
-    let (answer, _) = deliver(
-        &replay,
-        next_generation(&generation_2, pending_2, Some(2)),
-        Some(generation_2.hash()),
-        at,
-    )
-    .await;
-    assert_eq!(answer.status, 200);
-    assert_eq!(
-        scalar_i64(
-            &replay,
-            "SELECT count(*) FROM retired_enrollments WHERE account_id = $1"
-        )
-        .await,
-        2
-    );
-    let dropped = enroll(&replay, enrollment(1, None), at).await;
-    assert_eq!(dropped.status, 200, "answered as a new enrollment");
-    let fresh = answered_key(&dropped);
-    assert!(fresh != pending_2 && fresh != pending && fresh != key);
-    for nonce in [2, 3] {
-        let again = enroll(&replay, enrollment(nonce, None), at).await;
-        assert_eq!(code(&again), (409, "conflict".into()), "nonce {nonce}");
-    }
-    assert_eq!(
-        answered_key(&enroll(&replay, enrollment(4, None), at).await),
-        pending_2
-    );
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_in_place_keeps_the_pending_keys_answers_for_good() {
-    // The answers the pending key gave name the account's key once it serves, which a
-    // rebuild wouldn't give: kept for good, they never drop for newer enrollments' answers
-    // (Switch wire 3.7, 9.1).
-    let limits = pubky_switch::limits::Limits {
-        max_enrollments: 2,
-        ..pubky_switch::limits::Limits::default()
-    };
-    let Some(replay) = replay_with(limits).await else {
-        return;
-    };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
-    let before = held(&replay).await;
-    let (answer, _) = deliver(
-        &replay,
-        next_generation(&before, pending, Some(1)),
-        Some(before.hash()),
-        at,
-    )
-    .await;
-    assert_eq!(answer.status, 200);
-    for nonce in 10..14 {
-        assert_eq!(
-            enroll(&replay, enrollment(nonce, None), at).await.status,
-            200
-        );
-    }
-    let again = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
-    assert_eq!(answered_key(&again), pending);
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_rotation_after_a_recovery_isnt_served() {
+async fn test_recovery_key_change_after_a_recovery_naming_the_same_key_is_400() {
     // A later document keeps the earlier loss's `recovery_from` (spec 4.3), which doesn't
-    // name the generation that ends: the next generation under a new pending key is then a
-    // rotation, `503`, and nothing changes.
+    // name the generation that ends: the next generation is then a service key change, and
+    // one naming the same key as the ending generation's is `400`; nothing changes (Switch
+    // wire 3.3).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let (answer, _) = deliver(
         &replay,
-        next_generation(&before, pending, Some(1)),
+        next_generation(&before, key, Some(1)),
         Some(before.hash()),
         at,
     )
     .await;
     assert_eq!(answer.status, 200);
-    let fresh = enroll(&replay, enrollment(9, None), at).await;
-    let pending_2 = answered_key(&fresh);
+    assert_eq!(
+        answered_key(&enroll(&replay, enrollment(9, None), at).await),
+        key
+    );
     let generation_2 = held(&replay).await;
-    let key_2 = service_key_id(&replay).await;
-    let rotation = next_generation(&generation_2, pending_2, Some(1));
-    let (answer, _) = deliver(&replay, rotation, Some(generation_2.hash()), at).await;
-    assert_eq!(code(&answer), (503, "unavailable".into()));
-    assert_eq!(service_key_id(&replay).await, key_2);
+    let mark_2 = mark_of(&replay).await;
+    let mut change: IdentityBody = generation_2.body().clone();
+    change.version += 1;
+    change.generation += 1;
+    change.inbox.service_key = key;
+    change
+        .service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry { generation: 2, key });
+    let change = IdentityDoc::sign(&alice_key(), change)
+        .expect("sign")
+        .signed()
+        .clone();
+    let (answer, _) = deliver(&replay, change, Some(generation_2.hash()), at).await;
+    assert_eq!(
+        code(&answer),
+        (400, "bad_request".into()),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
     assert_eq!(held(&replay).await.hash(), generation_2.hash());
+    assert_eq!(mark_of(&replay).await, mark_2);
     replay.db.drop_database().await.expect("drop");
 }
 
-/// alice serving with the vectors' chain, restored: her key's mark three `seq`s past her
-/// state, or, with `fork`, her head at the mark's `seq` with another chain hash. The
-/// outgoing key and the time.
-async fn restored(replay: &Replay, fork: bool) -> (KeyId, u64) {
-    replay_chain_through_revoke(replay).await;
+/// alice serving with `identity.json` version 3 at seq 2, restored: her mark three `seq`s
+/// past her state, or, with `fork`, at her state's pair with another chain hash. The time
+/// after.
+async fn restored(replay: &Replay, fork: bool) -> u64 {
+    serve_alice(replay).await;
     let at = replay.clock.now_ms() + 60_000;
     set_time(&replay.clock, &rfc3339(at));
-    let old_key = service_key_id(replay).await;
-    let mark = replay
-        .keys
-        .mark(&old_key)
-        .await
-        .expect("mark")
-        .expect("a mark");
+    let mark = mark_of(replay).await;
     if fork {
-        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-            .await
-            .expect("conn");
-        sqlx::query("UPDATE accounts SET chain_hash = $2 WHERE id = $1")
-            .bind(alice_id())
-            .bind([9u8; 32].as_slice())
-            .execute(&mut conn)
-            .await
-            .expect("fork");
-        conn.close().await.expect("close");
-    } else {
+        replay.marks.delete(&alice_id()).await.expect("delete");
+        let beside = ChainTip {
+            chain_hash: [9; 32],
+            ..mark.head()
+        };
         replay
-            .keys
-            .advance_mark(
-                &old_key,
-                pubky_switch::keys::Mark {
-                    generation: mark.generation,
-                    seq: mark.seq + 3,
-                    chain_hash: [9; 32],
-                },
-            )
+            .marks
+            .write_anew(&alice_id(), beside, mark.key, mark.created_at_ms)
             .await
-            .expect("advance");
+            .expect("a mark beside the state");
+    } else {
+        let ahead = ChainTip {
+            generation: mark.generation,
+            seq: mark.seq + 3,
+            chain_hash: [9; 32],
+        };
+        replay
+            .marks
+            .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
+            .await
+            .expect("a mark ahead of the state");
     }
-    (old_key, at)
+    at
 }
 
-/// At a serving account behind its key's mark, or beside it, every request is `503` with no
-/// head, but the signer's enrollment, the recovery delivering the next generation under the
-/// pending key, and an erasure (Switch wire 7.3 step 10).
-async fn only_the_recovery_gets_past_the_mark(fork: bool) {
+/// The account's key, held document, chain length, stamped `seq` and recovery column.
+async fn snapshot(replay: &Replay) -> ([u8; 32], usize, i64, i64) {
+    let held = held(replay).await.hash();
+    let chain = chain(replay).await.len();
+    let seq = scalar_i64(replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let recovery = scalar_i64(
+        replay,
+        "SELECT COALESCE(recovery_from, -1) FROM accounts WHERE id = $1",
+    )
+    .await;
+    (held, chain, seq, recovery)
+}
+
+/// At a serving account that fails stop, behind its mark or beside it, every request gets
+/// the notice, but the signer's enrollment and the start above both the held document's and
+/// the mark's generation with `recovery_from` its generation less one, which starts the
+/// account afresh, its `prev` not compared (Switch wire 3.3, 7.3 Tables 1 and 2).
+async fn only_the_start_gets_past_the_mark(fork: bool) {
     let Some(replay) = replay().await else { return };
-    let (old_key, at) = restored(&replay, fork).await;
-    let old_public = replay.keys.public_key(&old_key).await.expect("key");
-    let apps = replay
-        .service
-        .handle(signer_request(
-            "GET",
-            &format!("/v1/{}/apps", alice_id()),
-            Vec::new(),
-            at,
-        ))
-        .await;
-    assert_eq!(code(&apps), (503, "unavailable".into()), "fails stop");
+    let at = restored(&replay, fork).await;
+    let reason = if fork { "fork" } else { "behind" };
+    let key = service_public(&replay);
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    let sent = signed_sent(&request);
+    let apps = replay.service.handle(request).await;
+    assert!(
+        is_notice(&apps, 1, reason),
+        "{}",
+        String::from_utf8_lossy(&apps.body)
+    );
+    assert!(signed_by(&apps, &key, &sent), "the key in the mark");
     let enrolled = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
     assert_eq!(enrolled.status, 200);
-    let pending = answered_key(&enrolled);
+    assert_eq!(answered_key(&enrolled), key);
+    let before = held(&replay).await;
+    let state_before = snapshot(&replay).await;
+    let mark_before = mark_of(&replay).await;
+    let mut ordinary = before.body().clone();
+    ordinary.version += 1;
+    let ordinary = IdentityDoc::sign(&alice_key(), ordinary)
+        .expect("sign")
+        .signed()
+        .clone();
+    let mut same_generation = before.body().clone();
+    same_generation.version += 1;
+    same_generation.recovery_from = Some(1);
+    let same_generation = IdentityDoc::sign(&alice_key(), same_generation)
+        .expect("sign")
+        .signed()
+        .clone();
+    let mut skipping = before.body().clone();
+    skipping.version += 1;
+    skipping.generation += 2;
+    skipping.recovery_from = Some(1);
+    let skipping = IdentityDoc::sign(&alice_key(), skipping)
+        .expect("sign")
+        .signed()
+        .clone();
+    for (what, doc) in [
+        ("an ordinary version", ordinary),
+        ("a key change", next_generation(&before, key, None)),
+        ("a start not above the generation", same_generation),
+        ("recovery_from not the generation less one", skipping),
+    ] {
+        let (answer, _) = deliver(&replay, doc, Some(before.hash()), at).await;
+        assert!(
+            is_notice(&answer, 1, reason),
+            "{what}: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(snapshot(&replay).await, state_before, "{what}: nothing");
+        assert_eq!(mark_of(&replay).await, mark_before, "{what}: the mark");
+    }
+    let start = next_generation(&before, key, Some(1));
+    let (answer, signature) = deliver(&replay, start, Some([3; 32]), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_by(&answer, &key, &signature));
+    assert_eq!(
+        chain(&replay).await,
+        [(2, 1, "service".into()), (2, 2, "identity".into())],
+        "afresh"
+    );
+    let head = head_of(&answer);
+    let mark = mark_of(&replay).await;
+    assert_eq!(
+        (
+            mark.generation,
+            mark.seq,
+            mark.chain_hash,
+            mark.created_at_ms
+        ),
+        (2, 2, head.chain_hash, mark_before.created_at_ms)
+    );
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    let read_signature = signed_sent(&request);
+    let apps = replay.service.handle(request).await;
+    assert_eq!(apps.status, 200);
+    assert!(signed_by(&apps, &key, &read_signature));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_failing_behind_its_mark_takes_only_the_start() {
+    only_the_start_gets_past_the_mark(false).await;
+}
+
+#[tokio::test]
+async fn test_recovery_failing_beside_its_mark_takes_only_the_start() {
+    only_the_start_gets_past_the_mark(true).await;
+}
+
+#[tokio::test]
+async fn test_recovery_failing_start_is_above_the_marks_generation() {
+    // The mark records a head at generation 3, above the held document's generation 1: the
+    // notice names generation 3, and only a start above it, with `recovery_from` its
+    // generation less one, goes through (Switch wire 7.3, Table 2; 7.6).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let key = service_public(&replay);
+    let ahead = ChainTip {
+        generation: 3,
+        seq: 1,
+        chain_hash: [9; 32],
+    };
+    replay
+        .marks
+        .advance(
+            &alice_id(),
+            ahead,
+            key,
+            mark_created_at(&replay, &alice_id()).await,
+        )
+        .await
+        .expect("a mark ahead");
+    let before = held(&replay).await;
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&before, key, Some(1)),
+        Some(before.hash()),
+        at,
+    )
+    .await;
+    assert!(
+        is_notice(&answer, 3, "behind"),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mut above: IdentityBody = before.body().clone();
+    above.version += 1;
+    above.generation = 4;
+    above.recovery_from = Some(3);
+    let above = IdentityDoc::sign(&alice_key(), above)
+        .expect("sign")
+        .signed()
+        .clone();
+    let (answer, _) = deliver(&replay, above, None, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mark = mark_of(&replay).await;
+    assert_eq!((mark.generation, mark.seq), (4, 2));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_failing_mark_lost_start_writes_the_mark_anew() {
+    // A serving account whose mark is lost fails stop, `mark_lost`. The start writes the
+    // mark anew at the new generation's first head, with the account's creation time
+    // (Switch wire 7.3, Table 3); any other delivery gets the notice and writes none.
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let key = service_public(&replay);
+    let created = created_at(&replay).await;
+    replay.marks.delete(&alice_id()).await.expect("lost");
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    assert!(is_notice(
+        &replay.service.handle(request).await,
+        1,
+        "mark_lost"
+    ));
     let before = held(&replay).await;
     let mut ordinary = before.body().clone();
     ordinary.version += 1;
@@ -1265,56 +1352,48 @@ async fn only_the_recovery_gets_past_the_mark(fork: bool) {
         .expect("sign")
         .signed()
         .clone();
-    for (what, doc) in [
-        ("an ordinary version", ordinary),
-        ("a rotation", next_generation(&before, pending, None)),
-        ("another key", next_generation(&before, old_public, Some(1))),
-    ] {
-        let (answer, _) = deliver(&replay, doc, Some(before.hash()), at).await;
-        assert_eq!(code(&answer), (503, "unavailable".into()), "{what}");
-        assert!(
-            header_text(&answer, header::HEAD).is_none(),
-            "{what}: no head"
-        );
-    }
-    assert_eq!(service_key_id(&replay).await, old_key);
-    assert_eq!(held(&replay).await.hash(), before.hash());
-    let recovery = next_generation(&before, pending, Some(1));
-    let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    let (answer, _) = deliver(&replay, ordinary, Some(before.hash()), at).await;
+    assert!(is_notice(&answer, 1, "mark_lost"));
+    assert_eq!(
+        replay.marks.read(&alice_id()).await.expect("read"),
+        MarkRead::Missing
+    );
+    let (answer, signature) = deliver(
+        &replay,
+        next_generation(&before, key, Some(1)),
+        Some([3; 32]),
+        at,
+    )
+    .await;
     assert_eq!(
         answer.status,
         200,
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(signed_by(&answer, &pending, &signature));
-    assert!(!signed_by(&answer, &old_public, &signature));
-    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
-    let read_signature = signature_of(&request);
-    let apps = replay.service.handle(request).await;
-    assert_eq!(apps.status, 200);
-    assert!(signed_by(&apps, &pending, &read_signature));
+    assert!(signed_by(&answer, &key, &signature));
+    let head = head_of(&answer);
+    assert_eq!(
+        mark_of(&replay).await,
+        AccountMark {
+            generation: 2,
+            seq: 2,
+            chain_hash: head.chain_hash,
+            key,
+            created_at_ms: created,
+        }
+    );
     replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_recovery_gets_past_a_state_behind_its_mark_alone() {
-    only_the_recovery_gets_past_the_mark(false).await;
-}
-
-#[tokio::test]
-async fn test_recovery_gets_past_a_state_beside_its_mark_alone() {
-    only_the_recovery_gets_past_the_mark(true).await;
 }
 
 #[tokio::test]
 async fn test_recovery_in_place_after_its_version_was_lost_too() {
     // The restore lost the newest `identity.json` too: the service holds an older version,
-    // and the signer's recovery builds on the one it lost. A provider loss in place takes it
-    // whatever its `prev` names, at a higher version than the one held (Switch wire 3.3);
-    // the account fails stop otherwise, and could never learn the version held.
+    // and the signer's recovery builds on the one it lost. At the account, which fails stop,
+    // the start is taken whatever its `prev` names (Switch wire 3.3, 7.3 Table 2), the
+    // revoked phone it still lists included, as the version held lists it (Switch wire 3.3).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let newest = held(&replay).await;
     let version_1: SignedDoc = serde_json::from_value(
         named(
@@ -1335,7 +1414,7 @@ async fn test_recovery_in_place_after_its_version_was_lost_too() {
         .expect("older version");
     conn.close().await.expect("close");
     restored_behind_the_mark(&replay).await;
-    let recovery = next_generation(&newest, pending, Some(1));
+    let recovery = next_generation(&newest, key, Some(1));
     let (answer, signature) = deliver(&replay, recovery, Some(newest.hash()), at).await;
     assert_eq!(
         answer.status,
@@ -1343,7 +1422,7 @@ async fn test_recovery_in_place_after_its_version_was_lost_too() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(signed_by(&answer, &pending, &signature));
+    assert!(signed_by(&answer, &key, &signature));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1373,109 +1452,74 @@ fn recovery_at(on: &IdentityDoc, key: [u8; 32], version: u64) -> SignedDoc {
         .clone()
 }
 
-/// Whether `answer` is the 503 of a state behind its key's mark: no head.
-fn is_behind_the_mark(answer: &SwitchResponse) -> bool {
-    code(answer) == (503, "unavailable".into())
-        && json_of(answer)["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("a new generation is needed"))
-        && header_text(answer, header::HEAD).is_none()
-}
-
-async fn snapshot(replay: &Replay) -> (KeyId, [u8; 32], usize, i64, i64) {
-    let key = service_key_id(replay).await;
-    let held = held(replay).await.hash();
-    let chain = chain(replay).await.len();
-    let seq = scalar_i64(replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
-    let recovery = scalar_i64(
-        replay,
-        "SELECT COALESCE(recovery_from, -1) FROM accounts WHERE id = $1",
-    )
-    .await;
-    (key, held, chain, seq, recovery)
-}
-
-async fn exempt_delivery_refused_deeper(fork: bool) {
-    // Behind (or beside) the mark, a delivery exempt from the mark check (the signer's,
-    // at the next generation, naming the pending key, `recovery_from` the held generation)
-    // that put_identity refuses all the same: a version not higher than the one held (409
-    // stale_identity), or one listing an App ID the pending enrollment revoked (400). Each
-    // gets the behind 503 with no head, signed with the outgoing key as every request in
-    // that state is, and nothing commits: the key, the held version, the chain, the
-    // stamped seq, the recovery columns and the outgoing key's mark all stay.
+/// At a serving account that fails stop, behind its mark or beside it, a start of the next
+/// generation that 3.3 doesn't take all the same: one listing an App ID an enrollment held
+/// for the next generation, or one naming a key the service doesn't hold. Each is refused
+/// without a head, and nothing commits: the held version, the chain, the stamped `seq`, the
+/// recovery column and the mark all stay (Switch wire 3.3, 3.7, 7.3 Table 2).
+async fn start_refused_deeper_changes_nothing(fork: bool) {
     let Some(replay) = replay().await else { return };
-    let (old_key, at) = restored(&replay, fork).await;
-    let old_public = replay.keys.public_key(&old_key).await.expect("key");
+    let at = restored(&replay, fork).await;
+    let key = service_public(&replay);
     let wallet = wallet_app_id();
     let enrolled = enroll(&replay, enrollment(3, Some(vec![wallet])), at).await;
     assert_eq!(enrolled.status, 200);
-    let pending = answered_key(&enrolled);
     let before = held(&replay).await;
     assert!(before.body().apps.iter().any(|a| a.app_id == wallet));
-    let mark_before = replay.keys.mark(&old_key).await.expect("mark");
+    let mark_before = mark_of(&replay).await;
     let state_before = snapshot(&replay).await;
-    let mut without_wallet: IdentityBody = before.body().clone();
-    without_wallet.apps.retain(|a| a.app_id != wallet);
-    let without_wallet = IdentityDoc::sign(&alice_key(), without_wallet).expect("sign");
     for (what, doc) in [
         (
-            "not a higher version",
-            recovery_at(&without_wallet, pending, before.version()),
+            "lists the held wallet",
+            next_generation(&before, key, Some(before.generation())),
         ),
         (
-            "lists the revoked wallet",
-            next_generation(&before, pending, Some(before.generation())),
+            "names another key",
+            next_generation(&before, [9; 32], Some(before.generation())),
         ),
     ] {
         let (answer, signature) = deliver(&replay, doc, Some(before.hash()), at).await;
-        assert!(
-            is_behind_the_mark(&answer),
-            "{what}: {} {}",
-            answer.status,
+        assert_eq!(
+            code(&answer),
+            (400, "bad_request".into()),
+            "{what}: {}",
             String::from_utf8_lossy(&answer.body)
         );
         assert!(
-            signed_by(&answer, &old_public, &signature),
-            "{what}: old key"
+            header_text(&answer, header::HEAD).is_none(),
+            "{what}: no head"
         );
+        assert!(signed_by(&answer, &key, &signature), "{what}: signed");
         assert_eq!(snapshot(&replay).await, state_before, "{what}: nothing");
-        assert_eq!(
-            replay.keys.mark(&old_key).await.expect("mark"),
-            mark_before,
-            "{what}: mark"
-        );
-        assert!(
-            replay.keys.public_key(&old_key).await.is_ok(),
-            "not retired"
-        );
+        assert_eq!(mark_of(&replay).await, mark_before, "{what}: mark");
     }
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
-async fn test_recovery_behind_the_mark_an_exempt_delivery_refused_deeper_is_the_503() {
-    exempt_delivery_refused_deeper(false).await;
+async fn test_recovery_behind_the_mark_a_start_refused_deeper_changes_nothing() {
+    start_refused_deeper_changes_nothing(false).await;
 }
 
 #[tokio::test]
-async fn test_recovery_beside_the_mark_an_exempt_delivery_refused_deeper_is_the_503() {
-    exempt_delivery_refused_deeper(true).await;
+async fn test_recovery_beside_the_mark_a_start_refused_deeper_changes_nothing() {
+    start_refused_deeper_changes_nothing(true).await;
 }
 
 #[tokio::test]
 async fn test_recovery_without_prev_still_needs_a_higher_version_and_only_for_a_recovery() {
-    // Wire 3.3: a recovery in place is exempt from comparing `prev`, but needs a
+    // Wire 3.3: a provider loss in place is exempt from comparing `prev`, but needs a
     // higher version than the one held: one at or below it, whatever its `prev`, is `409
-    // stale_identity` with the held copy. A rotation and an ordinary version with a stale
-    // `prev` aren't exempt: `409 stale_identity`, not the rotation's `503`.
+    // stale_identity` with the held copy. A key change and an ordinary version with a stale
+    // `prev` aren't exempt: `409 stale_identity`, not the key change's `400`.
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let state_before = snapshot(&replay).await;
     for version in [before.version(), before.version() - 1] {
         let (answer, _) = deliver(
             &replay,
-            recovery_at(&before, pending, version),
+            recovery_at(&before, key, version),
             Some([3; 32]),
             at,
         )
@@ -1492,34 +1536,16 @@ async fn test_recovery_without_prev_still_needs_a_higher_version_and_only_for_a_
         .expect("sign")
         .signed()
         .clone();
-    let old_public = replay
-        .keys
-        .public_key(&service_key_id(&replay).await)
-        .await
-        .expect("key");
-    let mut rotation: IdentityBody = before.body().clone();
-    rotation.version += 1;
-    rotation.generation += 1;
-    rotation.inbox.service_key = pending;
-    rotation
-        .service_keys
-        .push(pubky_switch_core::records::ServiceKeyEntry {
-            generation: 1,
-            key: old_public,
-        });
-    let rotation = IdentityDoc::sign(&alice_key(), rotation)
-        .expect("sign")
-        .signed()
-        .clone();
-    // With the right prev, the rotation is the 503 of a change not served.
-    let (answer, _) = deliver(&replay, rotation.clone(), Some(before.hash()), at).await;
+    let change = key_change(&before, key);
+    // With the right prev, the key change naming the same key is `400`.
+    let (answer, _) = deliver(&replay, change.clone(), Some(before.hash()), at).await;
     assert_eq!(
         code(&answer),
-        (503, "unavailable".into()),
-        "rotation, right prev"
+        (400, "bad_request".into()),
+        "key change, right prev"
     );
     for (what, doc) in [
-        ("a rotation", rotation),
+        ("a key change", change),
         ("an ordinary version", ordinary),
         (
             "a recovery naming another key",
@@ -1529,12 +1555,11 @@ async fn test_recovery_without_prev_still_needs_a_higher_version_and_only_for_a_
         let (answer, _) = deliver(&replay, doc, Some([3; 32]), at).await;
         assert_eq!(code(&answer), (409, "stale_identity".into()), "{what}");
     }
-    assert_eq!(snapshot(&replay).await.0, state_before.0);
-    assert_eq!(snapshot(&replay).await.1, state_before.1);
+    assert_eq!(snapshot(&replay).await, state_before);
     // `prev` null at an account holding a version: taken too (the rule's "whatever").
     let (answer, _) = deliver(
         &replay,
-        recovery_at(&before, pending, before.version() + 1),
+        recovery_at(&before, key, before.version() + 1),
         None,
         at,
     )
@@ -1549,9 +1574,9 @@ async fn test_recovery_document_replayed_later_is_refused() {
     // past (a later version, then a second loss), never takes the exemption again: its
     // generation is not the held one plus one.
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
-    let r1 = next_generation(&before, pending, Some(1));
+    let r1 = next_generation(&before, key, Some(1));
     let (answer, _) = deliver(&replay, r1.clone(), Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     let g2 = held(&replay).await;
@@ -1572,8 +1597,11 @@ async fn test_recovery_document_replayed_later_is_refused() {
         (409, "stale_identity".into()),
         "older, prev right"
     );
-    let p2 = answered_key(&enroll(&replay, enrollment(9, None), at).await);
-    let r2 = recovery_at(&later, p2, later.version() + 1);
+    assert_eq!(
+        answered_key(&enroll(&replay, enrollment(9, None), at).await),
+        key
+    );
+    let r2 = recovery_at(&later, key, later.version() + 1);
     let (answer, _) = deliver(&replay, r2, Some([4; 32]), at).await;
     assert_eq!(
         answer.status,
@@ -1581,12 +1609,12 @@ async fn test_recovery_document_replayed_later_is_refused() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    let key_3 = service_key_id(&replay).await;
+    let generation_3 = held(&replay).await.hash();
     for prev in [Some([3; 32]), Some(later.hash()), None] {
         let (answer, _) = deliver(&replay, r1.clone(), prev, at).await;
         assert_eq!(code(&answer), (409, "stale_identity".into()), "{prev:?}");
     }
-    assert_eq!(service_key_id(&replay).await, key_3);
+    assert_eq!(held(&replay).await.hash(), generation_3);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1649,9 +1677,9 @@ async fn test_admission_staged_until_the_signer_ends_it() {
     // is then refused as any sender not admitted. Ended, a second call chains nothing and
     // answers no proof (Switch spec 12.6 step 2; wire 7.4.14).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     assert_eq!(admission_staged(&replay, at).await, json!(true));
@@ -1693,12 +1721,12 @@ async fn test_admission_isnt_staged_by_a_recovery_listing_no_app() {
     // A recovery document that lists no app stages nothing: senders aren't held back, and
     // the signer's call chains nothing (Switch spec 12.6 step 2; wire 7.4.14).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let mut body: IdentityBody = before.body().clone();
     body.version += 1;
     body.generation += 1;
-    body.inbox.service_key = pending;
+    body.inbox.service_key = service_key;
     body.recovery_from = Some(1);
     body.apps.clear();
     body.renewed.clear();
@@ -1728,13 +1756,13 @@ async fn test_admission_needs_a_recovery_and_an_empty_body() {
     // `404` at an account whose generation began with no recovery; `400` for a body (Switch
     // wire 7.4.14).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     assert_eq!(
         code(&admission(&replay, Vec::new(), at).await),
         (404, "not_found".into())
     );
     let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     assert_eq!(
@@ -1752,12 +1780,12 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
     // would pass for a stranger, so a stranger gets `503 staged` too, at both calls; once it
     // ends, its delivery is taken and its request kept (Switch spec 12.6 step 2).
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let mut body: IdentityBody = before.body().clone();
     body.version += 1;
     body.generation += 1;
-    body.inbox.service_key = pending;
+    body.inbox.service_key = service_key;
     body.recovery_from = Some(1);
     body.policy.connect_requests.enabled = true;
     let recovery = IdentityDoc::sign(&alice_key(), body)
@@ -1811,9 +1839,9 @@ fn wallet_keys() -> Value {
 }
 
 async fn recovered_staged(replay: &Replay) -> u64 {
-    let (pending, at) = serving_with_a_pending_key(replay).await;
+    let (service_key, at) = serving_with_a_held_app(replay).await;
     let before = held(replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     assert_eq!(admission_staged(replay, at).await, json!(true));
@@ -1957,18 +1985,14 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
     // body `by: "signer"`; signed with the recovered generation's key, as is the answer.
     let Some(replay) = replay().await else { return };
     let at = recovered_staged(&replay).await;
-    let key = replay
-        .keys
-        .public_key(&service_key_id(&replay).await)
-        .await
-        .expect("key");
+    let key = service_public(&replay);
     let request = signer_request(
         "POST",
         &format!("/v1/{}/recovery/admission", alice_id()),
         Vec::new(),
         at,
     );
-    let signature = signature_of(&request);
+    let signature = signed_sent(&request);
     let answer = replay.service.handle(request).await;
     assert_eq!(answer.status, 200);
     assert!(signed_by(&answer, &key, &signature));
@@ -2006,9 +2030,9 @@ const ATTEMPTED: &str = "claim attempt (seq 7)";
 /// alice recovered in place from the loss of generation 1, admission staged, with the
 /// wallet current again at generation 2: the lost generation's `identity.json` and the time.
 async fn recovered_with_the_wallet(replay: &Replay) -> (IdentityDoc, u64) {
-    let (pending, at) = serving_with_a_pending_key(replay).await;
+    let (service_key, at) = serving_with_a_held_app(replay).await;
     let before = held(replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     let (status, body) = wallet_registers(replay, 77, 2, 3, true, at).await;
@@ -2320,7 +2344,7 @@ async fn test_upload_refusals() {
     let Some(replay) = replay_with(limits.clone()).await else {
         return;
     };
-    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (_, at) = serving_with_a_held_app(&replay).await;
     let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
@@ -2853,7 +2877,7 @@ async fn test_upload_refusals_order_and_the_rate_slot() {
     let Some(replay) = replay_with(limits.clone()).await else {
         return;
     };
-    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (_, at) = serving_with_a_held_app(&replay).await;
     let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
     assert_eq!(status, 200, "{body}");
     let path = format!("/v1/{}/recovery/upload", alice_id());
@@ -2926,18 +2950,8 @@ async fn test_upload_rate_is_per_app_and_forgotten_on_erasure() {
         upload_as(&replay, &executor, &json!({}), at).await.status,
         200
     );
-    let key = replay
-        .keys
-        .public_key(&service_key_id(&replay).await)
-        .await
-        .expect("key");
-    let path = format!("/v1/{}/erase", alice_id());
-    let erase = signer_request(
-        "POST",
-        &path,
-        pubky_switch_core::http::erase_body(&key, None),
-        at,
-    );
+    let hash = held(&replay).await.hash();
+    let erase = erasure_of(&replay, &alice_id(), Some(&hash), at).await;
     assert_eq!(replay.service.handle(erase).await.status, 200);
     assert_eq!(
         replay.service.counted_at(&alice_id()),
@@ -3139,7 +3153,7 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
     // it (Switch wire 7.3 step 4, 3.3).
     for sweep_first in [true, false] {
         let Some(replay) = replay().await else { return };
-        let (pending, at) = serving_with_a_pending_key(&replay).await;
+        let (service_key, at) = serving_with_a_held_app(&replay).await;
         let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
             .await
             .expect("conn");
@@ -3161,7 +3175,7 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
             .expect("due");
         log_swept_invite_codes(&replay).await;
         let before = held(&replay).await;
-        let recovery = next_generation(&before, pending, Some(1));
+        let recovery = next_generation(&before, service_key, Some(1));
         let apps = || {
             replay.service.handle(signer_request(
                 "GET",
@@ -3219,12 +3233,12 @@ async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy()
     // stranger's `POST /connect` is still `503 staged` (decision: "whatever the policy"),
     // and `403 not_admitted` once it ends.
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let mut body: IdentityBody = before.body().clone();
     body.version += 1;
     body.generation += 1;
-    body.inbox.service_key = pending;
+    body.inbox.service_key = service_key;
     body.recovery_from = Some(1);
     body.policy.connect_requests.enabled = false;
     let recovery = IdentityDoc::sign(&alice_key(), body)
@@ -3272,13 +3286,13 @@ async fn test_recovery_in_place_after_a_purge() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    let pending = answered_key(&answer);
+    let service_key = answered_key(&answer);
     let before = held(&replay).await;
     let wallet = app_id_of("wallet");
     let mut listing: IdentityBody = before.body().clone();
     listing.version += 1;
     listing.generation += 1;
-    listing.inbox.service_key = pending;
+    listing.inbox.service_key = service_key;
     listing.recovery_from = Some(1);
     listing.apps.push(pubky_switch_core::records::ListedApp {
         app_id: wallet,
@@ -3287,7 +3301,7 @@ async fn test_recovery_in_place_after_a_purge() {
     let listing = IdentityDoc::sign(&alice_key(), listing).expect("sign");
     let (answer, _) = deliver(&replay, listing.signed().clone(), Some(before.hash()), at).await;
     assert_eq!(code(&answer), (400, "bad_request".into()));
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(
         answer.status,
@@ -3322,7 +3336,7 @@ async fn test_upload_after_the_lost_generation_deleted_a_superseded_document() {
     // proofs, from what it holds: the service takes the record at (1, 8), as it would with
     // the create's document kept, since an upload reads nothing the chain kept.
     let Some(replay) = replay().await else { return };
-    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
     assert_eq!(
         chain_document_kept(&replay, &alice_id(), 6).await,
         (false, false)
@@ -3332,7 +3346,7 @@ async fn test_upload_after_the_lost_generation_deleted_a_superseded_document() {
         (true, true)
     );
     let before = held(&replay).await;
-    let recovery = next_generation(&before, pending, Some(1));
+    let recovery = next_generation(&before, service_key, Some(1));
     let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;

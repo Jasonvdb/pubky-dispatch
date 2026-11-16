@@ -1957,7 +1957,7 @@ impl App {
     /// The outcome of an applied effect, with the proofs its answer carried, if any: what
     /// its operations settle, the processed pair, the protocol's local writes and the
     /// cursor, in one commit.
-    async fn commit_effect(
+    pub(crate) async fn commit_effect(
         &mut self,
         pending: &PendingEffect,
         batch: &Batch,

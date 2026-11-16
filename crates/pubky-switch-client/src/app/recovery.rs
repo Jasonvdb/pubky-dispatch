@@ -421,6 +421,7 @@ impl App {
 
     /// Start following the loss `doc` declares, in one commit before any call.
     pub(crate) async fn start_loss(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+        self.complete_applied_effect().await?;
         let lost = self.state.meta.generation;
         let generation = doc.generation();
         let old_key = self.state.meta.service_key;

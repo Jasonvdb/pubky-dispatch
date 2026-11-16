@@ -257,6 +257,10 @@ impl FeedItem {
 /// contexts read (Switch wire 1.1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedPage {
+    /// The time stamped on this verified response, in Unix milliseconds.
+    pub server_time_ms: u64,
+    /// The pinned service key that verified this response.
+    pub service_key: [u8; 32],
     /// The items, in `seq` order.
     pub items: Vec<FeedItem>,
     /// The position to pass as the next `after`.
@@ -278,7 +282,12 @@ pub struct FeedPage {
 }
 
 impl FeedPage {
-    pub(crate) fn read(o: Obj<'_>, account: &[u8; 32]) -> Result<Self, ClientError> {
+    pub(crate) fn read(
+        o: Obj<'_>,
+        account: &[u8; 32],
+        server_time_ms: u64,
+        service_key: [u8; 32],
+    ) -> Result<Self, ClientError> {
         let next = Position::parse(o.str("next")?)
             .map_err(|_| bad("Switch wire 7.4.4: a feed page's next isn't a position"))?;
         let freeze = match o.opt_doc("freeze")? {
@@ -286,6 +295,8 @@ impl FeedPage {
             Some(signed) => Some(Freeze::verify(&signed, account)?),
         };
         Ok(Self {
+            server_time_ms,
+            service_key,
             items: o
                 .required_objects("items")?
                 .into_iter()
@@ -1387,7 +1398,7 @@ mod tests {
             "scanned_through": 9, "more": false, "cursor": 0, "head": head_value()
         });
         requires(&page, "/items", |value| {
-            let page = FeedPage::read(Obj::of(value, "feed")?, &account())?;
+            let page = FeedPage::read(Obj::of(value, "feed")?, &account(), 1, [1; 32])?;
             assert_eq!(page.items.len(), 1);
             Ok(())
         });
@@ -1401,7 +1412,7 @@ mod tests {
             "head": head_value()
         });
         requires(&page, "/cursor", |value| {
-            let page = FeedPage::read(Obj::of(value, "feed")?, &account())?;
+            let page = FeedPage::read(Obj::of(value, "feed")?, &account(), 1, [1; 32])?;
             assert_eq!(page.cursor, 3);
             Ok(())
         });

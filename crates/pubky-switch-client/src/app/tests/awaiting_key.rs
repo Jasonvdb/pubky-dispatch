@@ -189,7 +189,7 @@ fn key_requests(requests: &[String], method: &str) -> usize {
 }
 
 /// The signer stores `me`'s parts over `first..=last`.
-fn store_parts(w: &World, me: [u8; 16], cert: &AppCert, first: u64, last: u64) {
+pub(super) fn store_parts(w: &World, me: [u8; 16], cert: &AppCert, first: u64, last: u64) {
     let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
     for part in seal_bundle_parts(&w.alice, cert, first, last, &has_keys).unwrap() {
         w.switch
@@ -213,13 +213,13 @@ fn store_failing(events: &[AppEvent]) -> bool {
 
 /// A sender identity other than alice's, its `identity.json` published and listing its one
 /// app, so its entries pass check 7.
-struct Peer {
-    identity: IdentityKey,
-    keys: AppKeys,
-    cert: AppCert,
+pub(super) struct Peer {
+    pub(super) identity: IdentityKey,
+    pub(super) keys: AppKeys,
+    pub(super) cert: AppCert,
 }
 
-fn published_peer(w: &World, name: &str) -> Peer {
+pub(super) fn published_peer(w: &World, name: &str) -> Peer {
     let peer = super::identity(name);
     let keys = peer.app_keys("app");
     let cert = cert_for(peer.key(), &keys, w.clock.now_ms() - 1000, &["scope-a"]);
@@ -339,7 +339,7 @@ async fn test_awaiting_key_that_never_comes_costs_one_request_then_goes_at_the_b
         AppEvent::StoredEntryDropped {
             seq: s,
             reason: DropReason::Age,
-            awaited_epoch: Some(2),
+            waiting: crate::app::WaitingReason::Key { data_epoch: 2 },
             ..
         } if *s == seq && dropped[0].is_duty()
     ));
@@ -506,10 +506,8 @@ async fn test_awaiting_key_many_senders_bounded_and_reads_stay_flat() {
         seqs.push(notes_from(&w, peer, app.app_id(), over));
     }
     let mut events = app.receive(None).await.unwrap().events;
-    for seq in seqs.iter().flatten() {
-        assert_eq!(app.stored_at(*seq).map(|s| s.reason), awaiting(2), "{seq}");
-    }
-    // The bounds apply at the start of the next read.
+    assert!(app.state.parked.len() <= MAX_UNVERIFIED_TOTAL);
+    // The input-inclusive bounds already hold; another read does not admit a larger pool.
     events.extend(app.receive(None).await.unwrap().events);
     let waiting: Vec<_> = app
         .state
@@ -571,7 +569,7 @@ async fn test_awaiting_key_counts_with_unverified_entries_against_the_bounds() {
     let unverified = notes_from(&w, &peer, app.app_id(), 40);
     app.receive(None).await.unwrap();
     w.clock.advance_ms(World::config().park_after_ms + 1);
-    app.receive(None).await.unwrap();
+    let mut events = app.receive(None).await.unwrap().events;
     for seq in &unverified {
         assert_eq!(
             app.stored_at(*seq).map(|s| s.reason),
@@ -579,15 +577,14 @@ async fn test_awaiting_key_counts_with_unverified_entries_against_the_bounds() {
             "{seq}"
         );
     }
-    let report = app.receive(None).await.unwrap();
-    let dropped: Vec<u64> = report
-        .events
+    events.extend(app.receive(None).await.unwrap().events);
+    let dropped: Vec<u64> = events
         .iter()
         .filter_map(|e| match e {
             AppEvent::StoredEntryDropped {
                 seq,
                 reason: DropReason::PerSender,
-                awaited_epoch: Some(2),
+                waiting: crate::app::WaitingReason::Key { data_epoch: 2 },
                 ..
             } => Some(*seq),
             _ => None,
@@ -659,11 +656,9 @@ async fn test_awaiting_key_of_a_later_epoch_fetches_nothing() {
     );
 }
 
-/// The drop of an entry that waited for a key names its message, which passed the
-/// recipient checks before it was stored; the drop of one whose sender couldn't be checked
-/// names none.
+/// Every lost copy names its authenticated message; standing is recorded separately.
 #[tokio::test]
-async fn test_awaiting_key_drop_names_the_msg_id_an_unverified_drop_none() {
+async fn test_awaiting_key_drop_names_both_messages_with_separate_standing() {
     let w = World::new();
     let protocol = Keyed::new(Mode::Write);
     let transport = w.switch.transport();
@@ -693,21 +688,31 @@ async fn test_awaiting_key_drop_names_the_msg_id_an_unverified_drop_none() {
         app.stored_at(unverified).map(|s| s.reason),
         Some(ParkReason::Unverifiable)
     );
+    let unverified_id =
+        crate::app::parked::stored_msg_id(app.stored_at(unverified).unwrap()).unwrap();
     w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS);
     let mut events = Vec::new();
     for _ in 0..2 {
         events.extend(app.receive(None).await.unwrap().events);
     }
-    let dropped: Vec<(u64, Option<String>)> = events
+    let dropped: Vec<(u64, String, bool)> = events
         .iter()
         .filter_map(|e| match e {
-            AppEvent::StoredEntryDropped { seq, msg_id, .. } => Some((*seq, msg_id.clone())),
+            AppEvent::StoredEntryDropped {
+                seq,
+                message,
+                sender_verified,
+                ..
+            } => Some((*seq, message.msg_id.clone(), *sender_verified)),
             _ => None,
         })
         .collect();
     assert_eq!(
         dropped,
-        vec![(waiting, Some(sent.msg_id)), (unverified, None)],
+        vec![
+            (waiting, sent.msg_id, true),
+            (unverified, unverified_id, false)
+        ],
         "{events:?}"
     );
 }
@@ -910,8 +915,8 @@ async fn test_awaiting_key_drop_is_delivered_again_after_a_reload() {
         events
             .iter()
             .filter(|e| {
-                matches!(e, AppEvent::StoredEntryDropped { seq: s, awaited_epoch: Some(2), msg_id: Some(m), .. }
-                    if *s == seq && *m == note.msg_id)
+                matches!(e, AppEvent::StoredEntryDropped { seq: s, waiting: crate::app::WaitingReason::Key { data_epoch: 2 }, message, .. }
+                    if *s == seq && message.msg_id == note.msg_id)
             })
             .count()
     };
@@ -930,10 +935,10 @@ async fn test_awaiting_key_drop_is_delivered_again_after_a_reload() {
 }
 
 /// Two copies of one message wait for the key, accepted ten days apart. The earlier one
-/// ages out first: its drop names no `msg_id`, since the later copy still holds the
-/// message, which is taken once the key comes.
+/// ages out first: its drop still names that copy, while the later copy remains and is
+/// taken once the key comes.
 #[tokio::test]
-async fn test_awaiting_key_drop_of_a_copy_names_no_msg_id_while_another_waits() {
+async fn test_awaiting_key_drop_names_the_copy_while_another_waits() {
     use pubky_switch_core::message::{Message as Msg, Sender};
     let w = World::new();
     let protocol = Keyed::new(Mode::Check);
@@ -976,7 +981,7 @@ async fn test_awaiting_key_drop_of_a_copy_names_no_msg_id_while_another_waits() 
     assert_eq!(app.stored_at(second).map(|s| s.reason), awaiting(2));
     assert!(has(&events, |e| matches!(
         e,
-        AppEvent::StoredEntryDropped { seq, msg_id: None, awaited_epoch: Some(2), .. } if *seq == first
+        AppEvent::StoredEntryDropped { seq, message: identity, waiting: crate::app::WaitingReason::Key { data_epoch: 2 }, .. } if *seq == first && identity.msg_id == message.msg_id
     )));
     store_parts(&w, app_id, &cert, 1, 2);
     for _ in 0..2 {

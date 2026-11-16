@@ -74,7 +74,7 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
-    ParkReason, RefusedCall,
+    ParkReason, RefusedCall, StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
@@ -84,11 +84,11 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS,
-    MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES,
-    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase,
-    decode_local_state, encode_local_state, local_writes_bytes,
+    DenyListChange, DenyListGap, Effect, EntryReceipt, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite,
+    MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
+    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
+    Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason,
+    StoreFailure, WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -408,6 +408,8 @@ pub struct AppBackup {
     /// The local ID the next entry stored locally takes (`parkid`), so a restore gives out
     /// none the app gave out before the backup, whether or not the backup carries its entry.
     stored_next: u64,
+    /// Unprocessed custody and its owed drop notices, independent of a protocol layer.
+    waiting: unverified::WaitingOut,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -753,6 +755,7 @@ fn uncertain_copy(
     Ok((
         reserved.ok_or_else(missing)?,
         ParkedEntry {
+            receipt: pending.entry.receipt,
             seq: pending.seq,
             generation: pending.generation,
             sender: pending.sender,
@@ -1092,6 +1095,7 @@ impl App {
                 listed_before_items: false,
                 reopen_failures: 0,
             };
+            app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties().await?;
             app.queue_duties(kept);
@@ -1281,6 +1285,7 @@ impl App {
                 .collect(),
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
+            waiting: unverified::WaitingOut::of(state),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
@@ -1332,6 +1337,7 @@ impl App {
     /// app still owes a job, so a restore delivers what was queued before the backup with
     /// the same `msg_id` and bytes.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
+        backup.waiting.notices = unverified::waiting_notices(reader).await?;
         let carried = send::carried_outbox(reader).await?;
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
@@ -1382,12 +1388,11 @@ impl App {
     /// tolerance). While they add up to more than the batch size, every layered backup is
     /// refused, with [`AppEvent::BackupRefused`] for the host, until they drain: entries
     /// stored locally as they are processed, processed pairs as they age out. It applies the
-    /// bounds on entries stored unverified first, as a read does (Switch spec 8.2), so the
-    /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
-    /// what they drop. So it needs a writable store, and the drops stay committed even if
-    /// the backup is then refused. An app a read wouldn't run on (stopped by an alarm, left,
-    /// or no longer current here) skips the bounds, and its backup only reads the store but
-    /// for the one counter write below.
+    /// shared sender/key/admission bounds first, as a read does (Switch spec 8.2), even
+    /// while an alarm stops intake. Pending and independently uncertain inputs stay
+    /// protected. The backup carries retained waiting payloads and their owed drop
+    /// notices. It needs a writable store, and drops remain committed if the backup is
+    /// then refused; local bookkeeping never clears the alarm.
     ///
     /// It makes no network call. A kept effect isn't settled first, and a restore never
     /// carries one: the backup holds the effect's entry as what it is once the effect is
@@ -1422,18 +1427,13 @@ impl App {
             let Some(name) = self.protocol.backup_name() else {
                 return Err(Refusal::NotNow("the protocol names no backup layer".into()).into());
             };
-            // The bounds on entries stored unverified first, as at a read, so a pile stored
-            // during the last read doesn't go into the backup (Switch spec 8.2). An app a read
-            // wouldn't run on, halted by an alarm, left, or no longer current here, commits
-            // nothing: its backup is taken read-only, the entries as they are.
+            // Local waiting bounds precede backup, including while an alarm stops intake
+            // (Switch spec 8.2). The common commit preserves the alarm.
             self.ready_local().await?;
-            let halted = self.refuse_when_halted().is_err() || self.not_current_here().is_some();
-            if !halted {
-                self.bound_unverified().await?;
-            }
+            self.bound_unverified().await?;
             // The local ID the copy of a kept effect's feed entry takes is reserved in the
-            // live store first, for a halted app too: the backup's only write of its own
-            // there (its commit also keeps a service time not yet committed), which changes
+            // live store first, for a halted app too (its commit also keeps a service
+            // time not yet committed), which changes
             // nothing a read or the protocol sees. Without it, the next entry the
             // live store stored would take the same ID, and a restore in place would install
             // the copy under an ID its carried duty events give another message.
@@ -1456,7 +1456,14 @@ impl App {
             self.carry_outbox(&reader, &mut backup).await?;
             let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
-            let mut parked = state.parked.clone();
+            let waiting_ids: BTreeSet<u64> =
+                backup.waiting.entries.iter().map(|(id, _)| *id).collect();
+            let mut parked: BTreeMap<_, _> = state
+                .parked
+                .iter()
+                .filter(|(id, _)| !waiting_ids.contains(id))
+                .map(|(id, entry)| (*id, entry.clone()))
+                .collect();
             let mut seen = state.seen.clone();
             if let Some(pending) = &state.pending_effect {
                 // A restore never carries a kept effect, so the backup holds its entry as
@@ -1699,6 +1706,7 @@ impl App {
             {
                 return Err(invalid("its protocol layer is another protocol's"));
             }
+            backup.waiting.validate(backup, &cert, protocol.as_ref())?;
             // The protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written.
             let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
@@ -1711,7 +1719,7 @@ impl App {
                     )));
                 }
             };
-            let (seen, parked, processed) = match &backup.protocol {
+            let (mut seen, mut parked, processed) = match &backup.protocol {
                 Some(layer) => (
                     layer.seen.iter().copied().collect::<BTreeSet<u64>>(),
                     layer.parked.iter().cloned().collect::<BTreeMap<_, _>>(),
@@ -1731,6 +1739,21 @@ impl App {
                 ),
                 None => (BTreeSet::new(), BTreeMap::new(), Vec::new()),
             };
+            for (id, entry) in &backup.waiting.entries {
+                parked.insert(*id, entry.clone());
+                if entry.generation == backup.cursor.generation {
+                    seen.insert(entry.seq);
+                }
+            }
+            for notice in &backup.waiting.notices {
+                if let events::Duty::StoredEntryDropped {
+                    seq, generation, ..
+                } = notice
+                    && *generation == backup.cursor.generation
+                {
+                    seen.insert(*seq);
+                }
+            }
             // An entry the cursor passed needs no mark.
             let seen: BTreeSet<u64> = seen
                 .into_iter()
@@ -1764,11 +1787,11 @@ impl App {
                 device: backup.device,
                 cursor,
                 chain: Some(chain),
-                held: BTreeMap::new(),
-                retries: BTreeMap::new(),
-                stored_retries: BTreeMap::new(),
+                held: backup.waiting.held.iter().copied().collect(),
+                retries: backup.waiting.feed_retries.iter().copied().collect(),
+                stored_retries: backup.waiting.retries.iter().copied().collect(),
                 next_stored_id: next_stored_id(None, &parked),
-                parked_round: state::ParkedRound::default(),
+                parked_round: backup.waiting.round,
                 seen,
                 asked: BTreeSet::new(),
                 parked,
@@ -1826,6 +1849,30 @@ impl App {
             // value winning for a key both hold.
             let from_backup = Self::owed_of_backup(backup);
             let carried = carried.unwrap_or_default();
+            let mut waiting_notices = Vec::new();
+            for notice in &backup.waiting.notices {
+                unverified::merge_notice(&mut waiting_notices, notice.clone())?;
+            }
+            let mut retained_notices = Vec::new();
+            for (key, value) in &carried.values {
+                if key.starts_with(key::DUTY_PREFIX) {
+                    let duty: events::Duty =
+                        serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                    if matches!(duty, events::Duty::StoredEntryDropped { .. }) {
+                        unverified::merge_notice(&mut retained_notices, duty)?;
+                    }
+                }
+            }
+            for notice in &waiting_notices {
+                unverified::merge_notice(&mut retained_notices, notice.clone())?;
+            }
+            waiting_notices.retain(|notice| {
+                !carried.values.iter().any(|(key, value)| {
+                    key.starts_with(key::DUTY_PREFIX)
+                        && serde_json::from_value::<events::Duty>(value.clone())
+                            .is_ok_and(|held| held == *notice)
+                })
+            });
             // A restore in place keeps the store's holds beside the backup's: a hold the host
             // set after the backup still holds (`App::hold_queued`).
             let old_holds: Vec<String> = old
@@ -1894,7 +1941,15 @@ impl App {
             let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
+                // Age and capacity selection use the backup's verified observation, never
+                // the restoring device's clock. Selection joins the installation commit.
+                let drops = app.waiting_drops_at(None, backup.taken_service_ms);
+                let change = app.waiting_change(None, None, &drops)?;
+                change.stage(&mut app, &mut tx)?;
                 app.write_all(&mut tx).await?;
+                for notice in &waiting_notices {
+                    app.keep_duty(&mut tx, notice.clone())?;
+                }
                 for (sender, msg_id, record) in &processed {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
@@ -2030,6 +2085,16 @@ impl App {
         for (id, parked) in &s.parked {
             tx.put(&key::parked(*id), parked)?;
         }
+        for (seq, held) in &s.held {
+            tx.put(&key::held(*seq), held)?;
+        }
+        for (seq, retry) in &s.retries {
+            tx.put(&key::retry(*seq), retry)?;
+        }
+        for (id, retry) in &s.stored_retries {
+            tx.put(&key::stored_retry(*id), retry)?;
+        }
+        tx.put(key::PARKED_NEXT, &s.parked_round)?;
         tx.put(key::STORED_NEXT, &s.next_stored_id)?;
         tx.put(key::JOIN, &s.join)?;
         if let Some(check) = &s.restore_cursor {
@@ -2331,13 +2396,17 @@ impl App {
 
     /// The duty events kept, by ascending ID, without handing them to the host.
     pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
-        Ok(self
-            .reader()
+        self.reader()
             .scan_numbered::<events::Duty>(key::DUTY_PREFIX)
             .await?
             .into_iter()
-            .map(|(n, duty)| duty.event(EventId::new(self.state.duty_epoch.epoch, n)))
-            .collect())
+            .map(|(n, duty)| {
+                if matches!(duty, events::Duty::StoredEntryDropped { .. }) {
+                    unverified::notice_id(&duty)?;
+                }
+                Ok(duty.event(EventId::new(self.state.duty_epoch.epoch, n)))
+            })
+            .collect::<Result<Vec<_>, AppError>>()
     }
 
     /// Acknowledge every duty event up to and including `up_to`: the host and its protocol
@@ -2363,12 +2432,7 @@ impl App {
     pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            if up_to.epoch() != self.state.duty_epoch.epoch {
-                return Err(Refusal::Usage(
-                    "an event ID of another store: nothing acknowledged".into(),
-                )
-                .into());
-            }
+            self.check_event_store(up_to)?;
             // Only what the host was handed: a kept event it never took stays.
             let through = up_to.counter().min(self.duty_handed);
             let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
@@ -2379,6 +2443,60 @@ impl App {
             self.commit(tx).await
         })
         .await
+    }
+
+    /// Acknowledge exactly one delivered, still-owed event with bounded protocol-local
+    /// writes in the same commit (Switch spec 8.2, 11). No other event is acknowledged.
+    ///
+    /// After an unknown commit outcome, reload durable local handling state before acting
+    /// again. An absent event always refuses; absence alone is not proof it was handled.
+    /// A handler can keep its own idempotence marker with these writes, keyed by the
+    /// notice's stable identity when delivery IDs may change across restore.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for an absent, foreign or undelivered ID or oversized local writes;
+    /// [`Refusal::Left`] for nonempty local writes after the keys were deleted; a store error.
+    /// On refusal neither the acknowledgment nor the local writes is applied.
+    pub async fn ack_event_with(
+        &mut self,
+        id: EventId,
+        local: &[LocalWrite],
+    ) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.check_event_store(id)?;
+        if id.counter() > self.duty_handed
+            || !self.reader().exists(&key::duty(id.counter())).await?
+        {
+            return Err(Refusal::Usage("the event is absent or was not delivered".into()).into());
+        }
+        if local_writes_bytes(local) > MAX_STEP_LOCAL_BYTES {
+            return Err(
+                Refusal::Usage("the local acknowledgment exceeds its byte bound".into()).into(),
+            );
+        }
+        if !local.is_empty()
+            && self
+                .state
+                .leave
+                .is_some_and(|leave| leave.keys_deleted_ms.is_some())
+        {
+            return Err(Refusal::Left.into());
+        }
+        let mut tx = self.tx()?;
+        tx.local(local)?;
+        tx.delete(&key::duty(id.counter()))?;
+        self.commit(tx).await
+    }
+
+    fn check_event_store(&self, id: EventId) -> Result<(), AppError> {
+        if id.epoch() != self.state.duty_epoch.epoch {
+            return Err(Refusal::Usage(
+                "an event ID of another store: nothing acknowledged".into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
@@ -2415,6 +2533,9 @@ impl App {
             });
             match read {
                 Ok((n, duty, value)) => {
+                    if matches!(duty, events::Duty::StoredEntryDropped { .. }) {
+                        unverified::notice_id(&duty)?;
+                    }
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
                     if let Some(id) = duty.stored_id() {
                         carried.stored_past = carried.stored_past.max(id.saturating_add(1));
@@ -2423,6 +2544,7 @@ impl App {
                         .values
                         .push((format!("{}{rest}", key::DUTY_PREFIX), value));
                 }
+                Err(error) if unverified::waiting_record(&bytes) => return Err(error),
                 Err(_) => carried.lost_duties = carried.lost_duties.saturating_add(1),
             }
         }
@@ -2858,6 +2980,7 @@ impl App {
             // stored state. A failed retry leaves both held and stops this call.
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
+            self.validate_waiting_state()?;
             self.client = Self::client_for(
                 &self.env,
                 &self.state.meta,

@@ -1229,9 +1229,9 @@ impl App {
     /// batch kept from an earlier call would put in the outbox once it settles: the batch's
     /// other operations still go, and the message isn't queued. A message given up so is
     /// never queued again by this store: [`App::queue_stored`] refuses it, and a re-send
-    /// after the counterparty's provider loss leaves it out. Only the host's own
-    /// [`App::resend`] of it sends it again. Returns the messages given up: those of the
-    /// outbox in queue order, then those of kept batches. The retained queued copies and
+    /// after the counterparty's provider loss leaves it out. [`App::resend`] refuses
+    /// it too. Returns the messages given up: those of the outbox in queue order,
+    /// then those of kept batches. The retained queued copies and
     /// their delivery index are removed in the same commit, leaving the batch's other
     /// operations and local writes intact. Local only: it sends nothing.
     ///

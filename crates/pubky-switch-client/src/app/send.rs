@@ -673,6 +673,8 @@ pub(crate) struct OutboxItem {
     /// the retention of sent messages.
     failed: Option<(String, u64)>,
     last_error: Option<String>,
+    /// Job tries begun while unheld; delivery retries share this count. A hold
+    /// discovered after earlier work does not undo that work or its try.
     tries: u64,
     queued_ms: u64,
     /// An accepted message is to be sent again, sealed to the current keys (Switch spec 11).
@@ -949,6 +951,8 @@ pub(crate) fn put_outbox_item(
 
 /// What one delivery try came to.
 enum Tried {
+    /// The current hold decision stopped the remaining delivery work, without an answer.
+    Held,
     Accepted(AppendAnswer),
     Queued(String),
     /// Queued after `403 not_admitted` or `403 not_current`, for a bounded time.
@@ -2327,8 +2331,9 @@ impl App {
     }
 
     /// One try of each job of one message, as one unit: the conversation entry, one round of
-    /// the delivery, and the record job. Each is a bounded call of its own, and a try once
-    /// begun goes whole, so no job of a message waits behind another of its jobs.
+    /// the delivery, and the record job. Each is a bounded call of its own. A new hold
+    /// stops the remaining delivery work, preserving jobs already completed and allowing
+    /// an accepted message's record job to continue.
     async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
         let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(false);
@@ -2394,6 +2399,7 @@ impl App {
         }
         if item.delivery_owed() && !held {
             match self.deliver(&mut item).await? {
+                Tried::Held => self.save_item(&item).await?,
                 Tried::Accepted(answer) => self.accept(&mut item, &answer).await?,
                 Tried::Queued(why) => {
                     item.last_error = Some(why);
@@ -2678,6 +2684,11 @@ impl App {
         let round = self.begin_budget();
         let mut reread = false;
         loop {
+            // Conversation settlement or a prior retry may have committed new local
+            // policy. Re-read the common holds before further delivery work.
+            if self.delivery_waits(item).await? {
+                return Ok(Tried::Held);
+            }
             match Box::pin(self.deliver_under(item, &round)).await? {
                 Delivered::Tried(tried) => return Ok(tried),
                 // At most once a round, however long its requests take, and within its time.
@@ -2775,6 +2786,12 @@ impl App {
             let Some(sealed) = item.sealed.clone() else {
                 return Ok(Delivered::Tried(Tried::Queued("not sealed".into())));
             };
+            // Identity delivery, sealing and retry preparation may write state. The
+            // same current decision gates every actual append, own or peer, including
+            // retries, with no state-changing await between this check and the call.
+            if self.delivery_waits(item).await? {
+                return Ok(Delivered::Tried(Tried::Held));
+            }
             let result = if own {
                 let result = self
                     .client
@@ -2992,7 +3009,7 @@ impl App {
 
 /// What one try of a delivery came to.
 enum Delivered {
-    /// Tried: accepted, queued, undeliverable or failed.
+    /// Held, or tried: accepted, queued, undeliverable or failed.
     Tried(Tried),
     /// An answer of the recipient's switch that didn't verify with the service key of the
     /// copy `held` of its `identity.json`.

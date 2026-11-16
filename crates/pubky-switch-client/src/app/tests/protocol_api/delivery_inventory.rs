@@ -228,6 +228,420 @@ impl StateStore for DeliveryReadFault {
     }
 }
 
+async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage) {
+    p.alice.switch().fail_next(Fault::Unanswered {
+        path: "ops".into(),
+        after: 0,
+    });
+    app.submit_batch(
+        OpBatch::for_protocol("sample")
+            .op(OpKind::AllowPut {
+                pubky: [9; 32],
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            })
+            .local(LocalWrite::Delete {
+                key: delivery_key(signed.msg_id()),
+            })
+            .local(LocalWrite::Put {
+                key: b"settled".to_vec(),
+                value: b"yes".to_vec(),
+            }),
+    )
+    .await
+    .unwrap_err()
+    .kept_batch()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_delivery_view_rechecks_after_kept_local_settlement() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        protocol
+            .require_send_fact
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store = Arc::new(MemoryStore::new());
+        let mut wallet = p
+            .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+            .await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let signed = wallet
+            .sign_message(Pair::note(&p.bob, "settlement decision"))
+            .unwrap();
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        let fact = delivery_fact(&wallet, signed.plaintext());
+        wallet
+            .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
+            .await
+            .unwrap();
+        keep_fact_removal(&p, &mut wallet, &signed).await;
+        assert!(listed_origin(&wallet, &signed).await.may_send);
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert_eq!(
+            wallet.protocol_get("sample", b"settled").await.unwrap(),
+            Some(b"yes".to_vec())
+        );
+        assert!(
+            wallet
+                .protocol_get("sample", &delivery_key(signed.msg_id()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            p.bob.switch().entries_from(&p.alice.identity().public()),
+            0,
+            "committed policy must hold the append after settlement"
+        );
+        let queued = wallet.delivery(signed.msg_id()).await.unwrap();
+        assert!(
+            matches!(
+                &queued,
+                Some(Delivery::Queued {
+                    tries: 1,
+                    last_error: None,
+                    undeliverable_since_ms: None,
+                    ..
+                })
+            ),
+            "{queued:?}"
+        );
+        let item: Value = wallet
+            .reader()
+            .get(&format!("out/{}", signed.msg_id()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            item["conversation"], false,
+            "earlier completed work stays durable"
+        );
+        assert!(wallet.kept_batches().await.unwrap().is_empty());
+        let id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
+            .await
+            .unwrap();
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert_eq!(
+            wallet.delivery(signed.msg_id()).await.unwrap(),
+            queued,
+            "an already held round adds no try or error"
+        );
+        let other = wallet
+            .sign_message(Pair::note(&p.bob, "independent"))
+            .unwrap();
+        wallet.queue_signed(other.clone()).await.unwrap();
+        wallet
+            .protocol_commit(
+                "sample",
+                &[fact_write(
+                    other.msg_id(),
+                    &delivery_fact(&wallet, other.plaintext()),
+                )],
+            )
+            .await
+            .unwrap();
+        assert_eq!(wallet.flush_outbox().await.unwrap().done, [other.msg_id()]);
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+        wallet
+            .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
+            .await
+            .unwrap();
+        wallet.flush_message(signed.msg_id()).await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_settlement_failure_resolves_before_another_try() {
+    Box::pin(async {
+        for after in [false, true] {
+            for reopen in [false, true] {
+                let p = Pair::new();
+                let protocol = ApiProtocol::new(Mode::Plain);
+                protocol
+                    .require_send_fact
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let store = Arc::new(MemoryStore::new());
+                let mut wallet = p
+                    .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                    .await;
+                let mut shop = p.join(&p.bob, "shop", &protocol).await;
+                shop.invite(&p.alice.identity().public()).await.unwrap();
+                let signed = wallet
+                    .sign_message(Pair::note(&p.bob, "settlement failure"))
+                    .unwrap();
+                wallet.queue_signed(signed.clone()).await.unwrap();
+                wallet
+                    .protocol_commit(
+                        "sample",
+                        &[fact_write(
+                            signed.msg_id(),
+                            &delivery_fact(&wallet, signed.plaintext()),
+                        )],
+                    )
+                    .await
+                    .unwrap();
+                keep_fact_removal(&p, &mut wallet, &signed).await;
+                let id = wallet.app_id();
+                drop(wallet);
+                let fault = Arc::new(SettlementFault {
+                    inner: store.clone(),
+                    after,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                });
+                let mut wallet = App::load(
+                    p.env(&p.alice, fault.clone()),
+                    protocol.clone(),
+                    config(),
+                    id,
+                )
+                .await
+                .unwrap();
+                let result = wallet.flush_message(signed.msg_id()).await;
+                assert!(
+                    matches!(&result, Err(error) if matches!(error.unkept(), AppError::Store(_))),
+                    "{result:?}"
+                );
+                assert!(fault.fired.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(matches!(
+                    wallet.queued_messages("sample").await,
+                    Err(AppError::Refused(Refusal::NotNow(_)))
+                ));
+                assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+                if reopen {
+                    drop(wallet);
+                    wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
+                        .await
+                        .unwrap();
+                } else {
+                    wallet.protocol_commit("sample", &[]).await.unwrap();
+                }
+                assert_eq!(
+                    wallet
+                        .protocol_get("sample", b"settled")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    after
+                );
+                assert_eq!(listed_origin(&wallet, &signed).await.may_send, !after);
+                wallet.flush_message(signed.msg_id()).await.unwrap();
+                assert!(!listed_origin(&wallet, &signed).await.may_send);
+                assert_eq!(
+                    p.bob.switch().entries_from(&p.alice.identity().public()),
+                    0,
+                    "resolved local completion still precedes append"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Storage can become unavailable while a request is in flight, without a local write.
+struct UnavailableAfterAppend {
+    router: Arc<Router>,
+    fault: Arc<DeliveryReadFault>,
+    origin: String,
+    armed: std::sync::atomic::AtomicBool,
+    statuses: Mutex<Vec<u16>>,
+}
+
+impl Transport for UnavailableAfterAppend {
+    fn send(
+        &self,
+        request: crate::transport::Request,
+    ) -> crate::transport::BoxFuture<
+        '_,
+        Result<crate::transport::Response, crate::error::TransportError>,
+    > {
+        Box::pin(async move {
+            let append = request.method == "POST"
+                && request.origin == self.origin
+                && request
+                    .path_and_query
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .ends_with("/inbox");
+            let result = self.router.send(request).await;
+            if append && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(response) = &result {
+                    self.statuses.lock().unwrap().push(response.status);
+                }
+                self.fault
+                    .fail
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_delivery_view_rechecks_own_and_peer_append_retries() {
+    Box::pin(async {
+        for (own, stale_key) in [(false, true), (false, false), (true, true)] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let recipient = if own { &p.alice } else { &p.bob };
+            let mut shop = p.join(recipient, "shop", &protocol).await;
+            if !own {
+                shop.invite(&p.alice.identity().public()).await.unwrap();
+            }
+            let message = |text: &str| {
+                OutgoingMessage::new(
+                    recipient.identity().public(),
+                    if own { "sample.notice" } else { "sample.note" },
+                    json!({"text": text}).as_object().unwrap().clone(),
+                )
+            };
+            assert!(matches!(
+                wallet.send(message("directory")).await.unwrap().1,
+                Delivery::Accepted { .. }
+            ));
+            let signed = wallet.sign_message(message("retry")).unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            wallet
+                .protocol_commit(
+                    "sample",
+                    &[fact_write(
+                        signed.msg_id(),
+                        &delivery_fact(&wallet, signed.plaintext()),
+                    )],
+                )
+                .await
+                .unwrap();
+            protocol
+                .require_send_fact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if stale_key {
+                let _kiosk = p.join(recipient, "kiosk", &protocol).await;
+            } else {
+                recipient.switch().fail_next(Fault::Error {
+                    path: "/inbox".into(),
+                    code: ErrorCode::IdentityNeeded,
+                    current: json!({"version": null}),
+                });
+            }
+            let id = wallet.app_id();
+            drop(wallet);
+            let local =
+                crate::app::protocols::qualified_key("sample", &delivery_key(signed.msg_id()));
+            let fault = Arc::new(DeliveryReadFault {
+                inner: store,
+                key: [b"p/".as_slice(), local.as_slice()].concat(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let origin = if own { SWITCH_ORIGIN } else { BOB_ORIGIN };
+            let transport = Arc::new(UnavailableAfterAppend {
+                router: p.router.clone(),
+                fault: fault.clone(),
+                origin: origin.into(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+                statuses: Mutex::new(Vec::new()),
+            });
+            let mut wallet = App::load(
+                p.alice.env_with(fault.clone(), transport.clone()),
+                protocol,
+                config(),
+                id,
+            )
+            .await
+            .unwrap();
+            let before = recipient
+                .switch()
+                .entries_from(&p.alice.identity().public());
+            let attempts_before = p
+                .router
+                .log()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(&format!("POST {origin}")) && line.contains("/inbox")
+                })
+                .count();
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            let attempts_after = p
+                .router
+                .log()
+                .iter()
+                .filter(|line| {
+                    line.starts_with(&format!("POST {origin}")) && line.contains("/inbox")
+                })
+                .count();
+            assert_eq!(
+                *transport.statuses.lock().unwrap(),
+                [409],
+                "own={own} stale_key={stale_key} delivery={:?} requests={:?}",
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+                p.router.log()
+            );
+            assert_eq!(
+                attempts_after - attempts_before,
+                1,
+                "the later held decision stops the actual append retry"
+            );
+            assert_eq!(
+                recipient
+                    .switch()
+                    .entries_from(&p.alice.identity().public()),
+                before
+            );
+            assert!(fault.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            let held = wallet.delivery(signed.msg_id()).await.unwrap();
+            assert!(
+                matches!(
+                    &held,
+                    Some(Delivery::Queued {
+                        tries: 1,
+                        last_error: None,
+                        undeliverable_since_ms: None,
+                        ..
+                    })
+                ),
+                "{held:?}"
+            );
+            let item: Value = wallet
+                .reader()
+                .get(&format!("out/{}", signed.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(item["sealed"].is_object());
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            let again: Value = wallet
+                .reader()
+                .get(&format!("out/{}", signed.msg_id()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                again, item,
+                "the held round preserves cached bytes and the earlier try"
+            );
+            fault.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(
+                recipient
+                    .switch()
+                    .entries_from(&p.alice.identity().public()),
+                before + 1
+            );
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_delivery_view_uses_original_signed_bytes_and_exact_local_fact() {
     Box::pin(async {

@@ -1359,3 +1359,66 @@ async fn test_restore_in_place_keeps_the_local_epoch_floor() {
     let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
     assert_eq!(renewed.data_epoch(), 3);
 }
+
+#[tokio::test]
+async fn test_restore_refuses_a_backup_below_the_readable_epoch_floor() {
+    use pubky_switch_client::store::StateStore;
+    use pubky_switch_signer::state::signer_namespace;
+
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let reduce = || CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    signer.renew(a.keys.app_id_bytes(), reduce()).await.unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(b.keys.app_id_bytes(), reduce())
+        .await
+        .unwrap_err();
+    let current = snapshot(&world);
+    assert_eq!(current.0.data_epoch(), 2);
+    let ns = signer_namespace(&world.key.public());
+    let kept = store.scan(&ns, b"", None, 10).unwrap();
+
+    // Another real install has signed more versions without rotating its keys. Its
+    // otherwise current backup cannot erase the epoch this install already spent.
+    let other = World::new();
+    let (mut other_signer, _) = other.enrolled().await;
+    while other_signer.high_water().unwrap().unwrap().version <= current.0.version() + 2 {
+        let version = other_signer.high_water().unwrap().unwrap().version;
+        other_signer
+            .set_record_max_age(Some(60 + version))
+            .await
+            .unwrap();
+    }
+    let lower_epoch = snapshot(&other);
+    assert_eq!(lower_epoch.0.data_epoch(), 1);
+    put_back(&world, &lower_epoch);
+    let requests = world.transport.requests().len();
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+    assert_eq!(store.scan(&ns, b"", None, 10).unwrap(), kept);
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        current.0.signed()
+    );
+    assert!(
+        world.transport.requests()[requests..]
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+
+    put_back(&world, &current);
+    signer.restore(confirmed()).await.unwrap();
+    let renewed = signer.renew(b.keys.app_id_bytes(), reduce()).await.unwrap();
+    assert_eq!(renewed.data_epoch(), 4);
+}

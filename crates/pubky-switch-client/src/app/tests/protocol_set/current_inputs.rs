@@ -475,8 +475,8 @@ async fn test_protocol_inputs_restore_preserves_remaining_notice_owners_and_loca
         .await
         .unwrap();
     assert_eq!(
-        app.event_owners(id).unwrap(),
-        ["chat"],
+        app.event_owners(id).map(|owners| owners.to_vec()),
+        Some(vec!["chat".to_owned()]),
         "acknowledgment retires only its owner"
     );
     let after = app.backup_layered().await.unwrap();

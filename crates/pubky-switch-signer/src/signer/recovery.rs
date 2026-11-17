@@ -458,6 +458,14 @@ impl Signer {
         let answer = self
             .enroll_for_recovery(origin, enrollment, observed.body().service_key)
             .await?;
+        // The enrollment's answer names the key the service signs with from then on: only the
+        // one its account discovery showed, which the user confirmed, is followed. Another
+        // fails the step, and the recovery is declared again (Switch spec 12.6, 12.8).
+        if answer.service_key != observed.body().service_key {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.1: the enrollment's answer names another key than the account discovery".into(),
+            )));
+        }
         let base = self.recovery_base()?;
         let lost = self.lost_generation(base.as_ref())?;
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);

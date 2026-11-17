@@ -45,7 +45,7 @@ use super::clients::{RequestClient, Target};
 use super::key_recovery::{Found, KeyRecoveryConfirmed, RestoreConfirmed};
 use super::{Signer, gate};
 use crate::alert::Alert;
-use crate::error::{RecordsFault, Refusal, Result, SignerError};
+use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
@@ -290,6 +290,10 @@ impl Signer {
             .acquire(&state::signer_namespace(&identity))
             .await?;
         let key = confirmed.into().0;
+        // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
+        if key.as_ref().is_some_and(KeyRecoveryConfirmed::is_provider_loss) {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         if state::set_up(&store, &identity).await? {
             return match key {
                 Some(key) => Box::pin(Self::continue_fresh(env, keyring, store, key)).await,
@@ -331,6 +335,13 @@ impl Signer {
             .store
             .acquire(&state::signer_namespace(&identity))
             .await?;
+        if confirmed
+            .0
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         let local = match (
             RestoreLocal::unusable(state::read(&store, &identity).await?, &identity),
             confirmed.0.clone(),
@@ -405,6 +416,10 @@ impl Signer {
     pub async fn restore(&mut self, confirmed: impl Into<RestoreConfirmed>) -> Result<IdentityDoc> {
         self.refresh().await?;
         let key = confirmed.into().0;
+        // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
+        if key.as_ref().is_some_and(KeyRecoveryConfirmed::is_provider_loss) {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
             return Box::pin(self.continue_key_recovery(key.clone())).await;
         }

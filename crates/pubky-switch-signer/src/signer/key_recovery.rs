@@ -95,7 +95,18 @@ pub struct KeyRecoverySurvey {
     /// Whether `origin` is the one the user gave
     /// ([`Signer::survey_key_recovery_new_at`]), not the one the newest copy names.
     pub origin_supplied: bool,
+    /// The key the service at `origin` signs with: for a provider loss, the one its account
+    /// discovery showed, which every answer there must be signed with; at the service, the
+    /// one its copy names.
+    pub service_key: [u8; 32],
+    identity: [u8; 32],
     copy: [u8; 32],
+    /// What the account discovery at `origin` showed: its association and creation.
+    discovery: Vec<u8>,
+    /// The earlier certificates in `renewed` that go, by document hash.
+    certs_dropped: Vec<[u8; 32]>,
+    /// The highest version any source showed, which the version signed is above.
+    versions: u64,
     digest: [u8; 32],
 }
 
@@ -164,6 +175,9 @@ pub enum BackupFound {
 #[derive(Clone, Debug)]
 pub struct KeyRecoveryConfirmed {
     digest: [u8; 32],
+    /// The highest version the survey saw: the version signed stays above it, whatever a
+    /// source shows later.
+    versions: u64,
     dropped: Vec<[u8; 16]>,
     /// The service a provider loss goes to, which the user picked.
     to: Option<String>,
@@ -172,12 +186,19 @@ pub struct KeyRecoveryConfirmed {
 }
 
 impl KeyRecoveryConfirmed {
+    /// Whether it confirms a provider loss, which only
+    /// [`Signer::declare_provider_loss_with_key`] carries out.
+    pub(super) fn is_provider_loss(&self) -> bool {
+        self.to.is_some()
+    }
+
     /// Made by the host only after showing `survey` and what it loses, with `dropped` the
     /// apps of the survey the user chose to revoke too.
     #[must_use]
     pub fn shown_and_confirmed(survey: &KeyRecoverySurvey, dropped: &[[u8; 16]]) -> Self {
         Self {
             digest: survey.digest,
+            versions: survey.versions,
             dropped: dropped.to_vec(),
             to: match survey.kind {
                 KeyRecoveryKind::AtService => None,
@@ -237,6 +258,7 @@ struct KeyPlan {
 struct Fates {
     apps: Vec<([u8; 16], AppFate)>,
     renewals_dropped: Vec<[u8; 16]>,
+    certs_dropped: Vec<[u8; 32]>,
     revoked: Vec<[u8; 16]>,
     picked: Vec<RemovedApp>,
     certs: Vec<AppCert>,
@@ -296,13 +318,16 @@ impl Fates {
 }
 
 impl KeyRecoverySurvey {
-    /// The survey of a recovery `kind` at `origin` on `copy`, with its digest.
+    /// The survey of a recovery `kind` at `origin` on `copy`, with its digest, with
+    /// `observation` the account discovery there and `versions` the highest version seen.
     fn of(
         origin: String,
         copy: &IdentityDoc,
         fates: &Fates,
         backup: BackupFound,
         kind: KeyRecoveryKind,
+        observation: &AccountObservation,
+        versions: u64,
     ) -> Self {
         let mut survey = Self {
             origin,
@@ -315,7 +340,12 @@ impl KeyRecoverySurvey {
             backup,
             kind,
             origin_supplied: false,
+            service_key: observation.body().service_key,
+            identity: copy.body().identity,
             copy: copy.hash(),
+            discovery: discovery_of(observation),
+            certs_dropped: fates.certs_dropped.clone(),
+            versions,
             digest: [0; 32],
         };
         survey.digest = digest_of(&survey);
@@ -810,7 +840,15 @@ impl Signer {
         let docs: Vec<&IdentityDoc> = std::iter::once(&copy).chain(seen.iter().copied()).collect();
         let fates = self.fates(&copy, &docs, backed_up, kept, &answer).await?;
         let survey =
-            KeyRecoverySurvey::of(origin, &copy, &fates, backup, KeyRecoveryKind::AtService);
+            KeyRecoverySurvey::of(
+                origin,
+                &copy,
+                &fates,
+                backup,
+                KeyRecoveryKind::AtService,
+                &observation,
+                copy.version(),
+            );
         let view = fates.view(&copy, created, Limits::default());
         Ok(KeyPlan {
             survey,
@@ -881,6 +919,14 @@ impl Signer {
             };
             apps.push((listed.app_id, fate));
         }
+        let mut certs_dropped: Vec<[u8; 32]> = copy
+            .body()
+            .renewed
+            .iter()
+            .filter(|entry| !held(&entry.cert))
+            .map(|entry| entry.cert)
+            .collect();
+        certs_dropped.sort_unstable();
         let mut renewals_dropped: Vec<[u8; 16]> = copy
             .body()
             .renewed
@@ -892,6 +938,7 @@ impl Signer {
         Ok(Fates {
             apps,
             renewals_dropped,
+            certs_dropped,
             revoked,
             picked,
             certs,
@@ -1076,10 +1123,13 @@ impl Signer {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         };
         let (mut signer, found) = Self::loss_target(env, keyring).await?;
-        let plan = Box::pin(signer.loss_plan(&found, &to)).await?;
+        let mut plan = Box::pin(signer.loss_plan(&found, &to)).await?;
         if plan.survey.digest != confirmed.digest {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         }
+        // A source that showed a higher version at the survey and a lower one now can't lower
+        // the version signed.
+        plan.versions = plan.versions.max(confirmed.versions);
         let identity = signer.state.identity;
         let state = signer.loss_records(&plan, &found, &to, &confirmed.dropped)?;
         // In memory until the commit below: a refusal before it leaves the store as found.
@@ -1286,10 +1336,12 @@ impl Signer {
         };
         let Some(base) = base else {
             // No copy anywhere: a first document in a provider loss's shape, at a generation
-            // (its seconds) and a version (its milliseconds) from the picked service's trusted
-            // time, which the client checked against the device's clock, above any a lost
-            // install could have reached (Switch spec 12.8).
-            let time = observation.body().observed_at;
+            // (the seconds) and a version (the milliseconds, times a thousand, plus a random
+            // part, so two such recoveries in one millisecond don't sign one version twice)
+            // from the time, above any a lost install could have reached (Switch spec 12.8).
+            let time = no_copy_time(self.env.clock.now_ms(), observation.body().observed_at);
+            let spread = u64::from(u16::from_be_bytes(random_bytes()?) % 1_000);
+            let floor = time.saturating_mul(1_000).saturating_add(spread);
             let mut revoked = found.kept.tombstones.clone();
             revoked.sort_unstable();
             revoked.dedup();
@@ -1304,7 +1356,12 @@ impl Signer {
                 backup,
                 kind: KeyRecoveryKind::ProviderLoss { lost: None },
                 origin_supplied: false,
+                service_key: observation.body().service_key,
+                identity,
                 copy: [0; 32],
+                discovery: discovery_of(&observation),
+                certs_dropped: Vec::new(),
+                versions: versions.max(floor),
                 digest: [0; 32],
             };
             survey.digest = digest_of(&survey);
@@ -1313,7 +1370,7 @@ impl Signer {
                 observation,
                 base: None,
                 lost: (time / 1_000).max(found.generations),
-                versions: versions.max(time),
+                versions: versions.max(floor),
                 answer,
                 view: None,
             });
@@ -1334,6 +1391,8 @@ impl Signer {
             &fates,
             backup,
             KeyRecoveryKind::ProviderLoss { lost: Some(lost) },
+            &observation,
+            versions,
         );
         let (created, limits) = backed_up.map_or((created, Limits::default()), |view| {
             (view.account_created, view.limits)
@@ -1654,6 +1713,34 @@ fn fresh_records(
     state
 }
 
+/// The time a first document with no copy anywhere takes its generation and version from:
+/// the later of the device's clock `now` and the picked service's trusted time `observed`,
+/// which counts at most a day ahead of the device's, so neither a service's clock nor the
+/// device's alone sets it below the other.
+fn no_copy_time(now: u64, observed: u64) -> u64 {
+    now.max(observed.min(now.saturating_add(DAY_MS)))
+}
+
+/// A day, in milliseconds.
+const DAY_MS: u64 = 86_400_000;
+
+/// What an account discovery showed, as the digest takes it: the association, the creation
+/// and the key that signed it.
+fn discovery_of(observation: &AccountObservation) -> Vec<u8> {
+    let body = observation.body();
+    let association = match body.association {
+        AccountAssociation::Account => 0,
+        AccountAssociation::Mark => 1,
+        AccountAssociation::Absent => 2,
+    };
+    [
+        &[association][..],
+        &picked_time(body.created),
+        &body.service_key,
+    ]
+    .concat()
+}
+
 /// A picked time or a generation as the digest takes it: none, or its eight bytes.
 fn picked_time(time: Option<u64>) -> Vec<u8> {
     time.map(|time| u64be(time).to_vec()).unwrap_or_default()
@@ -1668,8 +1755,12 @@ fn digest_of(survey: &KeyRecoverySurvey) -> [u8; 32] {
     };
     let mut parts: Vec<Vec<u8>> = vec![
         kind,
+        survey.identity.to_vec(),
         survey.origin.as_bytes().to_vec(),
+        survey.service_key.to_vec(),
+        survey.discovery.clone(),
         survey.copy.to_vec(),
+        survey.certs_dropped.concat(),
     ];
     for (app, fate) in &survey.apps {
         let fate = match fate {
@@ -1779,7 +1870,12 @@ mod tests {
             backup: BackupFound::Stale { version: 3 },
             kind: KeyRecoveryKind::AtService,
             origin_supplied: false,
+            service_key: [10; 32],
+            identity: [11; 32],
             copy: [7; 32],
+            discovery: vec![0],
+            certs_dropped: vec![[12; 32]],
+            versions: 4,
             digest: [0; 32],
         };
         let changes: Vec<fn(&mut KeyRecoverySurvey)> = vec![
@@ -1802,6 +1898,10 @@ mod tests {
             |s| s.origin = "https://other.example".into(),
             |s| s.kind = KeyRecoveryKind::ProviderLoss { lost: Some(1) },
             |s| s.kind = KeyRecoveryKind::ProviderLoss { lost: None },
+            |s| s.service_key = [13; 32],
+            |s| s.identity = [14; 32],
+            |s| s.discovery = vec![1],
+            |s| s.certs_dropped = vec![[15; 32]],
         ];
         let mut digests = vec![digest_of(&survey)];
         for change in changes {
@@ -1813,6 +1913,15 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), digests.len());
+    }
+
+    #[test]
+    fn test_key_recovery_no_copy_time_is_bound_by_the_device_clock() {
+        // A service's time below the device's counts for nothing; one ahead counts at most a
+        // day ahead.
+        assert_eq!(no_copy_time(5_000_000, 1_000), 5_000_000);
+        assert_eq!(no_copy_time(5_000_000, 6_000_000), 6_000_000);
+        assert_eq!(no_copy_time(5_000_000, u64::MAX), 5_000_000 + DAY_MS);
     }
 
     #[test]

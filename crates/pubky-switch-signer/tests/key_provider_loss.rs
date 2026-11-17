@@ -1074,3 +1074,125 @@ async fn test_key_provider_loss_takes_revocations_every_service_shows() {
     let later = signer.set_record_max_age(Some(60)).await.unwrap();
     assert_eq!(third.identity_doc().unwrap().signed(), later.signed());
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_binds_the_picked_services_key() {
+    // The service picked answers its discovery under another key at the declaration than at
+    // the survey: the declaration is refused before anything is written.
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    drop(old);
+    let (first, router) = picked_service(&world);
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!(shown.service_key, first.service_key());
+    let found = stored(&world, &store);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x7e; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    router.add_switch(NEW_ORIGIN, &other);
+    let refusal = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
+    assert_eq!(stored(&world, &store), found);
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_follows_no_key_but_the_discovered_one() {
+    // The service's discovery is signed with one key and its enrollment answer names another:
+    // that key is not followed, and no version naming it is delivered.
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    drop(old);
+    let discovered =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5e; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let answering =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x7e; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let (d, a) = (Arc::clone(&discovered), Arc::clone(&answering));
+    let transport = Arc::new(pubky_switch_client::transport::MockTransport::with_handler(
+        move |request| {
+            if request.path_and_query.ends_with("/account") {
+                d.handle(request)
+            } else {
+                a.handle(request)
+            }
+        },
+    ));
+    let env = || {
+        let mut env = world.env(store.clone());
+        env.transport = transport.clone();
+        env
+    };
+    let shown = Signer::survey_provider_loss_with_key(env(), world.keyring(), NEW_ORIGIN)
+        .await
+        .unwrap();
+    assert_eq!(shown.service_key, discovered.service_key());
+    Signer::declare_provider_loss_with_key(
+        env(),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert!(answering.identity_doc().is_none());
+    assert!(discovered.identity_doc().is_none());
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_keeps_the_version_floor_it_showed() {
+    // The Homeserver showed version 9 at the survey and an older version at the declaration,
+    // the copy built on unchanged: the version signed is still above 9.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let seen = signed_at(&world, &doc, 9, 1, 7);
+    let base = signed_at(&world, &doc, 5, 2, 8);
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &base));
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(seen.signed()).unwrap());
+    let (service, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!((shown.version, shown.generation), (5, 2));
+    let rolled_back = signed_at(&world, &doc, 4, 1, 7);
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(rolled_back.signed()).unwrap());
+    let mut signer = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(signer.identity_doc().unwrap().unwrap().version(), 10);
+    signs_at(&world, &service, &mut signer, 2).await;
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_confirmation_restores_nothing() {
+    // A provider loss's confirmation given to a restore is refused, though a matching backup
+    // is there: the restore would sign at the old service, which the user didn't confirm.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    drop(old);
+    let (_, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    let refusal = Signer::restore_new(
+        world.env(store.clone()),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
+    assert_eq!(stored(&world, &store), (None, None));
+}

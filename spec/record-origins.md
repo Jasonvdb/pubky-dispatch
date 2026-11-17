@@ -343,6 +343,10 @@ revision/lineage/descriptor fields. A later restrictive slot change does not
 rewrite a historical proof. Check the historical association and the separately
 current statement; a historical vacant receipt cannot override initialization,
 retirement or recovery. Initialized immutable facts cannot change.
+Record lineage 3.1 separately preserves a written proof's exact application
+descriptor when later current restrictions change the lineage descriptor. That
+witness supplies no missing original node, parent permission, selector or child
+association, and its historical clean flags cannot override the current slot.
 
 ## 6. Exact byte bounds and accounting
 
@@ -367,6 +371,7 @@ length; never reserialize or truncate signed bytes to fit.
 | Complete current view and required lineage/origin | 7,864,320 |
 | `record_origin` export part | 2,048 |
 | `record_lineage` export part | 32,768 |
+| `record_application_descriptor` export part | 32,768 |
 | `record_lineage_node` export part | 559,360 |
 | Protected `record` export part | 567,296 |
 
@@ -379,7 +384,8 @@ the same exact bytes. A size violation is `413 too_large` on a write, an
 unverified/unaccounted recovery item, or `400 bad_request` on import; no partial
 effect is committed. A missing required node never counts as size reduction.
 
-The component bound is `14*558336 + 21846 + 4096 + 2048 + 8192 = 7852886`.
+Without an application descriptor, the component bound is
+`14*558336 + 21846 + 4096 + 2048 + 8192 = 7852886`.
 The descriptor's 21,846 bytes are its base64url expansion. The view bound leaves
 11,434 bytes above that sum. A maximal canonical origin statement body is 489
 bytes, carrying form 758; a 577-byte slot encodes to 770, making a 1,552-byte
@@ -387,6 +393,12 @@ origin object and a 1,645-byte `record_origin` part. The 32,872 certificate figu
 is both the selected cap and the maximal compact current-shape calculation;
 other whitespace in signed bytes does not gain an exemption. Byte encodings at
 these bounds are to be covered by the implementing changes' vectors and checks.
+An application descriptor has the same 16,384-byte payload cap and counts,
+with its actual carrying member, inside the unchanged complete-view and upload
+unit cap. Component maxima need not all fit together when this witness is
+required. Measure the complete form before admission; do not discard required
+evidence or raise the bound. Its separate export part keeps metadata only and
+does not enlarge the current node or retained-value budget.
 
 Each distinct retained non-delete ciphertext/tag is charged once to
 `record_quota_bytes`, including predecessors retained after deletion. Aliases
@@ -463,7 +475,8 @@ non-recycling allocation, byte bounds and complete per-input accounting apply;
 no proofless candidate gains clean original or initializer authority. It does
 not replace the source or dating rules of ordinary loss uploads.
 
-A current record with its complete required lineage/origin is one indivisible
+A current record with its complete required application descriptor and
+lineage/origin is one indivisible
 upload unit under the existing 16 MiB request cap. Pack whole units, fewer per
 call when necessary; each protected unit is at most 7,864,320 bytes before its
 small wrapper. Retired origin evidence uses its bounded part. Every retained

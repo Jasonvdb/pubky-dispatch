@@ -203,6 +203,107 @@ new generation's service key. Historical service keys are not retained merely
 for these statements. Current records and claims keep their existing proof-key
 rules. No certificate history is invented or compacted by a statement.
 
+### 3.1 Application descriptor and later restrictions
+
+A record's operation proof commits the descriptor at that operation's application.
+Recovery evidence can add restrictions while that same operation remains current.
+The service keeps the original proof association separately from the later current
+descriptor; a current statement cannot make the old proof commit changed bytes.
+
+The record view and an uploaded record may carry optional
+`application_descriptor: b64(exact descriptor bytes)`. When present it is a
+non-null string containing one strict descriptor of Section 3, with the same
+hash construction. It has no statement or node bodies. It is a witness to the
+selected proof's current-node commitment, not another lineage bundle or positive
+origin authority. Old references and digests in it do not supply pruned node
+bodies or authorize actions based on their content.
+
+The following forms are exact, including on list and conflict views:
+
+| Current or source record | Application descriptor |
+|---|---|
+| Ordinary written record whose proof has no lineage fields, without current lineage | absent |
+| Tracked proof commits the exact current bundle descriptor | absent; that bundle supplies the committed bytes |
+| Tracked proof commits a different descriptor for the same current application | required; the exact descriptor committed by that proof |
+| Ordinary current-only application with the restrictive reconstruction below | absent; there was no original descriptor |
+| Upload-derived public current record, whose public proof is absent | absent; its primary retained source unit keeps any source proof and application descriptor |
+| Source input with no selected proof | absent |
+
+For uploads these requirements apply after the actual per-item or bulk proof is
+selected under wire 7.4.14. A tracked proof requires a complete current bundle.
+A missing required descriptor, a present null or malformed descriptor, a
+descriptor without a selected tracked proof, or one equal to the current
+descriptor when carried redundantly makes that whole input unverified. Claims
+cannot carry this member. No omitted proof or another input's source context
+supplies a missing association.
+
+For a tracked proof, the reader or service checks all of the following:
+
+1. The application descriptor's exact hash equals the proof's `descriptor_hash`.
+   Its key, lineage ID and current reference equal that proof's record state.
+   The proof still binds the actual signed operation, version, generation and
+   date under the applicable ordinary, loss or current-history rules.
+2. The descriptor has the strict structural constraints of Section 3. Locate
+   its current reference in its required-reference order, reconstruct that
+   node from its `current` fields and the record's exact operation/certificate,
+   and check its digest against the descriptor's digest at that position.
+   This checks the certificate-bearing application without inventing the old
+   non-current node bodies.
+3. Independently check the current bundle's full closure, signed source and
+   snapshot, permissions, dates and origin/initializer associations. The
+   application descriptor replaces none of these checks.
+4. Between the application and current descriptors, `key`, `lineage_id`,
+   `origin`, `incarnation`, `current` and `deleted` are equal. Digests at every
+   reference present in both are equal. Neither uncertainty bit can become
+   false. A refinement from recovery evidence has `recovered:true`, including
+   when it adds only capsules or truncation.
+5. Each application descriptor capsule is retained unchanged, or is older than
+   all four current capsules with `truncated:true`. A capsule with the same
+   delete reference cannot change predecessor or incarnation. New capsules
+   have their complete checked current closure; the old proof supplies no date
+   or authority for them. This includes an older arriving capsule that cannot
+   enter the newest four and only makes truncation explicit.
+
+When both descriptors are identical, their one current bundle and its proof
+satisfy the same checks without a second copy. A renewed current statement may
+reauthenticate these facts but cannot replace any application-descriptor byte.
+The reader derives current authority only from the current bundle and required
+origin evidence, never from an earlier clean flag in the application descriptor.
+
+An ordinary unprotected current-only application can acquire an authenticated
+**restrictive reconstruction** without pretending that its plain proof committed
+lineage. The signed operation must not require tracked creation, and its proof
+has neither `lineage_id` nor `descriptor_hash`; its ordinary state and revision
+checks still hold. The current bundle independently binds the exact source
+identity, account creation and snapshot, and that same operation, certificate
+and application reference. Its descriptor has `recovered:true`, `origin:null`,
+`incarnation:null`, and current `previous:null` and `applied_at:null`. Its lineage
+ID is assigned by the service for this unknown history, not taken as an absence
+origin from an uploaded candidate. Retained capsules have their full checked
+closure and remain restrictive. The plain proof can date its own operation;
+it does not date unknown lineage relationships. This form grants no positive
+absence, original, initializer or cooperative ancestry authority. A later
+ordinary write inherits the unknown/recovered lineage and receives its own new
+proof. Plain divergence with no held or incoming lineage leaves the current-only
+record current-only.
+
+Before first changing a locally written descriptor through recovery, the service
+preserves its exact application descriptor with the unchanged operation,
+certificate and proof, atomically with the restriction. Further refinements keep
+that one descriptor, not a list of intermediate states. A new ordinary write
+has its own proof and application descriptor; the previous witness can be
+released with its proof only when no retained complete input still needs it.
+Required source units preserve their own exact witness until their legitimate
+final disposition permits release. An upload does not manufacture an ordinary
+application or an upload admission for a locally written record.
+
+The witness contains metadata only. It adds no historical node/value window,
+non-current input slot or independent signature key. Its actual carrying bytes
+count in the current view, upload unit and export bounds of Section 5 and record
+origins 6. A key's current bundle still has at most four full capsules and 14
+nodes. Missing original descriptor bytes cannot be reconstructed from a later
+descriptor, a hash, a current response or the operation's version.
+
 ## 4. Reader checks and authority
 
 A reader verifies the statement with the key of the newest own `identity.json`
@@ -280,7 +381,8 @@ The operation and batch limits do not change. A strict condition is part of its
 signed operation's existing 512 KiB cap. Lineage is not copied into a write
 request or each transition proof. A proof's record state additionally carries
 `revision` and, for a tracked key, `lineage_id` and `descriptor_hash`; these bind
-the committed descriptor. The full bundle is in record views.
+the committed descriptor. The full current bundle is in record views, with the
+application descriptor of Section 3.1 when later restrictions changed its bytes.
 
 Lineage nodes are separate export parts; a whole lineage is not one record part.
 Before starting or extending tracked lineage, the service checks the actual
@@ -293,7 +395,9 @@ and retention checks, not an assumption about every certificate's whitespace.
 Nodes already supplied as the current record are not repeated. Recovery packs
 whole record bundles under the existing 16 MiB request cap; a caller sends fewer
 records rather than splitting one unbound bundle. Import and recovery validate
-the same bounds. The implementing changes are to supply the corresponding byte
+the same bounds, including any required application descriptor. A required
+witness cannot be dropped or reserialized to make the complete view fit.
+The implementing changes are to supply the corresponding byte
 vectors and checks; no such result is asserted here.
 
 ## 6. Cooperative transfer and provider loss
@@ -319,6 +423,17 @@ descriptor bytes, dates and uncertainty bits atomically with the account. N may
 sign the same facts under its current key only after that validation. Missing
 witnesses or nodes do not become new absence origins. An abort leaves neither
 partial lineage nor a record recovery completion active.
+
+A locally written current record whose proof commits an earlier descriptor also
+has one `record_application_descriptor` part after its current lineage parts,
+with `key` and `descriptor` (the exact base64url bytes of Section 3.1). It has no
+statement or historical-node parts. It is absent for the other forms in that
+section's table. Import checks the proof, current-node digest, complete current
+bundle and permitted refinement before activation. Missing, duplicate,
+inapplicable or inconsistent associations are `409 conflict`; malformed shapes
+or byte bounds are `400 bad_request`. The complete part and chunk wrapper fit
+the same 1 MiB bound. It preserves an existing proof association through chain
+pruning and movement without retaining another historical node window.
 
 Complete retained upload inputs also have the bounded source-unit carriers of
 [record retention 6](record-retention.md#6-complete-retained-inputs-in-cooperative-transfer),
@@ -353,6 +468,11 @@ at most the same four most recent capsules and sets `truncated` when more valid
 capsules must be omitted; unavailable order or predecessor facts keep
 `recovered` true. Repeated losses cannot reset either uncertainty into a clean
 origin. A cooperative move of recovered state preserves that state.
+When such a restriction changes the descriptor beside a locally written current
+proof, Section 3.1 preserves both associations. A current-only application uses
+that section's conservative reconstruction; it cannot inherit an uploaded
+candidate's asserted absence origin. An input that cannot be retained within the
+complete bounds stays unaccounted; no partial acknowledgment removes its duty.
 
 ## 7. Recovery records and cursor acknowledgment
 

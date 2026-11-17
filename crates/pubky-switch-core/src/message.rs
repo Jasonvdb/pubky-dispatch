@@ -95,6 +95,79 @@ pub struct Sender {
     pub app_id: [u8; 16],
 }
 
+/// Common fields for writing a message around an already encoded body (Switch wire 5.1).
+///
+/// The caller chooses the ID and time once. [`Self::to_json_with_body`] preserves the
+/// body's exact bytes, including member order and whitespace, for signing with
+/// [`MessagePlaintext::sign_json`].
+#[derive(Clone, Copy)]
+pub struct MessageFields<'a> {
+    /// The kind, `<prefix>.<name>`.
+    pub kind: &'a str,
+    /// The message ID, a lower-case UUID v4.
+    pub msg_id: &'a str,
+    /// `created_at`, in Unix milliseconds; written with [`rfc3339`].
+    pub created_at_ms: u64,
+    /// The sender.
+    pub from: Sender,
+    /// The recipient identity's Ed25519 public key.
+    pub to: [u8; 32],
+    /// The hashes of the messages this one refers to, in the order its kind fixes.
+    pub refs: &'a [[u8; 32]],
+}
+
+impl MessageFields<'_> {
+    /// Write and check a message with exactly `body_json` as its body (Switch wire 1.1,
+    /// 5.1). The common fields use the same encoding as [`Message::to_json`].
+    ///
+    /// `body_json` must be one JSON object. `opaque` names the protocol's opaque body
+    /// members, just as for [`Message::parse`]. The complete message must fit an envelope
+    /// with one recipient; more recipients may impose a smaller limit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if the common fields or body break the message's JSON rules, or
+    /// the complete message is too large. Errors never quote the body's contents.
+    pub fn to_json_with_body(
+        &self,
+        body_json: &[u8],
+        opaque: &[OpaqueMember<'_>],
+    ) -> Result<Vec<u8>> {
+        check_json_len(body_json)?;
+        // Check one complete value before embedding it: a valid frame alone would also
+        // accept a body followed by additional, unknown common fields (Switch wire 1.1).
+        serde_json::from_slice::<serde::de::IgnoredAny>(body_json)?;
+        let json = self.write_body(body_json)?;
+        check_json_len(&json)?;
+        Message::parse(&json, opaque)?;
+        Ok(json)
+    }
+
+    fn write_body(&self, body_json: &[u8]) -> Result<Vec<u8>> {
+        check_kind(self.kind)?;
+        check_uuid_v4(self.msg_id)?;
+        let wire = WireOut {
+            v: 1,
+            kind: self.kind,
+            msg_id: self.msg_id,
+            created_at: rfc3339(self.created_at_ms),
+            from: WireFrom {
+                identity: pubky_id(&self.from.identity),
+                app_id: crate::enc::zbase32_encode(&self.from.app_id),
+            },
+            to: pubky_id(&self.to),
+            refs: self.refs.iter().map(|r| b64(r)).collect(),
+        };
+        let mut json = serde_json::to_vec(&wire)?;
+        // WireOut is an object; append its final member without rewriting the body.
+        json.pop();
+        json.extend_from_slice(b",\"body\":");
+        json.extend_from_slice(body_json);
+        json.push(b'}');
+        Ok(json)
+    }
+}
+
 /// A message's common fields, read from its JSON (Switch wire 5.1, Switch spec 5.3). `v` is
 /// 1. The body is the protocol's, parsed by its kind.
 ///
@@ -137,7 +210,6 @@ struct WireOut<'a> {
     from: WireFrom,
     to: String,
     refs: Vec<String>,
-    body: &'a Map<String, Value>,
 }
 
 /// The common fields as they are read: unknown members are ignored (Switch wire 1.1), and
@@ -235,22 +307,15 @@ impl Message {
     /// [`Error::Invalid`] for a kind or a `msg_id` of the wrong form, or a body that doesn't
     /// serialize.
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        check_kind(&self.kind)?;
-        check_uuid_v4(&self.msg_id)?;
-        let wire = WireOut {
-            v: 1,
+        MessageFields {
             kind: &self.kind,
             msg_id: &self.msg_id,
-            created_at: rfc3339(self.created_at_ms),
-            from: WireFrom {
-                identity: pubky_id(&self.from.identity),
-                app_id: crate::enc::zbase32_encode(&self.from.app_id),
-            },
-            to: pubky_id(&self.to),
-            refs: self.refs.iter().map(|r| b64(r)).collect(),
-            body: &self.body,
-        };
-        Ok(serde_json::to_vec(&wire)?)
+            created_at_ms: self.created_at_ms,
+            from: self.from,
+            to: self.to,
+            refs: &self.refs,
+        }
+        .write_body(&serde_json::to_vec(&self.body)?)
     }
 
     /// Write the message's JSON and sign it for its recipient `to` with the sender app's

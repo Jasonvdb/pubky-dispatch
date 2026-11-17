@@ -926,16 +926,152 @@ pub(crate) async fn carried_outbox(
     Ok(carried)
 }
 
-/// `sent/<msg_id>`: a sent message, kept 30 days. Sensitive.
+/// Whether a message first accepted at `first_ms` is still kept as sent at `now`: within
+/// [`SENT_RETENTION_MS`] of its first acceptance (Switch spec 11). The one rule of the
+/// pruning of `sent/` and of what a backup carries of it.
+fn sent_kept(first_ms: u64, now: u64) -> bool {
+    first_ms > now.saturating_sub(SENT_RETENTION_MS)
+}
+
+/// The most bytes of sent messages a backup carries, so the restore's one commit fits the
+/// store's batch size beside the outbox and the app's own state: 8 MiB (Switch spec 12.4
+/// "Sent messages").
+pub const MAX_CARRIED_SENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The sent messages a backup carries (Switch spec 12.4 "Sent messages").
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CarriedSent {
+    /// The records, in `msg_id` order, some without their plaintext.
+    pub(crate) records: Vec<SentStored>,
+    /// How many were left out.
+    pub(crate) left_out: u64,
+}
+
+/// `kept` within [`MAX_CARRIED_SENT_BYTES`], the most recently accepted first: first the
+/// acceptance of each, without its plaintext, while those fit, the rest left out and
+/// counted; then the plaintext of each, while the whole still fits. An acceptance is what
+/// keeps a restored app from telling a message undelivered, so it goes before any
+/// plaintext.
+fn fit_sent(mut kept: Vec<SentStored>) -> CarriedSent {
+    kept.sort_by(|a, b| {
+        b.latest_ms()
+            .cmp(&a.latest_ms())
+            .then_with(|| a.msg_id.cmp(&b.msg_id))
+    });
+    let mut bytes = 0u64;
+    let mut carried = CarriedSent::default();
+    for sent in kept {
+        match bytes.checked_add(sent.stored_bytes(true)) {
+            Some(total) if total <= MAX_CARRIED_SENT_BYTES => {
+                bytes = total;
+                carried.records.push(sent);
+            }
+            _ => carried.left_out = carried.left_out.saturating_add(1),
+        }
+    }
+    for sent in &mut carried.records {
+        let extra = sent
+            .stored_bytes(false)
+            .saturating_sub(sent.stored_bytes(true));
+        match bytes.checked_add(extra) {
+            Some(total) if total <= MAX_CARRIED_SENT_BYTES => bytes = total,
+            _ => sent.plaintext = None,
+        }
+    }
+    carried.records.sort_by(|a, b| a.msg_id.cmp(&b.msg_id));
+    carried
+}
+
+/// The sent messages a backup taken at `taken_ms` carries (Switch spec 12.4 "Sent
+/// messages"): every one `reader` holds still kept then ([`sent_kept`]), as stored, within
+/// [`MAX_CARRIED_SENT_BYTES`] ([`fit_sent`]).
+pub(crate) async fn carried_sent(
+    reader: &super::state::Reader,
+    taken_ms: u64,
+) -> Result<CarriedSent, AppError> {
+    let kept = reader
+        .scan::<SentStored>(SENT_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(_, sent)| sent)
+        .filter(|sent| sent_kept(sent.first_ms, taken_ms))
+        .collect();
+    Ok(fit_sent(kept))
+}
+
+/// Check the sent messages `sent` a backup taken at `taken_ms` carries against its outbox
+/// `outbox` and the messages it left out of it `left_out` (Switch spec 12.4 "Sent
+/// messages"). A backup holds what one store held at one moment: each message once, still
+/// kept at `taken_ms`, signed by this app, within [`MAX_CARRIED_SENT_BYTES`], the same
+/// message as its outbox copy, and never beside an outbox copy the store never saw
+/// accepted, since a message is queued alone only while it isn't kept as sent and the
+/// commit that records an acceptance writes both. Anything else is damage; the error says
+/// what, without content.
+pub(crate) fn check_carried_sent(
+    sent: &[SentStored],
+    taken_ms: u64,
+    outbox: &[OutboxItem],
+    left_out: &[(String, bool)],
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Result<(), &'static str> {
+    // The caller checked that the outbox holds each message once.
+    let mut copies: BTreeMap<String, DeliveryCopy> = outbox
+        .iter()
+        .map(|item| (item.msg_id.clone(), DeliveryCopy::of(item)))
+        .collect();
+    let mut bytes = 0u64;
+    let mut ids = BTreeSet::new();
+    for record in sent {
+        bytes = bytes.saturating_add(record.stored_bytes(false));
+        if bytes > MAX_CARRIED_SENT_BYTES {
+            return Err("its sent messages are over the bytes a backup carries");
+        }
+        if !ids.insert(record.msg_id.as_str())
+            || !sent_kept(record.first_ms, taken_ms)
+            || !record.is_own(meta, cert)
+        {
+            return Err("a sent message is repeated, past its retention or not its own");
+        }
+        let never_accepted = outbox.iter().any(|item| {
+            item.msg_id == record.msg_id && item.accepted_at_ms.is_none() && !item.resend_queued
+        }) || left_out
+            .iter()
+            .any(|(msg_id, resend)| *msg_id == record.msg_id && !resend);
+        if never_accepted
+            || DeliveryCopy::of_sent(record)
+                .remember(record.msg_id.clone(), &mut copies)
+                .is_err()
+        {
+            return Err("a sent message disagrees with its outbox copy");
+        }
+    }
+    Ok(())
+}
+
+/// Put the sent message `sent` in `tx`, with its time index (`sentt/`).
+pub(crate) fn put_sent(tx: &mut super::state::Tx, sent: &SentStored) -> Result<(), AppError> {
+    tx.put(&sent_time_key(sent.first_ms, &sent.msg_id), &())?;
+    tx.put(&sent_key(&sent.msg_id), sent)
+}
+
+/// A message's signed plaintext, as a sent message keeps it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SentStored {
+#[serde(transparent)]
+struct SignedBytes(#[serde(with = "serde_b64_vec")] Vec<u8>);
+
+/// `sent/<msg_id>`: a sent message, kept 30 days. Sensitive. A backup carries it (Switch
+/// spec 12.4 "Sent messages", [`carried_sent`]).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SentStored {
     origin: DeliveryOrigin,
     #[serde(with = "serde_b64")]
     to: [u8; 32],
     kind: String,
     msg_id: String,
-    #[serde(with = "serde_b64_vec")]
-    plaintext: Vec<u8>,
+    /// The signed plaintext; `None` for a message a backup carried without it, past
+    /// [`MAX_CARRIED_SENT_BYTES`]: it still reads as accepted, and can't be sent again.
+    plaintext: Option<SignedBytes>,
     /// The first acceptance, from which retention runs.
     first_ms: u64,
     /// The acceptances of re-sends.
@@ -949,13 +1085,48 @@ struct SentStored {
 }
 
 impl SentStored {
+    /// The record's signed plaintext agrees with its routing fields and was signed by this
+    /// app; one kept without it has nothing signed to check.
     fn is_own(
         &self,
         meta: &super::state::Meta,
         cert: &pubky_switch_core::records::AppCert,
     ) -> bool {
-        own_message(&self.plaintext, &self.to, meta, cert)
-            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+        self.plaintext.as_ref().is_none_or(|bytes| {
+            own_message(&bytes.0, &self.to, meta, cert)
+                .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+        })
+    }
+
+    /// The signed plaintext, if the record keeps it.
+    fn plaintext(&self) -> Option<&[u8]> {
+        self.plaintext.as_ref().map(|bytes| bytes.0.as_slice())
+    }
+
+    /// The latest acceptance, first or re-send.
+    fn latest_ms(&self) -> u64 {
+        self.resent.iter().copied().fold(self.first_ms, u64::max)
+    }
+
+    /// The bytes the record takes in the store, without its plaintext when `bare`.
+    fn stored_bytes(&self, bare: bool) -> u64 {
+        let size = if bare && self.plaintext.is_some() {
+            super::state::encode(&Self {
+                origin: self.origin,
+                to: self.to,
+                kind: self.kind.clone(),
+                msg_id: self.msg_id.clone(),
+                plaintext: None,
+                first_ms: self.first_ms,
+                resent: self.resent.clone(),
+                replay_until_ms: self.replay_until_ms,
+            })
+        } else {
+            super::state::encode(self)
+        };
+        size.map_or(u64::MAX, |bytes| {
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        })
     }
 
     /// The re-sends' acceptance times, ascending.
@@ -1031,12 +1202,12 @@ fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
 
-/// The immutable parts shared by every retained copy of one outgoing message.
-#[derive(PartialEq, Eq)]
+/// The immutable parts shared by every retained copy of one outgoing message. A sent
+/// record kept without its plaintext agrees with any plaintext.
 struct DeliveryCopy {
     to: [u8; 32],
     kind: String,
-    plaintext: Vec<u8>,
+    plaintext: Option<Vec<u8>>,
     origin: DeliveryOrigin,
 }
 
@@ -1045,17 +1216,38 @@ impl DeliveryCopy {
         Self {
             to: item.to,
             kind: item.kind.clone(),
-            plaintext: item.plaintext.clone(),
+            plaintext: Some(item.plaintext.clone()),
             origin: item.origin,
+        }
+    }
+
+    fn of_sent(sent: &SentStored) -> Self {
+        Self {
+            to: sent.to,
+            kind: sent.kind.clone(),
+            plaintext: sent.plaintext().map(<[u8]>::to_vec),
+            origin: sent.origin,
         }
     }
 
     fn remember(self, msg_id: String, copies: &mut BTreeMap<String, Self>) -> Result<(), AppError> {
         match copies.entry(msg_id) {
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &self => {
-                Err(store_corrupt())
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let held = entry.get_mut();
+                let differs = matches!(
+                    (&held.plaintext, &self.plaintext),
+                    (Some(held), Some(this)) if held != this
+                );
+                if differs
+                    || (held.to, &held.kind, held.origin) != (self.to, &self.kind, self.origin)
+                {
+                    return Err(store_corrupt());
+                }
+                if held.plaintext.is_none() {
+                    held.plaintext = self.plaintext;
+                }
+                Ok(())
             }
-            std::collections::btree_map::Entry::Occupied(_) => Ok(()),
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(self);
                 Ok(())
@@ -1081,13 +1273,7 @@ async fn retained_copies(
         if msg_id != sent.msg_id || !sent.is_own(meta, cert) {
             return Err(store_corrupt());
         }
-        DeliveryCopy {
-            to: sent.to,
-            kind: sent.kind,
-            plaintext: sent.plaintext,
-            origin: sent.origin,
-        }
-        .remember(msg_id, &mut copies)?;
+        DeliveryCopy::of_sent(&sent).remember(msg_id, &mut copies)?;
     }
     for item in super::batch::kept_queued(reader).await? {
         if !item.is_own(meta, cert) {
@@ -1715,11 +1901,11 @@ impl App {
     ///
     /// So for one message, within one store, the call never leads to a second
     /// [`AppEvent::MessageUndelivered`], nor to one with `resend: false` once this app had a
-    /// copy of it accepted. A backup carries neither the sent messages nor the give-up
-    /// marks, so a restored app may queue again a message given up or accepted before the
-    /// backup: within its window it goes again. A recipient that processed a copy accepted
-    /// before the backup drops it as a duplicate; a message given up before the backup goes
-    /// as a first delivery.
+    /// copy of it accepted. A backup carries the sent messages (Switch spec 12.4 "Sent
+    /// messages"), so a restored app knows a message accepted before the backup and queues
+    /// nothing for it, unless the backup left it out past [`MAX_CARRIED_SENT_BYTES`]. It
+    /// carries no give-up marks, so a restored app may queue again a message given up
+    /// before the backup: within its window it goes again, as a first delivery.
     ///
     /// # Errors
     ///
@@ -1886,12 +2072,15 @@ impl App {
     /// message's first acceptance, and by its replay deadline when it has one; past it the
     /// re-send is given up ([`AppEvent::MessageUndelivered`] with `resend: true`), and the
     /// call still returns the earlier acceptance ([`Delivery::Accepted`]). The try is one
-    /// unit, as [`App::send`]'s.
+    /// unit, as [`App::send`]'s. A message a backup carried without its signed plaintext
+    /// (Switch spec 12.4 "Sent messages") can't go again: its re-send is given up at once,
+    /// told the same way.
     ///
     /// # Errors
     ///
     /// [`Refusal::WontDeliver`] with [`WontDeliver::GivenUp`] for a delivery the app gave
-    /// up; [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
+    /// up, or a re-send it gives up for want of the plaintext; [`Refusal::Usage`] for a
+    /// message the app doesn't keep; as [`App::send`].
     pub async fn resend(&mut self, msg_id: &str) -> Result<Delivery, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -1912,6 +2101,9 @@ impl App {
     /// Prepare either retained copy for a re-send, unless its delivery was given up.
     /// Check before changing an accepted item's jobs or queuing its sent copy, so a repeated
     /// request neither delivers it nor reports it undelivered again (Switch spec 11).
+    /// A sent message a backup carried without its signed plaintext can't go again: its
+    /// re-send is given up at once, and the protocol told, as for one past its replay
+    /// deadline (Switch spec 12.4 "Sent messages"). Returns whether a re-send is queued.
     async fn prepare_resend(&mut self, msg_id: &str) -> Result<bool, AppError> {
         if given_up(&self.reader(), msg_id, self.now()).await? {
             return Ok(false);
@@ -1920,7 +2112,21 @@ impl App {
             let sent = self.read_sent(msg_id).await?.ok_or_else(|| {
                 AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
             })?;
-            self.queue_resend(&sent).await?;
+            let Some(plaintext) = sent.plaintext() else {
+                let to = self.owners_of_kind(&sent.kind);
+                let mut tx = self.tx()?;
+                self.keep_duty_for(
+                    &mut tx,
+                    to,
+                    Duty::MessageUndelivered {
+                        msg_id: sent.msg_id.clone(),
+                        resend: true,
+                    },
+                )?;
+                self.commit(tx).await?;
+                return Ok(false);
+            };
+            self.queue_resend(&sent, plaintext.to_vec()).await?;
         }
         Ok(true)
     }
@@ -1950,13 +2156,18 @@ impl App {
         Ok(true)
     }
 
-    async fn queue_resend(&mut self, sent: &SentStored) -> Result<(), AppError> {
+    /// Queue a re-send of `sent`, whose signed plaintext is `plaintext`.
+    async fn queue_resend(
+        &mut self,
+        sent: &SentStored,
+        plaintext: Vec<u8>,
+    ) -> Result<(), AppError> {
         let item = OutboxItem {
             origin: sent.origin,
             to: sent.to,
             kind: sent.kind.clone(),
             msg_id: sent.msg_id.clone(),
-            plaintext: sent.plaintext.clone(),
+            plaintext,
             notify: false,
             invite_code: None,
             conversation: false,
@@ -2003,14 +2214,7 @@ impl App {
             if msg_id != sent.msg_id || !sent.is_own(&self.state.meta, &self.state.cert) {
                 return Err(store_corrupt());
             }
-            let last = sent
-                .resent
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(sent.first_ms)
-                .max(sent.first_ms);
-            if sent.to != *pubky || last < since_ms {
+            if sent.to != *pubky || sent.latest_ms() < since_ms {
                 continue;
             }
             if self.prepare_resend(&sent.msg_id).await? {
@@ -2031,9 +2235,12 @@ impl App {
 
     /// Where the message `msg_id` is: in the outbox, sent, or in a kept batch that queues it
     /// ([`Delivery::Kept`], and [`Delivery::Failed`] once that batch is dropped); `None` for
-    /// one the app doesn't keep. `None` never says the message was never sent: one
-    /// accepted or ended longer than [`SENT_RETENTION_MS`] ago, or queued before a
-    /// restore, isn't known here. The protocol reads its shared state then.
+    /// one the app doesn't keep. A restore keeps the sent messages its backup carries
+    /// (Switch spec 12.4 "Sent messages"), so a message accepted before the backup reads as
+    /// accepted after it. `None` never says the message was never sent: one accepted or
+    /// ended longer than [`SENT_RETENTION_MS`] ago, one in a batch kept before a restore,
+    /// one the backup left out past [`MAX_CARRIED_SENT_BYTES`], or one the device a backup
+    /// came from sent after it, isn't known here. The protocol reads its shared state then.
     ///
     /// # Errors
     ///
@@ -2067,7 +2274,8 @@ impl App {
     /// The messages sent to `pubky` that its inbox accepted within `[from_ms, until_ms]`,
     /// first acceptances and re-sends, for the protocol's answer to a re-send request
     /// (Switch spec 11). Each carries every acceptance time the app kept
-    /// ([`SentMessage::accepted_times_ms`]).
+    /// ([`SentMessage::accepted_times_ms`]). A message a backup carried without its signed
+    /// plaintext isn't listed: it can't be sent again (Switch spec 12.4 "Sent messages").
     ///
     /// # Errors
     ///
@@ -2086,13 +2294,16 @@ impl App {
             let within = std::iter::once(sent.first_ms)
                 .chain(sent.resent.iter().copied())
                 .any(|at| at >= from_ms && at <= until_ms);
-            if sent.to == *pubky && within {
+            // One kept without its plaintext can't be sent again, and isn't listed.
+            if let Some(plaintext) = sent.plaintext()
+                && sent.to == *pubky
+                && within
+            {
                 out.push(SentMessage {
                     to: sent.to,
                     kind: sent.kind.clone(),
                     msg_id: sent.msg_id.clone(),
-                    plaintext: MessagePlaintext::decode(&sent.plaintext)
-                        .map_err(|_| store_corrupt())?,
+                    plaintext: MessagePlaintext::decode(plaintext).map_err(|_| store_corrupt())?,
                     accepted_at_ms: Some(sent.first_ms),
                     resent_at_ms: sent.resent_ascending(),
                 });
@@ -2565,6 +2776,9 @@ impl App {
                     .into_iter()
                     .flatten()
                     .min();
+                // A record a backup carried without its plaintext takes it again.
+                sent.plaintext
+                    .get_or_insert_with(|| SignedBytes(item.plaintext.clone()));
                 sent
             }
             None => {
@@ -2574,7 +2788,7 @@ impl App {
                     to: item.to,
                     kind: item.kind.clone(),
                     msg_id: item.msg_id.clone(),
-                    plaintext: item.plaintext.clone(),
+                    plaintext: Some(SignedBytes(item.plaintext.clone())),
                     first_ms: first,
                     resent: if at == first { Vec::new() } else { vec![at] },
                     replay_until_ms: item.replay_until_ms,
@@ -2633,7 +2847,7 @@ impl App {
 
     /// Forget sent messages 30 days after their first acceptance, oldest first.
     async fn prune_sent(&mut self) -> Result<(), AppError> {
-        let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
+        let now = self.now();
         let mut tx = self.tx()?;
         for (rest, ()) in self.reader().scan::<()>(SENT_TIME_PREFIX).await? {
             let Some((at, msg_id)) = rest.split_once('/') else {
@@ -2642,13 +2856,12 @@ impl App {
             let Ok(at) = super::state::parse_num(at) else {
                 continue;
             };
-            if at > cutoff {
+            if sent_kept(at, now) {
                 break;
             }
             tx.delete(&sent_key(msg_id))?;
             tx.delete(&sent_time_key(at, msg_id))?;
         }
-        let now = self.now();
         for (msg_id, until) in self.reader().scan::<u64>(GIVEN_UP_PREFIX).await? {
             // A retained item may still await its turn in a bounded flush. Keep its mark
             // until neither stored copy can produce a re-send, even if this commit removes
@@ -3279,5 +3492,43 @@ mod tests {
         assert_eq!(item.replay_until_ms, Some(1_000 + SENT_RETENTION_MS));
         item.replay_until(100);
         assert_eq!(item.replay_until_ms, Some(100 + SENT_RETENTION_MS));
+    }
+
+    #[test]
+    fn test_sent_fit_carries_acceptances_first_then_the_newest_plaintexts() {
+        // Every record takes the same bytes: its time has the same number of digits.
+        const AT: u64 = 1_000_000_000_000;
+        let record = |n: u64| SentStored {
+            origin: DeliveryOrigin::Original,
+            to: [3; 32],
+            kind: "sample.note".into(),
+            msg_id: format!("{n:020}"),
+            plaintext: Some(SignedBytes(vec![7; 50_000])),
+            first_ms: AT + n,
+            resent: Vec::new(),
+            replay_until_ms: None,
+        };
+        let bare = record(0).stored_bytes(true);
+        let total = MAX_CARRIED_SENT_BYTES / bare + 10;
+        let carried = fit_sent((0..total).map(record).collect());
+        // Every acceptance that fits goes, the oldest left out and counted.
+        assert_eq!(carried.left_out, 10);
+        assert_eq!(u64::try_from(carried.records.len()).unwrap(), total - 10);
+        assert!(carried.records.iter().all(|sent| sent.first_ms >= AT + 10));
+        // No plaintext fits beside them all; within the bound, the newest keep theirs.
+        assert!(carried.records.iter().all(|sent| sent.plaintext.is_none()));
+        let few = fit_sent((0..200).map(record).collect());
+        assert_eq!(few.left_out, 0);
+        let whole: Vec<u64> = few
+            .records
+            .iter()
+            .filter(|sent| sent.plaintext.is_some())
+            .map(|sent| sent.first_ms - AT)
+            .collect();
+        assert!(!whole.is_empty() && whole.len() < 200, "{}", whole.len());
+        assert_eq!(
+            whole.iter().min(),
+            Some(&(200 - u64::try_from(whole.len()).unwrap()))
+        );
     }
 }

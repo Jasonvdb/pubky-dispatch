@@ -125,10 +125,10 @@ pub use records::{
     PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
-    Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,
-    OutboxReport, OutgoingMessage, QueuedMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
-    UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, MAX_CARRIED_SENT_BYTES,
+    OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage, QueuedMessage, RecordJob,
+    SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS,
+    UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -428,6 +428,15 @@ pub struct AppBackup {
     /// The messages of the outbox left out past the budget, and whether each is a re-send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outbox_left_out: Vec<(String, bool)>,
+    /// The sent messages (`sent/`) still kept when the backup was taken, within
+    /// [`MAX_CARRIED_SENT_BYTES`] (`send::carried_sent`), in `msg_id` order: a restore keeps
+    /// them, so a message accepted before the backup reads as accepted (Switch spec 12.4
+    /// "Sent messages").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sent: Vec<send::SentStored>,
+    /// How many sent messages still kept were left out past [`MAX_CARRIED_SENT_BYTES`]: a
+    /// restore tells the protocol how many ([`AppEvent::RestoreLeftBehind`]).
+    sent_left_out: u64,
     /// The counterparties whose messages the app holds ([`App::hold_queued`]), in base64:
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1344,8 +1353,8 @@ impl App {
 
     /// The app's backup (Switch spec 12.4): its keys, certificate and record, scope keys
     /// and naming key, its receive keys and the kids it knows, its cursor and chain view,
-    /// its outbox, and the re-send and missed-entries calls it owes its protocol
-    /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
+    /// its outbox and sent messages, and the re-send and missed-entries calls it owes its
+    /// protocol ([`AppBackup`]). The app should take one at every rotation, replacing the previous
     /// one (Switch spec 3.6).
     ///
     /// The outbox goes in whole, but for the messages refused for good: each message with
@@ -1359,6 +1368,15 @@ impl App {
     /// only within [`SENT_RETENTION_MS`] of the backup, by the restoring device's clock;
     /// later it gives that delivery up, as for an undeliverable message
     /// ([`AppEvent::MessageUndelivered`]).
+    ///
+    /// The sent messages still kept, those whose first acceptance is within
+    /// [`SENT_RETENTION_MS`], go in within [`MAX_CARRIED_SENT_BYTES`], the most recently
+    /// accepted first: first each one's acceptance, then its signed plaintext while the
+    /// whole fits (Switch spec 12.4 "Sent messages"). The restored app reads each as
+    /// accepted and never tells its protocol that it wasn't delivered; one carried without
+    /// its plaintext can't be sent again, so a re-send of it is given up, told as a re-send.
+    /// Those left out are counted to the protocol at the restore
+    /// ([`AppEvent::RestoreLeftBehind`]).
     ///
     /// A backup is only ever of committed state. After a failed commit the app's memory may
     /// be ahead of its store, such as a cursor past an entry whose processed pair and local
@@ -1450,6 +1468,8 @@ impl App {
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
+            sent: Vec::new(),
+            sent_left_out: 0,
             held_counterparties: Vec::new(),
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
@@ -1518,11 +1538,15 @@ impl App {
 
     /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
     /// app still owes a job, so a restore delivers what was queued before the backup with
-    /// the same `msg_id` and bytes.
+    /// the same `msg_id` and bytes, and the sent messages still kept, so a restore reads
+    /// each as accepted (Switch spec 12.4 "Sent messages").
     /// The expiries the protocols asked of the record go with it.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
+        let sent = send::carried_sent(reader, backup.taken_ms).await?;
+        backup.sent = sent.records;
+        backup.sent_left_out = sent.left_out;
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -1745,6 +1769,10 @@ impl App {
     /// The backup's outbox goes back in, to be delivered by the next flush with the same
     /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still
     /// owed is given up instead, with [`AppEvent::MessageUndelivered`] ([`App::backup`]).
+    /// So do its sent messages: [`App::delivery`] answers [`Delivery::Accepted`] for each,
+    /// [`App::queue_stored`] queues nothing for it, and no event tells it undelivered but
+    /// for a re-send. A restore in place keeps only the backup's sent messages, not the
+    /// store's.
     ///
     /// The protocols' layers ([`App::backup_layered`]) are installed with the app's own
     /// state, and with the entries and processed pairs of the same moment that the backup
@@ -1783,7 +1811,10 @@ impl App {
     /// # Errors
     ///
     /// [`AppError::InvalidData`] for a backup that doesn't verify, for a layer of a protocol
-    /// not registered, or for one its protocol refuses; [`Refusal::Usage`] for a certificate
+    /// not registered, or for one its protocol refuses, or for sent messages no backup
+    /// carries: over [`MAX_CARRIED_SENT_BYTES`], one twice, past its retention when the
+    /// backup was taken, not signed by this app, or another message than its outbox copy or
+    /// beside one never accepted; [`Refusal::Usage`] for a certificate
     /// holding a scope root no registered protocol owns; [`Refusal::Certificate`] for one a
     /// protocol refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
     /// commit but not with the duty events and owed calls the store would carry beside it;
@@ -1858,6 +1889,15 @@ impl App {
                     ));
                 }
             }
+            send::check_carried_sent(
+                &backup.sent,
+                backup.taken_ms,
+                &backup.outbox,
+                &backup.outbox_left_out,
+                &meta,
+                &cert,
+            )
+            .map_err(invalid)?;
             // The app record the restore installs carries that very certificate, so what the
             // protocol checks below is all that is installed: the app writes the two
             // together, at a join and when it takes a certificate, so they never differ in a
@@ -2283,6 +2323,12 @@ impl App {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }
                 app.reinstall_outbox(backup, &mut tx)?;
+                // The sent messages go back as carried, so a message accepted before the
+                // backup reads as accepted, and is never told undelivered (Switch spec 12.4
+                // "Sent messages"); those past their retention by now go at the next prune.
+                for sent in &backup.sent {
+                    send::put_sent(&mut tx, sent)?;
+                }
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
                         send::put_hold(&mut tx, &pubky)?;
@@ -2341,13 +2387,15 @@ impl App {
                     }
                 }
                 // What didn't read is left behind, and the protocol told how much.
+                // So are the sent messages the backup left out past its bound.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
-                if carried.lost_duties > 0 || lost_owed > 0 {
+                if carried.lost_duties > 0 || lost_owed > 0 || backup.sent_left_out > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
                             owed_calls: lost_owed,
+                            sent_messages: backup.sent_left_out,
                         },
                     )?;
                 }

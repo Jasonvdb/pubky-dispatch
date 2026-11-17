@@ -266,8 +266,21 @@ enum RecordAnswer {
     /// `404`: the switch holds no record at the key.
     Absent,
     /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
-    /// (Switch wire 7.3 step 2).
-    NotHosted,
+    /// (Switch wire 7.3 step 2). That says nothing of the record: the service reads as
+    /// unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+    NotHosted(Box<ClientError>),
+}
+
+/// What a read of one record key came to ([`App::fetch_record`]).
+#[derive(Debug)]
+pub(crate) enum Fetched {
+    /// The switch's view, and what reading its write came to.
+    Read(WriteRead),
+    /// `404` at an account the switch hosts: it holds no record at the key.
+    Absent,
+    /// The signed `404` saying the switch doesn't host the identity: the service reads as
+    /// unreachable, and the record isn't absent (Switch spec 10.3.1 "Absence", 12.7 step 5).
+    NotHosted(Box<ClientError>),
 }
 
 pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
@@ -774,7 +787,7 @@ pub enum RecordRead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeptReason {
-    /// The switch holds no record at the key, or forgot it (`404`).
+    /// The switch holds no record at the key, or forgot it (`404`, at an account it hosts).
     NotFound,
     /// The switch's write was refused: a failed check, or one that goes back on what the
     /// app has seen ([`super::AppEvent::WriteFlagged`]).
@@ -788,8 +801,10 @@ pub enum KeptReason {
         /// The error code.
         code: ErrorCode,
     },
-    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, or an answer
-    /// that didn't verify; the error, without content.
+    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, an answer
+    /// that didn't verify, or the signed `404` saying it doesn't host the identity, which
+    /// says nothing of the record (Switch spec 10.3.1 "Absence", 12.7 step 5); the error,
+    /// without content.
     Unreachable(String),
 }
 
@@ -953,31 +968,30 @@ impl App {
         .await
     }
 
-    /// Read the record at `key` from the switch and take its write; what came of it, `None`
-    /// for a key the switch doesn't know.
+    /// Read the record at `key` from the switch and take its write; what came of it.
     pub(crate) async fn fetch_record(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<Option<WriteRead>, AppError> {
+    ) -> Result<Fetched, AppError> {
         let view = match self.record_answer(key).await? {
             RecordAnswer::View(view) => view,
             // The switch holds no record at the key, at an account it hosts: absence
             // (Switch spec 10.3.1 "Absence").
             RecordAnswer::Absent => {
                 self.note_absent(key).await?;
-                return Ok(None);
+                return Ok(Fetched::Absent);
             }
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
-            RecordAnswer::NotHosted => return Ok(None),
+            RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
         };
         let mut tx = self.tx()?;
         let read = self
             .take_view(&view, Some((key, collection)), &mut tx)
             .await?;
         self.commit(tx).await?;
-        Ok(Some(read))
+        Ok(Fetched::Read(read))
     }
 
     /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
@@ -1001,15 +1015,20 @@ impl App {
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
             let reason = match self.fetch_record(&key, &target.collection).await {
-                Ok(Some(WriteRead::Taken | WriteRead::Held)) => {
+                Ok(Fetched::Read(WriteRead::Taken | WriteRead::Held)) => {
                     if let Some(record) = self.shared_record(&key).await? {
                         return Ok(RecordRead::Fresh(record));
                     }
                     KeptReason::Refused
                 }
-                Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
-                Ok(Some(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
-                Ok(None) => KeptReason::NotFound,
+                Ok(Fetched::Read(WriteRead::NotNewer)) => KeptReason::NotNewer,
+                Ok(Fetched::Read(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
+                Ok(Fetched::Absent) => KeptReason::NotFound,
+                // A switch that doesn't host the identity says nothing of the record: it
+                // reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+                Ok(Fetched::NotHosted(error)) => {
+                    KeptReason::Unreachable(AppError::Switch(*error).to_string())
+                }
                 Err(AppError::Switch(ClientError::Switch { code, .. }))
                     if code.retry() == pubky_switch_core::http::Retry::No =>
                 {
@@ -1029,15 +1048,27 @@ impl App {
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
-    /// for a key it doesn't know, or forgot.
+    /// for a key it doesn't know, or forgot, at an account it hosts, which is absence
+    /// (Switch spec 10.3.1 "Absence", [`App::note_absent`]).
+    ///
+    /// # Errors
+    ///
+    /// The signed `404` saying the switch doesn't host the identity, as the failed call it
+    /// is: the service reads as unreachable, and the record isn't absent (Switch spec
+    /// 10.3.1 "Absence", 12.7 step 5). The rollback alarm for a permanent record the app
+    /// holds live that reads absent; a failed call.
     pub(crate) async fn record_view(
         &mut self,
         key: &[u8; 32],
     ) -> Result<Option<SharedRecordView>, AppError> {
-        Ok(match self.record_answer(key).await? {
-            RecordAnswer::View(view) => Some(*view),
-            RecordAnswer::Absent | RecordAnswer::NotHosted => None,
-        })
+        match self.record_answer(key).await? {
+            RecordAnswer::View(view) => Ok(Some(*view)),
+            RecordAnswer::Absent => {
+                self.note_absent(key).await?;
+                Ok(None)
+            }
+            RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
+        }
     }
 
     /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
@@ -1046,7 +1077,9 @@ impl App {
         let result = self.client.record(key).await;
         match self.take(result).await {
             Ok(view) => Ok(RecordAnswer::View(Box::new(view))),
-            Err(AppError::Switch(error)) if error.is_not_hosted() => Ok(RecordAnswer::NotHosted),
+            Err(AppError::Switch(error)) if error.is_not_hosted() => {
+                Ok(RecordAnswer::NotHosted(Box::new(error)))
+            }
             Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(RecordAnswer::Absent),
             Err(error) => Err(error),
         }

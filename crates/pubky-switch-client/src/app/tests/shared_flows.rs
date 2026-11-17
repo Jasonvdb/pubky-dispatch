@@ -10191,9 +10191,195 @@ async fn test_permanent_not_hosted_read_raises_no_alarm() {
     s.w.switch.lose_account();
     s.w.switch.lose_mark();
     let read = phone.read_record_fresh(&kept).await;
-    assert!(matches!(read, Ok(RecordRead::Kept { .. })), "{read:?}");
+    // The read keeps the copy, as for a switch it couldn't reach: not a record not found.
+    assert!(
+        matches!(
+            read,
+            Ok(RecordRead::Kept {
+                record: Some(_),
+                reason: KeptReason::Unreachable(_),
+            })
+        ),
+        "{read:?}"
+    );
     assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
     assert!(phone.shared_record(&key).await.unwrap().is_some());
+}
+
+/// A setup where the phone holds a permanent record live, its own create, and its next
+/// read finds in the feed the wallet's later write of it, under a certificate the phone never
+/// holds, which a renewal then reduced: the phone judges that write by the record's view
+/// (Switch wire 6.2 "Accepting a write" step 1). The setup, the phone and the record's key.
+async fn unheld_write_at_a_kept_record() -> (Setup, App, [u8; 32]) {
+    let s = Setup::new();
+    *s.protocol.collections.lock().unwrap() = Some(vec![items(), kept_items()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let kept = RecordTarget::new(kept_items(), b"n1");
+    phone
+        .put_record(&kept, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&kept).unwrap();
+    wallet.receive(None).await.unwrap();
+    wallet
+        .put_record(&kept, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    (s, phone, key)
+}
+
+#[tokio::test]
+async fn test_permanent_feed_write_judged_by_a_view_that_reads_absent_raises_the_alarm() {
+    let (s, mut phone, key) = unheld_write_at_a_kept_record().await;
+    // The switch lets the record go after its feed showed the write: the view is a `404`
+    // at an account it hosts.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: serde_json::Value::Null,
+    });
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "{read:?}");
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+#[tokio::test]
+async fn test_permanent_feed_write_judged_by_a_not_hosted_view_raises_no_alarm() {
+    let (s, mut phone, key) = unheld_write_at_a_kept_record().await;
+    // The view answered with the `404` saying the switch doesn't host the identity: the
+    // switch is unreachable, and the record isn't absent.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(
+        matches!(&read, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{read:?}"
+    );
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_permanent_upload_reread_that_reads_absent_raises_the_alarm() {
+    let (s, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        records: [key].into(),
+        ..Default::default()
+    };
+    s.w.switch
+        .chain_upload([9; 16], changes.to_value())
+        .unwrap();
+    // The read again answered with the `404` saying the switch doesn't host the identity:
+    // unreachable, so the record stays marked and nothing is absent.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let before = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    // The switch lets the record go: the next read again is a `404` at an account it hosts.
+    s.w.switch.drop_record(&key).unwrap();
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "{read:?}");
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+#[tokio::test]
+async fn test_permanent_listing_of_another_collection_raises_no_alarm() {
+    let (_, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    // A listing of the ordinary collection covers every key, and lists none of the
+    // permanent collection's: that says nothing of them.
+    let listed = phone.list_collection(&items()).await;
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+}
+
+#[tokio::test]
+async fn test_permanent_listing_across_pages_judges_each_page_by_its_range() {
+    let (s, mut wallet, mut phone, _, kept) = with_kept_records().await;
+    let mut targets = vec![kept];
+    for natural in [b"n2", b"n3"] {
+        let target = RecordTarget::new(kept_items(), natural);
+        wallet
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        targets.push(target);
+    }
+    phone.receive(None).await.unwrap();
+    let mut keys: Vec<[u8; 32]> = targets
+        .iter()
+        .map(|target| phone.record_key(target).unwrap())
+        .collect();
+    keys.sort_by_key(|key| pubky_switch_core::enc::b64(key));
+    // One record to a page: each page covers the keys after the one before it, through its
+    // own, and the records of the other pages are outside its range, on either side.
+    s.w.switch.lock().max_page_bytes = 1;
+    let pages = s.w.switch.lock().shared.listings;
+    let mut listed = 0;
+    loop {
+        let page = phone.list_collection(&kept_items()).await.unwrap();
+        listed += page.records;
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(listed, 3);
+    assert_eq!(s.w.switch.lock().shared.listings - pages, 3);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    // The middle record gone: the page after the first covers its key without it.
+    s.w.switch.drop_record(&keys[1]).unwrap();
+    let mut outcome = Ok(());
+    for _ in 0..3 {
+        match phone.list_collection(&kept_items()).await {
+            Ok(page) if page.more => {}
+            Ok(_) => break,
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
 }
 
 #[tokio::test]

@@ -317,9 +317,9 @@ pub enum Refusal {
     /// The Homeserver holds no signer backup to restore from (Switch wire 3.13).
     #[error("refused: there is no signer backup")]
     NoBackup,
-    /// The signer backup is stale: the switch holds another version than the backup's or
-    /// the one it builds on, or the Homeserver a newer one or another at its version (Switch
-    /// wire 3.13 "Restoring").
+    /// The signer backup is stale: the switch holds another version than the backup's, the
+    /// one it builds on, or a later one with its content that a racing delivery left, or the
+    /// Homeserver a newer one or another at its version (Switch wire 3.13 "Restoring").
     #[error("refused: the signer backup is stale")]
     StaleBackup,
     /// The newest `identity.json` doesn't list that App ID in `removed`.

@@ -335,9 +335,11 @@ pub enum Alert {
         /// later send succeeds.
         at_switch: bool,
     },
-    /// After a restore, the signer backup couldn't be written once its delivery won (Switch
-    /// wire 3.13). The backup on the Homeserver is the one restored from; the next version's
-    /// backup write replaces it.
+    /// After a delivery that raced another signer (a restore, a take-over, an abort or a
+    /// take-back), the signer backup couldn't be written once it won (Switch wire 3.13). The
+    /// backup on the Homeserver is the one before it; the next run, or the next version's
+    /// backup write, replaces it. Should this install be lost first, a restore from that
+    /// backup still takes over.
     BackupNotWritten,
     /// The switch refused to store the hand-over to this app for good (Switch wire 7.4.17),
     /// as when it isn't current there. An earlier send may still be stored, so the hand-over

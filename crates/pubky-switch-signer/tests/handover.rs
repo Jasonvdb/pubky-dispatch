@@ -1272,6 +1272,47 @@ async fn test_take_back_from_a_new_signer_lost_before_its_backup() {
 }
 
 #[tokio::test]
+async fn test_take_back_lost_before_its_backup_is_restored_over() {
+    // The new signer won and was lost before its backup; the old install took the identity
+    // back, and was lost before its own backup too. The backup still holds the version handed
+    // over, and the switch the take-back, with the same content: a restore builds on it.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let handed = world.backup().identity_doc().clone();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let new = Signer::receive_hand_over(
+        world.env(Arc::new(MemoryStore::new())),
+        &s.target,
+        empty_vault(),
+    )
+    .await
+    .unwrap();
+    drop(new);
+    s.old.resume().await.unwrap_err();
+    let back = s.old.take_back(confirmed()).await.unwrap();
+    assert!(s.old.alerts().contains(&Alert::BackupNotWritten));
+    drop(s.old);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(world.backup().identity_doc().signed(), handed.signed());
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), back.signed());
+    let mut signer = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.version(), back.version() + 1);
+    assert_eq!(doc.body().signer, signer.install_id());
+    assert_eq!(doc.body().apps, handed.body().apps);
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    signer.set_record_max_age(Some(60)).await.unwrap();
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
 async fn test_take_back_above_a_losing_abort_and_against_a_live_new_signer() {
     // The old install signed an abort that lost, so the take-back goes above it. The new
     // signer is still alive but hasn't written its backup: the take-back wins, and the new

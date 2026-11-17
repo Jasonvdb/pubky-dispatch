@@ -13,12 +13,16 @@
 //!   lost generation names, at that origin and below the backup's version, and under no
 //!   other key. Either way its copy of the lost generation below the backup's version, or a
 //!   signed `503 recovery_required` naming the lost generation or the backup's, counts as no
-//!   copy. Any other copy makes the backup stale, and the restore is refused;
-//! - the Homeserver's copy is neither newer than the backup's version nor another document at
-//!   it.
+//!   copy. A later version with the backup's content, changed only in `version` and `signer`,
+//!   is a racing delivery's whose own backup was never written, as when the install that
+//!   restored or took over was lost first: the restore builds on it. Any other copy makes the
+//!   backup stale, and the restore is refused;
+//! - the Homeserver's copy is neither newer than the version the restore builds on nor
+//!   another document at it.
 //!
 //! In place, the install's own records are checked too: no alarm stands, since a restore never
-//! clears one, and the backup isn't below the mark (wire 3.3 "Never back").
+//! clears one, and the version the restore builds on isn't below the mark (wire 3.3 "Never
+//! back").
 //!
 //! The install then takes the backup's records as its own, with these additions:
 //! - the App IDs `GET /apps` shows revoked or departed join the tombstones, and, in place, so
@@ -413,7 +417,7 @@ impl Signer {
         // In place, the service still serves the lost generation until it takes the version:
         // its copy of that generation counts as no copy (Switch wire 3.13).
         let answer = without_the_lost_copy(&view, answer, &identity);
-        let first = self
+        let copy = self
             .check_restore(&view, answer.identity.as_ref(), local.as_ref())
             .await?;
 
@@ -480,7 +484,7 @@ impl Signer {
         // A backup written mid-recovery holds the recovery's version, which the service it
         // names doesn't hold yet: the recovery is in progress again, delivered first, and
         // declared again elsewhere if that service refuses it (Switch spec 12.6 step 1).
-        if first == Some(None)
+        if copy == SwitchCopy::Before(None)
             && is_recovery(&view)
             && let Some(lost) = doc.body().recovery_from
         {
@@ -511,21 +515,30 @@ impl Signer {
                 })
             });
         }
+        // A racing delivery's version past the backup's, with its content, is adopted: the
+        // next version builds on it (Switch wire 3.13 "Restoring").
+        let (newest, prev) = match &copy {
+            SwitchCopy::RacedPast(copy) => (copy.signed().clone(), None),
+            _ => (doc.signed().clone(), view.prev),
+        };
         state.newest = Some(Newest {
             account: Some(service.clone()),
-            doc: doc.signed().clone(),
-            prev: view.prev,
+            doc: newest,
+            prev,
             published: false,
             delivered_at: None,
         });
         // The version the backup holds goes first when the switch is at the one before.
-        let deliver_first = first.map(|prev| Flow::Deliver {
-            account: service,
-            doc: doc.signed().clone(),
-            prev,
-            backup: None,
-            step: DeliverStep::BackupWritten,
-        });
+        let deliver_first = match copy {
+            SwitchCopy::Before(prev) => Some(Flow::Deliver {
+                account: service,
+                doc: doc.signed().clone(),
+                prev,
+                backup: None,
+                step: DeliverStep::BackupWritten,
+            }),
+            SwitchCopy::AtBackup | SwitchCopy::RacedPast(_) => None,
+        };
         let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
         match self.finish_flow().await {
@@ -717,35 +730,53 @@ impl Signer {
 
     /// The checks a restore passes before it takes the backup's records (Switch wire 3.13
     /// "Restoring"). They are its only guard: once the records are replaced, the signing gate
-    /// passes by construction. Returns, when the backup's own version is to be delivered
-    /// first, the `prev` it builds on.
+    /// passes by construction. Returns where the switch's copy stands against the backup.
     ///
-    /// - In place, the records' own state: no alarm's alert stands, since a restore never
-    ///   clears one, and the backup isn't below the mark, by version or generation, nor
-    ///   another body at its version, nor below a newer version of this install's own the
-    ///   switch showed (`RecordsBehind`) (Switch wire 3.3 "Never back").
+    /// - In place, no alarm's alert stands, since a restore never clears one.
     /// - The switch's copy, `held`, is the backup's version, or the one it builds on, or
-    ///   none under a backup of the account's first version.
-    /// - The Homeserver's copy is neither newer than the backup's version nor another
-    ///   document at it.
+    ///   none under a backup of the account's first version, or a later version with the
+    ///   backup's content: a racing delivery's whose own backup was never written.
+    /// - In place, the version the restore builds on, the backup's or that later one, isn't
+    ///   below the mark, by version or generation, nor another body at its version, nor below
+    ///   a newer version of this install's own the switch showed (`RecordsBehind`) (Switch
+    ///   wire 3.3 "Never back").
+    /// - The Homeserver's copy is neither newer than that version nor another document at it.
     async fn check_restore(
         &self,
         view: &BackupView,
         held: Option<&SignedDoc>,
         local: Option<&RestoreLocal>,
-    ) -> Result<Option<Option<[u8; 32]>>> {
+    ) -> Result<SwitchCopy> {
         let identity = self.state.identity;
-        let doc = &view.identity_doc;
+        if let Some(alarm) = local
+            .and_then(|local| local.state.as_ref())
+            .and_then(gate::held_alarm)
+        {
+            return Err(SignerError::Alarm(alarm.clone()));
+        }
+        let held = held
+            .map(|signed| IdentityDoc::verify(signed, &identity))
+            .transpose()?;
+        let copy = match (held, view.prev) {
+            (Some(copy), _) if copy.hash() == view.identity_doc.hash() => SwitchCopy::AtBackup,
+            (Some(copy), Some(prev)) if copy.hash() == prev => SwitchCopy::Before(Some(prev)),
+            (Some(copy), _) if raced_past(&copy, &view.identity_doc) => {
+                SwitchCopy::RacedPast(Box::new(copy))
+            }
+            (None, None) => SwitchCopy::Before(None),
+            _ => return Err(Refusal::StaleBackup.into()),
+        };
+        // Every other check is against the version the restore builds on.
+        let doc = match &copy {
+            SwitchCopy::RacedPast(copy) => copy.as_ref(),
+            _ => &view.identity_doc,
+        };
         if let Some(local) = local {
-            if let Some(state) = &local.state {
-                if let Some(alarm) = gate::held_alarm(state) {
-                    return Err(SignerError::Alarm(alarm.clone()));
-                }
-                if let Some(seen) = state.records_behind
-                    && doc.version() < seen
-                {
-                    return Err(Refusal::StaleBackup.into());
-                }
+            if let Some(state) = &local.state
+                && let Some(seen) = state.records_behind
+                && doc.version() < seen
+            {
+                return Err(Refusal::StaleBackup.into());
             }
             for copy in &local.copies {
                 if let KeptCopy::Verified(mark) = copy {
@@ -758,15 +789,6 @@ impl Signer {
                 }
             }
         }
-        let held = held
-            .map(|signed| IdentityDoc::verify(signed, &identity))
-            .transpose()?;
-        let first = match (&held, view.prev) {
-            (Some(copy), _) if copy.hash() == doc.hash() => None,
-            (Some(copy), Some(prev)) if copy.hash() == prev => Some(view.prev),
-            (None, None) => Some(None),
-            _ => return Err(Refusal::StaleBackup.into()),
-        };
         if let Some(copy) = self
             .env
             .homeserver
@@ -783,7 +805,7 @@ impl Signer {
                 return Err(Refusal::StaleBackup.into());
             }
         }
-        Ok(first)
+        Ok(copy)
     }
 
     /// Write the backup a restore owes, holding the newest version, once its delivery has won
@@ -890,6 +912,32 @@ impl Signer {
 /// version removed comes from its `removed` and the records, and one no version listed would
 /// only grow the records, and a move's enrollment with them, on a switch's word (Switch wire
 /// 3.7, 7.4.12).
+/// Where the switch's copy stands against a backup's version, once a restore has checked it
+/// (Switch wire 3.13 "Restoring").
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchCopy {
+    /// It is the backup's version.
+    AtBackup,
+    /// It is the version the backup's builds on, `prev`, or none under a first version: the
+    /// backup's version is delivered first.
+    Before(Option<[u8; 32]>),
+    /// It is a later version with the backup's content, which the restore builds on.
+    RacedPast(Box<IdentityDoc>),
+}
+
+/// Whether `copy` is a version past `backed_up` with its content, changed only in `version`
+/// and `signer`: what a delivery that races another signer carries (a restore's own version,
+/// a take-over's first, an abort, a take-back), and the only kind of version delivered before
+/// its backup is written (Switch wire 3.13 "When it is written"). Once its install is lost
+/// with the backup still owed, the backup before it is the newest there is, and it holds the
+/// same records.
+fn raced_past(copy: &IdentityDoc, backed_up: &IdentityDoc) -> bool {
+    let mut body = copy.body().clone();
+    body.version = backed_up.version();
+    body.signer = backed_up.body().signer;
+    copy.version() > backed_up.version() && body == *backed_up.body()
+}
+
 pub(super) fn removed_at_switch<'a>(
     apps: &'a AppsAnswer,
     version: &'a IdentityDoc,

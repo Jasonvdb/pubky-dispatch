@@ -17,8 +17,8 @@ use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::records::{
-    IDENTITY_PATH, IdentityDoc, Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
-    app_record_path,
+    IDENTITY_PATH, IdentityBody, IdentityDoc, Limits, SIGNER_BACKUP_PATH, SignerBackup,
+    SignerRecords, app_record_path,
 };
 use pubky_switch_signer::{
     Alert, CertChange, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
@@ -172,22 +172,109 @@ async fn test_restore_delivers_the_backups_version_first_when_the_switch_is_befo
 
 #[tokio::test]
 async fn test_restore_refuses_a_stale_backup() {
-    // Another install delivered a newer version since the backup: the switch is past it.
+    // The switch holds, and the Homeserver publishes, another version the backup doesn't: one
+    // past it with other content, or another install's at the backup's own version.
+    let changed: [fn(&mut IdentityBody); 2] = [
+        |body| {
+            body.version = 2;
+            body.signer = [7; 16];
+            body.record_max_age = Some(60);
+        },
+        |body| body.signer = [7; 16],
+    ];
+    for change in changed {
+        let world = World::new();
+        let (old, _) = world.enrolled().await;
+        let first = old.identity_doc().unwrap().unwrap();
+        drop(old);
+        let mut body = first.body().clone();
+        change(&mut body);
+        let other = IdentityDoc::sign(&world.key, body).unwrap();
+        world.switch.deliver_identity(&other).unwrap();
+        world
+            .homeserver
+            .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+        assert_eq!(
+            restored(&world).await.unwrap_err(),
+            SignerError::Refused(Refusal::StaleBackup)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_restore_builds_on_restores_lost_before_their_backups() {
+    // Two installs in turn restore, win, fail to write their backups and are lost: the backup
+    // still holds the first version, and the switch the second one's own version, with the
+    // same content. A third restore builds on that version, and the first install, opened
+    // again, finds the third signing.
     let world = World::new();
-    let (old, _) = world.enrolled().await;
-    let first = old.identity_doc().unwrap().unwrap();
+    let (mut old, memory) = world.enrolled().await;
+    two_joined(&world, &mut old).await;
+    let backed_up = world.backup().identity_doc().clone();
     drop(old);
-    let mut body = first.body().clone();
-    body.version = 2;
-    body.signer = [7; 16];
-    world
-        .switch
-        .deliver_identity(&IdentityDoc::sign(&world.key, body).unwrap())
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    for _ in 0..2 {
+        let lost = restored(&world).await.unwrap();
+        assert!(lost.alerts().contains(&Alert::BackupNotWritten));
+    }
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let raced = world.switch.identity_doc().unwrap();
+    assert_eq!(raced.version(), backed_up.version() + 2);
+    assert_eq!(world.backup().identity_doc().signed(), backed_up.signed());
+    assert_eq!(world.published().unwrap().signed(), raced.signed());
+    let mut signer = restored(&world).await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.version(), raced.version() + 1);
+    assert_eq!(doc.body().signer, signer.install_id());
+    assert_eq!(doc.body().apps, backed_up.body().apps);
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    assert_eq!(world.published().unwrap().signed(), doc.signed());
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+    signer.set_record_max_age(Some(60)).await.unwrap();
+    let mut old = Signer::open(world.env(memory), world.keyring())
+        .await
         .unwrap();
     assert_eq!(
-        restored(&world).await.unwrap_err(),
-        SignerError::Refused(Refusal::StaleBackup)
+        old.set_record_max_age(Some(120)).await.unwrap_err(),
+        SignerError::NotNamed {
+            install: signer.install_id()
+        }
     );
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_restore_in_place_builds_on_a_restore_lost_before_its_backup() {
+    // Another install restored, won and was lost before its backup was written: the install
+    // it took over from, still holding the backup's version, restores in place on that one's
+    // version and signs again.
+    let world = World::new();
+    let (old, memory) = world.enrolled().await;
+    let install = old.install_id();
+    drop(old);
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    let lost = restored(&world).await.unwrap();
+    let lost_install = lost.install_id();
+    drop(lost);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let raced = world.switch.identity_doc().unwrap();
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        signer.set_record_max_age(Some(60)).await.unwrap_err(),
+        SignerError::NotNamed {
+            install: lost_install
+        }
+    );
+    let doc = signer.restore(confirmed()).await.unwrap();
+    assert_eq!(doc.version(), raced.version() + 1);
+    assert_eq!(doc.body().signer, install);
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    signer.set_record_max_age(Some(60)).await.unwrap();
+    world.assert_no_version_sent_twice();
 }
 
 #[tokio::test]

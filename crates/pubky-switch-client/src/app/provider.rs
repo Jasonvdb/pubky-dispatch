@@ -465,13 +465,17 @@ impl App {
         .await
     }
 
-    /// The own service's public read of `identity.json` (Switch wire 7.4.15), the one place
-    /// the app makes it. The read binds no header and no timestamp, so every answer the
-    /// service ever gave it verifies at any time (Switch wire 7.1 "Identical requests"): a
-    /// freeze it shows may be one an unfreeze has cancelled since, and a freeze it lacks, its
-    /// `404` or any other status say nothing about the account now. So nothing it shows is
-    /// acted on: a freeze or a `404` makes the app ask [`App::service_freeze`], and a freeze
-    /// that answer carries is noted. A read that shows neither leaves everything as it was.
+    /// The public read of `identity.json` (Switch wire 7.4.15) at the service the app
+    /// follows, the one place the app makes it there; the next service's, while a move waits
+    /// to be published, gives only the `identity.json` it shows, taken by its version
+    /// ([`App::move_published`]). The read binds no header and no timestamp, so every answer
+    /// the service ever gave it verifies at any time (Switch wire 7.1 "Identical requests"):
+    /// a freeze it shows may be one an unfreeze has cancelled since, and a freeze it lacks,
+    /// its `404` or any other status say nothing about the account now. So nothing it shows
+    /// is acted on: a freeze or a `404` makes the app ask [`App::service_freeze`], and a
+    /// freeze that answer carries is noted. So does any answer the pinned key signed while
+    /// the erasure wait runs: the signed read's answer, if it verifies, starts the wait over
+    /// (Switch spec 12.7). Otherwise a read leaves everything as it was.
     ///
     /// # Errors
     ///
@@ -479,10 +483,12 @@ impl App {
     /// identity the service doesn't host included; as [`App::note_freeze`].
     async fn follow_public_read(&mut self) -> Result<(), AppError> {
         let result = self.client.public_identity().await;
+        let erasing = self.state.erasing.is_some();
         match self.take_unbound(result).await {
-            Ok(public) if public.freeze.is_none() => return Ok(()),
-            Ok(_) => {}
+            Ok(public) if public.freeze.is_some() || erasing => {}
+            Ok(_) => return Ok(()),
             Err(AppError::Switch(error)) if error.is_not_hosted() => {}
+            Err(AppError::Switch(ClientError::Switch { .. })) if erasing => {}
             Err(error) => return Err(error),
         }
         if let Some(freeze) = self.service_freeze().await? {

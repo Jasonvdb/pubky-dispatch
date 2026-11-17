@@ -674,6 +674,73 @@ async fn test_public_read_replayed_from_an_aborted_move_starts_none() {
     assert_eq!(app.cursor().generation, 1);
 }
 
+/// Each way the own feed's signed page with no items can fail: no answer, an answer the
+/// pinned key didn't sign, a `503` and a `429`.
+fn failed_signed_reads() -> Vec<Fault> {
+    let path = || "limit=0".to_owned();
+    vec![
+        Fault::Unanswered {
+            path: path(),
+            after: 0,
+        },
+        Fault::SignWith {
+            path: path(),
+            secret: [42; 32],
+        },
+        Fault::Error {
+            path: path(),
+            code: ErrorCode::Unavailable,
+            current: serde_json::Value::Null,
+        },
+        Fault::Error {
+            path: path(),
+            code: ErrorCode::RateLimited,
+            current: serde_json::Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn test_public_read_failed_signed_read_decides_nothing() {
+    // A signed read that fails shows neither a freeze nor its absence: a move waiting to be
+    // published, though since cancelled, isn't given up, and one the public read shows isn't
+    // started; the next check asks again and decides (Switch spec 12.5).
+    for fault in failed_signed_reads() {
+        let w = World::new();
+        let router = Router::of(&w);
+        let (mut app, freeze, _, _) = waiting_for_the_move(&w, &router).await;
+        w.switch.unfreeze(&freeze).unwrap();
+        w.switch.fail_next(fault.clone());
+        assert_eq!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::AwaitingMove { next_generation: 2 },
+            "{fault:?}"
+        );
+        assert!(holds_a_move(&app).await, "{fault:?}");
+        assert_eq!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::MoveCancelled,
+            "{fault:?}"
+        );
+
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let n_key = next_key();
+        w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+        router.add(NEXT, &w.switch.import_into(n_key.to_bytes()));
+        w.switch.fail_next(fault.clone());
+        let checked = app.check_for_move().await;
+        assert!(checked.is_err(), "{fault:?}: {checked:?}");
+        assert!(!holds_a_move(&app).await, "{fault:?}");
+        assert_eq!(
+            app.check_for_move().await.unwrap(),
+            ProviderStatus::AwaitingMove { next_generation: 2 },
+            "{fault:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_move_import_conflict_is_reported_and_the_move_goes_on() {
     let w = World::new();
@@ -2487,8 +2554,8 @@ async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
 #[tokio::test]
 async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
     // An answer to the public read verifies at any time, an earlier one sent again included,
-    // so it shows no account alive now: the wait goes on (Switch spec 12.7, wire 7.1
-    // "Identical requests").
+    // so it shows no account alive now: the wait goes on until a signed read answers (Switch
+    // spec 12.7, wire 7.1 "Identical requests").
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
@@ -2505,6 +2572,11 @@ async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
     replay_public_read(&w, &router, before);
     let _ = app.check_for_move().await;
     assert_eq!(app.state.erasing, erasing);
+    // The account answers again: the public read, replayed still, makes the app ask the own
+    // feed, whose signed answer ends the wait.
+    w.switch.lock().not_hosted_unpinned = false;
+    let _ = app.check_for_move().await;
+    assert_eq!(app.state.erasing, None);
 }
 
 #[tokio::test]

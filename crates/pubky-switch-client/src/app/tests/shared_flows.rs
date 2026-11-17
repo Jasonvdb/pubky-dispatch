@@ -8302,16 +8302,7 @@ async fn record_job_stops_at_a_later_delete(base: JobBase) {
     let deleted = phone.delete_record(&target, vec![]).await.unwrap();
     let report = wallet.flush_outbox().await.unwrap();
     assert!(report.queued.is_empty(), "{base:?}: {report:?}");
-    let stopped = async |wallet: &mut App| -> Vec<AppEvent> {
-        wallet
-            .unacknowledged_events()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|e| matches!(e, AppEvent::RecordJobStopped { .. }) && e.is_duty())
-            .collect()
-    };
-    let told = stopped(&mut wallet).await;
+    let told = record_jobs_stopped(&mut wallet).await;
     assert!(
         matches!(
             told.as_slice(),
@@ -8326,7 +8317,11 @@ async fn record_job_stops_at_a_later_delete(base: JobBase) {
     assert!(at_switch.state.deleted, "{base:?}: nothing written over it");
     assert_eq!(at_switch.state.version, deleted.version, "{base:?}");
     wallet.flush_outbox().await.unwrap();
-    assert_eq!(stopped(&mut wallet).await.len(), 1, "{base:?}: told once");
+    assert_eq!(
+        record_jobs_stopped(&mut wallet).await.len(),
+        1,
+        "{base:?}: told once"
+    );
 }
 
 #[tokio::test]
@@ -8342,6 +8337,191 @@ async fn test_send_record_job_queued_on_a_delete_stops_at_a_later_delete() {
 #[tokio::test]
 async fn test_send_record_job_queued_on_nothing_stops_at_a_later_delete() {
     Box::pin(record_job_stops_at_a_later_delete(JobBase::Nothing)).await;
+}
+
+/// The record job's duty events not yet acknowledged that stopped it.
+async fn record_jobs_stopped(app: &mut App) -> Vec<AppEvent> {
+    app.unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, AppEvent::RecordJobStopped { .. }) && e.is_duty())
+        .collect()
+}
+
+/// A record job queued on a value, its first try made with the switch acting as `fault`
+/// says; returns the wallet, the phone, the record key, the message ID and the batch the
+/// try left kept.
+async fn record_job_left_kept(
+    s: &Setup,
+    target: &RecordTarget,
+    fault: Fault,
+) -> (App, App, [u8; 32], String, [u8; 16]) {
+    let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let key = wallet.record_key(target).unwrap();
+    wallet
+        .put_record(target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    // A first message adds the conversation, so the fault below meets the record job.
+    wallet.send(s.note("first")).await.unwrap();
+    let mut message = s.note("hello");
+    message.record = Some(RecordJob {
+        target: target.clone(),
+        tag: b"sent".to_vec(),
+    });
+    s.w.switch.fail_next(fault);
+    let (msg_id, delivery) = wallet.send(message).await.unwrap();
+    assert!(accepted(&delivery), "{delivery:?}");
+    let kept = wallet.kept_batches().await.unwrap();
+    let [(batch_id, _)] = kept.as_slice() else {
+        panic!("{kept:?}")
+    };
+    let batch_id = *batch_id;
+    (wallet, phone, key, msg_id, batch_id)
+}
+
+/// The record job's first try applies, its answer lost; the phone reads it, then writes
+/// the record again: a delete, or a value without the message (`delete`). The wallet reads,
+/// which settles the kept batch as applied, and flushes. The job's write is made, so the
+/// job is done: it isn't stopped, and nothing is written again over the phone's write.
+async fn record_job_applied_before_a_later_write(delete: bool) {
+    let s = Setup::new();
+    let target = s.target("bob");
+    let (mut wallet, mut phone, key, msg_id, _) =
+        record_job_left_kept(&s, &target, Fault::LoseAnswer { path: "ops".into() }).await;
+    read_on(&mut phone).await;
+    let written = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        written.content.value(),
+        Some(value(&["a", msg_id.as_str()]).as_slice())
+    );
+    let later = if delete {
+        phone.delete_record(&target, vec![]).await.unwrap()
+    } else {
+        phone
+            .put_record(&target, &value(&["p"]), vec![])
+            .await
+            .unwrap()
+    };
+    wallet.receive(None).await.unwrap();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.is_empty(), "{report:?}");
+    let told = record_jobs_stopped(&mut wallet).await;
+    assert!(told.is_empty(), "delete {delete}: {told:?}");
+    let at_switch = s.w.switch.lock().shared.records.get(&key).cloned().unwrap();
+    assert_eq!(at_switch.state.version, later.version, "delete {delete}");
+    assert_eq!(at_switch.state.deleted, delete);
+}
+
+#[tokio::test]
+async fn test_send_record_job_applied_before_a_later_delete_is_done() {
+    Box::pin(record_job_applied_before_a_later_write(true)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_applied_before_a_later_put_is_done() {
+    Box::pin(record_job_applied_before_a_later_write(false)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_waits_while_its_try_is_still_kept() {
+    // The job's first try applies, its answer lost; the phone deletes the record, and the
+    // wallet takes the delete by reading that record alone, its kept batch still kept. A
+    // flush that can't send the batch again doesn't stop the job, whose write may yet show
+    // as applied; the next flush settles the batch as applied, and the job is done.
+    let s = Setup::new();
+    let target = s.target("bob");
+    let (mut wallet, mut phone, key, _, batch_id) =
+        record_job_left_kept(&s, &target, Fault::LoseAnswer { path: "ops".into() }).await;
+    read_on(&mut phone).await;
+    let deleted = phone.delete_record(&target, vec![]).await.unwrap();
+    wallet.read_record(&target).await.unwrap();
+    let unavailable = || Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    };
+    for _ in 0..4 {
+        s.w.switch.fail_next(unavailable());
+    }
+    let report = wallet.flush_outbox().await.unwrap();
+    s.w.switch.lock().faults.clear();
+    assert_eq!(report.queued.len(), 1, "{report:?}");
+    assert!(record_jobs_stopped(&mut wallet).await.is_empty());
+    assert!(matches!(
+        wallet.kept_batch(batch_id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Kept { .. })
+    ));
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.is_empty(), "{report:?}");
+    let told = record_jobs_stopped(&mut wallet).await;
+    assert!(told.is_empty(), "{told:?}");
+    let at_switch = s.w.switch.lock().shared.records.get(&key).cloned().unwrap();
+    assert!(at_switch.state.deleted);
+    assert_eq!(at_switch.state.version, deleted.version);
+}
+
+/// The record job's first try is never answered and never applied; the phone deletes the
+/// record. With `past` the wallet reads only past the window in which a resend tells, so
+/// the batch is dropped with its fate unknown; without, the read sends it again and the
+/// switch refuses it. The flush stops the job: the protocol is told the batch only while it
+/// may have applied.
+async fn record_job_unapplied_stops_at_a_delete(past: bool) {
+    let s = Setup::new();
+    let target = s.target("bob");
+    let (mut wallet, mut phone, key, msg_id, batch_id) = record_job_left_kept(
+        &s,
+        &target,
+        Fault::Unanswered {
+            path: "ops".into(),
+            after: 0,
+        },
+    )
+    .await;
+    if past {
+        s.w.clock
+            .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    }
+    read_on(&mut phone).await;
+    let deleted = phone.delete_record(&target, vec![]).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    let status = wallet.kept_batch(batch_id).await.unwrap();
+    assert!(
+        matches!(
+            status,
+            Some(crate::app::KeptBatchStatus::Dropped { ref reason, .. })
+                if matches!(reason, crate::app::KeptBatchDrop::Uncertain) == past
+        ),
+        "past {past}: {status:?}"
+    );
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.is_empty(), "{report:?}");
+    let told = record_jobs_stopped(&mut wallet).await;
+    let named = past.then_some(batch_id);
+    assert!(
+        matches!(
+            told.as_slice(),
+            [AppEvent::RecordJobStopped { msg_id: m, key: k, version, batch_id, .. }]
+                if *m == msg_id && *k == key && *version == deleted.version.version
+                    && *batch_id == named
+        ),
+        "past {past}: {told:?}"
+    );
+    let at_switch = s.w.switch.lock().shared.records.get(&key).cloned().unwrap();
+    assert!(at_switch.state.deleted);
+    assert_eq!(at_switch.state.version, deleted.version);
+}
+
+#[tokio::test]
+async fn test_send_record_job_refused_try_stops_naming_no_batch() {
+    Box::pin(record_job_unapplied_stops_at_a_delete(false)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_unknown_try_stops_naming_its_batch() {
+    Box::pin(record_job_unapplied_stops_at_a_delete(true)).await;
 }
 
 #[tokio::test]

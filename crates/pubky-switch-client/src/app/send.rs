@@ -25,9 +25,10 @@
 //!    [`SENT_RETENTION_MS`] after the message's first acceptance, such as one whose held
 //!    value waits for a key that never comes, is given up, and the protocol told
 //!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever. A
-//!    job never writes over a delete its protocol hasn't seen: when the app takes a delete
-//!    of the record that the job wasn't queued against, the job stops and the protocol is
-//!    told ([`AppEvent::RecordJobStopped`]), to decide again.
+//!    job whose earlier try left a batch kept settles it first: once it applied, the job is
+//!    done. A job never writes over a delete its protocol hasn't seen: when the app takes a
+//!    delete of the record that the job wasn't queued against, the job stops and the
+//!    protocol is told ([`AppEvent::RecordJobStopped`]), to decide again.
 //!
 //! The acceptance is committed as soon as the append is answered, before anything else is
 //! done with the answer, so a crash never sends the same bytes again: with it the message
@@ -743,8 +744,10 @@ pub(crate) struct OutboxItem {
     /// the deadline too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
-    /// The batch a try of the record job left kept, the latest one, in base64: named when
-    /// the job is given up ([`AppEvent::RecordJobDropped`]), as it may still apply.
+    /// The batch a try of the record job left kept, the latest one, in base64: settled
+    /// before the next try, and named when the job is given up
+    /// ([`AppEvent::RecordJobDropped`]) or stopped ([`AppEvent::RecordJobStopped`]) while it
+    /// may have applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record_batch: Option<String>,
 }
@@ -2508,7 +2511,18 @@ impl App {
                 self.drop_record_job(item).await?;
                 return Ok(false);
             }
-            match self.record_job(&item, &job).await {
+            // The batch an earlier try left kept is settled first: once it applied, the
+            // job's write is made, and a later write of the record is another writer's,
+            // which the protocol sees in the record.
+            let tried = match self.settle_job_batch(&mut item).await? {
+                JobBatch::Applied => Ok(None),
+                JobBatch::Waits => {
+                    self.save_item(&item).await?;
+                    return Ok(false);
+                }
+                JobBatch::NotApplied | JobBatch::Unknown => self.record_job(&item, &job).await,
+            };
+            match tried {
                 Ok(None) => item.record_done = true,
                 Ok(Some(deleted)) => {
                     self.stop_record_job(&mut item, &job, deleted).await?;
@@ -2668,10 +2682,47 @@ impl App {
         self.commit(tx).await
     }
 
+    /// What became of the batch the latest try of `item`'s record job left kept
+    /// (`item.record_batch`): a batch still kept is sent again first, in the order of the
+    /// kept batches, and waits when that doesn't settle it. One known never applied is
+    /// cleared from `item`, so a stop names only a batch that may have applied.
+    async fn settle_job_batch(&mut self, item: &mut OutboxItem) -> Result<JobBatch, AppError> {
+        use super::{KeptBatchDrop, KeptBatchStatus};
+        let Some(named) = &item.record_batch else {
+            return Ok(JobBatch::NotApplied);
+        };
+        let id = pubky_switch_core::enc::unb64_array::<16>(named)
+            .map_err(|_| AppError::Store(StoreError::Corrupt))?;
+        let mut status = self.kept_batch(id).await?;
+        if matches!(status, Some(KeptBatchStatus::Kept { .. })) {
+            match self
+                .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
+                .await
+            {
+                Err(error) if is_local(&error) => return Err(error),
+                Err(error) => item.last_error = Some(error.to_string()),
+                Ok(_) => {}
+            }
+            status = self.kept_batch(id).await?;
+        }
+        Ok(match status {
+            Some(KeptBatchStatus::Applied { .. }) => JobBatch::Applied,
+            Some(KeptBatchStatus::Kept { .. }) => JobBatch::Waits,
+            Some(KeptBatchStatus::Dropped {
+                reason: KeptBatchDrop::Refused { .. } | KeptBatchDrop::Unsent,
+                ..
+            }) => {
+                item.record_batch = None;
+                JobBatch::NotApplied
+            }
+            Some(KeptBatchStatus::Dropped { .. }) | None => JobBatch::Unknown,
+        })
+    }
+
     /// Stop the record job of `item` at `deleted`, a delete of its record the job wasn't
     /// queued against ([`App::record_job`]): in one commit with
-    /// [`AppEvent::RecordJobStopped`], which names the record and the delete, so the
-    /// protocol decides again.
+    /// [`AppEvent::RecordJobStopped`], which names the record, the delete, and the batch an
+    /// earlier try left kept whose fate isn't known, so the protocol decides again.
     async fn stop_record_job(
         &mut self,
         item: &mut OutboxItem,
@@ -2692,6 +2743,7 @@ impl App {
                 key,
                 generation: deleted.generation,
                 version: deleted.version,
+                batch_id: item.record_batch.clone(),
             },
         )?;
         self.commit(tx).await
@@ -3146,6 +3198,19 @@ impl App {
             super::records::Updated::Stopped { deleted, .. } => Some(deleted),
         })
     }
+}
+
+/// What became of the batch a try of a record job left kept ([`App::settle_job_batch`]).
+enum JobBatch {
+    /// Applied: the job's write is made.
+    Applied,
+    /// Still kept after a send that didn't settle it: the job waits for a later flush.
+    Waits,
+    /// None was kept, or the one kept was never applied.
+    NotApplied,
+    /// Its fate can't be known any more: dropped after a send that wasn't answered, or
+    /// ended before a restore or longer ago than the store keeps.
+    Unknown,
 }
 
 /// What one try of a delivery came to.

@@ -654,7 +654,9 @@ impl SwitchClient {
     /// `401`, among them `stale_timestamp`, a `429` before authentication, a first call
     /// nothing verified, and the `503` of an account behind its key's mark; to an app of
     /// another identity, which is shown no head, every refusal. They count for nothing
-    /// here, and so does a `stale_timestamp`'s `current.server_time`.
+    /// here, and so does a `stale_timestamp`'s `current.server_time`. Nor does any answer to
+    /// the public read, which may be an earlier one sent again (Switch wire 7.1 "Identical
+    /// requests").
     pub fn last_server_time(&self) -> Option<u64> {
         *self
             .last_server_time
@@ -753,9 +755,15 @@ impl SwitchClient {
             Err(_) => None,
         };
         let time = match checked {
+            // The public read binds no request, so its answer may be an earlier one sent again
+            // (Switch wire 7.1 "Identical requests"): its time is no latest time.
             _ if matches!(
                 class,
-                Some(http::Uncompared::AccountDiscovery | http::Uncompared::CreationConflict)
+                Some(
+                    http::Uncompared::AccountDiscovery
+                        | http::Uncompared::CreationConflict
+                        | http::Uncompared::PublicRead
+                )
             ) =>
             {
                 None

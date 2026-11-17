@@ -6,8 +6,10 @@
 //! crash resumes at the step it stopped in (`STATE.md`, "Moves, recovery and push"):
 //!
 //! - **A cooperative move** (Switch spec 12.5). The app learns of the freeze from a feed
-//!   page, a `410 moved` answer or the public read of `identity.json`, verifies it with the
-//!   identity key, and pins the next service's key it names. It reads the old feed to its
+//!   page or a `410 moved` answer, verifies it with the identity key, and pins the next
+//!   service's key it names. The public read of `identity.json` binds no request, so an
+//!   earlier answer sent again verifies too: a freeze it shows, or its `404`, only makes the
+//!   app read a feed page, and a freeze it lacks shows nothing. It reads the old feed to its
 //!   end, checking the chain only: the frozen service takes no write, so nothing there is
 //!   processed, and the next service shows the same items again. It uploads its newest head
 //!   and the evidence it keeps to the staged next service, presenting its certificate. Once
@@ -16,7 +18,7 @@
 //!   the chain under the next generation. It reads its own entry in the next directory,
 //!   re-registers its record and current receive key at the new generation, uploads the old
 //!   service's proofs again, and compares the admission lists with its own copy. A
-//!   cancelled freeze (the old service's public read carries none) ends the move.
+//!   cancelled freeze (the old service's feed page carries none) ends the move.
 //! - **A key change in place**, or a move the app never saw frozen, is followed the same way
 //!   from the switch on.
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
@@ -412,8 +414,9 @@ impl App {
     }
 
     /// Ask the own service's public read of `identity.json` whether the account is frozen
-    /// (Switch wire 7.4.15), and follow a move it shows. The freeze is verified with the
-    /// identity key.
+    /// (Switch wire 7.4.15), and follow a move the service confirms. The read is only a
+    /// reason to ask: what it shows is asked again with a page of the own feed, read with a
+    /// request the app signs, and only that answer is acted on.
     ///
     /// # Errors
     ///
@@ -428,57 +431,93 @@ impl App {
                 // `gone` stops every read: nothing is asked.
                 return self.follow_provider().await;
             }
-            let result = self.client.public_identity().await;
-            let public = match self.take(result).await {
-                Ok(public) => public,
-                // An answer the pinned key didn't sign is looked into as at a read: a try
-                // of the erasure wait counts here too (Switch spec 12.7).
-                // The service's signed word that it doesn't host the identity is looked into
-                // the same way (Switch spec 12.7 step 5), but only from an answer to a
-                // request the app signed: the public read binds no timestamp, so its `404`
-                // verifies at any time (Switch wire 7.1 "Identical requests"). A page of no
-                // items asks.
-                Err(AppError::Switch(public)) if public.is_not_hosted() => {
-                    let signed = self
-                        .client
-                        .feed(FeedQuery {
-                            after: None,
-                            limit: Some(0),
-                            wait: None,
-                        })
-                        .await;
-                    let error = match self.take(signed).await {
-                        Err(AppError::Switch(error)) if error.is_not_hosted() => error,
-                        // Hosted after all, or no word: the read fails as it came.
-                        Ok(_) => return Err(AppError::Switch(public)),
-                        Err(error) => return Err(error),
-                    };
+            let error = match self.follow_public_read().await {
+                Ok(()) => return self.follow_provider().await,
+                Err(error) => error,
+            };
+            match error {
+                // The service's signed word that it doesn't host the identity, given to a
+                // request the app signed (Switch spec 12.7 step 5).
+                AppError::Switch(error) if error.is_not_hosted() => {
                     self.reload_now().await?;
-                    return match self.not_hosted().await? {
+                    match self.not_hosted().await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
                         Unknown::Moved => self.follow_provider().await,
                         Unknown::Waiting(_) | Unknown::Unexplained => Err(AppError::Switch(error)),
-                    };
+                    }
                 }
-                Err(error @ AppError::Switch(ClientError::BadServiceSignature { status })) => {
+                // An answer the pinned key didn't sign is looked into as at a read: a try
+                // of the erasure wait counts here too (Switch spec 12.7).
+                error @ AppError::Switch(ClientError::BadServiceSignature { status }) => {
                     self.reload_now().await?;
-                    return match self.unknown_account(status).await? {
+                    match self.unknown_account(status).await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
                         Unknown::Moved => self.follow_provider().await,
                         Unknown::Waiting(since_ms) => {
                             Err(AppError::NotAnsweringAsAccount { since_ms })
                         }
                         Unknown::Unexplained => Err(error),
-                    };
+                    }
                 }
-                Err(error) => return Err(error),
-            };
-            if let Some(freeze) = &public.freeze {
-                self.note_freeze(freeze).await?;
+                error => Err(error),
             }
-            self.follow_provider().await
         })
         .await
+    }
+
+    /// The public read of `identity.json` (Switch wire 7.4.15) at the service the app
+    /// follows, the one place the app makes it there; the next service's, while a move waits
+    /// to be published, gives only the `identity.json` it shows, taken by its version
+    /// ([`App::move_published`]). The read binds no header and no timestamp, so every answer
+    /// the service ever gave it verifies at any time (Switch wire 7.1 "Identical requests"):
+    /// a freeze it shows may be one an unfreeze has cancelled since, and a freeze it lacks,
+    /// its `404` or any other status say nothing about the account now. So nothing it shows
+    /// is acted on: a freeze or a `404` makes the app ask [`App::service_freeze`], and a
+    /// freeze that answer carries is noted. So does any answer the pinned key signed while
+    /// the erasure wait runs: the signed read's answer, if it verifies, starts the wait over
+    /// (Switch spec 12.7). Otherwise a read leaves everything as it was.
+    ///
+    /// # Errors
+    ///
+    /// The public read's failure, except its `404`; the signed read's, its `404` of an
+    /// identity the service doesn't host included; as [`App::note_freeze`].
+    async fn follow_public_read(&mut self) -> Result<(), AppError> {
+        let result = self.client.public_identity().await;
+        let erasing = self.state.erasing.is_some();
+        match self.take_unbound(result).await {
+            Ok(public) if public.freeze.is_some() || erasing => {}
+            Ok(_) => return Ok(()),
+            Err(AppError::Switch(error)) if error.is_not_hosted() => {}
+            Err(AppError::Switch(ClientError::Switch { .. })) if erasing => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(freeze) = self.service_freeze().await? {
+            self.note_freeze(&freeze).await?;
+        }
+        Ok(())
+    }
+
+    /// The freeze the own service holds the account under now, `None` when it holds it
+    /// under none: from a page of the own feed with no items, read with a request the app
+    /// signs, so the answer binds that request and is the service's word now (Switch wire
+    /// 7.1), and a frozen account's page carries its freeze (Switch wire 7.3 step 8). A
+    /// decision on the account's current state that the public read could suggest, a move
+    /// to follow or one cancelled, is taken from here.
+    ///
+    /// # Errors
+    ///
+    /// The read's, among them the signed `404` of an identity the service doesn't host
+    /// (Switch wire 7.3 step 2).
+    async fn service_freeze(&mut self) -> Result<Option<Freeze>, AppError> {
+        let page = self
+            .client
+            .feed(FeedQuery {
+                after: None,
+                limit: Some(0),
+                wait: None,
+            })
+            .await;
+        Ok(self.take(page).await?.freeze)
     }
 
     // ---------------------------------------------------------------------------------
@@ -759,9 +798,9 @@ impl App {
         Ok(self.run_move(mv).await?.unwrap_or(ProviderStatus::Current))
     }
 
-    /// A freeze from a feed page, a `410 moved` or the public read, verified with the
-    /// identity key by whoever read it (Switch wire 3.6): kept, so the move is followed. A
-    /// freeze the app followed already is ignored; one that skips a generation is refused.
+    /// A freeze from a feed page or a `410 moved`, verified with the identity key by whoever
+    /// read it (Switch wire 3.6): kept, so the move is followed. A freeze the app followed
+    /// already is ignored; one that skips a generation is refused.
     pub(crate) async fn note_freeze(&mut self, freeze: &Freeze) -> Result<(), AppError> {
         let generation = self.state.meta.generation;
         if freeze.body().identity != self.state.meta.identity {
@@ -1133,15 +1172,14 @@ impl App {
         Ok(self.state.own_doc.generation() >= next_generation)
     }
 
-    /// Whether the freeze was cancelled: the old service's public read carries no freeze
-    /// any more (Switch spec 12.5 "Abort", Switch wire 7.4.15). The move record goes; a
-    /// newer freeze the read shows replaces it.
+    /// Whether the freeze was cancelled: the old service holds the account under no freeze
+    /// any more, by its signed word now ([`App::service_freeze`]; Switch spec 12.5 "Abort").
+    /// The move record goes; another freeze it holds the account under replaces it.
     async fn move_cancelled(&mut self, freeze: &Freeze) -> Result<bool, AppError> {
-        let result = self.client.public_identity().await;
-        let Ok(public) = self.take(result).await else {
+        let Ok(now) = self.service_freeze().await else {
             return Ok(false);
         };
-        match public.freeze {
+        match now {
             Some(shown) if shown.hash() == freeze.hash() => Ok(false),
             Some(shown) => {
                 let mut tx = self.tx()?;

@@ -66,7 +66,18 @@ async fn gap_after_restore(world: &World) -> FlowResult {
     Box::pin(listing_and_gap(world, true)).await
 }
 
-async fn listing_and_gap(world: &World, restore: bool) -> FlowResult {
+struct WaitingListing {
+    wallet: App,
+    signer: Signer,
+    tasks: Arc<TestProtocol>,
+    chat: Arc<TestProtocol>,
+    listed: Arc<ListedProtocol>,
+}
+
+async fn wait_for_listing(
+    world: &World,
+    restore: bool,
+) -> Result<Box<WaitingListing>, Box<dyn std::error::Error>> {
     use crate::flows::recovery::{RECOVERY_ORIGIN, SENDERS_ORIGIN};
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
@@ -190,16 +201,27 @@ async fn listing_and_gap(world: &World, restore: bool) -> FlowResult {
             "the independent protocol advances"
         );
     }
-    Box::pin(alice_signer.run_due()).await?;
+    Ok(Box::new(WaitingListing {
+        wallet,
+        signer: alice_signer,
+        tasks,
+        chat,
+        listed,
+    }))
+}
+
+async fn listing_and_gap(world: &World, restore: bool) -> FlowResult {
+    let mut waiting = Box::pin(wait_for_listing(world, restore)).await?;
+    Box::pin(waiting.signer.run_due()).await?;
     for _ in 0..4 {
-        Box::pin(wallet.receive(None)).await?;
+        Box::pin(waiting.wallet.receive(None)).await?;
     }
-    assert!(wallet.scope_key(2, TASKS).is_some());
-    assert!(!wallet.listing_owed().await?);
-    assert_eq!(tasks.received().len(), 1);
-    assert_eq!(chat.received().len(), 1);
+    assert!(waiting.wallet.scope_key(2, TASKS).is_some());
+    assert!(!waiting.wallet.listing_owed().await?);
+    assert_eq!(waiting.tasks.received().len(), 1);
+    assert_eq!(waiting.chat.received().len(), 1);
     if restore {
-        assert_eq!(*listed.gaps.lock().unwrap(), [(2, 0)]);
+        assert_eq!(*waiting.listed.gaps.lock().unwrap(), [(2, 0)]);
     }
     Ok(())
 }

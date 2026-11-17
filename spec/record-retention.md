@@ -104,7 +104,7 @@ not an inference about an earlier response, accounts for the named input.
 ## 3. Complete input validation
 
 A record input keeps its exact operation, writer certificate, selected source
-proof and required lineage/origin evidence. Original source document hashes,
+proof, required application descriptor and lineage/origin evidence. Original source document hashes,
 account associations, application references and dates remain unchanged. An app
 may submit a proofless input only when that immutable retained input actually
 has no proof. It cannot strip a proof, omit restrictive material, exchange a
@@ -163,6 +163,13 @@ node must form one coherent source unit. Reusing a proof with another
 certificate or descriptor is not justified by equal operation hash, version
 or lineage ID. A renewed statement may reauthenticate unchanged descriptor
 bytes; it cannot invent a missing association to an older proof.
+When the current source descriptor has acquired later restrictions, the exact
+`application_descriptor` of record lineage 3.1 binds the original proof to its
+certificate-bearing node. The separately authenticated current bundle passes
+that section's immutable/refinement checks. Its restricted plain-proof form
+supplies no original descriptor or positive authority. Missing or invalid
+required material makes the whole input unverified; neither mode supplies a
+missing proof, date, source document or historical node body.
 
 Standalone origins use record origins 7.1's complete bounded part and
 matching-only strengthening rules, with the source range and application
@@ -182,6 +189,11 @@ current upload transition's reference, distinct from its source reference.
 A received source proof is retained with its exact source association where
 needed; it is not a proof of that receiving application. Existing current
 operation/certificate/node/proof tuples stay coherent.
+Their original application descriptor is captured before refinement under
+record lineage 3.1. It is included in exact source capture and whole-input
+identity, not reconstructed from normalized receiving state. A later ordinary
+write may release its predecessor's witness only with the lawful release of
+that proof and all complete-input obligations.
 
 For each input, the final state has one of these dispositions:
 
@@ -358,7 +370,7 @@ exported as retained units.
 ### 6.1 Unit bytes and associations
 
 A unit is the actual UTF-8 bytes of a compact JSON object with these members,
-all required except the two optional members inside `record`:
+all required except the conditional members inside `record`:
 
 | Member | Form |
 |---|---|
@@ -368,7 +380,7 @@ all required except the two optional members inside `record`:
 | `application` | the actual receiving application reference, or null |
 | `source_identity` | the exact checked signed source identity document, or null where ordinary loss processing qualified no source |
 | `source_application` | the exact qualifying identity-delivery proof, or null |
-| `record` | `{ "op": signed record operation, "cert": signed writer certificate, "proof": selected source record proof or null }`, with the source input's optional `lineage` and `origin` members preserved, including present null |
+| `record` | `{ "op": signed record operation, "cert": signed writer certificate, "proof": selected source record proof or null }`, with the source input's optional `lineage` and `origin` members preserved, including present null, and its conditional non-null `application_descriptor` under record lineage 3.1 |
 
 The record proof is the actual checked per-item or bulk-selected proof, not a
 proof invented for the receiving upload. At admission, preserve the source
@@ -383,6 +395,10 @@ and application evidence, not only the operation hash or its export index.
 Receiving `admission`/`application` metadata, a ticket or a fragment index
 does not make another immutable input. A retry therefore cannot consume
 another slot by assigning a new receiving position to the same complete input.
+The application descriptor stays with its exact selected source proof even when
+the receiving current descriptor changes again. A public upload-derived current
+record has neither that source proof nor its application descriptor at top
+level; the primary source unit carries both in their original roles.
 The new-loss projection of Section 5.1 has its own complete input identity;
 its local accounting relation does not merge the original source variants.
 
@@ -533,6 +549,10 @@ After ordinary manifest/chunk authentication, the importer:
    matches the current record's exact operation/certificate, source version
    and receiving reference. Its public record proof stays absent. Ordinary
    written current records retain their operation-chain and proof checks.
+   If a written proof commits an earlier descriptor, activation also requires
+   its exact `record_application_descriptor` part and the immutable/refinement
+   checks of record lineage 3.1. The current receiving descriptor is never a
+   substitute. Unit records apply the same rule within their exact source bytes.
 5. Verifies every active divergent value and every non-current unit's final
    role. An active divergent unit must be a conflicting operation under the
    ordinary comparison rules, not merely another certificate for the current
@@ -576,6 +596,7 @@ local accounting must agree on the disposition.
 | Loss boundary 3, current generation 4, restored valid whole record A from generation 4; current is A | Full validation and retention permits A's index |
 | Same context, current is B, A qualifies under the canonical upload-base or supersession case and every restriction is represented | A's index; no need to retain legitimately obsolete bytes forever |
 | Same context, B alone proves neither A's disposition nor its required restrictive facts | A unaccounted, or valid complete A retained restrictively before its index |
+| An ordinary write clears current divergence, then a later upload conflicts under the original upload-base comparison | Keep the newer current write and account the complete retained divergent input; that later upload can make the view divergent again, even for a proved earlier write of the same generation |
 | Ordinary generation-4 A actually has no proof and no positive origin authority | May be retained unresolved under its lower bound; no clean original or initializer authority |
 | A holds proof P, but upload strips P or substitutes another source/certificate | Cannot account A from that changed input |
 | Exact current applied source, or exact historical applied source authenticated by an authorized generation key | Eligible restrictive source; no ancestry or original-authority inference |
@@ -586,6 +607,18 @@ local accounting must agree on the disposition.
 | Proof after the loss boundary predates a clean move, with both source and current documents authorizing its own generation key | Check its exact original generation and bytes; never label it a proof of the receiving upload |
 | Per-item proof, bulk-selected proof, and no proof | Preserve exactly the selected valid evidence; no borrowing another input's permission or date |
 | Same operation with a different certificate and old node/proof | Reject incoherent recombination; equality of operation hash does not account it |
+| Plain current and plain divergent upload, neither carrying lineage | Keep the current-only proof association; do not create unsupported tracked authority |
+| Plain current plus accepted tracked restrictive evidence | Fully authenticate the conservative reconstruction of record lineage 3.1; preserve the plain proof and grant no original or initializer authority |
+| Clean tracked current acquires recovered restrictions while its operation/proof stay current | Preserve the exact proof-bound application descriptor before refinement, then account a complete later view with both associations |
+| Later capsule addition, truncation or a fifth lawful capsule prunes the oldest full capsule | Keep one application descriptor as metadata; validate the current newest-four closure without retaining another historical value window |
+| Renewed statement for unchanged descriptor, or an ordinary write already committed recovered state | No redundant application descriptor; exact existing proof association remains valid |
+| Missing application descriptor, changed bytes under the old proof, substituted current certificate/node, or changed immutable lineage/origin/initializer facts | Reject the whole incoherent input |
+| Cleared uncertainty, changed same-delete capsule, or removal without the required four newer capsules and truncation | Reject the refinement |
+| Plain proof paired with a clean origin, initialized policy, invented date/predecessor or application descriptor | Reject; plain application evidence cannot create tracked original authority |
+| Repeated refinement, retry, restart and a later ordinary replacement | Preserve one exact witness while its proof is needed; release only under complete final disposition |
+| Another loss with a record proof and application descriptor from the newly lost generation | Preserve both byte-for-byte with the exact source and current restrictive bundle; only the existing identity-delivery projection may remove its separately obsolete proof |
+| Export/import after the application chain body is pruned | Require the exact descriptor part and current op/cert/proof association, independently of current lineage; no historical-node fabrication |
+| A required witness makes the actual complete view, input, source unit or export part exceed its bound | Refuse the whole input with no index; no witness trimming, second capacity pool or larger logical bound |
 | Compatible retired or child-observed standalone origin | Strengthen the same slot and account its own origin index if finally represented |
 | Incompatible immutable slot fact, missing initializer authority or required node | Refuse or mark unverified as specified; no partial input effect or index |
 | Required facts exceed any final view/export/retention cap | Unaccounted; no truncated acknowledgment or cursor completion |

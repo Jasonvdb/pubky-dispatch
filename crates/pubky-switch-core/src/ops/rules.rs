@@ -765,6 +765,20 @@ mod tests {
     }
 
     #[test]
+    fn test_permanent_generation_above_the_integer_range_isnt_signed() {
+        // A writer refuses to sign an `int` above 2^53 - 1 (Switch wire 1.1), the
+        // generation a permanent policy names among them.
+        let update = RecordVersion::new(1, 6);
+        let largest = permanent_body(Some(Some(crate::json::MAX_INT)), 1, update, false);
+        assert!(crate::ops::SignedOp::sign(&app(), largest).is_ok());
+        let above = permanent_body(Some(Some(crate::json::MAX_INT + 1)), 1, update, false);
+        assert!(matches!(
+            crate::ops::SignedOp::sign(&app(), above),
+            Err(Error::Invalid(why)) if why.contains("2^53 - 1")
+        ));
+    }
+
+    #[test]
     fn test_permanent_member_read_strictly() {
         let body = permanent_body(Some(Some(4)), 4, RecordVersion::NONE, false);
         let bytes = body.to_json().unwrap();

@@ -8330,10 +8330,18 @@ async fn record_job_stops_at_a_later_delete(base: JobBase) {
 }
 
 #[tokio::test]
-async fn test_send_record_job_stops_at_a_delete_its_protocol_hasnt_seen() {
-    for base in [JobBase::Value, JobBase::Delete, JobBase::Nothing] {
-        Box::pin(record_job_stops_at_a_later_delete(base)).await;
-    }
+async fn test_send_record_job_queued_on_a_value_stops_at_a_later_delete() {
+    Box::pin(record_job_stops_at_a_later_delete(JobBase::Value)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_queued_on_a_delete_stops_at_a_later_delete() {
+    Box::pin(record_job_stops_at_a_later_delete(JobBase::Delete)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_queued_on_nothing_stops_at_a_later_delete() {
+    Box::pin(record_job_stops_at_a_later_delete(JobBase::Nothing)).await;
 }
 
 #[tokio::test]

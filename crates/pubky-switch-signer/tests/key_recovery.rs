@@ -2080,18 +2080,31 @@ async fn test_key_recovery_leaves_room_for_the_identitys_own_versions() {
 
 #[tokio::test]
 async fn test_key_recovery_over_unusable_records_keeps_their_revocations() {
-    // The user revoked an app and the switch never took it; then the flow record is damaged
-    // and the backup is gone. The readable state's revocation binds the recovery: the app is
-    // removed. A refusal before the recovery's commit leaves the records as found.
+    // The user revoked an app, from a time they picked, and the switch never took it; then
+    // the flow record is damaged and the backup is gone. The readable state binds the
+    // recovery: the app is removed from the picked time, and another app, whose record is
+    // gone, stays with the certificate the state holds. A refusal before the recovery's
+    // commit leaves the records as found.
     let world = World::new();
     let (mut first, memory) = world.enrolled().await;
     let (app, _) = joined(&world, &mut first, 3).await;
+    let (other, _) = joined(&world, &mut first, 5).await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(&app_record_path(&other.keys.app_id_bytes()));
     let id = app.keys.app_id_bytes();
+    let picked = START_MS - 3_600_000;
     world.switch.fail_next(SwitchFault::Unreachable {
         path: "/revoke".into(),
         after: 0,
     });
-    first.revoke(id, None, confirmed()).await.unwrap_err();
+    first
+        .revoke(id, Some(picked), confirmed())
+        .await
+        .unwrap_err();
     drop(first);
     damage_flow(&world, &memory);
     world
@@ -2103,12 +2116,15 @@ async fn test_key_recovery_over_unusable_records_keeps_their_revocations() {
     let shown = survey(&world, &memory).await.unwrap();
     assert_eq!(
         shown.apps,
-        [(
-            id,
-            AppFate::RevocationPending {
-                distrust_from: None
-            }
-        )]
+        [
+            (
+                id,
+                AppFate::RevocationPending {
+                    distrust_from: Some(picked)
+                }
+            ),
+            (other.keys.app_id_bytes(), AppFate::Stays)
+        ]
     );
     let confirm = || {
         RecordsDiscarded::shown_and_confirmed()
@@ -2131,7 +2147,14 @@ async fn test_key_recovery_over_unusable_records_keeps_their_revocations() {
         .unwrap();
     let newest = signer.identity_doc().unwrap().unwrap();
     assert!(newest.listed_cert(&id).is_none());
-    assert!(world.switch.app(&id).revoked_at.is_some());
+    assert!(newest.listed_cert(&other.keys.app_id_bytes()).is_some());
+    let removed: Vec<_> = newest
+        .body()
+        .removed
+        .iter()
+        .map(|r| (r.app_id, r.distrust_from))
+        .collect();
+    assert_eq!(removed, [(id, picked)]);
     signs_on(&world, &mut signer).await;
 }
 

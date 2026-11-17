@@ -1,6 +1,5 @@
-//! Push delivery (Switch spec 9 step 4, Switch wire 8.2): the webhooks a `notify` entry
-//! owes its target apps' handles, sent from the queue the append filled (`store::push_queue`)
-//! by a worker of the service, never during the append.
+//! Push delivery (wire 7.4.7, 8.2). Notifying entries and connect requests queue webhooks
+//! for their target apps' handles. Delivery starts after the transaction commits.
 //!
 //! - **Fair across accounts:** at most `push.concurrency` attempts run at once, as a stream,
 //!   not in rounds: as one ends, the next due row is claimed, so a relay that never answers

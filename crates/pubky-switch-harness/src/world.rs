@@ -235,6 +235,19 @@ impl World {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_service(
+        &self,
+        origin: &str,
+        relay: std::net::SocketAddr,
+    ) -> Result<pubky_switch::service::Service, HarnessError> {
+        lock(&self.services)
+            .iter()
+            .find(|service| service.origin() == origin)
+            .ok_or_else(|| HarnessError::Setup(format!("no service at {origin}")))?
+            .push_service(relay)
+    }
+
     /// The switch at `origin` is lost: every request to it fails to connect from now on, as
     /// to a provider that is gone (Switch spec 12.6).
     pub fn lose_switch(&self, origin: &str) {

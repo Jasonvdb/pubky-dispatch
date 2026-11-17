@@ -395,16 +395,33 @@ async fn test_move_followed_from_a_410_answer() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    // A note waits in the feed; the frozen service's pages don't carry the freeze here, so
-    // the app learns of it from its effect's `410 moved`.
+    // A note waits in the feed. The page is read before the account is frozen, and the
+    // freeze lands before the note's effect is written, so the app learns of it from the
+    // effect's `410 moved`.
     w.note(me, "before");
     let n_key = next_key();
     let freeze = freeze_for(&w, &n_key, 2);
-    w.switch.freeze(&freeze).unwrap();
-    w.switch.lock().freeze_in_feed = false;
-    let next = w.switch.import_into(n_key.to_bytes());
-    router.add(NEXT, &next);
+    let imported = Arc::new(Mutex::new(None));
+    let (switch, held, routes) = (w.switch.clone(), Arc::clone(&imported), router.clone());
+    let secret = n_key.to_bytes();
+    router.add_transport(
+        ORIGIN,
+        Arc::new(crate::transport::MockTransport::with_handler(
+            move |request| {
+                let mut held = held.lock().unwrap();
+                if request.path_and_query.contains("/ops") && held.is_none() {
+                    switch.freeze(&freeze).unwrap();
+                    let next = switch.import_into(secret);
+                    routes.add(NEXT, &next);
+                    *held = Some(next);
+                }
+                drop(held);
+                switch.handle(request)
+            },
+        )),
+    );
     let report = app.receive(None).await.unwrap();
+    let next = imported.lock().unwrap().clone().unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Moved)));
     assert_eq!(next.uploads().len(), 1);
@@ -525,6 +542,203 @@ async fn test_move_cancelled_by_an_unfreeze_stays() {
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(app.cursor().generation, 1);
+}
+
+/// The switch's answer to the public read now (Switch wire 7.4.15), as an on-path party
+/// keeps it.
+fn public_read_now(w: &World) -> crate::transport::Response {
+    w.switch
+        .handle(&crate::transport::Request {
+            method: "GET".into(),
+            origin: ORIGIN.into(),
+            path_and_query: format!(
+                "/v1/{}/identity",
+                pubky_switch_core::enc::pubky_id(&w.alice.public())
+            ),
+            headers: Vec::new(),
+            body: Vec::new(),
+            timeout: crate::transport::TimeoutClass::default(),
+        })
+        .unwrap()
+}
+
+/// Route [`ORIGIN`] through an on-path party that answers every public read with `kept`, an
+/// earlier answer sent again, and passes every other request on to the switch. The public
+/// read binds no header and no timestamp, so `kept` verifies for each of them (Switch wire
+/// 7.1 "Identical requests").
+fn replay_public_read(w: &World, router: &Router, kept: crate::transport::Response) {
+    let switch = w.switch.clone();
+    router.add_transport(
+        ORIGIN,
+        Arc::new(crate::transport::MockTransport::with_handler(
+            move |request| {
+                if pubky_switch_core::http::is_public_read(&request.method, &request.path_and_query)
+                {
+                    Ok(kept.clone())
+                } else {
+                    switch.handle(request)
+                }
+            },
+        )),
+    );
+}
+
+/// The app frozen at its service with a move to [`NEXT`] under way, waiting for it to be
+/// published (`MoveStep::Uploaded`); with the freeze, and the public read's answers from
+/// before the freeze and while frozen.
+async fn waiting_for_the_move(
+    w: &World,
+    router: &Router,
+) -> (
+    App,
+    Freeze,
+    crate::transport::Response,
+    crate::transport::Response,
+) {
+    let mut app = join(w, router).await;
+    let before = public_read_now(w);
+    let n_key = next_key();
+    let freeze = freeze_for(w, &n_key, 2);
+    w.switch.freeze(&freeze).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::AwaitingMove { next_generation: 2 }
+    );
+    let during = public_read_now(w);
+    (app, freeze, before, during)
+}
+
+async fn holds_a_move(app: &App) -> bool {
+    app.reader()
+        .exists(crate::app::provider::keys::MOVE)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_public_read_replayed_without_freeze_cancels_no_move() {
+    // An answer from before the freeze, sent again, carries no freeze: it shows nothing about
+    // the account now, so the move stays (Switch wire 7.1 "Identical requests").
+    let w = World::new();
+    let router = Router::of(&w);
+    let (mut app, _, before, _) = waiting_for_the_move(&w, &router).await;
+    replay_public_read(&w, &router, before);
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::AwaitingMove { next_generation: 2 }
+    );
+    assert!(holds_a_move(&app).await);
+}
+
+#[tokio::test]
+async fn test_public_read_replayed_with_freeze_hides_no_cancellation() {
+    // The signer aborts while the public read still answers as when frozen: the own feed's
+    // signed word, which carries no freeze any more, is the one taken (Switch wire 7.3 step 8).
+    let w = World::new();
+    let router = Router::of(&w);
+    let (mut app, freeze, _, during) = waiting_for_the_move(&w, &router).await;
+    w.switch.unfreeze(&freeze).unwrap();
+    replay_public_read(&w, &router, during);
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::MoveCancelled
+    );
+    assert!(!holds_a_move(&app).await);
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+}
+
+#[tokio::test]
+async fn test_public_read_replayed_from_an_aborted_move_starts_none() {
+    // An app that never saw the freeze meets the aborted move's answer sent again: the own
+    // feed carries no freeze, so no move starts and nothing goes to the next service.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let n_key = next_key();
+    let freeze = freeze_for(&w, &n_key, 2);
+    w.switch.freeze(&freeze).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    let during = public_read_now(&w);
+    w.switch.unfreeze(&freeze).unwrap();
+    replay_public_read(&w, &router, during);
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Current);
+    assert!(!holds_a_move(&app).await);
+    assert!(next.uploads().is_empty());
+    assert_eq!(app.cursor().generation, 1);
+}
+
+/// Each way the own feed's signed page with no items can fail: no answer, an answer the
+/// pinned key didn't sign, a `503` and a `429`.
+fn failed_signed_reads() -> Vec<Fault> {
+    let path = || "limit=0".to_owned();
+    vec![
+        Fault::Unanswered {
+            path: path(),
+            after: 0,
+        },
+        Fault::SignWith {
+            path: path(),
+            secret: [42; 32],
+        },
+        Fault::Error {
+            path: path(),
+            code: ErrorCode::Unavailable,
+            current: serde_json::Value::Null,
+        },
+        Fault::Error {
+            path: path(),
+            code: ErrorCode::RateLimited,
+            current: serde_json::Value::Null,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn test_public_read_failed_signed_read_decides_nothing() {
+    // A signed read that fails shows neither a freeze nor its absence: a move waiting to be
+    // published, though since cancelled, isn't given up, and one the public read shows isn't
+    // started; the next check asks again and decides (Switch spec 12.5).
+    for fault in failed_signed_reads() {
+        let w = World::new();
+        let router = Router::of(&w);
+        let (mut app, freeze, _, _) = waiting_for_the_move(&w, &router).await;
+        w.switch.unfreeze(&freeze).unwrap();
+        w.switch.fail_next(fault.clone());
+        assert_eq!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::AwaitingMove { next_generation: 2 },
+            "{fault:?}"
+        );
+        assert!(holds_a_move(&app).await, "{fault:?}");
+        assert_eq!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::MoveCancelled,
+            "{fault:?}"
+        );
+
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let n_key = next_key();
+        w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+        router.add(NEXT, &w.switch.import_into(n_key.to_bytes()));
+        w.switch.fail_next(fault.clone());
+        let checked = app.check_for_move().await;
+        assert!(checked.is_err(), "{fault:?}: {checked:?}");
+        assert!(!holds_a_move(&app).await, "{fault:?}");
+        assert_eq!(
+            app.check_for_move().await.unwrap(),
+            ProviderStatus::AwaitingMove { next_generation: 2 },
+            "{fault:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2253,11 +2467,8 @@ async fn test_public_read_not_hosted_is_asked_again_with_a_signed_read() {
         code: ErrorCode::NotFound,
         current: pubky_switch_core::http::not_hosted_current(),
     });
-    let checked = app.check_for_move().await;
-    assert!(
-        matches!(&checked, Err(AppError::Switch(error)) if error.is_not_hosted()),
-        "{checked:?}"
-    );
+    // The signed read finds the account hosted: the public read's `404` shows nothing.
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Current);
     assert!(
         app.state.gone.is_none(),
         "not gone on the public read alone"
@@ -2338,6 +2549,67 @@ async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
     // A read makes the last try: the account is gone.
     assert!(app.receive(None).await.unwrap().stopped);
     assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
+    // An answer to the public read verifies at any time, an earlier one sent again included,
+    // so it shows no account alive now: the wait goes on until a signed read answers (Switch
+    // spec 12.7, wire 7.1 "Identical requests").
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let before = public_read_now(&w);
+    w.switch.lock().not_hosted_unpinned = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    let error = app.check_for_move().await.unwrap_err();
+    assert!(
+        matches!(error, AppError::NotAnsweringAsAccount { .. }),
+        "{error:?}"
+    );
+    let erasing = app.state.erasing;
+    assert!(erasing.is_some());
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    // A public read with no answer counts no try and starts nothing over.
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/identity".into(),
+        after: 0,
+    });
+    assert!(app.check_for_move().await.is_err());
+    assert_eq!(app.state.erasing, erasing);
+    // A replayed answer starts nothing over: the signed read it prompts counts the next try.
+    replay_public_read(&w, &router, before);
+    let _ = app.check_for_move().await;
+    let held = |app: &App| app.state.erasing.map(|e| (e.since_ms, e.tries));
+    let first = erasing.map(|e| (e.since_ms, e.tries + 1));
+    assert_eq!(held(&app), first);
+    // The account answers again: the public read, replayed still, makes the app ask the own
+    // feed, whose signed answer ends the wait.
+    w.switch.lock().not_hosted_unpinned = false;
+    let _ = app.check_for_move().await;
+    assert_eq!(app.state.erasing, None);
+}
+
+#[tokio::test]
+async fn test_erasure_wait_ends_on_a_signed_read_a_public_refusal_prompts() {
+    // A refusal the pinned key signed for the public read may be an earlier one sent again,
+    // so it only prompts the signed read, whose answer ends the wait (Switch spec 12.7).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.switch.lock().not_hosted_unpinned = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    assert!(app.check_for_move().await.is_err());
+    assert!(app.state.erasing.is_some());
+    w.switch.lock().not_hosted_unpinned = false;
+    w.switch.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::RateLimited,
+        current: serde_json::Value::Null,
+    });
+    let _ = app.check_for_move().await;
+    assert_eq!(app.state.erasing, None);
 }
 
 #[tokio::test]

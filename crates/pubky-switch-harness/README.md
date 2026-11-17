@@ -100,8 +100,8 @@ The flows send every call the service serves, each at both switches. What they l
 
 - **Push webhooks.** The `push registration` flow registers apps at a relay, has a list
   refused past the limit at one relay host, and frees the registration with its app. The
-  webhooks a `notify` entry queues aren't compared: the scripted switch sends none
-  (`FAKES.md`), and no world runs the service's delivery.
+  scripted switch models registration only (`FAKES.md`). A separate service test delivers
+  a connect wake-up to a local relay and checks its signature and contents.
 - **Calls the service doesn't serve yet**, seven of the thirty-three of Switch wire 7.4:
   `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST /import` with
   its chunks and activation. So no flow moves an account or changes its key in place, and

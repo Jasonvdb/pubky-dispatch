@@ -512,6 +512,22 @@ impl RealSwitch {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_service(&self, relay: SocketAddr) -> Result<Service, HarnessError> {
+        let store = self
+            .store()
+            .ok_or_else(|| setup("the database is closed"))?;
+        Ok(open_service(
+            &self.origin,
+            &store,
+            self.key_dir.path(),
+            self.service_secret,
+            self.time.clone(),
+            self.limits.clone(),
+        )?
+        .with_relay_route(Arc::new(move |_| Some(relay))))
+    }
+
     /// The service's store; `None` once its database is dropped.
     pub(crate) fn store(&self) -> Option<Store> {
         self.database

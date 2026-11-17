@@ -1348,17 +1348,16 @@ impl App {
     /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
     /// one (Switch spec 3.6).
     ///
-    /// The outbox goes in whole, but for the messages refused for good: each message with
-    /// its signed plaintext and the envelope sealed for its last try, so a restore delivers
-    /// what was queued before the backup with the same `msg_id` and bytes. A message the
-    /// device the backup came from delivered after it is then sent again: the recipient's
+    /// The backup takes outbox items oldest first within [`MAX_CARRIED_OUTBOX_BYTES`]
+    /// (8 MiB), including messages refused for good. Restore reports each omitted message
+    /// ID through [`AppEvent::MessageUndelivered`]. Each carried item keeps its signed
+    /// plaintext and any sealed envelope. If the original device delivered it after the
+    /// backup, the restored app may send the same `msg_id` and plaintext again. The recipient's
     /// switch answers a retry of the same envelope with its first answer while it holds the
     /// entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a second copy by its
     /// processed pair, kept at least 30 days from the first acceptance plus the clock
-    /// tolerance (Switch spec 11). So a restore reinstalls a message whose delivery is owed
-    /// only within [`SENT_RETENTION_MS`] of the backup, by the restoring device's clock;
-    /// later it gives that delivery up, as for an undeliverable message
-    /// ([`AppEvent::MessageUndelivered`]).
+    /// tolerance (Switch spec 11). Restore sets a replay deadline on each owed delivery.
+    /// A flush that reaches it past that deadline gives it up ([`AppEvent::MessageUndelivered`]).
     ///
     /// A backup is only ever of committed state. After a failed commit the app's memory may
     /// be ahead of its store, such as a cursor past an entry whose processed pair and local
@@ -3769,12 +3768,31 @@ impl App {
     /// a time that went back, and a rollback for an answer that contradicts itself (Switch
     /// spec 10.1).
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
+        self.take_answer(result, true).await
+    }
+
+    /// [`App::take`] for an answer that binds no request of the app's, the public read's
+    /// (Switch wire 7.1 "Identical requests"): it may be an earlier answer sent again, so it
+    /// shows nothing about the account now, and starts no erasure wait over.
+    pub(crate) async fn take_unbound<T>(
+        &mut self,
+        result: Result<T, ClientError>,
+    ) -> Result<T, AppError> {
+        self.take_answer(result, false).await
+    }
+
+    async fn take_answer<T>(
+        &mut self,
+        result: Result<T, ClientError>,
+        bound: bool,
+    ) -> Result<T, AppError> {
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
         }
-        // An answer verified with the pinned key, an error answer included: the account is
-        // there, and the erasure wait starts over (Switch spec 12.7).
-        if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
+        // An answer verified with the pinned key, an error answer included, to a request the
+        // app signed: the account is there, and the erasure wait starts over (Switch spec
+        // 12.7).
+        if bound && matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
             self.clear_erasing().await?;
         }
         if result.is_err() {

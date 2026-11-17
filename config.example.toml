@@ -129,7 +129,7 @@ connect_retry_ms = 30000               # keep trying to reach the database at st
 # path = "/var/lib/pubky-switch/keys"
 # backup_retention_days = 35            # the age of the oldest database backup kept; unset, erasures stay in the ledger for good
 
-# Push (Switch wire 8): registrations, and the webhooks a notify entry sends to each handle.
+# Push registrations and delivery for notifying entries and connect requests (wire 7.4.7, 8).
 [push]
 enabled = true                         # off: every PUT /push is 400, nothing queued or sent
 concurrency = 16                       # the most webhooks the service sends at once

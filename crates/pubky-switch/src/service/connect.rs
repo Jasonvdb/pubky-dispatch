@@ -19,8 +19,8 @@
 //!   `404` when none is pending. A contact, a conversation entry or a deny list entry for
 //!   the sender answers its request too (the store does it with the entry).
 //!
-//! Push for connect requests (`policy.connect_requests.push`) isn't sent yet: only `notify`
-//! entries queue webhooks (Switch wire 8.2).
+//! With `policy.connect_requests.push`, a newly kept request queues webhooks for current
+//! apps with `lists.read`, at most once per app in 60 seconds of service time (wire 7.4.7).
 
 use pubky_switch_core::{
     enc::{pubky_id, pubky_key},
@@ -33,7 +33,7 @@ use serde_json::json;
 use super::{Answer, Service, store_error};
 use crate::http::error::{ApiError, ErrorCode};
 use crate::keys::ServiceSigner;
-use crate::store::AccountTxn;
+use crate::store::{AccountTxn, StoreError};
 
 /// The pending requests' cap that applies: the policy's `max_pending`, at most
 /// `max_connect_pending` (Switch wire 3.3, 9.2). At 0, every new sender is refused.
@@ -49,6 +49,21 @@ fn identity_needed(version: Option<u64>) -> ApiError {
     .with_current(json!({ "version": version }));
     error.known_version = Some(version);
     error
+}
+
+async fn queue_connect_pushes(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    time_ms: u64,
+) -> Result<(), StoreError> {
+    let apps = super::batch::load_apps(txn, held, time_ms).await?;
+    let mut readers = apps.current_app_ids();
+    readers.retain(|app| {
+        apps.checked_cert(app)
+            .is_some_and(|cert| cert.has_permission(Permission::ListsRead))
+    });
+    txn.queue_connect_pushes(&readers, time_ms).await?;
+    Ok(())
 }
 
 impl Service {
@@ -149,6 +164,11 @@ impl Service {
             txn.put_connect(&sender, time_ms)
                 .await
                 .map_err(|e| store_error(&e))?;
+            if policy.push && self.push_enabled {
+                queue_connect_pushes(txn, held, time_ms)
+                    .await
+                    .map_err(|e| store_error(&e))?;
+            }
             txn.note_change();
         }
         Ok(Answer::ok(serde_json::to_vec(&pending).unwrap_or_default()))

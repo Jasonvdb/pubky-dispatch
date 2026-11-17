@@ -2607,6 +2607,9 @@ async fn test_key_recovery_refuses_an_unknown_member_whatever_its_value() {
         ("app", |v, x| v["apps"][0]["later_member"] = x),
         ("inbox", |v, x| v["inbox"]["later_member"] = x),
         ("policy", |v, x| v["policy"]["later_member"] = x),
+        ("connect requests", |v, x| {
+            v["policy"]["connect_requests"]["later_member"] = x;
+        }),
         ("removal", |v, x| v["removed"][0]["later_member"] = x),
     ];
     for (place, put) in places {

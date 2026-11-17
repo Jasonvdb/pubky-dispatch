@@ -830,7 +830,8 @@ fn carries_unknown_members(copy: &IdentityDoc) -> Result<bool> {
     };
     Ok(signed.iter().any(|(name, value)| match read.get(name) {
         Some(known) => unknown_in(value, known),
-        None => !(left_out_when_empty(read, name, copy.body()) && is_empty(value)),
+        // A name it leaves out can only be `null` or empty here: else it would read it.
+        None => !left_out_when_empty(read, name, copy.body()),
     }))
 }
 
@@ -850,17 +851,6 @@ fn left_out_when_empty(
     );
     serde_json::from_value::<IdentityBody>(serde_json::Value::Object(probe))
         .map_or(true, |probed| &probed != body)
-}
-
-/// `null`, `[]` or `{}`.
-fn is_empty(value: &serde_json::Value) -> bool {
-    use serde_json::Value;
-    match value {
-        Value::Null => true,
-        Value::Array(items) => items.is_empty(),
-        Value::Object(members) => members.is_empty(),
-        _ => false,
-    }
 }
 
 /// Whether `signed` holds a member `read`, the same value as this signer reads it, lacks,

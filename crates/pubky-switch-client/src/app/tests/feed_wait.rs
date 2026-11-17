@@ -1869,10 +1869,10 @@ async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
 }
 
 #[tokio::test]
-async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
-    // Two batches kept while the account is frozen. A message to a new peer keeps its
-    // conversation entry behind them; flushing the outbox again keeps no second copy, and
-    // once the freeze is called off every batch goes, the entry once.
+async fn test_outbox_writes_no_conversation_entry_behind_kept_batches() {
+    // Two batches kept while the account is frozen. A message to a new peer keeps no
+    // conversation entry behind them, since their settlement may hold the message; once
+    // the freeze is called off and every batch goes, the next flush writes the entry once.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
@@ -1886,28 +1886,11 @@ async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
     app.queue(OutgoingMessage::new(peer, "sample.note", body))
         .await
         .unwrap();
-    let entry = OpKind::AllowPut {
-        pubky: peer,
-        kind: AllowKind::Conversation,
-    };
-    let kept_entries = |kept: &[([u8; 16], crate::app::batch::PendingBatch)]| {
-        kept.iter()
-            .filter(|(_, pending)| {
-                crate::client::Batch::from_body(pending.body.clone())
-                    .unwrap()
-                    .ops()
-                    .iter()
-                    .any(|op| op.body().kind == entry)
-            })
-            .count()
-    };
     for _ in 0..3 {
         s.w.clock.advance_ms(1_000);
         app.flush_outbox().await.unwrap();
     }
-    let kept = app.kept_batches().await.unwrap();
-    assert_eq!(kept_entries(&kept), 1, "one copy kept");
-    assert_eq!(kept.len(), 3);
+    assert_eq!(app.kept_batches().await.unwrap().len(), 2, "no entry kept");
     s.w.switch.unfreeze(&freeze).unwrap();
     for _ in 0..4 {
         if !app.receive(None).await.unwrap().more {
@@ -1915,6 +1898,11 @@ async fn test_outbox_keeps_one_conversation_entry_behind_kept_batches() {
         }
     }
     assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(!conversations(&s.w).contains(&peer));
+    for _ in 0..2 {
+        s.w.clock.advance_ms(60_000);
+        app.flush_outbox().await.unwrap();
+    }
     let applied = conversations(&s.w);
     assert_eq!(applied.iter().filter(|pubky| **pubky == peer).count(), 1);
 }
@@ -2634,11 +2622,11 @@ async fn test_flush_outbox_stale_key_past_the_round_budget_is_resolved_by_the_ne
     );
 }
 
-/// A message whose conversation entry is in the second of two kept batches (kept while the
-/// account was frozen): each pass sends one kept batch again, oldest first, so it goes in
-/// the second pass, the one that sends its batch.
+/// A message whose conversation entry is owed behind a batch kept while the account was
+/// frozen: no entry is kept behind it, since its settlement may hold the message. The pass
+/// that sends that batch again writes the entry and delivers the message.
 #[tokio::test]
-async fn test_flush_outbox_message_behind_its_entry_in_the_second_kept_batch() {
+async fn test_flush_outbox_message_entry_waits_for_the_kept_batch_ahead() {
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
@@ -2647,19 +2635,18 @@ async fn test_flush_outbox_message_behind_its_entry_in_the_second_kept_batch() {
     s.w.clock.advance_ms(1_000);
     let msg_id = app.queue(note_to_bob(&s, "hello")).await.unwrap();
     app.flush_outbox().await.unwrap();
-    assert_eq!(app.kept_batches().await.unwrap().len(), 2, "two kept");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1, "no entry kept");
     s.w.switch.unfreeze(&freeze).unwrap();
-    let delivered = |delivery: Option<crate::app::Delivery>| {
-        matches!(delivery, Some(crate::app::Delivery::Accepted { .. }))
-    };
     s.w.clock.advance_ms(60_000);
     s.flush_while_more(&mut app).await;
-    let first = delivered(app.delivery(&msg_id).await.unwrap());
-    s.w.clock.advance_ms(60_000);
-    s.flush_while_more(&mut app).await;
-    let second = delivered(app.delivery(&msg_id).await.unwrap());
-    assert!(!first, "the first pass sends the batch ahead of its own");
-    assert!(second, "in the second pass, which sends its batch");
+    assert!(
+        matches!(
+            app.delivery(&msg_id).await.unwrap(),
+            Some(crate::app::Delivery::Accepted { .. })
+        ),
+        "the pass that sends the batch ahead writes the entry and delivers"
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
 }
 
 /// A kept batch whose resend takes 25 s and fails, sent again first in every pass: the

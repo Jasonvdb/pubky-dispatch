@@ -36,7 +36,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | Case | What happened and what to do |
 |---|---|
 | `AppEvent::MessageReceived` | The receive effect succeeded for this sender, kind and message ID. Show the resulting protocol state. Applying the effect again could repeat the action. |
-| `AppEvent::MessageDropped` | An input failed the numbered recipient check. It was passed without its requested effect. Show the rule if needed and discard the input. |
+| `AppEvent::MessageDropped` | The client skipped this copy after a recipient check failed. Use `check` and `reason` to explain why. If the read also reports `StoredEntryDropped`, handle that notice before acknowledging it. |
 | `AppEvent::Duplicate` | The sender and message ID were already seen. Suppress the second effect. If the bytes differed, show a conflict. |
 | `AppEvent::Held` | The client has temporarily left an entry on the feed because its sender could not yet be verified. Later entries can run. Read again later. |
 | `AppEvent::StoreFailing` | The same receive step still fails. On the feed this is reported from the third consecutive retry. A retry of an already parked input can report it sooner. Show the storage failure and duration, repair or free the store and read again. The input remains pending. |
@@ -45,13 +45,14 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `AppEvent::EffectRefused` | The saved input's proposed work cannot be applied in this form. Inspect the reason and optional code, then decide how to handle it in the protocol. The client will not send that effect again. |
 | `AppEvent::EffectUncertain` | A saved effect's answer can no longer settle whether it ran. Check current records and every named attempt before deciding whether to release the input. Blind replay can repeat work. |
 | `AppEvent::ReleasedDuplicate` | A released input's sender and ID had already been handled in the meantime. Its effect did not run again. Finish the release in the UI and flag differing bytes. |
-| `AppEvent::StoredEntryDropped` | A waiting payload was deleted. Save its stable `notice_id`, sender, message identity, acceptance time and reason. Use the current delivery ID to acknowledge. Ask for a resend if appropriate. Other copies and effects have their own fates. The saved receipt records a checked observation, not independently verifiable message bytes. |
+| `AppEvent::StoredEntryDropped` | The client dropped a copy waiting for sender verification, a key or admission and saved the notice in the same commit. Keep the stable `notice_id`, sender, message identity and acceptance time. Use `waiting` to see what the copy needed and `reason` to decide on a resend. Acknowledge the current delivery ID. The receipt records the original observation. Verifying the signature again would require the lost bytes. Other copies and effects have their own outcomes. |
 | `DropReason::Age` | A waiting input exceeded 21 days from acceptance by verified service time. Request another copy while the sender still has it. |
 | `DropReason::PerSender` | One sender exceeded 64 waiting inputs. Its earliest accepted eligible copy was lost. Use the notice to identify it. |
 | `DropReason::Total` | The shared pool exceeded 128 waiting inputs. It loses an earliest eligible copy from a sender with the most. Use the notice for that copy. |
+| `DropReason::Rules` | On retry, the waiting copy failed the recipient check identified by `check`. For example, the current body rules may reject a value they used to allow. Record the failed check and ask for a resend only if the same signed bytes could now pass it. |
 | `WaitingReason::Sender` | This lost copy was awaiting verification of its sender. Check the sender afresh for any resend. |
-| `WaitingReason::Key` | This lost copy needed a key for the named epoch. Obtain the key and request another copy if needed. |
-| `WaitingReason::Admission` | This lost copy was waiting for room under the protocol's own admission rule. Resolve that condition before requesting it again. |
+| `WaitingReason::Key` | The copy was waiting for a key for the named epoch. Check the signer's bundle for the key. Consult the drop reason before asking for another copy. |
+| `WaitingReason::Admission` | The protocol had deferred this copy under its admission rule. If a waiting limit caused the drop, check whether the protocol can admit another copy before asking for one. |
 | `ParkReason::Unverifiable` | Sender standing could not be checked within the feed wait. Keep reading. The local retry shares the waiting pool's limits. |
 | `ParkReason::AwaitingAdmission` | The protocol deferred admission. Keep the input for a scheduled retry against current protocol state, within the shared limits. |
 | `ParkReason::AwaitingKey` | A scope key is missing. The client waits for a change in the keys it holds and the required epoch's granted keys. Check the signer's bundle. The waiting pool can lose this copy. |
@@ -72,7 +73,9 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `AppEvent::Missed` | The service deleted unread inbox entries. Show the count. The client owes a collection listing and calls the protocol about the gap when the acceptance times allow it. Rebuild from records and available senders. |
 | `AppEvent::OwedCallHeld` | Repeated reads are stalled before further handoff by a required callback or its lookup. Check `owed_protocol_calls`, repair storage or connectivity, then read again. |
 
-Use `parked_entries` and `parked_entry` to inspect locally saved inputs. `release_parked` takes the ID and original plaintext hash of an uncertain input. `forget_parked` can discard multiple stored copies for the same sender and message in one call. It checks the supplied hash and refuses while an unanswered effect or an unacknowledged duty protects a copy. Show which copies can be lost before deletion. `forget_processed` lets the owning protocol remove an eligible duplicate marker together with its local writes, so the next copy can run again.
+Use `parked_entries` to list saved inputs and `parked_entry` to inspect one. A waiting input stays readable when the protocol's body rules change. The client uses the signed common fields to load, inspect, back up and restore it, and to identify it in a drop notice. The next retry checks the current rules. Check `sender_verified` before showing the sender as verified.
+
+`release_parked` takes the ID and original plaintext hash of an uncertain input. `forget_parked` can discard multiple stored copies for the same sender and message in one call. It checks the supplied hash and refuses while an unanswered effect or an unacknowledged duty protects a copy. Show which copies can be lost before deletion. `forget_processed` lets the owning protocol remove an eligible duplicate marker together with its local writes, so the next copy can run again.
 
 ### Implementing the receive step
 
@@ -91,7 +94,7 @@ The client verifies the envelope and signed message, recipient, sender standing,
 | `ClaimFetch::Absent` | The service answered that it holds no claim at this key. Handle absence under the protocol's rules. |
 | `ClaimFetch::Refused` | The service gave a lasting refusal for this read. Handle the code without asking for the same read again. |
 | `Outcome::AwaitAdmission` | The protocol's ordinary storage rule cannot admit the input yet. Staged changes are discarded. The client keeps either the waiting payload or its drop notice before passing it. |
-| `Outcome::AwaitKey` | The step needs a scope key at this epoch. Staged changes are discarded. The client schedules another try when keys change or reports a bounded drop. |
+| `Outcome::AwaitKey` | The step needs a scope key at this epoch. The client discards staged changes. Obtain the missing key and read again. The waiting copy can reach a shared limit or fail a recipient check on retry. |
 
 ### Waiting and push notifications
 
@@ -140,7 +143,7 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 |---|---|
 | `DeliveryOrigin::Original` | The client has retained the original intent. Use this in the owning protocol's `may_send` check. The separate `resend` flag says whether a copy was accepted before. |
 | `DeliveryOrigin::Reconstructed` | The copy came from signed plaintext without a retained original intent. Apply the protocol's rules for reconstructed sends. |
-| `Delivery::Queued` | Delivery is outstanding. Show tries, last error and any hold. Flush later after fixing the cause. |
+| `Delivery::Queued` | The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |
 | `Delivery::Kept` | A saved, unanswered batch owns this delivery. Follow its batch ID. It enters the outbox when the batch settles successfully. |
 | `Delivery::Accepted` | The inbox accepted the message at the reported time. Show delivery. A failed later resend can still leave this original acceptance visible. |
 | `Delivery::Failed` | A lasting refusal or a discarded carrying batch ended this delivery. Show the reason and time while the failure is retained. Stop flushing it. |
@@ -340,7 +343,7 @@ In the receive callback, read `sender_disposition`. A flag records repeated rate
 
 ## Running several protocols
 
-Construct `ProtocolSet::single` or `ProtocolSet::new` from the registered protocols. Names must be distinct, and a collection name has only one owner. For example, the sample protocol `tasks` supplies its own kinds, scopes, record policies and rules. Use `protocols()`, `names`, `contains` and `get` for the roster. Loading requires the stored roster. Restore can add a protocol with no earlier layer, subject to the certificate and layer checks.
+Construct `ProtocolSet::single` or `ProtocolSet::new` from the registered protocols. Names must be distinct, and a collection name has only one owner. Each protocol supplies its own kinds, scopes, record policies and rules. Use `protocols()`, `names`, `contains` and `get` for the roster. Loading requires the stored roster. Restore can add a protocol with no earlier layer, subject to the certificate and layer checks.
 
 Route a kind by the root before its first dot. The owning protocol supplies `check_scopes`, `check_body`, `receives`, `sends_to`, `adds_conversation` and `may_send`. Its `accepts` and `opaque_members` describe the messages it accepts, `has_keys` identifies keyed scopes, and `sent_between_own_apps` identifies traffic within the identity. Use a protocol-specific label in inputs to `blind`. `collections`, `record_seen`, `record_regression` and `sent_record` govern its records. A failed resend or missed-entries callback can hold back its owner while other owners receive. A deny-list change or gap is a barrier for all owners. Use `queued_messages(protocol)` to inspect outstanding copies, including those in saved batches. A message waits if held individually, its recipient is held, or the current `may_send` callback withholds it. That callback sees the signed bytes, origin, resend flag, durable local state and current cert. Its failure must preserve the delivery for a later try.
 
@@ -370,7 +373,7 @@ A failed multi-step call may already have saved work. Read its outer error befor
 | `AppError::Transport` | The network, homeserver or relay operation failed. Check whether the request could have left and resume any saved work. |
 | `AppError::Store` | Reading or writing the host's store failed. Show the storage problem and follow its certainty about that commit. |
 | `AppError::Protocol` | A protocol callback failed in its own store, for example during loss recovery. Repair that store and resume the saved step. |
-| `AppError::InvalidData` | A document, proof, saved value or host-supplied input failed its checks. Show the rule and inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
+| `AppError::InvalidData` | A document, proof, saved value or host input failed its checks. A later feed page can also contradict a held entry by changing its ID at the same position or placing acceptance after the first observation. Show the rule and inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
 | `AppError::Refused` | An app rule blocked a step. Use its detailed refusal. Earlier steps of the call may already be durable. |
 | `Refusal::NotNow` | A prerequisite is missing, such as completed reconciliation, a usable lookup or a required upload. Show the reason and retry after the prerequisite changes. |
 | `Refusal::Usage` | A host argument, permission, protocol registration or requested operation violates this API's rules. Correct the cause before calling again. |
@@ -391,7 +394,7 @@ Implement `StateStore::get`, `scan`, `commit`, `acquire` and `commit_if` with th
 | `StoreError::Unavailable` | Storage is temporarily unavailable. Nothing landed. Restore access and resume. |
 | `StoreError::Unknown` | The whole commit may or may not have landed. Re-read durable state before taking action. Never replay an external effect on this error alone. |
 | `StoreError::Full` | No writes landed for lack of space. Ask the user to free storage, then retry. |
-| `StoreError::Corrupt` | A stored value failed validation. Stop relying on that value. Diagnose the store or offer recovery from a known backup. |
+| `StoreError::Corrupt` | The client could not decode the stored bytes or found a state no writer produces, such as a waiting input whose saved receipt predates its acceptance. Stop using the damaged state. Diagnose the store or offer recovery from a known backup. |
 | `StoreError::TooLarge` | One value or batch exceeds the byte cap. No part of that commit was applied. Reduce the writes. Freeing disk space will not make identical writes fit. |
 | `StoreError::Other` | The host reports another definite failure. No writes landed. Fix the stated cause before retry. |
 | `BatchError::ValueTooLarge` | A proposed value exceeds the per-value limit. Reduce that value before constructing the batch again. |
@@ -423,7 +426,7 @@ Only `TransportError::Refused` and `TransportError::Connect` allow the client to
 | `ClientError::BodyOverCap` | The client refused an oversized outbound body before sending. Reduce it. Retrying the same bytes cannot work. |
 | `ClientError::Transport` | No usable service answer came back. Use the underlying transport error's delivery guarantee. |
 | `ClientError::Unpinned` | The call requires a pinned service key and none was supplied. Obtain the correct key through the identity or enrollment flow before retrying. |
-| `ClientError::InvalidResponse` | The response did not satisfy the wire checks. Discard the unusable data, preserve pending writes and check the service or integration. |
+| `ClientError::InvalidResponse` | The response failed a wire check. For example, a feed page showed an entry, readable or unreadable, accepted after the page's own service time. Discard the unusable answer, preserve pending writes and check the service or integration. |
 | `ClientError::Chain` | A head, proof or its binding failed verification. Preserve evidence and stop dependent action. The app can raise a rollback alarm for a contradictory signed answer. |
 | `ClientError::Core` | An underlying format, signing or verification operation failed. Inspect the rule and correct the input or its source. |
 | `ClientError::Usage` | The credentials or arguments cannot make this call. Correct them before sending. |

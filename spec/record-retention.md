@@ -338,13 +338,17 @@ another slot by assigning a new receiving position to the same complete input.
 | `created` | the actual receiving creation at admission, in wire 1.6 form with three fractional digits |
 | `identity` | the exact signed identity document actually applied at that admission |
 | `barrier` | its carried record recovery barrier position |
-| `before` | `{ "generation": int, "seq": int, "chain_hash": base64url(32 bytes) }`, the actual account head immediately before its upload transition |
+| `before` | `{ "generation": int, "seq": int, "chain_hash": base64url(32 bytes) }`, the actual account chain head immediately before its upload transition |
 | `upload` | the position of that upload transition |
 
 The admission's document and barrier are the authority actually checked then,
 not the exporter or importer's newer document substituted afterward. Its upload
 generation equals that document's and its `before.generation`; its upload
-sequence is `before.seq + 1`. If this unit supplied a new receiving current
+is the next chain item after `before`, linked to `before.chain_hash`. Its
+sequence is allocated from the existing shared account sequence and strictly
+exceeds `before.seq` (wire 6.6). Inbox entries can occupy intervening sequence
+positions without moving the chain head; they do not change `before` or require
+an adjacent upload sequence. If this unit supplied a new receiving current
 application, `application` is that reference: its generation/sequence equal
 `upload`, and its item hash is the uploaded operation's. Otherwise it is null;
 a same-current certificate variant does not pretend to have been the current
@@ -460,7 +464,13 @@ After ordinary manifest/chunk authentication, the importer:
    frozen sequence and retained chain. A retained stub there must be a service
    upload; a full transition must agree with the unit's application and list
    its key when the unit supplied a new current application. The `before`
-   hash must agree wherever the export retains that head or its successor.
+   head and the upload must be consecutive chain items wherever retained,
+   without requiring adjacent sequence numbers. The upload's sequence must
+   strictly exceed `before.seq`; its retained stub's `prev_chain_hash` must
+   equal `before.chain_hash`, and the retained head at `before` must have that
+   hash. An intervening retained chain item contradicts this association;
+   intervening inbox positions do not. Sequence allocation and uniqueness
+   still follow wire 6.6 and 10.5.
    Missing pruned stubs are not fabricated or treated as ancestry evidence:
    the frozen manifest carries the bounded retained admission association.
    An existing conflicting stub/document is never ignored. The primary unit
@@ -529,6 +539,9 @@ local accounting must agree on the disposition.
 | Mixed loss/current source contexts or claim/list/head material | No implicit fallback or partial mode selection |
 | Duplicate, unordered or out-of-range response indices | Client rejects accounting for the response |
 | Lost response, restart, restore, provider change or local commit uncertainty | Preserve duties and apply the exact ticket/run rules above |
+| Chain head at sequence 10, inbox entry at 11, then a loss or current-history upload at 12 | Preserve the actual head at 10 as `before`; link the upload to its hash and use 12 for any new receiving application; retention and import accept the sequence gap |
+| Retained upload stub links to a hash different from `before.chain_hash`, or another chain item intervenes | Refuse the inconsistent admission association |
+| Upload sequence reuses a retained inbox position or does not strictly exceed `before.seq` | Refuse under the shared sequence and admission rules; never fabricate a different `before` head |
 | Current-generation proofless current upload, then pruning and a clean move | Primary unit preserves exact op/cert, lower bound and receiving reference; import accepts current-history admission without a fabricated record proof |
 | Proof-bearing tracked A retained beside later ordinary B, then source/batch pruning and a clean move | Exact A cert/proof/source/descriptor and admission survive in its complete unit; B's current descriptor cannot replace them |
 | Same operation with several independently checked certificate/source variants | Each exact retained non-current unit shares the eight-slot pool and transfers coherently; value divergence is not multiplied by certificate bytes |

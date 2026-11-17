@@ -19,8 +19,8 @@ use pubky_switch_core::http::{ErrorCode, ResponseParts, frozen_refuses, header, 
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{
-    BatchRecord, BatchRef, KeyBundlePut, OpKind, OpsRequest, Position, SignedOp, random_batch_id,
-    sign_batch,
+    BatchRecord, BatchRef, Condition, KeyBundlePut, OpKind, OpsRequest, Position, SignedOp,
+    random_batch_id, sign_batch,
 };
 use pubky_switch_core::records::{AccountActivation, AppCert, Freeze, IdentityDoc};
 use pubky_switch_core::recovery::{UploadBody, UploadChanges, UploadContext, check_upload};
@@ -1741,7 +1741,22 @@ impl ScriptedSwitch {
     ///
     /// As [`ScriptedSwitch::signer_op`].
     pub fn app_op(&self, keys: &AppKeys, kind: OpKind) -> Result<u64, ScriptError> {
-        self.inject(keys, Some(keys.app_id_bytes()), vec![kind])
+        self.app_op_if(keys, Vec::new(), kind)
+    }
+
+    /// [`ScriptedSwitch::app_op`] with `conditions`, such as the ones
+    /// [`crate::app::App::record_op`] gives a record write.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    pub fn app_op_if(
+        &self,
+        keys: &AppKeys,
+        conditions: Vec<Condition>,
+        kind: OpKind,
+    ) -> Result<u64, ScriptError> {
+        self.inject_entries(keys, Some(keys.app_id_bytes()), vec![(conditions, kind)])
     }
 
     fn inject(
@@ -1749,6 +1764,16 @@ impl ScriptedSwitch {
         writer: &impl Signs,
         app_id: Option<[u8; 16]>,
         kinds: Vec<OpKind>,
+    ) -> Result<u64, ScriptError> {
+        let entries = kinds.into_iter().map(|kind| (vec![], kind)).collect();
+        self.inject_entries(writer, app_id, entries)
+    }
+
+    fn inject_entries(
+        &self,
+        writer: &impl Signs,
+        app_id: Option<[u8; 16]>,
+        entries: Vec<(Vec<Condition>, OpKind)>,
     ) -> Result<u64, ScriptError> {
         let mut inner = self.lock();
         let account = inner.identity.public();
@@ -1759,7 +1784,7 @@ impl ScriptedSwitch {
             app_id,
             inner.tip.generation,
             random_batch_id()?,
-            kinds.into_iter().map(|kind| (vec![], kind)).collect(),
+            entries,
         )?;
         let signed: Vec<SignedDoc> = ops.iter().map(|op| op.signed().clone()).collect();
         let (status, body) = match inner.gate("POST", &path) {

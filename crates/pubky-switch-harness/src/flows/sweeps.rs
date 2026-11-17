@@ -118,7 +118,27 @@ pub async fn deleted_key_forgotten(world: &World) -> FlowResult {
     }
     world.advance_ms(STEP_MS);
 
-    // The key again, as a new one.
+    // The key again. The wallet still holds the delete, so its first write names it and
+    // is refused with nothing current there; it then knows the key forgotten and creates
+    // the record as a new one.
+    let first = wallet
+        .put_record(&list, br#"{"items":["tea"]}"#, Vec::new())
+        .await;
+    let refused = first
+        .as_ref()
+        .err()
+        .and_then(|error| error.code())
+        .map(|code| code.as_str());
+    world.outcome(
+        "the wallet's first write at the forgotten key",
+        &json!({ "refused": refused }),
+    );
+    if refused != Some("conflict") {
+        return Err(format!(
+            "the wallet's first write at the forgotten key, naming the delete, came to              {first:?}, not 409 conflict"
+        )
+        .into());
+    }
     let again = wallet
         .put_record(&list, br#"{"items":["tea"]}"#, Vec::new())
         .await?;

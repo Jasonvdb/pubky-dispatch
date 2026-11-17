@@ -1513,9 +1513,10 @@ async fn test_records_regression_check_sees_the_write_base() {
     );
 }
 
-/// A create over a record the app holds deleted builds on what it holds.
+/// A write over a record the app holds deleted names the delete, and builds on what it
+/// holds.
 #[tokio::test]
-async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
+async fn test_records_regression_base_of_a_write_over_a_held_delete_is_held() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
@@ -1525,7 +1526,7 @@ async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    wallet.delete_record(&target, vec![]).await.unwrap();
+    let deleted = wallet.delete_record(&target, vec![]).await.unwrap().version;
     phone.receive(None).await.unwrap();
     wallet
         .put_record(&target, &value(&["a", "b"]), vec![])
@@ -1536,7 +1537,7 @@ async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
     assert_eq!(
         last,
         WriteBase {
-            expected_version: RecordVersion::NONE,
+            expected_version: deleted,
             held: true,
             conditions: Vec::new(),
         }
@@ -6521,6 +6522,23 @@ async fn read_on(app: &mut App) {
     app.flush_cursor().await.unwrap();
 }
 
+/// `app`'s write of `value` at `target`, whose delete the switch forgot: the first write
+/// names the delete and is refused with nothing current, and the next creates the record
+/// (Switch spec 10.3).
+async fn put_over_a_forgotten_delete(
+    app: &mut App,
+    target: &RecordTarget,
+    value: &[u8],
+) -> crate::app::SharedRecord {
+    let refused = app.put_record(target, value, vec![]).await;
+    assert_eq!(
+        refused.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{refused:?}"
+    );
+    app.put_record(target, value, vec![]).await.unwrap()
+}
+
 fn held_at_switch(s: &Setup, key: &[u8; 32]) -> bool {
     s.w.switch.lock().shared.records.contains_key(key)
 }
@@ -6528,7 +6546,8 @@ fn held_at_switch(s: &Setup, key: &[u8; 32]) -> bool {
 #[tokio::test]
 async fn test_scripted_records_deleted_key_is_forgotten_once_every_reader_passed() {
     // As at the service (Switch spec 10.3): once every current app's cursor is past the
-    // delete, the key is forgotten, its read is `404`, and a create at it starts afresh.
+    // delete, the key is forgotten, its read is `404`, and a create at it starts afresh,
+    // after the write naming the delete is refused.
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
@@ -6543,10 +6562,7 @@ async fn test_scripted_records_deleted_key_is_forgotten_once_every_reader_passed
         scripted_get(&s, Some(phone.app_id()), &rest),
         (404, json!("not_found"), true)
     );
-    wallet
-        .put_record(&target, &value(&["b"]), vec![])
-        .await
-        .unwrap();
+    put_over_a_forgotten_delete(&mut wallet, &target, &value(&["b"])).await;
     read_on(&mut phone).await;
     let held = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), vec!["b"]);
@@ -6624,10 +6640,7 @@ async fn test_scripted_records_create_after_a_forget_is_taken_only_at_its_newer_
     );
     read_on(&mut wallet).await;
     assert!(!held_at_switch(&s, &key), "forgotten");
-    phone
-        .put_record(&target, &value(&["a", "b"]), vec![])
-        .await
-        .unwrap();
+    put_over_a_forgotten_delete(&mut phone, &target, &value(&["a", "b"])).await;
     read_on(&mut wallet).await;
     let new = wallet.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(new.content.value()), vec!["a", "b"]);
@@ -6669,10 +6682,7 @@ async fn test_scripted_records_create_after_a_forget_is_refused_where_the_mark_r
     );
     read_on(&mut wallet).await;
     assert!(!held_at_switch(&s, &key), "forgotten");
-    phone
-        .put_record(&target, &value(&["b"]), vec![])
-        .await
-        .unwrap();
+    put_over_a_forgotten_delete(&mut phone, &target, &value(&["b"])).await;
     read_on(&mut wallet).await;
     // The wallet keeps the delete it read, not the create.
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
@@ -7933,30 +7943,55 @@ async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
 }
 
 #[tokio::test]
-async fn test_scripted_records_condition_zero_matches_a_held_delete() {
+async fn test_scripted_records_condition_zero_names_only_an_absent_key() {
     // As at the service (Switch wire 6.3): a `record_version` condition of `{0, 0}` holds
-    // for a deleted record, as for an absent one; a live record fails it.
+    // only where the switch holds nothing; a live record and a kept delete both fail it,
+    // and the delete holds by its own version, which the app's condition names.
     use pubky_switch_core::ops::Condition;
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    let fenced = |version: RecordVersion, pubky: u8| {
+        OpBatch::new().op_if(
+            OpKind::DenyPut { pubky: [pubky; 32] },
+            vec![Condition::RecordVersion { key, version }],
+        )
+    };
+    wallet
+        .submit_batch(fenced(RecordVersion::NONE, 7))
+        .await
+        .unwrap();
     wallet
         .put_record(&target, &value(&["a"]), vec![])
         .await
         .unwrap();
-    let key = wallet.record_key(&target).unwrap();
-    let fenced = |pubky: u8| {
-        OpBatch::new().op_if(
-            OpKind::DenyPut { pubky: [pubky; 32] },
-            vec![Condition::RecordVersion {
-                key,
-                version: RecordVersion::NONE,
-            }],
-        )
-    };
-    assert!(wallet.submit_batch(fenced(9)).await.is_err(), "live");
-    wallet.delete_record(&target, vec![]).await.unwrap();
-    wallet.submit_batch(fenced(8)).await.unwrap();
+    assert!(
+        wallet
+            .submit_batch(fenced(RecordVersion::NONE, 9))
+            .await
+            .is_err(),
+        "live"
+    );
+    let deleted = wallet.delete_record(&target, vec![]).await.unwrap();
+    assert!(
+        wallet
+            .submit_batch(fenced(RecordVersion::NONE, 8))
+            .await
+            .is_err(),
+        "a kept delete"
+    );
+    assert_eq!(
+        wallet.record_condition(&key).await.unwrap(),
+        Condition::RecordVersion {
+            key,
+            version: deleted.version
+        }
+    );
+    wallet
+        .submit_batch(fenced(deleted.version, 6))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -8048,16 +8083,27 @@ async fn test_scripted_records_refused_delete_is_written_over_after_a_forget() {
         !held.not_taken,
         "a write naming its writer is flagged instead"
     );
+    // Its write names the delete; once the switch forgot it, that write is refused with
+    // nothing current, and the next one creates the record.
     let forgotten = !held_at_switch(&s, &key);
-    let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    let mut written = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    if forgotten {
+        assert_eq!(
+            written.as_ref().err().and_then(AppError::code),
+            Some(ErrorCode::Conflict),
+            "{written:?}"
+        );
+        written = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    }
     assert!(written.is_ok(), "forgotten: {forgotten}; {written:?}");
 }
 
 #[tokio::test]
 async fn test_scripted_records_delete_flagged_as_a_regression_is_written_over_after_a_forget() {
     // A delete the protocol finds goes back on what the phone has seen: the phone keeps the
-    // record and follows the delete's version, so its next write names `{0, 0}`, which still
-    // holds once both readers have passed the delete and the switch forgets the key.
+    // record and follows the delete's version, so its next write names that delete. Once
+    // both readers have passed it and the switch forgot the key, that write is refused with
+    // nothing current, and the phone's next write creates the record.
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
@@ -8078,8 +8124,19 @@ async fn test_scripted_records_delete_flagged_as_a_regression_is_written_over_af
     assert!(held.flagged);
     read_on(&mut wallet).await;
     assert!(!held_at_switch(&s, &key), "both readers passed the delete");
+    let refused = phone.put_record(&target, &value(&["a"]), vec![]).await;
+    assert_eq!(
+        refused.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{refused:?}"
+    );
     let written = phone.put_record(&target, &value(&["a"]), vec![]).await;
     assert!(written.is_ok(), "{written:?}");
+    assert_eq!(
+        ids(written.unwrap().content.value()),
+        vec!["a"],
+        "the phone put back what it trusts"
+    );
 }
 
 #[tokio::test]
@@ -8118,11 +8175,12 @@ async fn test_scripted_records_deleted_key_doesnt_wait_for_a_kept_app_id() {
 }
 
 #[tokio::test]
-async fn test_scripted_records_condition_on_a_held_delete_holds_across_a_forget() {
+async fn test_scripted_records_condition_on_a_forgotten_delete_is_refused_once() {
     use pubky_switch_core::ops::Condition;
-    // The app's condition on a record it holds as deleted names `{0, 0}`, which matches
-    // the delete while the switch keeps it and the absent key once the switch forgets it
-    // (Switch wire 6.3, spec 10.3): the fenced write goes through both times.
+    // The app's condition on a record it holds as deleted names the delete, which holds
+    // while the switch keeps it (Switch wire 6.3, spec 10.3). Once the switch forgets the
+    // key the condition fails with `{0, 0}` current: the app takes the key as absent, so
+    // the protocol's next condition holds, with no refusal for good.
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
@@ -8132,18 +8190,124 @@ async fn test_scripted_records_condition_on_a_held_delete_holds_across_a_forget(
         OpBatch::new().op_if(OpKind::DenyPut { pubky: [pubky; 32] }, vec![condition])
     };
     let condition = wallet.record_condition(&key).await.unwrap();
+    let Condition::RecordVersion { version, .. } = condition else {
+        panic!("{condition:?}")
+    };
+    assert!(!version.is_none(), "the delete is named by its version");
+    wallet.submit_batch(fenced(condition, 8)).await.unwrap();
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    let refused = wallet.submit_batch(fenced(condition, 9)).await;
     assert_eq!(
-        condition,
+        refused.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{refused:?}"
+    );
+    let absent = wallet.record_condition(&key).await.unwrap();
+    assert_eq!(
+        absent,
         Condition::RecordVersion {
             key,
             version: RecordVersion::NONE
         }
     );
-    wallet.submit_batch(fenced(condition, 8)).await.unwrap();
-    read_on(&mut wallet).await;
+    wallet.submit_batch(fenced(absent, 10)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_records_update_returns_the_conflict_when_a_delete_lands() {
+    // A try built on a value never turns into a create over a delete: the call returns
+    // the conflict, and `change` isn't asked again with nothing (Switch spec 10.3).
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
     read_on(&mut phone).await;
-    assert!(!held_at_switch(&s, &key), "forgotten");
-    wallet.submit_batch(fenced(condition, 9)).await.unwrap();
+    phone.delete_record(&target, vec![]).await.unwrap();
+    let mut asked = Vec::new();
+    let updated = wallet
+        .update_record(&target, vec![], |current| {
+            asked.push(current.map(<[u8]>::to_vec));
+            Some(value(&["a", "b"]))
+        })
+        .await;
+    assert_eq!(
+        updated.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{updated:?}"
+    );
+    assert_eq!(asked, vec![Some(value(&["a"]))], "asked once, on the value");
+    let key = wallet.record_key(&target).unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.content, RecordContent::Deleted);
+}
+
+#[tokio::test]
+async fn test_send_record_job_stops_at_a_delete_its_protocol_hasnt_seen() {
+    // A record job queued against a live value, its write owed, when the app takes a
+    // delete of the record: the job doesn't write over it. It stops, and the protocol is
+    // told which record and which delete, once (Switch spec 10.3).
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("bob");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    // A first message adds the conversation, so the fault below meets the record job.
+    wallet.send(s.note("first")).await.unwrap();
+    let mut message = s.note("hello");
+    message.record = Some(RecordJob {
+        target: target.clone(),
+        tag: b"sent".to_vec(),
+    });
+    s.w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let (msg_id, delivery) = wallet.send(message).await.unwrap();
+    assert!(accepted(&delivery), "{delivery:?}");
+    read_on(&mut phone).await;
+    let deleted = phone.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut wallet).await;
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.is_empty(), "{report:?}");
+    let stopped = async |wallet: &mut App| -> Vec<AppEvent> {
+        wallet
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e, AppEvent::RecordJobStopped { .. }) && e.is_duty())
+            .collect()
+    };
+    let told = stopped(&mut wallet).await;
+    assert!(
+        matches!(
+            told.as_slice(),
+            [AppEvent::RecordJobStopped { msg_id: m, key: k, generation, version, .. }]
+                if *m == msg_id
+                    && *k == key
+                    && RecordVersion::new(*generation, *version) == deleted.version
+        ),
+        "{told:?}"
+    );
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Deleted,
+        "nothing written over it"
+    );
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(stopped(&mut wallet).await.len(), 1, "told once");
 }
 
 /// A listing stopped on the read's page budget has listed the family `sample.items` to its
@@ -8885,6 +9049,7 @@ async fn test_records_own_delete_is_never_refused_for_its_mark() {
 async fn test_records_own_delete_put_back_over_a_flagged_write_keeps_the_mark() {
     let s = Setup::new();
     let (mut wallet, mut phone, target, key) = seen_then_deleted(&s).await;
+    let deleted = wallet.shared_record(&key).await.unwrap().unwrap().version;
     phone.receive(None).await.unwrap();
     phone
         .put_record(&target, &value(&["b"]), vec![])
@@ -8896,7 +9061,7 @@ async fn test_records_own_delete_put_back_over_a_flagged_write_keeps_the_mark() 
     assert_eq!(
         *s.protocol.bases.lock().unwrap(),
         vec![WriteBase {
-            expected_version: RecordVersion::NONE,
+            expected_version: deleted,
             held: true,
             conditions: Vec::new(),
         }]
@@ -10011,7 +10176,7 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     assert_eq!(told, 1, "the protocol is told once");
     assert!(phone.flagged_writes().await.unwrap().is_empty());
     let held = phone.held_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.base_version(), proven);
+    assert_eq!(held.base(&key, None).0, proven);
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(shared.content.value()), vec!["a"]);
     assert!(!shared.flagged);

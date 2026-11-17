@@ -24,7 +24,10 @@
 //!    ([`super::Protocol::sent_record`]), compare-and-swap. One still not made
 //!    [`SENT_RETENTION_MS`] after the message's first acceptance, such as one whose held
 //!    value waits for a key that never comes, is given up, and the protocol told
-//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever.
+//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever. A
+//!    job never writes over a delete its protocol hasn't seen: when the app takes a delete
+//!    of the record that the job wasn't queued against, the job stops and the protocol is
+//!    told ([`AppEvent::RecordJobStopped`]), to decide again.
 //!
 //! The acceptance is committed as soon as the append is answered, before anything else is
 //! done with the answer, so a crash never sends the same bytes again: with it the message
@@ -662,15 +665,20 @@ struct KeptJob {
     natural_key: Vec<u8>,
     #[serde(with = "serde_b64_vec")]
     tag: Vec<u8>,
+    /// The version of the delete the record's next write built on when the job was queued
+    /// ([`super::records::HeldRecord::delete_base`]); `None` when it built on no delete.
+    #[serde(with = "super::records::opt_version_serde")]
+    delete_base: Option<pubky_switch_core::ops::RecordVersion>,
 }
 
 impl KeptJob {
-    fn of(job: &RecordJob) -> Self {
+    fn of(job: &RecordJob, delete_base: Option<pubky_switch_core::ops::RecordVersion>) -> Self {
         Self {
             collection: job.target.collection.name.clone(),
             policy: job.target.collection.policy.clone(),
             natural_key: job.target.natural_key.clone(),
             tag: job.tag.clone(),
+            delete_base,
         }
     }
 
@@ -1156,7 +1164,7 @@ impl App {
             retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let mut items = Vec::new();
         for message in messages {
-            let mut item = self.outbox_item(message)?;
+            let mut item = self.outbox_item(message).await?;
             self.inherit_origin(&mut item, &mut copies)?;
             items.push(item);
         }
@@ -1659,7 +1667,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let mut item = self.outbox_item(&message)?;
+            let mut item = self.outbox_item(&message).await?;
             let mut copies =
                 retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
             self.inherit_origin(&mut item, &mut copies)?;
@@ -1822,11 +1830,24 @@ impl App {
         Ok(reader.exists(&out_key(msg_id)).await? || reader.exists(&sent_key(msg_id)).await?)
     }
 
-    /// The outbox item of a signed message, its jobs owed.
-    pub(crate) fn outbox_item(&self, message: &SignedMessage) -> Result<OutboxItem, AppError> {
+    /// The outbox item of a signed message, its jobs owed; a record job keeps the delete
+    /// its record's next write builds on now, if any.
+    pub(crate) async fn outbox_item(
+        &self,
+        message: &SignedMessage,
+    ) -> Result<OutboxItem, AppError> {
         if message.plaintext.sender_app_id() != self.state.meta.app_id {
             return Err(Refusal::Usage("a message this app didn't sign".into()).into());
         }
+        let record = match &message.record {
+            Some(job) => {
+                let key = self.record_key(&job.target)?;
+                let held = self.held_record(&key).await?;
+                let delete_base = held.and_then(|held| held.delete_base());
+                Some(KeptJob::of(job, delete_base))
+            }
+            None => None,
+        };
         Ok(OutboxItem {
             origin: DeliveryOrigin::Original,
             to: message.to,
@@ -1837,7 +1858,7 @@ impl App {
             invite_code: message.invite_code.clone(),
             conversation: message.conversation,
             sealed: None,
-            record: message.record.as_ref().map(KeptJob::of),
+            record,
             record_done: false,
             accepted_at_ms: None,
             failed: None,
@@ -2487,6 +2508,12 @@ impl App {
                 self.drop_record_job(item).await?;
                 return Ok(false);
             }
+            if self.stop_record_job(&mut item, &job).await? {
+                if item.complete() {
+                    self.finish_item(&item).await?;
+                }
+                return Ok(false);
+            }
             match self.record_job(&item, &job).await {
                 Ok(()) => item.record_done = true,
                 Err(error) if is_local(&error) => return Err(error),
@@ -2638,6 +2665,44 @@ impl App {
             },
         )?;
         self.commit(tx).await
+    }
+
+    /// Stop the record job of `item` when the app took a delete of its record that the
+    /// job wasn't queued against: the job builds the record's next value from what the
+    /// protocol saw, so it never writes over a delete the protocol hasn't seen (Switch spec
+    /// 10.3). In one commit with [`AppEvent::RecordJobStopped`], which names the record and
+    /// the delete, so the protocol decides again. Returns whether it stopped.
+    async fn stop_record_job(
+        &mut self,
+        item: &mut OutboxItem,
+        job: &KeptJob,
+    ) -> Result<bool, AppError> {
+        let key = self.record_key(&job.job().target)?;
+        let Some(deleted) = self
+            .held_record(&key)
+            .await?
+            .and_then(|held| held.delete_base())
+            .filter(|now| job.delete_base != Some(*now))
+        else {
+            return Ok(false);
+        };
+        item.record = None;
+        item.record_done = true;
+        let mut tx = self.tx()?;
+        tx.put(&out_key(&item.msg_id), &*item)?;
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
+            &mut tx,
+            to,
+            Duty::RecordJobStopped {
+                msg_id: item.msg_id.clone(),
+                key,
+                generation: deleted.generation,
+                version: deleted.version,
+            },
+        )?;
+        self.commit(tx).await?;
+        Ok(true)
     }
 
     /// A complete item leaves the outbox; its sent message is kept from its acceptance.
@@ -3229,6 +3294,7 @@ mod tests {
                 policy: pubky_switch_core::ident::Policy::new("scope-a", &["scope-a"]),
                 natural_key: b"n1".to_vec(),
                 tag: Vec::new(),
+                delete_base: None,
             }),
             record_done: false,
             accepted_at_ms: Some(1_000),

@@ -213,7 +213,8 @@ fn apply_op(
             let view = state.record_view(&put.key);
             check_record_put(
                 put,
-                held.map(|h| &h.state),
+                &op.body().conditions,
+                held.map(|h| (&h.state, h.revision)),
                 state.data_epoch(),
                 cert.holds_scope(&put.policy.read_scope),
                 view.as_ref(),

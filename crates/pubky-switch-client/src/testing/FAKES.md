@@ -181,7 +181,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   departed, is at or past it, lagging or not, an app with no cursor here holding every key;
   a key a divergent upload names stays, and with no document held nothing goes. Its read
   is then `404`, its delete shows as its stub and a create at it starts afresh; a
-  `record_version` condition of `{0, 0}` matches it, as it matches a held delete. Unlike
+  `record_version` condition of `{0, 0}` matches it, and only then: while the delete is
+  held, a write or condition names the delete's version, by the one rule of the core
+  (`version_holds`) the service applies too. It has no record quota, so a create at the key
+  limit is `409` here where the service may answer `429` first. Unlike
   the service: it forgets only at a cursor move, so a revocation alone frees nothing until
   the next one, not at the minute's sweep, and every such key at once, not 256 a minute;
   its cursors are `seq`s with no generation; the frozen account's exception has nothing to

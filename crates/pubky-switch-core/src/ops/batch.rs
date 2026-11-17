@@ -425,11 +425,6 @@ pub trait ConditionState {
     /// A record's current version; [`RecordVersion::NONE`] for a record that doesn't exist or
     /// whose key the service forgot.
     fn record_version(&self, key: &[u8; 32]) -> RecordVersion;
-    /// Whether the record's current write is its delete. `false` by default, for a state
-    /// that holds no deleted record.
-    fn record_deleted(&self, _key: &[u8; 32]) -> bool {
-        false
-    }
     /// Whether the caller may see the record's version: it holds the record's read scope, or
     /// the record doesn't exist.
     fn may_read_record(&self, key: &[u8; 32]) -> bool;
@@ -443,7 +438,9 @@ pub trait ConditionState {
     fn server_time(&self) -> u64;
 }
 
-/// Check conditions against the state before the batch (Switch wire 6.3, 6.4 step 8).
+/// Check one operation's conditions against the state before the batch (Switch wire 6.3,
+/// 6.4 step 8). A `record_version` holds by [`crate::shared::version_holds`], so beside the
+/// operation's other conditions.
 ///
 /// # Errors
 ///
@@ -455,7 +452,8 @@ pub fn check_conditions<'a>(
     conditions: impl IntoIterator<Item = &'a Condition>,
     state: &impl ConditionState,
 ) -> std::result::Result<(), Refusal> {
-    for condition in conditions {
+    let conditions: Vec<&Condition> = conditions.into_iter().collect();
+    for condition in conditions.iter().copied() {
         let current = match condition {
             Condition::RecordCurrent {
                 key,
@@ -478,17 +476,9 @@ pub fn check_conditions<'a>(
             }
             Condition::RecordVersion { key, version } => {
                 let now = state.record_version(key);
-                // `{0, 0}` matches a record that is absent, forgotten or deleted, as a
-                // compare-and-swap's `expected_version` does (Switch wire 6.3), so a writer
-                // that holds or follows a delete names it the same way whether or not the
-                // service has forgotten the key since. The deleted case only for a caller
-                // that may read the record: to one that may not, a delete and a live write
-                // look alike, as its feed shows it both as stubs.
-                let holds = if version.version == 0 {
-                    now.is_none() || (state.record_deleted(key) && state.may_read_record(key))
-                } else {
-                    now == *version
-                };
+                let held = state.record_current(key).map(|held| (now, held.revision));
+                let holds =
+                    crate::shared::version_holds(key, *version, held, conditions.iter().copied());
                 (!holds).then(|| {
                     if state.may_read_record(key) {
                         json!({ "record_version": {
@@ -876,7 +866,14 @@ mod tests {
 
     impl ConditionState for State {
         fn record_current(&self, _: &[u8; 32]) -> Option<crate::shared::CurrentRecord> {
-            None
+            (!self.version.is_none()).then_some(crate::shared::CurrentRecord {
+                revision: crate::shared::ApplicationRef {
+                    generation: self.version.generation,
+                    seq: self.version.version,
+                    item_hash: [5; 32],
+                },
+                deleted: self.deleted,
+            })
         }
         fn record_view(&self, _: &[u8; 32]) -> Option<Value> {
             None
@@ -884,9 +881,6 @@ mod tests {
 
         fn record_version(&self, _: &[u8; 32]) -> RecordVersion {
             self.version
-        }
-        fn record_deleted(&self, _: &[u8; 32]) -> bool {
-            self.deleted
         }
         fn may_read_record(&self, _: &[u8; 32]) -> bool {
             self.readable
@@ -922,26 +916,20 @@ mod tests {
         assert!(check_conditions(&[record(1, 6)], &state).is_ok());
         let refused = check_conditions(&[record(1, 5)], &state).unwrap_err();
         assert_eq!(refused.current.unwrap()["record_version"]["version"], 6);
-        // Version 0 holds only for a record that is absent, forgotten or deleted, whatever
-        // the generation; the delete's own version holds too.
-        assert!(check_conditions(&[record(9, 0)], &state).is_err());
+        // Version 0 holds only where the service holds nothing; a kept delete is named by
+        // its own version (each case: `shared::test_version_holds_for_writes_and_conditions`).
+        assert!(check_conditions(&[record(0, 0)], &state).is_err());
         let absent = State {
             version: RecordVersion::NONE,
             ..state
         };
-        assert!(check_conditions(&[record(9, 0)], &absent).is_ok());
+        assert!(check_conditions(&[record(0, 0)], &absent).is_ok());
         let deleted = State {
             deleted: true,
             ..state
         };
-        assert!(check_conditions(&[record(9, 0)], &deleted).is_ok());
+        assert!(check_conditions(&[record(0, 0)], &deleted).is_err());
         assert!(check_conditions(&[record(1, 6)], &deleted).is_ok());
-        // To a caller that may not read the record, a delete looks like a live write.
-        let unreadable = State {
-            readable: false,
-            ..deleted
-        };
-        assert!(check_conditions(&[record(9, 0)], &unreadable).is_err());
         let step = |s| Condition::ClaimStep {
             claim_key: [2; 32],
             step: s,

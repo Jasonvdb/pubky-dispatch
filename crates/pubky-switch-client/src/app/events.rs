@@ -806,6 +806,25 @@ pub enum AppEvent {
         /// The batch the job's latest try left kept, if one did.
         batch_id: Option<[u8; 16]>,
     },
+    /// The shared record write a sent message named ([`super::RecordJob`]) was stopped
+    /// before it was made: the app took a delete of the record that the job wasn't queued
+    /// against, and the job never writes over a delete its protocol hasn't seen (Switch spec
+    /// 10.3). The protocol reads the record and decides again; the delete is at
+    /// (`generation`, `version`), which the service may have forgotten since. A duty event,
+    /// in the commit that stops the job.
+    #[non_exhaustive]
+    RecordJobStopped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The message ID.
+        msg_id: String,
+        /// The record key.
+        key: [u8; 32],
+        /// The delete's generation.
+        generation: u64,
+        /// The delete's version.
+        version: u64,
+    },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
     /// again, since the same answer would come. The read went on. The protocol acts on what
@@ -957,6 +976,7 @@ impl AppEvent {
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
             | Self::RecordJobDropped { id, .. }
+            | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
@@ -1175,6 +1195,13 @@ pub(crate) enum Duty {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<String>,
     },
+    RecordJobStopped {
+        msg_id: String,
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        generation: u64,
+        version: u64,
+    },
     LocalWritesRefused {
         call: KeptRefusal,
     },
@@ -1318,6 +1345,18 @@ impl Duty {
                 msg_id,
                 batch_id: batch_id
                     .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
+            },
+            Self::RecordJobStopped {
+                msg_id,
+                key,
+                generation,
+                version,
+            } => AppEvent::RecordJobStopped {
+                id,
+                msg_id,
+                key,
+                generation,
+                version,
             },
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,

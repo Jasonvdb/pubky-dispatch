@@ -3903,12 +3903,31 @@ impl App {
     /// a time that went back, and a rollback for an answer that contradicts itself (Switch
     /// spec 10.1).
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
+        self.take_answer(result, true).await
+    }
+
+    /// [`App::take`] for an answer that binds no request of the app's, the public read's
+    /// (Switch wire 7.1 "Identical requests"): it may be an earlier answer sent again, so it
+    /// shows nothing about the account now, and starts no erasure wait over.
+    pub(crate) async fn take_unbound<T>(
+        &mut self,
+        result: Result<T, ClientError>,
+    ) -> Result<T, AppError> {
+        self.take_answer(result, false).await
+    }
+
+    async fn take_answer<T>(
+        &mut self,
+        result: Result<T, ClientError>,
+        bound: bool,
+    ) -> Result<T, AppError> {
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
         }
-        // An answer verified with the pinned key, an error answer included: the account is
-        // there, and the erasure wait starts over (Switch spec 12.7).
-        if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
+        // An answer verified with the pinned key, an error answer included, to a request the
+        // app signed: the account is there, and the erasure wait starts over (Switch spec
+        // 12.7).
+        if bound && matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
             self.clear_erasing().await?;
         }
         if result.is_err() {

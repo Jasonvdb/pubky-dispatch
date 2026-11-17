@@ -8,6 +8,9 @@
 
 mod support;
 
+#[path = "endpoints_connect/push.rs"]
+mod push;
+
 use pubky_switch::http::{Handler, SwitchRequest, SwitchResponse};
 use pubky_switch::limits::Limits;
 use pubky_switch_core::enc::pubky_id;
@@ -74,12 +77,13 @@ fn bob() -> [u8; 32] {
 }
 
 /// alice's version 4, turning connect requests on with `max_pending`, delivered.
-async fn take_connect_requests(replay: &Replay, max_pending: u64) {
+async fn take_connect_requests(replay: &Replay, max_pending: u64, push: bool) {
     let v3 = doc("alice identity.json");
     let mut body: IdentityBody =
         serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
     body.version = 4;
     body.policy.connect_requests.enabled = true;
+    body.policy.connect_requests.push = push;
     body.policy.connect_requests.max_pending = max_pending;
     let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
     let v4 = IdentityDoc::sign(&key, body)
@@ -124,7 +128,7 @@ async fn deliver_bob(replay: &Replay) {
 async fn serving(limits: Limits, max_pending: u64) -> Option<Replay> {
     let replay = replay_with(limits).await?;
     replay_chain_through_revoke(&replay).await;
-    take_connect_requests(&replay, max_pending).await;
+    take_connect_requests(&replay, max_pending, false).await;
     deliver_bob(&replay).await;
     Some(replay)
 }
@@ -275,7 +279,7 @@ async fn test_connect_request_needs_the_senders_document() {
     // No copy of bob's document lists the shop: `409 identity_needed`, nothing kept.
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    take_connect_requests(&replay, 50).await;
+    take_connect_requests(&replay, 50, false).await;
     let asked = ask(&replay).await;
     assert_eq!(code(&asked), (409, json!("identity_needed")));
     assert!(requested(&list(&replay, "wallet").await).is_empty());
@@ -599,7 +603,7 @@ async fn answer_to(asker: Asker, max_pending: Option<u64>, copy: bool) -> Option
     let replay = replay().await?;
     replay_chain_through_revoke(&replay).await;
     if let Some(max_pending) = max_pending {
-        take_connect_requests(&replay, max_pending).await;
+        take_connect_requests(&replay, max_pending, false).await;
         if copy {
             deliver_bob(&replay).await;
         }
@@ -1157,15 +1161,8 @@ async fn test_connect_request_kept_at_the_service_time() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_connect_request_decline_needs_conversation_add() {
-    // An own app whose certificate holds `lists.read` but not `conversation.add` reads the
-    // requests, but its decline is `403 permission_missing`, and the request stays until
-    // the wallet declines it.
-    let Some(replay) = serving(Limits::default(), 50).await else {
-        return;
-    };
-    assert!(pending(&ask(&replay).await));
+/// Add a current app that can read the list and has no other switch permissions.
+async fn add_list_reader(replay: &Replay) -> Fresh {
     let keys = vectors("keys.json");
     let alice_identity = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
     let secret = [91; 32];
@@ -1270,6 +1267,19 @@ async fn test_connect_request_decline_needs_conversation_add() {
         "{}",
         String::from_utf8_lossy(&registered.body)
     );
+    reader
+}
+
+#[tokio::test]
+async fn test_connect_request_decline_needs_conversation_add() {
+    // An own app whose certificate holds `lists.read` but not `conversation.add` reads the
+    // requests, but its decline is `403 permission_missing`, and the request stays until
+    // the wallet declines it.
+    let Some(replay) = serving(Limits::default(), 50).await else {
+        return;
+    };
+    assert!(pending(&ask(&replay).await));
+    let reader = add_list_reader(&replay).await;
     let read = replay
         .service
         .handle(reader.request("GET", &format!("/v1/{}/connect", alice_id()), Vec::new()))

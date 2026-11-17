@@ -124,3 +124,72 @@ pub async fn push_registration(world: &World) -> FlowResult {
     world.outcome("signer ran what is due", &status(&signer)?);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
+    use pubky_switch_core::{
+        enc::unb64_array,
+        http::{header, verify_webhook},
+        records::ConnectRequests,
+    };
+    use tokio::{net::TcpListener, sync::mpsc};
+
+    use super::*;
+    use crate::{Backend, run};
+
+    async fn connect_wake(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let mut owner = enroll(world, &alice, ORIGIN).await?;
+        let mut sender = enroll(world, &bob, ORIGIN).await?;
+        let (mut wallet, _) = joined(world, &alice, &mut owner, "wallet").await?;
+        let (mut shop, _) = joined(world, &bob, &mut sender, "shop").await?;
+        owner
+            .set_connect_requests(ConnectRequests {
+                enabled: true,
+                push: true,
+                ..Default::default()
+            })
+            .await?;
+        let registration = wallet.register_push(&Relay, RELAY_URL, "phone").await?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let delivery = world.push_service(ORIGIN, listener.local_addr()?)?;
+        let (wakes, mut received) = mpsc::unbounded_channel();
+        let relay = Router::new().route(
+            "/v1/hook",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let wakes = wakes.clone();
+                async move {
+                    let _ = wakes.send((headers, body));
+                }
+            }),
+        );
+        let serving = tokio::spawn(async move { axum::serve(listener, relay).await });
+
+        assert!(shop.ask_to_connect(&alice.public()).await?);
+        let sent = delivery.deliver_pushes().await;
+        serving.abort();
+        assert_eq!(sent.delivered, 1);
+        let (headers, body) = received.try_recv()?;
+        let signature = unb64_array(headers[header::SIGNATURE].to_str()?)?;
+        verify_webhook(&registration.push_key, RELAY_URL, &body, &signature)?;
+        let hook: Value = serde_json::from_slice(&body)?;
+        assert_eq!(hook.as_object().map(|v| v.len()), Some(4));
+        assert_eq!(hook["v"], 1);
+        assert_eq!(hook["handle"], "phone at the relay");
+        assert_eq!(hook["ts"], pubky_switch_core::time::rfc3339(world.now_ms()));
+        unb64_array::<16>(hook["nonce"].as_str().ok_or("nonce")?)?;
+        let list = wallet.connect_requests().await?;
+        assert_eq!(list.requests.len(), 1);
+        assert_eq!(list.requests[0].pubky, bob.public());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connect_push_wakes_registered_app() -> FlowResult {
+        Box::pin(run(Backend::Service, connect_wake)).await?;
+        Ok(())
+    }
+}

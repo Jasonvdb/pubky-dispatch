@@ -533,3 +533,119 @@ async fn test_backup_sent_give_up_stands_after_a_restore() {
     })
     .await;
 }
+
+/// A delivery the store gave up after the backup, and told the protocol of, stands at a
+/// restore in place from that backup: a re-send the backup still owes of an accepted
+/// message, or the first delivery of one never accepted, carried or left out of its outbox,
+/// isn't put back, nothing goes and nothing is told again. A give-up mark of the store that
+/// doesn't read is counted.
+#[tokio::test]
+async fn test_backup_sent_restore_in_place_keeps_a_give_up_since_the_backup() {
+    Box::pin(async {
+        for (accepted, left_out) in [(true, false), (false, false), (false, true)] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(
+                    &p.alice,
+                    "wallet",
+                    protocol.clone(),
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                )
+                .await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            let alice = p.alice.identity().public();
+            let msg_id = if accepted {
+                shop.invite(&alice).await.unwrap();
+                let (msg_id, _) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+                p.bob.switch().fail_next(Fault::Unreachable {
+                    path: "inbox".into(),
+                    after: 0,
+                });
+                let resent = wallet.resend(&msg_id).await.unwrap();
+                assert!(matches!(resent, Delivery::Queued { .. }), "{resent:?}");
+                msg_id
+            } else {
+                let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+                let msg_id = wallet.queue_signed(signed).await.unwrap();
+                wallet.flush_outbox().await.unwrap();
+                msg_id
+            };
+            let mut backup = wallet.backup().await.unwrap();
+            if left_out {
+                // As a backup past its outbox budget leaves the message out.
+                let mut value: Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+                value["outbox"] = json!([]);
+                value["outbox_left_out"] = json!([[msg_id, false]]);
+                backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+            let events = wallet.take_events();
+            assert_eq!(undelivered(&events, &msg_id), vec![accepted]);
+            // The protocol acted on it: the store keeps no event a restore would carry.
+            let told = events
+                .iter()
+                .filter_map(AppEvent::id)
+                .max_by_key(|id| id.counter())
+                .unwrap();
+            wallet.ack_events(told).await.unwrap();
+            drop(wallet);
+            if !accepted {
+                shop.invite(&alice).await.unwrap();
+            }
+            let entries = p.bob.switch().entries_from(&alice);
+            let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+            let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+                .await
+                .unwrap();
+            let mut events = restored.take_events();
+            restored.flush_outbox().await.unwrap();
+            events.extend(restored.take_events());
+            assert_eq!(
+                p.bob.switch().entries_from(&alice),
+                entries,
+                "accepted: {accepted}, left out: {left_out}: not delivered again"
+            );
+            assert_eq!(
+                undelivered(&events, &msg_id),
+                Vec::<bool>::new(),
+                "accepted: {accepted}, left out: {left_out}: told once"
+            );
+            assert!(restored.outbox_record(&msg_id).await.is_none());
+            drop(restored);
+
+            // The same restore over a mark that doesn't read: counted, as a record is.
+            let ns = crate::store::client_namespace(&backup_app(&p));
+            let mut batch = crate::store::WriteBatch::new();
+            batch
+                .put(
+                    &ns,
+                    format!("outgone/{msg_id}").into_bytes(),
+                    b"not a value".to_vec(),
+                )
+                .unwrap();
+            store.commit(batch).unwrap();
+            let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+            let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+                .await
+                .unwrap();
+            assert!(
+                restored.take_events().iter().any(|e| matches!(
+                    e,
+                    AppEvent::RestoreLeftBehind {
+                        sent_messages: 1,
+                        ..
+                    }
+                )),
+                "accepted: {accepted}: the mark is counted"
+            );
+        }
+    })
+    .await;
+}
+
+/// The App ID of alice's wallet.
+fn backup_app(p: &Pair) -> [u8; 16] {
+    p.alice.identity().app_keys("wallet").app_id_bytes()
+}

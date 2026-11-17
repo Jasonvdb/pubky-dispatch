@@ -737,7 +737,8 @@ pub enum AppEvent {
         /// (Switch spec 12.4 "Sent messages"): those the backup left out past
         /// [`super::MAX_CARRIED_SENT_BYTES`], a record of the store restored in place no
         /// newer than the oldest the backup carries taken as one of them; those this restore
-        /// left out past it; and those of that store that didn't read as this app's.
+        /// left out past it; and those of that store, or their give-up marks, that didn't read
+        /// as this app's.
         /// [`super::App::delivery`] answers `None` for each.
         sent_messages: u64,
     },

@@ -969,6 +969,11 @@ pub(crate) struct CarriedSent {
 }
 
 impl CarriedSent {
+    /// The message's `msg_id`.
+    pub(crate) fn msg_id(&self) -> &str {
+        &self.record.msg_id
+    }
+
     /// The bytes it takes in a restore's commit to the namespace `ns`, every write that
     /// installs it ([`CarriedSent::put`]) counted as the store counts it, without its
     /// plaintext when `bare`. The one measure of [`MAX_CARRIED_SENT_BYTES`].
@@ -1140,9 +1145,10 @@ pub(crate) fn check_carried_sent(
 }
 
 /// The sent messages the store `reader`, restored in place, holds as this app's, each with
-/// its give-up mark: each read under its own `msg_id` and signed by the app `meta` and
-/// `cert` name; and how many it holds that aren't, which a restore leaves behind and counts,
-/// as it does a damaged value of what the store owes its protocol.
+/// its give-up mark, if one reads ([`store_give_ups`] counts one that doesn't): each read
+/// under its own `msg_id` and signed by the app `meta` and `cert` name; and how many records
+/// it holds that don't read so, which a restore leaves behind and counts, as it does a
+/// damaged value of what the store owes its protocol.
 pub(crate) async fn sent_of_store(
     reader: &super::state::Reader,
     meta: &super::state::Meta,
@@ -1153,7 +1159,7 @@ pub(crate) async fn sent_of_store(
     for (msg_id, bytes) in reader.scan_raw(SENT_PREFIX).await? {
         match super::state::decode::<SentStored>(&bytes) {
             Ok(record) if record.msg_id == msg_id && record.is_own(meta, cert) => {
-                let given_up_until_ms = reader.get(&given_up_key(&msg_id)).await.ok().flatten();
+                let (given_up_until_ms, _) = mark_of(reader, &msg_id).await?;
                 kept.push(CarriedSent {
                     record,
                     given_up_until_ms,
@@ -1163,6 +1169,61 @@ pub(crate) async fn sent_of_store(
         }
     }
     Ok((kept, lost))
+}
+
+/// The give-up mark of `msg_id` that the store `reader` holds, if one reads, and how many
+/// don't (0 or 1).
+async fn mark_of(
+    reader: &super::state::Reader,
+    msg_id: &str,
+) -> Result<(Option<u64>, u64), AppError> {
+    Ok(
+        match reader.get_raw(given_up_key(msg_id).as_bytes()).await? {
+            None => (None, 0),
+            Some(bytes) => match super::state::decode::<u64>(&bytes) {
+                Ok(until) => (Some(until), 0),
+                Err(_) => (None, 1),
+            },
+        },
+    )
+}
+
+/// The give-ups the store `reader`, restored in place, holds of the messages `msg_ids`,
+/// each named once,
+/// that still stand at `now` ([`given_up`]: until the time the mark holds, and while an
+/// outbox or sent copy remains), each with that time; and how many marks don't read, which
+/// the restore leaves behind and counts. The store told its protocol of each give-up, so a
+/// restore delivers none of those messages again and tells none of them again (Switch spec
+/// 12.4 "Sent messages").
+pub(crate) async fn store_give_ups<'a>(
+    reader: &super::state::Reader,
+    msg_ids: impl IntoIterator<Item = &'a str>,
+    now: u64,
+) -> Result<(BTreeMap<String, u64>, u64), AppError> {
+    let mut standing = BTreeMap::new();
+    let mut lost = 0u64;
+    let msg_ids: BTreeSet<&str> = msg_ids.into_iter().collect();
+    for msg_id in msg_ids {
+        let (until, unread) = mark_of(reader, msg_id).await?;
+        lost = lost.saturating_add(unread);
+        if let Some(until) = until
+            && (now <= until
+                || reader.exists(&out_key(msg_id)).await?
+                || reader.exists(&sent_key(msg_id)).await?)
+        {
+            standing.insert(msg_id.to_owned(), until);
+        }
+    }
+    Ok((standing, lost))
+}
+
+/// Put the give-up mark of `msg_id`, standing until `until`, in `tx`.
+pub(crate) fn put_give_up(
+    tx: &mut super::state::Tx,
+    msg_id: &str,
+    until: u64,
+) -> Result<(), AppError> {
+    tx.put(&given_up_key(msg_id), &until)
 }
 
 /// The sent messages a restore installs (Switch spec 12.4 "Sent messages").
@@ -1201,15 +1262,29 @@ impl RestoredSent {
 
     /// The outbox `outbox` a backup carries, as the restore puts it back: an item whose
     /// store never saw its message accepted takes the acceptance a store restored in place
-    /// holds ([`OutboxItem::take_acceptance`]), and goes once nothing else of it is owed.
-    pub(crate) fn outbox(&self, outbox: &[OutboxItem]) -> Vec<OutboxItem> {
+    /// holds ([`OutboxItem::take_acceptance`]); an item whose delivery that store gave up
+    /// since (`given_up`, [`store_give_ups`]) owes it no more, as the give-up left it: a
+    /// message never accepted isn't put back, and one accepted before stays only for a
+    /// record job still owed. Each goes once nothing else of it is owed.
+    pub(crate) fn outbox(
+        &self,
+        outbox: &[OutboxItem],
+        given_up: &BTreeMap<String, u64>,
+    ) -> Vec<OutboxItem> {
         outbox
             .iter()
-            .filter_map(|item| match self.get(&item.msg_id) {
-                Some(sent) if item.accepted_at_ms.is_none() && !item.resend_queued => {
-                    item.clone().take_acceptance(sent.first_ms)
+            .filter_map(|item| {
+                let item = match self.get(&item.msg_id) {
+                    Some(sent) if item.accepted_at_ms.is_none() && !item.resend_queued => {
+                        item.clone().take_acceptance(sent.first_ms)?
+                    }
+                    _ => item.clone(),
+                };
+                if item.delivery_owed() && given_up.contains_key(&item.msg_id) {
+                    item.give_up_delivery().0
+                } else {
+                    Some(item)
                 }
-                _ => Some(item.clone()),
             })
             .collect()
     }

@@ -220,7 +220,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   store never saw it accepted, while the restored `sent/` holds it, takes that acceptance
   (`RestoredSent::outbox`): no delivery owed, its hold ended, kept only for a record job
   still owed; a message the backup left out of its outbox as never accepted that the
-  restore holds as sent is accepted, neither given up nor told. `RestoreLeftBehind`
+  restore holds as sent is accepted, neither given up nor told. A store's `outgone/` mark of
+  a message the backup queues that still stands (`send::store_give_ups`) is kept: the
+  store told the protocol of that give-up, so the restore puts back no delivery of it, a
+  first delivery or a re-send (the item kept only for a record job still owed), and tells
+  nothing again of one the backup left out; a mark that doesn't read is left behind and
+  counted. `RestoreLeftBehind`
   counts each message the restored app doesn't know were accepted once: a store's message
   no newer than the oldest the backup carries, when the backup left some out, is taken as
   one of those. The store's copies go after the backup's state in the commit, and count

@@ -1493,12 +1493,13 @@ impl App {
     /// acceptances `sent` holds taken in ([`send::RestoredSent::outbox`]). The messages the
     /// backup left out past its budget are told to the protocol as undelivered, in the same
     /// commit, but for one `sent` holds as accepted that the backup's store never saw
-    /// accepted.
+    /// accepted, and one the store restored in place gave up (`given_up`), told then.
     fn reinstall_outbox(
         &mut self,
         backup: &AppBackup,
         outbox: &[send::OutboxItem],
         sent: &send::RestoredSent,
+        given_up: &BTreeMap<String, u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let baseline = backup
@@ -1549,9 +1550,9 @@ impl App {
         for (msg_id, resend) in &backup.outbox_left_out {
             // One the backup's store never saw accepted that the store restored in place
             // holds as sent was accepted: no delivery of it is owed, so nothing is given up,
-            // and the restore replaces the store's outbox as it replaces every other
-            // (Switch spec 12.4 "Sent messages").
-            if !resend && sent.holds(msg_id) {
+            // and the restore replaces the store's outbox as it replaces every other; one
+            // that store gave up was told then (Switch spec 12.4 "Sent messages").
+            if (!resend && sent.holds(msg_id)) || given_up.contains_key(msg_id) {
                 continue;
             }
             self.keep_duty(
@@ -2078,6 +2079,10 @@ impl App {
             // and is never told undelivered (Switch spec 12.4 "Sent messages"). The outbox
             // goes back with the acceptances they hold taken in.
             let (store_sent, sent_unread) = send::sent_of_store(&old, &meta, &cert).await?;
+            let store_sent_ids: Vec<String> = store_sent
+                .iter()
+                .map(|sent| sent.msg_id().to_owned())
+                .collect();
             let sent = send::restored_sent(
                 &backup.sent,
                 store_sent,
@@ -2086,7 +2091,25 @@ impl App {
                 &ns,
             )
             .map_err(invalid)?;
-            let outbox = sent.outbox(&backup.outbox);
+            // The give-ups the store made of the messages the backup queues or either holds
+            // as sent: each was told, so the restore neither delivers nor tells it again.
+            let (store_give_ups, marks_unread) = send::store_give_ups(
+                &old,
+                backup
+                    .outbox
+                    .iter()
+                    .map(send::OutboxItem::msg_id)
+                    .chain(
+                        backup
+                            .outbox_left_out
+                            .iter()
+                            .map(|(msg_id, _)| msg_id.as_str()),
+                    )
+                    .chain(store_sent_ids.iter().map(String::as_str)),
+                env.clock.now_ms(),
+            )
+            .await?;
+            let outbox = sent.outbox(&backup.outbox, &store_give_ups);
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
@@ -2369,7 +2392,7 @@ impl App {
                 for msg_id in &old_message_holds {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }
-                app.reinstall_outbox(backup, &outbox, &sent, &mut tx)?;
+                app.reinstall_outbox(backup, &outbox, &sent, &store_give_ups, &mut tx)?;
                 // The sent messages as the backup carries them; those past their retention
                 // by now go at the next prune.
                 for copy in sent.records(true) {
@@ -2415,6 +2438,12 @@ impl App {
                 for copy in sent.records(false) {
                     copy.put(&mut tx)?;
                 }
+                // A sent copy installed carries its own, the later of the two.
+                for (msg_id, until) in &store_give_ups {
+                    if !sent.holds(msg_id) {
+                        send::put_give_up(&mut tx, msg_id, *until)?;
+                    }
+                }
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
                     let in_backup = from_backup
@@ -2440,7 +2469,10 @@ impl App {
                 // So are the sent messages the restored app doesn't know were accepted, each
                 // once, and those of the store that didn't read as this app's.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
-                let lost_sent = sent.left_out.saturating_add(sent_unread);
+                let lost_sent = sent
+                    .left_out
+                    .saturating_add(sent_unread)
+                    .saturating_add(marks_unread);
                 if carried.lost_duties > 0 || lost_owed > 0 || lost_sent > 0 {
                     app.keep_duty(
                         &mut tx,

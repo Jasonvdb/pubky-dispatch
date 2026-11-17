@@ -326,8 +326,6 @@ pub(crate) struct Inner {
     pub(crate) applied: Vec<SignedOp>,
     /// The signed freeze while the account is frozen (Switch spec 12.5).
     pub(crate) frozen: Option<SignedDoc>,
-    /// Whether a frozen account's feed pages carry the freeze.
-    pub(crate) freeze_in_feed: bool,
     /// A staged account: everything but uploads answers `503 staged`.
     pub(crate) staged: bool,
     /// Whether a retained safety baseline requires an authorized recovery start.
@@ -475,7 +473,6 @@ impl Inner {
             next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
-            freeze_in_feed: true,
             staged: false,
             activation: AccountActivation::Ordinary,
             recovery_from: None,
@@ -2694,9 +2691,7 @@ impl Inner {
         if let Some(checkpoint) = &self.checkpoint {
             page["checkpoint"] = checkpoint.to_value();
         }
-        if let Some(freeze) = &self.frozen
-            && self.freeze_in_feed
-        {
+        if let Some(freeze) = &self.frozen {
             page["freeze"] = json!(freeze);
         }
         // The reader's feed read ends its lagging mark, unless it reads no entry (Switch wire

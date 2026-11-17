@@ -229,11 +229,29 @@ impl StateStore for DeliveryReadFault {
     }
 }
 
-async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage) {
+/// Keep a batch whose settlement removes the delivery's local fact. With `ahead`, a batch
+/// with no local writes is kept first, and the removal is kept unsent behind it.
+async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage, ahead: bool) {
     p.alice.switch().fail_next(Fault::Unanswered {
         path: "ops".into(),
         after: 0,
     });
+    if ahead {
+        app.submit_batch(OpBatch::new().op(OpKind::AllowPut {
+            pubky: [8; 32],
+            kind: pubky_switch_core::ops::AllowKind::Conversation,
+        }))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+        // The kept batch's resend is answered `410 moved`, so the removal is kept behind it.
+        p.alice.switch().fail_next(Fault::Error {
+            path: "ops".into(),
+            code: ErrorCode::Moved,
+            current: Value::Null,
+        });
+    }
     app.submit_batch(
         OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
@@ -256,103 +274,124 @@ async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage) {
 
 #[tokio::test]
 async fn test_delivery_view_rechecks_after_kept_local_settlement() {
+    // No outward effect of a try goes on a decision a kept settlement changed after it:
+    // the removal settles in the try's first write, or, kept behind another batch, at the
+    // next try, and neither the conversation entry nor the append goes out.
     Box::pin(async {
-        let p = Pair::new();
-        let protocol = ApiProtocol::new(Mode::Plain);
-        protocol
-            .require_send_fact
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let store = Arc::new(MemoryStore::new());
-        let mut wallet = p
-            .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
-            .await;
-        let mut shop = p.join(&p.bob, "shop", &protocol).await;
-        shop.invite(&p.alice.identity().public()).await.unwrap();
-        let signed = wallet
-            .sign_message(Pair::note(&p.bob, "settlement decision"))
-            .unwrap();
-        wallet.queue_signed(signed.clone()).await.unwrap();
-        let fact = delivery_fact(&wallet, signed.plaintext());
-        wallet
-            .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
-            .await
-            .unwrap();
-        keep_fact_removal(&p, &mut wallet, &signed).await;
-        assert!(listed_origin(&wallet, &signed).await.may_send);
-        wallet.flush_message(signed.msg_id()).await.unwrap();
-        assert_eq!(
-            wallet.protocol_get("sample", b"settled").await.unwrap(),
-            Some(b"yes".to_vec())
-        );
-        assert!(
+        for ahead in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            protocol
+                .require_send_fact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            let bob = p.bob.identity().public();
+            let signed = wallet
+                .sign_message(Pair::note(&p.bob, "settlement decision"))
+                .unwrap();
+            wallet.queue_signed(signed.clone()).await.unwrap();
+            let fact = delivery_fact(&wallet, signed.plaintext());
             wallet
-                .protocol_get("sample", &delivery_key(signed.msg_id()))
+                .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
+                .await
+                .unwrap();
+            keep_fact_removal(&p, &mut wallet, &signed, ahead).await;
+            assert!(listed_origin(&wallet, &signed).await.may_send);
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            if ahead {
+                assert!(
+                    !wallet.admits(&bob).await.unwrap(),
+                    "no entry is written while a batch is kept ahead of it"
+                );
+                assert_eq!(wallet.kept_batches().await.unwrap().len(), 1);
+                wallet.flush_message(signed.msg_id()).await.unwrap();
+            }
+            assert_eq!(
+                wallet.protocol_get("sample", b"settled").await.unwrap(),
+                Some(b"yes".to_vec())
+            );
+            assert!(
+                wallet
+                    .protocol_get("sample", &delivery_key(signed.msg_id()))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !wallet.admits(&bob).await.unwrap(),
+                "a settlement that holds the message admits no counterparty"
+            );
+            let item: Value = wallet
+                .reader()
+                .get(&format!("out/{}", signed.msg_id()))
                 .await
                 .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            p.bob.switch().entries_from(&p.alice.identity().public()),
-            0,
-            "committed policy must hold the append after settlement"
-        );
-        let queued = wallet.delivery(signed.msg_id()).await.unwrap();
-        assert!(
-            matches!(
-                &queued,
-                Some(Delivery::Queued {
-                    tries: 1,
-                    last_error: None,
-                    undeliverable_since_ms: None,
-                    ..
-                })
-            ),
-            "{queued:?}"
-        );
-        let item: Value = wallet
-            .reader()
-            .get(&format!("out/{}", signed.msg_id()))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            item["conversation"], false,
-            "earlier completed work stays durable"
-        );
-        assert!(wallet.kept_batches().await.unwrap().is_empty());
-        let id = wallet.app_id();
-        drop(wallet);
-        let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
-            .await
-            .unwrap();
-        wallet.flush_message(signed.msg_id()).await.unwrap();
-        assert_eq!(
-            wallet.delivery(signed.msg_id()).await.unwrap(),
-            queued,
-            "an already held round adds no try or error"
-        );
-        let other = wallet
-            .sign_message(Pair::note(&p.bob, "independent"))
-            .unwrap();
-        wallet.queue_signed(other.clone()).await.unwrap();
-        wallet
-            .protocol_commit(
-                "sample",
-                &[fact_write(
-                    other.msg_id(),
-                    &delivery_fact(&wallet, other.plaintext()),
-                )],
-            )
-            .await
-            .unwrap();
-        assert_eq!(wallet.flush_outbox().await.unwrap().done, [other.msg_id()]);
-        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
-        wallet
-            .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
-            .await
-            .unwrap();
-        wallet.flush_message(signed.msg_id()).await.unwrap();
-        assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+                .unwrap();
+            assert_eq!(
+                item["conversation"], true,
+                "the held message's conversation entry waits with it"
+            );
+            assert_eq!(
+                p.bob.switch().entries_from(&p.alice.identity().public()),
+                0,
+                "committed policy must hold the append after settlement"
+            );
+            let queued = wallet.delivery(signed.msg_id()).await.unwrap();
+            let Some(Delivery::Queued {
+                tries,
+                last_error,
+                undeliverable_since_ms: None,
+                ..
+            }) = &queued
+            else {
+                panic!("{queued:?}");
+            };
+            assert_eq!(
+                (*tries, last_error.is_some()),
+                (u64::from(ahead), ahead),
+                "only a try that waited for a kept batch counts: {queued:?}"
+            );
+            assert!(wallet.kept_batches().await.unwrap().is_empty());
+            let id = wallet.app_id();
+            drop(wallet);
+            let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
+                .await
+                .unwrap();
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(
+                wallet.delivery(signed.msg_id()).await.unwrap(),
+                queued,
+                "an already held message adds no try or error"
+            );
+            let other = wallet
+                .sign_message(Pair::note(&p.bob, "independent"))
+                .unwrap();
+            wallet.queue_signed(other.clone()).await.unwrap();
+            wallet
+                .protocol_commit(
+                    "sample",
+                    &[fact_write(
+                        other.msg_id(),
+                        &delivery_fact(&wallet, other.plaintext()),
+                    )],
+                )
+                .await
+                .unwrap();
+            assert_eq!(wallet.flush_outbox().await.unwrap().done, [other.msg_id()]);
+            assert!(wallet.admits(&bob).await.unwrap());
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+            wallet
+                .protocol_commit("sample", &[fact_write(signed.msg_id(), &fact)])
+                .await
+                .unwrap();
+            wallet.flush_message(signed.msg_id()).await.unwrap();
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
+        }
     })
     .await;
 }
@@ -387,7 +426,7 @@ async fn test_delivery_view_settlement_failure_resolves_before_another_try() {
                     )
                     .await
                     .unwrap();
-                keep_fact_removal(&p, &mut wallet, &signed).await;
+                keep_fact_removal(&p, &mut wallet, &signed, false).await;
                 let id = wallet.app_id();
                 drop(wallet);
                 let fault = Arc::new(SettlementFault {

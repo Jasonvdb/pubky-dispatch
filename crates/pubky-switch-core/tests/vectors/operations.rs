@@ -315,13 +315,22 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         format!(r#""key":{}"#, text(&json!(key))),
         format!(r#""key":{}"#, text(&json!(b64e(&named_key)))),
     );
+    // The delete without its claim condition: a service checks conditions before shapes
+    // (wire 6.4 steps 8 and 9), so a failing condition would answer first.
+    let delete = arr(v, "operations")
+        .iter()
+        .find(|o| st(o, "name") == "record.put delete")
+        .unwrap();
+    let delete = st(delete, "body");
+    let start = delete.find(r#""conditions":"#).unwrap();
+    let conditions = &delete[start..start + delete[start..].find(r#""op":"#).unwrap()];
     cases.push(shape_case(
         keys,
         v,
         identity,
         "record.put: a delete at a permanent policy",
         "record.put delete",
-        &[(&scopes, &made_permanent("null"))],
+        &[(conditions, ""), (&scopes, &made_permanent("null"))],
     ));
     cases.push(shape_case(
         keys,

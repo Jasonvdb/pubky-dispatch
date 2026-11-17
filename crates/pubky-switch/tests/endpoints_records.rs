@@ -1611,7 +1611,7 @@ async fn test_record_current_conflict_respects_read_scope() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"privacy", "tasks_people").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
     let put = record_put(
@@ -1705,7 +1705,7 @@ async fn test_record_current_store_failure_and_restart_keep_application() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"durable", "tasks").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let seq = last_seq(&replay).await;
     let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
@@ -1820,7 +1820,7 @@ async fn test_record_current_stored_reference_is_checked() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"corrupt", "tasks").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let old_seq = last_seq(&replay).await;
     let put = record_put(
@@ -1904,14 +1904,7 @@ async fn test_record_current_generated_condition_is_applied() {
     let revision = bound[0].record_revision().expect("revision");
     assert_eq!(revision.item_hash, op.item_hash().expect("hash"));
     assert_eq!(revision.seq, 10);
-    let read = body(
-        &get_as(
-            &replay,
-            "wallet",
-            &format!("records/{}?revision=1", b64(&key)),
-        )
-        .await,
-    );
+    let read = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     assert_eq!(
         read["revision"],
         serde_json::from_slice::<Value>(&revision.to_json().expect("reference"))

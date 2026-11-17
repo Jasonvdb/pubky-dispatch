@@ -1194,9 +1194,9 @@ async fn test_store_record_origin_checks_refuse_mixed_rows() {
     let insert = |columns: &str, values: &str| {
         format!(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, application_generation, application_seq, application_item_hash, \
+             permanent, generation, version, application_generation, application_seq, application_item_hash, \
              deleted, value_bytes, writer, cert, op{columns}) VALUES \
-             ($1, $2, $2, 'tasks', '{{tasks}}', 1, 1, 1, 1, $2, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
+             ($1, $2, $2, 'tasks', '{{tasks}}', false, 1, 1, 1, 1, $2, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
         )
     };
     let cases = [
@@ -1292,9 +1292,9 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
     for i in 1u8..=3 {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, application_generation, application_seq, application_item_hash, \
+             permanent, generation, version, application_generation, application_seq, application_item_hash, \
              deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'tasks', '{tasks}', 1, $4, 1, $4, $2, true, 0, $5, '\\x', '\\x', '\\x')",
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', false, 1, $4, 1, $4, $2, true, 0, $5, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([i; 32].as_slice())
@@ -1411,9 +1411,9 @@ async fn test_store_forget_compares_whole_positions() {
     for (key, generation, version) in [(1u8, 1i64, 100i64), (2, 2, 11)] {
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
-             generation, version, application_generation, application_seq, application_item_hash, \
+             permanent, generation, version, application_generation, application_seq, application_item_hash, \
              deleted, value_bytes, writer, cert, op, proof) \
-             VALUES ($1, $2, $3, 'tasks', '{tasks}', $4, $5, $4, $5, $2, true, 0, $6, '\\x', '\\x', '\\x')",
+             VALUES ($1, $2, $3, 'tasks', '{tasks}', false, $4, $5, $4, $5, $2, true, 0, $6, '\\x', '\\x', '\\x')",
         )
         .bind(ID_A)
         .bind([key; 32].as_slice())

@@ -142,11 +142,7 @@ impl Writer {
     }
 
     async fn get(&self, key: &[u8; 32]) -> CheckedResponse {
-        let path = format!(
-            "/v1/{}/records/{}?revision=1",
-            pubky_id(&self.who.public()),
-            b64(key)
-        );
+        let path = format!("/v1/{}/records/{}", pubky_id(&self.who.public()), b64(key));
         self.client
             .send(
                 self.client

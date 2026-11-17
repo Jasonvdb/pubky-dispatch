@@ -111,6 +111,9 @@ has no proof. It cannot strip a proof, omit restrictive material, exchange a
 certificate, or choose another source context to make an outstanding input
 eligible, then account for the original whole input from the reduced submission.
 Present null and absent optional evidence keep their specified meanings.
+Section 5.1 defines the sole accounting projection of a no-longer-needed
+identity-delivery association after a later provider loss; it never removes a
+record proof or changes the original whole input's identity.
 
 The source generation qualifies the source statements and proofs, not every
 historical node in a lineage. Source statements must bind `source_identity`
@@ -287,6 +290,57 @@ established; it introduces no portable custody-receipt format. Completion still
 requires every local duty across all registered protocols and the guarded
 `cursor.set.records_complete` of record lineage 7.
 
+### 5.1 Accounting across a later provider loss
+
+After authenticating a later provider loss and its actual receiving account,
+applied recovery document and new barrier, an app may project an outstanding
+current-history input into an ordinary loss upload. This is an explicit local
+accounting relation between two immutable inputs, not an implicit service mode
+switch, an equivalent input identity or authority from an older ticket.
+
+The original input's exact source document must be eligible as `lost_identity`
+under the new barrier's ordinary loss rules. For records it must name exactly
+the new lost generation; standalone origins keep only their existing
+earlier-source allowance in record origins 7.1. The projection preserves the
+entire record operation, certificate, selected record proof, optional original
+lineage/origin evidence and exact source document unchanged. For a standalone
+origin it preserves the entire part and exact source document unchanged.
+Required-null and optional-presence distinctions remain. The only omitted
+association is the original identity-delivery `source_application`, which
+ordinary loss processing neither requires nor uses. The original complete
+input, including that association, remains durably held until accounting.
+
+The app submits the projection without `record_context`, using the exact
+source as `lost_identity`. The service applies its unchanged ordinary loss or
+retained record-witness rules. The omitted identity-delivery proof supplies no
+record date, source substitution, clean origin, initializer authority or new
+account association. In particular this relation cannot make an ineligible
+record proof qualify, remove it to obtain proofless admission, or bypass any
+required restrictive fact. An ineligible or incompletely represented input
+stays outstanding. This is a new admission under the new barrier, not a relabeling
+of a retained service unit's older admission or receiving application.
+
+Before sending, the durable new ticket binds each original whole input
+identity to its exact projected request bytes, input kind and array index,
+along with the new accounting run, destination, creation, actually applied
+identity, barrier and fresh request ID. Each mapping must independently satisfy
+the preceding projection rule. Several originals may share one index only
+when every mapping independently produces that exact complete projected input
+with the same exact source. Equal operation hash, key, version or sealed value
+does not establish a mapping. Record and standalone-origin indices remain
+separate, and no mapping authorizes accounting another source variant.
+
+Only the actual authenticated response bound to this ticket, with its upload
+proof, reconciled head and applicable `accounted_records` or
+`accounted_origins` index, authorizes local accounting of the explicitly mapped
+originals. The run and target checks of Section 5 still apply after the await.
+Accounting those originals and consuming the ticket commit atomically. An
+omitted index, lost or invalid response, changed run or target, or unknown local
+commit outcome preserves the original duties and their identity-delivery
+associations until durable reconciliation. Restart uses the same outstanding
+ticket; restore invalidates it and preserves the originals for a new run.
+Neither a projection nor its acknowledgment completes a witness by itself.
+
 ## 6. Complete retained inputs in cooperative transfer
 
 Every complete record input still needed by the final disposition has one
@@ -329,6 +383,8 @@ and application evidence, not only the operation hash or its export index.
 Receiving `admission`/`application` metadata, a ticket or a fragment index
 does not make another immutable input. A retry therefore cannot consume
 another slot by assigning a new receiving position to the same complete input.
+The new-loss projection of Section 5.1 has its own complete input identity;
+its local accounting relation does not merge the original source variants.
 
 `admission` is exactly:
 
@@ -539,6 +595,12 @@ local accounting must agree on the disposition.
 | Mixed loss/current source contexts or claim/list/head material | No implicit fallback or partial mode selection |
 | Duplicate, unordered or out-of-range response indices | Client rejects accounting for the response |
 | Lost response, restart, restore, provider change or local commit uncertainty | Preserve duties and apply the exact ticket/run rules above |
+| Boundary 3 with exact source D4 and identity-delivery proof Q4, followed by a new loss of generation 4 | An explicitly bound ordinary loss projection may omit only Q4, keep the whole record or origin and exact D4, and account its mapped original only after the new ticket's applicable index |
+| Same sequence with a selected record proof P4, or with an actually proofless record | Preserve P4 byte-for-byte, or preserve its actual absence; unchanged ordinary loss validation decides admission |
+| A standalone origin's exact source predates the new loss | Only the existing origin-source allowance can qualify its projection; it cannot date a record operation |
+| Source ineligible under the new loss, changed certificate/source, removed record proof or omitted restrictive evidence | No projection accounting of the original input |
+| Several exact source-application variants produce the same complete ordinary input | One index may account only originals independently mapped to those exact bytes before sending; no operation-hash deduplication |
+| Projection response omits an index, belongs to an older ticket/run, or has an unknown local commit outcome | Preserve the mapped whole originals and application associations; no witness completion |
 | Chain head at sequence 10, inbox entry at 11, then a loss or current-history upload at 12 | Preserve the actual head at 10 as `before`; link the upload to its hash and use 12 for any new receiving application; retention and import accept the sequence gap |
 | Retained upload stub links to a hash different from `before.chain_hash`, or another chain item intervenes | Refuse the inconsistent admission association |
 | Upload sequence reuses a retained inbox position or does not strictly exceed `before.seq` | Refuse under the shared sequence and admission rules; never fabricate a different `before` head |

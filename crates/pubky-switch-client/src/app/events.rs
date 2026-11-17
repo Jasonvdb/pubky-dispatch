@@ -339,12 +339,14 @@ pub enum AppEvent {
     },
     /// An entry stored because its sender's standing couldn't be checked
     /// ([`ParkReason::Unverifiable`]), a scope key ([`ParkReason::AwaitingKey`]) or protocol
-    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed,
+    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed:
     /// past the shared bounds Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
-    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
+    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]), or failing a
+    /// recipient check when tried again ([`DropReason::Rules`]). For a bound, the protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
-    /// add members: a pattern on it ends in `..`.
+    /// 11); a copy sent again would fail the same recipient check. A duty event, kept in
+    /// the commit that deletes the entry. Later versions may add members: a pattern on it
+    /// ends in `..`.
     #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
@@ -360,7 +362,7 @@ pub enum AppEvent {
         /// When its inbox accepted it, service time in Unix milliseconds: the time a
         /// re-send request asks from.
         accepted_at_ms: u64,
-        /// Which bound it was past.
+        /// Which bound it was past, or which recipient check it failed.
         reason: DropReason,
         /// What the input waited for when it was selected.
         waiting: WaitingReason,
@@ -1362,9 +1364,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the shared bounds on sender/key/admission waiting inputs an entry was dropped
-/// past (Switch spec
-/// 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Why an entry waiting for sender standing, a key or admission left custody without
+/// being processed (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]): one of the shared
+/// bounds it was past, or a recipient check it failed when tried again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1377,6 +1379,12 @@ pub enum DropReason {
     /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
     /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
+    /// Tried again, it failed recipient check `check` (Switch wire 5.1) under the rules
+    /// current then, such as a body its protocol's opaque members no longer allow.
+    Rules {
+        /// The check that failed, 2 to 8.
+        check: u8,
+    },
 }
 
 /// What a locally retained input waits for (Switch spec 8.2). All three reasons share

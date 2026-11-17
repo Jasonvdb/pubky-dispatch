@@ -12,7 +12,6 @@
 //! didn't mean.
 
 use pubky_switch_core::enc::pubky_id;
-use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext, message_hash};
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
@@ -78,8 +77,9 @@ pub struct ParkedMessage {
     pub reason: ParkReason,
     /// The signed plaintext.
     pub plaintext: MessagePlaintext,
-    /// The message, read with the protocol's opaque members; `None` when its JSON doesn't
-    /// read as a message, as for an entry stored before its checks ran.
+    /// The message, read by its common fields with every body member opaque, so the
+    /// protocol's changed body rules never hide it; `None` when its JSON doesn't read as a
+    /// message, as for an entry stored before its checks ran.
     pub message: Option<Message>,
     /// The sender's certificate, as the entry carried it.
     pub cert: SignedDoc,
@@ -199,15 +199,7 @@ impl App {
             };
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
                 .map_err(|_| AppError::Store(StoreError::Corrupt))?;
-            let rules = self.protocols.opaque_of_json(plaintext.json());
-            let opaque: Vec<OpaqueMember<'_>> = rules
-                .iter()
-                .map(|rule| OpaqueMember {
-                    kind: rule.kind.as_deref(),
-                    member: rule.member.as_str(),
-                })
-                .collect();
-            let message = Message::parse(plaintext.json(), &opaque).ok();
+            let message = super::protocols::kept_message(plaintext.json());
             let retry = self.state.stored_retries.get(&id).copied();
             Ok(Some(ParkedMessage {
                 receipt: stored.receipt,

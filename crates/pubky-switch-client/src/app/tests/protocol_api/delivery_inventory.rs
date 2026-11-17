@@ -50,7 +50,7 @@ impl Protocol for OpaqueDelivery {
 }
 
 #[tokio::test]
-async fn test_delivery_view_unowned_opaque_sealed_retry_preserves_owner_boundary() {
+async fn test_delivery_view_kept_sealed_retry_ignores_changed_body_rules() {
     Box::pin(async {
         for keep_owner in [false, true] {
             for rate in [json!(1), json!(1.5)] {
@@ -110,11 +110,12 @@ async fn test_delivery_view_unowned_opaque_sealed_retry_preserves_owner_boundary
                 assert_eq!(listed.len(), 1);
                 assert_eq!(listed[0].kind, "retired.note");
                 restored.flush_message(&id).await.unwrap();
-                let allowed = !keep_owner || rate == json!(1);
+                // A kept copy is read by its signed common fields: neither a missing owner
+                // nor an owner whose body rules narrowed since it was queued stops it.
                 assert_eq!(
                     (p.bob.switch().entries_from(&alice), listed[0].may_send),
-                    (usize::from(allowed), allowed),
-                    "an unowned sealed copy retries; an owned body still obeys its parser"
+                    (1, true),
+                    "a kept sealed copy retries whatever its owner's current body rules"
                 );
             }
         }

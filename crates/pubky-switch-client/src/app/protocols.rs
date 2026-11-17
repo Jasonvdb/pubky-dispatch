@@ -374,6 +374,37 @@ pub(crate) fn kind_of_json(json: &[u8]) -> Option<String> {
         .map(|read| read.kind)
 }
 
+/// Every member of a message's `body`, named opaque: how the app reads the common fields
+/// of signed bytes it already authenticated and keeps, such as its outbox or an input
+/// waiting in custody (Switch wire 1.1, 5.1). The body's number rules are its protocol's,
+/// which the host may change between runs; they are judged when the message is handled,
+/// never when kept bytes are read for what they are, so a changed rule never makes kept
+/// bytes unreadable. `None` for JSON without an object `body`.
+pub(crate) struct OpaqueBody(Vec<String>);
+
+impl OpaqueBody {
+    pub(crate) fn of(json: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+        Some(Self(
+            value.get("body")?.as_object()?.keys().cloned().collect(),
+        ))
+    }
+
+    pub(crate) fn members(&self) -> Vec<OpaqueMember<'_>> {
+        self.0
+            .iter()
+            .map(|member| OpaqueMember { kind: None, member })
+            .collect()
+    }
+}
+
+/// The message whose JSON the app already authenticated and keeps, read for its common
+/// fields with every body member opaque ([`OpaqueBody`]); `None` when it doesn't read as
+/// a message.
+pub(crate) fn kept_message(json: &[u8]) -> Option<Message> {
+    Message::parse(json, &OpaqueBody::of(json)?.members()).ok()
+}
+
 /// The `kind` of an encoded message plaintext, as an entry stored locally keeps it.
 pub(crate) fn kind_of_plaintext(encoded: &[u8]) -> Option<String> {
     pubky_switch_core::message::MessagePlaintext::decode(encoded)

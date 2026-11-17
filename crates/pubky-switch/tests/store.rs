@@ -693,10 +693,9 @@ fn shared_record(
         ops::{
             BatchRef, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, StateAfter, proof_state,
         },
-        record_authority::ApplicationRef,
         records::{AppCert, AppCertBody},
         sealed::SealedValue,
-        shared::RecordState,
+        shared::{ApplicationRef, RecordState},
     };
     let identity = IdentityKey::from_secret([1; 32]);
     let app = AppKeys::from_secrets([2; 32], [3; 32]);

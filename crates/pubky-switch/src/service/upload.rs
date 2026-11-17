@@ -11,14 +11,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
 use pubky_switch_core::ops::{OpKind, SignedOp};
-use pubky_switch_core::record_authority::ApplicationRef;
 use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordMerge, UploadBody, UploadChanges,
     UploadContext, UploadLists, UploadVersion, check_upload, merge_checked_record,
     merge_upload_claim,
 };
-use pubky_switch_core::shared::RecordState;
+use pubky_switch_core::shared::{ApplicationRef, RecordState};
 use serde_json::json;
 
 use super::batch::{VerifiedApp, check_own_app};

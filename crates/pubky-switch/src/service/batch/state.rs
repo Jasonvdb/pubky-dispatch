@@ -16,11 +16,10 @@ use pubky_switch_core::{
         AllowKind, Condition, ConditionState, Held, KeyBundlePut, OpKind, Position, RecordVersion,
         SignedOp,
     },
-    record_authority::ApplicationRef,
     records::{AppCert, AppRecord, IdentityDoc, ReceiveKeyRecord, Standing},
     recovery::UploadBase,
     scopes::Permission,
-    shared::{CurrentRecord, RecordState},
+    shared::{ApplicationRef, CurrentRecord, RecordState},
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -51,7 +50,7 @@ pub struct HeldApp {
 pub struct HeldRecord {
     /// Its key, collection, policy, version and whether it is deleted.
     pub state: RecordState,
-    /// The exact receiving application (Switch record lineage 1).
+    /// The exact receiving application (Switch wire 6.3).
     pub revision: ApplicationRef,
     /// The bytes its value counts against the storage quota: its `ct`, 0 for a delete
     /// (Switch wire 9.1).
@@ -640,7 +639,6 @@ pub struct Before<'a> {
 impl ConditionState for Before<'_> {
     fn record_current(&self, key: &[u8; 32]) -> Option<CurrentRecord> {
         self.state.records.get(key).map(|held| CurrentRecord {
-            lineage_id: None,
             revision: held.revision,
             deleted: held.state.deleted,
         })

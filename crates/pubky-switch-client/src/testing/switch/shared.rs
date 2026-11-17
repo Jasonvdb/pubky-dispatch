@@ -15,14 +15,13 @@ use pubky_switch_core::ops::{
     AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion,
     Refusal, SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::record_authority::ApplicationRef;
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::recovery::{
     CheckedUpload, HeldRecord as MergeHeld, RecordMerge, UploadBase, UploadChanges, UploadLists,
     UploadVersion, merge_checked_record, merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_core::shared::{CurrentRecord, RecordState, check_record_put};
+use pubky_switch_core::shared::{ApplicationRef, CurrentRecord, RecordState, check_record_put};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
@@ -40,7 +39,7 @@ const MAX_DIVERGENT_UPLOADS: usize = 8;
 pub struct HeldRecord {
     /// The record's state after its newest write.
     pub state: RecordState,
-    /// The actual receiving application (Switch record lineage 1).
+    /// The actual receiving application (Switch wire 6.3).
     pub revision: ApplicationRef,
     /// The newest write's signed `record.put`.
     pub op: SignedDoc,
@@ -173,7 +172,6 @@ pub(super) struct Before<'a> {
 impl ConditionState for Before<'_> {
     fn record_current(&self, key: &[u8; 32]) -> Option<CurrentRecord> {
         self.shared.records.get(key).map(|held| CurrentRecord {
-            lineage_id: None,
             revision: held.revision,
             deleted: held.state.deleted,
         })
@@ -401,7 +399,7 @@ impl Shared {
                     seq,
                     item_hash: item_hash(ItemType::Op, &record.op.doc_bytes()?),
                 };
-                revision.to_bytes()?;
+                revision.check()?;
                 Ok(revision)
             })
             .collect::<pubky_switch_core::Result<Vec<_>>>()?;

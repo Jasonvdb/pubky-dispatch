@@ -11,9 +11,8 @@ use pubky_switch_core::{
     claims::{Claim, ClaimTally},
     ident::Policy,
     ops::{BatchRecord, OpKind, Position, SignedOp},
-    record_authority::ApplicationRef,
     recovery::UploadBase,
-    shared::RecordState,
+    shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -67,7 +66,7 @@ pub struct StoredBundlePart {
 pub struct StoredRecord {
     /// Its key, collection, policy, version and whether it is deleted.
     pub state: RecordState,
-    /// The exact receiving application, not the source version (Switch record lineage 1).
+    /// The exact receiving application, not the source version (Switch wire 6.3).
     pub revision: ApplicationRef,
     /// The bytes its value counts against the storage quota.
     pub value_bytes: u64,
@@ -89,7 +88,7 @@ pub struct StoredRecord {
 impl StoredRecord {
     fn check_revision(&self) -> Result<(), StoreError> {
         let corrupt = || StoreError::Corrupt("a record's application contradicts its write");
-        self.revision.to_bytes().map_err(|_| corrupt())?;
+        self.revision.check().map_err(|_| corrupt())?;
         let bytes = self.op.doc_bytes().map_err(|_| corrupt())?;
         if self.revision.item_hash != item_hash(ItemType::Op, &bytes) {
             return Err(corrupt());

@@ -320,6 +320,15 @@ sign the same facts under its current key only after that validation. Missing
 witnesses or nodes do not become new absence origins. An abort leaves neither
 partial lineage nor a record recovery completion active.
 
+Complete retained upload inputs also have the bounded source-unit carriers of
+[record retention 6](record-retention.md#6-complete-retained-inputs-in-cooperative-transfer),
+including non-current certificate/proof variants. These carry the original
+source bundle and statement bytes, separately from the normalized receiving
+lineage above. Pruning a source operation or upload transition does not remove
+a required unit. Import checks both associations; it cannot use the frozen
+current descriptor in place of an alternate source descriptor or turn a source
+proof into a receiving record-operation proof.
+
 An uploaded record may carry `lineage`, in the bundle form, with its current node
 supplied by that uploaded record's `op` and `cert`. A present malformed or invalid
 bundle makes that uploaded record unverified and it is left out. A record without
@@ -451,6 +460,17 @@ cannot rewrite the frozen imported snapshot or complete a witness by themselves.
 A staged/frozen service does not merge them, and a response from a mode that
 ignored record members cannot account for those records. Non-record upload
 stages and the completion/cursor rules remain separate.
+
+Retained evidence acquired after the original loss can instead use the explicit
+[current-history record disposition](record-retention.md) on the same endpoint.
+That mode binds the actual receiving creation, applied identity and carried
+barrier, and authenticates a source newer than the original lost boundary
+through the current generation. It accounts the exact immutable whole input
+only after final value disposition and every required restrictive fact are
+represented. It cannot strip an old proof, substitute another source or infer
+custody from a later head. The ordinary lost-generation upload and dating rules
+remain unchanged. A valid proofless ordinary record may remain unresolved;
+neither submission nor acknowledgment creates positive original authority.
 
 A subsequent provider loss starts a new barrier from that recovery document's
 current apps. No completion from the older position satisfies the new one.

@@ -1072,6 +1072,18 @@ A protocol may add states of its own.
    - **A protocol's own pauses:** a protocol may hold back more of its automatic attempts, such as standing ones the user set up, until the user confirms them again: a missed attempt can't be ruled out, because both N's rebuilt state and the apps' journals may lack it.
 6. **Close:** recovery ends per obligation, and per whatever else its protocol holds back. An uncertain obligation closes when it is SETTLED at N, or when the user states that it wasn't carried out before the loss; nothing else closes it, not a confirmed manual attempt that failed nor an `unknown` or `failed` resolution. A closed obligation is attempted like any other, automatically too.
 
+**Retained records from the carried history.** An app restored with whole
+record evidence newer than the original lost-generation boundary can obtain
+an explicit named-input disposition through
+[current-history record retention](record-retention.md). The existing upload
+endpoint binds the actual current account, applied identity and record barrier,
+validates a bounded source, and accounts only whole inputs whose value and
+required restrictive facts are represented at its final transaction head.
+This does not declare another loss or grant clean original authority. The
+original loss eligibility and proof dating remain unchanged. Missing custody,
+source authority or a response keeps the work outstanding; it is not inferred
+from a later head, a restored cursor or a generic successful read.
+
 **Residual risk:** N can't stop O. An app that still trusts O through a cached `identity.json` could get an attempt authorized there for up to 60 s after the declaration, or longer if its Homeserver serves it a stale `identity.json`. The residual window is 60 seconds plus the clock tolerance, since an app makes no attempt without an `identity.json` revalidated in the last 60 s (Section 4.3), plus the offset between O's and N's clocks, since O applied its time conditions on its own clock while N's dates the declaration. Each app measures that offset as the difference between the last service time it verified from O and the first from N, each taken against its own clock, and assumes twice the clock tolerance when it has none from O. Signed heads detect rollback of history an app saw; they can't prove that no newer authorization exists, which is why step 5 is conservative.
 
 ### 12.7 Erasing an account

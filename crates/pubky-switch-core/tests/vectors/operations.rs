@@ -291,9 +291,9 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         &[(&held, &range(last, last - 1))],
     ));
     // A permanent policy's rule (wire 6.2 "Permanent policies", spec 10.3.1), the policy
-    // made permanent by its member after `write_scopes`: the `record.put delete`, at a policy
-    // naming no generation, and the `record.put create`, of generation 1, at a policy naming
-    // generation 2, its key derived again for that policy.
+    // made permanent by its member after `write_scopes`, each key derived again for its
+    // policy: the `record.put delete`, at a policy naming no generation, and the `record.put
+    // create`, of generation 1, at a policy naming generation 2.
     let scopes = format!(
         r#""write_scopes":{},"expected_version""#,
         text(&json!(writes))
@@ -311,9 +311,16 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         &blinded,
         &named.hash().unwrap(),
     );
-    let (old_key, new_key) = (
+    let unnamed = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(None);
+    let unnamed_key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded,
+        &unnamed.hash().unwrap(),
+    );
+    let (old_key, new_key, delete_key) = (
         format!(r#""key":{}"#, text(&json!(key))),
         format!(r#""key":{}"#, text(&json!(b64e(&named_key)))),
+        format!(r#""key":{}"#, text(&json!(b64e(&unnamed_key)))),
     );
     // The delete without its claim condition: a service checks conditions before shapes
     // (wire 6.4 steps 8 and 9), so a failing condition would answer first.
@@ -330,7 +337,11 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         identity,
         "record.put: a delete at a permanent policy",
         "record.put delete",
-        &[(conditions, ""), (&scopes, &made_permanent("null"))],
+        &[
+            (conditions, ""),
+            (&old_key, &delete_key),
+            (&scopes, &made_permanent("null")),
+        ],
     ));
     cases.push(shape_case(
         keys,

@@ -2569,12 +2569,45 @@ async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
     );
     let erasing = app.state.erasing;
     assert!(erasing.is_some());
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    // A public read with no answer counts no try and starts nothing over.
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/identity".into(),
+        after: 0,
+    });
+    assert!(app.check_for_move().await.is_err());
+    assert_eq!(app.state.erasing, erasing);
+    // A replayed answer starts nothing over: the signed read it prompts counts the next try.
     replay_public_read(&w, &router, before);
     let _ = app.check_for_move().await;
-    assert_eq!(app.state.erasing, erasing);
+    let held = |app: &App| app.state.erasing.map(|e| (e.since_ms, e.tries));
+    let first = erasing.map(|e| (e.since_ms, e.tries + 1));
+    assert_eq!(held(&app), first);
     // The account answers again: the public read, replayed still, makes the app ask the own
     // feed, whose signed answer ends the wait.
     w.switch.lock().not_hosted_unpinned = false;
+    let _ = app.check_for_move().await;
+    assert_eq!(app.state.erasing, None);
+}
+
+#[tokio::test]
+async fn test_erasure_wait_ends_on_a_signed_read_a_public_refusal_prompts() {
+    // A refusal the pinned key signed for the public read may be an earlier one sent again,
+    // so it only prompts the signed read, whose answer ends the wait (Switch spec 12.7).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.switch.lock().not_hosted_unpinned = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    assert!(app.check_for_move().await.is_err());
+    assert!(app.state.erasing.is_some());
+    w.switch.lock().not_hosted_unpinned = false;
+    w.switch.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::RateLimited,
+        current: serde_json::Value::Null,
+    });
     let _ = app.check_for_move().await;
     assert_eq!(app.state.erasing, None);
 }

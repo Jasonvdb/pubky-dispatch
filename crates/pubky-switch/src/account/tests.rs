@@ -919,6 +919,7 @@ fn route_of(verdict: Verdict, class: RequestClass) -> Route {
         erase_account_again: false,
         verdict,
         recovery_floor: BEHIND.generation,
+        retirement_generation: None,
     };
     request_route(&judgement, &class)
 }
@@ -1463,4 +1464,131 @@ fn test_account_association_retains_physical_sql_floor() {
         .recovery_floor
     });
     assert_eq!(floors, [2, 2]);
+}
+
+/// Whether the verdict's notice says the loss is permanent; `None` where it gives none.
+fn permanent_of(verdict: Verdict) -> Option<bool> {
+    match verdict {
+        Verdict::Failing { notice, .. }
+        | Verdict::Bounded { notice, .. }
+        | Verdict::Lost { notice } => Some(notice.permanent),
+        Verdict::NotHosted { .. } | Verdict::Staged | Verdict::Healthy | Verdict::Unknown => None,
+    }
+}
+
+/// For every association of account and mark (Switch account binding 1.1), the generation
+/// [`retirement_generation`] selects is the one whose retirement makes the notice permanent,
+/// and retiring any other leaves it as it was (Switch wire 7.3 under Table 1).
+#[test]
+fn test_retirement_generation_is_the_one_the_verdict_reads() {
+    let serving_at = |state: ChainTip, created_at_ms| Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
+        state: AccountState::Serving(state),
+        created_at_ms,
+        document_generation: Some(state.generation),
+        enrolled_generation: state.generation,
+    };
+    let staged = Account {
+        activation: pubky_switch_core::records::AccountActivation::Ordinary,
+        state: AccountState::StagedNoChain,
+        created_at_ms: 100,
+        document_generation: None,
+        enrolled_generation: 2,
+    };
+    let at = |generation, seq, created_at_ms| {
+        MarkInput::Mark(mark_created(generation, seq, 1, created_at_ms))
+    };
+    // (case, account, mark, erasure, the generation the verdict reads)
+    let cases = [
+        (
+            "equal creations, behind",
+            Some(serving_at(STATE, 100)),
+            at(2, 12, 100),
+            None,
+            2,
+        ),
+        (
+            "equal creations, mark lost",
+            Some(serving_at(STATE, 100)),
+            MarkInput::Missing,
+            None,
+            2,
+        ),
+        // SQL newer than a readable mark: the lost-mark column, at the account's generation.
+        (
+            "account above an older mark",
+            Some(serving_at(STATE, 150)),
+            at(1, 5, 100),
+            None,
+            2,
+        ),
+        // SQL older than the mark: the rows without an account, at the mark's generation.
+        (
+            "account below a newer mark",
+            Some(serving_at(tip(1, 3, 1), 50)),
+            at(3, 4, 100),
+            None,
+            3,
+        ),
+        ("no account", None, at(2, 5, 100), None, 2),
+        (
+            "staged, mark records a head",
+            Some(staged),
+            at(3, 1, 100),
+            None,
+            3,
+        ),
+        (
+            "erased again, a later mark",
+            Some(serving_at(STATE, 100)),
+            at(2, 5, 300),
+            Some(ERASED_AT),
+            2,
+        ),
+    ];
+    for (case, account, mark, erasure_at_ms, expected) in cases {
+        let judge_retired = |retired: &[u64]| {
+            judge(&Inputs {
+                account: account.as_ref(),
+                mark: &mark,
+                stub_at_mark: None,
+                erasure_at_ms,
+                retired,
+            })
+        };
+        let judgement = judge_retired(&[]);
+        assert_eq!(judgement.retirement_generation, Some(expected), "{case}");
+        assert_eq!(
+            retirement_generation(account.as_ref(), &mark, erasure_at_ms),
+            Some(expected),
+            "{case}"
+        );
+        assert_eq!(permanent_of(judgement.verdict), Some(false), "{case}");
+        assert_eq!(
+            permanent_of(judge_retired(&[expected]).verdict),
+            Some(true),
+            "{case}"
+        );
+        for other in (1..=4).filter(|other| *other != expected) {
+            assert_eq!(
+                permanent_of(judge_retired(&[other]).verdict),
+                Some(false),
+                "{case}: retired {other}"
+            );
+        }
+    }
+}
+
+/// No retirement counts while the mark store can't be read.
+#[test]
+fn test_retirement_generation_unreadable_store_has_none() {
+    let account = account(Row::Serving);
+    assert_eq!(
+        retirement_generation(account.as_ref(), &MarkInput::StoreUnreadable, None),
+        None
+    );
+    assert_eq!(
+        judged(Row::Serving, MarkInput::StoreUnreadable, &[2]).retirement_generation,
+        None
+    );
 }

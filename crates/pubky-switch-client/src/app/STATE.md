@@ -180,36 +180,43 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   not the latest message-status index, and uses dispatch's hold and protocol decisions.
 - **A backup carries `sent/`** (Switch spec 12.4 "Sent messages"): every sent message whose
   first acceptance is within `SENT_RETENTION_MS` (30 days) of the backup's device time (the
-  rule `sentt/` pruning applies), in the same read as the outbox, within
-  `MAX_CARRIED_SENT_BYTES` (8 MiB, `send::fit_sent`), the most recently accepted first:
-  first each one's record without its signed plaintext while those fit, the rest left out
-  and counted (`AppBackup::sent_left_out`, told at the restore in `RestoreLeftBehind`);
-  then the plaintext of each while the whole fits. A restore writes the records back with
-  their `sentt/` index, so `App::delivery` answers `Accepted` for a message accepted
-  before the backup, `App::queue_stored` queues nothing for it, and no give-up tells it
-  undelivered with `resend: false`. A record without its plaintext isn't listed by
-  `App::sent_to`; a re-send of it, asked by `App::resend` or after a provider loss, is
-  given up at once with `MessageUndelivered` (`resend: true`); an acceptance of an outbox
-  copy gives it its plaintext again. A restore refuses a backup whose records are over the
-  bound, name a message twice, are past their retention at the backup's time, aren't
-  signed by this app, differ in recipient, kind, bytes or origin from an outbox copy, or
-  sit beside an outbox copy, or a message left out past the outbox budget, never
-  accepted: no store holds a sent record beside a message it never saw accepted, since a
-  message is queued alone only while it isn't kept as sent, and the commit that records an
-  acceptance writes both.
-- **A restore in place keeps the store's `sent/` beside the backup's** (`send::restored_sent`):
-  a message both hold is one record with every acceptance time of either, the earliest the
-  first, the earlier replay deadline and the plaintext either keeps; the whole fits
-  `MAX_CARRIED_SENT_BYTES` as a backup does, the rest left out and counted. A store's record
-  of another message than the backup's record or outbox copy of its `msg_id` (recipient,
-  kind, bytes or origin) refuses the restore; one that doesn't read, or isn't signed by this
-  app, is left behind and counted in `RestoreLeftBehind`. An outbox item the backup puts
-  back whose store never saw it accepted, while the restored `sent/` holds it, takes that
-  acceptance (`RestoredSent::outbox`): no delivery owed, its hold ended, kept only for a
-  record job still owed; a message the backup left out of its outbox that the restore holds
-  as sent is told `MessageUndelivered` with `resend: true`. The store's records go after
-  the backup's state in the commit, and count towards `Refusal::CarriedTooLarge`
-  (`sent_messages`).
+  rule `sentt/` pruning applies), with its `outgone/` give-up mark, which stands while a
+  sent copy remains (`send::given_up`), in the same read as the outbox (`send::CarriedSent`).
+  They go within `MAX_CARRIED_SENT_BYTES` (8 MiB) of the restore's commit, every write
+  that installs one counted as the store counts it (`CarriedSent::commit_bytes`, the one
+  measure of the writer and the restore's check), the most recently accepted first
+  (`send::fit_sent`): first each one's record without its signed plaintext, until one
+  doesn't fit, it and every older one left out and counted (`AppBackup::sent_left_out`);
+  then the plaintext of each while the whole fits. A restore writes them back with their
+  `sentt/` index and marks, so `App::delivery` answers `Accepted` for a message accepted
+  before the backup, `App::queue_stored` queues nothing for it, no give-up tells it
+  undelivered with `resend: false`, and a delivery given up stays given up, a re-send
+  after a provider loss or by `App::resend` included. A record without its plaintext isn't
+  listed by `App::sent_to`; a re-send of it is given up at once with `MessageUndelivered`
+  (`resend: true`); an acceptance of an outbox copy gives it its plaintext again. A restore
+  refuses a backup whose records are over the bound, name a message twice, are past their
+  retention at the backup's time, aren't signed by this app, differ in recipient, kind,
+  bytes or origin from an outbox copy, or sit beside an outbox copy, or a message left out
+  past the outbox budget, never accepted: no store holds a sent record beside a message it
+  never saw accepted, since a message is queued alone only while it isn't kept as sent,
+  and the commit that records an acceptance writes both.
+- **A restore in place keeps the store's `sent/` and their marks beside the backup's**
+  (`send::restored_sent`): a store's copy of a message the backup holds, as sent or in its
+  outbox, takes the backup's origin (two devices of one app may hold one message under
+  different origins); a message both hold is one copy with every acceptance time of
+  either, the earliest the first, the earlier replay deadline, the plaintext either keeps
+  and the later give-up; the whole fits `MAX_CARRIED_SENT_BYTES` as a backup does. A
+  store's record of another message than the backup's of its `msg_id` (recipient, kind or
+  bytes) refuses the restore; one that doesn't read, or isn't signed by this app, is left
+  behind and counted in `RestoreLeftBehind`. An outbox item the backup puts back whose
+  store never saw it accepted, while the restored `sent/` holds it, takes that acceptance
+  (`RestoredSent::outbox`): no delivery owed, its hold ended, kept only for a record job
+  still owed; a message the backup left out of its outbox as never accepted that the
+  restore holds as sent is accepted, neither given up nor told. `RestoreLeftBehind`
+  counts each message the restored app doesn't know were accepted once: a store's message
+  no newer than the oldest the backup carries, when the backup left some out, is taken as
+  one of those. The store's copies go after the backup's state in the commit, and count
+  towards `Refusal::CarriedTooLarge` (`sent_messages`).
 - **A backup doesn't carry `opq/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared

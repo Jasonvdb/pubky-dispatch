@@ -301,11 +301,88 @@ async fn test_backup_sent_messages_no_writer_produces_are_refused() {
 }
 
 /// A message queued and held when the backup was taken, and accepted since: a restore in
-/// place from that backup keeps the store's acceptance, so it delivers nothing again, never
-/// tells the message undelivered, and ends its hold. A backup whose copy of that message
-/// isn't the store's is refused, the store untouched.
+/// place from that backup keeps the store's acceptance, whether the backup carries the
+/// message in its outbox or left it out, so it delivers nothing again, never tells the
+/// message undelivered, ends its hold and still answers a re-send of it.
 #[tokio::test]
 async fn test_backup_sent_restore_in_place_keeps_an_acceptance_since_the_backup() {
+    Box::pin(async {
+        for left_out in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let store = Arc::new(MemoryStore::new());
+            let mut wallet = p
+                .join_on(
+                    &p.alice,
+                    "wallet",
+                    protocol.clone(),
+                    Arc::clone(&store) as Arc<dyn StateStore>,
+                )
+                .await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+            let msg_id = wallet.queue_signed(signed).await.unwrap();
+            wallet.flush_outbox().await.unwrap();
+            assert!(wallet.hold_message("sample", &msg_id).await.unwrap());
+            let mut backup = wallet.backup().await.unwrap();
+            if left_out {
+                // As a backup past its outbox budget leaves the message out.
+                let mut value: Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+                value["outbox"] = json!([]);
+                value["held_messages"] = json!([]);
+                value["outbox_left_out"] = json!([[msg_id, false]]);
+                backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            wallet.release_message("sample", &msg_id).await.unwrap();
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            assert_eq!(
+                wallet.flush_outbox().await.unwrap().done,
+                vec![msg_id.clone()]
+            );
+            let accepted = wallet.delivery(&msg_id).await.unwrap();
+            assert!(matches!(accepted, Some(Delivery::Accepted { .. })));
+            drop(wallet);
+
+            let alice = p.alice.identity().public();
+            let entries = p.bob.switch().entries_from(&alice);
+            let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+            let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+                .await
+                .unwrap();
+            let mut events = restored.take_events();
+            let delivery = restored.delivery(&msg_id).await.unwrap();
+            restored.flush_outbox().await.unwrap();
+            events.extend(restored.take_events());
+            assert_eq!(
+                undelivered(&events, &msg_id),
+                Vec::<bool>::new(),
+                "left out: {left_out}"
+            );
+            assert_eq!(
+                p.bob.switch().entries_from(&alice),
+                entries,
+                "not delivered again"
+            );
+            assert_eq!(delivery, accepted);
+            assert!(restored.outbox_record(&msg_id).await.is_none());
+            assert!(restored.held_messages("sample").await.unwrap().is_empty());
+            // Nothing given up: a re-send asked for goes.
+            p.clock.advance_ms(MINUTE);
+            assert_eq!(restored.resend(&msg_id).await.unwrap(), accepted.unwrap());
+            assert_eq!(p.bob.switch().entries_from(&alice), entries + 1);
+        }
+    })
+    .await;
+}
+
+/// A message both the backup and the store restored in place hold is one copy: every
+/// acceptance time of either, the earlier replay deadline, and the backup's origin where the
+/// two differ. A message only the store holds that is no newer than the oldest the backup
+/// carries, when the backup left some out, is taken as one of those: given back, it isn't
+/// counted. A store's message of another body under a `msg_id` the backup names refuses
+/// the restore.
+#[tokio::test]
+async fn test_backup_sent_restore_in_place_merges_the_copies_of_one_message() {
     Box::pin(async {
         let p = Pair::new();
         let protocol = ApiProtocol::new(Mode::Plain);
@@ -320,52 +397,139 @@ async fn test_backup_sent_restore_in_place_keeps_an_acceptance_since_the_backup(
             )
             .await;
         let mut shop = p.join(&p.bob, "shop", &protocol).await;
-        let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
-        let msg_id = wallet.queue_signed(signed).await.unwrap();
-        wallet.flush_outbox().await.unwrap();
-        assert!(wallet.hold_message("sample", &msg_id).await.unwrap());
-        let backup = wallet.backup().await.unwrap();
-        wallet.release_message("sample", &msg_id).await.unwrap();
         shop.invite(&p.alice.identity().public()).await.unwrap();
-        assert_eq!(
-            wallet.flush_outbox().await.unwrap().done,
-            vec![msg_id.clone()]
-        );
-        let accepted = wallet.delivery(&msg_id).await.unwrap();
-        assert!(matches!(accepted, Some(Delivery::Accepted { .. })));
+        let (older, _) = wallet.send(Pair::note(&p.bob, "older")).await.unwrap();
+        p.clock.advance_ms(MINUTE);
+        let (msg_id, _) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+        let backup = wallet.backup().await.unwrap();
+        // The store has the message accepted again since.
+        p.clock.advance_ms(MINUTE);
+        wallet.resend(&msg_id).await.unwrap();
+        let bob = p.bob.identity().public();
+        let times = |list: Vec<SentMessage>| {
+            list.into_iter()
+                .find(|sent| sent.msg_id == msg_id)
+                .unwrap()
+                .accepted_times_ms()
+        };
+        let in_store = times(wallet.sent_to(&bob, 0, u64::MAX).await.unwrap());
+        assert_eq!(in_store.len(), 2);
         drop(wallet);
-
-        // Another origin than the store's sent copy: no writer gives one `msg_id` two.
         let mut value: Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
-        value["outbox"][0]["origin"] = json!("Reconstructed");
-        let other = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let sent = value["sent"].as_array_mut().unwrap();
+        // The backup left the older message out.
+        sent.retain(|s| s["msg_id"] != older.as_str());
+        assert_eq!(sent.len(), 1);
+        // The backup's copy: an acceptance the store's lacks, an earlier replay deadline,
+        // and the other origin, as another device of the app would hold it.
+        let deadline = in_store[0] + SENT_RETENTION_MS - DAY_MS;
+        sent[0]["resent"] = json!([in_store[0] + 7]);
+        sent[0]["replay_until_ms"] = json!(deadline);
+        sent[0]["origin"] = json!("Reconstructed");
+        value["sent_left_out"] = json!(1);
+
+        // Another body under the same `msg_id`, signed by the app: refused.
+        let mut other = value.clone();
+        let keys = p.alice.identity().app_keys("wallet");
+        let mut forged = pubky_switch_core::message::Message::new(
+            "sample.note",
+            Sender {
+                identity: p.alice.identity().public(),
+                app_id: keys.app_id_bytes(),
+            },
+            bob,
+            START,
+            Vec::new(),
+            serde_json::from_value(json!({ "text": "another" })).unwrap(),
+        )
+        .unwrap();
+        forged.msg_id = msg_id.clone();
+        let forged = forged.sign(&keys).unwrap();
+        other["sent"][0]["plaintext"] = json!(pubky_switch_core::enc::b64(&forged.encode()));
+        let other = AppBackup::from_bytes(&serde_json::to_vec(&other).unwrap()).unwrap();
         let refused = App::restore(on_store(), protocol.clone(), config(), &other).await;
         assert!(
             matches!(refused, Err(AppError::InvalidData(_))),
             "{refused:?}"
         );
 
-        let alice = p.alice.identity().public();
-        let entries = p.bob.switch().entries_from(&alice);
+        let backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
         let mut restored = App::restore(on_store(), protocol.clone(), config(), &backup)
             .await
             .unwrap();
-        let mut events = restored.take_events();
-        let delivery = restored.delivery(&msg_id).await.unwrap();
-        restored.flush_outbox().await.unwrap();
-        // Past the put-back's replay deadline, a delivery still owed would be given up.
-        p.clock.advance_ms(SENT_RETENTION_MS + MINUTE);
-        restored.flush_outbox().await.unwrap();
-        events.extend(restored.take_events());
-        assert_eq!(
-            p.bob.switch().entries_from(&alice),
-            entries,
-            "not delivered again"
+        let events = restored.take_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AppEvent::RestoreLeftBehind { .. })),
+            "the older message is given back: {events:?}"
         );
-        assert_eq!(undelivered(&events, &msg_id), Vec::<bool>::new());
-        assert_eq!(delivery, accepted);
-        assert!(restored.outbox_record(&msg_id).await.is_none());
-        assert!(restored.held_messages("sample").await.unwrap().is_empty());
+        assert!(matches!(
+            restored.delivery(&older).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        let mut merged = in_store.clone();
+        merged.push(in_store[0] + 7);
+        merged.sort_unstable();
+        assert_eq!(
+            times(restored.sent_to(&bob, 0, u64::MAX).await.unwrap()),
+            merged
+        );
+        // A re-send held at bob takes the merged copy's deadline and origin.
+        restored.hold_queued(&bob).await.unwrap();
+        restored.resend(&msg_id).await.unwrap();
+        let item = restored.outbox_record(&msg_id).await.unwrap();
+        assert_eq!(item.replay_until_ms(), Some(deadline));
+        let listed = restored.queued_messages("sample").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].origin, crate::app::DeliveryOrigin::Reconstructed);
+    })
+    .await;
+}
+
+/// A delivery given up before the backup stays given up after the restore: a re-send asked
+/// of it, or after a provider loss, sends nothing and tells nothing again.
+#[tokio::test]
+async fn test_backup_sent_give_up_stands_after_a_restore() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (mut wallet, _shop, sent) = wallet_with_sent_notes(&p, &protocol, 1, "hi").await;
+        let msg_id = sent[0].msg_id.clone();
+        p.bob.switch().fail_next(Fault::Unreachable {
+            path: "inbox".into(),
+            after: 0,
+        });
+        assert!(matches!(
+            wallet.resend(&msg_id).await.unwrap(),
+            Delivery::Queued { .. }
+        ));
+        assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+        assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![true]);
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        let mut restored = restored_wallet(&p, &protocol, &backup).await;
+        restored.take_events();
+        let entries = p.bob.switch().entries_from(&p.alice.identity().public());
+        let resent = restored.resend(&msg_id).await;
+        assert!(
+            matches!(
+                resent,
+                Err(AppError::Refused(Refusal::WontDeliver(
+                    WontDeliver::GivenUp
+                )))
+            ),
+            "{resent:?}"
+        );
+        restored.flush_outbox().await.unwrap();
+        assert_eq!(
+            undelivered(&restored.take_events(), &msg_id),
+            Vec::<bool>::new()
+        );
+        assert_eq!(
+            p.bob.switch().entries_from(&p.alice.identity().public()),
+            entries
+        );
     })
     .await;
 }

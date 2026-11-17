@@ -312,9 +312,7 @@ pub fn retirement_generation(
     mark: &MarkInput,
     erasure_at_ms: Option<u64>,
 ) -> Option<u64> {
-    if matches!(mark, MarkInput::StoreUnreadable) {
-        return None;
-    }
+    // An unreadable store fails the association, so it selects no generation.
     select(account, mark, erasure_at_ms).retirement_generation()
 }
 

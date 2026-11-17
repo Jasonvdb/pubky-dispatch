@@ -397,6 +397,78 @@ async fn test_retire_service_answers_permanent_notice() {
 }
 
 #[tokio::test]
+async fn test_retire_newer_account_beside_older_mark_service_answers_permanent_notice() {
+    // alice's account created after her readable mark, which records a head of another
+    // generation: the verdict takes the lost-mark column at her account's generation
+    // (Switch account binding 1.1). `retire` names that generation, and a service started
+    // on the same key store and database reads that retirement: its notice is permanent.
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    mark_at(&replay, &alice, 2, 1, 4).await;
+    let created = alice_created() + 1;
+    write(
+        &replay.db,
+        &format!("UPDATE accounts SET created_at_ms = {created} WHERE id = '{alice}'"),
+    )
+    .await;
+    let at = ms(&item_time(&vectors("chain.json")["items"][1]));
+    let notice = |service: Service| {
+        let path = format!("/v1/{alice}/allow");
+        async move {
+            let answer = service
+                .handle(signer_request_at_creation(
+                    "GET",
+                    &path,
+                    Vec::new(),
+                    at,
+                    Some(created),
+                ))
+                .await;
+            assert_eq!(answer.status, 503);
+            let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+            body["current"].clone()
+        }
+    };
+    let before = notice(replay.restarted_with(Limits::default())).await;
+    assert_eq!(
+        (before["reason"].clone(), before["permanent"].clone()),
+        (serde_json::json!("mark_lost"), serde_json::json!(false)),
+        "{before}"
+    );
+    refused(
+        &replay,
+        &alice,
+        2,
+        Refusal::WrongGeneration {
+            given: 2,
+            retirable: 1,
+        },
+    )
+    .await;
+    let retired = retire(&replay, &alice, 1).await.expect("retired");
+    assert_eq!(
+        (retired.notice.reason, retired.notice.permanent),
+        (NoticeReason::MarkLost, true)
+    );
+    let started = Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        replay.keys.clone(),
+        MarkStore::open(replay.key_dir()).expect("mark store"),
+        replay.time.clone(),
+        Limits::default(),
+    );
+    let after = notice(started).await;
+    assert_eq!(
+        (after["reason"].clone(), after["permanent"].clone()),
+        (serde_json::json!("mark_lost"), serde_json::json!(true)),
+        "{after}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_clears_nothing() {
     // alice's account is staged at her (0, 0) mark, and generation 1 is retired for her, as
     // a lost identity's retirement that her new enrollment kept. An activation there isn't

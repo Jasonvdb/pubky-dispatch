@@ -40,6 +40,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../src/signer/handover.rs"),
     ),
     (
+        "signer/key_recovery.rs",
+        include_str!("../src/signer/key_recovery.rs"),
+    ),
+    (
         "signer/recovery.rs",
         include_str!("../src/signer/recovery.rs"),
     ),
@@ -88,6 +92,9 @@ const COVERED: &[&str] = &[
     "SignerStatus",
     "AppStanding",
     "AbortOutcome",
+    "KeyRecoveryStop",
+    "AppFate",
+    "BackupFound",
 ];
 
 /// Public enums a host never receives or returns, so the guide needn't name their variants.

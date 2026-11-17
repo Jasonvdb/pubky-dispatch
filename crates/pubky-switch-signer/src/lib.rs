@@ -19,7 +19,8 @@
 //! - [`Signer`]: enrolling the identity at a switch, and signing, delivering and publishing
 //!   its `identity.json` versions with the high-water mark, the one-signer rule and the
 //!   backup, each step committed to the host's store before it is sent (Switch spec 4.3, 12.8);
-//!   the restore from that backup, the hand-over to another signer, with its abort and the
+//!   the restore from that backup, or with the identity key alone when it is missing,
+//!   unreadable or stale, the hand-over to another signer, with its abort and the
 //!   new signer's take-over (Switch wire 3.12, 3.13), and the account's erasure when the user
 //!   stops using the Switch (Switch spec 12.7).
 //! - [`homeserver`]: the identity's own Homeserver, which the host implements.
@@ -38,13 +39,16 @@ mod signer;
 pub mod state;
 
 pub use alert::{Alert, RenewalSkip, Source};
-pub use error::{RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody};
+pub use error::{
+    KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody,
+};
 pub use homeserver::Homeserver;
 pub use key::{
     AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,
 };
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
 pub use signer::{
-    AbortOutcome, AppReview, AppStanding, AppSummary, ApprovedRequest, CertChange, HighWater,
-    ReceivingApp, RecordsDiscarded, RunDue, Signer, SignerEnv, SignerStatus, UserConfirmed,
+    AbortOutcome, AppFate, AppReview, AppStanding, AppSummary, ApprovedRequest, BackupFound,
+    CertChange, HighWater, KeyRecoveryConfirmed, KeyRecoverySurvey, ReceivingApp, RecordsDiscarded,
+    RestoreConfirmed, RunDue, Signer, SignerEnv, SignerStatus, UserConfirmed,
 };

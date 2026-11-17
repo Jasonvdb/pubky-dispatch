@@ -1345,9 +1345,12 @@ impl ScriptedSwitch {
                 .next()
                 .is_some_and(|p| p.ends_with("/account"))
         {
-            let (status, body) = inner
+            let (status, mut body) = inner
                 .account_observation(request)
                 .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
+                object.insert(member, value);
+            }
             if lose {
                 return Err(TransportError::Timeout);
             }

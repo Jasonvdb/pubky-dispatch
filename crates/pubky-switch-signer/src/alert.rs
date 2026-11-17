@@ -275,6 +275,19 @@ pub enum Alert {
         /// The key taken.
         service_key: [u8; 32],
     },
+    /// A recovery with the identity key alone enrolled at the account's service, and the
+    /// enrollment answer named another key than the one the service's copy of `identity.json`
+    /// names: the service changed its key (Switch spec 12.5). The account is served under the
+    /// key its copy names, so the recovery keeps that one and doesn't follow the other; the
+    /// user is shown both (Switch spec 12.8).
+    ServiceKeyNotFollowed {
+        /// The service's origin.
+        origin: String,
+        /// The key the copy names, kept.
+        kept: [u8; 32],
+        /// The key the enrollment answer named.
+        answered: [u8; 32],
+    },
     /// A removed app's Pubky grants still let it write its Homeserver paths. Each approved
     /// request made one, and each names the app's record path
     /// `/pub/pubky-switch/v1/apps/<app_id>.json`. The signer doesn't revoke grants itself:
@@ -406,6 +419,7 @@ impl Alert {
             | Self::AccountNotHosted
             | Self::ServiceHoldsNoAccount
             | Self::ServiceKeyTaken { .. }
+            | Self::ServiceKeyNotFollowed { .. }
             | Self::BackupNotWritten
             | Self::KeyNotInstalled
             | Self::TakeOverRefused

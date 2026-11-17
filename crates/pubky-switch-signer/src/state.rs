@@ -732,18 +732,24 @@ pub(crate) enum RecoveryEnrollment {
 
 impl RecoveryEnrollment {
     /// Permanent exclusions are the retained tombstones outside the verified recovery base
-    /// (Switch spec 12.6 step 1). Later revocations of listed apps remain deferred work.
+    /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
+    /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
     pub(crate) fn check_exclusions(&self, state: &SignerState, origin: &str) -> Result<()> {
-        let base = state
-            .recovery_base
-            .as_ref()
-            .ok_or(RecordsFault::Invariant("a recovery enrollment has no base"))?;
-        let base = stored_identity(base, &state.identity)?;
+        let base = match &state.recovery_base {
+            Some(base) => Some(stored_identity(base, &state.identity)?),
+            None if state.newest.is_none() => None,
+            None => {
+                return Err(RecordsFault::Invariant("a recovery enrollment has no base").into());
+            }
+        };
         let mut expected: Vec<_> = state
             .tombstones
             .iter()
             .copied()
-            .filter(|app| base.listed_cert(app).is_none())
+            .filter(|app| {
+                base.as_ref()
+                    .is_none_or(|base| base.listed_cert(app).is_none())
+            })
             .collect();
         expected.sort_unstable();
         expected.dedup();

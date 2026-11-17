@@ -73,7 +73,8 @@ pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use key_recovery::{
-    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoverySurvey, RestoreConfirmed,
+    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoveryKind, KeyRecoverySurvey,
+    RestoreConfirmed,
 };
 pub use renewal::{CertChange, RunDue};
 pub use restore::RecordsDiscarded;
@@ -957,6 +958,18 @@ impl Signer {
         body.version = version;
         body.signer = state.install;
         change(&mut body);
+        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
+        Self::measured(state, body, Some(base.hash()), room)
+    }
+
+    /// `body`, once measured against the cap with `room` as a delivery built on `prev`, for
+    /// the records `state`. Nothing is signed.
+    fn measured(
+        state: &SignerState,
+        body: IdentityBody,
+        prev: Option<[u8; 32]>,
+        room: Room,
+    ) -> Result<IdentityBody> {
         // Never a version the switch can't take: its delivery would be over `PUT /identity`'s
         // body cap (Switch wire 7.1), and could never be delivered. Nor one whose closings
         // couldn't be: an open `renewed` entry is closed in a later version, its `null` turned
@@ -970,8 +983,6 @@ impl Signer {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
-        let prev = Some(base.hash());
         for measure in measures(state, &closed, prev)? {
             if over_cap(measure.bytes, measure.limit, room) {
                 return Err(Refusal::IdentityTooLarge {

@@ -384,9 +384,10 @@ pub enum Refusal {
 /// Why a recovery with the identity key alone doesn't go ahead (Switch spec 12.8). It builds
 /// on the copy of `identity.json` the account's service holds, so it needs a service that
 /// serves the account and holds the newest version anyone saw. Where it doesn't, the way on
-/// is a provider loss, which this signer declares only from an install that holds this
-/// identity's records ([`crate::Signer::declare_provider_loss`]); with the key alone this
-/// version of the signer has no way on there.
+/// is a provider loss declared with the key alone, at a service the user picks
+/// ([`crate::Signer::survey_provider_loss_with_key`],
+/// [`crate::Signer::declare_provider_loss_with_key`]), which works from whatever the store
+/// holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyRecoveryStop {

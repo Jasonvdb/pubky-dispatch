@@ -435,13 +435,29 @@ mod tests {
             created_at_ms: 20,
         });
         let older = account(AccountState::Serving(tip(3)));
-        let judged = judged(Some(older), &newer);
+        let lost_older = judged(Some(older), &newer);
         assert!(matches!(
-            judged.judgement.decision.verdict,
+            lost_older.judgement.decision.verdict,
             Verdict::Lost { .. }
         ));
         assert_eq!(
-            retirable(&judged, &newer).map(|(generation, _)| generation),
+            retirable(&lost_older, &newer).map(|(generation, _)| generation),
+            Ok(3)
+        );
+        // The older account at a HIGHER generation than the newer mark: still the mark's.
+        let mut higher = account(AccountState::Serving(ChainTip {
+            generation: 5,
+            seq: 3,
+            chain_hash: [1; 32],
+        }));
+        higher.model.document_generation = Some(5);
+        let lost_higher = judged(Some(higher), &newer);
+        assert!(matches!(
+            lost_higher.judgement.decision.verdict,
+            Verdict::Lost { .. }
+        ));
+        assert_eq!(
+            retirable(&lost_higher, &newer).map(|(generation, _)| generation),
             Ok(3)
         );
     }

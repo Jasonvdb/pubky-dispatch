@@ -60,6 +60,10 @@ use crate::client::answers::{ChainItem, SharedRecordView};
 use crate::error::ClientError;
 
 const RECORD_PREFIX: &str = "rec/";
+/// The index of the records at a permanent policy the app holds live, by key, each with
+/// its collection's name (Switch spec 10.3.1 "Absence"): kept with `rec/` by
+/// [`put_held`], so a listing page judges absence without reading every held record.
+const PERMANENT_PREFIX: &str = "recp/";
 const SEEN_PREFIX: &str = "hw/";
 const FLAG_PREFIX: &str = "flag/";
 /// The most flagged writes kept for one record ([`App::flagged_writes`]).
@@ -255,8 +259,32 @@ impl ListProgress {
     }
 }
 
+/// The switch's answer to a read of one record key ([`App::record_answer`]).
+enum RecordAnswer {
+    /// The record's view.
+    View(Box<SharedRecordView>),
+    /// `404`: the switch holds no record at the key.
+    Absent,
+    /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
+    /// (Switch wire 7.3 step 2).
+    NotHosted,
+}
+
 pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
     format!("{RECORD_PREFIX}{}", b64(key))
+}
+
+/// Write `held` as the record the app holds at `key`, and keep its entry in the index of
+/// permanent records held live (`recp/`) in step: there while it is live and was seen live
+/// at a permanent policy, else gone.
+pub(crate) fn put_held(tx: &mut Tx, key: &[u8; 32], held: &HeldRecord) -> Result<(), AppError> {
+    tx.put(&record_key_of(key), held)?;
+    let index = format!("{PERMANENT_PREFIX}{}", b64(key));
+    if held.live_in.is_some() && held.content != RecordContent::Deleted {
+        tx.put(&index, &held.collection)
+    } else {
+        tx.delete(&index)
+    }
 }
 
 pub(crate) fn seen_key(key: &[u8; 32]) -> String {
@@ -932,9 +960,17 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Option<WriteRead>, AppError> {
-        let Some(view) = self.record_view(key).await? else {
-            self.note_absent(key).await?;
-            return Ok(None);
+        let view = match self.record_answer(key).await? {
+            RecordAnswer::View(view) => view,
+            // The switch holds no record at the key, at an account it hosts: absence
+            // (Switch spec 10.3.1 "Absence").
+            RecordAnswer::Absent => {
+                self.note_absent(key).await?;
+                return Ok(None);
+            }
+            // It doesn't host the identity: that says nothing of the record, and the
+            // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+            RecordAnswer::NotHosted => return Ok(None),
         };
         let mut tx = self.tx()?;
         let read = self
@@ -998,10 +1034,20 @@ impl App {
         &mut self,
         key: &[u8; 32],
     ) -> Result<Option<SharedRecordView>, AppError> {
+        Ok(match self.record_answer(key).await? {
+            RecordAnswer::View(view) => Some(*view),
+            RecordAnswer::Absent | RecordAnswer::NotHosted => None,
+        })
+    }
+
+    /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
+    /// doesn't hold from an identity it doesn't host.
+    async fn record_answer(&mut self, key: &[u8; 32]) -> Result<RecordAnswer, AppError> {
         let result = self.client.record(key).await;
         match self.take(result).await {
-            Ok(view) => Ok(Some(view)),
-            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(None),
+            Ok(view) => Ok(RecordAnswer::View(Box::new(view))),
+            Err(AppError::Switch(error)) if error.is_not_hosted() => Ok(RecordAnswer::NotHosted),
+            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(RecordAnswer::Absent),
             Err(error) => Err(error),
         }
     }
@@ -1747,7 +1793,7 @@ impl App {
                     && held.content.waits_for_key()
                 {
                     held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
-                    tx.put(&record_key_of(&shown_key), &held)?;
+                    put_held(tx, &shown_key, &held)?;
                 }
                 let deleted = writes_a_delete(evidence.op);
                 let shown = Shown {
@@ -1851,7 +1897,7 @@ impl App {
             held.follow = Some(version);
             held.follow_deleted = deleted;
             held.follow_named = named;
-            tx.put(&record_key_of(key), &held)?;
+            put_held(tx, key, &held)?;
             if !named {
                 self.events.push(AppEvent::WriteNotTaken { key: *key });
             }
@@ -2435,12 +2481,29 @@ impl App {
                     upgraded.proof = accepted.proof.clone().or(held.proof.clone());
                 }
                 if upgraded != *held {
-                    tx.put(&record_key_of(&key), &upgraded)?;
+                    put_held(tx, &key, &upgraded)?;
                 }
                 return Ok(Taken::Same);
             }
             if !accepted.version.replaces(&held.write_version()) {
                 return Ok(Taken::NotNewer);
+            }
+            // A proven create over a permanent record the app holds live: the switch let the
+            // record go and took a create at `{0, 0}` in its place, which absence would show
+            // had the app read it in between (Switch spec 10.3.1 "Absence").
+            if accepted.version.authenticated
+                && accepted.version.expected_version.is_none()
+                && held.content != RecordContent::Deleted
+                && absence_is_rollback(
+                    &held.policy,
+                    held.live_in,
+                    self.state.meta.generation,
+                    self.state.own_doc.body().recovery_from,
+                )
+            {
+                let reason =
+                    "Switch spec 10.3.1: a create over a permanent record seen live".into();
+                return Err(self.raise(Alarm::Rollback { reason }).await);
             }
         }
         let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
@@ -2562,7 +2625,7 @@ impl App {
             follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
             follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
         };
-        tx.put(&record_key_of(&key), &record)?;
+        put_held(tx, &key, &record)?;
         self.events.push(AppEvent::RecordChanged { key });
         Ok(if reopened {
             Taken::Reopened
@@ -2593,7 +2656,11 @@ impl App {
         let Some(held) = self.held_record(key).await? else {
             return Ok(());
         };
+        // The switch shows only records whose read scope the caller's certificate covers:
+        // one the app no longer reads, after a renewal that dropped its scope, is left out
+        // of a listing as any record it can't read is (Switch wire 7.4.9).
         if held.content != RecordContent::Deleted
+            && self.state.cert.holds_scope(&held.policy.read_scope)
             && absence_is_rollback(
                 &held.policy,
                 held.live_in,
@@ -2610,6 +2677,11 @@ impl App {
     /// [`App::note_absent`] for each record of `collection` the app holds whose key a
     /// listing page covered, after `after` and through `last` (to the end for `None`), and
     /// that the page didn't list.
+    ///
+    /// It reads only the index of permanent records held live (`recp/`), a key and a
+    /// collection name each, so a page costs one scan of that index, whatever the
+    /// collection, and one held record read for each permanent record of this collection
+    /// the page left out; ordinary records are never read.
     async fn note_unlisted(
         &mut self,
         collection: &str,
@@ -2618,9 +2690,8 @@ impl App {
         listed: &[[u8; 32]],
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
-        for (rest, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
-            if held.collection != collection
-                || held.policy.permanent.is_none()
+        for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
+            if of != collection
                 || after.as_ref().is_some_and(|after| rest <= *after)
                 || last.as_ref().is_some_and(|last| rest > *last)
             {
@@ -3131,6 +3202,7 @@ pub(crate) fn record_put(
 pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
     for prefix in [
         RECORD_PREFIX,
+        PERMANENT_PREFIX,
         SEEN_PREFIX,
         "recname/",
         "out/",

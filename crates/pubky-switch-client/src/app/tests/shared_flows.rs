@@ -10180,3 +10180,85 @@ async fn test_permanent_absent_raises_the_alarm() {
     assert!(tablet.list_collection(&kept_items()).await.is_err());
     assert!(matches!(tablet.alarm(), Some(Alarm::Rollback { .. })));
 }
+
+#[tokio::test]
+async fn test_permanent_not_hosted_read_raises_no_alarm() {
+    let (s, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    // The switch lost the account with its mark: its signed `404` says it doesn't host the
+    // identity, which says nothing of the record (Switch spec 12.7 step 5).
+    s.w.switch.lose_account();
+    s.w.switch.lose_mark();
+    let read = phone.read_record_fresh(&kept).await;
+    assert!(matches!(read, Ok(RecordRead::Kept { .. })), "{read:?}");
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_permanent_listing_after_a_narrowing_raises_no_alarm() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes(
+        "sample.kept",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    );
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_some());
+    // A renewal drops `sample-a:till`: the listing leaves the record out, as any record
+    // the wallet can't read.
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk"]);
+    store_parts_for(&s, &renewed);
+    renewal_another_device_took(&s, &earlier, &renewed);
+    for _ in 0..3 {
+        wallet.receive(None).await.unwrap();
+        if wallet.cert().hash() == renewed.hash() {
+            break;
+        }
+    }
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    let listed = wallet.list_collection(&family).await;
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(wallet.alarm().is_none(), "{:?}", wallet.alarm());
+}
+
+#[tokio::test]
+async fn test_permanent_create_over_a_record_seen_live_raises_the_alarm() {
+    let (s, _, mut phone, ordinary, kept) = with_kept_records().await;
+    let mut tablet = s.join("tablet").await;
+    // A switch that lets each record go takes another app's create at `{0, 0}` in its
+    // place: taken for an ordinary record, a rollback for a permanent one seen live.
+    for target in [&ordinary, &kept] {
+        let key = phone.record_key(target).unwrap();
+        s.w.switch.drop_record(&key).unwrap();
+        tablet
+            .put_record(target, &value(&["a", "b"]), vec![])
+            .await
+            .unwrap();
+        let _ = phone.receive(None).await;
+        if target == &ordinary {
+            assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+            let held = phone.shared_record(&key).await.unwrap().unwrap();
+            assert_eq!(ids(held.content.value()), vec!["a", "b"]);
+        } else {
+            assert!(
+                matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+                "{:?}",
+                phone.alarm()
+            );
+        }
+    }
+}

@@ -2092,7 +2092,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
   |---|---|---|
   | `key` | `b64(32)` | |
   | `collection` | `b64(32)` | the collection ID |
-  | `read_scope`, `write_scopes` | | the policy |
+  | `read_scope`, `write_scopes` | | the policy's scopes; a permanent policy's `permanent` member (6.2) is in `op` |
   | `generation`, `version` | int | the current version |
   | `revision` | reference | the current write's application (6.3), which a `record_current` condition names |
   | `seq` | int | the write's `seq`; for a record taken from a recovery upload, the `upload` transition's (7.4.14) |

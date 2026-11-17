@@ -301,8 +301,21 @@ impl Signer {
         statuses: &[AppStatus],
         switch_time: u64,
     ) -> Result<()> {
+        self.rotate_through(statuses, switch_time, self.state.epoch_through)
+            .await
+    }
+
+    /// Bring every current app the newest version lists through epoch `through`, and deliver
+    /// the version that raises `data_epoch` to it (Switch spec 3.5): an epoch's completion,
+    /// or one more rotation after a removal at an epoch the removed apps may hold the keys of
+    /// ([`Signer::remove_unheld`]).
+    pub(super) async fn rotate_through(
+        &mut self,
+        statuses: &[AppStatus],
+        switch_time: u64,
+        through: u64,
+    ) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let through = self.state.epoch_through;
         let key = self.signing_key()?;
         let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
@@ -669,7 +682,11 @@ impl Signer {
             return Ok(false);
         }
         let owed = self.owed()?;
-        let stalled = self.closing_stalled()? || super::gate::refusal(&self.state).is_some();
+        // The version that drops certificates this install doesn't hold comes first: no
+        // backup of a closing that still names them can be sealed (Switch spec 12.8).
+        let stalled = self.closing_stalled()?
+            || super::gate::refusal(&self.state).is_some()
+            || self.unheld_references()?;
         let mut state = self.state.clone();
         state
             .alerts

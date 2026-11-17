@@ -156,6 +156,23 @@ pub(crate) fn recovery_refusal(state: &SignerState) -> Option<SignerError> {
     None
 }
 
+/// The identity key for the `existing` enrollment of a recovery with the key alone (Switch
+/// spec 12.8), which changes nothing at a serving account (Switch wire 3.7). The recovery
+/// replaces the records, so another install named and records behind don't hold it back;
+/// the restore's own checks ran first: no erasure, flow, hand-over or take-over in place,
+/// and the survey's rules. Its version is signed through [`signing_key`], on the records
+/// it rebuilt. A host's keyring is never a received one: only a take-over makes those.
+///
+/// # Errors
+///
+/// The key's error.
+pub(crate) fn key_recovery_key(
+    keyring: &IdentityKeyring,
+    store: &OwnedStoreHandle,
+) -> Result<SigningKey> {
+    Ok(keyring.signing_key(GatePassed(store.ownership()?))?)
+}
+
 /// The identity key for a hand-over's own steps, while this install hands the identity over
 /// (Switch wire 3.12): storing it at the switch, and the abort. The base checks still apply.
 ///

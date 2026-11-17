@@ -46,7 +46,8 @@ pub enum SignerError {
     StoredData(#[source] pubky_switch_core::Error),
     /// Another install is the identity's signer, as the newest `identity.json` or the backup
     /// names it, so this one signs nothing until the user has it take over (Switch spec 4.3,
-    /// 12.8).
+    /// 12.8): [`crate::Signer::restore`], from the backup, or with the key alone when the
+    /// backup is missing, unreadable or stale ([`crate::Signer::survey_key_recovery`]).
     #[error("another install is the identity's signer")]
     NotNamed {
         /// That install's signer ID.
@@ -190,7 +191,9 @@ pub enum Refusal {
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,
     /// This install's records are behind a newer `identity.json` it signed itself, so it
-    /// signs nothing until they are restored from the signer backup (Switch wire 3.13).
+    /// signs nothing until they are restored (Switch wire 3.13): [`crate::Signer::restore`],
+    /// from the signer backup, or with the key alone when the backup is missing, unreadable
+    /// or stale ([`crate::Signer::survey_key_recovery`]).
     #[error("refused: this install's records are behind its own version {version}")]
     RecordsBehind {
         /// The newer version.
@@ -314,14 +317,22 @@ pub enum Refusal {
     /// records and the take-over, are deleted.
     #[error("refused: the take-over was cancelled")]
     TakeOverCancelled,
-    /// The Homeserver holds no signer backup to restore from (Switch wire 3.13).
-    #[error("refused: there is no signer backup")]
+    /// The Homeserver holds no signer backup to restore from (Switch wire 3.13). The way on
+    /// is a recovery with the key alone: [`crate::Signer::survey_key_recovery_new`] (or
+    /// [`crate::Signer::survey_key_recovery`] in place), then the restore again with the
+    /// user's [`crate::KeyRecoveryConfirmed`].
+    #[error("refused: there is no signer backup; recover with the identity key")]
     NoBackup,
     /// The signer backup is stale: the switch holds another version than the backup's or
     /// the one it builds on, or the Homeserver a newer one or another at its version (Switch
-    /// wire 3.13 "Restoring").
-    #[error("refused: the signer backup is stale")]
+    /// wire 3.13 "Restoring"). The way on is a recovery with the key alone, as for
+    /// [`Refusal::NoBackup`].
+    #[error("refused: the signer backup is stale; recover with the identity key")]
     StaleBackup,
+    /// A recovery with the identity key alone doesn't go ahead, for the reason given (Switch
+    /// spec 12.8); nothing was signed.
+    #[error("refused: the recovery with the identity key doesn't go ahead: {0:?}")]
+    KeyRecovery(KeyRecoveryStop),
     /// The newest `identity.json` doesn't list that App ID in `removed`.
     #[error("refused: the App ID isn't in removed")]
     NotRemoved,
@@ -333,9 +344,10 @@ pub enum Refusal {
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,
-    /// The Homeserver holds a signer backup this install can't open, found before its first
-    /// version was delivered; nothing is written or delivered until the user deals with it
-    /// ([`crate::Alert::UnreadableBackupBeforeEnrollment`]).
+    /// The Homeserver holds a signer backup this install can't open: found by a restore, the
+    /// way on is a recovery with the key alone, as for [`Refusal::NoBackup`]; found before an
+    /// enrollment's first version was delivered, nothing is written or delivered until the
+    /// user deals with it ([`crate::Alert::UnreadableBackupBeforeEnrollment`]).
     #[error("refused: the Homeserver holds a signer backup this install can't open")]
     UnreadableBackup,
     /// A flow is in progress: [`crate::Signer::resume`] finishes it first.
@@ -367,6 +379,46 @@ pub enum Refusal {
         /// The adopted version.
         version: u64,
     },
+}
+
+/// Why a recovery with the identity key alone doesn't go ahead (Switch spec 12.8). It builds
+/// on the copy of `identity.json` the account's service holds, so it needs a service that
+/// serves the account and holds the newest version anyone saw. Where it doesn't, the way on
+/// is a provider loss, which this signer declares only from an install that holds this
+/// identity's records ([`crate::Signer::declare_provider_loss`]); with the key alone this
+/// version of the signer has no way on there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyRecoveryStop {
+    /// No copy of `identity.json` the identity key signed was found, on the Homeserver, in a
+    /// backup that opens or in this install's records, so no service is known to recover
+    /// at: the user gives the one that serves the account
+    /// ([`crate::Signer::survey_key_recovery_new_at`]).
+    NoCopy,
+    /// The service the newest copy names, or the one the user gave, doesn't serve the
+    /// account: it holds none, only its mark, or a staged or recovering one, or answers with
+    /// an error it signs. Where the account moved since that copy, the user gives the service
+    /// that serves it ([`crate::Signer::survey_key_recovery_new_at`]).
+    NotServing,
+    /// The service's copy is missing, doesn't verify, or names another origin or service key
+    /// than the one that answered.
+    SwitchCopy,
+    /// A copy newer than the service's was seen, at `seen_version`: on the Homeserver, in the
+    /// signer backup or in this install's records, or this install's own epochs show one.
+    /// The service holds an older version, `switch_version`, and building on it would undo
+    /// what came after.
+    ServiceBehind {
+        /// The version of the service's copy.
+        switch_version: u64,
+        /// The version seen above it.
+        seen_version: u64,
+    },
+    /// What the survey shows changed since the user confirmed it: survey again and confirm.
+    SurveyChanged,
+    /// The service's copy carries members this signer doesn't read, which a later version of
+    /// the signer signed: recovering here would drop them. A signer version that reads them
+    /// recovers.
+    UnknownMembers,
 }
 
 /// The signer's result type.

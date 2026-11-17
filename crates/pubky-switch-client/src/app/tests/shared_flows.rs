@@ -10070,3 +10070,113 @@ async fn test_records_undated_write_under_a_closed_renewal_is_not_taken_until_on
     assert!(!shared.not_taken, "{shared:?}");
     assert_eq!(ids(shared.content.value()), vec!["a", "b", "c"]);
 }
+
+/// A collection of the neutral protocol under a permanent policy naming no generation
+/// (Switch spec 10.3.1).
+fn kept_items() -> Collection {
+    Collection::new(
+        "sample.kept",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    )
+}
+
+/// A setup whose protocol has [`items`] and [`kept_items`], with one record written in each
+/// by the wallet and taken by the phone: the setup, the wallet, the phone, and the two
+/// targets, the ordinary one first.
+async fn with_kept_records() -> (Setup, App, App, RecordTarget, RecordTarget) {
+    let s = Setup::new();
+    *s.protocol.collections.lock().unwrap() = Some(vec![items(), kept_items()]);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let ordinary = s.target("n1");
+    let kept = RecordTarget::new(kept_items(), b"n1");
+    for target in [&ordinary, &kept] {
+        wallet
+            .put_record(target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+    }
+    phone.receive(None).await.unwrap();
+    (s, wallet, phone, ordinary, kept)
+}
+
+#[tokio::test]
+async fn test_permanent_delete_refused_before_it_is_sent() {
+    let (s, mut wallet, _, ordinary, kept) = with_kept_records().await;
+    let written = s.w.switch.applied().len();
+    let error = wallet.delete_record(&kept, vec![]).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
+    );
+    // Nothing was signed, kept or sent.
+    assert_eq!(s.w.switch.applied().len(), written);
+    assert!(wallet.kept_batches().await.unwrap().is_empty());
+    // An ordinary record is deleted as before, and the permanent one is still written to.
+    let deleted = wallet.delete_record(&ordinary, vec![]).await.unwrap();
+    assert_eq!(deleted.content, RecordContent::Deleted);
+    let changed = wallet
+        .put_record(&kept, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(ids(changed.content.value()), vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn test_permanent_delete_a_switch_applied_raises_the_alarm() {
+    let (s, mut wallet, mut phone, ordinary, kept) = with_kept_records().await;
+    // A faulty switch applies the wallet's deletes without the shape check: the ordinary
+    // one is taken, the permanent one, which its proof shows applied, is a rollback.
+    for target in [&ordinary, &kept] {
+        let (_, delete) = wallet.record_op(target, None, vec![]).await.unwrap();
+        s.w.switch.skip_next_shape_check();
+        s.w.switch.app_op(&app_keys("wallet"), delete).unwrap();
+        let _ = phone.receive(None).await;
+        let key = phone.record_key(target).unwrap();
+        if target == &ordinary {
+            assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+            let held = phone.shared_record(&key).await.unwrap().unwrap();
+            assert_eq!(held.content, RecordContent::Deleted);
+        } else {
+            assert!(
+                matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+                "{:?}",
+                phone.alarm()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_permanent_absent_raises_the_alarm() {
+    let (s, _, mut phone, ordinary, kept) = with_kept_records().await;
+    let mut tablet = s.join("tablet").await;
+    tablet.list_collection(&kept_items()).await.unwrap();
+    let kept_key = tablet.record_key(&kept).unwrap();
+    assert!(tablet.shared_record(&kept_key).await.unwrap().is_some());
+    // An ordinary record the switch no longer holds reads as not found.
+    s.w.switch
+        .drop_record(&phone.record_key(&ordinary).unwrap())
+        .unwrap();
+    let read = phone.read_record_fresh(&ordinary).await.unwrap();
+    assert!(
+        matches!(
+            read,
+            RecordRead::Kept {
+                reason: KeptReason::NotFound,
+                ..
+            }
+        ),
+        "{read:?}"
+    );
+    assert!(phone.alarm().is_none());
+    // A permanent one seen live in this generation is a rollback, at a read of the key and
+    // at a listing that leaves it out.
+    s.w.switch
+        .drop_record(&phone.record_key(&kept).unwrap())
+        .unwrap();
+    assert!(phone.read_record_fresh(&kept).await.is_err());
+    assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
+    assert!(tablet.list_collection(&kept_items()).await.is_err());
+    assert!(matches!(tablet.alarm(), Some(Alarm::Rollback { .. })));
+}

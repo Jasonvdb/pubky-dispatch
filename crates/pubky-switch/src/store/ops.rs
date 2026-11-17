@@ -527,9 +527,10 @@ impl AccountTxn {
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
-             upload_base_op_hash, application_generation, application_seq, application_item_hash) \
+             upload_base_op_hash, application_generation, application_seq, application_item_hash, \
+             permanent, permanent_generation) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22) \
+             $17, $18, $19, $20, $21, $22, $23, $24) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
@@ -559,6 +560,15 @@ impl AccountTxn {
         .bind(to_db(record.revision.generation, "application_generation")?)
         .bind(to_db(record.revision.seq, "application_seq")?)
         .bind(record.revision.item_hash.as_slice())
+        .bind(state.policy.permanent.is_some())
+        .bind(
+            state
+                .policy
+                .permanent
+                .and_then(|p| p.generation)
+                .map(|g| to_db(g, "permanent_generation"))
+                .transpose()?,
+        )
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -1153,13 +1163,32 @@ impl AccountTxn {
 }
 
 /// The columns [`record_of`] reads.
-pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, generation, \
+pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, permanent, \
+     permanent_generation, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
      version_exact, upload_base_generation, upload_base_version, upload_base_op_hash, \
      application_generation, application_seq, application_item_hash, \
      EXISTS (SELECT 1 FROM \
      divergent_uploads d WHERE d.account_id = shared_records.account_id \
      AND d.key = shared_records.key) AS divergent";
+
+/// A stored policy's permanent member (Switch wire 6.2), from its two columns.
+fn permanent_of(
+    permanent: bool,
+    generation: Option<i64>,
+) -> Result<Option<pubky_switch_core::ident::Permanent>, StoreError> {
+    match (permanent, generation) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(StoreError::Corrupt(
+            "a permanent generation on an ordinary policy",
+        )),
+        (true, generation) => Ok(Some(pubky_switch_core::ident::Permanent {
+            generation: generation
+                .map(|g| from_db(g, "permanent_generation"))
+                .transpose()?,
+        })),
+    }
+}
 
 pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, StoreError> {
     let key: Vec<u8> = row.try_get("key")?;
@@ -1205,6 +1234,10 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
             policy: Policy {
                 read_scope: row.try_get("read_scope")?,
                 write_scopes: row.try_get("write_scopes")?,
+                permanent: permanent_of(
+                    row.try_get("permanent")?,
+                    row.try_get("permanent_generation")?,
+                )?,
             },
             version: pubky_switch_core::ops::RecordVersion::new(
                 from_db(row.try_get("generation")?, "generation")?,

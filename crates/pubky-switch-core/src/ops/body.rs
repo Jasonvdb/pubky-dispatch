@@ -11,7 +11,7 @@ use super::read::{
 use crate::claims::ClaimFields;
 use crate::enc::{app_id_bytes, b64, lp, pubky_id, zbase32_encode};
 use crate::error::{Error, Result, invalid};
-use crate::ident::Policy;
+use crate::ident::{Permanent, Policy};
 use crate::json::{Doc, parse_json_as};
 use crate::labels;
 use crate::records::KeyBundle;
@@ -561,6 +561,7 @@ fn type_members(op: &str) -> Option<&'static [&'static str]> {
             "collection",
             "read_scope",
             "write_scopes",
+            "permanent",
             "expected_version",
             "value_sealed",
             "id_inputs",
@@ -647,8 +648,16 @@ impl OpKind {
                 o.str("key", &b64(&put.key))
                     .str("collection", &b64(&put.collection))
                     .str("read_scope", &put.policy.read_scope)
-                    .raw("write_scopes", &string_array(&put.policy.write_scopes))
-                    .raw("expected_version", &put.expected_version.to_json());
+                    .raw("write_scopes", &string_array(&put.policy.write_scopes));
+                if let Some(permanent) = &put.policy.permanent {
+                    let mut p = Obj::new();
+                    match permanent.generation {
+                        Some(generation) => p.int("generation", generation),
+                        None => p.null("generation"),
+                    };
+                    o.raw("permanent", &p.finish());
+                }
+                o.raw("expected_version", &put.expected_version.to_json());
                 let sealed = &put.value_sealed;
                 let mut s = Obj::new();
                 s.int("data_epoch", sealed.data_epoch)
@@ -770,6 +779,10 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
     let sealed = req(v, "value_sealed", what)?;
     only(sealed, &SEALED_MEMBERS, "value_sealed")?;
     let value_sealed: SealedValue = serde_json::from_value(sealed.clone())?;
+    let permanent = match v.get("permanent") {
+        None => None,
+        Some(member) => Some(read_permanent(member)?),
+    };
     let id_inputs = match opt(v, "id_inputs") {
         None => None,
         Some(inputs) => {
@@ -787,11 +800,29 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
         policy: Policy {
             read_scope: req_str(v, "read_scope", what)?.to_owned(),
             write_scopes,
+            permanent,
         },
         expected_version: RecordVersion::read(req(v, "expected_version", what)?, what)?,
         value_sealed,
         id_inputs,
     })
+}
+
+/// Read a `record.put`'s `permanent` member, `{ "generation": int | null }` (Switch wire
+/// 6.2): an object with its one member, which is required. A `null` member, or a generation
+/// of 0, is malformed: the second at the policy hash (Switch wire 1.5).
+fn read_permanent(member: &Value) -> Result<Permanent> {
+    let what = "permanent";
+    if !member.is_object() {
+        return invalid("Switch wire 6.2: record.put: permanent isn't an object");
+    }
+    only(member, &["generation"], what)?;
+    let generation = match member.get("generation") {
+        None => return invalid("Switch wire 6.2: permanent: generation is missing"),
+        Some(Value::Null) => None,
+        Some(n) => Some(super::read::int(n, "generation", what)?),
+    };
+    Ok(Permanent { generation })
 }
 
 /// A signed operation's body (Switch wire 6.1): the members every operation carries and its
@@ -922,11 +953,14 @@ impl OpBody {
                 ints.push(f.expected_step);
                 ints.extend(f.orphan_after);
             }
-            OpKind::RecordPut(p) => ints.extend([
-                p.expected_version.generation,
-                p.expected_version.version,
-                p.value_sealed.data_epoch,
-            ]),
+            OpKind::RecordPut(p) => {
+                ints.extend([
+                    p.expected_version.generation,
+                    p.expected_version.version,
+                    p.value_sealed.data_epoch,
+                ]);
+                ints.extend(p.policy.permanent.and_then(|p| p.generation));
+            }
             OpKind::InviteCodePut(p) => ints.push(p.max_uses),
             OpKind::KeyBundlePut(p) => ints.extend([p.first_epoch, p.last_epoch]),
             _ => {}

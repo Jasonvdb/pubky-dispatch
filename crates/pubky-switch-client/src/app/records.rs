@@ -40,7 +40,9 @@ use pubky_switch_core::chain::{ChainEnvelope, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, record_key_from_blinded};
-use pubky_switch_core::ops::{Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp};
+use pubky_switch_core::ops::{
+    Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp, check_permanent,
+};
 use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, Standing};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::shared::{WriteVersion, date_write};
@@ -536,6 +538,9 @@ pub(crate) struct HeldRecord {
     /// `false` for one refused only on the service's word, which names nobody and reads as
     /// not flagged.
     follow_named: bool,
+    /// At a permanent policy, the newest generation the app saw the record live in (Switch
+    /// spec 10.3.1 "Absence"); `None` for an ordinary policy, or one never seen live.
+    live_in: Option<u64>,
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -928,6 +933,7 @@ impl App {
         collection: &Collection,
     ) -> Result<Option<WriteRead>, AppError> {
         let Some(view) = self.record_view(key).await? else {
+            self.note_absent(key).await?;
             return Ok(None);
         };
         let mut tx = self.tx()?;
@@ -1127,6 +1133,9 @@ impl App {
                 tx.put(key, &**progress)?;
             }
             self.commit(tx).await?;
+            let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
+            self.note_unlisted(&collection.name, after.as_ref(), next.as_ref(), &shown)
+                .await?;
             match next {
                 Some(next) => after = Some(next),
                 None => return Ok(Listed::Done(listed)),
@@ -1947,6 +1956,16 @@ impl App {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
+        // Step 3, a permanent policy's rule, by the write's own generation (Switch wire 6.2,
+        // Switch spec 10.3.1): a write the service applied against it, as its proof or
+        // verified stub shows, is signed misbehaviour; without that, it is only the
+        // service's word, and names no app.
+        if let Err(refused) = check_permanent(put, body.generation) {
+            return Ok(Err(match proven {
+                Some(_) => Refused::Misbehaviour(refused.reason),
+                None => Refused::Ignored,
+            }));
+        }
         // The version step 6 checks, `None` when nothing gives one.
         let shown = match (proven, evidence.view_version) {
             (Some(version), _) => Some(WriteVersion {
@@ -2407,12 +2426,15 @@ impl App {
         }
         if let Some(held) = held.as_ref().filter(|_| !reopened) {
             if held.item_hash == accepted.item_hash {
+                let mut upgraded = held.clone();
+                upgraded.live_in = self.live_in(&held.policy, &held.content, held.live_in);
                 if accepted.version.authenticated && !held.authenticated {
-                    let mut upgraded = held.clone();
                     upgraded.version = accepted.version.version;
                     upgraded.authenticated = true;
                     upgraded.written_at_ms = accepted.time.or(held.written_at_ms);
                     upgraded.proof = accepted.proof.clone().or(held.proof.clone());
+                }
+                if upgraded != *held {
                     tx.put(&record_key_of(&key), &upgraded)?;
                 }
                 return Ok(Taken::Same);
@@ -2513,7 +2535,13 @@ impl App {
             None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
             None => {}
         }
+        let live_in = self.live_in(
+            &accepted.collection.policy,
+            &accepted.content,
+            held.as_ref().and_then(|held| held.live_in),
+        );
         let record = HeldRecord {
+            live_in,
             collection: accepted.collection.name.clone(),
             policy: accepted.collection.policy.clone(),
             op: accepted.op,
@@ -2541,6 +2569,69 @@ impl App {
         } else {
             Taken::New
         })
+    }
+
+    /// The newest generation a record at `policy` was seen live in, once it is seen with
+    /// `content` in the generation the app follows: that one for a live record at a
+    /// permanent policy, else `held` (Switch spec 10.3.1 "Absence").
+    fn live_in(&self, policy: &Policy, content: &RecordContent, held: Option<u64>) -> Option<u64> {
+        if policy.permanent.is_none() || *content == RecordContent::Deleted {
+            return held;
+        }
+        let now = self.state.meta.generation;
+        Some(held.map_or(now, |held| held.max(now)))
+    }
+
+    /// A signed answer shows the key absent (a `404`, or a listing page that covers the key
+    /// without it): the rollback alarm when the app holds a permanent record there live
+    /// (Switch spec 10.3.1 "Absence", [`absence_is_rollback`]).
+    ///
+    /// # Errors
+    ///
+    /// The alarm; a store failure.
+    async fn note_absent(&mut self, key: &[u8; 32]) -> Result<(), AppError> {
+        let Some(held) = self.held_record(key).await? else {
+            return Ok(());
+        };
+        if held.content != RecordContent::Deleted
+            && absence_is_rollback(
+                &held.policy,
+                held.live_in,
+                self.state.meta.generation,
+                self.state.own_doc.body().recovery_from,
+            )
+        {
+            let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
+            return Err(self.raise(Alarm::Rollback { reason }).await);
+        }
+        Ok(())
+    }
+
+    /// [`App::note_absent`] for each record of `collection` the app holds whose key a
+    /// listing page covered, after `after` and through `last` (to the end for `None`), and
+    /// that the page didn't list.
+    async fn note_unlisted(
+        &mut self,
+        collection: &str,
+        after: Option<&[u8; 32]>,
+        last: Option<&[u8; 32]>,
+        listed: &[[u8; 32]],
+    ) -> Result<(), AppError> {
+        let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
+        for (rest, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
+            if held.collection != collection
+                || held.policy.permanent.is_none()
+                || after.as_ref().is_some_and(|after| rest <= *after)
+                || last.as_ref().is_some_and(|last| rest > *last)
+            {
+                continue;
+            }
+            let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
+            if !listed.contains(&key) {
+                self.note_absent(&key).await?;
+            }
+        }
+        Ok(())
     }
 
     /// An own `record.put` the switch answered: taken at the version its proof gives.
@@ -3072,6 +3163,26 @@ pub(crate) struct SeenMark {
     pub(crate) mark: Vec<u8>,
 }
 
+/// Whether a signed answer that shows a permanent record's key absent is a rollback (Switch
+/// spec 10.3.1 "Absence"), for a record the app holds live at `policy`, last seen live in
+/// generation `live_in`, while the app follows `generation` and its newest own
+/// `identity.json` names `recovery_from`: not for an ordinary policy or one never seen live,
+/// nor when the provider lost the record since (`recovery_from` at or past `live_in`), nor
+/// once the account is past the generation the policy names.
+pub(crate) fn absence_is_rollback(
+    policy: &Policy,
+    live_in: Option<u64>,
+    generation: u64,
+    recovery_from: Option<u64>,
+) -> bool {
+    let (Some(permanent), Some(seen)) = (policy.permanent, live_in) else {
+        return false;
+    };
+    let lost_since = recovery_from.is_some_and(|lost| lost >= seen);
+    let passed = permanent.generation.is_some_and(|named| generation > named);
+    !lost_since && !passed
+}
+
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
 /// policy, or a member of its family), the collection ID is the name's, the sealed value's
 /// scope is the read scope, and a create's key derives from its `id_inputs`.
@@ -3122,6 +3233,47 @@ pub(crate) fn cut_reason(mut reason: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_permanent_sub_scope_policy_keeps_the_member() {
+        let base = Policy::new("scope-a", &["scope-a"]);
+        let kept = Collection::with_sub_scopes("sample.kept", base.clone().permanent(Some(3)));
+        let policy = kept.sub_scope_policy("s1").unwrap();
+        assert_eq!(policy.read_scope, "scope-a:s1");
+        assert_eq!(policy.permanent, base.clone().permanent(Some(3)).permanent);
+        assert!(kept.admits(&policy));
+        let ordinary = Collection::with_sub_scopes("sample.items", base);
+        assert_eq!(ordinary.sub_scope_policy("s1").unwrap().permanent, None);
+    }
+
+    #[test]
+    fn test_permanent_absence_by_generation() {
+        let ordinary = Policy::new("scope-a", &["scope-a"]);
+        let none = ordinary.clone().permanent(None);
+        let named = ordinary.clone().permanent(Some(2));
+        // (policy, live in, generation followed, recovery_from, rollback)
+        let cases = [
+            (&ordinary, Some(1), 1, None, false),
+            (&none, None, 1, None, false),
+            (&none, Some(1), 1, None, true),
+            // A move carries every record: absent after it is a rollback too.
+            (&none, Some(1), 2, None, true),
+            // Lost with the provider, and an upload may bring it back.
+            (&none, Some(1), 2, Some(1), false),
+            (&none, Some(2), 3, Some(2), false),
+            // Seen live after the loss: the new switch lost it.
+            (&none, Some(2), 2, Some(1), true),
+            (&named, Some(2), 2, None, true),
+            (&named, Some(2), 3, None, false),
+        ];
+        for (policy, live_in, generation, recovery_from, rollback) in cases {
+            assert_eq!(
+                absence_is_rollback(policy, live_in, generation, recovery_from),
+                rollback,
+                "{policy:?} {live_in:?} {generation} {recovery_from:?}"
+            );
+        }
+    }
 
     fn collection() -> Collection {
         Collection::new("sample.items", Policy::new("scope-a", &["scope-a"]))

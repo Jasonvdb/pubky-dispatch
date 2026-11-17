@@ -875,6 +875,11 @@ fn check_records(
                 "the writer's certificate holds none of its write scopes",
             ));
         }
+        // A write at a permanent policy keeps its rule, by its own generation (Switch wire
+        // 6.2, 10.5): an O that applied a delete it must refuse can't pass it on.
+        if crate::ops::check_permanent(put, op.body().generation).is_err() {
+            return Err(fail("its operation breaks its permanent policy's rule"));
+        }
         let deleted = put.value_sealed.looks_like_delete();
         let size = if deleted {
             0

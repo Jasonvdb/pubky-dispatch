@@ -290,8 +290,49 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         bundle_base,
         &[(&held, &range(last, last - 1))],
     ));
+    // A permanent policy's rule (wire 6.2 "Permanent policies", spec 10.3.1), the policy
+    // made permanent by its member after `write_scopes`: the `record.put delete`, at a policy
+    // naming no generation, and the `record.put create`, of generation 1, at a policy naming
+    // generation 2, its key derived again for that policy.
+    let scopes = format!(
+        r#""write_scopes":{},"expected_version""#,
+        text(&json!(writes))
+    );
+    let made_permanent = |generation: &str| {
+        format!(
+            r#""write_scopes":{},"permanent":{{"generation":{generation}}},"expected_version""#,
+            text(&json!(writes))
+        )
+    };
+    let refs: Vec<&str> = writes.iter().map(String::as_str).collect();
+    let named = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(Some(2));
+    let named_key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded,
+        &named.hash().unwrap(),
+    );
+    let (old_key, new_key) = (
+        format!(r#""key":{}"#, text(&json!(key))),
+        format!(r#""key":{}"#, text(&json!(b64e(&named_key)))),
+    );
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "record.put: a delete at a permanent policy",
+        "record.put delete",
+        &[(&scopes, &made_permanent("null"))],
+    ));
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "record.put: a create at a permanent policy of another generation",
+        based_on,
+        &[(&old_key, &new_key), (&scopes, &made_permanent("2"))],
+    ));
     let section = json!({
-        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2).",
+        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2); a record.put at a permanent policy, its permanent member written after write_scopes, deletes only in a generation above the one the policy names, never when it names none, and creates only in the generation it names (wire 6.2 \"Permanent policies\", spec 10.3.1).",
         "cases": cases,
     });
     generated(

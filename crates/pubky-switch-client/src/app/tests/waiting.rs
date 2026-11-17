@@ -3,8 +3,8 @@
 use super::*;
 use crate::app::state::key;
 use crate::app::{
-    AppBackup, AppEvent, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES, MAX_UNVERIFIED_AGE_MS,
-    ParkReason, ReceiveContext, StoreFailure, WaitingReason,
+    AppBackup, AppEvent, DropReason, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES,
+    MAX_UNVERIFIED_AGE_MS, ParkReason, ReceiveContext, StoreFailure, WaitingReason,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -23,6 +23,8 @@ struct Admission {
     mode: Mutex<Mode>,
     hold: AtomicBool,
     calls: Mutex<Vec<(String, EntryReceipt)>>,
+    /// The body members it names opaque, which a host update may change.
+    opaque: Mutex<Vec<crate::app::OpaqueRule>>,
 }
 
 impl Admission {
@@ -32,10 +34,20 @@ impl Admission {
             mode: Mutex::new(Mode::Wait),
             hold: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
+            opaque: Mutex::new(Vec::new()),
         })
     }
     fn set(&self, mode: Mode) {
         *self.mode.lock().unwrap() = mode;
+    }
+    fn set_opaque(&self, members: &[&str]) {
+        *self.opaque.lock().unwrap() = members
+            .iter()
+            .map(|member| crate::app::OpaqueRule {
+                kind: None,
+                member: (*member).into(),
+            })
+            .collect();
     }
 }
 
@@ -48,6 +60,9 @@ impl Protocol for Admission {
     }
     fn sent_between_own_apps(&self, kind: &str) -> bool {
         self.sample.sent_between_own_apps(kind)
+    }
+    fn opaque_members(&self) -> Vec<crate::app::OpaqueRule> {
+        self.opaque.lock().unwrap().clone()
     }
     fn check_scopes(&self, m: &Message, s: &AppCert, o: &AppCert) -> Result<(), String> {
         self.sample.check_scopes(m, s, o)
@@ -1013,4 +1028,180 @@ async fn test_admission_restore_commit_failure_leaves_one_complete_snapshot() {
             );
         }
     }
+}
+
+/// Kept custody is read by its authenticated common fields, never judged again under the
+/// protocol's current body rules: inputs whose body only the protocol's former rules allow
+/// load, reload, back up, restore and have their drop notice built; the next retry of one
+/// judges the current rules and drops it at check 5, a custody drop with its durable notice.
+#[tokio::test]
+async fn test_waiting_custody_outside_current_body_rules_loads_and_drops() {
+    let w = World::new();
+    let p = Admission::new();
+    p.set_opaque(&["score"]);
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    let fraction = |text: &str| {
+        w.switch
+            .send(
+                &w.bob,
+                &w.bob_keys,
+                &w.bob_cert,
+                "sample.note",
+                json!({ "text": text, "score": 1.5 }),
+                &[me],
+            )
+            .unwrap()
+    };
+    // One waits for a key that never comes, so only a bound drops it; one waits for
+    // admission, so the next read tries it again.
+    p.set(Mode::Key(9));
+    let (keyed, keyed_message) = fraction("keyed");
+    app.receive(None).await.unwrap();
+    p.set(Mode::Wait);
+    let (admitted, admitted_message) = fraction("admitted");
+    app.receive(None).await.unwrap();
+    assert!(app.stored_at(keyed).is_some() && app.stored_at(admitted).is_some());
+    // A host update narrows the protocol's opaque members.
+    p.set_opaque(&[]);
+    drop(app);
+    let mut app = App::load(w.env(), p.clone(), World::config(), me)
+        .await
+        .expect("kept custody loads under the narrowed rules");
+    let id = app.stored_id_at(keyed).unwrap();
+    assert!(
+        app.parked_entry(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .message
+            .is_some(),
+        "the host still reads the kept message"
+    );
+    let backup = app.backup().await.unwrap();
+    let fresh = Arc::new(MemoryStore::new());
+    let mut app = App::restore(w.env_on(fresh.clone()), p.clone(), World::config(), &backup)
+        .await
+        .expect("kept custody restores under the narrowed rules");
+    app.refresh_identity().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report.events.iter().any(|event| matches!(event,
+            AppEvent::MessageDropped { seq, check: 5, .. } if *seq == admitted)),
+        "the retry judges the current rules and drops the input at check 5"
+    );
+    assert!(app.stored_at(admitted).is_none());
+    assert!(
+        app.stored_at(keyed).is_some(),
+        "the other input still waits"
+    );
+    // The custody drop's durable notice was committed with it: it survives a reload.
+    drop(app);
+    let mut app = App::load(w.env_on(fresh), p.clone(), World::config(), me)
+        .await
+        .unwrap();
+    let kept = app.unacknowledged_events().await.unwrap();
+    assert!(
+        kept.iter().any(|event| matches!(event,
+            AppEvent::StoredEntryDropped { seq, reason: DropReason::Rules { check: 5 },
+                waiting: WaitingReason::Admission, message, .. }
+            if *seq == admitted && message.msg_id == admitted_message.msg_id)),
+        "the retry's custody drop keeps its durable notice: {kept:?}"
+    );
+    let notices = dropped(&expire(&w, &mut app).await);
+    assert_eq!(
+        notices
+            .iter()
+            .map(|notice| (notice.2, notice.3.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (admitted, admitted_message.msg_id),
+            (keyed, keyed_message.msg_id)
+        ],
+        "the bound's drop notice is built without the current rules"
+    );
+    assert!(app.stored_at(keyed).is_none());
+}
+
+/// The service's facts about an entry are checked when its page is read, before anything
+/// of the entry is kept: a page showing it accepted after the page's own time, and a later
+/// page contradicting the observation kept from an earlier one (another entry at its `seq`,
+/// or the entry accepted after that observation), are refused. So no kept observation ever
+/// precedes its entry's acceptance, and none is judged again as a store fault.
+#[tokio::test]
+async fn test_waiting_page_contradicting_an_entrys_acceptance_is_refused() {
+    enum Case {
+        AfterPageTime,
+        HeldOtherEntry,
+        HeldBeforeAcceptance,
+    }
+    for case in [
+        Case::AfterPageTime,
+        Case::HeldOtherEntry,
+        Case::HeldBeforeAcceptance,
+    ] {
+        let w = World::new();
+        let p = Admission::new();
+        let mut app = wallet(&w, &p).await;
+        let me = app.app_id();
+        let cursor = app.cursor().seq;
+        w.clock.advance_ms(10_000);
+        let (seq, message) = w.note(me, "held");
+        match case {
+            Case::AfterPageTime => w.clock.set_ms(w.clock.now_ms() - 5_000),
+            Case::HeldOtherEntry | Case::HeldBeforeAcceptance => {
+                // Held at the first page; the observation an earlier page would have left.
+                p.hold.store(true, Ordering::SeqCst);
+                app.receive(None).await.unwrap();
+                p.hold.store(false, Ordering::SeqCst);
+                let mut held = app.state.held[&seq];
+                match case {
+                    Case::HeldOtherEntry => held.receipt.entry_id[0] ^= 1,
+                    _ => held.receipt.read_at_ms = message.created_at_ms - 1,
+                }
+                let mut tx = app.tx().unwrap();
+                tx.put(&key::held(seq), &held).unwrap();
+                app.commit(tx).await.unwrap();
+                drop(app);
+                app = App::load(w.env(), p.clone(), World::config(), me)
+                    .await
+                    .unwrap();
+            }
+        }
+        let error = app.receive(None).await.unwrap_err();
+        assert!(
+            matches!(&error,
+                crate::app::AppError::Switch(crate::error::ClientError::InvalidResponse(why))
+                    if why.contains("accepted after the page's time"))
+                || matches!(&error, crate::app::AppError::InvalidData(why)
+                    if why.contains("contradicts the entry an earlier page showed")),
+            "{error:?}"
+        );
+        drop(app);
+        let app = App::load(w.env(), p.clone(), World::config(), me)
+            .await
+            .expect("a refused page leaves a store that loads");
+        assert!(app.stored_at(seq).is_none(), "no custody of the entry");
+        assert!(!pair(&app, &w, &message).await, "not processed");
+        assert_eq!(app.cursor().seq, cursor, "the cursor stays before it");
+    }
+    // Since no writer keeps one, kept custody whose observation precedes its acceptance
+    // is a corrupt store.
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    let mut stored = app.stored_at(seq).unwrap().clone();
+    stored.receipt.read_at_ms = stored.accepted_at_ms - 1;
+    let mut tx = app.tx().unwrap();
+    tx.put(&key::parked(id), &stored).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    assert!(matches!(
+        App::load(w.env(), p.clone(), World::config(), me).await,
+        Err(crate::app::AppError::Store(StoreError::Corrupt))
+    ));
 }

@@ -8216,6 +8216,69 @@ async fn test_scripted_records_condition_on_a_forgotten_delete_is_refused_once()
 }
 
 #[tokio::test]
+async fn test_records_read_finding_a_delete_forgotten_lets_the_next_write_create() {
+    // A read answered `404` over a held delete takes the key as forgotten, so the next
+    // write creates the record at once rather than naming the delete and being refused
+    // (Switch spec 10.3).
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    wallet.read_record(&target).await.unwrap();
+    let created = wallet.put_record(&target, &value(&["b"]), vec![]).await;
+    assert!(created.is_ok(), "{created:?}");
+}
+
+#[tokio::test]
+async fn test_records_write_followed_after_a_forgotten_delete_is_named() {
+    // The wallet's delete is forgotten, and a read marks it so. The phone then creates the
+    // record without what the wallet saw, which the wallet follows rather than takes
+    // (Switch spec 8.2): the next write names that create, not the absence before it.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    wallet.read_record(&target).await.unwrap();
+    let created = put_over_a_forgotten_delete(&mut phone, &target, &value(&["p"])).await;
+    read_on(&mut wallet).await;
+    assert!(wallet.shared_record(&key).await.unwrap().unwrap().flagged);
+    let written = wallet
+        .put_record(&target, &value(&["a", "w"]), vec![])
+        .await;
+    assert!(written.is_ok(), "{written:?}");
+    let at_switch = s.w.switch.lock().shared.records.get(&key).cloned().unwrap();
+    assert!(at_switch.state.version > created.version);
+}
+
+#[tokio::test]
+async fn test_records_view_of_the_held_delete_after_a_404_is_named() {
+    // A `404` marks the held delete forgotten; a later view shows the switch holding that
+    // very delete, as a new service does once the delete is uploaded to it (Switch spec
+    // 12.6). The mark goes, and the next write names the delete.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    s.w.switch.fail_next(Fault::Error {
+        path: format!("records/{}", pubky_switch_core::enc::b64(&key)),
+        code: ErrorCode::NotFound,
+        current: json!(null),
+    });
+    wallet.read_record(&target).await.unwrap();
+    wallet.read_record(&target).await.unwrap();
+    let written = wallet.put_record(&target, &value(&["b"]), vec![]).await;
+    assert!(written.is_ok(), "{written:?}");
+}
+
+#[tokio::test]
 async fn test_records_update_returns_the_conflict_when_a_delete_lands() {
     // A try built on a value never turns into a create over a delete: the call returns
     // the conflict, and `change` isn't asked again with nothing (Switch spec 10.3).

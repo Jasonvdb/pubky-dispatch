@@ -135,7 +135,7 @@ pub async fn deleted_key_forgotten(world: &World) -> FlowResult {
     );
     if refused != Some("conflict") {
         return Err(format!(
-            "the wallet's first write at the forgotten key, naming the delete, came to              {first:?}, not 409 conflict"
+            "the wallet's first write at the forgotten key, naming the delete, came to {first:?}, not 409 conflict"
         )
         .into());
     }

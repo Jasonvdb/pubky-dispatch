@@ -1254,6 +1254,35 @@ impl Signer {
         )
     }
 
+    /// Read each service `pending` names that isn't `visited` yet ([`Signer::serving`]),
+    /// into `reads`, and the service each copy read names in turn, up to [`MAX_SERVICES`] in
+    /// all.
+    async fn follow(
+        &self,
+        pending: &mut std::collections::BTreeSet<String>,
+        visited: &mut std::collections::BTreeSet<String>,
+        reads: &mut Vec<(u64, AppsAnswer)>,
+    ) -> Result<()> {
+        let identity = self.state.identity;
+        while let Some(origin) = pending.pop_first() {
+            if visited.len() > MAX_SERVICES || !visited.insert(origin.clone()) {
+                continue;
+            }
+            if let Some(read) = Box::pin(self.serving(&origin)).await? {
+                if let Some(copy) = read
+                    .1
+                    .identity
+                    .as_ref()
+                    .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
+                {
+                    pending.insert(copy.inbox().url.clone());
+                }
+                reads.push(read);
+            }
+        }
+        Ok(())
+    }
+
     /// Read a provider loss's survey at `to` (the doc of
     /// [`Signer::survey_provider_loss_with_key`]) over what the store holds, `found`.
     async fn loss_plan(&self, found: &LossFound, to: &str) -> Result<LossPlan> {
@@ -1277,18 +1306,15 @@ impl Signer {
                 .as_ref()
                 .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
         };
-        // Every service a copy names, read where it serves the account: the Homeserver
-        // can't choose which copy counts as the newest by showing an older one naming
-        // another service.
-        let mut named: Vec<String> = held.iter().map(|doc| doc.inbox().url.clone()).collect();
-        named.sort_unstable();
-        named.dedup();
+        // Every service a copy names, read where it serves the account, and every service
+        // the copies those hold name in turn: the Homeserver can't choose which copy counts
+        // as the newest by showing an older one naming another service, and a service's
+        // newer copy naming the next one is followed there.
+        let mut visited = std::collections::BTreeSet::from([to.to_owned()]);
+        let mut pending: std::collections::BTreeSet<String> =
+            held.iter().map(|doc| doc.inbox().url.clone()).collect();
         let mut reads = Vec::new();
-        for named in named.iter().filter(|named| *named != to) {
-            if let Some(read) = Box::pin(self.serving(named)).await? {
-                reads.push(read);
-            }
-        }
+        Box::pin(self.follow(&mut pending, &mut visited, &mut reads)).await?;
         // The service picked, which the enrollment goes to.
         let target = Target {
             origin: to,
@@ -1310,6 +1336,10 @@ impl Signer {
             Err(error @ ClientError::Transport(_)) => return Err(error.into()),
             Err(_) => None,
         };
+        if let Some(copy) = picked.as_ref().and_then(|(_, answer)| copy_of(answer)) {
+            pending.insert(copy.inbox().url.clone());
+            Box::pin(self.follow(&mut pending, &mut visited, &mut reads)).await?;
+        }
         reads.extend(picked);
         // Copies a service took come first among equals.
         let mut seen: Vec<IdentityDoc> = reads
@@ -1745,6 +1775,9 @@ fn fresh_records(
 fn no_copy_time(now: u64, observed: u64) -> u64 {
     now.max(observed.min(now.saturating_add(DAY_MS)))
 }
+
+/// How many services a provider loss's survey reads at most, following the copies.
+const MAX_SERVICES: usize = 32;
 
 /// A day, in milliseconds.
 const DAY_MS: u64 = 86_400_000;

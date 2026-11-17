@@ -1269,3 +1269,45 @@ async fn test_key_provider_loss_takes_the_earlier_of_a_departure_and_a_revocatio
         )]
     );
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_follows_a_copy_to_the_service_it_names() {
+    // The Homeserver names the first service only. That service holds a newer copy naming a
+    // second one, which serves a newer version still: the survey follows the copies there
+    // and builds on that version.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    let first = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let (second, router) = picked_service(&world);
+    let moved = lost_with_key(&world, &Arc::new(MemoryStore::new()), &router, &[])
+        .await
+        .unwrap()
+        .identity_doc()
+        .unwrap()
+        .unwrap();
+    let mut body = first.body().clone();
+    body.version = moved.version() - 1;
+    body.inbox = moved.inbox().clone();
+    let pointing = IdentityDoc::sign(&world.key, body).unwrap();
+    world.switch.lose_identity();
+    world.switch.deliver_identity(&pointing).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(first.signed()).unwrap());
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    const THIRD: &str = "https://third.example";
+    let third =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x6e; 32], Arc::clone(&world.clock), THIRD);
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    router.add_switch(NEW_ORIGIN, &second);
+    router.add_switch(THIRD, &third);
+    let store = Arc::new(MemoryStore::new());
+    let shown =
+        Signer::survey_provider_loss_with_key(env_on(&world, &store, &router), world.keyring(), THIRD)
+            .await
+            .unwrap();
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), pointing.signed());
+    assert_eq!((shown.version, shown.generation), (moved.version(), 2));
+}

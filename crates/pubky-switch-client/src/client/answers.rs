@@ -999,7 +999,9 @@ impl AppsAnswer {
     }
 }
 
-/// The answer of the public read `GET /v1/{id}/identity` (Switch wire 7.4.15).
+/// The answer of the public read `GET /v1/{id}/identity` (Switch wire 7.4.15). It binds no
+/// request, so it may be an earlier answer sent again (Switch wire 7.1 "Identical
+/// requests"): it shows what the identity key signed, and nothing about the account now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicIdentity {
     /// The newest `identity.json` the service holds, verified with the account's identity.

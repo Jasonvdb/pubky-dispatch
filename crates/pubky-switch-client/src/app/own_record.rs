@@ -126,6 +126,12 @@ pub enum Publication {
     /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
     /// then.
     AwaitingRead,
+    /// The change is kept and waits unsent: the own `identity.json` lists a renewed
+    /// certificate a protocol refused its member for ([`super::AppEvent::RenewalWaits`]),
+    /// and the switch refuses a record under the earlier one. It goes, signed anew under
+    /// the renewed certificate, once that is taken (Switch spec 3.2 step 3). A later change
+    /// replaces it.
+    RenewalWaits,
 }
 
 /// A protocol's own expiry policy, resolved only for a newly signed record.
@@ -161,7 +167,7 @@ impl RecordExpiry {
     }
 }
 
-type RecordExpiries = BTreeMap<String, RecordExpiry>;
+pub(super) type RecordExpiries = BTreeMap<String, RecordExpiry>;
 
 fn expiry_refused(protocol: &str) -> AppError {
     Refusal::Usage(format!(
@@ -409,7 +415,7 @@ impl App {
         Ok(expiries)
     }
 
-    fn resolve_record_expiries(
+    pub(super) fn resolve_record_expiries(
         &self,
         expiries: &RecordExpiries,
         updated_at: u64,
@@ -492,8 +498,7 @@ impl App {
     async fn own_record_body(&mut self) -> Result<NextBody, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        let record = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        Ok(NextBody::of(&record))
+        Ok(NextBody::held(&self.state)?)
     }
 
     /// Sign `body` as the app's next record, unless it is the record held and `renew` is
@@ -547,9 +552,7 @@ impl App {
                 .is_some_and(|accepted| accepted != &self.state.record)
     }
 
-    /// Every new signature uses one timestamp and resolves every protocol policy at it. A
-    /// body under another certificate than the record held is one whose members the
-    /// protocols judged for it ([`NextBody::for_cert`]).
+    /// Every new signature uses one timestamp and resolves every protocol policy at it.
     pub(super) async fn sign_next_record(
         &mut self,
         body: NextBody,
@@ -580,7 +583,7 @@ impl App {
         AppRecord::verify(record.signed(), &self.state.meta.identity).map_err(refused)
     }
 
-    async fn next_record_time(&mut self, held: u64) -> Result<u64, AppError> {
+    pub(super) async fn next_record_time(&mut self, held: u64) -> Result<u64, AppError> {
         let next = held
             .checked_add(1)
             .filter(|next| *next <= MAX_TIME_MS)

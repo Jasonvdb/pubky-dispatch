@@ -82,6 +82,8 @@ struct Named {
     collections: Vec<crate::app::Collection>,
     /// Its member of the record for a renewed certificate; the default's while `None`.
     member_for: Mutex<Option<MemberFor>>,
+    /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
+    assign_kind: Mutex<bool>,
 }
 
 /// A [`Protocol::member_for`] of a test protocol.
@@ -275,11 +277,14 @@ impl Protocol for Named {
         }
     }
 
-    fn accepts(&self, _cert: &AppCert) -> Vec<String> {
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
         let mut kinds = vec![
             format!("{}.item", self.name),
             format!("{}.clear", self.name),
         ];
+        if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.push(format!("{}.assign", self.name));
+        }
         kinds.extend(self.foreign.clone());
         kinds
     }

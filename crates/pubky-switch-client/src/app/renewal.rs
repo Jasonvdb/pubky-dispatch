@@ -18,8 +18,9 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::{AppEvent, Duty};
-use super::next_body::NextBody;
-use super::state::{PendingRecord, Tx, key};
+use super::next_body::{CertBody, MemberRefusal, NextBody};
+use super::own_record::RecordExpiries;
+use super::state::{PendingRecord, RenewalWait, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
 use crate::error::ClientError;
@@ -45,7 +46,7 @@ impl App {
     }
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
-    /// carrying it, with each protocol's member judged for it ([`App::body_for_cert`]).
+    /// carrying it, with each protocol's member judged for it ([`App::judge_for_cert`]).
     /// Returns whether the certificate changed.
     pub(crate) async fn adopt_renewal(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
         let Some(renewal) = self.state.renewal.clone() else {
@@ -56,12 +57,11 @@ impl App {
             return Ok(false);
         }
         let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        let Some(body) = self.body_for_cert(&renewal).await? else {
+        let Some(judged) = self.judge_for_cert(&renewal, old.updated_at()).await? else {
             return Ok(false);
         };
-        let record = self.sign_next_record(body, old.updated_at()).await?;
         if !self
-            .take_cert(renewal, record.signed().clone(), true, None, at)
+            .take_cert(renewal, Taken::Judged(judged), None, at)
             .await?
         {
             return Ok(false);
@@ -70,47 +70,135 @@ impl App {
         Ok(true)
     }
 
-    /// The body of the app's next record under `cert`, a certificate it is about to take:
-    /// the record held, with `accepts` and every registered protocol's member as they are
-    /// for `cert` ([`NextBody::for_cert`]), each member checked as
-    /// [`App::set_protocol_member`] checks one: signed and read back the same way, and in an
-    /// `app.put` the switch would take. Nothing of that check is kept or sent.
+    /// The record the app holds, signed under `cert`, a certificate it is about to take,
+    /// later than `previous`, with its `app.put`: `accepts` and every member as the
+    /// registered protocols give them for `cert` ([`CertBody::judged`]), and the expiry the
+    /// protocols asked for, without the ask of a protocol whose member is removed. The whole
+    /// body is built first, then signed once and checked as [`App::set_protocol_member`]
+    /// checks a record: read back the same way, and in an `app.put` the switch would take.
+    /// Nothing is kept or sent here.
     ///
-    /// `None` when `cert` isn't taken now, with nothing signed or taken: one the protocols
-    /// can't run with is refused ([`App::refuse_cert`]); one a protocol refuses to give a member for
-    /// leaves the certificate and record held, and the renewal owed for the next read, and
-    /// the host is told ([`AppEvent::RenewalWaits`]).
-    async fn body_for_cert(&mut self, cert: &AppCert) -> Result<Option<NextBody>, AppError> {
+    /// `None` when `cert` isn't taken now, with nothing taken: one the protocols can't run
+    /// with is refused ([`App::refuse_cert`]); one a protocol refuses to give a member for,
+    /// or whose record the check refuses, leaves the certificate and record held, and the
+    /// renewal owed for a later read ([`App::renewal_waits`]).
+    async fn judge_for_cert(
+        &mut self,
+        cert: &AppCert,
+        previous: u64,
+    ) -> Result<Option<Judged>, AppError> {
         if let Some(refusal) = self.protocols.certificate_refusal(cert) {
             self.refuse_cert(cert, refusal).await?;
             return Ok(None);
         }
-        let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        let judged = NextBody::for_cert(&held, cert, &self.protocols, |body| {
-            AppRecord::sign(&self.state.keys, body.clone())
+        let held = NextBody::held(&self.state)?;
+        let body = match CertBody::judged(held, cert, &self.protocols) {
+            Ok(body) => body,
+            Err(refusal) => {
+                self.renewal_waits(cert, refusal).await?;
+                return Ok(None);
+            }
+        };
+        // A removed member's expiry ask goes with it, as when its protocol removes it.
+        let mut expiries = self.record_expiries().await?;
+        for name in body.removed() {
+            expiries.remove(name);
+        }
+        let updated_at = self.next_record_time(previous).await?;
+        let expires_at = self.resolve_record_expiries(&expiries, updated_at)?;
+        let check = |body: &CertBody| {
+            body.sign(&self.state.keys, updated_at, expires_at)
                 .map_err(AppError::from)
                 .and_then(|record| self.read_back(&record))
-                .and_then(|record| self.record_batch(record.signed()))
-                .map(drop)
-                .map_err(|error| error.to_string())
-        });
-        match judged {
-            Ok(body) => Ok(Some(body)),
-            Err(refusal) => {
-                self.push_once(AppEvent::RenewalWaits {
-                    issued_at: cert.issued_at(),
-                    protocol: refusal.protocol,
-                    reason: refusal.reason,
-                });
+                .and_then(|record| Ok((self.record_batch(record.signed())?, record)))
+        };
+        match check(&body) {
+            Ok((batch, record)) => Ok(Some(Judged {
+                record: record.signed().clone(),
+                pending: PendingRecord {
+                    body: batch.body().to_vec(),
+                },
+                expiries,
+                dropped: body.dropped().to_vec(),
+            })),
+            Err(error) => {
+                // Named by the first member the check refuses alone, else by the largest:
+                // each body checked holds only members given for `cert`.
+                let names = self.protocols.names();
+                let alone = names
+                    .iter()
+                    .find(|name| body.only(name).is_some_and(|alone| check(&alone).is_err()));
+                let largest = || {
+                    names
+                        .iter()
+                        .filter(|name| body.member_len(name) > 0)
+                        .max_by_key(|name| body.member_len(name))
+                };
+                let Some(protocol) = alone.or_else(largest) else {
+                    return Err(error);
+                };
+                let refusal = MemberRefusal {
+                    protocol: protocol.clone(),
+                    reason: error.to_string(),
+                };
+                self.renewal_waits(cert, refusal).await?;
                 Ok(None)
             }
         }
     }
 
-    /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
-    /// before it is sent. A certificate that reads a member of a collection of the protocol
-    /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
-    /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
+    /// A protocol refused `cert`, a listed renewal ([`App::judge_for_cert`]): nothing of it
+    /// is taken, and the record changes kept wait unsent ([`App::renewal_waits_here`]).
+    /// Noted in `cert/waits`, a single row, and told once per certificate and protocol
+    /// ([`AppEvent::RenewalWaits`]).
+    async fn renewal_waits(
+        &mut self,
+        cert: &AppCert,
+        refusal: MemberRefusal,
+    ) -> Result<(), AppError> {
+        let wait = RenewalWait {
+            cert: pubky_switch_core::enc::b64(&cert.hash()),
+            protocol: refusal.protocol,
+        };
+        if self.state.renewal_waits.as_ref() == Some(&wait) {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        tx.put(key::CERT_WAITS, &wait)?;
+        self.commit(tx).await?;
+        self.events.push(AppEvent::RenewalWaits {
+            issued_at: cert.issued_at(),
+            protocol: wait.protocol.clone(),
+            reason: refusal.reason,
+        });
+        self.state.renewal_waits = Some(wait);
+        Ok(())
+    }
+
+    /// Whether the certificate the own `identity.json` lists is one a protocol refused
+    /// ([`App::renewal_waits`]): the record the app holds carries the earlier one, so its
+    /// kept `app.put` would be refused `403 not_current` (Switch wire 6.2), and waits unsent
+    /// until the renewal is taken, signed anew then under it.
+    pub(crate) fn renewal_waits_here(&self) -> bool {
+        let me = self.state.meta.app_id;
+        match (
+            &self.state.renewal_waits,
+            self.state.own_doc.listed_cert(&me),
+        ) {
+            (Some(wait), Some(listed)) => {
+                listed != self.state.cert.hash()
+                    && wait.cert == pubky_switch_core::enc::b64(&listed)
+            }
+            _ => false,
+        }
+    }
+
+    /// Present `cert` from now on, with the record `taken`; one signed here
+    /// ([`Taken::Judged`]) is kept with its `app.put` for delivery, with the expiry asks it
+    /// was signed with, and each member it dropped is told ([`AppEvent::MemberDropped`]). A
+    /// certificate that reads a member of a collection of the protocol the one before didn't
+    /// owes a listing, in the same commit, so the next read lists it (Switch spec 8.3, Switch
+    /// wire 7.4.9): the writes made there before it were stubs in the feed.
     ///
     /// With `accepted`, a record the switch holds that carries `cert`, that record is noted
     /// as the newest the switch accepted, in the same commit, and the published copy is
@@ -123,8 +211,7 @@ impl App {
     async fn take_cert(
         &mut self,
         cert: AppCert,
-        record: SignedDoc,
-        deliver: bool,
+        taken: Taken,
         accepted: Option<SignedDoc>,
         at: Option<(u64, u64)>,
     ) -> Result<bool, AppError> {
@@ -182,23 +269,29 @@ impl App {
             tx.delete(super::admission::LISTS_AT)?;
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
+        let (record, judged) = match taken {
+            Taken::Judged(judged) => (judged.record.clone(), Some(judged)),
+            Taken::AsIs(record) => (record, None),
+        };
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
+        tx.delete(key::CERT_WAITS)?;
         if !keep_renewal {
             tx.delete(key::CERT_RENEWAL)?;
         }
         if let Some(accepted) = &accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
         }
-        if deliver {
-            let pending = PendingRecord {
-                body: self.record_batch(&record)?.body().to_vec(),
-            };
-            tx.put(key::PENDING_RECORD, &pending)?;
-            self.state.pending_record = Some(pending);
+        let mut dropped = Vec::new();
+        if let Some(judged) = judged {
+            tx.put(key::PENDING_RECORD, &judged.pending)?;
+            tx.put(key::RECORD_EXPIRIES, &judged.expiries)?;
+            self.state.pending_record = Some(judged.pending);
+            dropped = judged.dropped;
         }
         self.state.record = record;
+        self.state.renewal_waits = None;
         if !keep_renewal {
             self.state.renewal = None;
         }
@@ -208,6 +301,12 @@ impl App {
             self.published_checked_ms = None;
         }
         self.events.push(AppEvent::CertificateTaken { issued_at });
+        for protocol in dropped {
+            self.events.push(AppEvent::MemberDropped {
+                issued_at,
+                protocol,
+            });
+        }
         Ok(true)
     }
 
@@ -233,12 +332,20 @@ impl App {
             .renewal
             .as_ref()
             .is_some_and(|renewal| renewal.hash() == cert.hash());
-        if told && !held {
+        let waits = self
+            .state
+            .renewal_waits
+            .as_ref()
+            .is_some_and(|wait| wait.cert == hash);
+        if told && !held && !waits {
             return Ok(());
         }
         let mut tx = self.tx()?;
         if held {
             tx.delete(key::CERT_RENEWAL)?;
+        }
+        if waits {
+            tx.delete(key::CERT_WAITS)?;
         }
         if !told {
             tx.put(key::CERT_REFUSED, &hash)?;
@@ -253,6 +360,9 @@ impl App {
         self.commit(tx).await?;
         if held {
             self.state.renewal = None;
+        }
+        if waits {
+            self.state.renewal_waits = None;
         }
         Ok(())
     }
@@ -274,6 +384,9 @@ impl App {
 
     /// Deliver what is owed of the record, then publish it (`own_record.rs`).
     pub(crate) async fn deliver_record(&mut self) -> Result<Publication, AppError> {
+        if self.state.pending_record.is_some() && self.renewal_waits_here() {
+            return Ok(Publication::RenewalWaits);
+        }
         let accepted = self.deliver_pending_record().await?;
         self.publish_owed(false, accepted).await
     }
@@ -294,10 +407,15 @@ impl App {
     /// one under any other certificate is never taken ([`App::take_superseding`]).
     /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
+    /// While a protocol refuses the listed renewal, the kept record waits unsent
+    /// ([`App::renewal_waits_here`]).
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
         };
+        if self.renewal_waits_here() {
+            return Ok(false);
+        }
         let mut batch = Batch::from_body(pending.body)?;
         let result = self.submit(&batch).await;
         let held = match result {
@@ -334,7 +452,7 @@ impl App {
                     "Switch wire 6.2: an app.put conflict naming another app's record".into(),
                 ));
             }
-            let body = NextBody::of(&mine);
+            let body = NextBody::held(&self.state)?;
             let record = self
                 .sign_next_record(body, held.updated_at().max(mine.updated_at()))
                 .await?;
@@ -400,8 +518,13 @@ impl App {
             // into the dropped body; and before the drop, so a crash between the two leaves
             // the kept record, whose re-send then finds the later record under the
             // certificate presented.
-            self.take_cert(cert.clone(), later.signed().clone(), false, None, None)
-                .await?;
+            self.take_cert(
+                cert.clone(),
+                Taken::AsIs(later.signed().clone()),
+                None,
+                None,
+            )
+            .await?;
         }
         if newer {
             self.take_own_copy(identity).await?;
@@ -558,23 +681,19 @@ impl App {
             // as the app not current. While a protocol refuses to give a member for it, nothing is
             // taken, and the next look tries again.
             let taken = entry.record.signed().clone();
-            let kept = self.state.pending_record.is_some();
-            let record = if kept {
+            let record = if self.state.pending_record.is_some() {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-                let Some(body) = self.body_for_cert(&cert).await? else {
+                let previous = old.updated_at().max(entry.record.updated_at());
+                let Some(judged) = self.judge_for_cert(&cert, previous).await? else {
                     return Ok(Listed::Key(key));
                 };
-                self.sign_next_record(body, old.updated_at().max(entry.record.updated_at()))
-                    .await?
-                    .signed()
-                    .clone()
+                Taken::Judged(judged)
             } else {
-                taken.clone()
+                Taken::AsIs(taken.clone())
             };
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            self.take_cert(cert, record, kept, Some(taken), None)
-                .await?;
+            self.take_cert(cert, record, Some(taken), None).await?;
         }
         Ok(Listed::Key(key))
     }
@@ -610,4 +729,25 @@ pub(crate) fn delivered_record(batch: &Batch) -> Result<SignedDoc, AppError> {
             _ => None,
         })
         .ok_or_else(|| AppError::InvalidData("a kept app.put batch carries no record".into()))
+}
+
+/// The record [`App::take_cert`] presents with the certificate it takes.
+enum Taken {
+    /// One signed here under that certificate ([`App::judge_for_cert`]).
+    Judged(Judged),
+    /// One another device signed and the switch holds, presented as it is: that device's
+    /// protocols gave its members.
+    AsIs(SignedDoc),
+}
+
+/// The record held, signed under a certificate the app is about to take, its members
+/// judged for it ([`App::judge_for_cert`]).
+struct Judged {
+    record: SignedDoc,
+    /// Its `app.put`, kept for delivery in the commit that takes the certificate.
+    pending: PendingRecord,
+    /// The protocols' expiry asks it was signed with, without those of members removed.
+    expiries: RecordExpiries,
+    /// The protocols not registered here whose member it dropped.
+    dropped: Vec<String>,
 }

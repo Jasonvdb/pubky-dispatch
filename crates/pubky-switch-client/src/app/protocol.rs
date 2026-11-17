@@ -849,21 +849,28 @@ pub trait Protocol: Send + Sync {
 
     /// The protocol's member of the app's record under `cert`, a certificate other than the
     /// one the record carries, such as a renewal, from `member`, the one it carries now
-    /// (Switch spec 3.2, 4.2). The app asks before it signs the record carrying `cert`, and
-    /// signs that record with the member returned, in the commit that takes `cert`: a
-    /// member whose content `cert` no longer covers, such as one that names a scope the
-    /// certificate dropped, is changed or removed here, and the earlier member is never
-    /// signed under `cert`. `None` removes the member. Pure and synchronous: it reads no
-    /// store and writes nothing. Keeps `member` by default.
+    /// (Switch spec 3.2 step 3, 4.2). The app asks every registered protocol before it signs
+    /// the record carrying `cert`, builds that record from the answers alone, and signs it
+    /// once, in the commit that takes `cert`: a member whose content `cert` no longer
+    /// covers, such as one that names a scope the certificate dropped, is changed or removed
+    /// here, and the earlier member is never signed under `cert`. `None` removes the member,
+    /// and its expiry ask with it. A member of a protocol not registered here is removed: no
+    /// protocol here can give it ([`super::AppEvent::MemberDropped`]); its protocol, where
+    /// it runs, writes it again when it next runs. Keeps `member` by default, so a protocol
+    /// whose member depends on the certificate's scopes overrides this.
     ///
-    /// The member returned is checked as [`super::App::set_protocol_member`] checks one.
+    /// Pure and synchronous: it reads no store and writes nothing. It must not panic: a
+    /// panic unwinds through the read, as from any other method of the protocol.
+    ///
+    /// The record built is checked as [`super::App::set_protocol_member`] checks one.
     ///
     /// # Errors
     ///
-    /// Why the protocol can't give a member for `cert`, without content; the same for a
-    /// member the check refuses. Nothing is signed: the app keeps presenting the
-    /// certificate and record it holds, the renewal stays owed and is tried again at the
-    /// next read, and the host is told ([`super::AppEvent::RenewalWaits`]).
+    /// Why the protocol can't give a member for `cert`, without content; the same, named
+    /// for a protocol whose member it refuses, for a record the check refuses. Nothing is
+    /// signed: the app keeps presenting the certificate and record it holds, the renewal
+    /// stays owed and is tried again at a later read, and the host is told once
+    /// ([`super::AppEvent::RenewalWaits`]).
     fn member_for(
         &self,
         member: Option<&Map<String, Value>>,

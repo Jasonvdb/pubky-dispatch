@@ -141,17 +141,18 @@ use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::keys::{AppKeys, ReceiveKey, ScopeKey, ScopeKeys};
 use pubky_switch_core::ops::{Condition, OpKind, Position};
 use pubky_switch_core::records::{
-    AppCert, AppRecord, AppRecordBody, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS,
-    IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord,
+    AppCert, AppRecord, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc,
+    ReceiveKeyBody, ReceiveKeyRecord, is_renewal,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use self::chain::ChainView;
+use self::next_body::CertBody;
 use self::state::{
     BundleState, CachedDoc, Cursor, Device, HeldEntry, HeldKey, JoinStep, KnownKid, LeaveState,
-    Meta, ParkedEntry, PendingEffect, PendingRecord, Processed, Reader, Registration,
+    Meta, ParkedEntry, PendingEffect, PendingRecord, Processed, Reader, Registration, RenewalWait,
     RestorePending, RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
@@ -398,6 +399,11 @@ pub struct AppBackup {
     /// a backup of an app the switch accepted no record from that it knows of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted: Option<SignedDoc>,
+    /// A renewal of `cert` from its `cert.put` that the app holds until its `identity.json`
+    /// lists it, or while a protocol refuses it (`cert/renewal`): the cursor may have passed
+    /// the `cert.put`, so a restore takes it from here (Switch spec 3.2 step 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renewal: Option<SignedDoc>,
     naming: NamingKey,
     scope_keys: Vec<ScopeKey>,
     own_doc: SignedDoc,
@@ -583,6 +589,8 @@ pub(crate) struct AppState {
     pub(crate) keys: AppKeys,
     pub(crate) cert: AppCert,
     pub(crate) renewal: Option<AppCert>,
+    /// The listed renewal a protocol refused, and that protocol (`cert/waits`).
+    pub(crate) renewal_waits: Option<RenewalWait>,
     pub(crate) record: SignedDoc,
     pub(crate) naming: NamingKey,
     pub(crate) scope_keys: ScopeKeys,
@@ -964,9 +972,8 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let mut body = AppRecordBody::new(&cert, protocols.accepts(&cert), now);
-            body.label = config.label.clone();
-            let record = AppRecord::sign(&keys, body)?;
+            let record = CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
+                .sign(&keys, now, None)?;
             let client = Self::client_for(&env, &meta, &keys, &cert)?;
             let batch = client.sign_batch(
                 meta.generation,
@@ -998,6 +1005,7 @@ impl App {
                 keys: keys.clone(),
                 cert: cert.clone(),
                 renewal: None,
+                renewal_waits: None,
                 record: record.signed().clone(),
                 naming: approved.naming_key.clone(),
                 scope_keys: approved.keys.clone(),
@@ -1304,6 +1312,7 @@ impl App {
             keys,
             cert,
             renewal,
+            renewal_waits: reader.get(key::CERT_WAITS).await?,
             record: reader.get(key::RECORD).await?.ok_or_else(missing)?,
             naming: reader.get(key::NAMING).await?.ok_or_else(missing)?,
             scope_keys,
@@ -1417,6 +1426,10 @@ impl App {
             cert: state.cert.signed().clone(),
             record: state.record.clone(),
             accepted: state.accepted.clone(),
+            renewal: state
+                .renewal
+                .as_ref()
+                .map(|renewal| renewal.signed().clone()),
             naming: state.naming.clone(),
             scope_keys: state.scope_keys.keys.clone(),
             own_doc: state.own_doc.signed().clone(),
@@ -1877,6 +1890,18 @@ impl App {
                     return Err(invalid("its accepted app record isn't its keys'"));
                 }
             }
+            // A renewal it holds renews its certificate under its own keys.
+            let renewal = match &backup.renewal {
+                None => None,
+                Some(renewal) => {
+                    let renewal = AppCert::verify(renewal, &meta.identity)
+                        .map_err(|_| invalid("its renewed certificate doesn't verify"))?;
+                    if !is_renewal(&cert, &renewal) {
+                        return Err(invalid("its renewed certificate doesn't renew its own"));
+                    }
+                    Some(renewal)
+                }
+            };
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
             let mut at = BTreeMap::new();
@@ -2061,7 +2086,8 @@ impl App {
                 meta: meta.clone(),
                 keys: backup.keys.clone(),
                 cert: cert.clone(),
-                renewal: None,
+                renewal,
+                renewal_waits: None,
                 record: backup.record.clone(),
                 naming: backup.naming.clone(),
                 scope_keys: ScopeKeys {
@@ -2382,6 +2408,9 @@ impl App {
         tx.put(key::META, &s.meta)?;
         tx.put(key::KEYS, &s.keys)?;
         tx.put(key::CERT, s.cert.signed())?;
+        if let Some(renewal) = &s.renewal {
+            tx.put(key::CERT_RENEWAL, renewal.signed())?;
+        }
         tx.put(key::RECORD, &s.record)?;
         if let Some(accepted) = &s.accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;

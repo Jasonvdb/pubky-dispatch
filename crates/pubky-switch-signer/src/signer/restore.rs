@@ -906,12 +906,6 @@ impl Signer {
     }
 }
 
-/// The App IDs `GET /apps` shows revoked or departed, of the apps `version` lists: a removal
-/// is taken from the switch only for an app the identity's own version lists, as a routine
-/// run takes one. An ID the switch shows for any other app counts for nothing: one the
-/// version removed comes from its `removed` and the records, and one no version listed would
-/// only grow the records, and a move's enrollment with them, on a switch's word (Switch wire
-/// 3.7, 7.4.12).
 /// Where the switch's copy stands against a backup's version, once a restore has checked it
 /// (Switch wire 3.13 "Restoring").
 #[derive(Debug, PartialEq, Eq)]
@@ -928,9 +922,10 @@ enum SwitchCopy {
 /// Whether `copy` is a version past `backed_up` with its content, changed only in `version`
 /// and `signer`: what a delivery that races another signer carries (a restore's own version,
 /// a take-over's first, an abort, a take-back), and the only kind of version delivered before
-/// its backup is written (Switch wire 3.13 "When it is written"). Once its install is lost
-/// with the backup still owed, the backup before it is the newest there is, and it holds the
-/// same records.
+/// its backup is written (Switch wire 3.13 "When it is written"). No other version carries
+/// its base's content unchanged: a change that changes nothing signs nothing. Once the
+/// racing install's backup write has failed, the backup before it is the newest there is,
+/// and it holds the same content.
 fn raced_past(copy: &IdentityDoc, backed_up: &IdentityDoc) -> bool {
     let mut body = copy.body().clone();
     body.version = backed_up.version();
@@ -938,6 +933,12 @@ fn raced_past(copy: &IdentityDoc, backed_up: &IdentityDoc) -> bool {
     copy.version() > backed_up.version() && body == *backed_up.body()
 }
 
+/// The App IDs `GET /apps` shows revoked or departed, of the apps `version` lists: a removal
+/// is taken from the switch only for an app the identity's own version lists, as a routine
+/// run takes one. An ID the switch shows for any other app counts for nothing: one the
+/// version removed comes from its `removed` and the records, and one no version listed would
+/// only grow the records, and a move's enrollment with them, on a switch's word (Switch wire
+/// 3.7, 7.4.12).
 pub(super) fn removed_at_switch<'a>(
     apps: &'a AppsAnswer,
     version: &'a IdentityDoc,

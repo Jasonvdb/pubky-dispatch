@@ -61,6 +61,28 @@ async fn test_signer_create_refuses_an_identity_already_set_up() {
 }
 
 #[tokio::test]
+async fn test_signer_unchanged_setting_signs_no_version() {
+    // Setting what the newest version holds already signs nothing: only a delivery racing
+    // another signer carries its base's content unchanged (Switch wire 3.13).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let same = signer
+        .set_record_max_age(first.body().record_max_age)
+        .await
+        .unwrap();
+    assert_eq!(same.signed(), first.signed());
+    let same = signer
+        .set_connect_requests(first.body().policy.connect_requests)
+        .await
+        .unwrap();
+    assert_eq!(same.signed(), first.signed());
+    assert_eq!(world.sent_docs().len(), 1);
+    let changed = signer.set_record_max_age(Some(60)).await.unwrap();
+    assert_eq!(changed.version(), 2);
+}
+
+#[tokio::test]
 async fn test_signer_open_refuses_an_empty_store() {
     let world = World::new();
     let error = Signer::open(world.env(Arc::new(MemoryStore::new())), world.keyring())

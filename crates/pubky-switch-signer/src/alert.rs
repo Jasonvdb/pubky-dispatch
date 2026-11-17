@@ -339,7 +339,7 @@ pub enum Alert {
     /// take-back), the signer backup couldn't be written once it won (Switch wire 3.13). The
     /// backup on the Homeserver is the one before it; the next run, or the next version's
     /// backup write, replaces it. Should this install be lost first, a restore from that
-    /// backup still takes over.
+    /// backup builds on the version it delivered.
     BackupNotWritten,
     /// The switch refused to store the hand-over to this app for good (Switch wire 7.4.17),
     /// as when it isn't current there. An earlier send may still be stored, so the hand-over

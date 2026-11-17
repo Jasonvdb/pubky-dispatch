@@ -666,7 +666,8 @@ impl Signer {
     }
 
     /// Set the record age limit, in seconds, or clear it for the 90-day default (Switch spec
-    /// 4.3), in a new version. Returns that version once it is delivered and published.
+    /// 4.3), in a new version. Returns that version once it is delivered and published; the
+    /// limit it holds already signs nothing, and returns the newest version.
     ///
     /// # Errors
     ///
@@ -690,11 +691,23 @@ impl Signer {
     /// Sign the next version, built from the newest with `change`, and deliver it. Its
     /// version is above every version this install committed a signed document at, so a
     /// version whose document went out in a flow that was dropped is never signed again
-    /// (Switch spec 4.3, 13.2).
+    /// (Switch spec 4.3, 13.2). A change that leaves the content as it is signs nothing and
+    /// returns the newest version: only a delivery that races another signer carries its
+    /// base's content unchanged, which is how a restore tells one (Switch wire 3.13).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
         self.ready().await?;
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        let mut changed = newest.body().clone();
+        change(&mut changed);
+        if changed == *newest.body() {
+            return Ok(newest);
+        }
         let key = self.signing_key()?;
-        let (doc, flow) = self.next_version(&key, change)?;
+        let (doc, flow) = self.next_version(&key, |body| {
+            changed.version = body.version;
+            changed.signer = body.signer;
+            *body = changed;
+        })?;
         drop(key);
         let mut state = self.state.clone();
         state.signed_through = doc.version();

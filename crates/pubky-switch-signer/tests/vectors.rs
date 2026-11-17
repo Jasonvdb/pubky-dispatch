@@ -559,7 +559,8 @@ async fn test_vectors_take_over_answered_with_the_vectors_abort_is_cancelled() {
 /// alice from her backup. With the switch at version 3 it delivers its own version 4 next,
 /// built on version 3; with the switch at version 1, the backup's version 3 goes first, its
 /// bytes, then version 4. Either way its backup then holds the vector's records with version
-/// 4. A switch at the abort, past the backup, refuses the restore before anything is sent.
+/// 4. A switch at the abort, past the backup with its content, is built on: the next version
+/// has the abort as its `prev`.
 #[tokio::test]
 async fn test_vectors_restore_from_the_vectors_backup() {
     for (versions, first) in [(&[V1, V3][..], false), (&[V1][..], true)] {
@@ -607,13 +608,21 @@ async fn test_vectors_restore_from_the_vectors_backup() {
         text(&backup, "path"),
         serde_json::to_vec(&backup["backup"]).unwrap(),
     );
-    let refused = Signer::restore_new(
+    let signer = Signer::restore_new(
         alice.env(Arc::new(MemoryStore::new())),
         IdentityKeyring::open(alice.vault()).unwrap(),
         UserConfirmed::shown_and_confirmed(),
     )
     .await
-    .unwrap_err();
-    assert_eq!(refused, SignerError::Refused(Refusal::StaleBackup));
-    assert!(alice.deliveries().is_empty());
+    .unwrap();
+    let abort = alice.doc(ABORT);
+    let next = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(next.version(), abort.version() + 1);
+    let deliveries = alice.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].1, Some(abort.hash()));
+    assert_eq!(
+        alice.backup_records(),
+        vector_records(next.signed(), Some(abort.hash()))
+    );
 }

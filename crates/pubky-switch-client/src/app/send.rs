@@ -1465,14 +1465,8 @@ fn own_message(
     {
         return None;
     }
-    let value: Value = serde_json::from_slice(plaintext.json()).ok()?;
-    let body = value.get("body")?.as_object()?;
     // Only the common fields are read from these already-authenticated bytes.
-    let opaque: Vec<_> = body
-        .keys()
-        .map(|member| OpaqueMember { kind: None, member })
-        .collect();
-    let message = Message::parse(plaintext.json(), &opaque).ok()?;
+    let message = super::protocols::kept_message(plaintext.json())?;
     (message.to == *to
         && message.from.identity == meta.identity
         && message.from.app_id == meta.app_id)
@@ -3482,15 +3476,9 @@ impl App {
         let Ok(plaintext) = item.plaintext() else {
             return false;
         };
-        let rules = self.protocols.opaque_of_json(plaintext.json());
-        let opaque: Vec<OpaqueMember<'_>> = rules
-            .iter()
-            .map(|rule| OpaqueMember {
-                kind: rule.kind.as_deref(),
-                member: rule.member.as_str(),
-            })
-            .collect();
-        let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
+        // A kept message is read by its common fields, so a protocol's changed body rules
+        // never hold it for good; the protocol's own hook decides.
+        let Some(message) = super::protocols::kept_message(plaintext.json()) else {
             return false;
         };
         let local = super::LocalView::new(
@@ -3519,15 +3507,9 @@ impl App {
     /// before it is sent.
     async fn seal(&mut self, item: &mut OutboxItem, invite: Option<&str>) -> Result<(), AppError> {
         let plaintext = item.plaintext()?;
-        let rules = self.protocols.opaque_of_json(plaintext.json());
-        let opaque: Vec<pubky_switch_core::json::OpaqueMember<'_>> = rules
-            .iter()
-            .map(|rule| pubky_switch_core::json::OpaqueMember {
-                kind: rule.kind.as_deref(),
-                member: rule.member.as_str(),
-            })
-            .collect();
-        let message = Message::parse(plaintext.json(), &opaque)?;
+        // Read by its signed common fields, as every kept copy is ([`own_message`]): the
+        // body rules judged it when it was queued, and a changed rule never stops it.
+        let message = super::protocols::kept_message(plaintext.json()).ok_or_else(store_corrupt)?;
         let (routes, apps_version) = self.routes(&item.to, &message, invite).await?;
         let recipients: Vec<_> = routes.iter().map(|r: &Route| r.recipient).collect();
         let envelope = pubky_switch_core::envelope::seal_retained(

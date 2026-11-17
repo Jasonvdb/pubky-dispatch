@@ -1863,9 +1863,10 @@ impl App {
 
     /// Try the jobs of the queued message `msg_id` once, as [`App::flush_outbox`] does for
     /// every message, and return where it is; `None` for one the app doesn't keep. The try
-    /// is one unit, as [`App::send`]'s, and the call sends no kept batch itself beyond the
-    /// one each write of the try sends first. So it doesn't move a message whose conversation
-    /// entry is in a kept batch: a read, a write or the flushes' passes send that batch.
+    /// is one unit, as [`App::send`]'s. A try whose conversation entry is owed sends one kept
+    /// batch first, and the entry is written only once no batch is kept; otherwise the call
+    /// sends no kept batch beyond the one each write of the try sends first. A read, a write
+    /// or the flushes' passes send the rest.
     ///
     /// # Errors
     ///
@@ -2133,10 +2134,9 @@ impl App {
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
-    ///   of each pass, and none otherwise. A message whose conversation entry is in a kept
-    ///   batch, or that a kept batch would queue, goes in the pass that sends its batch: with
-    ///   k kept batches ahead of it, the k-th pass, sooner when a read or another write sends
-    ///   them. A batch past its answer window gets its end in the pass that sends it
+    ///   of each pass, and none otherwise. A message whose conversation entry is owed goes
+    ///   once no batch is kept: with k kept batches, in the k-th pass, sooner when a read or
+    ///   another write sends them. A batch past its answer window gets its end in the pass that sends it
     ///   ([`super::App::kept_batch`]). Reads send kept batches
     ///   too ([`super::App::receive`]), and so does each write a message's try makes, one
     ///   first, as every write does. One that keeps failing holds the others behind it until
@@ -2706,8 +2706,8 @@ impl App {
     /// written only with no batch kept from an earlier call ahead of it: otherwise the call
     /// fails with [`Refusal::NotNow`] and the item is tried again once they are answered.
     /// A kept batch's settlement may close the delivery's holds, so the entry is never kept
-    /// behind one, decided before that settlement ([`App::try_item`] reads the holds after
-    /// the batch its write sends first).
+    /// behind one, decided before that settlement ([`App::try_item`] sends one kept batch
+    /// first and reads the holds after it).
     async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         if !self.entry_owed(pubky).await? {
             return Ok(());

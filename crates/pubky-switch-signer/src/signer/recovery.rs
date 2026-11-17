@@ -497,9 +497,9 @@ impl Signer {
         // After a recovery with the key alone the version may name a certificate this install
         // doesn't hold, and no backup of it can be sealed: it is written once the delivery
         // has won, as a racing delivery's is, by the version that drops those certificates
-        // (Switch spec 12.8).
+        // (Switch spec 12.8). That backup is owed already: the recovery's own stays owed
+        // until that version.
         let unheld = self.names_unheld(&doc)?;
-        state.backup_owed |= unheld;
         let flow = Flow::Deliver {
             account: service,
             doc: doc.signed().clone(),

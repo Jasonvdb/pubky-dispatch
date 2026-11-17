@@ -2309,7 +2309,9 @@ async fn test_key_recovery_takes_a_copy_in_another_writers_encoding() {
                 members.reverse();
                 let reordered = members
                     .iter()
-                    .map(|(name, value)| format!("{}:{}", serde_json::to_string(name).unwrap(), value))
+                    .map(|(name, value)| {
+                        format!("{}:{}", serde_json::to_string(name).unwrap(), value)
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 format!("{{{reordered}}}").into_bytes()

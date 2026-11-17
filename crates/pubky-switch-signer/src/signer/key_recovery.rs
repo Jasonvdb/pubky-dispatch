@@ -367,7 +367,9 @@ impl Signer {
                 Held::Unusable,
             ),
         };
-        let plan = self.key_plan(&kept, &marks, confirmed.asked.as_deref()).await?;
+        let plan = self
+            .key_plan(&kept, &marks, confirmed.asked.as_deref())
+            .await?;
         if plan.survey.digest != confirmed.digest {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         }
@@ -829,16 +831,23 @@ fn carries_unknown_members(copy: &IdentityDoc) -> Result<bool> {
 fn unknown_in(signed: &serde_json::Value, read: &serde_json::Value) -> bool {
     use serde_json::Value;
     match (signed, read) {
-        (Value::Object(signed), Value::Object(read)) => signed.iter().any(|(name, value)| {
-            match read.get(name) {
+        (Value::Object(signed), Value::Object(read)) => {
+            signed.iter().any(|(name, value)| match read.get(name) {
                 Some(known) => unknown_in(value, known),
-                None => !matches!(value, Value::Null)
-                    && !matches!(value, Value::Array(items) if items.is_empty())
-                    && !matches!(value, Value::Object(members) if members.is_empty()),
-            }
-        }),
-        (Value::Array(signed), Value::Array(read)) => signed.len() != read.len()
-            || signed.iter().zip(read).any(|(value, known)| unknown_in(value, known)),
+                None => {
+                    !matches!(value, Value::Null)
+                        && !matches!(value, Value::Array(items) if items.is_empty())
+                        && !matches!(value, Value::Object(members) if members.is_empty())
+                }
+            })
+        }
+        (Value::Array(signed), Value::Array(read)) => {
+            signed.len() != read.len()
+                || signed
+                    .iter()
+                    .zip(read)
+                    .any(|(value, known)| unknown_in(value, known))
+        }
         (Value::Object(_) | Value::Array(_), _) => true,
         _ => false,
     }

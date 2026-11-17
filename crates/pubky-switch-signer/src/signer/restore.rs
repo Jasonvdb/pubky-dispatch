@@ -593,10 +593,13 @@ impl Signer {
             .map_err(SignerError::Homeserver)?
             .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
             .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok());
-        let kept = local.into_iter().flat_map(|local| &local.copies).filter_map(|copy| match copy {
-            KeptCopy::Verified(doc) => Some(doc.as_ref()),
-            _ => None,
-        });
+        let kept = local
+            .into_iter()
+            .flat_map(|local| &local.copies)
+            .filter_map(|copy| match copy {
+                KeptCopy::Verified(doc) => Some(doc.as_ref()),
+                _ => None,
+            });
         let newest = published
             .iter()
             .chain(std::iter::once(&view.identity_doc))

@@ -414,6 +414,13 @@ and policy; they do not duplicate the slot. Lineage and non-current node parts
 are separate. Reconstruct any omitted operation or certificate from the exact
 chain/app part before checking hashes, caps and the initializer permission rule.
 
+Attached source origin evidence still required by a retained record input
+travels in that complete unit under record retention 6, with its original
+source statement and document association. The account's `record_origin` part
+continues to describe the final frozen slot, including retired/unknown state;
+it cannot replace a source input's differing required evidence. These source
+units share the same non-current capacity and do not allocate another slot.
+
 Each added part plus wire 10.3's maximum 103-byte chunk wrapper fits the hard
 1 MiB chunk bound. A whole 7.5 MiB view is not one export part. An individual
 part larger than a configured smaller target gets its own chunk, still within
@@ -448,6 +455,14 @@ registration (wire 7.4.14; record lineage 7). Its retained signed source documen
 fixes the lost-generation boundary. This record-only continuation does not
 reopen admission staging or the separate claim/list recovery modes.
 
+[Current-history record retention](record-retention.md) provides an explicit
+record-only disposition for whole retained inputs from a source newer than that
+original boundary through the current generation. Its source application and
+current target bindings are separate. The same matching-only slot strengthening,
+non-recycling allocation, byte bounds and complete per-input accounting apply;
+no proofless candidate gains clean original or initializer authority. It does
+not replace the source or dating rules of ordinary loss uploads.
+
 A current record with its complete required lineage/origin is one indivisible
 upload unit under the existing 16 MiB request cap. Pack whole units, fewer per
 call when necessary; each protected unit is at most 7,864,320 bytes before its
@@ -468,11 +483,15 @@ record operation or certificate. Parts share the upload's 16 MiB body bound.
 Attached origin evidence remains part of its indivisible record input.
 
 Verify each statement against the exact identity-signed source document carried
-as `lost_identity` and named by its `identity_hash`, for this account. The source
+as `lost_identity` and named by its `identity_hash`, for this account, in the
+ordinary loss and retained record-witness modes. The explicitly selected
+current-history mode instead uses record retention 2-3's exact source, applied
+authority and newer-generation range; the complete-part and matching rules
+below remain the same. In the ordinary modes, the source
 document and statement must name the same positive generation, at or before the
 barrier's original lost-generation bound. Thus evidence retained before a clean
 move or an earlier loss can still restrict the current recovery. A current or
-future generation is not eligible. The statement's service signature, snapshot,
+future generation is not eligible in the ordinary modes. The statement's service signature, snapshot,
 canonical slot hash and declared parent key must agree. This standalone rule
 does not date an uploaded record operation: its source-proof generation checks
 remain exactly those of wire 7.4.14. The part's `origin_key` and statement's `origin_key` equal

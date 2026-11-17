@@ -398,6 +398,13 @@ impl OpaqueBody {
     }
 }
 
+/// The message whose JSON the app already authenticated and keeps, read for its common
+/// fields with every body member opaque ([`OpaqueBody`]); `None` when it doesn't read as
+/// a message.
+pub(crate) fn kept_message(json: &[u8]) -> Option<Message> {
+    Message::parse(json, &OpaqueBody::of(json)?.members()).ok()
+}
+
 /// The `kind` of an encoded message plaintext, as an entry stored locally keeps it.
 pub(crate) fn kind_of_plaintext(encoded: &[u8]) -> Option<String> {
     pubky_switch_core::message::MessagePlaintext::decode(encoded)

@@ -194,6 +194,31 @@ impl App {
         }
     }
 
+    /// Whether the entry stored at `id` is in the shared waiting custody: stored for a
+    /// bounded reason and not the input of a kept effect, which Switch spec 11 protects.
+    pub(crate) fn in_custody(&self, id: u64) -> bool {
+        self.state.parked.get(&id).is_some_and(|stored| {
+            stored.reason.bounded()
+                && self
+                    .state
+                    .pending_effect
+                    .as_ref()
+                    .is_none_or(|effect| effect.stored != Some(id))
+        })
+    }
+
+    /// Drop the input stored at `id` from custody for `reason`, its durable notice in `tx`:
+    /// the same change the bounds stage ([`App::waiting_change`]).
+    pub(crate) fn drop_waiting(
+        &mut self,
+        id: u64,
+        reason: DropReason,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        self.waiting_change(None, None, &[(id, reason)])?
+            .stage(self, tx)
+    }
+
     /// Count the currently staged pool and the incoming input together. No protected
     /// pending input is made evictable by a change of its cached waiting reason.
     pub(crate) fn waiting_drops(

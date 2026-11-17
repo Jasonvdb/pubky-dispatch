@@ -3,8 +3,8 @@
 use super::*;
 use crate::app::state::key;
 use crate::app::{
-    AppBackup, AppEvent, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES, MAX_UNVERIFIED_AGE_MS,
-    ParkReason, ReceiveContext, StoreFailure, WaitingReason,
+    AppBackup, AppEvent, DropReason, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES,
+    MAX_UNVERIFIED_AGE_MS, ParkReason, ReceiveContext, StoreFailure, WaitingReason,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -1033,7 +1033,7 @@ async fn test_admission_restore_commit_failure_leaves_one_complete_snapshot() {
 /// Kept custody is read by its authenticated common fields, never judged again under the
 /// protocol's current body rules: inputs whose body only the protocol's former rules allow
 /// load, reload, back up, restore and have their drop notice built; the next retry of one
-/// judges the current rules and drops it at check 5, as an input read from the feed would be.
+/// judges the current rules and drops it at check 5, a custody drop with its durable notice.
 #[tokio::test]
 async fn test_waiting_custody_outside_current_body_rules_loads_and_drops() {
     let w = World::new();
@@ -1059,24 +1059,30 @@ async fn test_waiting_custody_outside_current_body_rules_loads_and_drops() {
     let (keyed, keyed_message) = fraction("keyed");
     app.receive(None).await.unwrap();
     p.set(Mode::Wait);
-    let (admitted, _) = fraction("admitted");
+    let (admitted, admitted_message) = fraction("admitted");
     app.receive(None).await.unwrap();
     assert!(app.stored_at(keyed).is_some() && app.stored_at(admitted).is_some());
     // A host update narrows the protocol's opaque members.
     p.set_opaque(&[]);
     drop(app);
-    let app = App::load(w.env(), p.clone(), World::config(), me)
+    let mut app = App::load(w.env(), p.clone(), World::config(), me)
         .await
         .expect("kept custody loads under the narrowed rules");
+    let id = app.stored_id_at(keyed).unwrap();
+    assert!(
+        app.parked_entry(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .message
+            .is_some(),
+        "the host still reads the kept message"
+    );
     let backup = app.backup().await.unwrap();
-    let mut app = App::restore(
-        w.env_on(Arc::new(MemoryStore::new())),
-        p.clone(),
-        World::config(),
-        &backup,
-    )
-    .await
-    .expect("kept custody restores under the narrowed rules");
+    let fresh = Arc::new(MemoryStore::new());
+    let mut app = App::restore(w.env_on(fresh.clone()), p.clone(), World::config(), &backup)
+        .await
+        .expect("kept custody restores under the narrowed rules");
     app.refresh_identity().await.unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(
@@ -1089,13 +1095,29 @@ async fn test_waiting_custody_outside_current_body_rules_loads_and_drops() {
         app.stored_at(keyed).is_some(),
         "the other input still waits"
     );
+    // The custody drop's durable notice was committed with it: it survives a reload.
+    drop(app);
+    let mut app = App::load(w.env_on(fresh), p.clone(), World::config(), me)
+        .await
+        .unwrap();
+    let kept = app.unacknowledged_events().await.unwrap();
+    assert!(
+        kept.iter().any(|event| matches!(event,
+            AppEvent::StoredEntryDropped { seq, reason: DropReason::Rules { check: 5 },
+                waiting: WaitingReason::Admission, message, .. }
+            if *seq == admitted && message.msg_id == admitted_message.msg_id)),
+        "the retry's custody drop keeps its durable notice: {kept:?}"
+    );
     let notices = dropped(&expire(&w, &mut app).await);
     assert_eq!(
         notices
             .iter()
             .map(|notice| (notice.2, notice.3.clone()))
             .collect::<Vec<_>>(),
-        vec![(keyed, keyed_message.msg_id)],
+        vec![
+            (admitted, admitted_message.msg_id),
+            (keyed, keyed_message.msg_id)
+        ],
         "the bound's drop notice is built without the current rules"
     );
     assert!(app.stored_at(keyed).is_none());

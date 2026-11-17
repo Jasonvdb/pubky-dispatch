@@ -83,7 +83,7 @@ use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
-use super::events::{AppEvent, Duty, KeptRefusal, ParkReason};
+use super::events::{AppEvent, DropReason, Duty, KeptRefusal, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::order::{Handover, Kept, Walk};
 use super::protocol::{
@@ -1417,7 +1417,13 @@ impl App {
         let received = match checked {
             Ok(received) => received,
             Err(CheckRefusal::Dropped { check, reason }) => {
-                self.unpark(entry.stored, &mut read.tx)?;
+                // A stored input in custody leaves it as every custody drop does, with its
+                // durable notice in the same commit (Switch spec 8.2); any other goes as an
+                // input read from the feed does.
+                match entry.stored.filter(|id| self.in_custody(*id)) {
+                    Some(id) => self.drop_waiting(id, DropReason::Rules { check }, &mut read.tx)?,
+                    None => self.unpark(entry.stored, &mut read.tx)?,
+                }
                 return Ok(self.dropped(entry.seq, check, reason));
             }
             Err(CheckRefusal::Duplicate { conflicting }) => {

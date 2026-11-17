@@ -1362,9 +1362,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the shared bounds on sender/key/admission waiting inputs an entry was dropped
-/// past (Switch spec
-/// 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Why an entry waiting for sender standing, a key or admission left custody without
+/// being processed (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]): one of the shared
+/// bounds it was past, or a recipient check it failed when tried again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1377,6 +1377,12 @@ pub enum DropReason {
     /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
     /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
+    /// Tried again, it failed recipient check `check` (Switch wire 5.1) under the rules
+    /// current then, such as a body its protocol's opaque members no longer allow.
+    Rules {
+        /// The check that failed, 2 to 8.
+        check: u8,
+    },
 }
 
 /// What a locally retained input waits for (Switch spec 8.2). All three reasons share

@@ -12,7 +12,7 @@
 use pubky_switch_core::{
     chain::ChainTip,
     http::{IdentityDelivery, NoticeReason, RecoveryNotice, Uncompared, not_hosted_current},
-    records::{AccountActivation, AccountAssociation, AccountBinding, IdentityBody},
+    records::{AccountActivation, AccountBinding, IdentityBody},
     sig::SignedDoc,
 };
 
@@ -254,20 +254,9 @@ impl Service {
         if !clear {
             mark = MarkInput::StoreUnreadable;
         }
-        // Table 1 selects exactly one retirement: the mark's generation, or the
-        // account's when the mark is lost. No unrelated generation affects this verdict.
-        let binding = verdict::account_binding(account.as_ref(), &mark);
-        let generation = match (&mark, &binding) {
-            (MarkInput::Mark(held), Ok(binding))
-                if binding.created() == Some(held.created_at_ms) =>
-            {
-                Some(held.generation)
-            }
-            (_, Ok(binding)) if binding.association() == AccountAssociation::Account => {
-                account.map(|held| held.generation())
-            }
-            _ => None,
-        };
+        // Table 1 reads exactly one retirement, the model's selected generation: no
+        // unrelated generation affects this verdict.
+        let generation = verdict::retirement_generation(account.as_ref(), &mark, erasure_at_ms);
         let mut retired = None;
         if let Some(generation) = generation {
             match self.marks.is_retired(identity, generation).await {

@@ -297,7 +297,7 @@ impl Signer {
             };
         }
         let mut signer = Self::restore_target(env, keyring, store)?;
-        match (signer.restore_records(None).await, key) {
+        match (signer.restore_records(None, key.is_some()).await, key) {
             (Err(error), Some(key)) if backup_refused(&error) => {
                 Box::pin(signer.recover_with_key(Found::Fresh(None), key)).await?;
             }
@@ -341,7 +341,12 @@ impl Signer {
             (local, _) => local?,
         };
         let mut signer = Self::restore_target(env, keyring, store)?;
-        match (signer.restore_records(Some(local)).await, confirmed.0) {
+        match (
+            signer
+                .restore_records(Some(local), confirmed.0.is_some())
+                .await,
+            confirmed.0,
+        ) {
             (Err(error), Some(key)) if backup_refused(&error) => {
                 let local = RestoreLocal::unusable(
                     state::read(&signer.store, &identity).await?,
@@ -405,7 +410,7 @@ impl Signer {
         }
         check_local_restore(&self.state, self.flow.is_some())?;
         let local = RestoreLocal::intact(self.state.clone())?;
-        match (self.restore_records(Some(local)).await, key) {
+        match (self.restore_records(Some(local), key.is_some()).await, key) {
             (Err(error), Some(key)) if backup_refused(&error) => {
                 Box::pin(self.recover_with_key(Found::InPlace, key)).await
             }
@@ -413,7 +418,18 @@ impl Signer {
         }
     }
 
-    async fn restore_records(&mut self, local: Option<RestoreLocal>) -> Result<IdentityDoc> {
+    /// The restore from the backup, the doc of [`Signer::restore`]. Under the user's
+    /// confirmation of a recovery with the key alone, `key_confirmed`, a backup its own
+    /// service can't check is refused as stale, and the recovery goes on without it: one
+    /// that service refuses for good, or, unreachable or failing for now, one naming another
+    /// service or key than the newest copy the install reads, as a backup from before a move
+    /// does. The service that copy names failing for now fails the recovery too: that error
+    /// is returned, and the restore tried again.
+    async fn restore_records(
+        &mut self,
+        local: Option<RestoreLocal>,
+        key_confirmed: bool,
+    ) -> Result<IdentityDoc> {
         let identity = self.state.identity;
         let bytes = self
             .env
@@ -473,7 +489,12 @@ impl Signer {
                     None => return Err(error.into()),
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if key_confirmed && self.unchecked_backup(&view, &error, local.as_ref()).await? {
+                    return Err(Refusal::StaleBackup.into());
+                }
+                return Err(error.into());
+            }
         };
         // In place, the service still serves the lost generation until it takes the version:
         // its copy of that generation counts as no copy (Switch wire 3.13).
@@ -545,6 +566,43 @@ impl Signer {
         let next = self.sign_own_version().await?;
         self.resume().await?;
         Ok(next)
+    }
+
+    /// Whether the backup `view` can't be checked at the service it names, which answered
+    /// `error` (the doc of [`Signer::restore_records`]), with `local` what in-place or
+    /// unusable records keep.
+    async fn unchecked_backup(
+        &self,
+        view: &BackupView,
+        error: &ClientError,
+        local: Option<&RestoreLocal>,
+    ) -> Result<bool> {
+        let transient = matches!(
+            error,
+            ClientError::Transport(_) | ClientError::Switch { status: 500.., .. }
+        );
+        if !transient {
+            return Ok(true);
+        }
+        let identity = self.state.identity;
+        let published = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok());
+        let kept = local.into_iter().flat_map(|local| &local.copies).filter_map(|copy| match copy {
+            KeptCopy::Verified(doc) => Some(doc.as_ref()),
+            _ => None,
+        });
+        let newest = published
+            .iter()
+            .chain(std::iter::once(&view.identity_doc))
+            .chain(kept)
+            .max_by_key(|doc| (doc.generation(), doc.version()));
+        Ok(newest.is_some_and(|doc| doc.inbox() != view.identity_doc.inbox()))
     }
 
     /// The records a restore takes from `view`, the backup's or those a recovery with the

@@ -2268,3 +2268,77 @@ async fn test_key_recovery_takes_a_copy_in_another_writers_encoding() {
         signs_on(&world, &mut signer).await;
     }
 }
+
+#[tokio::test]
+async fn test_key_recovery_past_a_backup_naming_a_service_gone() {
+    // The backup was rolled back to a version that named a former service, now gone, while
+    // the account is served elsewhere: under the key confirmation that backup counts as
+    // stale, and the recovery goes ahead at the service the newest copy names.
+    let world = World::new();
+    let (mut first, _) = world.enrolled().await;
+    let doc = first.identity_doc().unwrap().unwrap();
+    first.set_record_max_age(Some(60)).await.unwrap();
+    drop(first);
+    let mut body = doc.body().clone();
+    body.inbox =
+        pubky_switch_core::records::Inbox::new("https://gone.example", doc.inbox().service_key);
+    let former = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &former));
+    let router = Arc::new(Router::new());
+    router.add_switch(pubky_switch_client::testing::SWITCH_ORIGIN, &world.switch);
+    let store = Arc::new(MemoryStore::new());
+    let mut env = world.env(store.clone());
+    env.transport = router.clone();
+    let shown = Signer::survey_key_recovery_new(env, world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(shown.backup, BackupFound::Stale { version: 1 });
+    let mut env = world.env(store);
+    env.transport = router;
+    let mut signer = Signer::restore_new(
+        env,
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_key_recovery_waits_out_its_own_service_failing_for_now() {
+    // The backup names the service the newest copy names, which can't be reached for now:
+    // the restore returns that error, and the next try goes on, here past the stale backup.
+    let world = World::new();
+    let (mut first, _) = world.enrolled().await;
+    let doc = first.identity_doc().unwrap().unwrap();
+    first.set_record_max_age(Some(60)).await.unwrap();
+    drop(first);
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &doc));
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store).await.unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    let error = Signer::restore_new(
+        world.env(store.clone()),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
+    let mut signer = Signer::restore_new(
+        world.env(store),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    signs_on(&world, &mut signer).await;
+}

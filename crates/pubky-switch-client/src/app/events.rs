@@ -339,12 +339,14 @@ pub enum AppEvent {
     },
     /// An entry stored because its sender's standing couldn't be checked
     /// ([`ParkReason::Unverifiable`]), a scope key ([`ParkReason::AwaitingKey`]) or protocol
-    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed,
+    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed:
     /// past the shared bounds Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
-    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
+    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]), or failing a
+    /// recipient check when tried again ([`DropReason::Rules`]). For a bound, the protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
-    /// add members: a pattern on it ends in `..`.
+    /// 11); a copy sent again would fail the same recipient check. A duty event, kept in
+    /// the commit that deletes the entry. Later versions may add members: a pattern on it
+    /// ends in `..`.
     #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
@@ -360,7 +362,7 @@ pub enum AppEvent {
         /// When its inbox accepted it, service time in Unix milliseconds: the time a
         /// re-send request asks from.
         accepted_at_ms: u64,
-        /// Which bound it was past.
+        /// Which bound it was past, or which recipient check it failed.
         reason: DropReason,
         /// What the input waited for when it was selected.
         waiting: WaitingReason,

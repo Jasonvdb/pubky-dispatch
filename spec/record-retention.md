@@ -4,7 +4,7 @@ This document is normative. It defines an explicit record-only mode of wire
 7.4.14 for retained evidence newer than a carried provider-loss boundary. It
 uses the existing upload endpoint, request authentication, upload transition
 and per-input accounting. It does not declare another loss, replay an ordinary
-write, reopen claim or list recovery, or change cooperative transfer.
+write, reopen claim or list recovery, or bypass cooperative transfer.
 
 ## 1. Request and current account binding
 
@@ -287,7 +287,219 @@ established; it introduces no portable custody-receipt format. Completion still
 requires every local duty across all registered protocols and the guarded
 `cursor.set.records_complete` of record lineage 7.
 
-## 6. Conformance
+## 6. Complete retained inputs in cooperative transfer
+
+Every complete record input still needed by the final disposition has one
+bounded **retained record unit**, whether admitted through ordinary loss,
+retained record-witness or current-history processing. The representation is
+the same for a current upload-derived value, a conflicting value and additional
+source evidence for the same operation, including another certificate. A
+current record has at most one primary unit; all its non-current units share
+the existing `max_divergent_uploads` capacity. It is not a history of requests:
+an exact complete input already represented uses its held unit and admission
+association, and a legitimately superseded unit is discarded only under
+Section 4. Request IDs, tickets, unused bulk proofs and failed inputs are not
+exported as retained units.
+
+### 6.1 Unit bytes and associations
+
+A unit is the actual UTF-8 bytes of a compact JSON object with these members,
+all required except the two optional members inside `record`:
+
+| Member | Form |
+|---|---|
+| `v` | `1` |
+| `key` | the record key, base64url(32 bytes) |
+| `admission` | the object below |
+| `application` | the actual receiving application reference, or null |
+| `source_identity` | the exact checked signed source identity document, or null where ordinary loss processing qualified no source |
+| `source_application` | the exact qualifying identity-delivery proof, or null |
+| `record` | `{ "op": signed record operation, "cert": signed writer certificate, "proof": selected source record proof or null }`, with the source input's optional `lineage` and `origin` members preserved, including present null |
+
+The record proof is the actual checked per-item or bulk-selected proof, not a
+proof invented for the receiving upload. At admission, preserve the source
+bundle before constructing normalized receiving lineage. A reconstructed recovered descriptor cannot recreate an
+original signed source statement. Every signed body, signature, descriptor byte
+and node stays exact; the source bundle is not replaced by the
+current receiving bundle. Source nodes already present elsewhere in the export
+are still carried in this unit, so reassembly does not depend on chain or batch
+retention. Failed or unselected proof candidates are not selected evidence.
+The complete input identity compares this record material and its exact source
+and application evidence, not only the operation hash or its export index.
+Receiving `admission`/`application` metadata, a ticket or a fragment index
+does not make another immutable input. A retry therefore cannot consume
+another slot by assigning a new receiving position to the same complete input.
+
+`admission` is exactly:
+
+| Member | Form |
+|---|---|
+| `mode` | `loss` or `current_history`; `loss` includes the retained record-witness continuation |
+| `created` | the actual receiving creation at admission, in wire 1.6 form with three fractional digits |
+| `identity` | the exact signed identity document actually applied at that admission |
+| `barrier` | its carried record recovery barrier position |
+| `before` | `{ "generation": int, "seq": int, "chain_hash": base64url(32 bytes) }`, the actual account head immediately before its upload transition |
+| `upload` | the position of that upload transition |
+
+The admission's document and barrier are the authority actually checked then,
+not the exporter or importer's newer document substituted afterward. Its upload
+generation equals that document's and its `before.generation`; its upload
+sequence is `before.seq + 1`. If this unit supplied a new receiving current
+application, `application` is that reference: its generation/sequence equal
+`upload`, and its item hash is the uploaded operation's. Otherwise it is null;
+a same-current certificate variant does not pretend to have been the current
+application. A primary current unit has a non-null application matching the
+record's retained receiving revision, or the same reference derived from its
+upload sequence and operation where the ordinary projection omits revision.
+Its source version remains the original proved version or lower bound, not the
+receiving upload sequence relabeled as a record-operation proof.
+
+These are bounded account-state associations established atomically at
+admission. They are retained with the unit through pruning and clean moves.
+They are not a portable upload receipt or a client constructor for authority.
+During a cooperative transfer, the authenticated frozen manifest commits the
+exact unit bytes and the exporting service's assertion that this admission and
+its source application qualification belong to the carried account history.
+An importer checks that assertion with the complete unit and the consistency
+rules below. Outside that checked transfer, parsing an admission object, an
+identity signature, or restoring a local marker establishes no such fact.
+A previously checked source-application association may be continued this way;
+an exporter cannot create one merely to make a source document qualify.
+
+### 6.2 Export carriers and exact bounds
+
+A `record` part taken from an upload has required `source_unit`, the base64url
+32-byte hash of its primary complete unit bytes; this member is absent otherwise. Its public
+`proof` remains absent, and its operation/certificate and receiving reference
+must match the primary unit. The current record's separate lineage and origin
+parts still describe the final frozen receiving state. They are not carriers
+for alternate source descriptors or proofs.
+
+Every non-current unit is named by one part:
+
+```json
+{"part":"record_retained","key":"<b64(32)>","index":0,"unit":"<b64(32)>","divergent":true}
+```
+
+Its index is consecutive from zero within the key's common non-current pool,
+at most seven. `divergent` says whether this unit still represents an active
+conflicting value; a separately retained certificate or required restrictive
+unit need not do so. Distinct complete inputs for the same operation consume
+distinct slots while kept, but do not create distinct conflicting values just
+because their certificate or proof bytes differ. Duplicate complete inputs,
+a primary unit also listed as non-current, or more than the existing shared
+capacity are invalid.
+
+Complete units travel in `record_source` parts:
+
+```json
+{"part":"record_source","key":"<b64(32)>","unit":"<b64(32)>","index":0,"count":1,"length":123,"data":"<b64>"}
+```
+
+`unit` is `hash(unit bytes)`, `length` their total byte length, and `data` an
+unmodified consecutive slice encoded as unpadded base64url. Each slice decodes
+to at most 524,288 bytes. Every slice except the last has exactly that length;
+the last is nonempty. `count = ceil(length / 524288)` and `index` runs from zero
+to `count - 1`. A unit is at most 16,777,216 bytes including its admission and
+source context, so at most 32 slices. Metadata agrees on every slice. There is
+exactly one complete set for each referenced unit, and no unreferenced set.
+
+This transport bound does not enlarge an admitted record unit, protected
+bundle, current view, source context or non-current pool. All preceding logical
+bounds apply independently, including the existing 16 MiB upload body limit.
+Admission also checks the complete retained encoding with its required
+admission context. It refuses an input that cannot be retained and exported
+whole; splitting bytes cannot make an oversized logical unit eligible.
+
+The maximal `record_source` part in the compact carrying form above is 699,230
+bytes: 699,051 base64url characters for 524,288 bytes plus the fixed members
+with maximal indices/count and length. Adding the maximum 103-byte chunk
+wrapper gives 699,333 bytes, below 1 MiB. All actual part bytes still undergo
+the hard chunk check. The current record part's `source_unit` member counts
+toward its existing actual ordinary/protected part cap. The manifest counts
+all fragments and bytes; the total import limit still refuses the whole
+transfer rather than omitting a unit. The same sealed value appearing in
+current lineage and source units is charged once by full value identity;
+fragmentation does not change quota or control-reserve accounting.
+
+### 6.3 Activation and continued authority
+
+After ordinary manifest/chunk authentication, the importer:
+
+1. Checks exact part shapes, ordering, indices, fragment lengths/counts and
+   total bounds, reassembles each unit, and verifies its hash before parsing.
+   It rejects duplicates, missing/extra fragments, unreferenced units and a
+   reference to another key. Required-null and optional-presence distinctions
+   survive reassembly. Malformed encodings or caps are `400 bad_request`;
+   absent, substituted or inconsistent required evidence is `409 conflict`.
+2. Verifies both identity signatures, when a source exists, and the exact
+   record-operation union, certificate, selected proof, source bundle and
+   origin facts under the recorded admission's mode and authority. The mode
+   never comes from comparing the operation's generation with the export's.
+   Its barrier equals the carried barrier, with the same original loss bound.
+   Its admission generation/version do not exceed the frozen account's; a
+   document at the same version must be the exact held document. Source
+   application qualification for `current_history` remains actual checked
+   application/continuation, an exact delivery proof, or a qualifying source
+   statement as Section 2 requires. A supplied delivery proof must verify.
+   `loss` keeps wire 7.4.14's source qualification and does not acquire a new
+   delivery-proof requirement; its `source_application` is null. The frozen
+   transfer can continue the stored checked association; it cannot invent an
+   unavailable one or supply a missing original date.
+3. For `loss`, applies the unchanged old-loss generation, proof and initializer
+   rules: operation generation at or before the original loss bound, and a
+   selected dating proof only of the permitted lost generation. For
+   `current_history`, applies Sections 2-3 against the actual recorded
+   admission context, including source and proof key authorization, bounds and
+   source snapshot ceilings. Thus an authentic operation from the admission's
+   own generation is permitted without calling it an ordinary write. Neither
+   mode assigns a source proof to the receiving application or promotes
+   unknown/recovered facts to clean authority. Import does not rejudge the
+   historical admission as a fresh upload under a newer identity document.
+4. Checks the admission upload position and every application against the
+   frozen sequence and retained chain. A retained stub there must be a service
+   upload; a full transition must agree with the unit's application and list
+   its key when the unit supplied a new current application. The `before`
+   hash must agree wherever the export retains that head or its successor.
+   Missing pruned stubs are not fabricated or treated as ancestry evidence:
+   the frozen manifest carries the bounded retained admission association.
+   An existing conflicting stub/document is never ignored. The primary unit
+   matches the current record's exact operation/certificate, source version
+   and receiving reference. Its public record proof stays absent. Ordinary
+   written current records retain their operation-chain and proof checks.
+5. Verifies every active divergent value and every non-current unit's final
+   role. An active divergent unit must be a conflicting operation under the
+   ordinary comparison rules, not merely another certificate for the current
+   operation. A non-divergent unit must match the current operation, qualify
+   for a canonical terminal value comparison, or have its value divergence
+   cleared by a verified ordinary receiving write after its recorded upload
+   position in the continued sequence. That write does not clear required
+   restrictive facts. All source restrictions still needed must agree with
+   or remain represented beside the final current lineage and origin slots;
+   the unit's source descriptor cannot be substituted with the current one.
+   A full chain operation can additionally be justified by an exact retained
+   source unit; unrelated superseded full operations remain invalid.
+6. Activates records, primary and non-current complete units, exact source and
+   admission associations, their common capacity, current lineage/origins,
+   quota accounting and barrier together. Partial import or abort establishes
+   none of them. A later export preserves these associations even after the
+   source operation, upload transition or identity delivery leaves the feed.
+
+Every retained selected record proof and retained identity-delivery application
+proof whose generation is newer than the carried original loss bound is a
+kept proof for wire 3.3's `proof_generations` report. This includes non-current
+units and certificate variants. A move or key change must preserve the actual
+key of every such generation, resolved from the actually checked source
+association rather than assumed to be the current service key; activation
+checks those keys against the frozen
+identity's map and the recorded checked source. The existing 256-key limit and
+refusal apply. Old-loss proofs continue to use their exact restrictive source
+association and remain excluded from that map as wire 3.3 requires; they gain
+no clean dating authority. Source statements and admission bookkeeping alone
+do not add proof generations. A legitimately discarded unit releases only key
+duties no other kept proof needs.
+
+## 7. Conformance
 
 Implementations must cover the following cases with authentic signed inputs
 and the exact immutable ticket. The service, shared checker, client and durable
@@ -317,3 +529,12 @@ local accounting must agree on the disposition.
 | Mixed loss/current source contexts or claim/list/head material | No implicit fallback or partial mode selection |
 | Duplicate, unordered or out-of-range response indices | Client rejects accounting for the response |
 | Lost response, restart, restore, provider change or local commit uncertainty | Preserve duties and apply the exact ticket/run rules above |
+| Current-generation proofless current upload, then pruning and a clean move | Primary unit preserves exact op/cert, lower bound and receiving reference; import accepts current-history admission without a fabricated record proof |
+| Proof-bearing tracked A retained beside later ordinary B, then source/batch pruning and a clean move | Exact A cert/proof/source/descriptor and admission survive in its complete unit; B's current descriptor cannot replace them |
+| Same operation with several independently checked certificate/source variants | Each exact retained non-current unit shares the eight-slot pool and transfers coherently; value divergence is not multiplied by certificate bytes |
+| Loss-mode unit relabeled current-history, future admission/source, or current-generation operation with no qualifying admission | Import refuses; the operation generation alone never selects an exception |
+| Truncated, reordered, duplicated, cross-key, hash-mismatched or over-bound source fragments | Import refuses before activation; fragmentation does not waive whole-unit bounds |
+| Missing primary unit, missing selected proof/source, or replacement of source D with the current descriptor | Import refuses the incomplete transfer |
+| Required non-current record or application proof generation omitted from the next identity | Move/key change or import refuses under the kept-proof rule |
+| Ordinary write clears value divergence but a retained source restriction is still required | Clear only the value flag; transfer the needed complete unit or its qualifying final representation |
+| Partial import, abort, retry, or a second clean move after feed pruning | No partial authority; exact complete unit and admission association remain bound to the frozen transfer |

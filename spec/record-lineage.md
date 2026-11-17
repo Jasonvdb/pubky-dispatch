@@ -320,6 +320,15 @@ sign the same facts under its current key only after that validation. Missing
 witnesses or nodes do not become new absence origins. An abort leaves neither
 partial lineage nor a record recovery completion active.
 
+Complete retained upload inputs also have the bounded source-unit carriers of
+[record retention 6](record-retention.md#6-complete-retained-inputs-in-cooperative-transfer),
+including non-current certificate/proof variants. These carry the original
+source bundle and statement bytes, separately from the normalized receiving
+lineage above. Pruning a source operation or upload transition does not remove
+a required unit. Import checks both associations; it cannot use the frozen
+current descriptor in place of an alternate source descriptor or turn a source
+proof into a receiving record-operation proof.
+
 An uploaded record may carry `lineage`, in the bundle form, with its current node
 supplied by that uploaded record's `op` and `cert`. A present malformed or invalid
 bundle makes that uploaded record unverified and it is left out. A record without

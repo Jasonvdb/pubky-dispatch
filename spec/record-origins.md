@@ -414,6 +414,13 @@ and policy; they do not duplicate the slot. Lineage and non-current node parts
 are separate. Reconstruct any omitted operation or certificate from the exact
 chain/app part before checking hashes, caps and the initializer permission rule.
 
+Attached source origin evidence still required by a retained record input
+travels in that complete unit under record retention 6, with its original
+source statement and document association. The account's `record_origin` part
+continues to describe the final frozen slot, including retired/unknown state;
+it cannot replace a source input's differing required evidence. These source
+units share the same non-current capacity and do not allocate another slot.
+
 Each added part plus wire 10.3's maximum 103-byte chunk wrapper fits the hard
 1 MiB chunk bound. A whole 7.5 MiB view is not one export part. An individual
 part larger than a configured smaller target gets its own chunk, still within

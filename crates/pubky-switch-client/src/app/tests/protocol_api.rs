@@ -2599,6 +2599,32 @@ async fn test_queue_stored_reads_the_protocols_opaque_members() {
     assert!(wallet.outbox_record(&msg_id).await.is_some());
 }
 
+/// A queued message is read by its signed common fields, so a host update that narrows
+/// the protocol's opaque members doesn't stop its delivery.
+#[tokio::test]
+async fn test_queue_stored_narrowed_opaque_members_still_deliver() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    *protocol.opaque.lock().unwrap() = vec![crate::app::OpaqueRule {
+        kind: None,
+        member: "score".into(),
+    }];
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let mut body = Map::new();
+    body.insert("score".into(), json!(1.5));
+    let message = OutgoingMessage::new(p.bob.identity().public(), "sample.note", body);
+    let signed = wallet.sign_message(message).unwrap();
+    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
+    protocol.opaque.lock().unwrap().clear();
+    let delivery = wallet.flush_message(&msg_id).await;
+    assert!(
+        matches!(delivery, Ok(Some(Delivery::Accepted { .. }))),
+        "{delivery:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
     let p = Pair::new();

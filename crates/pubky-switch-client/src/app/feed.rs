@@ -83,7 +83,7 @@ use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
-use super::events::{AppEvent, Duty, KeptRefusal, ParkReason};
+use super::events::{AppEvent, DropReason, Duty, KeptRefusal, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::order::{Handover, Kept, Walk};
 use super::protocol::{
@@ -1309,9 +1309,23 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        // The first observation of an entry held at this `seq` is kept: a page that shows
+        // another entry there, or this one accepted after that observation, contradicts what
+        // the service showed before, and is refused before anything of the entry is kept, so
+        // no kept observation ever precedes its entry's acceptance (Switch wire 7.4.4).
         let receipt = match self.state.held.get(&item.seq) {
-            Some(held) if held.receipt.entry_id == item.entry_id => held.receipt,
-            Some(_) => return Err(super::corrupt()),
+            Some(held)
+                if held.receipt.entry_id == item.entry_id
+                    && item.accepted_at <= held.receipt.read_at_ms =>
+            {
+                held.receipt
+            }
+            Some(_) => {
+                return Err(AppError::InvalidData(
+                    "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at its seq"
+                        .into(),
+                ));
+            }
             None => receipt,
         };
         let entry = Entry {
@@ -1403,7 +1417,13 @@ impl App {
         let received = match checked {
             Ok(received) => received,
             Err(CheckRefusal::Dropped { check, reason }) => {
-                self.unpark(entry.stored, &mut read.tx)?;
+                // A stored input in custody leaves it as every custody drop does, with its
+                // durable notice in the same commit (Switch spec 8.2); any other goes as an
+                // input read from the feed does.
+                match entry.stored.filter(|id| self.in_custody(*id)) {
+                    Some(id) => self.drop_waiting(id, DropReason::Rules { check }, &mut read.tx)?,
+                    None => self.unpark(entry.stored, &mut read.tx)?,
+                }
                 return Ok(self.dropped(entry.seq, check, reason));
             }
             Err(CheckRefusal::Duplicate { conflicting }) => {

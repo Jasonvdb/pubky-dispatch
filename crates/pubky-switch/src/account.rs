@@ -211,8 +211,9 @@ pub struct Judgement {
     /// chain generation. Unused while the verdict is unknown.
     pub recovery_floor: u64,
     /// The generation whose retirement the verdict read ([`retirement_generation`]): the
-    /// one an operator retires to make this account's loss permanent. `None` where no
-    /// retirement counts.
+    /// one an operator retires to make this account's loss permanent. A retirement of it
+    /// still counts only where the verdict lets it (an erasure's leftover mark, or a state
+    /// of a later generation, takes none); `None` where none can count at all.
     pub retirement_generation: Option<u64>,
 }
 

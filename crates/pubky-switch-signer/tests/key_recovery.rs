@@ -2566,3 +2566,119 @@ async fn test_key_recovery_at_a_given_service_keeps_the_rules() {
         SignerError::Refused(Refusal::KeyRecovery(KeyRecoveryStop::ServiceBehind { .. }))
     ));
 }
+
+/// The next version after the switch's copy, its body edited by `edit` and signed by the
+/// identity key, delivered to the switch and published; the backup removed.
+fn copy_edited(world: &World, edit: impl FnOnce(&mut serde_json::Value)) -> IdentityDoc {
+    let doc = world.switch.identity_doc().unwrap();
+    let mut body = doc.body().clone();
+    body.version += 1;
+    let plain = IdentityDoc::sign(&world.key, body).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&plain.signed().body_bytes().unwrap()).unwrap();
+    edit(&mut value);
+    let signed = world.key.sign_doc(
+        pubky_switch_core::labels::sig::IDENTITY,
+        &[],
+        serde_json::to_vec(&value).unwrap(),
+    );
+    let edited = IdentityDoc::verify(&signed, &world.key.public()).unwrap();
+    assert_eq!(edited.body(), plain.body());
+    world.switch.deliver_identity(&edited).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(edited.signed()).unwrap());
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    edited
+}
+
+#[tokio::test]
+async fn test_key_recovery_refuses_an_unknown_member_whatever_its_value() {
+    // A member this signer doesn't read, at the top or nested in an app, the inbox, the
+    // policy or a removal, is refused even when it is `null`, `[]` or `{}`: an empty list
+    // may be a later signer's restriction, which the recovery's version would drop.
+    let places: Vec<(&str, fn(&mut serde_json::Value, serde_json::Value))> = vec![
+        ("top", |v, x| v["later_member"] = x),
+        ("app", |v, x| v["apps"][0]["later_member"] = x),
+        ("inbox", |v, x| v["inbox"]["later_member"] = x),
+        ("policy", |v, x| v["policy"]["later_member"] = x),
+        ("removal", |v, x| v["removed"][0]["later_member"] = x),
+    ];
+    for (place, put) in places {
+        for value in [serde_json::json!([]), serde_json::json!({}), serde_json::Value::Null] {
+            let world = World::new();
+            let (mut first, _) = world.enrolled().await;
+            let (_, _) = joined(&world, &mut first, 3).await;
+            let (gone, _) = joined(&world, &mut first, 5).await;
+            first
+                .revoke(gone.keys.app_id_bytes(), None, confirmed())
+                .await
+                .unwrap();
+            drop(first);
+            copy_edited(&world, |v| put(v, value.clone()));
+            assert_eq!(
+                survey(&world, &Arc::new(MemoryStore::new()))
+                    .await
+                    .unwrap_err(),
+                refused(KeyRecoveryStop::UnknownMembers),
+                "{place} {value}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_key_recovery_takes_members_it_leaves_out_written_empty() {
+    // The members this signer leaves out when absent or empty, written `null` or empty by
+    // another writer, are no unknown members: the recovery goes ahead.
+    let world = World::new();
+    let (first, _) = world.enrolled().await;
+    drop(first);
+    let edited = copy_edited(&world, |v| {
+        v["record_max_age"] = serde_json::Value::Null;
+        v["service_keys"] = serde_json::json!([]);
+        v["renewed"] = serde_json::json!([]);
+    });
+    let mut signer = recovered(&world, &[]).await.unwrap();
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().version(),
+        edited.version() + 1
+    );
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_key_recovery_past_a_backup_its_service_refuses() {
+    // The backup names the service and key the newest copy names, but an account creation
+    // that service no longer answers for: without the key confirmation the restore returns
+    // the service's refusal, as before; with it, the recovery goes ahead without the backup.
+    let world = World::new();
+    let (mut first, _) = world.enrolled().await;
+    let doc = first.identity_doc().unwrap().unwrap();
+    first.set_record_max_age(Some(60)).await.unwrap();
+    drop(first);
+    let records = pubky_switch_core::records::SignerRecords::new(
+        pubky_switch_core::keys::IdentityKey::from_secret(SECRET),
+        doc.clone(),
+        world.backup().account_created() - 1_000,
+        &[],
+        &[],
+        pubky_switch_core::records::Limits::default(),
+        &[],
+        None,
+    )
+    .unwrap();
+    let backup = pubky_switch_core::records::SignerBackup::seal(&world.key, &records).unwrap();
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, serde_json::to_vec(&backup).unwrap());
+    let error = restored(&world).await.unwrap_err();
+    assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
+    let mut signer = recovered(&world, &[]).await.unwrap();
+    signs_on(&world, &mut signer).await;
+}

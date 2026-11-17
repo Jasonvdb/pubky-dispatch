@@ -48,7 +48,7 @@ use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::enc::{hash, lp, random_bytes, u64be};
 use pubky_switch_core::records::{
     AccountAssociation, AccountObservation, AppCert, AppRecord, Enrollment, EnrollmentAnswer,
-    EnrollmentBody, IDENTITY_PATH, IdentityDoc, Limits, RemovedApp, SIGNER_BACKUP_PATH,
+    EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Limits, RemovedApp, SIGNER_BACKUP_PATH,
     app_record_path,
 };
 use pubky_switch_core::sig::SignedDoc;
@@ -813,7 +813,9 @@ impl Signer {
 
 /// Whether the body `copy` was signed with carries a member this signer doesn't read, at
 /// any depth. Its bytes are never compared with this signer's own encoding: writers may use
-/// any member order and whitespace, and write `null` for an absent member (Switch wire 1.1).
+/// any member order and whitespace (Switch wire 1.1). A member this signer leaves out when
+/// it is absent or empty may be written as `null` or empty; any other name it doesn't
+/// read counts, whatever its value.
 fn carries_unknown_members(copy: &IdentityDoc) -> Result<bool> {
     let invalid = |error: serde_json::Error| {
         SignerError::InvalidData(pubky_switch_core::Error::Invalid(error.to_string()))
@@ -822,33 +824,62 @@ fn carries_unknown_members(copy: &IdentityDoc) -> Result<bool> {
         serde_json::from_slice(&copy.signed().body_bytes()?).map_err(invalid)?;
     let read: serde_json::Value =
         serde_json::from_slice(&copy.body().to_json()?).map_err(invalid)?;
-    Ok(unknown_in(&signed, &read))
+    let (serde_json::Value::Object(signed), serde_json::Value::Object(read)) = (&signed, &read)
+    else {
+        return Ok(true);
+    };
+    Ok(signed.iter().any(|(name, value)| match read.get(name) {
+        Some(known) => unknown_in(value, known),
+        None => !(left_out_when_empty(read, name, copy.body()) && is_empty(value)),
+    }))
 }
 
-/// Whether `signed` holds a member `read`, the same value as this signer reads it, lacks.
-/// A member this signer leaves out when it is absent or empty may be written as `null` or
-/// empty.
+/// Whether this signer reads the top-level member `name` of `identity.json` and left it out
+/// of `read`, its own encoding of `body`, as it leaves out a member that is absent or
+/// empty: the reader is asked, not a list kept beside it. A name it reads, given a value of
+/// no type it takes, fails to read or reads otherwise; an unknown one is passed over.
+fn left_out_when_empty(
+    read: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    body: &IdentityBody,
+) -> bool {
+    let mut probe = read.clone();
+    probe.insert(
+        name.to_owned(),
+        serde_json::Value::String("\u{0}".to_owned()),
+    );
+    serde_json::from_value::<IdentityBody>(serde_json::Value::Object(probe))
+        .map_or(true, |probed| &probed != body)
+}
+
+/// `null`, `[]` or `{}`.
+fn is_empty(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Object(members) => members.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `signed` holds a member `read`, the same value as this signer reads it, lacks,
+/// below the top level, where this signer leaves no member out. Both come from the same
+/// bytes, so each list holds as many entries in both, and a member read as an object or a
+/// list was one: only names can differ.
 fn unknown_in(signed: &serde_json::Value, read: &serde_json::Value) -> bool {
     use serde_json::Value;
     match (signed, read) {
         (Value::Object(signed), Value::Object(read)) => {
             signed.iter().any(|(name, value)| match read.get(name) {
                 Some(known) => unknown_in(value, known),
-                None => {
-                    !matches!(value, Value::Null)
-                        && !matches!(value, Value::Array(items) if items.is_empty())
-                        && !matches!(value, Value::Object(members) if members.is_empty())
-                }
+                None => true,
             })
         }
-        (Value::Array(signed), Value::Array(read)) => {
-            signed.len() != read.len()
-                || signed
-                    .iter()
-                    .zip(read)
-                    .any(|(value, known)| unknown_in(value, known))
-        }
-        (Value::Object(_) | Value::Array(_), _) => true,
+        (Value::Array(signed), Value::Array(read)) => signed
+            .iter()
+            .zip(read)
+            .any(|(value, known)| unknown_in(value, known)),
         _ => false,
     }
 }

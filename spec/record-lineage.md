@@ -474,6 +474,11 @@ neither submission nor acknowledgment creates positive original authority.
 
 A subsequent provider loss starts a new barrier from that recovery document's
 current apps. No completion from the older position satisfies the new one.
+Record retention 5.1 permits an explicitly bound ordinary loss projection of an
+eligible whole input, omitting only its now-unneeded identity-delivery source
+association. The exact original duty remains held until that new ticket's
+per-input acknowledgment and atomic local accounting; no record proof is
+removed or redated, and ineligible evidence remains outstanding.
 An export carries the barrier, its originating signed identity document and all
 completion bits in its required `record_recovery` part (wire 10.3). Import verifies the witness set against that document and
 preserves it; missing or inconsistent barrier state is `409 conflict`. A fresh

@@ -565,6 +565,11 @@ identity distinguishes record units from standalone origin parts and binds all
 carried evidence and the exact source association. Snapshot, in-place restore,
 request selection, ticket consumption and witness completion include both kinds
 under record lineage 7; a standalone part is never encoded as an invented op.
+After a later provider loss, the explicit accounting projection of record
+retention 5.1 may omit only the no-longer-needed identity-delivery association.
+It preserves this whole part and its exact source, obeys the unchanged ordinary
+origin-source bound, and accounts an original only through its independently
+qualified durable mapping to the new ticket's `accounted_origins` index.
 
 ## 8. Client submission during earlier recovery
 

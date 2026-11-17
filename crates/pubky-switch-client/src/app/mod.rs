@@ -562,7 +562,11 @@ impl AppBackup {
 enum Restorable {
     Ready(Box<App>, Tx),
     TooLarge(AppError),
-    CarriedTooLarge { duty_events: u64, owed_calls: u64 },
+    CarriedTooLarge {
+        duty_events: u64,
+        owed_calls: u64,
+        sent_messages: u64,
+    },
 }
 
 /// How a restore's build treats the protocol's check of its layer: in full, for a restore
@@ -1483,14 +1487,22 @@ impl App {
     /// message as the backup holds it, each owed delivery with its replay deadline
     /// ([`send::OutboxItem::replay_until`]), from the backup's verified service time, or its
     /// device time without one, less the clock tolerance. The deadline is checked at every
-    /// try, not here. The messages the backup left out past its budget are told to the
-    /// protocol as undelivered, in the same commit.
-    fn reinstall_outbox(&mut self, backup: &AppBackup, tx: &mut Tx) -> Result<(), AppError> {
+    /// try, not here. `outbox` is the backup's as the restore puts it back, with the
+    /// acceptances `sent` holds taken in ([`send::RestoredSent::outbox`]). The messages the
+    /// backup left out past its budget are told to the protocol as undelivered, in the same
+    /// commit, as a re-send for one `sent` holds.
+    fn reinstall_outbox(
+        &mut self,
+        backup: &AppBackup,
+        outbox: &[send::OutboxItem],
+        sent: &send::RestoredSent,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let baseline = backup
             .taken_service_ms
             .unwrap_or(backup.taken_ms)
             .saturating_sub(CLOCK_TOLERANCE_MS);
-        for item in &backup.outbox {
+        for item in outbox {
             let mut item = item.clone();
             if item.delivery_owed() {
                 item.replay_until(baseline);
@@ -1522,14 +1534,23 @@ impl App {
                     "a backup's held message isn't one of its outbox owed a delivery".into(),
                 ));
             }
-            send::put_message_hold(tx, msg_id)?;
+            // A message whose acceptance the store restored in place holds owes no
+            // delivery: its hold ended with it.
+            if outbox
+                .iter()
+                .any(|item| item.msg_id() == msg_id && item.delivery_pending())
+            {
+                send::put_message_hold(tx, msg_id)?;
+            }
         }
+        // A message left out that the restore holds as sent was accepted: only what else
+        // was owed of it is given up, told as for a re-send.
         for (msg_id, resend) in &backup.outbox_left_out {
             self.keep_duty(
                 tx,
                 events::Duty::MessageUndelivered {
                     msg_id: msg_id.clone(),
-                    resend: *resend,
+                    resend: *resend || sent.holds(msg_id),
                 },
             )?;
         }
@@ -1771,8 +1792,10 @@ impl App {
     /// owed is given up instead, with [`AppEvent::MessageUndelivered`] ([`App::backup`]).
     /// So do its sent messages: [`App::delivery`] answers [`Delivery::Accepted`] for each,
     /// [`App::queue_stored`] queues nothing for it, and no event tells it undelivered but
-    /// for a re-send. A restore in place keeps only the backup's sent messages, not the
-    /// store's.
+    /// for a re-send. A restore in place keeps the store's sent messages beside them, one
+    /// both hold with every acceptance time of either, and a message the backup's outbox
+    /// puts back that the store holds as accepted takes that acceptance: it isn't delivered
+    /// again, and its hold ends.
     ///
     /// The protocols' layers ([`App::backup_layered`]) are installed with the app's own
     /// state, and with the entries and processed pairs of the same moment that the backup
@@ -1814,10 +1837,12 @@ impl App {
     /// not registered, or for one its protocol refuses, or for sent messages no backup
     /// carries: over [`MAX_CARRIED_SENT_BYTES`], one twice, past its retention when the
     /// backup was taken, not signed by this app, or another message than its outbox copy or
-    /// beside one never accepted; [`Refusal::Usage`] for a certificate
+    /// beside one never accepted, and for a store restored in place whose sent message is
+    /// another message than the backup's of its `msg_id`; [`Refusal::Usage`] for a certificate
     /// holding a scope root no registered protocol owns; [`Refusal::Certificate`] for one a
     /// protocol refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
-    /// commit but not with the duty events and owed calls the store would carry beside it;
+    /// commit but not with the duty events, owed calls and sent messages the store would
+    /// carry beside it;
     /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
     /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
     /// included. Nothing is written on any of them.
@@ -1844,9 +1869,11 @@ impl App {
                 Restorable::CarriedTooLarge {
                     duty_events,
                     owed_calls,
+                    sent_messages,
                 } => Err(Refusal::CarriedTooLarge {
                     duty_events,
                     owed_calls,
+                    sent_messages,
                 }
                 .into()),
             }
@@ -2037,6 +2064,14 @@ impl App {
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();
+            // The sent messages the restore installs: the backup's, and for a restore in
+            // place the store's beside them, so a message either holds as accepted reads so
+            // and is never told undelivered (Switch spec 12.4 "Sent messages"). The outbox
+            // goes back with the acceptances they hold taken in.
+            let (store_sent, sent_unread) = send::sent_of_store(&old, &meta, &cert).await?;
+            let sent =
+                send::restored_sent(&backup.sent, store_sent, &backup.outbox).map_err(invalid)?;
+            let outbox = sent.outbox(&backup.outbox);
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
@@ -2216,12 +2251,9 @@ impl App {
                 .into_iter()
                 .map(|(msg_id, _)| msg_id)
                 .filter(|msg_id| {
-                    backup
-                        .outbox
+                    outbox
                         .iter()
-                        .rev()
-                        .find(|item| item.msg_id() == msg_id)
-                        .is_some_and(send::OutboxItem::delivery_pending)
+                        .any(|item| item.msg_id() == msg_id && item.delivery_pending())
                 })
                 .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
@@ -2322,12 +2354,11 @@ impl App {
                 for msg_id in &old_message_holds {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }
-                app.reinstall_outbox(backup, &mut tx)?;
-                // The sent messages go back as carried, so a message accepted before the
-                // backup reads as accepted, and is never told undelivered (Switch spec 12.4
-                // "Sent messages"); those past their retention by now go at the next prune.
-                for sent in &backup.sent {
-                    send::put_sent(&mut tx, sent)?;
+                app.reinstall_outbox(backup, &outbox, &sent, &mut tx)?;
+                // The sent messages as the backup carries them; those past their retention
+                // by now go at the next prune.
+                for record in sent.records(true) {
+                    send::put_sent(&mut tx, record)?;
                 }
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
@@ -2365,6 +2396,10 @@ impl App {
                     tx.put(stored, value)?;
                 }
                 carrying = true;
+                // Those the store restored in place adds or holds more of.
+                for record in sent.records(false) {
+                    send::put_sent(&mut tx, record)?;
+                }
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
                     let in_backup = from_backup
@@ -2387,15 +2422,20 @@ impl App {
                     }
                 }
                 // What didn't read is left behind, and the protocol told how much.
-                // So are the sent messages the backup left out past its bound.
+                // So are the sent messages left out past the bound, by the backup or the
+                // restore, and those of the store that didn't read as this app's.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
-                if carried.lost_duties > 0 || lost_owed > 0 || backup.sent_left_out > 0 {
+                let lost_sent = backup
+                    .sent_left_out
+                    .saturating_add(sent.left_out)
+                    .saturating_add(sent_unread);
+                if carried.lost_duties > 0 || lost_owed > 0 || lost_sent > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
                             owed_calls: lost_owed,
-                            sent_messages: backup.sent_left_out,
+                            sent_messages: lost_sent,
                         },
                     )?;
                 }
@@ -2416,6 +2456,8 @@ impl App {
                     Ok(Restorable::CarriedTooLarge {
                         duty_events: count(key::DUTY_PREFIX),
                         owed_calls: count(key::OWED_PREFIX),
+                        sent_messages: u64::try_from(sent.records(false).count())
+                            .unwrap_or(u64::MAX),
                     })
                 }
                 Err(error) => restore_build_error(error),

@@ -839,6 +839,22 @@ impl OutboxItem {
         (kept, duty)
     }
 
+    /// The item once the acceptance first at `first_ms` that a store restored in place
+    /// holds is taken into it (Switch spec 12.4 "Sent messages"), as the commit that records
+    /// an acceptance takes one: no delivery owed, nor the conversation entry that goes
+    /// before it, its sealed envelope, refusal and undeliverable count dropped. `None` when
+    /// nothing else of it is owed.
+    fn take_acceptance(mut self, first_ms: u64) -> Option<Self> {
+        self.accepted_at_ms = Some(first_ms);
+        self.resend = false;
+        self.conversation = false;
+        self.sealed = None;
+        self.failed = None;
+        self.last_error = None;
+        self.clear_undeliverable();
+        (!self.complete()).then_some(self)
+    }
+
     /// The replay deadline a restore gives the item (Switch spec 11): the earliest of the
     /// one it carries, its first acceptance plus [`SENT_RETENTION_MS`] for a message
     /// accepted before, and `baseline` plus [`SENT_RETENTION_MS`], where `baseline` is when
@@ -1049,6 +1065,120 @@ pub(crate) fn check_carried_sent(
     Ok(())
 }
 
+/// The sent messages the store `reader`, restored in place, holds as this app's: each read
+/// under its own `msg_id` and signed by the app `meta` and `cert` name; and how many it
+/// holds that aren't, which a restore leaves behind and counts, as it does a damaged value
+/// of what the store owes its protocol.
+pub(crate) async fn sent_of_store(
+    reader: &super::state::Reader,
+    meta: &super::state::Meta,
+    cert: &pubky_switch_core::records::AppCert,
+) -> Result<(Vec<SentStored>, u64), AppError> {
+    let mut kept = Vec::new();
+    let mut lost = 0u64;
+    for (msg_id, bytes) in reader.scan_raw(SENT_PREFIX).await? {
+        match super::state::decode::<SentStored>(&bytes) {
+            Ok(sent) if sent.msg_id == msg_id && sent.is_own(meta, cert) => kept.push(sent),
+            _ => lost = lost.saturating_add(1),
+        }
+    }
+    Ok((kept, lost))
+}
+
+/// The sent messages a restore installs (Switch spec 12.4 "Sent messages").
+pub(crate) struct RestoredSent {
+    /// The records, in `msg_id` order.
+    records: Vec<SentStored>,
+    /// Those of `records` exactly as the backup carries them.
+    from_backup: BTreeSet<String>,
+    /// How many were left out past [`MAX_CARRIED_SENT_BYTES`].
+    pub(crate) left_out: u64,
+}
+
+impl RestoredSent {
+    /// The record of `msg_id`, if the restore installs one.
+    fn get(&self, msg_id: &str) -> Option<&SentStored> {
+        self.records
+            .binary_search_by(|sent| sent.msg_id.as_str().cmp(msg_id))
+            .ok()
+            .and_then(|at| self.records.get(at))
+    }
+
+    /// Whether the restore installs a record of `msg_id`: it reads as accepted.
+    pub(crate) fn holds(&self, msg_id: &str) -> bool {
+        self.get(msg_id).is_some()
+    }
+
+    /// The records, those exactly as the backup carries them (`true`) or not.
+    pub(crate) fn records(&self, from_backup: bool) -> impl Iterator<Item = &SentStored> {
+        self.records
+            .iter()
+            .filter(move |sent| self.from_backup.contains(&sent.msg_id) == from_backup)
+    }
+
+    /// The outbox `outbox` a backup carries, as the restore puts it back: an item whose
+    /// store never saw its message accepted takes the acceptance a store restored in place
+    /// holds ([`OutboxItem::take_acceptance`]), and goes once nothing else of it is owed.
+    pub(crate) fn outbox(&self, outbox: &[OutboxItem]) -> Vec<OutboxItem> {
+        outbox
+            .iter()
+            .filter_map(|item| match self.get(&item.msg_id) {
+                Some(sent) if item.accepted_at_ms.is_none() && !item.resend_queued => {
+                    item.clone().take_acceptance(sent.first_ms)
+                }
+                _ => Some(item.clone()),
+            })
+            .collect()
+    }
+}
+
+/// What a restore installs of the sent messages (Switch spec 12.4 "Sent messages"): those
+/// the backup carries (`carried`, checked with [`check_carried_sent`]), and for a restore in
+/// place those the store holds (`store`, [`sent_of_store`]) beside them. A message both
+/// hold is one record with every acceptance time of either, the earlier replay deadline and
+/// the plaintext either keeps; one only the store holds goes as it is. The whole goes within
+/// [`MAX_CARRIED_SENT_BYTES`], as a backup's does ([`fit_sent`]). A store's record of another
+/// message than the backup's record or outbox copy of its `msg_id`, by recipient, kind,
+/// bytes or origin, refuses the restore: no writer gives two messages one `msg_id`.
+pub(crate) fn restored_sent(
+    carried: &[SentStored],
+    store: Vec<SentStored>,
+    outbox: &[OutboxItem],
+) -> Result<RestoredSent, &'static str> {
+    let mut copies: BTreeMap<String, DeliveryCopy> = outbox
+        .iter()
+        .map(|item| (item.msg_id.clone(), DeliveryCopy::of(item)))
+        .collect();
+    let mut records: BTreeMap<String, SentStored> = carried
+        .iter()
+        .map(|sent| (sent.msg_id.clone(), sent.clone()))
+        .collect();
+    for sent in store {
+        DeliveryCopy::of_sent(&sent)
+            .remember(sent.msg_id.clone(), &mut copies)
+            .map_err(|_| "the store holds another message than the backup's queued one")?;
+        let record = match records.get(&sent.msg_id) {
+            Some(held) => held
+                .merged(&sent)
+                .ok_or("the store holds another message than the backup's sent one")?,
+            None => sent,
+        };
+        records.insert(record.msg_id.clone(), record);
+    }
+    let fitted = fit_sent(records.into_values().collect());
+    let from_backup = fitted
+        .records
+        .iter()
+        .filter(|sent| carried.contains(sent))
+        .map(|sent| sent.msg_id.clone())
+        .collect();
+    Ok(RestoredSent {
+        records: fitted.records,
+        from_backup,
+        left_out: fitted.left_out,
+    })
+}
+
 /// Put the sent message `sent` in `tx`, with its time index (`sentt/`).
 pub(crate) fn put_sent(tx: &mut super::state::Tx, sent: &SentStored) -> Result<(), AppError> {
     tx.put(&sent_time_key(sent.first_ms, &sent.msg_id), &())?;
@@ -1095,6 +1225,41 @@ impl SentStored {
         self.plaintext.as_ref().is_none_or(|bytes| {
             own_message(&bytes.0, &self.to, meta, cert)
                 .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+        })
+    }
+
+    /// The record of one message this one and `other` both hold, as a restore in place
+    /// keeps it (Switch spec 12.4 "Sent messages"): every acceptance time of either, the
+    /// earliest the first, the earlier replay deadline, and the plaintext either keeps.
+    /// `None` when they aren't of one message ([`DeliveryCopy::remember`]).
+    fn merged(&self, other: &Self) -> Option<Self> {
+        let mut copies = BTreeMap::new();
+        DeliveryCopy::of_sent(self)
+            .remember(self.msg_id.clone(), &mut copies)
+            .ok()?;
+        DeliveryCopy::of_sent(other)
+            .remember(self.msg_id.clone(), &mut copies)
+            .ok()?;
+        let mut times: Vec<u64> = [self.first_ms, other.first_ms]
+            .into_iter()
+            .chain(self.resent.iter().copied())
+            .chain(other.resent.iter().copied())
+            .collect();
+        times.sort_unstable();
+        times.dedup();
+        let (first_ms, resent) = times.split_first()?;
+        Some(Self {
+            origin: self.origin,
+            to: self.to,
+            kind: self.kind.clone(),
+            msg_id: self.msg_id.clone(),
+            plaintext: self.plaintext.clone().or_else(|| other.plaintext.clone()),
+            first_ms: *first_ms,
+            resent: resent.to_vec(),
+            replay_until_ms: [self.replay_until_ms, other.replay_until_ms]
+                .into_iter()
+                .flatten()
+                .min(),
         })
     }
 

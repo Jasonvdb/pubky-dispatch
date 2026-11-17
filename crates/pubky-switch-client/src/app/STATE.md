@@ -196,8 +196,20 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   sit beside an outbox copy, or a message left out past the outbox budget, never
   accepted: no store holds a sent record beside a message it never saw accepted, since a
   message is queued alone only while it isn't kept as sent, and the commit that records an
-  acceptance writes both. A restore in place keeps the backup's records only: the store's
-  go with the rest of the namespace.
+  acceptance writes both.
+- **A restore in place keeps the store's `sent/` beside the backup's** (`send::restored_sent`):
+  a message both hold is one record with every acceptance time of either, the earliest the
+  first, the earlier replay deadline and the plaintext either keeps; the whole fits
+  `MAX_CARRIED_SENT_BYTES` as a backup does, the rest left out and counted. A store's record
+  of another message than the backup's record or outbox copy of its `msg_id` (recipient,
+  kind, bytes or origin) refuses the restore; one that doesn't read, or isn't signed by this
+  app, is left behind and counted in `RestoreLeftBehind`. An outbox item the backup puts
+  back whose store never saw it accepted, while the restored `sent/` holds it, takes that
+  acceptance (`RestoredSent::outbox`): no delivery owed, its hold ended, kept only for a
+  record job still owed; a message the backup left out of its outbox that the restore holds
+  as sent is told `MessageUndelivered` with `resend: true`. The store's records go after
+  the backup's state in the commit, and count towards `Refusal::CarriedTooLarge`
+  (`sent_messages`).
 - **A backup doesn't carry `opq/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared

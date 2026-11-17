@@ -39,7 +39,7 @@
 //! of a protocol's format is an input of one of the Switch's, now or later.
 
 use pubky_switch_core::labels::is_switch_label;
-use pubky_switch_core::records::{AppRecord, AppRecordBody, app_record_path};
+use pubky_switch_core::records::{AppRecord, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::MAX_TIME_MS;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 use super::events::AppEvent;
+use super::next_body::NextBody;
 use super::state::{PendingRecord, key};
 use super::{App, AppError, Refusal};
 use crate::error::TransportError;
@@ -258,7 +259,7 @@ impl App {
             if !expiry.valid() {
                 return Err(expiry_refused(&protocol));
             }
-            if body.protocols.get(&protocol) == member.as_ref() {
+            if body.body().protocols.get(&protocol) == member.as_ref() {
                 if preserve_unchanged {
                     return self.put_own_record(body, false, None).await;
                 }
@@ -279,11 +280,8 @@ impl App {
                 expiry
             };
             let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
-            match member {
-                Some(member) => body.protocols.insert(protocol, member),
-                None => body.protocols.remove(&protocol),
-            };
-            body.expires_at = self.resolve_record_expiries(&expiries, updated_at)?;
+            body.set_member(protocol, member);
+            body.set_expires_at(self.resolve_record_expiries(&expiries, updated_at)?);
             self.put_own_record(body, false, Some((&expiries, updated_at)))
                 .await
         })
@@ -346,7 +344,7 @@ impl App {
             let mut body = self.own_record_body().await?;
             self.check_registered(&protocol)?;
             let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
-            body.expires_at = self.resolve_record_expiries(&expiries, updated_at)?;
+            body.set_expires_at(self.resolve_record_expiries(&expiries, updated_at)?);
             self.put_own_record(body, true, Some((&expiries, updated_at)))
                 .await
         })
@@ -439,7 +437,7 @@ impl App {
     pub async fn update_accepts(&mut self) -> Result<Publication, AppError> {
         Box::pin(async move {
             let mut body = self.own_record_body().await?;
-            body.accepts = self.protocols.accepts(&self.state.cert);
+            body.set_accepts(self.protocols.accepts(&self.state.cert));
             self.put_own_record(body, false, None).await
         })
         .await
@@ -491,11 +489,11 @@ impl App {
     }
 
     /// The body of the record the app presents, once the app may change it.
-    async fn own_record_body(&mut self) -> Result<AppRecordBody, AppError> {
+    async fn own_record_body(&mut self) -> Result<NextBody, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         let record = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        Ok(record.body().clone())
+        Ok(NextBody::of(&record))
     }
 
     /// Sign `body` as the app's next record, unless it is the record held and `renew` is
@@ -503,7 +501,7 @@ impl App {
     /// for (`rexp`) when given, in one commit, then deliver and publish.
     async fn put_own_record(
         &mut self,
-        body: AppRecordBody,
+        body: NextBody,
         renew: bool,
         expiries: Option<(&RecordExpiries, u64)>,
     ) -> Result<Publication, AppError> {
@@ -514,7 +512,7 @@ impl App {
         // goes again with this change, signed anew: the backup carries the accepted record
         // apart, and only that one is published (Switch spec 4.2).
         let unaccepted = self.record_needs_new_delivery();
-        if renew || unaccepted || &body != held.body() {
+        if renew || unaccepted || body.body() != held.body() {
             let record = match expiries {
                 Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
                 None => self.sign_next_record(body, held.updated_at()).await?,
@@ -549,10 +547,12 @@ impl App {
                 .is_some_and(|accepted| accepted != &self.state.record)
     }
 
-    /// Every new signature uses one timestamp and resolves every protocol policy at it.
+    /// Every new signature uses one timestamp and resolves every protocol policy at it. A
+    /// body under another certificate than the record held is one whose members the
+    /// protocols judged for it ([`NextBody::for_cert`]).
     pub(super) async fn sign_next_record(
         &mut self,
-        body: AppRecordBody,
+        body: NextBody,
         previous: u64,
     ) -> Result<AppRecord, AppError> {
         let expiries = self.record_expiries().await?;
@@ -562,13 +562,21 @@ impl App {
 
     fn sign_record_at(
         &self,
-        mut body: AppRecordBody,
+        body: NextBody,
         expiries: &RecordExpiries,
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
-        body.updated_at = updated_at;
-        body.expires_at = self.resolve_record_expiries(expiries, updated_at)?;
-        let record = AppRecord::sign(&self.state.keys, body).map_err(refused)?;
+        let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
+        let record = body
+            .sign(&self.state.keys, updated_at, expires_at)
+            .map_err(refused)?;
+        self.read_back(&record)
+    }
+
+    /// `record`, signed by the app, as the switch and its readers read it: one that doesn't
+    /// read back, such as one with a member outside the JSON rules (Switch wire 1.1), is
+    /// refused before it is kept.
+    pub(super) fn read_back(&self, record: &AppRecord) -> Result<AppRecord, AppError> {
         AppRecord::verify(record.signed(), &self.state.meta.identity).map_err(refused)
     }
 

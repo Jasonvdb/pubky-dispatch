@@ -6,6 +6,7 @@ mod callback_batches;
 mod current_inputs;
 mod gap_completion;
 mod ownership;
+mod renewal_member;
 mod retained_authority;
 
 use std::sync::{Arc, Mutex};
@@ -79,7 +80,15 @@ struct Named {
     taken: Mutex<Vec<u64>>,
     /// Its collections.
     collections: Vec<crate::app::Collection>,
+    /// Its member of the record for a renewed certificate; the default's while `None`.
+    member_for: Mutex<Option<MemberFor>>,
 }
+
+/// A [`Protocol::member_for`] of a test protocol.
+type MemberFor = fn(
+    Option<&serde_json::Map<String, serde_json::Value>>,
+    &AppCert,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String>;
 
 fn named(name: &str) -> Named {
     Named {
@@ -415,6 +424,17 @@ impl Protocol for Named {
             );
         }
         Ok(!*self.holding.lock().unwrap())
+    }
+
+    fn member_for(
+        &self,
+        member: Option<&serde_json::Map<String, serde_json::Value>>,
+        cert: &AppCert,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+        match *self.member_for.lock().unwrap() {
+            Some(member_for) => member_for(member, cert),
+            None => Ok(member.cloned()),
+        }
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {

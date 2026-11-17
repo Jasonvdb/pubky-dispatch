@@ -18,6 +18,7 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::{AppEvent, Duty};
+use super::next_body::NextBody;
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
@@ -44,7 +45,8 @@ impl App {
     }
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
-    /// carrying it. Returns whether the certificate changed.
+    /// carrying it, with each protocol's member judged for it ([`App::body_for_cert`]).
+    /// Returns whether the certificate changed.
     pub(crate) async fn adopt_renewal(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
         let Some(renewal) = self.state.renewal.clone() else {
             return Ok(false);
@@ -54,9 +56,9 @@ impl App {
             return Ok(false);
         }
         let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        let mut body = old.body().clone();
-        body.cert = renewal.signed().clone();
-        body.accepts = self.protocols.accepts(&renewal);
+        let Some(body) = self.body_for_cert(&renewal).await? else {
+            return Ok(false);
+        };
         let record = self.sign_next_record(body, old.updated_at()).await?;
         if !self
             .take_cert(renewal, record.signed().clone(), true, None, at)
@@ -66,6 +68,43 @@ impl App {
         }
         self.deliver_record().await?;
         Ok(true)
+    }
+
+    /// The body of the app's next record under `cert`, a certificate it is about to take:
+    /// the record held, with `accepts` and every registered protocol's member as they are
+    /// for `cert` ([`NextBody::for_cert`]), each member checked as
+    /// [`App::set_protocol_member`] checks one: signed and read back the same way, and in an
+    /// `app.put` the switch would take. Nothing of that check is kept or sent.
+    ///
+    /// `None` when `cert` isn't taken now, with nothing signed or taken: one the protocols
+    /// can't run with is refused ([`App::refuse_cert`]); one a protocol refuses to give a member for
+    /// leaves the certificate and record held, and the renewal owed for the next read, and
+    /// the host is told ([`AppEvent::RenewalWaits`]).
+    async fn body_for_cert(&mut self, cert: &AppCert) -> Result<Option<NextBody>, AppError> {
+        if let Some(refusal) = self.protocols.certificate_refusal(cert) {
+            self.refuse_cert(cert, refusal).await?;
+            return Ok(None);
+        }
+        let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+        let judged = NextBody::for_cert(&held, cert, &self.protocols, |body| {
+            AppRecord::sign(&self.state.keys, body.clone())
+                .map_err(AppError::from)
+                .and_then(|record| self.read_back(&record))
+                .and_then(|record| self.record_batch(record.signed()))
+                .map(drop)
+                .map_err(|error| error.to_string())
+        });
+        match judged {
+            Ok(body) => Ok(Some(body)),
+            Err(refusal) => {
+                self.push_once(AppEvent::RenewalWaits {
+                    issued_at: cert.issued_at(),
+                    protocol: refusal.protocol,
+                    reason: refusal.reason,
+                });
+                Ok(None)
+            }
+        }
     }
 
     /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
@@ -295,7 +334,7 @@ impl App {
                     "Switch wire 6.2: an app.put conflict naming another app's record".into(),
                 ));
             }
-            let body = mine.body().clone();
+            let body = NextBody::of(&mine);
             let record = self
                 .sign_next_record(body, held.updated_at().max(mine.updated_at()))
                 .await?;
@@ -513,16 +552,18 @@ impl App {
         {
             // The switch holds that record: it is the newest it accepted, and the published
             // copy is checked against it. A record change kept under the earlier certificate
-            // is signed anew under this one, later than both records, and delivered by the
-            // read, as `adopt_renewal` builds on a kept one: sent as it is, it would be
-            // refused for its certificate, and read as the app not current.
+            // is signed anew under this one, with each protocol's member judged for it,
+            // later than both records, and delivered by the read, as `adopt_renewal` builds
+            // on a kept one: sent as it is, it would be refused for its certificate, and read
+            // as the app not current. While a protocol refuses to give a member for it, nothing is
+            // taken, and the next look tries again.
             let taken = entry.record.signed().clone();
             let kept = self.state.pending_record.is_some();
             let record = if kept {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-                let mut body = old.body().clone();
-                body.cert = cert.signed().clone();
-                body.accepts = self.protocols.accepts(&cert);
+                let Some(body) = self.body_for_cert(&cert).await? else {
+                    return Ok(Listed::Key(key));
+                };
                 self.sign_next_record(body, old.updated_at().max(entry.record.updated_at()))
                     .await?
                     .signed()

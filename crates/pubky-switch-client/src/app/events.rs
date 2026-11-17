@@ -525,6 +525,19 @@ pub enum AppEvent {
     /// A renewed certificate was seen in the feed; it is taken once the own
     /// `identity.json` lists it (Switch spec 3.2).
     RenewalSeen,
+    /// A renewed certificate the own `identity.json` lists wasn't taken yet: the registered
+    /// protocol `protocol` refused to give its member for it, or gave one the record check
+    /// refused ([`super::Protocol::member_for`]; a member removed is a valid answer). Nothing was signed: the app keeps presenting the
+    /// certificate and record it holds, and tries the renewal again at the next read, when
+    /// this event comes again while it still waits (Switch spec 3.2).
+    RenewalWaits {
+        /// The renewed certificate's `issued_at`.
+        issued_at: u64,
+        /// The protocol's name.
+        protocol: String,
+        /// Its reason, without content.
+        reason: String,
+    },
     /// The app saved its renewed certificate and app record. Record delivery may still be pending.
     CertificateTaken {
         /// The new certificate's `issued_at`.

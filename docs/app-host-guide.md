@@ -22,6 +22,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `IdentityRefresh::Unavailable` | The homeserver read failed in transport. Retry later. A failed document check instead raises an error. |
 | `AppEvent::IdentityUpdated` | The client took a newer own identity document. Refresh the displayed membership and provider from it. |
 | `AppEvent::RenewalSeen` | The feed supplied a candidate renewal of this app's certificate. Keep using the held certificate while waiting for the identity to list the new one. |
+| `AppEvent::RenewalWaits` | The named protocol refused to give its record member for a listed renewal, or gave one the record check refused. Keep using the held certificate and record, show the reason to that protocol's owner, and update the protocol; each read tries the renewal again. |
 | `AppEvent::CertificateTaken` | The client committed a new certificate and its app record. Use the new permissions. A record delivery can still be pending. |
 | `AppEvent::CertificateRefused` | A proposed certificate could not run with the registered protocols. Tell every owner, show the reason and retain the current certificate. Ask the signer for a compatible renewal. |
 | `CertificateRefusal::UnownedRoot` | No registered protocol owns a scope root in the renewal. Correct the renewal or register the missing protocol at restore. |
@@ -228,7 +229,7 @@ Keep the original local batch ID. Look it up with `kept_batch`, or look up an at
 
 ## Publishing the app's own record and rotating keys
 
-Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
+Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member under that certificate; the default keeps it. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
 
 | Case | What happened and what to do |
 |---|---|

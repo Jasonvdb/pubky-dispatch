@@ -46,7 +46,7 @@
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
@@ -846,6 +846,32 @@ pub trait Protocol: Send + Sync {
     /// The kinds the app's record lists in `accepts` for a certificate: never wider than
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
+
+    /// The protocol's member of the app's record under `cert`, a certificate other than the
+    /// one the record carries, such as a renewal, from `member`, the one it carries now
+    /// (Switch spec 3.2, 4.2). The app asks before it signs the record carrying `cert`, and
+    /// signs that record with the member returned, in the commit that takes `cert`: a
+    /// member whose content `cert` no longer covers, such as one that names a scope the
+    /// certificate dropped, is changed or removed here, and the earlier member is never
+    /// signed under `cert`. `None` removes the member. Pure and synchronous: it reads no
+    /// store and writes nothing. Keeps `member` by default.
+    ///
+    /// The member returned is checked as [`super::App::set_protocol_member`] checks one.
+    ///
+    /// # Errors
+    ///
+    /// Why the protocol can't give a member for `cert`, without content; the same for a
+    /// member the check refuses. Nothing is signed: the app keeps presenting the
+    /// certificate and record it holds, the renewal stays owed and is tried again at the
+    /// next read, and the host is told ([`super::AppEvent::RenewalWaits`]).
+    fn member_for(
+        &self,
+        member: Option<&Map<String, Value>>,
+        cert: &AppCert,
+    ) -> Result<Option<Map<String, Value>>, String> {
+        let _ = cert;
+        Ok(member.cloned())
+    }
 
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
     /// the body parses as its kind's body, the members read have their types, and the

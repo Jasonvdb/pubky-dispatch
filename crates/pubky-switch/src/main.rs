@@ -54,7 +54,8 @@ enum Command {
     Retire {
         /// The identity's Pubky ID.
         identity: String,
-        /// The generation to retire: the mark's, or the account's where the mark is lost.
+        /// The generation to retire: the one the account's verdict reads its retirement
+        /// of, which `check-marks` reports for the identity.
         generation: u64,
     },
 }

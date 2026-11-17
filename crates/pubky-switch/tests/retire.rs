@@ -396,22 +396,18 @@ async fn test_retire_service_answers_permanent_notice() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_retire_newer_account_beside_older_mark_service_answers_permanent_notice() {
-    // alice's account created after her readable mark, which records a head of another
-    // generation: the verdict takes the lost-mark column at her account's generation
-    // (Switch account binding 1.1). `retire` names that generation, and a service started
-    // on the same key store and database reads that retirement: its notice is permanent.
-    let Some(replay) = replay().await else { return };
-    serve_alice(&replay).await;
+/// Retire `alice` through the operator command and check that the generation her verdict
+/// reads is the only one it takes: `other` is refused as the wrong generation, `retirable`
+/// is recorded, and a service started on the same key store and database then answers her
+/// signer, bound to `created`, with the notice `reason`, permanent.
+async fn retire_takes_the_selected_generation(
+    replay: &Replay,
+    created: u64,
+    retirable: u64,
+    other: u64,
+    reason: NoticeReason,
+) {
     let alice = alice_id();
-    mark_at(&replay, &alice, 2, 1, 4).await;
-    let created = alice_created() + 1;
-    write(
-        &replay.db,
-        &format!("UPDATE accounts SET created_at_ms = {created} WHERE id = '{alice}'"),
-    )
-    .await;
     let at = ms(&item_time(&vectors("chain.json")["items"][1]));
     let notice = |service: Service| {
         let path = format!("/v1/{alice}/allow");
@@ -430,26 +426,31 @@ async fn test_retire_newer_account_beside_older_mark_service_answers_permanent_n
             body["current"].clone()
         }
     };
+    let reason_text = serde_json::to_value(reason).expect("reason");
     let before = notice(replay.restarted_with(Limits::default())).await;
     assert_eq!(
         (before["reason"].clone(), before["permanent"].clone()),
-        (serde_json::json!("mark_lost"), serde_json::json!(false)),
+        (reason_text.clone(), serde_json::json!(false)),
         "{before}"
     );
     refused(
-        &replay,
+        replay,
         &alice,
-        2,
+        other,
         Refusal::WrongGeneration {
-            given: 2,
-            retirable: 1,
+            given: other,
+            retirable,
         },
     )
     .await;
-    let retired = retire(&replay, &alice, 1).await.expect("retired");
+    let retired = retire(replay, &alice, retirable).await.expect("retired");
     assert_eq!(
-        (retired.notice.reason, retired.notice.permanent),
-        (NoticeReason::MarkLost, true)
+        (
+            retired.retired,
+            retired.notice.reason,
+            retired.notice.permanent
+        ),
+        (retirable, reason, true)
     );
     let started = Service::new(
         ORIGIN.into(),
@@ -462,9 +463,41 @@ async fn test_retire_newer_account_beside_older_mark_service_answers_permanent_n
     let after = notice(started).await;
     assert_eq!(
         (after["reason"].clone(), after["permanent"].clone()),
-        (serde_json::json!("mark_lost"), serde_json::json!(true)),
+        (reason_text, serde_json::json!(true)),
         "{after}"
     );
+}
+
+#[tokio::test]
+async fn test_retire_newer_account_beside_older_mark_service_answers_permanent_notice() {
+    // alice's account created after her readable mark, which records a head of a later
+    // generation: the verdict takes the lost-mark column at her ACCOUNT's generation
+    // (Switch account binding 1.1), 1 and not the mark's 2.
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    mark_at(&replay, &alice, 2, 1, 4).await;
+    let created = alice_created() + 1;
+    write(
+        &replay.db,
+        &format!("UPDATE accounts SET created_at_ms = {created} WHERE id = '{alice}'"),
+    )
+    .await;
+    retire_takes_the_selected_generation(&replay, created, 1, 2, NoticeReason::MarkLost).await;
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_retire_state_behind_a_later_generation_mark_service_answers_permanent_notice() {
+    // alice's account and mark of one creation, the mark at a later generation than her
+    // state: she is behind, and the verdict reads the retirement of the MARK's generation,
+    // 2 and not her account's 1 (Switch wire 7.3, Table 1).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    mark_at(&replay, &alice, 2, 1, 4).await;
+    retire_takes_the_selected_generation(&replay, alice_created(), 2, 1, NoticeReason::Behind)
+        .await;
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -428,9 +428,8 @@ fn judge_account(account: &Account, inputs: &Inputs<'_>, retired: Option<u64>) -
     let state = account.state.state();
     let mark = inputs.mark.mark();
     let column = column(state, mark, inputs.stub_at_mark);
-    // A retirement is of the mark's generation, or of the account's where the mark is
-    // lost ([`retirement_generation`]), and counts only while the state isn't of a later
-    // generation than that.
+    // A retirement is of the generation [`retirement_generation`] selects, and counts
+    // only while the state isn't of a later generation than that.
     let retired =
         retired.is_some_and(|retired| state.is_none_or(|state| state.generation <= retired));
     let generation = account

@@ -93,7 +93,8 @@ pub enum Refusal {
     WrongGeneration {
         /// The generation given.
         given: u64,
-        /// The mark's generation, or the account's where the mark is lost.
+        /// The generation the account's verdict reads its retirement of
+        /// ([`crate::account::retirement_generation`]).
         retirable: u64,
     },
 }
@@ -412,6 +413,36 @@ mod tests {
         assert_eq!(
             check_marks::notice_of(&retired.decision.verdict).map(|notice| notice.permanent),
             Some(true)
+        );
+    }
+
+    /// The generation `retire` names is the one the verdict selects, the MARK's where the
+    /// mark is selected and differs from the account's: a state behind a mark of a later
+    /// generation (failing, `behind`), and an account created before a newer mark (lost).
+    #[test]
+    fn test_retire_mark_generation_selected_beside_another_account_generation() {
+        let later = mark(3, 1);
+        let behind = account(AccountState::Serving(tip(3)));
+        assert_eq!(
+            retirable(&judged(Some(behind), &later), &later).map(|(generation, _)| generation),
+            Ok(3)
+        );
+        let newer = MarkInput::Mark(AccountMark {
+            generation: 3,
+            seq: 1,
+            chain_hash: [1; 32],
+            key: KEY,
+            created_at_ms: 20,
+        });
+        let older = account(AccountState::Serving(tip(3)));
+        let judged = judged(Some(older), &newer);
+        assert!(matches!(
+            judged.judgement.decision.verdict,
+            Verdict::Lost { .. }
+        ));
+        assert_eq!(
+            retirable(&judged, &newer).map(|(generation, _)| generation),
+            Ok(3)
         );
     }
 

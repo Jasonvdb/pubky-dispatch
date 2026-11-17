@@ -65,7 +65,8 @@ pub use erasure::{
 pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
-    publication_other_document, publication_repaired, signer_new_install, signer_records_behind,
+    publication_other_document, publication_repaired, signer_key_recovery_after_a_racer,
+    signer_key_recovery_backup_gone, signer_new_install, signer_records_behind,
     signer_restore_revocation, signer_restore_undelivered, signer_two_installs_race,
 };
 pub use join::join;
@@ -338,6 +339,14 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("signer, records behind and restored in place", |world| {
         Box::pin(signer_records_behind(world))
     }),
+    (
+        "signer, recovered with the key alone after a racer",
+        |world| Box::pin(signer_key_recovery_after_a_racer(world)),
+    ),
+    (
+        "signer, recovered with the key alone, the backup gone",
+        |world| Box::pin(signer_key_recovery_backup_gone(world)),
+    ),
     ("signer restore, a version never delivered", |world| {
         Box::pin(signer_restore_undelivered(world))
     }),

@@ -56,6 +56,7 @@ mod clients;
 mod erasure;
 pub(crate) mod gate;
 mod handover;
+mod key_recovery;
 mod recovery;
 mod renewal;
 mod restore;
@@ -71,6 +72,9 @@ pub use approval::{AppReview, ApprovedRequest};
 pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
+pub use key_recovery::{
+    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoverySurvey, RestoreConfirmed,
+};
 pub use renewal::{CertChange, RunDue};
 pub use restore::RecordsDiscarded;
 pub use revocation::UserConfirmed;
@@ -470,6 +474,20 @@ impl Signer {
                 },
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
+                Flow::KeyRecover {
+                    origin,
+                    enrollment,
+                    digest,
+                    dropped,
+                    fresh,
+                } => {
+                    let held = if fresh {
+                        key_recovery::Held::Fresh
+                    } else {
+                        key_recovery::Held::InPlace
+                    };
+                    Box::pin(self.key_recover(&origin, &enrollment, digest, &dropped, held)).await?
+                }
                 Flow::Erase {
                     unpublished,
                     reminded,
@@ -744,6 +762,13 @@ impl Signer {
         if let Some(refused) = gate::refusal(&self.state) {
             return Err(refused);
         }
+        // After a recovery with the key alone, the version that drops the certificates this
+        // install doesn't hold comes before every other: no backup holding them can be
+        // sealed (Switch spec 12.8).
+        if self.unheld_references()? {
+            Box::pin(self.remove_unheld()).await?;
+            return Ok(None);
+        }
         if self.owes_closing()? {
             self.resume().await?;
             // The delivery changed what the switch holds.
@@ -886,16 +911,51 @@ impl Signer {
         change: impl FnOnce(&mut IdentityBody),
         room: Room,
     ) -> Result<IdentityBody> {
+        Self::body_on(&self.state, base, change, room)
+    }
+
+    /// Whether the newest version names a certificate, of an app it lists or in `renewed`,
+    /// that this install doesn't hold, as after a recovery with the key alone that found no
+    /// copy of it (Switch spec 12.8): no backup holding that version can be sealed.
+    pub(crate) fn unheld_references(&self) -> Result<bool> {
+        match self.state.newest_doc()? {
+            Some(newest) => self.names_unheld(&newest),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether `doc` names a certificate, of an app it lists or in `renewed`, that this
+    /// install doesn't hold ([`Signer::unheld_references`]).
+    pub(crate) fn names_unheld(&self, doc: &IdentityDoc) -> Result<bool> {
+        let held = self.held_certs()?;
+        let body = doc.body();
+        Ok(body
+            .apps
+            .iter()
+            .map(|a| a.cert)
+            .chain(body.renewed.iter().map(|r| r.cert))
+            .any(|cert| !held.iter().any(|h| h.hash() == cert)))
+    }
+
+    /// The body of the next version of the records `state` built on `base` with `change`, at
+    /// a version above both `base`'s and every version they signed, measured against the cap
+    /// with `room`. Nothing is signed.
+    fn body_on(
+        state: &SignerState,
+        base: &IdentityDoc,
+        change: impl FnOnce(&mut IdentityBody),
+        room: Room,
+    ) -> Result<IdentityBody> {
         let version = base
             .version()
-            .max(self.state.signed_through)
+            .max(state.signed_through)
             .checked_add(1)
             .ok_or(SignerError::Records(RecordsFault::Invariant(
                 "the version can't go higher",
             )))?;
         let mut body = base.body().clone();
         body.version = version;
-        body.signer = self.state.install;
+        body.signer = state.install;
         change(&mut body);
         // Never a version the switch can't take: its delivery would be over `PUT /identity`'s
         // body cap (Switch wire 7.1), and could never be delivered. Nor one whose closings
@@ -912,7 +972,7 @@ impl Signer {
         }
         // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
         let prev = Some(base.hash());
-        for measure in measures(&self.state, &closed, prev)? {
+        for measure in measures(state, &closed, prev)? {
             if over_cap(measure.bytes, measure.limit, room) {
                 return Err(Refusal::IdentityTooLarge {
                     body: measure.body,

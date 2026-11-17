@@ -494,12 +494,22 @@ impl Signer {
         };
         state.service = Some(service.clone());
         state.signed_through = state.signed_through.max(doc.version());
+        // After a recovery with the key alone the version may name a certificate this install
+        // doesn't hold, and no backup of it can be sealed: it is written once the delivery
+        // has won, as a racing delivery's is, by the version that drops those certificates
+        // (Switch spec 12.8).
+        let unheld = self.names_unheld(&doc)?;
+        state.backup_owed |= unheld;
         let flow = Flow::Deliver {
             account: service,
             doc: doc.signed().clone(),
             prev: None,
             backup: None,
-            step: DeliverStep::Signed,
+            step: if unheld {
+                DeliverStep::BackupWritten
+            } else {
+                DeliverStep::Signed
+            },
         };
         self.commit(state, Some(flow)).await
     }

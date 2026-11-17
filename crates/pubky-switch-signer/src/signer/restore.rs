@@ -42,7 +42,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::SignerEnv;
 use super::clients::{RequestClient, Target};
-use super::revocation::UserConfirmed;
+use super::key_recovery::{Found, KeyRecoveryConfirmed, RestoreConfirmed};
 use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
@@ -52,19 +52,35 @@ use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerSta
 /// Confirmation that the user chose restoration after seeing what unusable local records
 /// may lose: claims, undelivered changes, pending effects and local history (Switch spec 12.8).
 /// This is the host's attestation, not verification that a user interface was shown.
-#[derive(Clone, Copy, Debug)]
-pub struct RecordsDiscarded(());
+#[derive(Clone, Debug)]
+pub struct RecordsDiscarded(Option<KeyRecoveryConfirmed>);
 
 impl RecordsDiscarded {
     /// Made by the host only after showing the losses and obtaining confirmation to restore.
     #[must_use]
     pub fn shown_and_confirmed() -> Self {
-        Self(())
+        Self(None)
+    }
+
+    /// The same, with the user's confirmation of a recovery with the key alone, for a backup
+    /// that is missing, unreadable or stale ([`Signer::survey_key_recovery_new`]).
+    #[must_use]
+    pub fn and_key_recovery(self, confirmed: KeyRecoveryConfirmed) -> Self {
+        Self(Some(confirmed))
     }
 }
 
+/// Whether `error` is a refusal of the backup itself, which a recovery with the key alone
+/// is the way past (Switch spec 12.8): none, one that doesn't open, or a stale one.
+pub(super) fn backup_refused(error: &SignerError) -> bool {
+    matches!(
+        error,
+        SignerError::Refused(Refusal::NoBackup | Refusal::UnreadableBackup | Refusal::StaleBackup)
+    )
+}
+
 // A missing copy in readable current state is different from a copy whose evidence was lost.
-enum KeptCopy {
+pub(super) enum KeptCopy {
     Absent,
     Verified(Box<IdentityDoc>),
     Unusable,
@@ -84,11 +100,11 @@ impl KeptCopy {
 
 // Retained restrictions, never a ready signer or permission to sign. Only a whole decoded
 // current state for the requested identity contributes its scalar and collection members.
-struct RestoreLocal {
-    state: Option<SignerState>,
-    copies: [KeptCopy; 2],
-    signed_through: Option<u64>,
-    epoch_through: Option<u64>,
+pub(super) struct RestoreLocal {
+    pub(super) state: Option<SignerState>,
+    pub(super) copies: [KeptCopy; 2],
+    pub(super) signed_through: Option<u64>,
+    pub(super) epoch_through: Option<u64>,
 }
 
 impl RestoreLocal {
@@ -115,13 +131,13 @@ impl RestoreLocal {
         local
     }
 
-    fn intact(state: SignerState) -> Result<Self> {
+    pub(super) fn intact(state: SignerState) -> Result<Self> {
         state.check_copies()?;
         let identity = state.identity;
         Ok(Self::from_state(Some(state), &identity))
     }
 
-    fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
+    pub(super) fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let mut damaged = false;
         let state = match records.state {
             Ok(state) => state,
@@ -226,7 +242,7 @@ fn restored_alerts(state: &SignerState) -> Vec<Alert> {
         .collect()
 }
 
-fn check_local_restore(state: &SignerState, has_flow: bool) -> Result<()> {
+pub(super) fn check_local_restore(state: &SignerState, has_flow: bool) -> Result<()> {
     if state.erased {
         return Err(Refusal::Erased.into());
     }
@@ -253,25 +269,40 @@ impl Signer {
     /// key `keyring` holds and whose records this store doesn't hold, as on a new device
     /// (Switch spec 12.8, Switch wire 3.13). This install gets a signer ID of its own.
     ///
+    /// With the user's [`KeyRecoveryConfirmed`] in `confirmed`, a backup that is missing,
+    /// unreadable or stale is recovered from with the key alone instead
+    /// ([`Signer::survey_key_recovery_new`]), and a recovery a crash left on this store goes
+    /// on; a backup the switch's copy matches is restored from as without it.
+    ///
     /// # Errors
     ///
-    /// [`Refusal::AlreadySetUp`] when the store holds records for this identity; otherwise as
+    /// [`Refusal::AlreadySetUp`] when the store holds records for this identity, but those of
+    /// a recovery with the key alone in progress under a key confirmation; otherwise as
     /// [`Signer::restore`].
     pub async fn restore_new(
         env: SignerEnv,
         keyring: IdentityKeyring,
-        _confirmed: UserConfirmed,
+        confirmed: impl Into<RestoreConfirmed>,
     ) -> Result<Self> {
         let identity = keyring.public_key();
         let store = env
             .store
             .acquire(&state::signer_namespace(&identity))
             .await?;
+        let key = confirmed.into().0;
         if state::set_up(&store, &identity).await? {
-            return Err(Refusal::AlreadySetUp.into());
+            return match key {
+                Some(key) => Box::pin(Self::continue_fresh(env, keyring, store, key)).await,
+                None => Err(Refusal::AlreadySetUp.into()),
+            };
         }
         let mut signer = Self::restore_target(env, keyring, store)?;
-        signer.restore_records(None).await?;
+        match (signer.restore_records(None).await, key) {
+            (Err(error), Some(key)) if backup_refused(&error) => {
+                Box::pin(signer.recover_with_key(Found::Fresh(None), key)).await?;
+            }
+            (result, _) => drop(result?),
+        }
         Ok(signer)
     }
 
@@ -287,24 +318,44 @@ impl Signer {
     /// take-over, security alarms and known version or epoch floors still constrain it.
     /// A completed hand-over refuses with [`SignerError::NotNamed`]. Otherwise as
     /// [`Signer::restore`]. An unknown write requires reopening the actual stored result;
-    /// repeating this entry cannot replace a successfully committed usable candidate.
+    /// repeating this entry cannot replace a successfully committed usable candidate. With
+    /// a key recovery confirmed too ([`RecordsDiscarded::and_key_recovery`]), as
+    /// [`Signer::restore_new`] with one: the versions and epochs the readable records spent bind it.
     pub async fn restore_over_unusable(
         env: SignerEnv,
         keyring: IdentityKeyring,
-        _confirmed: RecordsDiscarded,
+        confirmed: RecordsDiscarded,
     ) -> Result<Self> {
         let identity = keyring.public_key();
         let store = env
             .store
             .acquire(&state::signer_namespace(&identity))
             .await?;
-        let local = RestoreLocal::unusable(state::read(&store, &identity).await?, &identity)?;
+        let local = match (
+            RestoreLocal::unusable(state::read(&store, &identity).await?, &identity),
+            confirmed.0.clone(),
+        ) {
+            (Err(SignerError::Refused(Refusal::AlreadySetUp)), Some(key)) => {
+                return Box::pin(Self::continue_fresh(env, keyring, store, key)).await;
+            }
+            (local, _) => local?,
+        };
         let mut signer = Self::restore_target(env, keyring, store)?;
-        signer.restore_records(Some(local)).await?;
+        match (signer.restore_records(Some(local)).await, confirmed.0) {
+            (Err(error), Some(key)) if backup_refused(&error) => {
+                let local = RestoreLocal::unusable(
+                    state::read(&signer.store, &identity).await?,
+                    &identity,
+                )?;
+                let local = Some(Box::new(local));
+                Box::pin(signer.recover_with_key(Found::Fresh(local), key)).await?;
+            }
+            (result, _) => drop(result?),
+        }
         Ok(signer)
     }
 
-    fn restore_target(
+    pub(super) fn restore_target(
         env: SignerEnv,
         keyring: IdentityKeyring,
         store: OwnedStoreHandle,
@@ -341,11 +392,25 @@ impl Signer {
     /// Homeserver holds none; [`Refusal::UnreadableBackup`] for one that doesn't open or
     /// verify; [`Refusal::StaleBackup`] when the switch's or the Homeserver's copy is past it;
     /// otherwise as [`Signer::resume`].
-    pub async fn restore(&mut self, _confirmed: UserConfirmed) -> Result<IdentityDoc> {
+    ///
+    /// With the user's [`KeyRecoveryConfirmed`] in `confirmed`, a backup that is missing,
+    /// unreadable or stale is recovered from with the key alone instead
+    /// ([`Signer::survey_key_recovery`]), and such a recovery in progress goes on with it; a
+    /// backup the switch's copy matches is restored from as without it.
+    pub async fn restore(&mut self, confirmed: impl Into<RestoreConfirmed>) -> Result<IdentityDoc> {
         self.refresh().await?;
+        let key = confirmed.into().0;
+        if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
+            return Box::pin(self.continue_key_recovery(key.clone())).await;
+        }
         check_local_restore(&self.state, self.flow.is_some())?;
         let local = RestoreLocal::intact(self.state.clone())?;
-        self.restore_records(Some(local)).await
+        match (self.restore_records(Some(local)).await, key) {
+            (Err(error), Some(key)) if backup_refused(&error) => {
+                Box::pin(self.recover_with_key(Found::InPlace, key)).await
+            }
+            (result, _) => result,
+        }
     }
 
     async fn restore_records(&mut self, local: Option<RestoreLocal>) -> Result<IdentityDoc> {
@@ -416,67 +481,8 @@ impl Signer {
         let first = self
             .check_restore(&view, answer.identity.as_ref(), local.as_ref())
             .await?;
-
-        // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
-        // and, in place, this install's own, with the revocations it asked for and the
-        // deletions it owes: one whose record is gone already still owes its grant reminder,
-        // which `deletion_checks`, finding no record, wouldn't raise.
-        let mut tombstones = view.revoked_apps.clone();
-        tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
-        tombstones.extend(removed_at_switch(&answer, &doc));
+        let mut state = self.rebuilt_records(&view, &answer, service.clone(), local.as_ref())?;
         let kept = local.as_ref().and_then(|local| local.state.as_ref());
-        let cleanup = if let Some(kept) = kept {
-            tombstones.extend(kept.tombstones.iter().copied());
-            kept.cleanup.clone()
-        } else {
-            Vec::new()
-        };
-        let mut state = self.taken_records(&view, &answer, service.clone(), tombstones, cleanup);
-        if let Some(local) = &local {
-            if let Some(epoch) = local.epoch_through {
-                if epoch > doc.data_epoch().saturating_add(1) {
-                    return Err(Refusal::StaleBackup.into());
-                }
-                state.epoch_through = state.epoch_through.max(epoch);
-            }
-            if let Some(version) = local.signed_through {
-                state.signed_through = state.signed_through.max(version);
-            }
-        }
-        if let Some(kept) = kept {
-            for alert in restored_alerts(kept) {
-                state.alert(alert);
-            }
-        }
-        // The first commit must also tell a restart to finish taking over (Switch wire 3.13).
-        state.owes_own_version = true;
-        // In place, the revocations this install asked for stay as they were, with their
-        // alerts; those only the backup names are added. Where both picked a time to distrust
-        // an app from, the earlier wins: after a compromise it trusts less, and two installs
-        // that disagree never trust more than either asked (Switch wire 3.12).
-        if let Some(kept) = kept {
-            for carried in &kept.revoking {
-                if let Some(rebuilt) = state
-                    .revoking
-                    .iter_mut()
-                    .find(|r| r.app_id == carried.app_id)
-                {
-                    let backed_up = rebuilt.distrust_from;
-                    rebuilt.clone_from(carried);
-                    rebuilt.distrust_from = match (carried.distrust_from, backed_up) {
-                        (Some(own), Some(theirs)) => Some(own.min(theirs)),
-                        (own, theirs) => own.or(theirs),
-                    };
-                    state.alerts.retain(|alert| {
-                        !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
-                            if *app_id == carried.app_id)
-                            || kept.alerts.contains(alert)
-                    });
-                } else {
-                    state.revoking.push(carried.clone());
-                }
-            }
-        }
         // A backup written mid-recovery holds the recovery's version, which the service it
         // names doesn't hold yet: the recovery is in progress again, delivered first, and
         // declared again elsewhere if that service refuses it (Switch spec 12.6 step 1).
@@ -539,6 +545,81 @@ impl Signer {
         let next = self.sign_own_version().await?;
         self.resume().await?;
         Ok(next)
+    }
+
+    /// The records a restore takes from `view`, the backup's or those a recovery with the
+    /// key alone found, the switch's `GET /apps` answer `answer`, and, in place or over
+    /// unusable records, what `local` keeps binding (Switch wire 3.13 "Restoring"). The
+    /// caller sets `newest`; the version naming this install is owed.
+    pub(super) fn rebuilt_records(
+        &self,
+        view: &BackupView,
+        answer: &AppsAnswer,
+        service: Service,
+        local: Option<&RestoreLocal>,
+    ) -> Result<SignerState> {
+        let doc = &view.identity_doc;
+        // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
+        // and, in place, this install's own, with the revocations it asked for and the
+        // deletions it owes: one whose record is gone already still owes its grant reminder,
+        // which `deletion_checks`, finding no record, wouldn't raise.
+        let mut tombstones = view.revoked_apps.clone();
+        tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
+        tombstones.extend(removed_at_switch(answer, doc));
+        let kept = local.and_then(|local| local.state.as_ref());
+        let cleanup = if let Some(kept) = kept {
+            tombstones.extend(kept.tombstones.iter().copied());
+            kept.cleanup.clone()
+        } else {
+            Vec::new()
+        };
+        let mut state = self.taken_records(view, answer, service, tombstones, cleanup);
+        if let Some(local) = local {
+            if let Some(epoch) = local.epoch_through {
+                if epoch > doc.data_epoch().saturating_add(1) {
+                    return Err(Refusal::StaleBackup.into());
+                }
+                state.epoch_through = state.epoch_through.max(epoch);
+            }
+            if let Some(version) = local.signed_through {
+                state.signed_through = state.signed_through.max(version);
+            }
+        }
+        if let Some(kept) = kept {
+            for alert in restored_alerts(kept) {
+                state.alert(alert);
+            }
+        }
+        // The first commit must also tell a restart to finish taking over (Switch wire 3.13).
+        state.owes_own_version = true;
+        // In place, the revocations this install asked for stay as they were, with their
+        // alerts; those only the backup names are added. Where both picked a time to distrust
+        // an app from, the earlier wins: after a compromise it trusts less, and two installs
+        // that disagree never trust more than either asked (Switch wire 3.12).
+        if let Some(kept) = kept {
+            for carried in &kept.revoking {
+                if let Some(rebuilt) = state
+                    .revoking
+                    .iter_mut()
+                    .find(|r| r.app_id == carried.app_id)
+                {
+                    let backed_up = rebuilt.distrust_from;
+                    rebuilt.clone_from(carried);
+                    rebuilt.distrust_from = match (carried.distrust_from, backed_up) {
+                        (Some(own), Some(theirs)) => Some(own.min(theirs)),
+                        (own, theirs) => own.or(theirs),
+                    };
+                    state.alerts.retain(|alert| {
+                        !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
+                            if *app_id == carried.app_id)
+                            || kept.alerts.contains(alert)
+                    });
+                } else {
+                    state.revoking.push(carried.clone());
+                }
+            }
+        }
+        Ok(state)
     }
 
     /// The next version, naming this install as the signer, committed for delivery: a
@@ -800,6 +881,17 @@ impl Signer {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());
         };
+        // A recovery with the key alone's version may list a certificate this install doesn't
+        // hold, and no backup holding it can be sealed: it stays owed, told, until the
+        // version that drops those certificates writes its own (Switch spec 12.8).
+        if self.unheld_references()? {
+            let mut state = self.state.clone();
+            state.alert(Alert::BackupNotWritten);
+            if state != self.state {
+                self.commit(state, None).await?;
+            }
+            return Ok(());
+        }
         // Sealed before the check, so only the check's read comes before the write.
         let backup = self.seal_backup(&newest.doc, newest.prev, &self.newest_account()?)?;
         let bytes = serde_json::to_vec(&backup).map_err(|_| RecordsFault::Encode)?;

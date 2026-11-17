@@ -15,7 +15,7 @@ use super::ProtocolSet;
 use super::events::{
     AppEvent, DropReason, Duty, EventId, KeptDuty, ParkReason, StoredMessageIdentity,
 };
-use super::protocols::Rules;
+use super::protocols::OpaqueBody;
 use super::state::{HeldEntry, ParkedEntry, ParkedRound, Reader, RetryEntry, Tx, key};
 use super::{App, AppError};
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,7 @@ impl App {
         {
             if stored.seq == 0
                 || stored.generation == 0
+                || stored.accepted_at_ms > stored.receipt.read_at_ms
                 || (stored.reason.awaited_epoch().is_none() && stored.keys_at.is_some())
             {
                 return Err(super::corrupt());
@@ -353,12 +354,7 @@ impl App {
         &self,
         stored: &ParkedEntry,
     ) -> Result<StoredMessageIdentity, AppError> {
-        waiting_identity(
-            stored,
-            &self.state.meta.identity,
-            &self.state.cert,
-            &self.protocols,
-        )
+        waiting_identity(stored, &self.state.meta.identity)
     }
 
     pub(crate) fn waiting_notice(
@@ -440,7 +436,6 @@ impl WaitingOut {
     pub(super) fn validate(
         &self,
         backup: &super::AppBackup,
-        cert: &AppCert,
         protocols: &ProtocolSet,
     ) -> Result<(), AppError> {
         let mut ids = std::collections::BTreeSet::new();
@@ -452,11 +447,12 @@ impl WaitingOut {
                 || stored.seq == 0
                 || stored.generation == 0
                 || stored.round > self.round.number
+                || stored.accepted_at_ms > stored.receipt.read_at_ms
                 || (stored.reason.awaited_epoch().is_none() && stored.keys_at.is_some())
             {
                 return Err(super::corrupt());
             }
-            waiting_identity(stored, &backup.meta.identity, cert, protocols)?;
+            waiting_identity(stored, &backup.meta.identity)?;
         }
         let mut retried = std::collections::BTreeSet::new();
         for (id, _) in &self.retries {
@@ -510,26 +506,32 @@ impl WaitingOut {
     }
 }
 
+/// The identity of a retained input, for its notice and the bounds: the bytes are
+/// authenticated again, by the certificate they carry, and read for their common fields
+/// only (checks 2 to 6, every body member opaque: [`OpaqueBody`]). Nothing here judges
+/// current protocol policy:
+/// that is judged when the input is next tried, where one that no longer passes is dropped
+/// as any message failing a recipient check is, so a host that changes a protocol's rules
+/// never makes kept custody, or the notice of its drop, unreadable. Nor are the
+/// service's facts judged here: they are checked when the page is read, so no writer keeps
+/// an observation that precedes its entry's acceptance, and the structural checks beside
+/// this refuse one. A failure here is stored bytes no writer produces.
 pub(super) fn waiting_identity(
     stored: &ParkedEntry,
     own: &[u8; 32],
-    cert: &AppCert,
-    protocols: &ProtocolSet,
 ) -> Result<StoredMessageIdentity, AppError> {
     let sender = AppCert::verify(&stored.cert, &stored.sender).map_err(|_| super::corrupt())?;
-    if sender.expired_at(stored.accepted_at_ms) || stored.accepted_at_ms > stored.receipt.read_at_ms
-    {
+    if sender.expired_at(stored.accepted_at_ms) {
         return Err(super::corrupt());
     }
     let plaintext = MessagePlaintext::decode(&stored.plaintext).map_err(|_| super::corrupt())?;
-    let opaque = protocols.opaque_of_json(plaintext.json());
-    let rules = Rules::new(protocols, cert, &opaque);
+    let body = OpaqueBody::of(plaintext.json()).ok_or_else(super::corrupt)?;
     let message = plaintext
         .check(
             own,
             &stored.sender,
             &VerifiedSender::from_cert(&sender),
-            &rules.opaque,
+            &body.members(),
         )
         .map_err(|_| super::corrupt())?;
     Ok(StoredMessageIdentity {

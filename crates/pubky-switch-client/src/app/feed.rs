@@ -1309,9 +1309,23 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        // The first observation of an entry held at this `seq` is kept: a page that shows
+        // another entry there, or this one accepted after that observation, contradicts what
+        // the service showed before, and is refused before anything of the entry is kept, so
+        // no kept observation ever precedes its entry's acceptance (Switch wire 7.4.4).
         let receipt = match self.state.held.get(&item.seq) {
-            Some(held) if held.receipt.entry_id == item.entry_id => held.receipt,
-            Some(_) => return Err(super::corrupt()),
+            Some(held)
+                if held.receipt.entry_id == item.entry_id
+                    && item.accepted_at <= held.receipt.read_at_ms =>
+            {
+                held.receipt
+            }
+            Some(_) => {
+                return Err(AppError::InvalidData(
+                    "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at its seq"
+                        .into(),
+                ));
+            }
             None => receipt,
         };
         let entry = Entry {

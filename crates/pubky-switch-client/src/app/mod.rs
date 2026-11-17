@@ -1982,7 +1982,7 @@ impl App {
                     return Err(invalid("its feed progress and protocol layers disagree"));
                 }
             }
-            backup.waiting.validate(backup, &cert, &protocols)?;
+            backup.waiting.validate(backup, &protocols)?;
             let ns = client_namespace(&meta.app_id);
             // A restore in place keeps the store's event epoch and counter, and what the store
             // holds of what the app still owes its protocol: the duty events not

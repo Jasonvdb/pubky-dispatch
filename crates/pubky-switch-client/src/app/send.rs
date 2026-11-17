@@ -1013,14 +1013,9 @@ fn own_message(
     {
         return None;
     }
-    let value: Value = serde_json::from_slice(plaintext.json()).ok()?;
-    let body = value.get("body")?.as_object()?;
     // Only the common fields are read from these already-authenticated bytes.
-    let opaque: Vec<_> = body
-        .keys()
-        .map(|member| OpaqueMember { kind: None, member })
-        .collect();
-    let message = Message::parse(plaintext.json(), &opaque).ok()?;
+    let body = super::protocols::OpaqueBody::of(plaintext.json())?;
+    let message = Message::parse(plaintext.json(), &body.members()).ok()?;
     (message.to == *to
         && message.from.identity == meta.identity
         && message.from.app_id == meta.app_id)

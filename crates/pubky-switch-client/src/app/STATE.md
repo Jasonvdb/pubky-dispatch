@@ -119,6 +119,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   backed-up notice again if it no longer carries the handling effect. A receipt records the
   original authenticated page's time and key; it is not portable signature proof. A notice
   has no plaintext with which to reverify the historical message signature.
+- **Kept custody is read, not judged again:** load, reload, intake, a drop notice and
+  restore read a waiting input by its authenticated common fields only, every body member
+  opaque, so a protocol's changed body rules never make the store corrupt; the input's next
+  retry judges current rules and drops one that no longer passes at that check. The
+  service's facts about an entry are checked when its page is read: a page that shows an
+  entry accepted after the page's time, or after the observation kept for it, is refused,
+  so a kept observation that precedes its entry's acceptance is a corrupt store.
 - **A restore is one commit:** the namespace cleared, the app's restored state and each
   registered protocol's backup layer under its `p/<name>/`, all checked before it, so a
   failure leaves none of them. A layer of a protocol not registered refuses the restore,

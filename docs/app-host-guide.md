@@ -143,7 +143,7 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 |---|---|
 | `DeliveryOrigin::Original` | The client has retained the original intent. Use this in the owning protocol's `may_send` check. The separate `resend` flag says whether a copy was accepted before. |
 | `DeliveryOrigin::Reconstructed` | The copy came from signed plaintext without a retained original intent. Apply the protocol's rules for reconstructed sends. |
-| `Delivery::Queued` | The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |
+| `Delivery::Queued` | A pending resend also reads as queued. If the matching entry in the owning protocol's `queued_messages` has `resend: true`, the inbox accepted this message before. The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |
 | `Delivery::Kept` | A saved, unanswered batch owns this delivery. Follow its batch ID. It enters the outbox when the batch settles successfully. |
 | `Delivery::Accepted` | The inbox accepted the message at the reported time. Show delivery. A failed later resend can still leave this original acceptance visible. |
 | `Delivery::Failed` | A lasting refusal or a discarded carrying batch ended this delivery. Show the reason and time while the failure is retained. Stop flushing it. |
@@ -151,7 +151,7 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 | `UndeliverableReason::NotCurrent` | The sender's own certificate was refused as no longer current. Check membership and renewal with the signer before retry. |
 | `AppEvent::MessageAccepted` | A checked append answer supplied the recipient's acceptance time. Update the status for this message ID. |
 | `AppEvent::UnreachableApp` | One eligible recipient app lacks a usable receive-key record. Other eligible apps can still receive. Show which app is unreachable if delivery matters on that device. |
-| `AppEvent::MessageUndelivered` | The app gave up or withdrew delivery. Causes include repeated admission/current-certificate refusals, oversized local writes, a replay deadline or a backup that left this message out. For a first send the plaintext can be gone. For a resend the earlier acceptance still stands. A restored store cannot exclude acceptance on the original device. Tell the owning protocol before acknowledging. |
+| `AppEvent::MessageUndelivered` | The app gave up or withdrew delivery. Causes include repeated admission/current-certificate refusals, oversized local writes, a replay deadline or a backup that left this message out. For a first send the plaintext can be gone. With `resend: true`, the earlier inbox acceptance still stands. With `resend: false`, this event leaves acceptance unconfirmed. The inbox may have accepted a send whose answer was lost. A restored store may also lack an acceptance the original device saw. Tell the owning protocol before acknowledging. |
 | `AppEvent::ResendAfterLoss` | A peer lost its old service. The client queued retained eligible messages accepted since its previous check. Flush the reported work with the original IDs. |
 | `AppEvent::RecordJobDropped` | The post-acceptance record job remained unfinished through its retention window. The client stopped building it. Check the optional kept batch ID before repairing the record. Delivery itself already succeeded. |
 | `Refusal::WontDeliver` | The client declined a stored copy, or a resend was already given up. Nothing new was queued. Use the detailed reason below. |
@@ -159,7 +159,7 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 | `WontDeliver::GivenUp` | This store remembers giving up delivery. Preserve that decision. No further undelivered notice is needed for this refusal. |
 | `WontDeliver::TooLarge` | The reconstructed outbox item cannot fit the store. Show that it could not be queued. Repeating those bytes cannot help. |
 
-For admission or current-certificate refusals, give-up takes five qualifying answers spread across at least 30 days (at least 7.5 days between counted tries), or 45 days since the first such answer on a later try. A held message can still reach a deadline. Only a new user intent should become a new message.
+For admission or current-certificate refusals, the client gives up after five qualifying answers spread across at least 30 days (at least 7.5 days between counted tries). Once 45 days have passed since the first such answer, the next flush that reaches the message gives up without another delivery try. A held message can still reach a deadline. Only a new user intent should become a new message.
 
 ## Writing records and claims
 
@@ -209,7 +209,7 @@ Keep the original local batch ID. Look it up with `kept_batch`, or look up an at
 | Case | What happened and what to do |
 |---|---|
 | `AppError::Kept` | The call's own batch is saved, possibly still unsent. Show pending, save its ID and read again. Building a replacement could apply the same work twice. |
-| `AppError::Ahead` | An older batch could not be settled first. Nothing from this new write was kept or sent. Resolve the older batch, then re-evaluate the new write. |
+| `AppError::Ahead` | An older batch could not be settled first. Nothing from this new write was kept or sent. Call `receive` to let the client try the older batch first. When the client reaches a sent batch whose answer window has closed, it drops that batch. Check the outcome before deciding whether the new write is still needed. |
 | `Refusal::KeptBatchesAhead` | Earlier saved batches still need to go first. Inside a kept error, this call's batch is already queued behind them. Show the count and oldest ID and let reads drain the queue. |
 | `KeptBatchStatus::Kept` | The batch is still outstanding. `wire_batch_id` names its current bytes. An absent send stamp means those bytes are unsent. Keep tracking the original local ID. |
 | `KeptBatchStatus::Applied` | The client has committed the batch's outcome. Use its local effects and stop retrying. |

@@ -392,10 +392,13 @@ pub enum Refusal {
 pub enum KeyRecoveryStop {
     /// No copy of `identity.json` the identity key signed was found, on the Homeserver, in a
     /// backup that opens or in this install's records, so no service is known to recover
-    /// at.
+    /// at: the user gives the one that serves the account
+    /// ([`crate::Signer::survey_key_recovery_new_at`]).
     NoCopy,
-    /// The service the newest copy names doesn't serve the account: it holds none, only its
-    /// mark, or a staged or recovering one, or answers with an error it signs.
+    /// The service the newest copy names, or the one the user gave, doesn't serve the
+    /// account: it holds none, only its mark, or a staged or recovering one, or answers with
+    /// an error it signs. Where the account moved since that copy, the user gives the service
+    /// that serves it ([`crate::Signer::survey_key_recovery_new_at`]).
     NotServing,
     /// The service's copy is missing, doesn't verify, or names another origin or service key
     /// than the one that answered.

@@ -2040,6 +2040,72 @@ async fn test_key_recovery_then_a_provider_loss_before_the_removal() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_provider_loss_backup_waits_for_the_removal() {
+    // As above, and the revocation at the new service fails too: the provider loss's version
+    // is delivered, and its backup stays owed, shown, until the version removing the app
+    // writes it.
+    const NEW_ORIGIN: &str = "https://recovery.example";
+    let world = World::new();
+    let (kept, lost, _) = two_apps(&world).await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    for _ in 0..2 {
+        world.switch.fail_next(SwitchFault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+    }
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store).await.unwrap();
+    Signer::restore_new(
+        world.env(store.clone()),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    let service =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5e; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(NEW_ORIGIN, &service);
+    let mut env = world.env(store);
+    env.transport = router.clone();
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let before = world.homeserver.file(SIGNER_BACKUP_PATH);
+    for _ in 0..4 {
+        service.fail_next(SwitchFault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+    }
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    let delivered = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(delivered.inbox().url, NEW_ORIGIN);
+    assert!(delivered.listed_cert(&lost.keys.app_id_bytes()).is_some());
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH), before);
+    // The revocation is sent again until the service takes it.
+    let mut later = signer.set_record_max_age(Some(60)).await;
+    for _ in 0..4 {
+        if later.is_ok() {
+            break;
+        }
+        later = signer.set_record_max_age(Some(60)).await;
+    }
+    let later = later.unwrap();
+    assert!(later.listed_cert(&lost.keys.app_id_bytes()).is_none());
+    assert!(later.listed_cert(&kept.keys.app_id_bytes()).is_some());
+    assert_eq!(world.backup().identity_doc().signed(), later.signed());
+}
+
+#[tokio::test]
 async fn test_key_recovery_leaves_room_for_the_identitys_own_versions() {
     // The service shows ten thousand App IDs revoked that no copy names: the recovery takes
     // no more than leave room for the identity's own later versions, and a new app is
@@ -2341,4 +2407,160 @@ async fn test_key_recovery_waits_out_its_own_service_failing_for_now() {
     .await
     .unwrap();
     signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_key_recovery_takes_the_earliest_picked_time() {
+    // The install's records and the backup picked different times to distrust one app from:
+    // whichever holds the earlier one, the survey and the recovery take it.
+    for records_earlier in [true, false] {
+        let world = World::new();
+        let (mut first, memory) = world.enrolled().await;
+        let (app, _) = joined(&world, &mut first, 3).await;
+        let id = app.keys.app_id_bytes();
+        let backed_up = START_MS - 3_600_000;
+        world.switch.fail_next(SwitchFault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+        first
+            .revoke(id, Some(backed_up), confirmed())
+            .await
+            .unwrap_err();
+        // The next version's backup holds the revocation with that time.
+        first.set_record_max_age(Some(60)).await.unwrap();
+        drop(first);
+        let own = if records_earlier {
+            backed_up - 3_600_000
+        } else {
+            backed_up + 1_800_000
+        };
+        edit_state(&world, &memory, |state| {
+            state["revoking"][0]["distrust_from"] = own.into();
+        });
+        let mut signer = Signer::open(world.env(memory), world.keyring())
+            .await
+            .unwrap();
+        let shown = signer.survey_key_recovery().await.unwrap();
+        let earliest = own.min(backed_up);
+        assert!(
+            shown.apps.contains(&(
+                id,
+                AppFate::RevocationPending {
+                    distrust_from: Some(earliest)
+                }
+            )),
+            "{records_earlier}: {:?}",
+            shown.apps
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_key_recovery_at_a_service_the_user_gives() {
+    // No copy names the service that serves the account: the Homeserver lost its copy and
+    // the backup, or its copy names a former service. The user gives the origin; the
+    // service's copy there passes every rule, and the recovery goes ahead.
+    for case in ["no copy", "former service"] {
+        let world = World::new();
+        let (mut first, _) = world.enrolled().await;
+        let (app, _) = joined(&world, &mut first, 5).await;
+        let doc = first.identity_doc().unwrap().unwrap();
+        drop(first);
+        world
+            .homeserver
+            .files
+            .lock()
+            .unwrap()
+            .remove(SIGNER_BACKUP_PATH);
+        let router = Arc::new(Router::new());
+        router.add_switch(pubky_switch_client::testing::SWITCH_ORIGIN, &world.switch);
+        if case == "no copy" {
+            world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
+        } else {
+            let mut body = doc.body().clone();
+            body.version -= 1;
+            body.inbox = pubky_switch_core::records::Inbox::new(
+                "https://former.example",
+                doc.inbox().service_key,
+            );
+            let former = IdentityDoc::sign(&world.key, body).unwrap();
+            world
+                .homeserver
+                .set(IDENTITY_PATH, serde_json::to_vec(former.signed()).unwrap());
+        }
+        let store = Arc::new(MemoryStore::new());
+        let env = || {
+            let mut env = world.env(store.clone());
+            env.transport = router.clone();
+            env
+        };
+        let refusal = Signer::survey_key_recovery_new(env(), world.keyring())
+            .await
+            .unwrap_err();
+        match case {
+            "no copy" => assert_eq!(refusal, refused(KeyRecoveryStop::NoCopy)),
+            _ => assert!(matches!(refusal, SignerError::Switch(_)), "{refusal:?}"),
+        }
+        let shown = Signer::survey_key_recovery_new_at(
+            env(),
+            world.keyring(),
+            pubky_switch_client::testing::SWITCH_ORIGIN,
+        )
+        .await
+        .unwrap();
+        assert!(shown.origin_supplied, "{case}");
+        assert_eq!(shown.version, doc.version(), "{case}");
+        let mut signer = Signer::restore_new(
+            env(),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            signer
+                .identity_doc()
+                .unwrap()
+                .unwrap()
+                .listed_cert(&app.keys.app_id_bytes())
+                .is_some(),
+            "{case}"
+        );
+        signs_on(&world, &mut signer).await;
+    }
+}
+
+#[tokio::test]
+async fn test_key_recovery_at_a_given_service_keeps_the_rules() {
+    // An origin the user gives is held to every rule: a service whose copy is behind the
+    // Homeserver's is refused there as anywhere.
+    let world = World::new();
+    let (mut first, _) = world.enrolled().await;
+    let doc = first.identity_doc().unwrap().unwrap();
+    first.set_record_max_age(Some(60)).await.unwrap();
+    drop(first);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let mut body = doc.body().clone();
+    body.version += 5;
+    let ahead = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(ahead.signed()).unwrap());
+    let refusal = Signer::survey_key_recovery_new_at(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        pubky_switch_client::testing::SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        refusal,
+        SignerError::Refused(Refusal::KeyRecovery(KeyRecoveryStop::ServiceBehind { .. }))
+    ));
 }

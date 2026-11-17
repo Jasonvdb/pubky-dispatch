@@ -84,6 +84,9 @@ pub struct KeyRecoverySurvey {
     pub revoked: Vec<[u8; 16]>,
     /// What the signer backup on the Homeserver holds.
     pub backup: BackupFound,
+    /// Whether `origin` is the one the user gave
+    /// ([`Signer::survey_key_recovery_new_at`]), not the one the newest copy names.
+    pub origin_supplied: bool,
     copy: [u8; 32],
     digest: [u8; 32],
 }
@@ -136,6 +139,8 @@ pub enum BackupFound {
 pub struct KeyRecoveryConfirmed {
     digest: [u8; 32],
     dropped: Vec<[u8; 16]>,
+    /// The origin the user gave for the survey, if they gave one.
+    asked: Option<String>,
 }
 
 impl KeyRecoveryConfirmed {
@@ -146,6 +151,7 @@ impl KeyRecoveryConfirmed {
         Self {
             digest: survey.digest,
             dropped: dropped.to_vec(),
+            asked: survey.origin_supplied.then(|| survey.origin.clone()),
         }
     }
 }
@@ -231,6 +237,36 @@ impl Signer {
         env: SignerEnv,
         keyring: IdentityKeyring,
     ) -> Result<KeyRecoverySurvey> {
+        Self::survey_new(env, keyring, None).await
+    }
+
+    /// [`Signer::survey_key_recovery_new`] at the service at `origin`, which the user gave:
+    /// when no copy the identity key signed names the service that serves the account
+    /// ([`KeyRecoveryStop::NoCopy`]), or the newest one names a former service
+    /// ([`KeyRecoveryStop::NotServing`]), as after the user changed Homeserver or moved. Every
+    /// other rule holds: that service's copy verifies and names `origin` and the key that
+    /// signed its answers, and nothing the install reads shows a newer one. The survey shows
+    /// the origin as the user's ([`KeyRecoverySurvey::origin_supplied`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Signer::survey_key_recovery_new`].
+    pub async fn survey_key_recovery_new_at(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        origin: &str,
+    ) -> Result<KeyRecoverySurvey> {
+        let mut survey = Self::survey_new(env, keyring, Some(origin)).await?;
+        survey.origin_supplied = true;
+        Ok(survey)
+    }
+
+    /// [`Signer::survey_key_recovery_new`], at `asked` when the user gave an origin.
+    async fn survey_new(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        asked: Option<&str>,
+    ) -> Result<KeyRecoverySurvey> {
         let identity = keyring.public_key();
         let store = env
             .store
@@ -260,7 +296,7 @@ impl Signer {
         let signer = Self::restore_target(env, keyring, store)?;
         let kept = kept.unwrap_or_else(|| signer.state.clone());
         Ok(signer
-            .key_plan(&kept, &marks, origin.as_deref())
+            .key_plan(&kept, &marks, asked.or(origin.as_deref()))
             .await?
             .survey)
     }
@@ -331,7 +367,7 @@ impl Signer {
                 Held::Unusable,
             ),
         };
-        let plan = self.key_plan(&kept, &marks, None).await?;
+        let plan = self.key_plan(&kept, &marks, confirmed.asked.as_deref()).await?;
         if plan.survey.digest != confirmed.digest {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         }
@@ -702,6 +738,7 @@ impl Signer {
             renewals_dropped,
             revoked,
             backup,
+            origin_supplied: false,
             copy: copy.hash(),
             digest: [0; 32],
         };
@@ -1063,6 +1100,67 @@ mod tests {
                 <= limit
         );
         assert!(near < room);
+    }
+
+    #[test]
+    fn test_key_recovery_digest_binds_every_member_shown() {
+        // Each member the survey shows changes the digest the confirmation binds.
+        let survey = KeyRecoverySurvey {
+            origin: "https://switch.example".into(),
+            version: 4,
+            generation: 1,
+            signer: [1; 16],
+            apps: vec![
+                ([2; 16], AppFate::Stays),
+                (
+                    [3; 16],
+                    AppFate::RemovedAtSwitch {
+                        distrust_from: Some(10),
+                    },
+                ),
+                (
+                    [4; 16],
+                    AppFate::RevocationPending {
+                        distrust_from: Some(20),
+                    },
+                ),
+                ([5; 16], AppFate::CertificateNotFound),
+            ],
+            renewals_dropped: vec![[2; 16]],
+            revoked: vec![[6; 16]],
+            backup: BackupFound::Stale { version: 3 },
+            origin_supplied: false,
+            copy: [7; 32],
+            digest: [0; 32],
+        };
+        let changes: Vec<fn(&mut KeyRecoverySurvey)> = vec![
+            |s| s.copy = [8; 32],
+            |s| s.apps[0].1 = AppFate::CertificateNotFound,
+            |s| {
+                s.apps[1].1 = AppFate::RemovedAtSwitch {
+                    distrust_from: Some(11),
+                };
+            },
+            |s| {
+                s.apps[2].1 = AppFate::RevocationPending {
+                    distrust_from: None,
+                };
+            },
+            |s| s.renewals_dropped.clear(),
+            |s| s.revoked.push([9; 16]),
+            |s| s.backup = BackupFound::Stale { version: 2 },
+            |s| s.backup = BackupFound::Missing,
+        ];
+        let mut digests = vec![digest_of(&survey)];
+        for change in changes {
+            let mut changed = survey.clone();
+            change(&mut changed);
+            digests.push(digest_of(&changed));
+        }
+        let mut distinct = digests.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), digests.len());
     }
 
     #[test]

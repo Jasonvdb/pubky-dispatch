@@ -26,9 +26,10 @@
 //!
 //! **One expiry for every protocol.** The record has one `expires_at` (Switch wire 3.2), and
 //! each protocol's rules on it are its own (Switch spec 4.2): a protocol may require one. The
-//! app keeps the expiry each protocol last asked for (`rexp`), `None` for none, and signs
+//! app keeps each protocol's fixed deadline, relative lifetime or no-expiry policy (`rexp`), and signs
 //! the record with the earliest of them, so the record never outlives what any protocol
-//! asked for; it doesn't expire only while no protocol asked for an expiry. A protocol
+//! asked for, resolving lifetimes at the exact new signed timestamp, within the identity's age limit.
+//! It does not expire only while no protocol asks for an expiry. A protocol
 //! that asked for a later one renews the record by its own schedule. A backup carries the
 //! expiries asked, and a restore keeps them.
 //!
@@ -40,6 +41,8 @@
 use pubky_switch_core::labels::is_switch_label;
 use pubky_switch_core::records::{AppRecord, AppRecordBody, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
+use pubky_switch_core::time::MAX_TIME_MS;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use std::collections::BTreeMap;
@@ -124,6 +127,48 @@ pub enum Publication {
     AwaitingRead,
 }
 
+/// A protocol's own expiry policy, resolved only for a newly signed record.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RecordExpiry {
+    Never,
+    At(u64),
+    Lifetime(u64),
+}
+
+impl RecordExpiry {
+    pub(super) fn valid(self) -> bool {
+        match self {
+            Self::Never => true,
+            Self::At(at) | Self::Lifetime(at) => at > 0 && at <= MAX_TIME_MS,
+        }
+    }
+
+    fn at(self, updated_at: u64, max_age: u64) -> Option<Option<u64>> {
+        match self {
+            Self::Never => Some(None),
+            Self::At(at) => (at > updated_at && at <= MAX_TIME_MS).then_some(Some(at)),
+            Self::Lifetime(lifetime) => {
+                let requested = updated_at.checked_add(lifetime)?;
+                if lifetime == 0 || requested > MAX_TIME_MS {
+                    return None;
+                }
+                let at = updated_at.checked_add(lifetime.min(max_age))?;
+                (at > updated_at).then_some(Some(at))
+            }
+        }
+    }
+}
+
+type RecordExpiries = BTreeMap<String, RecordExpiry>;
+
+fn expiry_refused(protocol: &str) -> AppError {
+    Refusal::Usage(format!(
+        "the record expiry `{protocol}` asked for must be writable and later than its signed timestamp"
+    ))
+    .into()
+}
+
 impl App {
     /// Set the member the registered protocol `protocol` adds to the app's record, under its
     /// name, or remove it with `None`, and the expiry `protocol` asks of the record, `None`
@@ -140,10 +185,10 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Usage`] for a name no protocol of the app is registered under, an
-    /// expiry asked (this protocol's or another's) at or before now, naming the protocol
+    /// expiry asked (this protocol's or another's) at or before the next signed timestamp, naming the protocol
     /// that asked for it, a member the switch would refuse, or a record over the operation
     /// cap, before anything is signed. When another protocol's expiry has lapsed, this
-    /// protocol's `expires_at`, if later than now or `None`, is kept for the next signing,
+    /// protocol's `expires_at`, if later than that timestamp or `None`, is kept for the next signing,
     /// and its `member` is not: the next record signed, at any protocol's change, carries
     /// the expiry with the member the record held. [`Refusal::Stopped`], [`Refusal::Left`] or
     /// [`Refusal::Gone`]; a store failure;
@@ -155,17 +200,92 @@ impl App {
         member: Option<Map<String, Value>>,
         expires_at: Option<u64>,
     ) -> Result<Publication, AppError> {
+        self.set_member_expiry(
+            protocol,
+            member,
+            expires_at.map_or(RecordExpiry::Never, RecordExpiry::At),
+            false,
+        )
+        .await
+    }
+
+    /// Set a protocol member with an expiry measured from the exact `updated_at` the
+    /// writer signs, even when the device clock goes back (Switch spec 4.2).
+    /// `None` asks for no expiry; the earliest expiry any protocol asked for still wins.
+    /// An unchanged member preserves its expiry policy and finishes owed delivery. A
+    /// restored unaccepted record is signed anew; an accepted or pending record keeps
+    /// its signed bytes. Use [`App::renew_record_with_lifetime`] to change only the policy.
+    /// Removing the member clears its policy. Other protocols' members and policies
+    /// remain unchanged.
+    ///
+    /// The lifetime applies to each new signed record, including changes by another
+    /// protocol or a certificate renewal, and is capped by the current identity's record
+    /// age limit. Use [`App::set_protocol_member`] for a fixed absolute deadline.
+    /// The policy and signed bytes are kept together before delivery; an exact retry
+    /// sends those bytes without extending their lifetime. On clock rollback, a new
+    /// signing first obtains verified service time; failure keeps no new candidate.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::set_protocol_member`], also [`Refusal::Usage`] for a zero lifetime,
+    /// an expiry outside the wire time range, or an unadvanceable `updated_at`.
+    pub async fn set_protocol_member_with_lifetime(
+        &mut self,
+        protocol: &str,
+        member: Option<Map<String, Value>>,
+        lifetime_ms: Option<u64>,
+    ) -> Result<Publication, AppError> {
+        self.set_member_expiry(
+            protocol,
+            member,
+            lifetime_ms.map_or(RecordExpiry::Never, RecordExpiry::Lifetime),
+            true,
+        )
+        .await
+    }
+
+    async fn set_member_expiry(
+        &mut self,
+        protocol: &str,
+        member: Option<Map<String, Value>>,
+        expiry: RecordExpiry,
+        preserve_unchanged: bool,
+    ) -> Result<Publication, AppError> {
         let protocol = protocol.to_owned();
         Box::pin(async move {
             let mut body = self.own_record_body().await?;
             self.check_registered(&protocol)?;
-            let expiries = self.asked_expiries(&protocol, expires_at).await?;
+            if !expiry.valid() {
+                return Err(expiry_refused(&protocol));
+            }
+            if body.protocols.get(&protocol) == member.as_ref() {
+                if preserve_unchanged {
+                    return self.put_own_record(body, false, None).await;
+                }
+                let policies = self.record_expiries().await?;
+                if policies.get(&protocol) == Some(&expiry) && !self.record_needs_new_delivery() {
+                    let now = self.now().max(self.highest_service_time().unwrap_or(0));
+                    for (name, policy) in &policies {
+                        if matches!(policy, RecordExpiry::At(at) if *at <= now) {
+                            return Err(expiry_refused(name));
+                        }
+                    }
+                    return self.deliver_record().await;
+                }
+            }
+            let expiry = if preserve_unchanged && member.is_none() {
+                RecordExpiry::Never
+            } else {
+                expiry
+            };
+            let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
             match member {
                 Some(member) => body.protocols.insert(protocol, member),
                 None => body.protocols.remove(&protocol),
             };
-            body.expires_at = earliest(&expiries);
-            self.put_own_record(body, false, Some(&expiries)).await
+            body.expires_at = self.resolve_record_expiries(&expiries, updated_at)?;
+            self.put_own_record(body, false, Some((&expiries, updated_at)))
+                .await
         })
         .await
     }
@@ -189,13 +309,46 @@ impl App {
         protocol: &str,
         expires_at: Option<u64>,
     ) -> Result<Publication, AppError> {
+        self.renew_record_expiry(
+            protocol,
+            expires_at.map_or(RecordExpiry::Never, RecordExpiry::At),
+        )
+        .await
+    }
+
+    /// Renew with an expiry measured from the exact new `updated_at`, preserving every
+    /// protocol member (Switch spec 4.2). `None` asks for no expiry; other protocols'
+    /// earlier expiry requests remain in force. This call always signs a new record.
+    /// Choosing when to renew, including after clock rollback, remains the caller's duty.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::set_protocol_member_with_lifetime`].
+    pub async fn renew_record_with_lifetime(
+        &mut self,
+        protocol: &str,
+        lifetime_ms: Option<u64>,
+    ) -> Result<Publication, AppError> {
+        self.renew_record_expiry(
+            protocol,
+            lifetime_ms.map_or(RecordExpiry::Never, RecordExpiry::Lifetime),
+        )
+        .await
+    }
+
+    async fn renew_record_expiry(
+        &mut self,
+        protocol: &str,
+        expiry: RecordExpiry,
+    ) -> Result<Publication, AppError> {
         let protocol = protocol.to_owned();
         Box::pin(async move {
             let mut body = self.own_record_body().await?;
             self.check_registered(&protocol)?;
-            let expiries = self.asked_expiries(&protocol, expires_at).await?;
-            body.expires_at = earliest(&expiries);
-            self.put_own_record(body, true, Some(&expiries)).await
+            let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
+            body.expires_at = self.resolve_record_expiries(&expiries, updated_at)?;
+            self.put_own_record(body, true, Some((&expiries, updated_at)))
+                .await
         })
         .await
     }
@@ -203,53 +356,76 @@ impl App {
     /// The expiry each protocol asked of the record (`rexp`), with `protocol`'s now
     /// `expires_at`.
     ///
-    /// Each protocol's ask is its own: one that is later than now, or `None`, is kept, in a
+    /// Each protocol's ask is its own: one that is later than the next signed time, or `None`, is kept, in a
     /// commit of its own, even while another protocol's has lapsed and the record can't be
     /// signed, so two protocols whose expiries lapsed each renew in turn, and the record is
     /// signed once neither is lapsed. The host may renew for a protocol that doesn't.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] when `expires_at` is at or before now, naming `protocol`, with
+    /// [`Refusal::Usage`] when `expires_at` is at or before the next signed time, naming `protocol`, with
     /// nothing kept; or when another protocol's is, naming it, with `protocol`'s ask kept:
     /// a record signed with it would have lapsed already, so nothing is signed or sent until
     /// that protocol asks for a later one.
     async fn asked_expiries(
         &mut self,
         protocol: &str,
-        expires_at: Option<u64>,
-    ) -> Result<BTreeMap<String, Option<u64>>, AppError> {
-        let now = self.now();
-        let lapsed_ask = |name: &str| {
-            Refusal::Usage(format!(
-                "the record expiry `{name}` asked for is at or before now: `{name}` asks for \
-                 a later one before the record is signed"
-            ))
-        };
-        if expires_at.is_some_and(|at| at <= now) {
-            return Err(lapsed_ask(protocol).into());
+        expiry: RecordExpiry,
+    ) -> Result<(RecordExpiries, u64), AppError> {
+        if !expiry.valid() {
+            return Err(expiry_refused(protocol));
         }
-        let mut expiries: BTreeMap<String, Option<u64>> = self
-            .reader()
-            .get(key::RECORD_EXPIRIES)
-            .await?
-            .unwrap_or_default();
-        let changed = expiries.get(protocol) != Some(&expires_at);
-        expiries.insert(protocol.to_owned(), expires_at);
-        let lapsed = expiries
-            .iter()
-            .filter_map(|(name, at)| at.map(|at| (name.clone(), at)))
-            .min_by_key(|(_, at)| *at)
-            .filter(|(_, at)| *at <= now);
-        if let Some((name, _)) = lapsed {
+        let mut expiries = self.record_expiries().await?;
+        let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+        let updated_at = self.next_record_time(held.updated_at()).await?;
+        expiry
+            .at(updated_at, self.state.own_doc.record_max_age_ms())
+            .ok_or_else(|| expiry_refused(protocol))?;
+        let changed = expiries.get(protocol) != Some(&expiry);
+        expiries.insert(protocol.to_owned(), expiry);
+        if let Err(error) = self.resolve_record_expiries(&expiries, updated_at) {
+            // Keep a valid caller's ask while another protocol prevents signing, so the
+            // protocols can each renew in turn (Switch spec 4.2).
             if changed {
                 let mut tx = self.tx()?;
                 tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 self.commit(tx).await?;
             }
-            return Err(lapsed_ask(&name).into());
+            return Err(error);
+        }
+        Ok((expiries, updated_at))
+    }
+
+    pub(super) async fn record_expiries(&self) -> Result<RecordExpiries, AppError> {
+        let expiries: RecordExpiries = self
+            .reader()
+            .get(key::RECORD_EXPIRIES)
+            .await?
+            .unwrap_or_default();
+        if expiries
+            .iter()
+            .any(|(name, expiry)| !self.protocols.contains(name) || !expiry.valid())
+        {
+            return Err(super::corrupt());
         }
         Ok(expiries)
+    }
+
+    fn resolve_record_expiries(
+        &self,
+        expiries: &RecordExpiries,
+        updated_at: u64,
+    ) -> Result<Option<u64>, AppError> {
+        let mut earliest = None;
+        for (name, expiry) in expiries {
+            if let Some(at) = expiry
+                .at(updated_at, self.state.own_doc.record_max_age_ms())
+                .ok_or_else(|| expiry_refused(name))?
+            {
+                earliest = Some(earliest.map_or(at, |held: u64| held.min(at)));
+            }
+        }
+        Ok(earliest)
     }
 
     /// Bring the record's `accepts` to the kinds [`super::Protocol::accepts`] gives for the
@@ -327,9 +503,9 @@ impl App {
     /// for (`rexp`) when given, in one commit, then deliver and publish.
     async fn put_own_record(
         &mut self,
-        mut body: AppRecordBody,
+        body: AppRecordBody,
         renew: bool,
-        expiries: Option<&BTreeMap<String, Option<u64>>>,
+        expiries: Option<(&RecordExpiries, u64)>,
     ) -> Result<Publication, AppError> {
         let identity = self.state.meta.identity;
         let held = AppRecord::verify(&self.state.record, &identity)?;
@@ -337,20 +513,12 @@ impl App {
         // after a restore from a backup taken while its `app.put` was refused or unanswered,
         // goes again with this change, signed anew: the backup carries the accepted record
         // apart, and only that one is published (Switch spec 4.2).
-        let unaccepted = self.state.pending_record.is_none()
-            && self
-                .state
-                .accepted
-                .as_ref()
-                .is_some_and(|accepted| accepted != &self.state.record);
+        let unaccepted = self.record_needs_new_delivery();
         if renew || unaccepted || &body != held.body() {
-            // Later than every record of the app before (Switch spec 4.2): the one held is
-            // the newest this device delivered or took.
-            body.updated_at = self.now().max(held.updated_at().saturating_add(1));
-            let record = AppRecord::sign(&self.state.keys, body).map_err(refused)?;
-            // The switch reads the record strictly (Switch wire 1.1, 3.2): a member it would
-            // refuse is refused here, before anything is kept.
-            AppRecord::verify(record.signed(), &identity).map_err(refused)?;
+            let record = match expiries {
+                Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
+                None => self.sign_next_record(body, held.updated_at()).await?,
+            };
             let batch = self.record_batch(record.signed()).map_err(refused)?;
             let pending = PendingRecord {
                 body: batch.body().to_vec(),
@@ -358,18 +526,78 @@ impl App {
             let mut tx = self.tx()?;
             tx.put(key::RECORD, record.signed())?;
             tx.put(key::PENDING_RECORD, &pending)?;
-            if let Some(expiries) = expiries {
+            if let Some((expiries, _)) = expiries {
                 tx.put(key::RECORD_EXPIRIES, expiries)?;
             }
             self.commit(tx).await?;
             self.state.record = record.signed().clone();
             self.state.pending_record = Some(pending);
-        } else if let Some(expiries) = expiries {
+        } else if let Some((expiries, _)) = expiries {
             let mut tx = self.tx()?;
             tx.put(key::RECORD_EXPIRIES, expiries)?;
             self.commit(tx).await?;
         }
         self.deliver_record().await
+    }
+
+    fn record_needs_new_delivery(&self) -> bool {
+        self.state.pending_record.is_none()
+            && self
+                .state
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| accepted != &self.state.record)
+    }
+
+    /// Every new signature uses one timestamp and resolves every protocol policy at it.
+    pub(super) async fn sign_next_record(
+        &mut self,
+        body: AppRecordBody,
+        previous: u64,
+    ) -> Result<AppRecord, AppError> {
+        let expiries = self.record_expiries().await?;
+        let updated_at = self.next_record_time(previous).await?;
+        self.sign_record_at(body, &expiries, updated_at)
+    }
+
+    fn sign_record_at(
+        &self,
+        mut body: AppRecordBody,
+        expiries: &RecordExpiries,
+        updated_at: u64,
+    ) -> Result<AppRecord, AppError> {
+        body.updated_at = updated_at;
+        body.expires_at = self.resolve_record_expiries(expiries, updated_at)?;
+        let record = AppRecord::sign(&self.state.keys, body).map_err(refused)?;
+        AppRecord::verify(record.signed(), &self.state.meta.identity).map_err(refused)
+    }
+
+    async fn next_record_time(&mut self, held: u64) -> Result<u64, AppError> {
+        let next = held
+            .checked_add(1)
+            .filter(|next| *next <= MAX_TIME_MS)
+            .ok_or_else(|| Refusal::Usage("the record time cannot advance".into()))?;
+        let now = self.now();
+        if now > MAX_TIME_MS {
+            return Err(
+                Refusal::Usage("the record time is outside the writable range".into()).into(),
+            );
+        }
+        if now < held {
+            self.fresh_service_time().await?;
+        }
+        let verified = self
+            .state
+            .service_time
+            .filter(|time| time.key == self.state.meta.service_key)
+            .map_or(0, |time| time.highest_ms);
+        let next = next.max(self.now()).max(verified);
+        if next > MAX_TIME_MS {
+            return Err(
+                Refusal::Usage("the record time is outside the writable range".into()).into(),
+            );
+        }
+        Ok(next)
     }
 
     /// Keep `record`, which the switch has just accepted, as the newest accepted record, in
@@ -551,10 +779,4 @@ pub(crate) fn check_publisher(
 /// A record the core or the switch would refuse is the caller's to fix.
 fn refused(error: impl std::fmt::Display) -> AppError {
     Refusal::Usage(format!("the app record: {error}")).into()
-}
-
-/// The record's `expires_at` for the expiries the protocols asked for: the earliest, `None`
-/// while no protocol asked for one.
-pub(crate) fn earliest(expiries: &BTreeMap<String, Option<u64>>) -> Option<u64> {
-    expiries.values().flatten().min().copied()
 }

@@ -57,8 +57,7 @@ impl App {
         let mut body = old.body().clone();
         body.cert = renewal.signed().clone();
         body.accepts = self.protocols.accepts(&renewal);
-        body.updated_at = self.now().max(old.updated_at().saturating_add(1));
-        let record = AppRecord::sign(&self.state.keys, body)?;
+        let record = self.sign_next_record(body, old.updated_at()).await?;
         if !self
             .take_cert(renewal, record.signed().clone(), true, None, at)
             .await?
@@ -296,12 +295,10 @@ impl App {
                     "Switch wire 6.2: an app.put conflict naming another app's record".into(),
                 ));
             }
-            let mut body = mine.body().clone();
-            body.updated_at = self
-                .now()
-                .max(held.updated_at().saturating_add(1))
-                .max(mine.updated_at().saturating_add(1));
-            let record = AppRecord::sign(&self.state.keys, body)?;
+            let body = mine.body().clone();
+            let record = self
+                .sign_next_record(body, held.updated_at().max(mine.updated_at()))
+                .await?;
             batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
             tx.put(key::RECORD, record.signed())?;
@@ -526,11 +523,10 @@ impl App {
                 let mut body = old.body().clone();
                 body.cert = cert.signed().clone();
                 body.accepts = self.protocols.accepts(&cert);
-                body.updated_at = self
-                    .now()
-                    .max(old.updated_at().saturating_add(1))
-                    .max(entry.record.updated_at().saturating_add(1));
-                AppRecord::sign(&self.state.keys, body)?.signed().clone()
+                self.sign_next_record(body, old.updated_at().max(entry.record.updated_at()))
+                    .await?
+                    .signed()
+                    .clone()
             } else {
                 taken.clone()
             };

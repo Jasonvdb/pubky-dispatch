@@ -1348,17 +1348,16 @@ impl App {
     /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
     /// one (Switch spec 3.6).
     ///
-    /// The outbox goes in whole, but for the messages refused for good: each message with
-    /// its signed plaintext and the envelope sealed for its last try, so a restore delivers
-    /// what was queued before the backup with the same `msg_id` and bytes. A message the
-    /// device the backup came from delivered after it is then sent again: the recipient's
+    /// The backup takes outbox items oldest first within [`MAX_CARRIED_OUTBOX_BYTES`]
+    /// (8 MiB), including messages refused for good. Restore reports each omitted message
+    /// ID through [`AppEvent::MessageUndelivered`]. Each carried item keeps its signed
+    /// plaintext and any sealed envelope. If the original device delivered it after the
+    /// backup, the restored app may send the same `msg_id` and plaintext again. The recipient's
     /// switch answers a retry of the same envelope with its first answer while it holds the
     /// entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a second copy by its
     /// processed pair, kept at least 30 days from the first acceptance plus the clock
-    /// tolerance (Switch spec 11). So a restore reinstalls a message whose delivery is owed
-    /// only within [`SENT_RETENTION_MS`] of the backup, by the restoring device's clock;
-    /// later it gives that delivery up, as for an undeliverable message
-    /// ([`AppEvent::MessageUndelivered`]).
+    /// tolerance (Switch spec 11). Restore sets a replay deadline on each owed delivery.
+    /// A flush that reaches it past that deadline gives it up ([`AppEvent::MessageUndelivered`]).
     ///
     /// A backup is only ever of committed state. After a failed commit the app's memory may
     /// be ahead of its store, such as a cursor past an entry whose processed pair and local

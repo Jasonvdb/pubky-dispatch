@@ -615,7 +615,7 @@ impl Signer {
             .ok_or_else(|| stop(KeyRecoveryStop::SwitchCopy))?;
         // The recovery signs the copy's content from the members this signer reads: a copy
         // that carries others, signed by a later signer, would lose them.
-        if hash(&copy.body().to_json()?) != copy.body_hash() {
+        if carries_unknown_members(&copy)? {
             return Err(stop(KeyRecoveryStop::UnknownMembers));
         }
         let backup = match &opened {
@@ -769,6 +769,41 @@ impl Signer {
             }
         }
         Ok(held)
+    }
+}
+
+/// Whether the body `copy` was signed with carries a member this signer doesn't read, at
+/// any depth. Its bytes are never compared with this signer's own encoding: writers may use
+/// any member order and whitespace, and write `null` for an absent member (Switch wire 1.1).
+fn carries_unknown_members(copy: &IdentityDoc) -> Result<bool> {
+    let invalid = |error: serde_json::Error| {
+        SignerError::InvalidData(pubky_switch_core::Error::Invalid(error.to_string()))
+    };
+    let signed: serde_json::Value =
+        serde_json::from_slice(&copy.signed().body_bytes()?).map_err(invalid)?;
+    let read: serde_json::Value =
+        serde_json::from_slice(&copy.body().to_json()?).map_err(invalid)?;
+    Ok(unknown_in(&signed, &read))
+}
+
+/// Whether `signed` holds a member `read`, the same value as this signer reads it, lacks.
+/// A member this signer leaves out when it is absent or empty may be written as `null` or
+/// empty.
+fn unknown_in(signed: &serde_json::Value, read: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (signed, read) {
+        (Value::Object(signed), Value::Object(read)) => signed.iter().any(|(name, value)| {
+            match read.get(name) {
+                Some(known) => unknown_in(value, known),
+                None => !matches!(value, Value::Null)
+                    && !matches!(value, Value::Array(items) if items.is_empty())
+                    && !matches!(value, Value::Object(members) if members.is_empty()),
+            }
+        }),
+        (Value::Array(signed), Value::Array(read)) => signed.len() != read.len()
+            || signed.iter().zip(read).any(|(value, known)| unknown_in(value, known)),
+        (Value::Object(_) | Value::Array(_), _) => true,
+        _ => false,
     }
 }
 

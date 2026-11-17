@@ -2212,3 +2212,59 @@ async fn test_key_recovery_reads_the_copy_as_signed() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_key_recovery_takes_a_copy_in_another_writers_encoding() {
+    // Another conforming signer wrote the copy: pretty-printed, or with its members in
+    // another order and an absent one written as `null`. Nothing in it is unknown, so the
+    // recovery goes ahead (Switch wire 1.1).
+    for case in ["pretty", "reordered"] {
+        let world = World::new();
+        let (first, _) = world.enrolled().await;
+        let doc = first.identity_doc().unwrap().unwrap();
+        drop(first);
+        world
+            .homeserver
+            .files
+            .lock()
+            .unwrap()
+            .remove(SIGNER_BACKUP_PATH);
+        let mut body = doc.body().clone();
+        body.version += 1;
+        let plain = IdentityDoc::sign(&world.key, body).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&plain.signed().body_bytes().unwrap()).unwrap();
+        let bytes = match case {
+            "pretty" => serde_json::to_vec_pretty(&value).unwrap(),
+            _ => {
+                value["record_max_age"] = serde_json::Value::Null;
+                let mut members: Vec<(String, serde_json::Value)> =
+                    value.as_object().unwrap().clone().into_iter().collect();
+                members.reverse();
+                let reordered = members
+                    .iter()
+                    .map(|(name, value)| format!("{}:{}", serde_json::to_string(name).unwrap(), value))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{reordered}}}").into_bytes()
+            }
+        };
+        assert_ne!(bytes, plain.signed().body_bytes().unwrap(), "{case}");
+        let signed = world
+            .key
+            .sign_doc(pubky_switch_core::labels::sig::IDENTITY, &[], bytes);
+        let other = IdentityDoc::verify(&signed, &world.key.public()).unwrap();
+        assert_eq!(other.body(), plain.body(), "{case}");
+        world.switch.deliver_identity(&other).unwrap();
+        world
+            .homeserver
+            .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+        let mut signer = recovered(&world, &[]).await.unwrap();
+        assert_eq!(
+            signer.identity_doc().unwrap().unwrap().version(),
+            other.version() + 1,
+            "{case}"
+        );
+        signs_on(&world, &mut signer).await;
+    }
+}

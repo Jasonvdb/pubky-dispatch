@@ -220,8 +220,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   check 5, after the staged and policy checks, answering a bad one `400`, where the service
   checks it before the account's lock (`400`, or `401` for a certificate that doesn't
   verify), so a staged or policy-off answer can come first here. A sender the allowlist admits is
-  answered `pending` with nothing kept, as at the service. Neither switch sends the push
-  `policy.connect_requests.push` asks for yet.
+  answered `pending` with nothing kept, as at the service. When `policy.connect_requests.push` is on,
+  the service queues webhooks for registered apps that can read the list. The scripted switch models registration only.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below). `make_divergent`, public,
   sets it for one record the switch holds, without a loss or an upload (a key it holds no
@@ -474,7 +474,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   COMMIT or filesystem directory-sync boundary; those failures, exact outcome receipt
   binding, and crash/reload/database-restore ordering are exercised by the service's tests.
 - **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
-  handle for every `notify` entry and sends it to the relay (8.2); the scripted switch
+  target handle for notifying entries and eligible connect requests (7.4.7, 8.2). The scripted switch
   neither sends nor records one, since a webhook goes to the relay, never to an app, so no
   client flow sees it, and an app learns of the entry by reading its feed at either switch.
   The same as the service: the body goes through

@@ -171,6 +171,8 @@ CREATE TABLE apps (
     -- wire 6.2): the request stays in force for dropping passed parts until the app's cursor
     -- has passed it, so the app reads every part it asked for before any of them goes.
     full_completed_seq BIGINT CHECK (full_completed_seq > 0),
+    -- Service time when a connect request last queued a webhook for this app (wire 7.4.7).
+    last_connect_push_ms BIGINT CHECK (last_connect_push_ms >= 0),
     -- An app marked lagging: entries no longer wait for it (Switch wire 7.4.4). Set at the
     -- requests that bring the pressure, with trusted time; cleared at the app's feed read.
     lagging         BOOLEAN NOT NULL DEFAULT false,
@@ -217,7 +219,7 @@ CREATE TABLE shared_records (
     -- The record's version: the write's generation and seq.
     generation    BIGINT   NOT NULL CHECK (generation >= 0),
     version       BIGINT   NOT NULL CHECK (version > 0),
-    -- The receiving application, distinct from an uploaded source version (record lineage 1).
+    -- The receiving application, distinct from an uploaded source version (Switch wire 6.3).
     application_generation BIGINT NOT NULL CHECK (application_generation BETWEEN 1 AND 9007199254740991),
     application_seq BIGINT NOT NULL CHECK (application_seq BETWEEN 1 AND 9007199254740991),
     application_item_hash BYTEA NOT NULL CHECK (octet_length(application_item_hash) = 32),
@@ -582,8 +584,8 @@ CREATE TABLE push_registrations (
 );
 
 -- Push deliveries (Switch spec 9 step 4, Switch wire 8.2): one webhook owed to one handle of
--- a registration for one `notify` entry, queued in the append's transaction and sent by a
--- background worker. A row holds what sending and retrying need and nothing of the message:
+-- a registration for a notifying entry or a connect request, queued in the same transaction.
+-- A row holds what sending and retrying need and nothing of the entry or request:
 -- the webhook carries only the handle. Its body, `ts` and `nonce`, is made at each attempt,
 -- since `ts` is the time it is sent and each nonce is fresh.
 --

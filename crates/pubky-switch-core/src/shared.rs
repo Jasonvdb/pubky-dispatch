@@ -10,20 +10,93 @@
 use serde_json::{Value, json};
 
 use crate::chain::{ItemType, TransitionProof, item_hash};
-use crate::enc::b64;
-use crate::error::{Error, Result};
+use crate::enc::{b64, unb64_array};
+use crate::error::{Error, Result, invalid};
 use crate::http::ErrorCode;
 use crate::ident::Policy;
+use crate::json::{MAX_INT, parse_json, reject_unknown_members};
+use crate::ops::body::Obj;
 use crate::ops::{RecordPut, RecordVersion, Refusal, SignedOp};
-use crate::record_authority::ApplicationRef;
 use crate::records::IdentityDoc;
 
-/// Exact current facts for a record condition (Switch record lineage 1).
-/// This comparison state establishes neither an absence origin nor reader authority.
+/// One application of a record write at the service, ordered by generation, sequence, then
+/// item hash (Switch wire 6.3). Its shape alone does not prove an application occurred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ApplicationRef {
+    /// Positive application generation, at most the wire integer maximum.
+    pub generation: u64,
+    /// Positive sequence within that generation, at most the wire integer maximum.
+    pub seq: u64,
+    /// Hash of the full applied item.
+    pub item_hash: [u8; 32],
+}
+
+impl ApplicationRef {
+    /// Read an exact reference object under the strict JSON rules.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] for malformed members or an invalid reference.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::read(&parse_json(bytes)?)
+    }
+
+    pub(crate) fn read(value: &Value) -> Result<Self> {
+        const NAMES: [&str; 3] = ["generation", "seq", "item_hash"];
+        reject_unknown_members(value, &NAMES, "reference")?;
+        let member = |name: &str| {
+            value
+                .get(name)
+                .ok_or_else(|| Error::Invalid(format!("Switch wire 6.3: missing member {name}")))
+        };
+        let integer = |name: &str| match member(name)?.as_u64() {
+            Some(n) if n <= MAX_INT => Ok(n),
+            _ => invalid("Switch wire 6.3: expected a wire integer"),
+        };
+        let hash = member("item_hash")?
+            .as_str()
+            .ok_or_else(|| Error::Invalid("Switch wire 6.3: expected a string".into()))?;
+        let reference = Self {
+            generation: integer("generation")?,
+            seq: integer("seq")?,
+            item_hash: unb64_array(hash)?,
+        };
+        reference.check()?;
+        Ok(reference)
+    }
+
+    /// Check that both integers are positive wire integers (Switch wire 6.3).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] for a zero or out-of-range integer.
+    pub fn check(&self) -> Result<()> {
+        for n in [self.generation, self.seq] {
+            if n == 0 || n > MAX_INT {
+                return invalid("Switch wire 6.3: expected a positive wire integer");
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the reference in member order (Switch wire 6.3).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] for a zero or out-of-range integer.
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        self.check()?;
+        let mut out = Obj::new();
+        out.int("generation", self.generation)
+            .int("seq", self.seq)
+            .str("item_hash", &b64(&self.item_hash));
+        Ok(out.finish())
+    }
+}
+
+/// Exact current facts for a `record_current` condition (Switch wire 6.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurrentRecord {
-    /// The tracked lineage, or `None` for a current-only record.
-    pub lineage_id: Option<[u8; 32]>,
     /// The application at the service, distinct from an uploaded source version.
     pub revision: ApplicationRef,
     /// Whether the current application deletes the record.
@@ -265,6 +338,76 @@ mod tests {
     use crate::keys::IdentityKey;
     use crate::ops::IdInputs;
     use crate::sealed::SealedValue;
+
+    fn reference(generation: u64, seq: u64, byte: u8) -> ApplicationRef {
+        ApplicationRef {
+            generation,
+            seq,
+            item_hash: [byte; 32],
+        }
+    }
+
+    #[test]
+    fn test_reference_exact_json_and_order() {
+        let value = reference(1, 2, 3);
+        assert_eq!(
+            String::from_utf8(value.to_json().unwrap()).unwrap(),
+            r#"{"generation":1,"seq":2,"item_hash":"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"}"#
+        );
+        assert_eq!(
+            ApplicationRef::parse(&value.to_json().unwrap()).unwrap(),
+            value
+        );
+        assert!(reference(1, 2, 254) < reference(1, 2, 255));
+        assert!(reference(1, 2, 255) < reference(1, 3, 0));
+        assert!(reference(1, 3, 255) < reference(2, 1, 0));
+        assert!(reference(MAX_INT, MAX_INT, 0).check().is_ok());
+    }
+
+    #[test]
+    fn test_reference_strict_members_and_integer_bounds() {
+        let good = reference(1, 2, 3);
+        for field in ["generation", "seq", "item_hash"] {
+            let mut value: Value = serde_json::from_slice(&good.to_json().unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(ApplicationRef::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        for bad in [
+            json!(0),
+            json!(MAX_INT + 1),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            Value::Null,
+            json!(true),
+        ] {
+            for field in ["generation", "seq"] {
+                let mut value: Value = serde_json::from_slice(&good.to_json().unwrap()).unwrap();
+                value[field] = bad.clone();
+                assert!(ApplicationRef::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+            }
+        }
+        for bad in [0, MAX_INT + 1] {
+            assert!(reference(bad, 2, 3).to_json().is_err());
+            assert!(reference(1, bad, 3).check().is_err());
+        }
+        let text = String::from_utf8(good.to_json().unwrap()).unwrap();
+        for extra in [r#""generation":1,"#, r#""unknown":null,"#] {
+            assert!(ApplicationRef::parse(format!("{{{extra}{}", &text[1..]).as_bytes()).is_err());
+        }
+        assert!(
+            ApplicationRef::parse(
+                text.replace("\"generation\":1", "\"generation\":1e0")
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        for hash in [b64(&[0; 31]), b64(&[0; 33]), format!("{}=", b64(&[0; 32]))] {
+            value["item_hash"] = json!(hash);
+            assert!(ApplicationRef::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+    }
 
     fn put(expected: RecordVersion, epoch: u64, delete: bool) -> RecordPut {
         let id = IdentityKey::from_secret([1; 32]);

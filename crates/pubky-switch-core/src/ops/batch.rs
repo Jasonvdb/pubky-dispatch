@@ -417,8 +417,8 @@ pub fn retry_check(
 /// The state conditions are checked against, before the batch (Switch wire 6.3), and what the
 /// caller may read of it (Switch wire 7.6).
 pub trait ConditionState {
-    /// Exact known current facts; `None` cannot satisfy `record_current` and does not
-    /// establish absence (Switch record lineage 1).
+    /// The current record's application and deletion state; `None` for a key the service
+    /// holds nothing for, which fails `record_current` (Switch wire 6.3).
     fn record_current(&self, key: &[u8; 32]) -> Option<crate::shared::CurrentRecord>;
     /// The complete current view, before the caller's read-scope redaction.
     fn record_view(&self, key: &[u8; 32]) -> Option<Value>;
@@ -459,12 +459,10 @@ pub fn check_conditions<'a>(
         let current = match condition {
             Condition::RecordCurrent {
                 key,
-                lineage_id,
                 revision,
                 deleted,
             } => {
                 let expected = crate::shared::CurrentRecord {
-                    lineage_id: *lineage_id,
                     revision: *revision,
                     deleted: *deleted,
                 };
@@ -1197,8 +1195,7 @@ mod tests {
     #[test]
     fn test_record_current_compares_each_fact() {
         let held = crate::shared::CurrentRecord {
-            lineage_id: None,
-            revision: crate::record_authority::ApplicationRef {
+            revision: crate::shared::ApplicationRef {
                 generation: 2,
                 seq: 9,
                 item_hash: [8; 32],
@@ -1212,16 +1209,14 @@ mod tests {
         };
         let condition = Condition::RecordCurrent {
             key: state.key,
-            lineage_id: held.lineage_id,
             revision: held.revision,
             deleted: held.deleted,
         };
         assert!(check_conditions([&condition], &state).is_ok());
-        for case in 0..6 {
+        for case in 0..5 {
             let mut changed = condition;
             let Condition::RecordCurrent {
                 key,
-                lineage_id,
                 revision,
                 deleted,
             } = &mut changed
@@ -1230,10 +1225,9 @@ mod tests {
             };
             match case {
                 0 => *key = [4; 32],
-                1 => *lineage_id = Some([7; 32]),
-                2 => revision.generation += 1,
-                3 => revision.seq += 1,
-                4 => revision.item_hash = [9; 32],
+                1 => revision.generation += 1,
+                2 => revision.seq += 1,
+                3 => revision.item_hash = [9; 32],
                 _ => *deleted = false,
             }
             let refused = check_conditions([&changed], &state).unwrap_err();
@@ -1254,8 +1248,7 @@ mod tests {
     #[test]
     fn test_record_current_conflict_redacts_the_view() {
         let held = crate::shared::CurrentRecord {
-            lineage_id: None,
-            revision: crate::record_authority::ApplicationRef {
+            revision: crate::shared::ApplicationRef {
                 generation: 2,
                 seq: 9,
                 item_hash: [8; 32],
@@ -1269,7 +1262,6 @@ mod tests {
         };
         let stale = Condition::RecordCurrent {
             key: state.key,
-            lineage_id: None,
             revision: held.revision,
             deleted: false,
         };

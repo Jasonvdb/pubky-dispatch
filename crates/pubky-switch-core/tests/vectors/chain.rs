@@ -210,7 +210,7 @@ fn state_of_op(
         OpKind::RecordPut(put) => ProofState::Record {
             version: RecordVersion::new(env.generation, env.seq),
             deleted: put.value_sealed.looks_like_delete(),
-            revision: pubky_switch_core::record_authority::ApplicationRef {
+            revision: pubky_switch_core::shared::ApplicationRef {
                 generation: env.generation,
                 seq: env.seq,
                 item_hash: op.item_hash().unwrap(),
@@ -576,7 +576,7 @@ fn check_record_delete(
         ProofState::Record {
             version: RecordVersion::new(tip.generation, seq),
             deleted: true,
-            revision: pubky_switch_core::record_authority::ApplicationRef {
+            revision: pubky_switch_core::shared::ApplicationRef {
                 generation: tip.generation,
                 seq,
                 item_hash: hash

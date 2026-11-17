@@ -339,12 +339,14 @@ pub enum AppEvent {
     },
     /// An entry stored because its sender's standing couldn't be checked
     /// ([`ParkReason::Unverifiable`]), a scope key ([`ParkReason::AwaitingKey`]) or protocol
-    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed,
+    /// admission ([`ParkReason::AwaitingAdmission`]) was dropped without being processed:
     /// past the shared bounds Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
-    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
+    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]), or failing a
+    /// recipient check when tried again ([`DropReason::Rules`]). For a bound, the protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
-    /// add members: a pattern on it ends in `..`.
+    /// 11); a copy sent again would fail the same recipient check. A duty event, kept in
+    /// the commit that deletes the entry. Later versions may add members: a pattern on it
+    /// ends in `..`.
     #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
@@ -360,7 +362,7 @@ pub enum AppEvent {
         /// When its inbox accepted it, service time in Unix milliseconds: the time a
         /// re-send request asks from.
         accepted_at_ms: u64,
-        /// Which bound it was past.
+        /// Which bound it was past, or which recipient check it failed.
         reason: DropReason,
         /// What the input waited for when it was selected.
         waiting: WaitingReason,
@@ -523,7 +525,7 @@ pub enum AppEvent {
     /// A renewed certificate was seen in the feed; it is taken once the own
     /// `identity.json` lists it (Switch spec 3.2).
     RenewalSeen,
-    /// The app took its renewed certificate and delivered its record with it.
+    /// The app saved its renewed certificate and app record. Record delivery may still be pending.
     CertificateTaken {
         /// The new certificate's `issued_at`.
         issued_at: u64,
@@ -731,9 +733,10 @@ pub enum AppEvent {
         /// The owed protocol calls left behind.
         owed_calls: u64,
     },
-    /// The account the app used is gone: the service answers as for an identity it doesn't
-    /// host and the identity publishes no `identity.json`, at every try of the wait (Switch
-    /// spec 12.7, [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
+    /// With no `identity.json` published and no later generation known, the app marks its
+    /// account erased on a verified not-hosted answer to its request, without waiting.
+    /// An unverified `404` with the same absence must recur over the wait (Switch spec 12.7,
+    /// [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
     /// commit that marks the app gone: the app reads nothing more, and the protocol learns
     /// its account is gone, at least once, whenever the host next takes its events. Once
     /// the account is seen alive again ([`AppEvent::AccountBack`]), an `AccountGone` not yet
@@ -1362,9 +1365,9 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
-/// Which of the shared bounds on sender/key/admission waiting inputs an entry was dropped
-/// past (Switch spec
-/// 8.2, [`AppEvent::StoredEntryDropped`]).
+/// Why an entry waiting for sender standing, a key or admission left custody without
+/// being processed (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]): one of the shared
+/// bounds it was past, or a recipient check it failed when tried again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DropReason {
@@ -1377,6 +1380,12 @@ pub enum DropReason {
     /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
     /// and it was the one accepted earliest of the sender identity that held the most.
     Total,
+    /// Tried again, it failed recipient check `check` (Switch wire 5.1) under the rules
+    /// current then, such as a body its protocol's opaque members no longer allow.
+    Rules {
+        /// The check that failed, 2 to 8.
+        check: u8,
+    },
 }
 
 /// What a locally retained input waits for (Switch spec 8.2). All three reasons share

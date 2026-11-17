@@ -19,8 +19,8 @@ use crate::labels;
 use crate::ops::body::{Obj, quote};
 use crate::ops::read::{opt, req, req_app_id, req_b64n, req_int, req_pubky, req_str, req_time};
 use crate::ops::{BatchRef, RecordVersion, SignedOp};
-use crate::record_authority::ApplicationRef;
 use crate::records::Inbox;
+use crate::shared::ApplicationRef;
 use crate::sig::{self, SignedDoc};
 use crate::signing::Signs;
 use crate::time::rfc3339;
@@ -670,7 +670,7 @@ pub enum ProofState {
         version: RecordVersion,
         /// The write is a delete.
         deleted: bool,
-        /// The exact application and full signed operation hash (Switch record lineage 5).
+        /// The exact application and full signed operation hash (Switch wire 6.3, 6.5).
         revision: ApplicationRef,
     },
     /// `allow.put`, `allow.delete`.
@@ -920,8 +920,8 @@ impl TransitionProof {
     }
 
     /// Read a record proof's exact application and check it against its authenticated stub
-    /// and resulting version (Switch wire 6.5, Switch record lineage 5).
-    /// This does not establish lineage or a receiving upload's application.
+    /// and resulting version (Switch wire 6.3, 6.5).
+    /// This does not establish a receiving upload's application.
     ///
     /// # Errors
     ///

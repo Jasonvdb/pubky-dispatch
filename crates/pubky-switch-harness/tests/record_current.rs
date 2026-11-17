@@ -16,8 +16,8 @@ use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{
     Condition, IdInputs, OpKind, OpsRequest, RecordPut, RecordVersion, SignedOp, sign_batch,
 };
-use pubky_switch_core::record_authority::ApplicationRef;
 use pubky_switch_core::sealed::SealedValue;
+use pubky_switch_core::shared::ApplicationRef;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_harness::parties::{Asking, NOTES, notes_protocol};
 use pubky_switch_harness::{Backend, World};
@@ -196,7 +196,6 @@ fn version(view: &Value) -> RecordVersion {
 fn guard(key: [u8; 32], view: &Value) -> Condition {
     Condition::RecordCurrent {
         key,
-        lineage_id: None,
         revision: current(view),
         deleted: view["deleted"].as_bool().unwrap(),
     }

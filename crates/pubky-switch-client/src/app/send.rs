@@ -1013,14 +1013,8 @@ fn own_message(
     {
         return None;
     }
-    let value: Value = serde_json::from_slice(plaintext.json()).ok()?;
-    let body = value.get("body")?.as_object()?;
     // Only the common fields are read from these already-authenticated bytes.
-    let opaque: Vec<_> = body
-        .keys()
-        .map(|member| OpaqueMember { kind: None, member })
-        .collect();
-    let message = Message::parse(plaintext.json(), &opaque).ok()?;
+    let message = super::protocols::kept_message(plaintext.json())?;
     (message.to == *to
         && message.from.identity == meta.identity
         && message.from.app_id == meta.app_id)
@@ -1863,9 +1857,10 @@ impl App {
 
     /// Try the jobs of the queued message `msg_id` once, as [`App::flush_outbox`] does for
     /// every message, and return where it is; `None` for one the app doesn't keep. The try
-    /// is one unit, as [`App::send`]'s, and the call sends no kept batch itself beyond the
-    /// one each write of the try sends first. So it doesn't move a message whose conversation
-    /// entry is in a kept batch: a read, a write or the flushes' passes send that batch.
+    /// is one unit, as [`App::send`]'s. A try whose conversation entry is owed sends one kept
+    /// batch first, and the entry is written only once no batch is kept; otherwise the call
+    /// sends no kept batch beyond the one each write of the try sends first. A read, a write
+    /// or the flushes' passes send the rest.
     ///
     /// # Errors
     ///
@@ -2133,14 +2128,16 @@ impl App {
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
-    ///   of each pass, and none otherwise. A message whose conversation entry is in a kept
-    ///   batch, or that a kept batch would queue, goes in the pass that sends its batch: with
-    ///   k kept batches ahead of it, the k-th pass, sooner when a read or another write sends
-    ///   them. A batch past its answer window gets its end in the pass that sends it
+    ///   of each pass, and none otherwise. A message whose conversation entry is owed goes
+    ///   once no batch is kept: with k kept batches, in the k-th pass, sooner when a read or
+    ///   another write sends them. A batch past its answer window gets its end in the pass that sends it
     ///   ([`super::App::kept_batch`]). Reads send kept batches
     ///   too ([`super::App::receive`]), and so does each write a message's try makes, one
     ///   first, as every write does. One that keeps failing holds the others behind it until
-    ///   its answer window ends, by design: no write overtakes another.
+    ///   its answer window ends, by design: no write overtakes another. A conversation
+    ///   entry is written only once no batch is kept ahead of it, and the holds are read
+    ///   after the kept batch its write sends: a settlement that holds the message holds
+    ///   its entry too.
     /// - The next flush starts after the last message this one tried, by queue time, and
     ///   goes round, so a message that keeps failing holds up none behind it.
     /// - Flushes go in passes, each trying every queued message and every owed delivery
@@ -2385,7 +2382,7 @@ impl App {
         // protocol holds back, isn't tried, a first one or a re-send ([`App::hold_queued`],
         // [`App::hold_message`], [`super::Protocol::may_send`]);
         // its replay deadline still runs, and its record job goes.
-        let held = self.delivery_waits(&item).await?;
+        let mut held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
         // queued, or a re-send of either, goes only by it, judged at the later of the device
         // clock and a service time verified in this call (Switch spec 11).
@@ -2422,11 +2419,30 @@ impl App {
         {
             return Ok(true);
         }
+        // The conversation entry is a write, and a write first sends a batch kept from an
+        // earlier call, whose settlement may commit local policy the holds read. So that
+        // batch goes first and the holds are read again after it: the entry and the
+        // delivery go by this one decision, with nothing kept settled after it.
+        let mut settled = Ok(());
+        if item.conversation && !held && self.entry_owed(&item.to).await? {
+            match self
+                .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
+                .await
+            {
+                Err(error) if is_local(&error) => return Err(error),
+                resumed => settled = resumed.map(|_| ()),
+            }
+            held = self.delivery_waits(&item).await?;
+        }
         if !held {
             item.tries = item.tries.saturating_add(1);
         }
         if item.conversation && !held {
-            match self.conversation_entry(&item.to).await {
+            let entry = match settled {
+                Ok(()) => self.conversation_entry(&item.to).await,
+                Err(error) => Err(error),
+            };
+            match entry {
                 Ok(()) => item.conversation = false,
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
@@ -2669,36 +2685,38 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The jobs
 
-    /// The conversation entry for `pubky`, unless the app knows it holds one, or a contact
-    /// (Switch spec 7). An app whose certificate lacks `conversation.add` can't write one.
-    /// One a batch kept from an earlier call carries isn't written again: the call fails
-    /// with [`Refusal::NotNow`] until that batch is answered, so the item is tried again,
-    /// and no copy of the entry is kept behind another.
-    async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+    /// Whether the conversation entry for `pubky` is still to be written: the app knows it
+    /// holds none and no contact (Switch spec 7), and its certificate has `conversation.add`.
+    async fn entry_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         let reader = self.reader();
-        if reader
+        Ok(!(reader
             .exists(&allow_key(AllowKind::Conversation, pubky))
             .await?
             || reader.exists(&allow_key(AllowKind::Contact, pubky)).await?
-            || !self.state.cert.has_permission(Permission::ConversationAdd)
-        {
+            || !self.state.cert.has_permission(Permission::ConversationAdd)))
+    }
+
+    /// The conversation entry for `pubky`, unless it isn't owed ([`App::entry_owed`]). It is
+    /// written only with no batch kept from an earlier call ahead of it: otherwise the call
+    /// fails with [`Refusal::NotNow`] and the item is tried again once they are answered.
+    /// A kept batch's settlement may close the delivery's holds, so the entry is never kept
+    /// behind one, decided before that settlement ([`App::try_item`] sends one kept batch
+    /// first and reads the holds after it).
+    async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+        if !self.entry_owed(pubky).await? {
             return Ok(());
         }
-        let entry = OpKind::AllowPut {
+        if self.kept_ahead().await?.is_some() {
+            return Err(Refusal::NotNow(
+                "the conversation entry waits for the batches kept ahead of it".into(),
+            )
+            .into());
+        }
+        self.submit_batch(OpBatch::new().op(OpKind::AllowPut {
             pubky: *pubky,
             kind: AllowKind::Conversation,
-        };
-        for (_, pending) in self.kept_batches().await? {
-            let kept = crate::client::Batch::from_body(pending.body)?;
-            if kept.ops().iter().any(|op| op.body().kind == entry) {
-                return Err(Refusal::NotNow(
-                    "the conversation entry is kept, to be sent after the batches ahead of it"
-                        .into(),
-                )
-                .into());
-            }
-        }
-        self.submit_batch(OpBatch::new().op(entry)).await?;
+        }))
+        .await?;
         Ok(())
     }
 
@@ -2964,15 +2982,9 @@ impl App {
         let Ok(plaintext) = item.plaintext() else {
             return false;
         };
-        let rules = self.protocols.opaque_of_json(plaintext.json());
-        let opaque: Vec<OpaqueMember<'_>> = rules
-            .iter()
-            .map(|rule| OpaqueMember {
-                kind: rule.kind.as_deref(),
-                member: rule.member.as_str(),
-            })
-            .collect();
-        let Ok(message) = Message::parse(plaintext.json(), &opaque) else {
+        // A kept message is read by its common fields, so a protocol's changed body rules
+        // never hold it for good; the protocol's own hook decides.
+        let Some(message) = super::protocols::kept_message(plaintext.json()) else {
             return false;
         };
         let local = super::LocalView::new(
@@ -3001,15 +3013,9 @@ impl App {
     /// before it is sent.
     async fn seal(&mut self, item: &mut OutboxItem, invite: Option<&str>) -> Result<(), AppError> {
         let plaintext = item.plaintext()?;
-        let rules = self.protocols.opaque_of_json(plaintext.json());
-        let opaque: Vec<pubky_switch_core::json::OpaqueMember<'_>> = rules
-            .iter()
-            .map(|rule| pubky_switch_core::json::OpaqueMember {
-                kind: rule.kind.as_deref(),
-                member: rule.member.as_str(),
-            })
-            .collect();
-        let message = Message::parse(plaintext.json(), &opaque)?;
+        // Read by its signed common fields, as every kept copy is ([`own_message`]): the
+        // body rules judged it when it was queued, and a changed rule never stops it.
+        let message = super::protocols::kept_message(plaintext.json()).ok_or_else(store_corrupt)?;
         let (routes, apps_version) = self.routes(&item.to, &message, invite).await?;
         let recipients: Vec<_> = routes.iter().map(|r: &Route| r.recipient).collect();
         let envelope = pubky_switch_core::envelope::seal_retained(

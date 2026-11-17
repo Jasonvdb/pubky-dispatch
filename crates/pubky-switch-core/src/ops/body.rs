@@ -14,9 +14,9 @@ use crate::error::{Error, Result, invalid};
 use crate::ident::Policy;
 use crate::json::{Doc, parse_json_as};
 use crate::labels;
-use crate::record_authority::ApplicationRef;
 use crate::records::KeyBundle;
 use crate::sealed::SealedValue;
+use crate::shared::ApplicationRef;
 use crate::sig::SignedDoc;
 use crate::signing::Signs;
 use crate::time::rfc3339;
@@ -201,12 +201,11 @@ impl BatchRef {
 /// 10.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Condition {
-    /// The exact current application, lineage and deletion state (Switch record lineage 1).
+    /// The record's current write is exactly this application, with this deletion state; a
+    /// key the service holds nothing for fails it.
     RecordCurrent {
         /// The record key.
         key: [u8; 32],
-        /// The tracked lineage, or `None` for a current-only record.
-        lineage_id: Option<[u8; 32]>,
         /// The application being compared.
         revision: ApplicationRef,
         /// Whether that application deletes the record.
@@ -243,17 +242,12 @@ impl Condition {
         match self {
             Condition::RecordCurrent {
                 key,
-                lineage_id,
                 revision,
                 deleted,
             } => {
                 let mut o = Obj::new();
-                o.str("key", &b64(&key));
-                match lineage_id {
-                    Some(id) => o.str("lineage_id", &b64(&id)),
-                    None => o.null("lineage_id"),
-                };
-                o.raw("revision", &revision.to_json()?)
+                o.str("key", &b64(&key))
+                    .raw("revision", &revision.to_json()?)
                     .raw("deleted", if deleted { b"true" } else { b"false" });
                 outer.raw("record_current", &o.finish());
             }
@@ -305,18 +299,12 @@ impl Condition {
         }
         if let Some(inner) = value.get("record_current") {
             let what = "record_current";
-            only(inner, &["key", "lineage_id", "revision", "deleted"], what)?;
-            let lineage_id = match inner.get("lineage_id") {
-                Some(Value::Null) => None,
-                Some(_) => Some(req_b64n::<32>(inner, "lineage_id", what)?),
-                None => return invalid("Switch record lineage 1: lineage_id is missing"),
-            };
+            only(inner, &["key", "revision", "deleted"], what)?;
             return Ok(Condition::RecordCurrent {
                 key: req_b64n::<32>(inner, "key", what)?,
-                lineage_id,
                 revision: ApplicationRef::read(req(inner, "revision", what)?)?,
                 deleted: req(inner, "deleted", what)?.as_bool().ok_or_else(|| {
-                    Error::Invalid("Switch record lineage 1: deleted isn't a boolean".into())
+                    Error::Invalid("Switch wire 6.3: deleted isn't a boolean".into())
                 })?,
             });
         }
@@ -1488,7 +1476,6 @@ mod tests {
         let mut fields = body(attempt());
         fields.conditions = vec![Condition::RecordCurrent {
             key: [3; 32],
-            lineage_id: None,
             revision: ApplicationRef {
                 generation: 2,
                 seq: 9,
@@ -1511,14 +1498,14 @@ mod tests {
             let current = &mut changed["conditions"][0]["record_current"];
             match case {
                 0 => {
-                    current.as_object_mut().unwrap().remove("lineage_id");
+                    current.as_object_mut().unwrap().remove("deleted");
                 }
                 1 => current["revision"]["extra"] = Value::Bool(true),
                 2 => current["deleted"] = Value::String("true".into()),
                 3 => current["revision"]["seq"] = Value::from(0),
                 4 => current["revision"]["generation"] = Value::from(crate::json::MAX_INT + 1),
                 5 => current["revision"]["item_hash"] = Value::String("AA".into()),
-                6 => current["lineage_id"] = Value::String("AA".into()),
+                6 => current["extra"] = Value::Null,
                 _ => {
                     current.as_object_mut().unwrap().remove("revision");
                 }

@@ -183,7 +183,7 @@ fn record_proof(op: &SignedOp, version: RecordVersion, time: u64) -> SignedDoc {
     let state = ProofState::Record {
         version,
         deleted: false,
-        revision: crate::record_authority::ApplicationRef {
+        revision: crate::shared::ApplicationRef {
             generation: op.body().generation,
             seq: version.version,
             item_hash: op.item_hash().unwrap(),
@@ -393,7 +393,7 @@ fn test_upload_out_of_range_proof_counts_as_none() {
         let state = ProofState::Record {
             version,
             deleted: false,
-            revision: crate::record_authority::ApplicationRef {
+            revision: crate::shared::ApplicationRef {
                 generation: op.body().generation,
                 seq: 60,
                 item_hash: op.item_hash().unwrap(),

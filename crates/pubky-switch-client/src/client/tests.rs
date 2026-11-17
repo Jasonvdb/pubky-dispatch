@@ -1537,6 +1537,39 @@ async fn test_last_server_time_follows_checked_answers_only() {
     assert_eq!(client.latest_server_time(), None);
 }
 
+#[tokio::test]
+async fn test_last_server_time_ignores_the_public_read() {
+    // The public read binds no request, so its answer may be an earlier one sent again
+    // (Switch wire 7.1 "Identical requests"): its time is no latest time.
+    let doc = IdentityDoc::sign(
+        &identity(),
+        IdentityBody::first(
+            identity().public(),
+            [0; 16],
+            Inbox::new(ORIGIN, service_public()),
+            IdentityPolicy::default(),
+        ),
+    )
+    .unwrap();
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        Ok(
+            if http::is_public_read(&request.method, &request.path_and_query) {
+                let body = json!({ "identity": doc.signed() });
+                timed_response(request, 200, body, None, NOW - 600_000)
+            } else {
+                let body = json!({ "contacts": [], "conversations": [], "deny": [],
+                                   "flagged": [], "invite_codes": [] });
+                timed_response(request, 200, body, None, NOW)
+            },
+        )
+    }));
+    let client = client_with(app(), Some(service_public()), transport);
+    client.allow().await.unwrap();
+    client.public_identity().await.unwrap();
+    assert_eq!(client.last_server_time(), Some(NOW));
+    assert_eq!(client.latest_server_time(), None);
+}
+
 /// A batch of one shared record write.
 fn record_write() -> Vec<(Vec<Condition>, OpKind)> {
     use pubky_switch_core::ident::{Policy, collection_id};

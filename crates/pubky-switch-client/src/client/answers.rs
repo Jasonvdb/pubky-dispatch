@@ -294,14 +294,28 @@ impl FeedPage {
             None => None,
             Some(signed) => Some(Freeze::verify(&signed, account)?),
         };
+        let items: Vec<FeedItem> = o
+            .required_objects("items")?
+            .into_iter()
+            .filter_map(|item| FeedItem::read(item).transpose())
+            .collect::<Result<_, _>>()?;
+        // The service's facts about an entry are checked here, once, before anything of the
+        // page is kept: an inbox accepts an entry before any page shows it, so no `entry` or
+        // `unreadable` item is accepted after the page's own time, which the app keeps as
+        // the entry's first observation (Switch wire 7.4.4).
+        if items.iter().any(|item| match item {
+            FeedItem::Entry(entry) => entry.accepted_at > server_time_ms,
+            FeedItem::Unreadable { accepted_at, .. } => *accepted_at > server_time_ms,
+            _ => false,
+        }) {
+            return Err(bad(
+                "Switch wire 7.4.4: a feed page shows an entry accepted after the page's time",
+            ));
+        }
         Ok(Self {
             server_time_ms,
             service_key,
-            items: o
-                .required_objects("items")?
-                .into_iter()
-                .filter_map(|item| FeedItem::read(item).transpose())
-                .collect::<Result<_, _>>()?,
+            items,
             next,
             scanned_through: o.u64("scanned_through")?,
             more: o.bool("more")?,
@@ -985,7 +999,9 @@ impl AppsAnswer {
     }
 }
 
-/// The answer of the public read `GET /v1/{id}/identity` (Switch wire 7.4.15).
+/// The answer of the public read `GET /v1/{id}/identity` (Switch wire 7.4.15). It binds no
+/// request, so it may be an earlier answer sent again (Switch wire 7.1 "Identical
+/// requests"): it shows what the identity key signed, and nothing about the account now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicIdentity {
     /// The newest `identity.json` the service holds, verified with the account's identity.

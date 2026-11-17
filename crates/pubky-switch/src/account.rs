@@ -210,6 +210,10 @@ pub struct Judgement {
     /// start must exceed it (Switch wire 7.3, Table 2). This is independent of the notice's
     /// chain generation. Unused while the verdict is unknown.
     pub recovery_floor: u64,
+    /// The generation whose retirement the verdict read ([`retirement_generation`]): the
+    /// one an operator retires to make this account's loss permanent. `None` where no
+    /// retirement counts.
+    pub retirement_generation: Option<u64>,
 }
 
 /// The columns of Table 1 other than the retired one.
@@ -243,18 +247,12 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
             erase_account_again: false,
             verdict: Verdict::Unknown,
             recovery_floor: 0,
+            retirement_generation: None,
         };
     }
-    let mut account = inputs.account;
-    let mut erase_account_again = false;
-    if let (Some(held), Some(erased_at)) = (account, inputs.erasure_at_ms)
-        && held.created_at_ms <= erased_at
-    {
-        // A restore brought it back, or its deletion never committed: then a row "None"
-        // applies.
-        erase_account_again = true;
-        account = None;
-    }
+    let selected = select(inputs.account, inputs.mark, inputs.erasure_at_ms);
+    let account = selected.account;
+    let erase_account_again = selected.erase_account_again;
     let recovery_floor = account
         .map_or(0, |account| {
             let retained_sql = if account.activation == AccountActivation::Recovery
@@ -270,36 +268,26 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
             account.document_generation.unwrap_or(0).max(retained_sql)
         })
         .max(inputs.mark.mark().map_or(0, |mark| mark.generation));
-    let binding = account_binding(account, inputs.mark);
     let recovery_required = account
         .is_some_and(|account| account.activation == AccountActivation::Recovery)
-        && binding
-            .as_ref()
-            .is_ok_and(|binding| binding.association() == AccountAssociation::Account);
-    let verdict = match binding {
-        Err(_) => Verdict::Unknown,
-        Ok(binding) => {
-            let effective_account =
-                account.filter(|_| binding.association() == AccountAssociation::Account);
-            let missing = MarkInput::Missing;
-            let effective_mark = if effective_account.is_some_and(|account| {
-                inputs
-                    .mark
-                    .mark()
-                    .is_some_and(|mark| mark.created_at_ms < account.created_at_ms)
-            }) {
-                &missing
-            } else {
-                inputs.mark
-            };
-            let effective = Inputs {
-                account: effective_account,
-                mark: effective_mark,
+        && selected
+            .effective
+            .is_some_and(|effective| effective.account.is_some());
+    let retirement_generation = selected.retirement_generation();
+    let verdict = match selected.effective {
+        None => Verdict::Unknown,
+        Some(effective) => {
+            let effective_inputs = Inputs {
+                account: effective.account,
+                mark: &effective.mark,
                 ..*inputs
             };
-            match effective_account {
-                None => judge_without_account(&effective),
-                Some(account) => judge_account(account, &effective),
+            // The selected generation, where the operator retired it.
+            let retired =
+                retirement_generation.filter(|generation| inputs.retired.contains(generation));
+            match effective.account {
+                None => judge_without_account(&effective_inputs, retired.is_some()),
+                Some(account) => judge_account(account, &effective_inputs, retired),
             }
         }
     };
@@ -308,11 +296,102 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         erase_account_again,
         verdict,
         recovery_floor,
+        retirement_generation,
+    }
+}
+
+/// The generation whose retirement Table 1 reads for an identity (Switch wire 7.3 under
+/// Table 1): the selected mark's generation, or the selected account's where no mark is
+/// selected, after the first row and the common association (Switch account binding 1.1).
+/// `None` where no retirement can count: the mark store can't be read, the association
+/// can't be judged, or neither an account nor a mark is selected. The one rule for the
+/// verdict, the service's retirement read and the operator's `retire`.
+pub fn retirement_generation(
+    account: Option<&Account>,
+    mark: &MarkInput,
+    erasure_at_ms: Option<u64>,
+) -> Option<u64> {
+    if matches!(mark, MarkInput::StoreUnreadable) {
+        return None;
+    }
+    select(account, mark, erasure_at_ms).retirement_generation()
+}
+
+/// The account and mark Table 1 judges, after its first row and the common association.
+struct Selected<'a> {
+    /// The account, unless the first row erases it again.
+    account: Option<&'a Account>,
+    /// The first row applies: the account was created at or before the erasure's record.
+    erase_account_again: bool,
+    /// The selected account and mark; `None` where the association can't be judged.
+    effective: Option<Effective<'a>>,
+}
+
+/// The selected inputs of [`Selected`].
+#[derive(Clone, Copy)]
+struct Effective<'a> {
+    /// The account associated with the selected lifetime, if any.
+    account: Option<&'a Account>,
+    /// The selected mark: missing where it is of an older lifetime than the account.
+    mark: MarkInput,
+}
+
+impl Selected<'_> {
+    fn retirement_generation(&self) -> Option<u64> {
+        let effective = self.effective?;
+        match (effective.account, effective.mark.mark()) {
+            (Some(account), mark) => {
+                Some(mark.map_or(account.generation(), |mark| mark.generation))
+            }
+            (None, Some(mark)) => Some(mark.generation),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Apply Table 1's first row and the common association (Switch wire 7.3, account binding
+/// 1.1) to the identity's account and mark.
+fn select<'a>(
+    account: Option<&'a Account>,
+    mark: &MarkInput,
+    erasure_at_ms: Option<u64>,
+) -> Selected<'a> {
+    let mut account = account;
+    let mut erase_account_again = false;
+    if let (Some(held), Some(erased_at)) = (account, erasure_at_ms)
+        && held.created_at_ms <= erased_at
+    {
+        // A restore brought it back, or its deletion never committed: then a row "None"
+        // applies.
+        erase_account_again = true;
+        account = None;
+    }
+    let effective = account_binding(account, mark).ok().map(|binding| {
+        let effective_account =
+            account.filter(|_| binding.association() == AccountAssociation::Account);
+        // A mark of an older lifetime than the selected account is no mark of it.
+        let older_mark = effective_account.is_some_and(|account| {
+            mark.mark()
+                .is_some_and(|mark| mark.created_at_ms < account.created_at_ms)
+        });
+        Effective {
+            account: effective_account,
+            mark: if older_mark {
+                MarkInput::Missing
+            } else {
+                *mark
+            },
+        }
+    });
+    Selected {
+        account,
+        erase_account_again,
+        effective,
     }
 }
 
 /// Table 1, rows "None" and "None, erased".
-fn judge_without_account(inputs: &Inputs<'_>) -> Verdict {
+fn judge_without_account(inputs: &Inputs<'_>, retired: bool) -> Verdict {
     let Some(mark) = inputs.mark.mark() else {
         return Verdict::NotHosted { delete_mark: false };
     };
@@ -325,7 +404,7 @@ fn judge_without_account(inputs: &Inputs<'_>) -> Verdict {
         return Verdict::NotHosted { delete_mark: true };
     }
     // With no account there is no state, so a retirement always counts.
-    if inputs.retired.contains(&mark.generation) {
+    if retired {
         return lost(mark, true);
     }
     if mark.records_head() {
@@ -346,15 +425,15 @@ fn lost(mark: &Mark, permanent: bool) -> Verdict {
 }
 
 /// Table 1, the rows of an account.
-fn judge_account(account: &Account, inputs: &Inputs<'_>) -> Verdict {
+fn judge_account(account: &Account, inputs: &Inputs<'_>, retired: Option<u64>) -> Verdict {
     let state = account.state.state();
     let mark = inputs.mark.mark();
     let column = column(state, mark, inputs.stub_at_mark);
     // A retirement is of the mark's generation, or of the account's where the mark is
-    // lost, and counts only while the state isn't of a later generation than that.
-    let retired_generation = mark.map_or(account.generation(), |mark| mark.generation);
-    let retired = inputs.retired.contains(&retired_generation)
-        && state.is_none_or(|state| state.generation <= retired_generation);
+    // lost ([`retirement_generation`]), and counts only while the state isn't of a later
+    // generation than that.
+    let retired =
+        retired.is_some_and(|retired| state.is_none_or(|state| state.generation <= retired));
     let generation = account
         .generation()
         .max(mark.map_or(0, |mark| mark.generation));

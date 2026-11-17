@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::message::Message;
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
-use pubky_switch_core::records::AppCert;
+use pubky_switch_core::records::{AppCert, AppRecord};
 use pubky_switch_core::scopes::Permission;
 use serde_json::json;
 
@@ -3069,3 +3069,195 @@ async fn test_protocol_set_marks_wait_for_what_was_held_before_them() {
 }
 
 mod zero_listing;
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_preserves_other_expiry_and_blocked_ask() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_switch_core::records::DAY_MS;
+    app.renew_record("chat", Some(p.w.clock.now_ms() + day))
+        .await
+        .unwrap();
+    let chat_expiry = record_expiry(&app).unwrap();
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(2 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(chat_expiry));
+    let before = app.record().clone();
+    p.w.clock.advance_ms(day + 1);
+    usage(
+        app.renew_record_with_lifetime("tasks", Some(3 * day)).await,
+        "`chat`",
+    );
+    assert_eq!(app.record(), &before);
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    app.renew_record_with_lifetime("chat", None).await.unwrap();
+    assert_eq!(
+        record_expiry(&app),
+        Some(
+            AppRecord::verify(app.record(), &app.identity())
+                .unwrap()
+                .updated_at()
+                + 3 * day
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_noop_and_withdrawal_preserve_siblings() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(day))
+        .await
+        .unwrap();
+    app.set_protocol_member_with_lifetime("chat", a_member(), Some(2 * day))
+        .await
+        .unwrap();
+    let before = app.record().clone();
+    let policies = app.record_expiries().await.unwrap();
+    p.w.clock.advance_ms(1000);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(3 * day))
+        .await
+        .unwrap();
+    assert_eq!(app.record(), &before);
+    assert_eq!(app.record_expiries().await.unwrap(), policies);
+    app.set_protocol_member_with_lifetime("chat", None, None)
+        .await
+        .unwrap();
+    let record = AppRecord::verify(app.record(), &app.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + day));
+    assert_eq!(record.body().protocol("tasks"), a_member().as_ref());
+    assert!(record.body().protocol("chat").is_none());
+    app.set_protocol_member_with_lifetime("tasks", None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), None);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatures() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(4 * day))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    p.w.clock.advance_ms(5 * day);
+    restored
+        .set_protocol_member("chat", a_member(), None)
+        .await
+        .unwrap();
+    let record = AppRecord::verify(restored.record(), &restored.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + 4 * day));
+    p.w.next_doc(|body| body.record_max_age = Some(86_400));
+    restored.refresh_identity().await.unwrap();
+    restored.renew_record("chat", None).await.unwrap();
+    let record = AppRecord::verify(restored.record(), &restored.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + day));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_restore_rejects_invalid_policies() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    app.renew_record_with_lifetime("tasks", Some(86_400_000))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let original: Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    for policy in [
+        json!({"lifetime": 0}),
+        json!({"lifetime": u64::MAX}),
+        json!({"at": u64::MAX}),
+    ] {
+        let mut changed = original.clone();
+        changed["record_expiries"][0][1] = policy;
+        let invalid = AppBackup::from_bytes(&serde_json::to_vec(&changed).unwrap()).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let result = App::restore(
+            p.w.env_on(store.clone()),
+            p.set(),
+            World::config(),
+            &invalid,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InvalidData(_))));
+        assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+    }
+    let mut changed = original.clone();
+    changed["record_expiries"]
+        .as_array_mut()
+        .unwrap()
+        .push(original["record_expiries"][0].clone());
+    let repeated = AppBackup::from_bytes(&serde_json::to_vec(&changed).unwrap()).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    assert!(matches!(
+        App::restore(
+            p.w.env_on(store.clone()),
+            p.set(),
+            World::config(),
+            &repeated
+        )
+        .await,
+        Err(AppError::InvalidData(_))
+    ));
+    assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadline() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_switch_core::records::DAY_MS;
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(3 * day))
+        .await
+        .unwrap();
+    app.renew_record("chat", Some(p.w.clock.now_ms() + day))
+        .await
+        .unwrap();
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.renew_record_with_lifetime("tasks", Some(4 * day))
+        .await
+        .unwrap_err();
+    let pending = app.record().clone();
+    let policies = app.record_expiries().await.unwrap();
+    let mut later = AppRecord::verify(&pending, &app.identity())
+        .unwrap()
+        .body()
+        .clone();
+    p.w.clock.advance_ms(2 * day);
+    later.updated_at = p.w.clock.now_ms();
+    later.expires_at = None;
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    p.w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    usage(app.publish_record().await, "`chat`");
+    assert_eq!(app.record(), &pending);
+    assert_eq!(app.record_expiries().await.unwrap(), policies);
+    assert!(app.state.pending_record.is_some());
+    assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(later.signed()));
+}

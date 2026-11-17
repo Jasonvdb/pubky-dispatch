@@ -436,11 +436,11 @@ pub struct AppBackup {
     /// restore holds them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     held_messages: Vec<String>,
-    /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for
-    /// none: a restore keeps them, so the record's next `expires_at` is still the earliest
-    /// of them. Absent while no protocol asked for one.
+    /// Each protocol's expiry policy (`rexp`), retained on restore: fixed deadlines stay
+    /// fixed and lifetimes resolve from each new signed timestamp. The earliest resolved
+    /// finite policy is the record's expiry. Empty while no protocol asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    record_expiries: Vec<(String, Option<u64>)>,
+    record_expiries: Vec<(String, own_record::RecordExpiry)>,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1538,12 +1538,7 @@ impl App {
             .into_iter()
             .map(|(rest, _)| rest)
             .collect();
-        backup.record_expiries = reader
-            .get::<std::collections::BTreeMap<String, Option<u64>>>(key::RECORD_EXPIRIES)
-            .await?
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        backup.record_expiries = self.record_expiries().await?.into_iter().collect();
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -1953,6 +1948,16 @@ impl App {
                     "its record expiry of `{name}` is of no registered protocol"
                 )));
             }
+            let mut expiry_owners = std::collections::BTreeSet::new();
+            if backup
+                .record_expiries
+                .iter()
+                .any(|(name, expiry)| !expiry.valid() || !expiry_owners.insert(name))
+            {
+                return Err(invalid(
+                    "its record expiry policies are invalid or repeated",
+                ));
+            }
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
@@ -2286,7 +2291,7 @@ impl App {
                 tx.local(&layer_writes)?;
                 tx.put(key::PROTOCOLS, &protocols_names)?;
                 if !backup.record_expiries.is_empty() {
-                    let expiries: std::collections::BTreeMap<String, Option<u64>> =
+                    let expiries: std::collections::BTreeMap<String, own_record::RecordExpiry> =
                         backup.record_expiries.iter().cloned().collect();
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }

@@ -1286,7 +1286,11 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         };
         let alarm = alarm.clone().unwrap();
         assert!(reason.contains(&format!("seq {at}")), "{shown:?}: {reason}");
-        assert_eq!(error, crate::app::AppError::Alarm(alarm.clone()), "{shown:?}");
+        assert_eq!(
+            error,
+            crate::app::AppError::Alarm(alarm.clone()),
+            "{shown:?}"
+        );
         for _ in 0..2 {
             drop(app);
             app = App::load(w.env(), p.clone(), World::config(), me)
@@ -1302,7 +1306,10 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
                 kept,
                 "{shown:?}: the observation stays as evidence"
             );
-            assert!(!pair(&app, &w, &message).await, "{shown:?}: nothing processed");
+            assert!(
+                !pair(&app, &w, &message).await,
+                "{shown:?}: nothing processed"
+            );
             // Later reads stop on the alarm, raised once, rather than on the page.
             assert_eq!(
                 app.receive(None).await.unwrap_err(),
@@ -1334,7 +1341,10 @@ async fn test_waiting_held_entry_a_page_leaves_out_is_passed_with_the_cursor() {
     let mut app = App::load(w.env(), p.clone(), World::config(), me)
         .await
         .unwrap();
-    assert!(app.state.held.is_empty() && app.no_retries(), "nothing held behind it");
+    assert!(
+        app.state.held.is_empty() && app.no_retries(),
+        "nothing held behind it"
+    );
     let backup = app.backup_layered().await.unwrap();
     App::restore(
         w.env_on(Arc::new(MemoryStore::new())),
@@ -1381,7 +1391,11 @@ async fn test_waiting_drop_notice_check_outside_recipient_checks_is_corrupt() {
         .await;
         assert_eq!(result.is_ok(), shape, "restore, check {check}");
         assert!(
-            shape || matches!(result, Err(crate::app::AppError::Store(StoreError::Corrupt))),
+            shape
+                || matches!(
+                    result,
+                    Err(crate::app::AppError::Store(StoreError::Corrupt))
+                ),
             "restore, check {check}"
         );
         let store = Arc::new(MemoryStore::new());
@@ -1404,7 +1418,11 @@ async fn test_waiting_drop_notice_check_outside_recipient_checks_is_corrupt() {
         let loaded = App::load(w.env_on(store), p.clone(), World::config(), me).await;
         assert_eq!(loaded.is_ok(), shape, "load, check {check}");
         assert!(
-            shape || matches!(loaded, Err(crate::app::AppError::Store(StoreError::Corrupt))),
+            shape
+                || matches!(
+                    loaded,
+                    Err(crate::app::AppError::Store(StoreError::Corrupt))
+                ),
             "load, check {check}"
         );
     }

@@ -1566,8 +1566,7 @@ async fn test_records_write_superseding_an_item_that_doesnt_read_still_commits()
 fn current_guard(key: [u8; 32], view: &Value) -> pubky_switch_core::ops::Condition {
     pubky_switch_core::ops::Condition::RecordCurrent {
         key,
-        lineage_id: None,
-        revision: pubky_switch_core::record_authority::ApplicationRef::parse(
+        revision: pubky_switch_core::shared::ApplicationRef::parse(
             &serde_json::to_vec(&view["revision"]).expect("revision"),
         )
         .expect("reference"),
@@ -1835,7 +1834,7 @@ async fn test_record_current_stored_reference_is_checked() {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
-    let reference = pubky_switch_core::record_authority::ApplicationRef::parse(
+    let reference = pubky_switch_core::shared::ApplicationRef::parse(
         &serde_json::to_vec(&before["revision"]).expect("json"),
     )
     .expect("reference");

@@ -3,7 +3,7 @@
 use crate::chain::ProofState;
 use crate::claims::ClaimView;
 use crate::error::{Result, invalid};
-use crate::record_authority::ApplicationRef;
+use crate::shared::ApplicationRef;
 use crate::shared::RecordState;
 
 use super::{OpKind, RecordVersion, SignedOp};

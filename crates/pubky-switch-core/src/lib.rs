@@ -27,7 +27,6 @@ pub mod message;
 pub mod net;
 pub mod ops;
 pub mod receive;
-pub mod record_authority;
 pub mod records;
 pub mod recovery;
 pub mod scopes;

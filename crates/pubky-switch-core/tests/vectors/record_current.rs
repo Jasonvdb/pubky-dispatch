@@ -451,7 +451,6 @@ fn condition_case(keys: &Keys) {
     put.expected_version = RecordVersion::new(1, 8);
     body.conditions = vec![Condition::RecordCurrent {
         key: put.key,
-        lineage_id: None,
         revision: proof.record_revision().unwrap(),
         deleted: false,
     }];

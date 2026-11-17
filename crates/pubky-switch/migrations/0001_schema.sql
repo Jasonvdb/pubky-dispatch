@@ -217,7 +217,7 @@ CREATE TABLE shared_records (
     -- The record's version: the write's generation and seq.
     generation    BIGINT   NOT NULL CHECK (generation >= 0),
     version       BIGINT   NOT NULL CHECK (version > 0),
-    -- The receiving application, distinct from an uploaded source version (record lineage 1).
+    -- The receiving application, distinct from an uploaded source version (Switch wire 6.3).
     application_generation BIGINT NOT NULL CHECK (application_generation BETWEEN 1 AND 9007199254740991),
     application_seq BIGINT NOT NULL CHECK (application_seq BETWEEN 1 AND 9007199254740991),
     application_item_hash BYTEA NOT NULL CHECK (octet_length(application_item_hash) = 32),

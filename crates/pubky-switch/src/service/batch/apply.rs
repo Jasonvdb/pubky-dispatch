@@ -16,10 +16,9 @@ use pubky_switch_core::{
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
-    record_authority::ApplicationRef,
     records::{AppCert, AppRecord, ReceiveKeyRecord},
     scopes::Permission,
-    shared::{RecordState, check_record_put},
+    shared::{ApplicationRef, RecordState, check_record_put},
     sig::SignedDoc,
 };
 

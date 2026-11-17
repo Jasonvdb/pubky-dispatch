@@ -91,7 +91,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   - a failed mark move (above), the instance lock's freshness, and the leftover sweep at
     start: a leftover mark goes at the next request for the identity;
   - the creation time of an account enrolled right after an erasure is a millisecond past
-    the erasure's record where the clock hasn't moved, so the record never covers it.
+    the erasure's record where the clock hasn't moved, so the record never covers it;
+  - Table 1 is judged by this switch's own copy of the rule, the generation a retirement is
+    of included, not by the service's account model.
 - **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
   feed read with `wait` that has nothing to show its app, until the account's sequence
   grows or the wait has passed. The wait passes by the switch's clock, a test clock that

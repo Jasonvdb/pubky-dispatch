@@ -72,11 +72,6 @@ impl Account {
             named_key,
         }
     }
-
-    /// Its generation here (Switch wire 7.6).
-    pub fn generation(&self) -> u64 {
-        self.model.generation()
-    }
 }
 
 /// The identity's mark, as the request finds it.
@@ -129,6 +124,20 @@ pub(super) fn account_binding(
     mark: &MarkInput,
 ) -> pubky_switch_core::Result<AccountBinding> {
     account::account_binding(account.map(|account| &account.model), &mark.model())
+}
+
+/// The generation whose retirement the verdict reads for these persisted inputs: the
+/// shared model's one rule ([`account::retirement_generation`]).
+pub fn retirement_generation(
+    account: Option<&Account>,
+    mark: &MarkInput,
+    erasure_at_ms: Option<u64>,
+) -> Option<u64> {
+    account::retirement_generation(
+        account.map(|account| &account.model),
+        &mark.model(),
+        erasure_at_ms,
+    )
 }
 
 /// Everything [`judge`] reads.
@@ -985,7 +994,7 @@ mod tests {
             },
             named_key: None,
         };
-        assert_eq!(import.generation(), 3);
+        assert_eq!(import.model.generation(), 3);
         let at = |account: &Account, mark: MarkInput, retired: &[u64]| {
             judge(&Inputs {
                 account: Some(account),
@@ -1019,7 +1028,7 @@ mod tests {
             },
             ..import
         };
-        assert_eq!(with_document.generation(), 3);
+        assert_eq!(with_document.model.generation(), 3);
         assert_eq!(
             at(&with_document, MarkInput::Missing, &[2])
                 .decision
@@ -1035,7 +1044,7 @@ mod tests {
             },
             ..with_document
         };
-        assert_eq!(staged.generation(), 2);
+        assert_eq!(staged.model.generation(), 2);
         let empty = Account {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
@@ -1044,7 +1053,7 @@ mod tests {
             },
             ..staged
         };
-        assert_eq!(empty.generation(), 0);
+        assert_eq!(empty.model.generation(), 0);
     }
 
     #[test]
@@ -1239,6 +1248,7 @@ mod tests {
                 erase_account_again: false,
                 verdict,
                 recovery_floor: BEHIND.generation,
+                retirement_generation: None,
             },
             key: MARK_KEY,
         };
@@ -1889,7 +1899,7 @@ mod tests {
                 retired: &[],
                 current_key: CURRENT,
             });
-            let notice = notice(account.generation(), NoticeReason::MarkLost, false);
+            let notice = notice(account.model.generation(), NoticeReason::MarkLost, false);
             assert_eq!(
                 answer(&judgement, &RequestClass::Ordinary, CURRENT).route,
                 Route::Notice(notice)

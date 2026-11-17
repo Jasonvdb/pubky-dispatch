@@ -93,7 +93,8 @@ pub enum Refusal {
     WrongGeneration {
         /// The generation given.
         given: u64,
-        /// The mark's generation, or the account's where the mark is lost.
+        /// The generation the account's verdict reads its retirement of
+        /// ([`crate::account::retirement_generation`]).
         retirable: u64,
     },
 }
@@ -176,9 +177,9 @@ impl Retired {
 }
 
 /// The generation the identity's retirement is of, where it may be retired (Switch wire
-/// 7.3, Table 3): a failing account its newest `identity.json` names, at the mark's
-/// generation or the account's where the mark is lost; a lost identity, at the mark's.
-/// With it, the notice the identity answers.
+/// 7.3, Table 3): a failing account its newest `identity.json` names, or a lost identity,
+/// at the generation whose retirement the verdict reads
+/// ([`crate::account::retirement_generation`]). With it, the notice the identity answers.
 pub(crate) fn retirable(
     judged: &Judged,
     mark: &MarkInput,
@@ -205,10 +206,18 @@ pub(crate) fn retirable(
                     return Err(Refusal::Staged);
                 }
             }
-            mark.map_or(account.generation(), |mark| mark.generation)
+            judged
+                .judgement
+                .decision
+                .retirement_generation
+                .ok_or(Refusal::NotHosted)?
         }
         Verdict::Lost { .. } => match mark {
-            Some(mark) if mark.records_head() => mark.generation,
+            Some(mark) if mark.records_head() => judged
+                .judgement
+                .decision
+                .retirement_generation
+                .ok_or(Refusal::NotHosted)?,
             _ => return Err(Refusal::NotHosted),
         },
     };
@@ -378,6 +387,78 @@ mod tests {
             )
             .map(|(generation, _)| generation),
             Ok(2)
+        );
+    }
+
+    /// A newer account beside an older readable mark judges by the lost-mark column at its
+    /// own generation: that is the one to retire, and retiring it makes the loss permanent
+    /// (Switch account binding 1.1, Switch wire 7.3 Table 3).
+    #[test]
+    fn test_retire_newer_account_beside_older_mark_takes_the_account_generation() {
+        let mut newer = account(AccountState::Serving(tip(3)));
+        newer.model.created_at_ms = 20;
+        let older = mark(1, 5);
+        let (generation, notice) =
+            retirable(&judged(Some(newer), &older), &older).expect("retirable");
+        assert_eq!(generation, 2);
+        assert!(!notice.permanent);
+        let retired = verdict::judge(&Inputs {
+            account: Some(&newer),
+            mark: &older,
+            stub_at_mark: None,
+            erasure_at_ms: None,
+            retired: &[generation],
+            current_key: KEY,
+        });
+        assert_eq!(
+            check_marks::notice_of(&retired.decision.verdict).map(|notice| notice.permanent),
+            Some(true)
+        );
+    }
+
+    /// The generation `retire` names is the one the verdict selects, the MARK's where the
+    /// mark is selected and differs from the account's: a state behind a mark of a later
+    /// generation (failing, `behind`), and an account created before a newer mark (lost).
+    #[test]
+    fn test_retire_mark_generation_selected_beside_another_account_generation() {
+        let later = mark(3, 1);
+        let behind = account(AccountState::Serving(tip(3)));
+        assert_eq!(
+            retirable(&judged(Some(behind), &later), &later).map(|(generation, _)| generation),
+            Ok(3)
+        );
+        let newer = MarkInput::Mark(AccountMark {
+            generation: 3,
+            seq: 1,
+            chain_hash: [1; 32],
+            key: KEY,
+            created_at_ms: 20,
+        });
+        let older = account(AccountState::Serving(tip(3)));
+        let lost_older = judged(Some(older), &newer);
+        assert!(matches!(
+            lost_older.judgement.decision.verdict,
+            Verdict::Lost { .. }
+        ));
+        assert_eq!(
+            retirable(&lost_older, &newer).map(|(generation, _)| generation),
+            Ok(3)
+        );
+        // The older account at a HIGHER generation than the newer mark: still the mark's.
+        let mut higher = account(AccountState::Serving(ChainTip {
+            generation: 5,
+            seq: 3,
+            chain_hash: [1; 32],
+        }));
+        higher.model.document_generation = Some(5);
+        let lost_higher = judged(Some(higher), &newer);
+        assert!(matches!(
+            lost_higher.judgement.decision.verdict,
+            Verdict::Lost { .. }
+        ));
+        assert_eq!(
+            retirable(&lost_higher, &newer).map(|(generation, _)| generation),
+            Ok(3)
         );
     }
 

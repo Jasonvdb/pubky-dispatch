@@ -2597,12 +2597,15 @@ fn copy_edited(world: &World, edit: impl FnOnce(&mut serde_json::Value)) -> Iden
     edited
 }
 
+/// Puts a member's value somewhere in a copy's body.
+type Put = fn(&mut serde_json::Value, serde_json::Value);
+
 #[tokio::test]
 async fn test_key_recovery_refuses_an_unknown_member_whatever_its_value() {
     // A member this signer doesn't read, at the top or nested in an app, the inbox, the
     // policy or a removal, is refused even when it is `null`, `[]` or `{}`: an empty list
     // may be a later signer's restriction, which the recovery's version would drop.
-    let places: Vec<(&str, fn(&mut serde_json::Value, serde_json::Value))> = vec![
+    let places: Vec<(&str, Put)> = vec![
         ("top", |v, x| v["later_member"] = x),
         ("app", |v, x| v["apps"][0]["later_member"] = x),
         ("inbox", |v, x| v["inbox"]["later_member"] = x),
@@ -2613,7 +2616,11 @@ async fn test_key_recovery_refuses_an_unknown_member_whatever_its_value() {
         ("removal", |v, x| v["removed"][0]["later_member"] = x),
     ];
     for (place, put) in places {
-        for value in [serde_json::json!([]), serde_json::json!({}), serde_json::Value::Null] {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
             let world = World::new();
             let (mut first, _) = world.enrolled().await;
             let (_, _) = joined(&world, &mut first, 3).await;

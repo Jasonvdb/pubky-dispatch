@@ -48,8 +48,8 @@ use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::enc::{hash, lp, random_bytes, u64be};
 use pubky_switch_core::records::{
     AccountAssociation, AccountObservation, AppCert, AppRecord, Enrollment, EnrollmentAnswer,
-    EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Limits, RemovedApp, SIGNER_BACKUP_PATH,
-    app_record_path,
+    EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Limits, RemovedApp,
+    SIGNER_BACKUP_PATH, app_record_path,
 };
 use pubky_switch_core::sig::SignedDoc;
 

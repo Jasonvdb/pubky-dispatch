@@ -1615,6 +1615,35 @@ impl ScriptedSwitch {
         seq
     }
 
+    /// Delete the entry at `seq` with a `missed` item for it at a new `seq`, as the service
+    /// does for a lagging app (Switch wire 7.4.4). Returns the `missed` item's `seq`.
+    #[cfg(test)]
+    pub(crate) fn delete_lagging_entry(&self, seq: u64) -> u64 {
+        let mut inner = self.lock();
+        let accepted = inner
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Entry {
+                    seq: at,
+                    accepted_at,
+                    ..
+                } if *at == seq => Some(*accepted_at),
+                _ => None,
+            })
+            .expect("an entry at the seq");
+        inner.items.retain(|item| item.seq() != seq);
+        let missed = inner.next_seq();
+        inner.items.push(Item::Missed {
+            seq: missed,
+            app: None,
+            entries: 1,
+            from: accepted,
+            until: accepted,
+        });
+        missed
+    }
+
     /// Keep the entries every reader they wait for has passed, where the switch deletes
     /// them as the service does (Switch wire 9.1): the state of an inbox whose entries
     /// another target still holds, for a test that reads an entry again from an earlier

@@ -576,6 +576,7 @@ pub(super) fn notice_id(duty: &Duty) -> Result<EventId, AppError> {
         seq,
         generation,
         accepted_at_ms,
+        reason,
         waiting,
         message,
         sender_verified,
@@ -592,6 +593,9 @@ pub(super) fn notice_id(duty: &Duty) -> Result<EventId, AppError> {
         || notice_id.counter() == 0
         || *accepted_at_ms > receipt.read_at_ms
         || *sender_verified != !matches!(waiting, super::events::WaitingReason::Sender)
+        // A stored input is open already: a drop on its retry fails one of recipient checks
+        // 2 to 8, never check 1 or the deduplication of check 9 (Switch wire 5.1).
+        || matches!(reason, DropReason::Rules { check } if !(2..=8).contains(check))
     {
         return Err(super::corrupt());
     }

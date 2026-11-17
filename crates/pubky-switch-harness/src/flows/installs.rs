@@ -16,8 +16,16 @@ use std::sync::Arc;
 
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
-use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
-use pubky_switch_signer::{Alert, CertChange, Signer, SignerError, SignerStatus, UserConfirmed};
+use pubky_switch_client::{Credentials, SwitchClient};
+use pubky_switch_core::keys::IdentityKey;
+use pubky_switch_core::records::{
+    AppRecord, AppRecordBody, IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup,
+    app_record_path,
+};
+use pubky_switch_signer::{
+    Alert, AppFate, CertChange, KeyRecoveryConfirmed, Refusal, Signer, SignerError, SignerStatus,
+    UserConfirmed,
+};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -632,6 +640,297 @@ pub async fn signer_two_installs_race(world: &World) -> FlowResult {
             ended(&late.as_ref().map(|_| ()))
         )
         .into());
+    }
+    Ok(())
+}
+
+/// The switch's view of alice's account a recovery with the key alone relies on: its copy of
+/// `identity.json`, its creation, and each app's App ID, standing and removal times (Switch
+/// wire 7.4.12, 7.4.18), read with a client of its own.
+async fn account_view(
+    world: &World,
+    alice: &TestIdentity,
+    service_key: [u8; 32],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let client = SwitchClient::new(
+        ORIGIN,
+        alice.public(),
+        Credentials::Signer {
+            identity: alice.public(),
+            key: Arc::new(IdentityKey::from_secret(alice.key().secret_bytes())),
+        },
+        Some(service_key),
+        world.transport(),
+        world.clock().clone(),
+    )?;
+    let created = client
+        .observe_account()
+        .await?
+        .body()
+        .created
+        .ok_or("the account has no creation")?;
+    let answer = client.with_account_created(created)?.apps().await?;
+    let copy = answer
+        .identity
+        .map(|signed| IdentityDoc::verify(&signed, &alice.public()))
+        .transpose()?
+        .map(|doc| doc.hash());
+    let mut apps: Vec<Value> = answer
+        .apps
+        .iter()
+        .map(|status| {
+            json!([
+                status.app_id,
+                status.current,
+                status.revoked_at,
+                status.departed_at
+            ])
+        })
+        .collect();
+    apps.sort_by_key(Value::to_string);
+    Ok(json!({ "created": created, "copy": copy, "apps": apps }))
+}
+
+/// A recovery with the identity key alone after a racing delivery won and its backup write
+/// failed (Switch spec 12.8, Switch wire 3.13). alice's signer has approved her wallet. An
+/// install restored on another device wins its delivery, its backup write fails, and that
+/// device is lost: the backup on the Homeserver is the one it restored from, and a restore
+/// from it is refused as stale. On a third device the user confirms a survey of a recovery
+/// with the key alone: the install enrolls at the account with `existing`, and its delivery
+/// doesn't arrive. The account is as before the enrollment: the same copy, creation and apps.
+/// Run again, the install delivers the racer's content naming itself, built on the racer's
+/// version, and signs on.
+///
+/// Calls: `GET /v1/{id}/account`, an `existing` `POST /v1/enroll` at a serving account, and
+/// `PUT /v1/{id}/identity` built on another install's version, sent again.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the enrollment changes the
+/// account, or the recovering install isn't the signer afterwards.
+pub async fn signer_key_recovery_after_a_racer(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut old = enroll(world, &alice, ORIGIN).await?;
+    let (_wallet, _) = joined(world, &alice, &mut old, "wallet").await?;
+    let before = old.identity_doc()?.ok_or("the signer holds no document")?;
+    drop(old);
+
+    world.fail_homeserver_write(&alice, SIGNER_BACKUP_PATH);
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let racer = Signer::restore_new(
+        env,
+        world.keyring(&alice)?,
+        UserConfirmed::shown_and_confirmed(),
+    )
+    .await?;
+    world.outcome(
+        "an install restored on another device won, its backup write failing",
+        &json!({ "backup_not_written": racer.alerts().contains(&Alert::BackupNotWritten) }),
+    );
+    if world.homeserver_faults_left() != 0 || !racer.alerts().contains(&Alert::BackupNotWritten) {
+        return Err("the racer's backup write didn't fail".into());
+    }
+    let racer_install = racer.install_id();
+    drop(racer);
+    world.advance_ms(STEP_MS);
+
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let stale = Signer::restore_new(
+        env,
+        world.keyring(&alice)?,
+        UserConfirmed::shown_and_confirmed(),
+    )
+    .await;
+    world.outcome(
+        "a restore on a third device",
+        &ended(&stale.as_ref().map(|_| ())),
+    );
+    if !matches!(stale, Err(SignerError::Refused(Refusal::StaleBackup))) {
+        return Err("the restore from the stale backup wasn't refused as stale".into());
+    }
+    let store = Arc::new(MemoryStore::new());
+    let survey = Signer::survey_key_recovery_new(
+        world.signer_env(&alice, store.clone())?,
+        world.keyring(&alice)?,
+    )
+    .await?;
+    world.outcome(
+        "the survey of a recovery with the key alone",
+        &json!({
+            "version_steps": survey.version - before.version(),
+            "names_the_racer": survey.signer == racer_install,
+            "apps_staying": survey.apps.iter().filter(|(_, fate)| *fate == AppFate::Stays).count(),
+        }),
+    );
+    let service_key = before.inbox().service_key;
+    let enrolled = account_view(world, &alice, service_key).await?;
+    world.unreachable("PUT", "/identity");
+    let cut = Signer::restore_new(
+        world.signer_env(&alice, store.clone())?,
+        world.keyring(&alice)?,
+        KeyRecoveryConfirmed::shown_and_confirmed(&survey, &[]),
+    )
+    .await;
+    let after = account_view(world, &alice, service_key).await?;
+    world.outcome(
+        "the recovery enrolled with existing, its delivery not arriving",
+        &json!({ "ended": ended(&cut.as_ref().map(|_| ())), "account_unchanged": after == enrolled }),
+    );
+    if cut.is_ok() || world.faults_left() != 0 || after != enrolled {
+        return Err(
+            "the existing enrollment changed the account, or the delivery wasn't cut".into(),
+        );
+    }
+    world.advance_ms(STEP_MS);
+
+    let mut new = Signer::open(world.signer_env(&alice, store)?, world.keyring(&alice)?).await?;
+    new.resume().await?;
+    let taken = new
+        .identity_doc()?
+        .ok_or("the recovering install holds no document")?;
+    world.outcome(
+        "the recovery, run again, delivered its version",
+        &json!({
+            "version_steps": taken.version() - before.version(),
+            "names_the_new_install": taken.body().signer == new.install_id(),
+            "same_generation": taken.generation() == before.generation(),
+            "signer": status(&new)?,
+        }),
+    );
+    if taken.version() != before.version() + 2
+        || taken.body().signer != new.install_id()
+        || taken.body().apps != before.body().apps
+        || published(world, &alice) != Some(taken.version())
+    {
+        return Err("the recovering install didn't deliver the racer's content as its own".into());
+    }
+    world.advance_ms(STEP_MS);
+    let next = new.set_record_max_age(Some(60)).await?;
+    world.outcome("the recovering install signed on", &status(&new)?);
+    if published(world, &alice) != Some(next.version()) {
+        return Err("the version after the recovery isn't published".into());
+    }
+    Ok(())
+}
+
+/// A recovery with the identity key alone with the backup gone (Switch spec 12.8, Switch
+/// wire 3.13). alice's signer has approved her wallet and her phone; the wallet's record is on
+/// her Homeserver and the phone's isn't, the signer backup is gone, and the device is lost. On a
+/// new device the user confirms the survey: the wallet stays, its certificate found in its
+/// record, and the phone, whose certificate isn't found, is revoked. The install delivers the
+/// copy's content naming itself, then the version that removes the phone, and signs on.
+///
+/// Calls: `POST /v1/{id}/apps/{app_id}/revoke` for an app whose certificate wasn't found, and
+/// the removing version.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or the phone isn't removed.
+pub async fn signer_key_recovery_backup_gone(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut old = enroll(world, &alice, ORIGIN).await?;
+    let (wallet, _) = joined(world, &alice, &mut old, "wallet").await?;
+    let (phone, _) = joined(world, &alice, &mut old, "phone").await?;
+    let before = old.identity_doc()?.ok_or("the signer holds no document")?;
+    drop(old);
+    // The wallet publishes its record, carrying its certificate, on alice's Homeserver
+    // (Switch spec 4.2); the phone's isn't there.
+    let backup: SignerBackup = serde_json::from_slice(
+        &world
+            .files()
+            .file(alice.public(), SIGNER_BACKUP_PATH)
+            .ok_or("no signer backup")?,
+    )?;
+    let cert = backup
+        .open(alice.key())?
+        .certs()
+        .iter()
+        .find(|cert| cert.app_id() == wallet.app_id())
+        .ok_or("the backup holds no certificate of the wallet")?
+        .clone();
+    let record = AppRecord::sign(
+        &world.app_keys(&alice, "wallet")?,
+        AppRecordBody::new(&cert, Vec::new(), world.now_ms()),
+    )?;
+    world.files().put(
+        alice.public(),
+        &app_record_path(&wallet.app_id()),
+        serde_json::to_vec(record.signed())?,
+    );
+    world
+        .files()
+        .remove(alice.public(), &app_record_path(&phone.app_id()));
+    world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
+    world.advance_ms(STEP_MS);
+
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let refused = Signer::restore_new(
+        env,
+        world.keyring(&alice)?,
+        UserConfirmed::shown_and_confirmed(),
+    )
+    .await;
+    if !matches!(refused, Err(SignerError::Refused(Refusal::NoBackup))) {
+        return Err("the restore with no backup wasn't refused".into());
+    }
+    let store = Arc::new(MemoryStore::new());
+    let survey = Signer::survey_key_recovery_new(
+        world.signer_env(&alice, store.clone())?,
+        world.keyring(&alice)?,
+    )
+    .await?;
+    let fate = |app: [u8; 16]| {
+        survey
+            .apps
+            .iter()
+            .find(|(id, _)| *id == app)
+            .map(|(_, f)| *f)
+    };
+    world.outcome(
+        "the survey of a recovery with the key alone",
+        &json!({
+            "wallet_stays": fate(wallet.app_id()) == Some(AppFate::Stays),
+            "phone_not_found": fate(phone.app_id()) == Some(AppFate::CertificateNotFound),
+        }),
+    );
+    if fate(wallet.app_id()) != Some(AppFate::Stays)
+        || fate(phone.app_id()) != Some(AppFate::CertificateNotFound)
+    {
+        return Err("the survey shows other fates for the two apps".into());
+    }
+    let mut new = Signer::restore_new(
+        world.signer_env(&alice, store)?,
+        world.keyring(&alice)?,
+        KeyRecoveryConfirmed::shown_and_confirmed(&survey, &[]),
+    )
+    .await?;
+    let newest = new
+        .identity_doc()?
+        .ok_or("the recovering install holds no document")?;
+    world.outcome(
+        "the recovery delivered its version, then removed the phone",
+        &json!({
+            "version_steps": newest.version() - before.version(),
+            "wallet_listed": newest.listed_cert(&wallet.app_id()).is_some(),
+            "phone_removed": newest.body().removed.iter().any(|r| r.app_id == phone.app_id()),
+            "signer": status(&new)?,
+        }),
+    );
+    if newest.version() != before.version() + 2
+        || newest.body().signer != new.install_id()
+        || newest.listed_cert(&wallet.app_id()).is_none()
+        || newest.listed_cert(&phone.app_id()).is_some()
+        || published(world, &alice) != Some(newest.version())
+    {
+        return Err("the recovery didn't end with the wallet listed and the phone removed".into());
+    }
+    world.advance_ms(STEP_MS);
+    let next = new.set_record_max_age(Some(60)).await?;
+    world.outcome("the recovering install signed on", &status(&new)?);
+    if published(world, &alice) != Some(next.version()) {
+        return Err("the version after the recovery isn't published".into());
     }
     Ok(())
 }

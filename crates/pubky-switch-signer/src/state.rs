@@ -841,6 +841,23 @@ pub(crate) enum Flow {
         /// until one did (Switch wire 7.4.16).
         shown: Option<ShownCopy>,
     },
+    /// Recovering with the identity key alone (Switch spec 12.8): the `existing` enrollment
+    /// at the service the newest copy names, sent again with the same bytes until answered,
+    /// then the records rebuilt and the version naming this install signed, in one commit,
+    /// once the survey the user confirmed still reads the same.
+    KeyRecover {
+        /// The service's origin.
+        origin: String,
+        /// The observation and the signed `existing` enrollment selected from it.
+        enrollment: RecoveryEnrollment,
+        /// The digest of the survey the user confirmed.
+        digest: [u8; 32],
+        /// The listed apps the user chose to drop.
+        dropped: Vec<[u8; 16]>,
+        /// Whether the records were made for it, on a store that held none or unusable ones:
+        /// a refusal before the version is signed deletes them.
+        fresh: bool,
+    },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
         /// The original target of this signed version, kept through every retry.
@@ -885,6 +902,31 @@ impl Flow {
                     {
                         return Err(RecordsFault::Invariant("another initial enrollment").into());
                     }
+                }
+            }
+            Self::KeyRecover {
+                origin, enrollment, ..
+            } => {
+                let RecoveryEnrollment::Ready {
+                    observation,
+                    enrollment,
+                } = enrollment
+                else {
+                    return Err(
+                        RecordsFault::Invariant("a key recovery without its enrollment").into(),
+                    );
+                };
+                let observed = observation
+                    .verify(identity, origin)
+                    .map_err(SignerError::StoredData)?;
+                let signed = Enrollment::verify(enrollment, identity, origin)
+                    .map_err(SignerError::StoredData)?;
+                // The observation is of a serving account, so its intent is `existing`.
+                if signed.body().intent != observed.enrollment_intent()?
+                    || signed.body().identity_doc.is_some()
+                    || !signed.revoked_apps().is_empty()
+                {
+                    return Err(RecordsFault::Invariant("another key recovery enrollment").into());
                 }
             }
             Self::Recover { origin, enrollment } => {

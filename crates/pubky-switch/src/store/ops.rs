@@ -490,23 +490,51 @@ impl AccountTxn {
 
     /// Store a shared record's newest write. A write made here clears the record's divergent
     /// uploads: it is a newer version at this service (Switch spec 12.6 step 3).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for a write of another collection or policy than the record
+    /// held at its key, a deleted one included, which nothing stores: the record's collection
+    /// and policy are fixed at creation (Switch wire 6.2, Switch spec 10.3.1), and the row
+    /// would keep the old ones beside the new write.
     pub async fn put_record(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
         record.check_revision()?;
         let id = self.head().id.clone();
         let state = &record.state;
         // The write it replaces shows as its stub from now on (Switch wire 7.5).
-        let replaced: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT generation, version FROM shared_records WHERE account_id = $1 AND key = $2",
+        let replaced = sqlx::query(
+            "SELECT generation, version, collection, read_scope, write_scopes, permanent, \
+             permanent_generation FROM shared_records WHERE account_id = $1 AND key = $2",
         )
         .bind(&id)
         .bind(state.key.as_slice())
         .fetch_optional(self.conn())
         .await
         .map_err(db)?;
-        if let Some((generation, version)) = replaced
-            && from_db(generation, "generation")? == self.head().generation
-        {
-            self.note_superseded([from_db(version, "version")?]);
+        if let Some(row) = replaced {
+            let collection: Vec<u8> = row.try_get("collection")?;
+            let read_scope: String = row.try_get("read_scope")?;
+            let write_scopes: Vec<String> = row.try_get("write_scopes")?;
+            let permanent: bool = row.try_get("permanent")?;
+            let named: Option<i64> = row.try_get("permanent_generation")?;
+            let named = named
+                .map(|g| from_db(g, "permanent_generation"))
+                .transpose()?;
+            if collection != state.collection
+                || read_scope != state.policy.read_scope
+                || write_scopes != state.policy.write_scopes
+                || permanent != state.policy.permanent.is_some()
+                || named != state.policy.permanent.and_then(|p| p.generation)
+            {
+                return Err(StoreError::Corrupt(
+                    "a record write of another collection or policy than the record it replaces",
+                ));
+            }
+            let generation: i64 = row.try_get("generation")?;
+            if from_db(generation, "generation")? == self.head().generation {
+                let version: i64 = row.try_get("version")?;
+                self.note_superseded([from_db(version, "version")?]);
+            }
         }
         let (proof, upload_seq, exact, base) = match &record.origin {
             RecordOrigin::Written { proof, upload_base } => {

@@ -685,10 +685,21 @@ fn shared_record(
     deleted: bool,
     version: u64,
 ) -> pubky_switch::store::StoredRecord {
+    let policy = pubky_switch_core::ident::Policy::new(read_scope, &["tasks"]);
+    record_at_policy(key, collection, policy, deleted, version)
+}
+
+/// [`shared_record`] at `policy`.
+fn record_at_policy(
+    key: [u8; 32],
+    collection: [u8; 32],
+    policy: pubky_switch_core::ident::Policy,
+    deleted: bool,
+    version: u64,
+) -> pubky_switch::store::StoredRecord {
     use pubky_switch_core::{
         chain::{ChainTip, ItemType, ProofBody, TransitionProof, ZERO_HASH},
         enc::b64,
-        ident::Policy,
         keys::{AppKeys, IdentityKey},
         ops::{
             BatchRef, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, StateAfter, proof_state,
@@ -699,7 +710,8 @@ fn shared_record(
     };
     let identity = IdentityKey::from_secret([1; 32]);
     let app = AppKeys::from_secrets([2; 32], [3; 32]);
-    let policy = Policy::new(read_scope, &["tasks"]);
+    let read_scope = policy.read_scope.clone();
+    let read_scope = read_scope.as_str();
     let put = RecordPut {
         key,
         collection,
@@ -1070,6 +1082,71 @@ async fn test_store_record_taken_from_an_upload_keeps_no_proof() {
     );
     assert_eq!(held.origin.proof(), None);
     assert!(!held.divergent);
+}
+
+#[tokio::test]
+async fn test_store_record_write_of_another_policy_is_refused() {
+    use pubky_switch::store::StoreError;
+    use pubky_switch_core::ident::Policy;
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let key = [0x57; 32];
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&shared_record(key, [1; 32], "tasks", false, 3))
+            .await
+            .expect("put");
+        txn.put_record(&shared_record(key, [1; 32], "tasks", true, 4))
+            .await
+            .expect("put");
+        txn.commit().await.expect("commit");
+    }
+    // A record's collection and policy are fixed at creation (Switch wire 6.2): a write of
+    // another one, a permanent policy over the deleted ordinary record among them (Switch
+    // spec 10.3.1), is refused, and the row keeps what it held.
+    let ordinary = Policy::new("tasks", &["tasks"]);
+    for (collection, policy) in [
+        ([1; 32], ordinary.clone().permanent(None)),
+        ([1; 32], ordinary.clone().permanent(Some(1))),
+        ([1; 32], Policy::new("tasks", &["tasks", "tasks_people"])),
+        ([2; 32], ordinary.clone()),
+    ] {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        let refused = txn
+            .put_record(&record_at_policy(key, collection, policy.clone(), false, 5))
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Corrupt(_))),
+            "{policy:?}: {refused:?}"
+        );
+        drop(txn);
+        let held = record_at(&fx, key).await;
+        assert!(held.state.deleted);
+        assert_eq!(held.state.policy, ordinary);
+        assert_eq!(held.state.collection, [1; 32]);
+    }
+    // The same policy is written as before.
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.put_record(&shared_record(key, [1; 32], "tasks", false, 5))
+        .await
+        .expect("put");
+    txn.commit().await.expect("commit");
+    assert!(!record_at(&fx, key).await.state.deleted);
 }
 
 #[tokio::test]

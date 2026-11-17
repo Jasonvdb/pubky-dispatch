@@ -32,8 +32,8 @@ pub struct Config {
     pub push: PushConfig,
 }
 
-/// Push (Switch spec 9, Switch wire 8): registrations, and the webhooks a `notify` entry
-/// queues for them, sent by the service's background worker.
+/// Push registrations and delivery of webhooks for notifying entries and connect requests
+/// (wire 7.4.7, 8).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PushConfig {

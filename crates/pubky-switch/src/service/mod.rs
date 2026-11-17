@@ -18,10 +18,10 @@
 //! `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
 //! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
 //! `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`,
-//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`. A
-//! `notify` entry's webhooks are queued with it and sent to the relays by a background
-//! worker ([`Service::deliver_pushes_until`]). The freeze, the export and the import are
-//! answered `503 unavailable`.
+//! `PUT` and `GET /v1/{id}/handover`, `POST /v1/{id}/erase`, and `PUT /v1/{id}/push`.
+//! Notifying entries and eligible connect requests queue webhooks in their own transaction.
+//! [`Service::deliver_pushes_until`] sends them to the relays. The freeze, the export and
+//! the import are answered `503 unavailable`.
 //!
 //! An account a restored database brought back after its erasure is erased again at its
 //! judgement, before anything is served or signed for it (Switch wire 7.3, Table 1;
@@ -375,8 +375,8 @@ impl Service {
     /// A service at `origin`, the switch origin `identity.json` names.
     ///
     /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
-    /// run [`Service::deliver_pushes_until`], as the binary does, or the webhooks its
-    /// `notify` entries queue are neither sent nor dropped. [`Service::with_push`] turns it
+    /// run [`Service::deliver_pushes_until`], as the binary does, to send queued webhooks and
+    /// drop those past their minute. [`Service::with_push`] turns it
     /// off.
     pub fn new(
         origin: String,

@@ -452,6 +452,17 @@ A staged/frozen service does not merge them, and a response from a mode that
 ignored record members cannot account for those records. Non-record upload
 stages and the completion/cursor rules remain separate.
 
+Retained evidence acquired after the original loss can instead use the explicit
+[current-history record disposition](record-retention.md) on the same endpoint.
+That mode binds the actual receiving creation, applied identity and carried
+barrier, and authenticates a source newer than the original lost boundary
+through the current generation. It accounts the exact immutable whole input
+only after final value disposition and every required restrictive fact are
+represented. It cannot strip an old proof, substitute another source or infer
+custody from a later head. The ordinary lost-generation upload and dating rules
+remain unchanged. A valid proofless ordinary record may remain unresolved;
+neither submission nor acknowledgment creates positive original authority.
+
 A subsequent provider loss starts a new barrier from that recovery document's
 current apps. No completion from the older position satisfies the new one.
 An export carries the barrier, its originating signed identity document and all

@@ -448,6 +448,14 @@ registration (wire 7.4.14; record lineage 7). Its retained signed source documen
 fixes the lost-generation boundary. This record-only continuation does not
 reopen admission staging or the separate claim/list recovery modes.
 
+[Current-history record retention](record-retention.md) provides an explicit
+record-only disposition for whole retained inputs from a source newer than that
+original boundary through the current generation. Its source application and
+current target bindings are separate. The same matching-only slot strengthening,
+non-recycling allocation, byte bounds and complete per-input accounting apply;
+no proofless candidate gains clean original or initializer authority. It does
+not replace the source or dating rules of ordinary loss uploads.
+
 A current record with its complete required lineage/origin is one indivisible
 upload unit under the existing 16 MiB request cap. Pack whole units, fewer per
 call when necessary; each protected unit is at most 7,864,320 bytes before its
@@ -468,11 +476,15 @@ record operation or certificate. Parts share the upload's 16 MiB body bound.
 Attached origin evidence remains part of its indivisible record input.
 
 Verify each statement against the exact identity-signed source document carried
-as `lost_identity` and named by its `identity_hash`, for this account. The source
+as `lost_identity` and named by its `identity_hash`, for this account, in the
+ordinary loss and retained record-witness modes. The explicitly selected
+current-history mode instead uses record retention 2-3's exact source, applied
+authority and newer-generation range; the complete-part and matching rules
+below remain the same. In the ordinary modes, the source
 document and statement must name the same positive generation, at or before the
 barrier's original lost-generation bound. Thus evidence retained before a clean
 move or an earlier loss can still restrict the current recovery. A current or
-future generation is not eligible. The statement's service signature, snapshot,
+future generation is not eligible in the ordinary modes. The statement's service signature, snapshot,
 canonical slot hash and declared parent key must agree. This standalone rule
 does not date an uploaded record operation: its source-proof generation checks
 remain exactly those of wire 7.4.14. The part's `origin_key` and statement's `origin_key` equal

@@ -225,17 +225,90 @@ impl Signer {
             (statuses, answered_at) = self.switch_apps_at().await?;
         }
         let found = self.removals(&newest, &statuses, answered_at);
+        self.removal_version(&newest, &statuses, answered_at, found)
+            .await?;
+        Ok((true, failures))
+    }
+
+    /// The version after a recovery with the key alone that drops every certificate this
+    /// install doesn't hold (Switch spec 12.8): the apps listed with one are revoked at the
+    /// switch, as the recovery asked, and removed with the rotation every removal makes, with
+    /// any other removal due; a `renewed` entry naming one goes, and messages carrying that
+    /// certificate are refused. No backup of a version naming such a certificate can be
+    /// sealed, so this comes before every other version, closings included. Where a given-up
+    /// rotation sent keys of the next epoch, the removed apps may hold them: the version
+    /// removes them at that epoch, and one more rotation follows.
+    pub(super) async fn remove_unheld(&mut self) -> Result<()> {
+        let failures = self.revoke_at_switch().await?;
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        let held = self.held_certs()?;
+        let unheld: Vec<[u8; 16]> = newest
+            .body()
+            .apps
+            .iter()
+            .filter(|listed| !held.iter().any(|cert| cert.hash() == listed.cert))
+            .map(|listed| listed.app_id)
+            .collect();
+        if let Some((_, error)) = failures.into_iter().find(|(app, _)| unheld.contains(app)) {
+            return Err(error);
+        }
+        let (statuses, answered_at) = self.switch_apps_at().await?;
+        let found = self.removals(&newest, &statuses, answered_at);
+        if unheld
+            .iter()
+            .any(|app| !found.apps.iter().any(|removed| removed.app_id == *app))
+        {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
+            )));
+        }
+        let completing = !found.apps.is_empty() && self.state.epoch_through > newest.data_epoch();
+        self.removal_version(&newest, &statuses, answered_at, found)
+            .await?;
+        if completing {
+            let (statuses, answered_at) = self.switch_apps_at().await?;
+            let next = self
+                .state
+                .newest_doc()?
+                .ok_or(Refusal::NotSetUp)?
+                .data_epoch();
+            self.rotate_through(&statuses, answered_at, next.saturating_add(1))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sign, commit and deliver the version on `newest` that removes the apps of `found`,
+    /// with a rotation to the next data epoch when there are any, and drops every `renewed`
+    /// entry naming a certificate this install doesn't hold (Switch spec 12.2, 12.8), the
+    /// bundles that rotation needs stored first.
+    async fn removal_version(
+        &mut self,
+        newest: &IdentityDoc,
+        statuses: &[AppStatus],
+        answered_at: u64,
+        found: Removals,
+    ) -> Result<()> {
         let removing = found.apps;
-        let last = newest
-            .data_epoch()
-            .checked_add(1)
-            .ok_or(SignerError::Records(RecordsFault::Invariant(
-                "the data epoch can't go higher",
-            )))?;
+        let last = if removing.is_empty() {
+            newest.data_epoch()
+        } else {
+            newest
+                .data_epoch()
+                .checked_add(1)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the data epoch can't go higher",
+                )))?
+        };
+        let held: Vec<[u8; 32]> = self.held_certs()?.iter().map(|cert| cert.hash()).collect();
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
         let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();
-        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, answered_at, &cut, last)?;
+        let (ops, mut alerts) = if removing.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.catch_up(&key, newest, statuses, answered_at, &cut, last)?
+        };
         alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
@@ -244,6 +317,7 @@ impl Signer {
                 body.renewed.retain(|r| r.app_id != removed.app_id);
                 body.removed.push(*removed);
             }
+            body.renewed.retain(|r| held.contains(&r.cert));
             body.data_epoch = last;
         })?;
         drop(key);
@@ -263,10 +337,9 @@ impl Signer {
                 state.cleanup.push(removed.app_id);
             }
         }
-        self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
+        self.commit_batches(state, newest, statuses, alerts, batches, &doc, flow)
             .await?;
-        self.resume().await?;
-        Ok((true, failures))
+        self.resume().await
     }
 
     /// How many attempts the app `app_id` owns that are open or `unknown`, as `GET /apps` lists

@@ -2857,3 +2857,85 @@ async fn test_own_record_unchanged_absolute_member_needs_no_new_timestamp() {
     assert_eq!(app.record(), &before);
     assert_eq!(w.switch.lock().feed_reads, reads);
 }
+
+#[tokio::test]
+async fn test_own_record_lifetime_unchanged_member_retries_pending_bytes() {
+    for fault in [
+        Fault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        },
+        Fault::LoseAnswer {
+            path: "/ops".into(),
+        },
+    ] {
+        let w = World::new();
+        let mut app = w.join_publishing("wallet").await;
+        let day = pubky_switch_core::records::DAY_MS;
+        w.clock.advance_ms(1_000);
+        w.switch.fail_next(fault);
+        app.set_protocol_member_with_lifetime(PROTO, member(json!({ "a": 1 })), Some(day))
+            .await
+            .unwrap_err();
+        let signed = app.record().clone();
+        let policies = app.record_expiries().await.unwrap();
+        assert!(app.state.pending_record.is_some());
+        let id = app.app_id();
+        drop(app);
+        let mut app = w.load_publishing_on(w.store.clone(), id).await;
+        w.clock.advance_ms(1_000);
+        assert_eq!(
+            app.set_protocol_member_with_lifetime(PROTO, member(json!({ "a": 1 })), Some(2 * day),)
+                .await
+                .unwrap(),
+            Publication::Published
+        );
+        assert_eq!(app.record(), &signed);
+        assert_eq!(app.record_expiries().await.unwrap(), policies);
+        assert!(app.state.pending_record.is_none());
+        assert_eq!(w.held(id).as_ref(), Some(&signed));
+        assert_eq!(w.published(id), Some(bytes_of(&signed)));
+    }
+}
+
+#[tokio::test]
+async fn test_own_record_lifetime_reassertion_delivers_after_unanswered_backup() {
+    for fault in [
+        Fault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        },
+        Fault::LoseAnswer {
+            path: "/ops".into(),
+        },
+    ] {
+        let w = World::new();
+        let mut app = w.join_publishing("wallet").await;
+        let id = app.app_id();
+        let day = pubky_switch_core::records::DAY_MS;
+        w.clock.advance_ms(1_000);
+        w.switch.fail_next(fault);
+        app.set_protocol_member_with_lifetime(PROTO, member(json!({ "a": 1 })), Some(day))
+            .await
+            .unwrap_err();
+        let policies = app.record_expiries().await.unwrap();
+        let backup = app.backup().await.unwrap();
+        drop(app);
+        let mut restored = restored_publishing(&w, &backup).await;
+        assert!(restored.state.pending_record.is_none());
+        restored.receive(None).await.unwrap();
+        w.clock.advance_ms(1_000);
+        assert_eq!(
+            restored
+                .set_protocol_member_with_lifetime(PROTO, member(json!({ "a": 1 })), Some(2 * day),)
+                .await
+                .unwrap(),
+            Publication::Published
+        );
+        assert_eq!(w.held(id).as_ref(), Some(restored.record()));
+        assert_eq!(w.published(id), Some(bytes_of(restored.record())));
+        assert_eq!(restored.record_expiries().await.unwrap(), policies);
+        let record = record_of(&restored);
+        assert_eq!(record.expires_at(), Some(record.updated_at() + day));
+    }
+}

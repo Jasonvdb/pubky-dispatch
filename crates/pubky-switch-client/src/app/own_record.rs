@@ -212,9 +212,11 @@ impl App {
     /// Set a protocol member with an expiry measured from the exact `updated_at` the
     /// writer signs, even when the device clock goes back (Switch spec 4.2).
     /// `None` asks for no expiry; the earliest expiry any protocol asked for still wins.
-    /// An unchanged member preserves both the signed bytes and its expiry policy; use
-    /// [`App::renew_record_with_lifetime`] to change only the policy. Removing the member
-    /// clears its policy. Other protocols' members and policies remain unchanged.
+    /// An unchanged member preserves its expiry policy and finishes owed delivery. A
+    /// restored unaccepted record is signed anew; an accepted or pending record keeps
+    /// its signed bytes. Use [`App::renew_record_with_lifetime`] to change only the policy.
+    /// Removing the member clears its policy. Other protocols' members and policies
+    /// remain unchanged.
     ///
     /// The lifetime applies to each new signed record, including changes by another
     /// protocol or a certificate renewal, and is capped by the current identity's record
@@ -258,7 +260,7 @@ impl App {
             }
             if body.protocols.get(&protocol) == member.as_ref() {
                 if preserve_unchanged {
-                    return self.deliver_record().await;
+                    return self.put_own_record(body, false, None).await;
                 }
                 let policies = self.record_expiries().await?;
                 if policies.get(&protocol) == Some(&expiry) && !self.record_needs_new_delivery() {

@@ -2508,14 +2508,15 @@ impl App {
                 self.drop_record_job(item).await?;
                 return Ok(false);
             }
-            if self.stop_record_job(&mut item, &job).await? {
-                if item.complete() {
-                    self.finish_item(&item).await?;
-                }
-                return Ok(false);
-            }
             match self.record_job(&item, &job).await {
-                Ok(()) => item.record_done = true,
+                Ok(None) => item.record_done = true,
+                Ok(Some(deleted)) => {
+                    self.stop_record_job(&mut item, &job, deleted).await?;
+                    if item.complete() {
+                        self.finish_item(&item).await?;
+                    }
+                    return Ok(false);
+                }
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
                     if let Some(batch_id) = error.kept_batch() {
@@ -2667,25 +2668,17 @@ impl App {
         self.commit(tx).await
     }
 
-    /// Stop the record job of `item` when the app took a delete of its record that the
-    /// job wasn't queued against: the job builds the record's next value from what the
-    /// protocol saw, so it never writes over a delete the protocol hasn't seen (Switch spec
-    /// 10.3). In one commit with [`AppEvent::RecordJobStopped`], which names the record and
-    /// the delete, so the protocol decides again. Returns whether it stopped.
+    /// Stop the record job of `item` at `deleted`, a delete of its record the job wasn't
+    /// queued against ([`App::record_job`]): in one commit with
+    /// [`AppEvent::RecordJobStopped`], which names the record and the delete, so the
+    /// protocol decides again.
     async fn stop_record_job(
         &mut self,
         item: &mut OutboxItem,
         job: &KeptJob,
-    ) -> Result<bool, AppError> {
+        deleted: pubky_switch_core::ops::RecordVersion,
+    ) -> Result<(), AppError> {
         let key = self.record_key(&job.job().target)?;
-        let Some(deleted) = self
-            .held_record(&key)
-            .await?
-            .and_then(|held| held.delete_base())
-            .filter(|now| job.delete_base != Some(*now))
-        else {
-            return Ok(false);
-        };
         item.record = None;
         item.record_done = true;
         let mut tx = self.tx()?;
@@ -2701,8 +2694,7 @@ impl App {
                 version: deleted.version,
             },
         )?;
-        self.commit(tx).await?;
-        Ok(true)
+        self.commit(tx).await
     }
 
     /// A complete item leaves the outbox; its sent message is kept from its acceptance.
@@ -3118,8 +3110,14 @@ impl App {
     }
 
     /// The record job: the protocol builds the record's next value from what the app holds,
-    /// written compare-and-swap.
-    async fn record_job(&mut self, item: &OutboxItem, job: &KeptJob) -> Result<(), AppError> {
+    /// written compare-and-swap, from the delete the job was queued against
+    /// ([`App::update_record_on`]). It never writes over another delete, which the protocol
+    /// hasn't seen (Switch spec 10.3): at any try it returns that delete instead.
+    async fn record_job(
+        &mut self,
+        item: &OutboxItem,
+        job: &KeptJob,
+    ) -> Result<Option<pubky_switch_core::ops::RecordVersion>, AppError> {
         let kept = self.read_sent(&item.msg_id).await?;
         let sent = SentMessage {
             to: item.to,
@@ -3135,13 +3133,18 @@ impl App {
                 .map(SentStored::resent_ascending)
                 .unwrap_or_default(),
         };
+        let base = Some(job.delete_base);
         let job = job.job();
         let protocols = self.protocols.clone();
-        self.update_record(&job.target, Vec::new(), |current| {
-            protocols.sent_record(&job, &sent, current)
+        let updated = self
+            .update_record_on(&job.target, Vec::new(), base, |current| {
+                protocols.sent_record(&job, &sent, current)
+            })
+            .await?;
+        Ok(match updated {
+            super::records::Updated::Written(_) => None,
+            super::records::Updated::Stopped { deleted, .. } => Some(deleted),
         })
-        .await?;
-        Ok(())
     }
 }
 

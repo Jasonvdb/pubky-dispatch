@@ -209,8 +209,9 @@ fn conflict(result: Result<CheckedResponse, ClientError>) -> Value {
 }
 
 /// A create at a key whose delete the service keeps is refused with that delete as current;
-/// a write naming the delete applies. A write naming a version at a key the service never
-/// held shows version 0, with no view. Without the rule the create applies over the delete.
+/// a write naming the delete applies. A write or a `record_current` naming a key the
+/// service never held shows version 0, with no view. Without the rule the create applies
+/// over the delete.
 async fn create_against_a_retained_delete(world: &World) {
     let (who, mut signer) = enrolled(world).await;
     let w = joined(world, &who, &mut signer, "wallet", ORIGIN).await;
@@ -236,6 +237,17 @@ async fn create_against_a_retained_delete(world: &World) {
         })
     );
     assert_ne!(never_key, key);
+    // A `record_current` there fails with version 0 current too.
+    let named = Condition::RecordCurrent {
+        key: never_key,
+        revision: revision(&deleted),
+        deleted: true,
+    };
+    let guarded = w.put(b"other", RecordVersion::NONE, b"{}");
+    assert_eq!(
+        conflict(w.post(6, vec![named], guarded).await),
+        json!({"record_version": {"key": b64(&never_key), "generation": 0, "version": 0}})
+    );
 }
 
 /// A delete at v, a put-back naming v, and a third writer's create at `{0, 0}`: the create

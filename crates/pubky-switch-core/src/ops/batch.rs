@@ -447,7 +447,8 @@ pub trait ConditionState {
 /// `409 conflict` at the first that fails, with the current value the caller may read
 /// (Switch wire 7.6): `{ "record_version": { "key", "generation", "version" } }`, `{
 /// "claim_step": { "claim_key", "step" }, "claim": view | null }`, `{ "record_view": view }`
-/// for an exact-current guard, or `{ "server_time" }`, and `{}` for what it may not read.
+/// for an exact-current guard, or the `record_version` at `{0, 0}` when the service holds
+/// nothing at its key, or `{ "server_time" }`, and `{}` for what it may not read.
 pub fn check_conditions<'a>(
     conditions: impl IntoIterator<Item = &'a Condition>,
     state: &impl ConditionState,
@@ -464,14 +465,19 @@ pub fn check_conditions<'a>(
                     revision: *revision,
                     deleted: *deleted,
                 };
-                (state.record_current(key) != Some(expected)).then(|| {
-                    if state.may_read_record(key) {
-                        state
-                            .record_view(key)
-                            .map_or_else(|| json!({}), |view| json!({ "record_view": view }))
-                    } else {
-                        json!({})
-                    }
+                let held = state.record_current(key);
+                (held != Some(expected)).then(|| match held {
+                    // Nothing held: version 0, which a writer naming a write the service
+                    // forgot since builds on next (Switch wire 6.3).
+                    None => json!({ "record_version": {
+                        "key": b64(key),
+                        "generation": 0,
+                        "version": 0,
+                    } }),
+                    Some(_) if state.may_read_record(key) => state
+                        .record_view(key)
+                        .map_or_else(|| json!({}), |view| json!({ "record_view": view })),
+                    Some(_) => json!({}),
                 })
             }
             Condition::RecordVersion { key, version } => {
@@ -1221,16 +1227,26 @@ mod tests {
             let refused = check_conditions([&changed], &state).unwrap_err();
             assert_eq!(refused.status(), 409, "case {case}");
         }
-        let missing = CurrentState {
-            held: None,
-            ..state
-        };
-        assert_eq!(
-            check_conditions([&condition], &missing)
-                .unwrap_err()
-                .status(),
-            409
-        );
+        // Nothing held: version 0 is current, also to a caller that may not read the key's
+        // record, as for any key the service holds nothing for.
+        for readable in [true, false] {
+            let refused = check_conditions(
+                [&condition],
+                &CurrentState {
+                    key: [3; 32],
+                    held: None,
+                    readable,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(refused.status(), 409);
+            assert_eq!(
+                refused.current,
+                Some(
+                    json!({"record_version": {"key": b64(&[3; 32]), "generation": 0, "version": 0}})
+                )
+            );
+        }
     }
 
     #[test]

@@ -724,8 +724,8 @@ The switch offers two generic primitives: **claims** and **shared records**. It 
 
 - **Operations and transition proofs.** Every change is an **operation**: a JSON body signed by its writer (an app, or the signer) that names the object, the change and its conditions (Section 13.5). The service validates the operation, gives it a `seq`, links it into the chain and returns a **transition proof**, signed with its service key, with the resulting state (Section 13.6). Changes the service makes itself, such as recording a revocation or a recovery, are service-signed transitions in the chain.
 - **Conditions.** An operation may carry conditions, checked atomically with it against the state before its batch. There are four:
-  - `record_version(K) == v`: v is the version of the record's current write, a delete included, or 0 when the service holds nothing at K;
-  - `record_current(K) == (r, d)`: the service holds a record at K whose current write is the application r, named by its generation, `seq` and operation hash, and whose deletion state is d; a key the service holds nothing for fails it. So a write prepared against one write of a record, a delete included, can't apply over a later one (`spec/wire-format.md` Section 6.3);
+  - `record_version(K) == v`: v is the version of the record's current write, a delete included, or 0 when the service holds nothing at K; when that write was taken from a recovery upload, v holds only beside a `record_current` of the same operation naming it, since two uploads can share a version (Section 12.6 step 3);
+  - `record_current(K) == (r, d)`: the service holds a record at K whose current write is the application r, named by its generation, `seq` and operation hash, and whose deletion state is d; a key the service holds nothing for fails it, with version 0 as current. So a write prepared against one write of a record, a delete included, can't apply over a later one (`spec/wire-format.md` Section 6.3);
   - `claim_step(K) == n`;
   - `server_time_in(start, end)`: the service's time when it applies the operation lies in `[start, end)`; either bound may be null.
 

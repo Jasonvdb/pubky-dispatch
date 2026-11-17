@@ -821,6 +821,18 @@ enum Refused {
     Unheld(Collection),
 }
 
+/// What [`App::update_record_on`] came to.
+pub(crate) enum Updated {
+    /// The record written, or `None` when `change` changed nothing.
+    Written(Option<SharedRecord>),
+    /// Stopped at `deleted`, a delete other than the call's base, before anything was
+    /// written over it; `last` is the conflict a try met before, if one did.
+    Stopped {
+        deleted: RecordVersion,
+        last: Option<AppError>,
+    },
+}
+
 /// What reading a write came to ([`App::read_write`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteRead {
@@ -2933,10 +2945,11 @@ impl App {
     /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
     /// message's record job waits the same way.
     ///
-    /// A try built on a value never turns into a create over a delete: when the read after
-    /// its `409 conflict` shows the record deleted, or nothing at the switch, the call
-    /// returns that conflict instead of calling `change` with `None`, and the caller decides
-    /// again from what the app now holds (Switch spec 10.3).
+    /// The call never writes over a delete `change` wasn't asked on: when a try finds the
+    /// record built on another delete than the one the call started from, or a delete where
+    /// it started from a value or from nothing, it returns the `409 conflict` it last met
+    /// instead of calling `change` with `None`, and the caller decides again from what the
+    /// app now holds (Switch spec 10.3).
     ///
     /// **Worst case.** At most four tries, a further one only while the call's time budget
     /// isn't spent ([`super::AppConfig::call_budget_ms`], 20 s by default). The call reads
@@ -2958,53 +2971,82 @@ impl App {
         &mut self,
         target: &RecordTarget,
         conditions: Vec<Condition>,
-        mut change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
+        change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
     ) -> Result<Option<SharedRecord>, AppError> {
         Box::pin(async move {
-            let key = self.record_key(target)?;
-            let budget = self.begin_budget();
-            let mut last = None;
-            let mut built_on_value = false;
-            for attempt in 0..UPDATE_TRIES {
-                // A further try only within the call's time budget: past it the call
-                // returns the conflict it last met.
-                if attempt > 0 && self.spent(&budget) {
-                    break;
-                }
-                let current = self.shared_record(&key).await?;
-                let live = current
-                    .as_ref()
-                    .is_some_and(|r| r.content != RecordContent::Deleted);
-                if built_on_value && !live {
-                    break;
-                }
-                built_on_value = live;
-                if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
-                    return Err(Refusal::NotNow(
-                        "Switch spec 3.5: the record's value is sealed under a key the app \
-                         doesn't hold yet"
-                            .into(),
-                    )
-                    .into());
-                }
-                let value = current.as_ref().and_then(|r| r.content.value());
-                let Some(next) = change(value) else {
-                    return Ok(None);
-                };
-                match self
-                    .write_record(target, Some(&next), conditions.clone(), attempt > 0)
-                    .await
-                {
-                    Ok(record) => return Ok(Some(record)),
-                    Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
-                    Err(error) => return Err(error),
-                }
+            match self
+                .update_record_on(target, conditions, None, change)
+                .await?
+            {
+                Updated::Written(record) => Ok(record),
+                Updated::Stopped { last, .. } => Err(last.unwrap_or_else(|| {
+                    AppError::Switch(ClientError::Usage(
+                        "the record was deleted since the call began".into(),
+                    ))
+                })),
             }
-            Err(last.unwrap_or_else(|| {
-                AppError::Switch(ClientError::Usage("the record kept changing".into()))
-            }))
         })
         .await
+    }
+
+    /// [`App::update_record`] from `base`, the delete the record's next write built on when
+    /// its caller decided to write (`Some(None)` for none), or, for `None`, the one it
+    /// builds on when the call begins. Each try first compares the delete the next write
+    /// would build on with that base ([`HeldRecord::delete_base`]): another one, also a
+    /// delete where the base was none, stops the call before anything is written over it
+    /// (Switch spec 10.3). A delete the service forgot since still counts as that delete.
+    pub(crate) async fn update_record_on(
+        &mut self,
+        target: &RecordTarget,
+        conditions: Vec<Condition>,
+        base: Option<Option<RecordVersion>>,
+        mut change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
+    ) -> Result<Updated, AppError> {
+        let key = self.record_key(target)?;
+        let budget = self.begin_budget();
+        let mut last = None;
+        let mut base = base;
+        for attempt in 0..UPDATE_TRIES {
+            // A further try only within the call's time budget: past it the call returns
+            // the conflict it last met.
+            if attempt > 0 && self.spent(&budget) {
+                break;
+            }
+            let now = self
+                .held_record(&key)
+                .await?
+                .and_then(|held| held.delete_base());
+            let from = *base.get_or_insert(now);
+            if let Some(deleted) = now
+                && from != now
+            {
+                return Ok(Updated::Stopped { deleted, last });
+            }
+            let current = self.shared_record(&key).await?;
+            if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
+                return Err(Refusal::NotNow(
+                    "Switch spec 3.5: the record's value is sealed under a key the app \
+                     doesn't hold yet"
+                        .into(),
+                )
+                .into());
+            }
+            let value = current.as_ref().and_then(|r| r.content.value());
+            let Some(next) = change(value) else {
+                return Ok(Updated::Written(None));
+            };
+            match self
+                .write_record(target, Some(&next), conditions.clone(), attempt > 0)
+                .await
+            {
+                Ok(record) => return Ok(Updated::Written(Some(record))),
+                Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            AppError::Switch(ClientError::Usage("the record kept changing".into()))
+        }))
     }
 
     /// A chain item of the shared state in the feed: a record write, a claim entry, a list

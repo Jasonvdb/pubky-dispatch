@@ -3555,9 +3555,9 @@ fn test_activation_peers_and_floors() {
     refused(f.run_with(&sorted(parts)), ErrorCode::BadSignature, "");
 }
 
-fn record_revision(stub: &crate::chain::Stub) -> crate::record_authority::ApplicationRef {
+fn record_revision(stub: &crate::chain::Stub) -> crate::shared::ApplicationRef {
     let env = stub.open().unwrap();
-    crate::record_authority::ApplicationRef {
+    crate::shared::ApplicationRef {
         generation: env.generation,
         seq: env.seq,
         item_hash: env.item_hash,

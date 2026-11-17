@@ -15,8 +15,6 @@ The design is still open to review. It may change before it is frozen. The spec'
 | [`spec.md`](spec.md) | The specification. It decides behaviour: identities, apps and their keys, certificates and scopes, messages, the service and its API, admission, claims and shared records, push, delivery, the lifecycle of apps and identities (revocation, restore, moves, erasure, the hand-over to another signer and its backup), threat model and guarantees. Start here. |
 | [`wire-format.md`](wire-format.md) | The wire format. It decides bytes: encodings, signatures, documents, envelopes, operations, the chain, the HTTP API, push, limits, and export and import, so that a second team can build a compatible switch, signer or app. |
 | [`account-binding.md`](account-binding.md) | Normative account-creation request binding, authenticated discovery, enrollment intent and exact retry association. |
-| [`record-lineage.md`](record-lineage.md) | Normative shared-record conditions, bounded deletion evidence, current statements, recovery witnesses and protective-effect acknowledgment. |
-| [`record-origins.md`](record-origins.md) | Normative protected policies, non-recycling origins, atomic child initialization, byte bounds, transfer and current-birth submission. |
 | [`vectors/`](vectors/) | Test vectors for the wire format, as JSON files. Its `README.md` lists the files and how they were made. |
 
 ## Shared separately

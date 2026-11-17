@@ -1196,3 +1196,76 @@ async fn test_key_provider_loss_confirmation_restores_nothing() {
     assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
     assert_eq!(stored(&world, &store), (None, None));
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_takes_an_earlier_time_for_a_removed_app() {
+    // The copy built on removes an app from a later time than the one a backup shows the
+    // user picked for its revocation: the version signed distrusts it from the earlier one.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 62).await;
+    let id = app.keys.app_id_bytes();
+    let picked = START_MS - 7_200_000;
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    old.revoke(id, Some(picked), confirmed()).await.unwrap_err();
+    old.set_record_max_age(Some(60)).await.unwrap();
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let mut body = doc.body().clone();
+    body.version += 1;
+    body.apps.retain(|a| a.app_id != id);
+    body.removed.push(pubky_switch_core::records::RemovedApp {
+        app_id: id,
+        distrust_from: START_MS,
+    });
+    let removing = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(removing.signed()).unwrap());
+    let (service, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let removed = signer.identity_doc().unwrap().unwrap().body().removed.clone();
+    assert_eq!(
+        removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+        picked
+    );
+    signs_at(&world, &service, &mut signer, 1).await;
+    let later = world.published().unwrap();
+    assert_eq!(
+        later.body().removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+        picked
+    );
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_takes_the_earlier_of_a_departure_and_a_revocation() {
+    // The account's service shows an app departed, then revoked later: the earlier time is
+    // the one it is distrusted from.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 64).await;
+    let id = app.keys.app_id_bytes();
+    drop(old);
+    let departed = pubky_switch_client::clock::Clock::now_ms(world.clock.as_ref());
+    world.switch.leave(id).unwrap();
+    world.clock.advance_ms(3_600_000);
+    world.switch.revoke(id).unwrap_or_default();
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let (_, router) = picked_service(&world);
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!(
+        shown.apps,
+        vec![(
+            id,
+            AppFate::RemovedAtSwitch {
+                distrust_from: Some(departed)
+            }
+        )]
+    );
+}

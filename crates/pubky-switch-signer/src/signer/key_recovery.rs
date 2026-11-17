@@ -105,6 +105,9 @@ pub struct KeyRecoverySurvey {
     discovery: Vec<u8>,
     /// The earlier certificates in `renewed` that go, by document hash.
     certs_dropped: Vec<[u8; 32]>,
+    /// For apps the copy removes, the earlier times picked to distrust them from, which the
+    /// version signed takes.
+    earlier: Vec<RemovedApp>,
     /// The highest version any source showed, which the version signed is above.
     versions: u64,
     digest: [u8; 32],
@@ -261,6 +264,8 @@ struct Fates {
     certs_dropped: Vec<[u8; 32]>,
     revoked: Vec<[u8; 16]>,
     picked: Vec<RemovedApp>,
+    /// For apps the copy removes, the earlier times picked than its `removed` entries'.
+    earlier: Vec<RemovedApp>,
     certs: Vec<AppCert>,
     not_found: Vec<[u8; 16]>,
 }
@@ -278,7 +283,7 @@ impl Fates {
                 .apps
                 .iter()
                 .filter(|status| status.app_id == *app_id)
-                .filter_map(|status| status.revoked_at.or(status.departed_at))
+                .flat_map(|status| status.revoked_at.into_iter().chain(status.departed_at))
                 .min();
             let earliest = match (*distrust_from, at_switch) {
                 (Some(picked), Some(shown)) => Some(picked.min(shown)),
@@ -345,6 +350,7 @@ impl KeyRecoverySurvey {
             copy: copy.hash(),
             discovery: discovery_of(observation),
             certs_dropped: fates.certs_dropped.clone(),
+            earlier: fates.earlier.clone(),
             versions,
             digest: [0; 32],
         };
@@ -684,6 +690,7 @@ impl Signer {
             delivered_at: None,
         });
         // No content is added, so the plain cap: the copy was measured with the headroom.
+        state.earlier_distrust.clone_from(&plan.survey.earlier);
         let body = Self::body_on(&state, &plan.copy, |_| {}, Room::Cap)?;
         let doc = {
             let key = gate::signing_key(&self.keyring, &state, &self.store)?;
@@ -940,6 +947,16 @@ impl Signer {
             renewals_dropped,
             certs_dropped,
             revoked,
+            earlier: picked
+                .iter()
+                .filter(|p| {
+                    copy.body()
+                        .removed
+                        .iter()
+                        .any(|r| r.app_id == p.app_id && p.distrust_from < r.distrust_from)
+                })
+                .copied()
+                .collect(),
             picked,
             certs,
             not_found,
@@ -1361,6 +1378,7 @@ impl Signer {
                 copy: [0; 32],
                 discovery: discovery_of(&observation),
                 certs_dropped: Vec::new(),
+                earlier: Vec::new(),
                 versions: versions.max(floor),
                 digest: [0; 32],
             };
@@ -1470,6 +1488,7 @@ impl Signer {
         state.epoch_through = state
             .epoch_through
             .max(found.local.epoch_through.unwrap_or(0));
+        state.earlier_distrust.clone_from(&plan.survey.earlier);
         state.recovering = true;
         state.lost_generation = Some(plan.lost);
         state.recovery_origin = Some(to.to_owned());
@@ -1576,7 +1595,13 @@ fn revoked_for_good(
         times.extend(doc.body().removed.iter().copied());
     }
     let mut picked: Vec<RemovedApp> = Vec::new();
-    for time in times.into_iter().filter(|t| listed(&t.app_id)) {
+    // For an app the copy lists, and one it removes: an earlier time than its `removed`
+    // entry's is a time the user picked, and the version signed takes it.
+    let removes = |app: &[u8; 16]| copy.body().removed.iter().any(|r| &r.app_id == app);
+    for time in times
+        .into_iter()
+        .filter(|t| listed(&t.app_id) || removes(&t.app_id))
+    {
         match picked.iter_mut().find(|p| p.app_id == time.app_id) {
             Some(earlier) => earlier.distrust_from = earlier.distrust_from.min(time.distrust_from),
             None => picked.push(time),
@@ -1762,6 +1787,9 @@ fn digest_of(survey: &KeyRecoverySurvey) -> [u8; 32] {
         survey.copy.to_vec(),
         survey.certs_dropped.concat(),
     ];
+    for earlier in &survey.earlier {
+        parts.push([&earlier.app_id[..], &u64be(earlier.distrust_from)].concat());
+    }
     for (app, fate) in &survey.apps {
         let fate = match fate {
             AppFate::Stays => vec![0],
@@ -1875,6 +1903,10 @@ mod tests {
             copy: [7; 32],
             discovery: vec![0],
             certs_dropped: vec![[12; 32]],
+            earlier: vec![RemovedApp {
+                app_id: [16; 16],
+                distrust_from: 7,
+            }],
             versions: 4,
             digest: [0; 32],
         };
@@ -1902,6 +1934,7 @@ mod tests {
             |s| s.identity = [14; 32],
             |s| s.discovery = vec![1],
             |s| s.certs_dropped = vec![[15; 32]],
+            |s| s.earlier[0].distrust_from = 6,
         ];
         let mut digests = vec![digest_of(&survey)];
         for change in changes {

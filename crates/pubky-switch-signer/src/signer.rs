@@ -958,6 +958,17 @@ impl Signer {
         body.version = version;
         body.signer = state.install;
         change(&mut body);
+        // A removed app's earlier time a recovery with the key alone found is taken: it only
+        // ever trusts the app less (Switch spec 12.8).
+        for removed in &mut body.removed {
+            if let Some(earlier) = state
+                .earlier_distrust
+                .iter()
+                .find(|e| e.app_id == removed.app_id)
+            {
+                removed.distrust_from = removed.distrust_from.min(earlier.distrust_from);
+            }
+        }
         // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
         Self::measured(state, body, Some(base.hash()), room)
     }

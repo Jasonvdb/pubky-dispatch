@@ -525,7 +525,7 @@ pub enum AppEvent {
     /// A renewed certificate was seen in the feed; it is taken once the own
     /// `identity.json` lists it (Switch spec 3.2).
     RenewalSeen,
-    /// The app took its renewed certificate and delivered its record with it.
+    /// The app saved its renewed certificate and app record. Record delivery may still be pending.
     CertificateTaken {
         /// The new certificate's `issued_at`.
         issued_at: u64,
@@ -733,9 +733,10 @@ pub enum AppEvent {
         /// The owed protocol calls left behind.
         owed_calls: u64,
     },
-    /// The account the app used is gone: the service answers as for an identity it doesn't
-    /// host and the identity publishes no `identity.json`, at every try of the wait (Switch
-    /// spec 12.7, [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
+    /// With no `identity.json` published and no later generation known, the app marks its
+    /// account erased on a verified not-hosted answer to its request, without waiting.
+    /// An unverified `404` with the same absence must recur over the wait (Switch spec 12.7,
+    /// [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
     /// commit that marks the app gone: the app reads nothing more, and the protocol learns
     /// its account is gone, at least once, whenever the host next takes its events. Once
     /// the account is seen alive again ([`AppEvent::AccountBack`]), an `AccountGone` not yet

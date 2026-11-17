@@ -1,15 +1,13 @@
 //! The push delivery queue (Switch spec 9 step 4, Switch wire 8.2): one row per webhook owed,
-//! queued with its `notify` entry and sent by a background worker (`service::webhooks`).
+//! queued with its notifying entry or connect request and sent by `service::webhooks`.
 //!
 //! - **Timed by the database's clock:** every time a row holds (its entry, when it is due,
 //!   its lease) is the database's `statement_timestamp()` in milliseconds, read once by each
 //!   statement, never the service host's own clock, so two processes whose clocks disagree in
-//!   an overlap still agree on when a row is due, leased or past its minute. The service's trusted time is only the
-//!   webhook's `ts`.
-//! - **Queued** in the append's transaction, one row per handle of each target app's
-//!   registration, at most [`PUSH_PER_HOST`] toward one relay host
-//!   ([`AccountTxn::queue_pushes`]), so a row exists only if its entry commits, and nothing is
-//!   sent during the append.
+//!   an overlap still agree on when a row is due, leased or past its minute. The webhook timestamp
+//!   and the interval between connect wake-ups use service time.
+//! - **Queued** in the transaction that kept the entry or request, one row per registered
+//!   handle of each target app and at most [`PUSH_PER_HOST`] toward one host (wire 8.2).
 //! - **Claimed** by one claim at a time ([`Store::claim_pushes`]): under one advisory lock
 //!   that every claim takes, so they run one at a time, and `FOR UPDATE SKIP
 //!   LOCKED`; then a lease of [`PUSH_LEASE_MS`], committed before anything is sent. An account
@@ -360,14 +358,35 @@ impl AccountTxn {
     /// target apps, for a `notify` entry (Switch wire 8.2), at most [`PUSH_PER_HOST`] toward
     /// one relay host, due at once by the database's clock. Returns how many were queued.
     pub async fn queue_pushes(&mut self, targets: &[[u8; 16]]) -> Result<u64, StoreError> {
+        self.queue_target_handles(targets, None).await
+    }
+
+    /// Queue connect wake-ups at most once per app in 60 seconds of service time (wire 7.4.7).
+    pub(crate) async fn queue_connect_pushes(
+        &mut self,
+        targets: &[[u8; 16]],
+        at_ms: u64,
+    ) -> Result<u64, StoreError> {
+        self.queue_target_handles(targets, Some(super::to_db(at_ms, "connect push time")?))
+            .await
+    }
+
+    async fn queue_target_handles(
+        &mut self,
+        targets: &[[u8; 16]],
+        connect_at_ms: Option<i64>,
+    ) -> Result<u64, StoreError> {
         let id = self.head().id.clone();
         let targets: Vec<Vec<u8>> = targets.iter().map(|app| app.to_vec()).collect();
         let registrations: Vec<Target> = sqlx::query_as(
             "SELECT app_id, push_key_id, relay_url, handles FROM push_registrations \
-             WHERE account_id = $1 AND app_id = ANY($2) ORDER BY app_id",
+             WHERE account_id = $1 AND app_id = ANY($2) \
+             AND ($3::bigint IS NULL OR app_id NOT IN (SELECT app_id FROM apps \
+                 WHERE account_id = $1 AND last_connect_push_ms > $3)) ORDER BY app_id",
         )
         .bind(&id)
         .bind(&targets)
+        .bind(connect_at_ms.map(|now| now - 60_000))
         .fetch_all(self.conn())
         .await
         .map_err(StoreError::from_db)?;
@@ -375,7 +394,7 @@ impl AccountTxn {
         if apps.is_empty() {
             return Ok(0);
         }
-        Ok(sqlx::query(concat!(
+        let queued = sqlx::query(concat!(
             "INSERT INTO push_deliveries (account_id, app_id, push_key_id, handle, entry_at_ms, \
              next_attempt_ms) SELECT $1, t.app_id, t.push_key_id, t.handle, ",
             db_now_ms!(),
@@ -390,7 +409,20 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?
-        .rows_affected())
+        .rows_affected();
+        if let Some(now) = connect_at_ms {
+            sqlx::query(
+                "UPDATE apps SET last_connect_push_ms = $3 \
+                 WHERE account_id = $1 AND app_id = ANY($2)",
+            )
+            .bind(&id)
+            .bind(&apps)
+            .bind(now)
+            .execute(self.conn())
+            .await
+            .map_err(StoreError::from_db)?;
+        }
+        Ok(queued)
     }
 
     /// Drop the queued deliveries of `app` whose handle `keep` doesn't hold, all of them when

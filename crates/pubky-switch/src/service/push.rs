@@ -1,9 +1,8 @@
 //! `PUT /v1/{id}/push` (Switch spec 9, Switch wire 8.1): an own app starts a push
 //! registration, at most one per app, and sets its handles.
 //!
-//! A `notify` entry queues a webhook to each of the app's handles, sent by the delivery
-//! worker (8.2, `service::webhooks`); a replacement or a new list of handles drops the ones
-//! queued for what it lets go.
+//! A notifying entry or an eligible connect request queues a webhook per target handle
+//! (wire 7.4.7, 8.2). A replacement or a change of handles drops deliveries for old handles.
 //!
 //! - **Before the lock**, after the app's request verified: the body is read and checked
 //!   (`400`): its form, at most 8 handles, none on a start, no `replaces` with `push_key`, and

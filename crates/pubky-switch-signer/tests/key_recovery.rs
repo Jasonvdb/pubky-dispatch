@@ -109,13 +109,13 @@ async fn racer_won_and_lost(world: &World) -> [u8; 16] {
     install
 }
 
-/// A backup holding `doc`, of the account the backup on the Homeserver names.
-fn backup_holding(world: &World, doc: &IdentityDoc) -> Vec<u8> {
+/// A backup holding `doc` and `revoked`, of the account the backup on the Homeserver names.
+fn backup_holding(world: &World, doc: &IdentityDoc, revoked: &[[u8; 16]]) -> Vec<u8> {
     let records = pubky_switch_core::records::SignerRecords::new(
         pubky_switch_core::keys::IdentityKey::from_secret(SECRET),
         doc.clone(),
         world.backup().account_created(),
-        &[],
+        revoked,
         &[],
         pubky_switch_core::records::Limits::default(),
         &[],
@@ -1019,7 +1019,7 @@ async fn test_key_recovery_rule_3_refuses_a_copy_above_the_services() {
                 let ahead = IdentityDoc::sign(&world.key, body).unwrap();
                 world
                     .homeserver
-                    .set(SIGNER_BACKUP_PATH, backup_holding(&world, &ahead));
+                    .set(SIGNER_BACKUP_PATH, backup_holding(&world, &ahead, &[]));
             }
             _ => {
                 world
@@ -1031,7 +1031,7 @@ async fn test_key_recovery_rule_3_refuses_a_copy_above_the_services() {
                 let higher = IdentityDoc::sign(&world.key, body).unwrap();
                 world
                     .homeserver
-                    .set(SIGNER_BACKUP_PATH, backup_holding(&world, &higher));
+                    .set(SIGNER_BACKUP_PATH, backup_holding(&world, &higher, &[]));
             }
         }
         let seen = match case {
@@ -2202,6 +2202,68 @@ async fn test_key_recovery_provider_loss_backup_waits_for_the_removal() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_counts_retained_revocations_before_taking_new_ids() {
+    let world = World::new();
+    let (mut first, _) = world.enrolled().await;
+    let older = first.identity_doc().unwrap().unwrap();
+    let (app, _) = joined(&world, &mut first, 3).await;
+    revoked_and_purged(&mut first, &app).await;
+    let served = first.identity_doc().unwrap().unwrap();
+    drop(first);
+
+    // Only the service still lists the revoked app. A signer with room takes its ID.
+    let store = Arc::new(MemoryStore::new());
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &older, &[]));
+    let shown = survey(&world, &store).await.unwrap();
+    assert_eq!(shown.revoked, [app.keys.app_id_bytes()]);
+
+    // This backup already accounts for more than seven eighths of a move's enrollment.
+    // Its revocations stay, and recovering again leaves room to approve a new app.
+    let retained: Vec<_> = (0..6_000_u128).map(u128::to_be_bytes).collect();
+    let bytes = pubky_switch_core::records::Enrollment::max_request_len(
+        &served.body().policy,
+        Some(served.signed()),
+        &retained,
+    )
+    .unwrap();
+    let limit = pubky_switch_core::http::body_cap("POST", "/v1/enroll").unwrap();
+    assert!((limit - limit / 8..limit).contains(&bytes));
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        backup_holding(&world, &older, &retained),
+    );
+    let shown = survey(&world, &store).await.unwrap();
+    assert_eq!(shown.revoked.len(), retained.len());
+    assert_eq!(shown.revoked, retained);
+    let mut signer = Signer::restore_new(
+        world.env(store),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let again = signer.survey_key_recovery().await.unwrap();
+    assert_eq!(again.revoked, retained);
+    signer
+        .restore(KeyRecoveryConfirmed::shown_and_confirmed(&again, &[]))
+        .await
+        .unwrap();
+    let mut saved = world.backup().revoked_apps().to_vec();
+    saved.sort_unstable();
+    assert_eq!(saved, retained);
+    joined(&world, &mut signer, 5).await;
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_leaves_room_for_the_identitys_own_versions() {
     // The service shows ten thousand App IDs revoked that no copy names: the recovery takes
     // no more than leave room for the identity's own later versions, and a new app is
@@ -2449,7 +2511,7 @@ async fn test_key_recovery_past_a_backup_naming_a_service_gone() {
     let former = IdentityDoc::sign(&world.key, body).unwrap();
     world
         .homeserver
-        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &former));
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &former, &[]));
     let router = Arc::new(Router::new());
     router.add_switch(pubky_switch_client::testing::SWITCH_ORIGIN, &world.switch);
     let store = Arc::new(MemoryStore::new());
@@ -2482,7 +2544,7 @@ async fn test_key_recovery_waits_out_its_own_service_failing_for_now() {
     drop(first);
     world
         .homeserver
-        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &doc));
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &doc, &[]));
     let store = Arc::new(MemoryStore::new());
     let shown = survey(&world, &store).await.unwrap();
     world.switch.fail_next(SwitchFault::Unreachable {

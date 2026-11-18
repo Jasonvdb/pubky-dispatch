@@ -152,6 +152,49 @@ async fn test_sender_document_older_copy_leaves_the_held_copy_stale() {
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 4);
 }
 
+/// The copy held doesn't list an entry's renewed certificate at 9m59s of age, and the read
+/// again takes two seconds and gives an older copy: the copy is judged when the read ends,
+/// past its 10 minutes, so the entry is held, not dropped, and kept once a read gives the
+/// renewal.
+#[tokio::test]
+async fn test_sender_document_read_again_past_the_ten_minutes_holds_the_entry() {
+    let w = World::new();
+    let mut app = app_holding_bobs_document(&w).await;
+    let bob = w.bob.public();
+    let older = w.homeserver.identity_doc(&bob).unwrap();
+    let mut body = older.body().clone();
+    body.version += 1;
+    let newer = IdentityDoc::sign(&w.bob, body).unwrap();
+    w.homeserver.publish(&newer).unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS);
+    let (seq, _) = w.note(app.app_id(), "read the newer copy");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    w.homeserver.publish(&older).unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS - 1_000);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
+    let seq = note_under(&w, &renewed, app.app_id(), "under the renewal");
+    w.homeserver.slow_reads(bob, Arc::clone(&w.clock), 2_000);
+    let reads = w.homeserver.identity_reads(&bob);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
+    assert!(held(&report.events, seq), "{:?}", report.events);
+    assert!(!dropped_at_check_7(&report.events, seq));
+    assert!(app.cursor().seq < seq);
+    let mut body = newer.body().clone();
+    body.version += 1;
+    body.apps = vec![ListedApp {
+        app_id: renewed.app_id(),
+        cert: renewed.hash(),
+    }];
+    w.homeserver
+        .publish(&IdentityDoc::sign(&w.bob, body).unwrap())
+        .unwrap();
+    w.clock.advance_ms(SENDER_REREAD_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+}
+
 fn held(events: &[AppEvent], seq: u64) -> bool {
     has(
         events,

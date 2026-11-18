@@ -756,9 +756,10 @@ impl App {
     ) -> Result<IdentityDoc, AppError> {
         let reader = self.reader();
         let held = identity::held_copy(&reader, pubky).await?;
+        let now = self.now();
         let read_ms = match source {
             CopySource::Switch { read_ms } => read_ms,
-            CopySource::Homeserver | CopySource::Directory => self.now(),
+            CopySource::Homeserver | CopySource::Directory => now,
         };
         let fresh = source != CopySource::Directory;
         let mut tx = self.tx()?;
@@ -769,8 +770,10 @@ impl App {
                 .unwrap_or_default();
             match source {
                 CopySource::Homeserver => reads.homeserver_ms = Some(read_ms),
-                // A lookup that finished first keeps its later time.
-                CopySource::Switch { .. } => reads.switch_ms = reads.switch_ms.max(Some(read_ms)),
+                CopySource::Switch { .. } => {
+                    let held_ms = reads.switch_ms.unwrap_or(0);
+                    reads.switch_ms = Some(identity::later_read(held_ms, read_ms, now));
+                }
                 CopySource::Directory => {}
             }
             tx.put(&source_reads_key(pubky), &reads)?;
@@ -780,7 +783,7 @@ impl App {
         } else {
             held.as_ref().map_or(0, |(_, at)| *at)
         };
-        let taken = identity::take_peer_read(&reader, &mut tx, doc, held, fetched_ms).await?;
+        let taken = identity::take_peer_read(&reader, &mut tx, doc, held, fetched_ms, now).await?;
         let newest = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {

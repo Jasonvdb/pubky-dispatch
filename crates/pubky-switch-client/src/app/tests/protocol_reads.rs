@@ -969,7 +969,7 @@ async fn test_identity_lookup_older_copy_leaves_the_read_time() {
 /// with the Homeserver down. The switch was read, but the copy held was not read again, so
 /// no action is taken on it before another lookup.
 #[tokio::test]
-async fn test_identity_lookup_older_switch_copy_leaves_the_read_time() {
+async fn test_identity_lookup_older_switch_copy_asks_to_look_up_again() {
     let p = Pair::new();
     let protocol = ReadsProtocol::new(Mode::Settle);
     let mut wallet = p
@@ -1039,6 +1039,36 @@ async fn test_identity_lookup_split_earlier_answer_of_the_same_copy_keeps_the_la
     assert_eq!(found.read_at_ms, later_ms);
     assert_eq!(found.switch_read_ms, Some(later_ms));
     assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
+}
+
+/// The clock is set back a minute after a lookup, and a lookup again gives the same copy:
+/// its read times are those of the new lookup, none ahead of the clock.
+#[tokio::test]
+async fn test_identity_lookup_after_the_clock_is_set_back_keeps_no_time_ahead() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.read_at_ms, start);
+    p.clock.set_ms(start - MINUTE);
+    let found = wallet.identity_of(&bob, true).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.switch_copy, SwitchCopy::Read);
+    assert_eq!(found.read_at_ms, now);
+    assert_eq!(found.homeserver_read_ms, Some(now));
+    assert_eq!(found.switch_read_ms, Some(now));
 }
 
 #[tokio::test]

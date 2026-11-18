@@ -3170,7 +3170,7 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now).await?;
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now, now).await?;
         let (doc, read_ms) = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
@@ -3184,8 +3184,9 @@ impl App {
         };
         self.commit(tx).await?;
         // A read that served an older copy doesn't confirm the one held: past its 10
-        // minutes, it verifies no sender until a read gives it again, or a newer one.
-        if now.saturating_sub(read_ms) >= DOC_CACHE_MS {
+        // minutes when the read ends, it verifies no sender until a read gives it again, or
+        // a newer one.
+        if self.now().saturating_sub(read_ms) >= DOC_CACHE_MS {
             return Ok(None);
         }
         Ok(Some((doc, true)))

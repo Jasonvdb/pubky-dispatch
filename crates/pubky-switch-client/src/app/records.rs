@@ -1122,7 +1122,7 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Fetched, AppError> {
-        let view = match self.record_answer(key).await? {
+        let view = match Box::pin(self.record_answer(key)).await? {
             RecordAnswer::View(view) => view,
             // The switch holds no record at the key, at an account it hosts: absence
             // (Switch spec 10.3.1 "Absence").
@@ -1131,7 +1131,7 @@ impl App {
             // can't be gone, and [`App::note_absent`] raises the alarm for it.
             RecordAnswer::Absent => {
                 self.note_gone(key).await?;
-                self.note_absent(key).await?;
+                Box::pin(self.note_absent(key)).await?;
                 return Ok(Fetched::Absent);
             }
             // It doesn't host the identity: that says nothing of the record, and the
@@ -1213,10 +1213,10 @@ impl App {
         &mut self,
         key: &[u8; 32],
     ) -> Result<Option<SharedRecordView>, AppError> {
-        match self.record_answer(key).await? {
+        match Box::pin(self.record_answer(key)).await? {
             RecordAnswer::View(view) => Ok(Some(*view)),
             RecordAnswer::Absent => {
-                self.note_absent(key).await?;
+                Box::pin(self.note_absent(key)).await?;
                 Ok(None)
             }
             RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
@@ -1365,7 +1365,7 @@ impl App {
             }
             self.commit(tx).await?;
             let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
-            self.note_unlisted(&collection.name, after.as_ref(), next.as_ref(), &shown)
+            Box::pin(self.note_unlisted(&collection.name, after.as_ref(), next.as_ref(), &shown))
                 .await?;
             match next {
                 Some(next) => after = Some(next),
@@ -2743,7 +2743,7 @@ impl App {
                 {
                     let reason =
                         "Switch spec 10.3.1: a create over a permanent record seen live".into();
-                    return Err(self.raise(Alarm::Rollback { reason }).await);
+                    return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
                 }
             }
             let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
@@ -2921,7 +2921,7 @@ impl App {
             )
         {
             let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
-            return Err(self.raise(Alarm::Rollback { reason }).await);
+            return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
         }
         Ok(())
     }
@@ -2951,7 +2951,7 @@ impl App {
             }
             let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
             if !listed.contains(&key) {
-                self.note_absent(&key).await?;
+                Box::pin(self.note_absent(&key)).await?;
             }
         }
         Ok(())

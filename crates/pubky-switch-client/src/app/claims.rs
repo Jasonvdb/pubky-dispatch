@@ -640,6 +640,22 @@ impl App {
         &mut self,
         claim_key: &[u8; 32],
     ) -> Result<Option<ClaimRead>, AppError> {
+        Ok(Box::pin(self.read_claim_with_evidence(claim_key))
+            .await?
+            .map(|(read, _)| read))
+    }
+
+    /// A fresh claim and the signed entries and proofs from that same checked service answer
+    /// (Switch wire 7.4.8). A tombstone can have no entries. An absent claim supplies no
+    /// evidence that an old attempt was resolved.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_claim`].
+    pub async fn read_claim_with_evidence(
+        &mut self,
+        claim_key: &[u8; 32],
+    ) -> Result<Option<(ClaimRead, Vec<crate::client::answers::ClaimEntryItem>)>, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         let result = self.client.claim(claim_key).await;
@@ -697,7 +713,7 @@ impl App {
         // Any read of the claim is the read again a stub asked for (Switch wire 7.5).
         tx.delete(&reread_key(claim_key))?;
         self.commit(tx).await?;
-        Ok(Some(read))
+        Ok(Some((read, answer.entries)))
     }
 
     /// At the end of a read: read again the claims the app follows, after its feed showed
@@ -1053,15 +1069,19 @@ impl App {
     /// which an upload can't carry (Switch wire 7.4.14).
     pub(crate) async fn claim_evidence_items(
         &self,
-    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>, u64), AppError> {
+    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>, Vec<super::OmittedClaimEntry>), AppError> {
         let identity = self.state.meta.identity;
         let mut ops = Vec::new();
-        let mut left_out = 0u64;
+        let mut left_out = Vec::new();
         for (_, entry) in self.reader().scan::<KeptEntry>(ENTRY_PREFIX).await? {
             let Some(writer) = SignedOp::peek(&entry.op)
                 .ok()
                 .and_then(|op| op.body().app_id)
             else {
+                left_out.push(super::OmittedClaimEntry {
+                    op: entry.op,
+                    proof: entry.proof,
+                });
                 continue;
             };
             // Only a certificate whose key verifies the entry: a switch that forged an
@@ -1080,7 +1100,10 @@ impl App {
                     cert: cert.signed().clone(),
                     proof: Some(entry.proof),
                 }),
-                None => left_out = left_out.saturating_add(1),
+                None => left_out.push(super::OmittedClaimEntry {
+                    op: entry.op,
+                    proof: entry.proof,
+                }),
             }
         }
         let proofs = self

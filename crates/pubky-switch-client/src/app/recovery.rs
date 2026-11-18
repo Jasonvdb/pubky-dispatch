@@ -27,6 +27,7 @@
 //! 12.6 steps 5 and 6, 12.4): the obligations from before the loss are uncertain, which is
 //! the protocol's to judge with the declaration time and the residual window.
 
+pub(super) mod inventory;
 mod roster;
 
 use pubky_switch_core::chain::{
@@ -327,9 +328,11 @@ impl App {
 
     /// All retained evidence for the upload, including the omissions counted in the same
     /// shared-state scan (Switch spec 12.5 step 3, 12.6 step 3).
-    async fn retained_evidence(&self) -> Result<SharedEvidence, AppError> {
+    async fn retained_evidence(
+        &self,
+    ) -> Result<(SharedEvidence, inventory::LossInventoryDetails), AppError> {
         let reader = self.reader();
-        let shared = self.shared_evidence().await?;
+        let (shared, omitted) = self.shared_evidence_with_omissions().await?;
         let mut ops: Vec<_> = reader
             .scan::<KeptOp>("ev/op/")
             .await?
@@ -357,11 +360,14 @@ impl App {
                 ops.push(item);
             }
         }
-        Ok(SharedEvidence {
-            ops,
-            proofs,
-            claim_entries_left_out: shared.claim_entries_left_out,
-        })
+        Ok((
+            SharedEvidence {
+                ops,
+                proofs,
+                claim_entries_left_out: shared.claim_entries_left_out,
+            },
+            omitted,
+        ))
     }
 
     /// The retained proofs that verify with the selected service key, or all of them.
@@ -369,7 +375,7 @@ impl App {
         &self,
         service_key: Option<&[u8; 32]>,
     ) -> Result<Vec<SignedDoc>, AppError> {
-        let mut proofs = self.retained_evidence().await?.proofs;
+        let mut proofs = self.retained_evidence().await?.0.proofs;
         if let Some(key) = service_key {
             let identity = self.state.meta.identity;
             proofs.retain(|proof| TransitionProof::verify(proof, key, &identity).is_ok());
@@ -853,11 +859,12 @@ impl App {
     /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on. Returns how
     /// many kept claim entries it left out, without a certificate of their writer.
     async fn loss_upload(&mut self, loss: &LossRecord) -> Result<u64, AppError> {
+        let (evidence, omitted) = self.retained_evidence().await?;
         let SharedEvidence {
             ops,
             proofs,
             claim_entries_left_out: left_out,
-        } = self.retained_evidence().await?;
+        } = evidence;
         let mut records = Vec::new();
         let mut claims = Vec::new();
         for kept in ops {
@@ -877,18 +884,32 @@ impl App {
             Some(value) => vec![SignedHead::from_value(value).map_err(|_| corrupt())?],
             None => Vec::new(),
         };
-        if records.is_empty() && claims.is_empty() && proofs.is_empty() && heads.is_empty() {
-            return Ok(left_out);
-        }
+        let send =
+            !(records.is_empty() && claims.is_empty() && proofs.is_empty() && heads.is_empty());
         let upload = RecoveryUpload {
-            lost_identity: self.generation_doc(loss.lost_generation).await?,
+            lost_identity: if send {
+                self.generation_doc(loss.lost_generation).await?
+            } else {
+                None
+            },
             records,
             claims,
             heads,
             proofs,
             lists: None,
         };
-        self.upload_here(&upload).await?;
+        let body = upload.to_json();
+        let entry = if self.reader().get::<bool>("retain-loss-uploads").await? == Some(true) {
+            Some(Box::pin(self.keep_loss_inputs(loss, &body, &omitted, send)).await?)
+        } else {
+            None
+        };
+        if send {
+            let answer = Box::pin(self.upload_here(body)).await?;
+            if let Some(entry) = entry {
+                Box::pin(self.keep_loss_answer(entry, answer)).await?;
+            }
+        }
         Ok(left_out)
     }
 
@@ -914,7 +935,7 @@ impl App {
             lists: Some(lists),
             ..RecoveryUpload::default()
         };
-        self.upload_here(&upload).await
+        self.upload_here(upload.to_json()).await.map(|_| ())
     }
 
     /// `POST /recovery/upload` at the service followed; its head goes to the chain view. A
@@ -923,7 +944,7 @@ impl App {
     /// `retry_after` asks: the recovery doesn't move on past an upload that may still land,
     /// such as the one that ends staged admission (Switch wire 7.6, 7.4.14). Any other
     /// refusal is final: reported, and the recovery goes on.
-    async fn upload_here(&mut self, upload: &RecoveryUpload) -> Result<(), AppError> {
+    async fn upload_here(&mut self, body: Vec<u8>) -> Result<inventory::UploadReply, AppError> {
         let now = self.now();
         if let Some(until) = self.loss_upload_wait.filter(|until| now < *until) {
             return Err(AppError::Refused(Refusal::NotNow(format!(
@@ -931,7 +952,7 @@ impl App {
                 (until - now).div_ceil(1000)
             ))));
         }
-        let result = self.client.recovery_upload(upload, false).await;
+        let result = self.client.recovery_upload_body(body, false).await;
         match self.take(result).await {
             Ok(answer) => {
                 if let Some(head) = answer.head {
@@ -944,7 +965,8 @@ impl App {
                     .heads
                     .or_else(|| answer.result.as_ref().map(|changes| changes.heads));
                 let proofs = answer.proofs.or(Some(u64::from(answer.proof.is_some())));
-                self.uploaded(Ok((heads, proofs)))
+                self.uploaded(Ok((heads, proofs)))?;
+                Ok(inventory::UploadReply::Answered(Box::new(answer)))
             }
             Err(AppError::Switch(
                 error @ ClientError::Switch {
@@ -957,7 +979,15 @@ impl App {
                 }
                 Err(AppError::Switch(error))
             }
-            Err(AppError::Switch(error)) => self.uploaded(Err(error)),
+            Err(AppError::Switch(error)) => {
+                let reply = match &error {
+                    ClientError::Switch { code, .. } => inventory::UploadReply::Refused(*code),
+                    ClientError::BodyOverCap { .. } => inventory::UploadReply::TooLarge,
+                    _ => return Err(error.into()),
+                };
+                self.uploaded(Err(error))?;
+                Ok(reply)
+            }
             Err(error) => Err(error),
         }
     }

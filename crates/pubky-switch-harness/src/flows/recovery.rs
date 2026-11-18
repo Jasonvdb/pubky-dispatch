@@ -280,6 +280,8 @@ pub async fn provider_loss(world: &World) -> FlowResult {
     let (mut wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
 
+    Box::pin(wallet.retain_loss_uploads()).await?;
+
     // The service is gone, and another stands ready.
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
@@ -309,6 +311,24 @@ pub async fn provider_loss(world: &World) -> FlowResult {
         .ok_or("the recovery roster is missing")?;
     if opening.hash() != doc.hash() {
         return Err("the wallet kept a different opening document".into());
+    }
+
+    let observations = Box::pin(wallet.loss_uploads(opening.generation())).await?;
+    let [observation] = observations.as_slice() else {
+        return Err("the recovery evidence step was not retained once".into());
+    };
+    let (inputs, local) = Box::pin(wallet.loss_upload_inputs(observation)).await?;
+    if observation.app_id != wallet.app_id()
+        || observation.opening_hash != Some(opening.hash())
+        || !local.omitted.is_empty()
+        || inputs.lists.is_some()
+        || !matches!(
+            observation.outcome,
+            pubky_switch_client::app::LossUploadOutcome::Answered { .. }
+                | pubky_switch_client::app::LossUploadOutcome::NoRequest
+        )
+    {
+        return Err("the wallet's loss evidence step has no matching outcome".into());
     }
 
     send(
@@ -965,6 +985,24 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
             .is_some_and(|doc| doc.lists_removed(&phone.app_id()))
     {
         return Err("the original roster or the subsequent removal is missing".into());
+    }
+    let removed_version = newest
+        .as_ref()
+        .ok_or("the removing document is missing")?
+        .version();
+    world.advance_ms(STEP_MS);
+    let purged = Box::pin(signer.purge_removed(phone.app_id())).await?;
+    Box::pin(wallet.refresh_identity()).await?;
+    if purged.lists_removed(&phone.app_id())
+        || wallet.own_identity().hash() != purged.hash()
+        || !Box::pin(wallet.recovery_removal(&phone.app_id()))
+            .await?
+            .is_some_and(|doc| doc.version() == removed_version)
+        || Box::pin(wallet.recovery_removal(&wallet.app_id()))
+            .await?
+            .is_some()
+    {
+        return Err("the purged phone's original removal did not survive".into());
     }
     Ok(())
 }

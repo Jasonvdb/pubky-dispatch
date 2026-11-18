@@ -437,6 +437,28 @@ impl RecordContent {
     }
 }
 
+/// The retained write and the service application the app builds on for a record in a
+/// recovery inventory (Switch wire 6.3, 7.4.14). They can differ after a refused write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossRecordApplication {
+    /// The opaque record key.
+    #[serde(with = "serde_b64")]
+    pub key: [u8; 32],
+    /// The signed operation the app holds and its application.
+    #[serde(with = "revision_serde")]
+    pub held: ApplicationRef,
+    /// The application the app last followed at this key.
+    #[serde(with = "revision_serde")]
+    pub followed: ApplicationRef,
+    /// The version the app last followed.
+    #[serde(with = "version_serde")]
+    pub version: RecordVersion,
+    /// Whether that write was a delete.
+    pub deleted: bool,
+    /// Whether a later read found that delete forgotten.
+    pub gone: bool,
+}
+
 /// A shared record as the app holds it: the newest write it accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedRecord {
@@ -1188,24 +1210,41 @@ impl App {
     ///
     /// A store failure.
     pub async fn shared_evidence(&self) -> Result<SharedEvidence, AppError> {
-        let mut ops: Vec<KeptOp> = self
-            .reader()
-            .scan::<HeldRecord>(RECORD_PREFIX)
-            .await?
-            .into_iter()
-            .map(|(_, held)| KeptOp {
+        Ok(self.shared_evidence_with_omissions().await?.0)
+    }
+
+    pub(super) async fn shared_evidence_with_omissions(
+        &self,
+    ) -> Result<(SharedEvidence, super::LossInventoryDetails), AppError> {
+        let mut ops = Vec::new();
+        let mut records = Vec::new();
+        for (key, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
+            let (version, followed, deleted) = held.base_write();
+            records.push(LossRecordApplication {
+                key: unb64_array(&key)
+                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                held: held.applied,
+                followed,
+                version,
+                deleted,
+                gone: held.gone,
+            });
+            ops.push(KeptOp {
                 op: held.op,
                 cert: held.cert,
                 proof: held.proof,
-            })
-            .collect();
-        let (claim_ops, proofs, claim_entries_left_out) = self.claim_evidence_items().await?;
+            });
+        }
+        let (claim_ops, proofs, omitted) = self.claim_evidence_items().await?;
         ops.extend(claim_ops);
-        Ok(SharedEvidence {
-            ops,
-            proofs,
-            claim_entries_left_out,
-        })
+        Ok((
+            SharedEvidence {
+                ops,
+                proofs,
+                claim_entries_left_out: u64::try_from(omitted.len()).unwrap_or(u64::MAX),
+            },
+            super::LossInventoryDetails { records, omitted },
+        ))
     }
 
     /// The protocol's mark of what the app has seen in record `key`, its high water.
@@ -1251,17 +1290,27 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Fetched, AppError> {
+        Ok(Box::pin(self.fetch_record_application(key, collection))
+            .await?
+            .0)
+    }
+
+    async fn fetch_record_application(
+        &mut self,
+        key: &[u8; 32],
+        collection: &Collection,
+    ) -> Result<(Fetched, Option<ApplicationRef>), AppError> {
         let (view, at) = match Box::pin(self.record_answer(key)).await? {
             RecordAnswer::View(view) => *view,
             RecordAnswer::Absent { current: true }
                 if self.state.cert.holds_scope(&collection.policy.read_scope) =>
             {
-                return Ok(Fetched::Absent);
+                return Ok((Fetched::Absent, None));
             }
-            RecordAnswer::Absent { .. } => return Ok(Fetched::Read(WriteRead::Unordered)),
+            RecordAnswer::Absent { .. } => return Ok((Fetched::Read(WriteRead::Unordered), None)),
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
-            RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
+            RecordAnswer::NotHosted(error) => return Ok((Fetched::NotHosted(error), None)),
         };
         let mut tx = self.tx()?;
         let read = self
@@ -1272,11 +1321,11 @@ impl App {
         // Only the service generation the app follows can report this key as fresh now.
         let current =
             matches!(at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
-        Ok(Fetched::Read(if current {
-            read
+        Ok(if current {
+            (Fetched::Read(read), Some(view.revision))
         } else {
-            WriteRead::Unordered
-        }))
+            (Fetched::Read(WriteRead::Unordered), None)
+        })
     }
 
     /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
@@ -1336,6 +1385,43 @@ impl App {
             })
         })
         .await
+    }
+
+    /// Read the service's current record and return its accepted contents, exact application
+    /// and signed input together (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
+    /// read returns no evidence. A divergent or doubtful record keeps its ordinary flags.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_record_fresh`].
+    pub async fn read_record_application(
+        &mut self,
+        target: &RecordTarget,
+    ) -> Result<Option<(SharedRecord, ApplicationRef, KeptOp)>, AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        let key = self.record_key(target)?;
+        let (Fetched::Read(WriteRead::Taken | WriteRead::Equal), Some(application)) =
+            Box::pin(self.fetch_record_application(&key, &target.collection)).await?
+        else {
+            return Ok(None);
+        };
+        let Some(held) = self.held_record(&key).await? else {
+            return Ok(None);
+        };
+        if held.gone || held.follow.is_some() || held.applied != application {
+            return Ok(None);
+        }
+        let record = held.shared(&key, self.is_divergent(&key).await?);
+        Ok(Some((
+            record,
+            application,
+            KeptOp {
+                op: held.op,
+                cert: held.cert,
+                proof: held.proof,
+            },
+        )))
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what
@@ -4084,6 +4170,8 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         PERMANENT_PREFIX,
         SEEN_PREFIX,
         "recname/",
+        "loss-data/",
+        "loss-upload/",
         "out/",
         "sent/",
         "sentt/",

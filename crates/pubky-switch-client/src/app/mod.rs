@@ -98,6 +98,9 @@ pub use protocol::{
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
+pub use recovery::inventory::{
+    LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
+};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 pub use unverified::{
@@ -124,8 +127,8 @@ pub use directory::{
 };
 pub use records::{
     Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord,
-    ShownWrite, Unopened,
+    LossRecordApplication, PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence,
+    SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,

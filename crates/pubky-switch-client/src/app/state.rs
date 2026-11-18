@@ -737,6 +737,12 @@ impl Tx {
         Ok(())
     }
 
+    /// Exact bytes kept for a recovery upload, already encoded for the wire.
+    pub(crate) fn put_raw(&mut self, key: &str, value: Vec<u8>) -> Result<(), AppError> {
+        self.batch.put(&self.ns, key.as_bytes().to_vec(), value)?;
+        Ok(())
+    }
+
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), AppError> {
         self.batch.delete(&self.ns, key.as_bytes().to_vec())?;
         Ok(())

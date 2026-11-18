@@ -1600,6 +1600,71 @@ async fn test_loss_roster_keeps_the_opening_document_after_a_later_version_and_r
 }
 
 #[tokio::test]
+async fn test_loss_upload_inputs_and_application_survive_an_unanswered_request() {
+    use crate::app::LossUploadOutcome;
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(Arc::clone(&store) as Arc<dyn StateStore>, &[], true, false).await;
+    let load = || {
+        App::load(
+            lost.router
+                .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+            loss_set(&lost.protocol, &lost.others),
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+    };
+    let mut app = load().await.unwrap();
+    app.retain_loss_uploads().await.unwrap();
+    lost.next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.receive(None).await.is_err());
+    drop(app);
+    let mut app = load().await.unwrap();
+    let pending = app.loss_uploads(2).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].outcome, LossUploadOutcome::Pending);
+    let (inputs, local) = app.loss_upload_inputs(&pending[0]).await.unwrap();
+    assert_eq!(inputs.records.len(), 1);
+    assert_eq!(local.records.len(), 1);
+    assert!(local.omitted.is_empty());
+    app.receive(None).await.unwrap();
+    drop(app);
+    let mut app = load().await.unwrap();
+    let seen = app.loss_uploads(2).await.unwrap();
+    assert_eq!(seen.len(), 1);
+    let kept = &seen[0];
+    assert_eq!(kept.body_hash, pending[0].body_hash);
+    assert_eq!(
+        kept.opening_hash,
+        Some(app.recovery_roster().await.unwrap().unwrap().hash())
+    );
+    assert_eq!(kept.recovery_from, 1);
+    assert_eq!(
+        app.loss_upload_inputs(kept).await.unwrap(),
+        (inputs.clone(), local)
+    );
+    let LossUploadOutcome::Answered { proof, .. } = &kept.outcome else {
+        panic!("the checked retry is missing");
+    };
+    let pubky_switch_core::chain::ServiceTransition::Upload { by, changes, .. } =
+        pubky_switch_core::chain::ServiceTransition::from_value(&proof.body().state).unwrap()
+    else {
+        panic!("expected an upload");
+    };
+    assert_eq!(by, app.app_id());
+    assert!(changes["records"].as_array().unwrap().is_empty());
+    let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
+    let (record, applied, evidence) = app.read_record_application(&target).await.unwrap().unwrap();
+    assert_eq!(evidence.op, inputs.records[0].op);
+    assert_eq!(record.key, app.record_key(&target).unwrap());
+    assert_eq!(applied.generation, 2);
+    app.forget_loss_uploads(2).await.unwrap();
+    assert!(app.loss_uploads(2).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_loss_recovers_at_the_new_generation() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

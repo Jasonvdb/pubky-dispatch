@@ -1124,67 +1124,33 @@ async fn test_waiting_custody_outside_current_body_rules_loads_and_drops() {
 }
 
 /// The service's facts about an entry are checked when its page is read, before anything
-/// of the entry is kept: a page showing it accepted after the page's own time, and a later
-/// page contradicting the observation kept from an earlier one (another entry at its `seq`,
-/// or the entry accepted after that observation), are refused. So no kept observation ever
-/// precedes its entry's acceptance, and none is judged again as a store fault.
+/// of the entry is kept: a page showing it accepted after the page's own time is refused.
+/// So no kept observation ever precedes its entry's acceptance, and none is judged again as
+/// a store fault.
 #[tokio::test]
 async fn test_waiting_page_contradicting_an_entrys_acceptance_is_refused() {
-    enum Case {
-        AfterPageTime,
-        HeldOtherEntry,
-        HeldBeforeAcceptance,
-    }
-    for case in [
-        Case::AfterPageTime,
-        Case::HeldOtherEntry,
-        Case::HeldBeforeAcceptance,
-    ] {
-        let w = World::new();
-        let p = Admission::new();
-        let mut app = wallet(&w, &p).await;
-        let me = app.app_id();
-        let cursor = app.cursor().seq;
-        w.clock.advance_ms(10_000);
-        let (seq, message) = w.note(me, "held");
-        match case {
-            Case::AfterPageTime => w.clock.set_ms(w.clock.now_ms() - 5_000),
-            Case::HeldOtherEntry | Case::HeldBeforeAcceptance => {
-                // Held at the first page; the observation an earlier page would have left.
-                p.hold.store(true, Ordering::SeqCst);
-                app.receive(None).await.unwrap();
-                p.hold.store(false, Ordering::SeqCst);
-                let mut held = app.state.held[&seq];
-                match case {
-                    Case::HeldOtherEntry => held.receipt.entry_id[0] ^= 1,
-                    _ => held.receipt.read_at_ms = message.created_at_ms - 1,
-                }
-                let mut tx = app.tx().unwrap();
-                tx.put(&key::held(seq), &held).unwrap();
-                app.commit(tx).await.unwrap();
-                drop(app);
-                app = App::load(w.env(), p.clone(), World::config(), me)
-                    .await
-                    .unwrap();
-            }
-        }
-        let error = app.receive(None).await.unwrap_err();
-        assert!(
-            matches!(&error,
-                crate::app::AppError::Switch(crate::error::ClientError::InvalidResponse(why))
-                    if why.contains("accepted after the page's time"))
-                || matches!(&error, crate::app::AppError::InvalidData(why)
-                    if why.contains("contradicts the entry an earlier page showed")),
-            "{error:?}"
-        );
-        drop(app);
-        let app = App::load(w.env(), p.clone(), World::config(), me)
-            .await
-            .expect("a refused page leaves a store that loads");
-        assert!(app.stored_at(seq).is_none(), "no custody of the entry");
-        assert!(!pair(&app, &w, &message).await, "not processed");
-        assert_eq!(app.cursor().seq, cursor, "the cursor stays before it");
-    }
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    let cursor = app.cursor().seq;
+    w.clock.advance_ms(10_000);
+    let (seq, message) = w.note(me, "held");
+    w.clock.set_ms(w.clock.now_ms() - 5_000);
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(&error,
+            crate::app::AppError::Switch(crate::error::ClientError::InvalidResponse(why))
+                if why.contains("accepted after the page's time")),
+        "{error:?}"
+    );
+    drop(app);
+    let app = App::load(w.env(), p.clone(), World::config(), me)
+        .await
+        .expect("a refused page leaves a store that loads");
+    assert!(app.stored_at(seq).is_none(), "no custody of the entry");
+    assert!(!pair(&app, &w, &message).await, "not processed");
+    assert_eq!(app.cursor().seq, cursor, "the cursor stays before it");
     // Since no writer keeps one, kept custody whose observation precedes its acceptance
     // is a corrupt store.
     let w = World::new();
@@ -1204,4 +1170,324 @@ async fn test_waiting_page_contradicting_an_entrys_acceptance_is_refused() {
         App::load(w.env(), p.clone(), World::config(), me).await,
         Err(crate::app::AppError::Store(StoreError::Corrupt))
     ));
+}
+
+/// Two signed pages that contradict each other at a `seq` tell two histories, a rollback or
+/// fork: where the app keeps the first observation of an entry an earlier page showed, a
+/// later page that shows anything but that entry accepted by then, whatever the item's type,
+/// raises the rollback alarm once, before anything of the page is kept. The cursor and the
+/// observation stay as they were, the alarm survives a reload, and later reads stop on it
+/// instead of failing at the same page again (Switch spec 10.1, wire 7.4.4).
+#[tokio::test]
+async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_alarm() {
+    #[derive(Clone, Copy, Debug)]
+    enum Shown {
+        OtherEntry,
+        EntryAcceptedLater,
+        Unreadable,
+        Missed,
+        Chain,
+        Stub,
+        OtherThanAStoredEntry,
+    }
+    for shown in [
+        Shown::OtherEntry,
+        Shown::EntryAcceptedLater,
+        Shown::Unreadable,
+        Shown::Missed,
+        Shown::Chain,
+        Shown::Stub,
+        Shown::OtherThanAStoredEntry,
+    ] {
+        let w = World::new();
+        let p = Admission::new();
+        let mut app = wallet(&w, &p).await;
+        let me = app.app_id();
+        w.clock.advance_ms(10_000);
+        // An entry held at the first page, before an entry the read stores past it.
+        let (held_seq, message) = w.note(me, "held");
+        let (stored_seq, _) = w.note(me, "wait");
+        p.hold.store(true, Ordering::SeqCst);
+        app.receive(None).await.unwrap();
+        p.hold.store(false, Ordering::SeqCst);
+        let cursor = app.cursor();
+        assert!(cursor.seq < held_seq && app.stored_at(stored_seq).is_some());
+        let observed = app.state.held[&held_seq];
+        let now = w.clock.now_ms();
+        // The observation an earlier page left at `at`, which the next page contradicts.
+        let mut tx = app.tx().unwrap();
+        let at = match shown {
+            Shown::OtherEntry | Shown::EntryAcceptedLater => {
+                let mut held = observed;
+                match shown {
+                    Shown::OtherEntry => held.receipt.entry_id[0] ^= 1,
+                    _ => held.receipt.read_at_ms = message.created_at_ms - 1,
+                }
+                tx.put(&key::held(held_seq), &held).unwrap();
+                held_seq
+            }
+            Shown::OtherThanAStoredEntry => {
+                let id = app.stored_id_at(stored_seq).unwrap();
+                let mut stored = app.stored_at(stored_seq).unwrap().clone();
+                stored.receipt.entry_id[0] ^= 1;
+                tx.put(&key::parked(id), &stored).unwrap();
+                stored_seq
+            }
+            Shown::Unreadable | Shown::Missed | Shown::Chain | Shown::Stub => {
+                match shown {
+                    Shown::Unreadable => {
+                        w.switch.push_unreadable(w.bob.public(), now);
+                    }
+                    Shown::Missed => {
+                        w.switch.push_missed(1, now, now);
+                    }
+                    // The signer's new `identity.json`, which every own app reads in full.
+                    Shown::Chain => w.switch.deliver_identity(&w.next_doc(|_| {})).unwrap(),
+                    // A deny list change, which an app without `lists.read` reads as a stub.
+                    _ => {
+                        let manager = w.other_app("manager", &[Permission::ListsManage]);
+                        w.switch
+                            .app_op(&manager, OpKind::DenyPut { pubky: [9; 32] })
+                            .unwrap();
+                    }
+                }
+                let at = w.switch.seq();
+                tx.put(&key::held(at), &observed).unwrap();
+                at
+            }
+        };
+        let item_type = match shown {
+            Shown::Unreadable => "unreadable",
+            Shown::Missed => "missed",
+            Shown::Chain => "chain",
+            Shown::Stub => "stub",
+            _ => "entry",
+        };
+        assert!(
+            w.switch
+                .shown(me)
+                .iter()
+                .any(|item| item["seq"] == at && item["type"] == item_type),
+            "{shown:?}: the page shows a `{item_type}` item at {at}"
+        );
+        app.commit(tx).await.unwrap();
+        drop(app);
+        let mut app = App::load(w.env(), p.clone(), World::config(), me)
+            .await
+            .unwrap();
+        let kept = (
+            app.state.held.get(&at).copied(),
+            app.stored_at(at).map(|stored| stored.receipt),
+        );
+        let error = app.receive(None).await.unwrap_err();
+        let alarm = app.alarm().cloned();
+        let Some(crate::app::Alarm::Rollback { reason }) = &alarm else {
+            panic!("{shown:?}: no rollback alarm: {error:?}");
+        };
+        let alarm = alarm.clone().unwrap();
+        assert!(reason.contains(&format!("seq {at}")), "{shown:?}: {reason}");
+        assert_eq!(
+            error,
+            crate::app::AppError::Alarm(alarm.clone()),
+            "{shown:?}"
+        );
+        for _ in 0..2 {
+            drop(app);
+            app = App::load(w.env(), p.clone(), World::config(), me)
+                .await
+                .unwrap();
+            assert_eq!(app.alarm(), Some(&alarm), "{shown:?}: the alarm is kept");
+            assert_eq!(app.cursor(), cursor, "{shown:?}: the cursor stays");
+            assert_eq!(
+                (
+                    app.state.held.get(&at).copied(),
+                    app.stored_at(at).map(|stored| stored.receipt)
+                ),
+                kept,
+                "{shown:?}: the observation stays as evidence"
+            );
+            assert!(
+                !pair(&app, &w, &message).await,
+                "{shown:?}: nothing processed"
+            );
+            // Later reads stop on the alarm, raised once, rather than on the page.
+            assert_eq!(
+                app.receive(None).await.unwrap_err(),
+                crate::app::AppError::Refused(crate::app::Refusal::Stopped),
+                "{shown:?}"
+            );
+            assert_eq!(app.alarm(), Some(&alarm), "{shown:?}");
+        }
+    }
+}
+
+/// A page shows one item per `seq`: a page that shows another entry at the `seq` of one it
+/// holds is refused before anything of it is kept. So the other entry is never handed the
+/// held one's receipt, nor taken as the held one handled, and the held entry is processed
+/// once its store is back (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_waiting_page_with_two_items_at_one_seq_is_refused() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    let cursor = app.cursor();
+    let (seq, held) = w.note(me, "held");
+    let (own_seq, other) = w.note(me, "free");
+    // Moves the last entry at `from` to `to`.
+    let at = |from: u64, to: u64| {
+        for item in w.switch.lock().items.iter_mut().rev() {
+            if let crate::testing::Item::Entry { seq, .. } = item
+                && *seq == from
+            {
+                *seq = to;
+                break;
+            }
+        }
+    };
+    // The other entry shown at the held entry's `seq` too, right after it.
+    at(own_seq, seq);
+    p.hold.store(true, Ordering::SeqCst);
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(&error,
+            crate::app::AppError::Switch(crate::error::ClientError::InvalidResponse(why))
+                if why.contains("increasing seq order")),
+        "{error:?}"
+    );
+    assert!(p.calls.lock().unwrap().is_empty(), "nothing handed");
+    assert_eq!(app.cursor(), cursor, "the cursor stays");
+    assert!(app.state.held.is_empty(), "nothing held");
+    at(seq, own_seq);
+    p.hold.store(false, Ordering::SeqCst);
+    p.set(Mode::Apply);
+    app.receive(None).await.unwrap();
+    assert!(pair(&app, &w, &held).await, "the held entry is processed");
+    assert!(pair(&app, &w, &other).await, "and the other");
+}
+
+/// A cooperative move continues the sequence: an entry stored locally before the move, at a
+/// `seq` the cursor hasn't passed, is compared with what the next service's page shows there,
+/// as at the service it was read from (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_waiting_stored_entry_observation_is_compared_after_a_move() {
+    use super::moves::{self, Router};
+    let w = World::new();
+    let router = Router::of(&w);
+    let p = Admission::new();
+    let store = Arc::clone(&w.store) as Arc<dyn StateStore>;
+    let mut app = moves::join_on(
+        &w,
+        &router,
+        store,
+        p.clone(),
+        &[Permission::ConversationAdd],
+    )
+    .await;
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    // An entry held, before an entry the read stores past it.
+    let (held_seq, _) = w.note(me, "held");
+    let (stored_seq, _) = w.note(me, "wait");
+    p.hold.store(true, Ordering::SeqCst);
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq < held_seq && app.stored_at(stored_seq).is_some());
+    let n_key = moves::next_key();
+    w.switch.freeze(&moves::freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(moves::NEXT, &next);
+    let _ = app.receive(None).await;
+    // The observation an earlier page left, which the next service's page contradicts.
+    let id = app.stored_id_at(stored_seq).unwrap();
+    let mut stored = app.stored_at(stored_seq).unwrap().clone();
+    stored.receipt.entry_id[0] ^= 1;
+    let mut tx = app.tx().unwrap();
+    tx.put(&key::parked(id), &stored).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.parked.insert(id, stored);
+    moves::publish_at(
+        &w,
+        &next,
+        Inbox::new(moves::NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let _ = app.receive(None).await;
+    assert_eq!(app.cursor().generation, 2);
+    let Some(crate::app::Alarm::Rollback { reason }) = app.alarm() else {
+        panic!("no rollback alarm: {:?}", app.alarm());
+    };
+    assert!(reason.contains(&format!("seq {stored_seq}")), "{reason}");
+}
+
+/// A custody drop's notice names one of the recipient checks a stored input can fail when
+/// tried again, 2 to 8 (Switch wire 5.1): no writer keeps another, so a notice naming one is
+/// a corrupt store, at a load and at a restore alike.
+#[tokio::test]
+async fn test_waiting_drop_notice_check_outside_recipient_checks_is_corrupt() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    expire(&w, &mut app).await;
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    // The notice as a backup carries it, and as a store keeps it.
+    let with_check = |mut kept: crate::app::events::KeptDuty, check: u8| {
+        let crate::app::events::Duty::StoredEntryDropped { reason, .. } = &mut kept.duty else {
+            unreachable!()
+        };
+        *reason = DropReason::Rules { check };
+        kept
+    };
+    for check in [0, 1, 2, 8, 9] {
+        let shape = (2..=8).contains(&check);
+        let mut restored = backup.clone();
+        restored.waiting.notices[0] = with_check(restored.waiting.notices[0].clone(), check);
+        let result = App::restore(
+            w.env_on(Arc::new(MemoryStore::new())),
+            p.clone(),
+            World::config(),
+            &restored,
+        )
+        .await;
+        assert_eq!(result.is_ok(), shape, "restore, check {check}");
+        assert!(
+            shape
+                || matches!(
+                    result,
+                    Err(crate::app::AppError::Store(StoreError::Corrupt))
+                ),
+            "restore, check {check}"
+        );
+        let store = Arc::new(MemoryStore::new());
+        let mut app = App::restore(w.env_on(store.clone()), p.clone(), World::config(), &backup)
+            .await
+            .unwrap();
+        let (at, bytes) = app
+            .reader()
+            .scan_raw(key::DUTY_PREFIX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(_, bytes)| crate::app::unverified::waiting_record(bytes))
+            .unwrap();
+        let kept = with_check(crate::app::state::decode(&bytes).unwrap(), check);
+        let mut tx = app.tx().unwrap();
+        tx.put(&format!("{}{at}", key::DUTY_PREFIX), &kept).unwrap();
+        app.commit(tx).await.unwrap();
+        drop(app);
+        let loaded = App::load(w.env_on(store), p.clone(), World::config(), me).await;
+        assert_eq!(loaded.is_ok(), shape, "load, check {check}");
+        assert!(
+            shape
+                || matches!(
+                    loaded,
+                    Err(crate::app::AppError::Store(StoreError::Corrupt))
+                ),
+            "load, check {check}"
+        );
+    }
 }

@@ -1165,10 +1165,27 @@ impl App {
                     self.clear_retry(seq, &mut read)?;
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
-                    } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
+                    } else if let FeedItem::Entry(entry) = item
+                        && !self.state.seen.contains(&seq)
                     {
                         read.tx.put(&key::seen(seq), &())?;
                         self.state.seen.insert(seq);
+                        // Processed ahead of the cursor, it keeps its observation as a held
+                        // entry does, unless it is stored locally, whose copy is compared.
+                        let generation = self.state.cursor.generation;
+                        if !self
+                            .state
+                            .parked
+                            .values()
+                            .any(|stored| stored.seq == seq && stored.generation == generation)
+                        {
+                            self.keep_observation(
+                                seq,
+                                observed(entry),
+                                entry.accepted_at,
+                                &mut read.tx,
+                            )?;
+                        }
                     }
                 }
                 Step::Hold => {
@@ -1315,8 +1332,9 @@ impl App {
     }
 
     /// Keeps the first observation of an entry of the feed the cursor stays before, at
-    /// `held/<seq>`: from the read that holds it, whatever it waits for, or the commit that
-    /// keeps its effect, so no later step can lose it. Kept until the cursor passes the entry
+    /// `held/<seq>`: from the read that holds it, whatever it waits for, or processes it
+    /// past an earlier one, or the commit that keeps its effect, so no later step can lose
+    /// it. Kept until the cursor passes the entry
     /// or it is stored locally ([`App::drop_observation`]), so a later page that shows
     /// anything else there raises the alarm (Switch spec 8.2, 10.1; wire 7.4.4).
     fn keep_observation(

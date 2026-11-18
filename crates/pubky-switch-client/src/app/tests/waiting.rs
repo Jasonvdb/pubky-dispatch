@@ -316,8 +316,10 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
         let mut app = wallet(&w, &p).await;
         p.hold.store(true, Ordering::SeqCst);
         let (seq, _) = w.note(app.app_id(), "held");
+        let (ahead, _) = w.note(app.app_id(), "free");
         app.receive(None).await.unwrap();
         let receipt = app.state.held[&seq].receipt;
+        let processed_ahead = app.state.held[&ahead];
         let backup = if layered {
             app.backup_layered().await.unwrap()
         } else {
@@ -331,6 +333,11 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
             restored.state.held.get(&seq).map(|held| held.receipt),
             Some(receipt),
             "a backup retains the original held observation"
+        );
+        assert_eq!(
+            restored.state.held.get(&ahead),
+            Some(&processed_ahead),
+            "and that of an entry processed ahead of the cursor"
         );
         w.clock.advance_ms(10_000);
         p.hold.store(false, Ordering::SeqCst);
@@ -1189,6 +1196,7 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         Chain,
         Stub,
         OtherThanAStoredEntry,
+        OtherThanAnEntryProcessedAhead,
     }
     for shown in [
         Shown::OtherEntry,
@@ -1198,20 +1206,24 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         Shown::Chain,
         Shown::Stub,
         Shown::OtherThanAStoredEntry,
+        Shown::OtherThanAnEntryProcessedAhead,
     ] {
         let w = World::new();
         let p = Admission::new();
         let mut app = wallet(&w, &p).await;
         let me = app.app_id();
         w.clock.advance_ms(10_000);
-        // An entry held at the first page, before an entry the read stores past it.
+        // An entry held at the first page, before an entry the read stores past it and one
+        // it processes past it.
         let (held_seq, message) = w.note(me, "held");
         let (stored_seq, _) = w.note(me, "wait");
+        let (ahead_seq, _) = w.note(me, "free");
         p.hold.store(true, Ordering::SeqCst);
         app.receive(None).await.unwrap();
         p.hold.store(false, Ordering::SeqCst);
         let cursor = app.cursor();
         assert!(cursor.seq < held_seq && app.stored_at(stored_seq).is_some());
+        assert!(app.state.seen.contains(&ahead_seq));
         let observed = app.state.held[&held_seq];
         let now = w.clock.now_ms();
         // The observation an earlier page left at `at`, which the next page contradicts.
@@ -1225,6 +1237,12 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
                 }
                 tx.put(&key::held(held_seq), &held).unwrap();
                 held_seq
+            }
+            Shown::OtherThanAnEntryProcessedAhead => {
+                let mut ahead = app.state.held[&ahead_seq];
+                ahead.receipt.entry_id[0] ^= 1;
+                tx.put(&key::held(ahead_seq), &ahead).unwrap();
+                ahead_seq
             }
             Shown::OtherThanAStoredEntry => {
                 let id = app.stored_id_at(stored_seq).unwrap();

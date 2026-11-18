@@ -430,11 +430,7 @@ impl WaitingOut {
         let held: Vec<_> = state
             .held
             .iter()
-            .filter(|(seq, _)| {
-                **seq > state.cursor.seq
-                    && !state.seen.contains(seq)
-                    && pending.is_none_or(|effect| effect.stored.is_some() || effect.seq != **seq)
-            })
+            .filter(|(seq, _)| **seq > state.cursor.seq)
             .map(|(seq, held)| (*seq, *held))
             .collect();
         Self {
@@ -500,10 +496,6 @@ impl WaitingOut {
         for (seq, _) in &self.held {
             if *seq <= backup.cursor.seq
                 || !held.insert(*seq)
-                || backup
-                    .beyond_cursor
-                    .as_ref()
-                    .is_some_and(|layer| layer.seen.contains(seq))
                 || self.entries.iter().any(|(_, entry)| {
                     entry.generation == backup.cursor.generation && entry.seq == *seq
                 })

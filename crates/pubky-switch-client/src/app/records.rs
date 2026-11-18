@@ -3081,7 +3081,11 @@ impl App {
                 .feed_claim_entry(item, envelope, tx)
                 .await
                 .map(|()| false),
-            OpKind::AppPut { record } => self.feed_app_record(record, tx).map(|()| false),
+            OpKind::AppPut { record } => {
+                self.feed_app_record(record, tx)?;
+                self.take_own_later(record).await?;
+                Ok(false)
+            }
             _ => self.feed_list_change(item, tx).map(|()| false),
         }
     }

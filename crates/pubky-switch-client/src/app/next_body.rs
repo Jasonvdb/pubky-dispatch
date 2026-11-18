@@ -29,6 +29,39 @@ impl NextBody {
         &self.0
     }
 
+    /// The members of `later`, a later record of the app another device signed, with the
+    /// changes made here since `accepted`, the newest record of this device the switch
+    /// accepted: each registered protocol's member as held when it differs from `accepted`,
+    /// else as in `later`; the others as in `later`. Also the registered protocols whose
+    /// member held is now another, gone or new.
+    pub(super) fn over(
+        mut self,
+        accepted: Option<&AppRecordBody>,
+        later: &AppRecordBody,
+        protocols: &ProtocolSet,
+    ) -> (Self, Vec<String>) {
+        let mut members = later.protocols.clone();
+        let mut changed = Vec::new();
+        for name in protocols.names() {
+            let mine = self.0.protocols.get(&name);
+            let member = match accepted {
+                Some(accepted) if accepted.protocols.get(&name) == mine => {
+                    later.protocols.get(&name)
+                }
+                _ => mine,
+            };
+            if member != mine {
+                changed.push(name.clone());
+            }
+            match member.cloned() {
+                Some(member) => members.insert(name, member),
+                None => members.remove(&name),
+            };
+        }
+        self.0.protocols = members;
+        (self, changed)
+    }
+
     /// Set `protocol`'s member, or remove it with `None`.
     pub(super) fn set_member(&mut self, protocol: String, member: Option<Map<String, Value>>) {
         match member {
@@ -99,15 +132,26 @@ impl CertBody {
             let Some(protocol) = protocols.get(&name) else {
                 continue;
             };
-            let ask = asks.get(&name).copied().unwrap_or(RecordExpiry::Never);
-            let (member, ask) = protocol.member_for(carried.get(&name), ask, cert);
+            // An ask or a member without the other is carried as it is; a member the
+            // protocol removes takes its ask with it.
+            let had = asks.get(&name).copied();
+            let before = carried.get(&name);
+            let (member, ask) =
+                protocol.member_for(before, had.unwrap_or(RecordExpiry::Never), cert);
+            let keeps_ask = had.is_some() || ask != RecordExpiry::Never;
             let Some(member) = member else {
+                if before.is_none() && keeps_ask {
+                    judging_asks.insert(name, ask);
+                }
                 continue;
             };
-            let json = serde_json::to_vec(&member).ok();
+            // Checked at the depth the record holds it (Switch wire 1.1).
+            let json = serde_json::to_vec(&serde_json::json!({ "r": { "p": &member } })).ok();
             if json.is_some_and(|json| check_json(&json).is_ok()) && ask.valid() && writable(ask) {
                 body.protocols.insert(name.clone(), member);
-                judging_asks.insert(name, ask);
+                if keeps_ask {
+                    judging_asks.insert(name, ask);
+                }
             } else {
                 dropped.push(name);
             }
@@ -148,5 +192,6 @@ fn sign(
 ) -> pubky_switch_core::Result<AppRecord> {
     body.updated_at = updated_at;
     body.expires_at = expires_at;
+    check_json(&body.to_json()?)?;
     AppRecord::sign(keys, body)
 }

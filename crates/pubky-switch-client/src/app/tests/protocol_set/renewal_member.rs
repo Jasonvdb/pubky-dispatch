@@ -137,8 +137,13 @@ fn renew(p: &Pair, app: &App) -> AppCert {
 
 /// The signer renews `app`'s certificate to `scopes` and lists it.
 fn renew_to(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
-    let me = app.app_id();
-    let old = app.cert().clone();
+    let renewed = cert_put(p, app, scopes);
+    list(p, app, &renewed);
+    renewed
+}
+
+/// The signer stores a renewal of `app`'s certificate to `scopes` (Switch spec 3.2 step 1).
+fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
     let renewed = issue_cert(
         &p.w.alice,
         &app_keys("wallet"),
@@ -148,10 +153,17 @@ fn renew_to(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
     .unwrap();
     p.w.switch
         .signer_op(OpKind::CertPut {
-            target_app_id: me,
+            target_app_id: app.app_id(),
             cert: renewed.signed().clone(),
         })
         .unwrap();
+    renewed
+}
+
+/// The signer lists `renewed` for `app` (Switch spec 3.2 step 2).
+fn list(p: &Pair, app: &App, renewed: &AppCert) {
+    let me = app.app_id();
+    let old = app.cert().clone();
     p.w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
         body.apps.push(ListedApp {
@@ -165,7 +177,6 @@ fn renew_to(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
             until: None,
         });
     });
-    renewed
 }
 
 /// How the renewal reaches the app, and what fails after it is signed.
@@ -510,4 +521,230 @@ async fn test_renewal_member_unowned_dropped_then_written_again_by_its_owner() {
     let held = AppRecord::verify(&held, &p.w.alice.public()).unwrap();
     assert_eq!(held.cert().hash(), second.hash());
     assert_eq!(held.body().protocols.get("chat"), Some(&room));
+}
+
+/// The `MemberChanged` events of `events`.
+fn changed(events: Vec<AppEvent>) -> Vec<String> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            AppEvent::MemberChanged { protocol, .. } => Some(protocol),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A plain renewal with the default hook carries members and asks as they are, as before
+/// members were judged: an ask without a member, a member without an ask, both, neither.
+#[tokio::test]
+async fn test_renewal_member_default_carries_members_and_asks() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    let deadline = p.w.clock.now_ms() + HOUR;
+    // `tasks` has both; `chat`'s member comes from another device without an ask.
+    app.set_protocol_member(
+        "tasks",
+        Some(object(json!({ "list": "a" }))),
+        Some(deadline),
+    )
+    .await
+    .unwrap();
+    let mut asks = app.record_expiries().await.unwrap();
+    asks.remove("chat");
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::RECORD_EXPIRIES, &asks)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    // A protocol with an ask and no member, and one with neither.
+    let p2 = Pair::new();
+    let (mut other, _) = join(&p2).await;
+    other.set_protocol_member("chat", None, None).await.unwrap();
+    other.renew_record("chat", Some(deadline)).await.unwrap();
+    for (app, p) in [(&mut app, &p), (&mut other, &p2)] {
+        let before = (members(app), app.record_expiries().await.unwrap());
+        p.w.clock.advance_ms(1000);
+        let renewed = renew_to(p, app, &SCOPES);
+        app.receive(None).await.unwrap();
+        assert_eq!(app.cert().hash(), renewed.hash());
+        assert_eq!((members(app), app.record_expiries().await.unwrap()), before);
+        let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
+        assert_eq!(held.body().expires_at, Some(deadline));
+    }
+    let _ = me;
+}
+
+/// Two devices hold one reducing renewal from its `cert.put`: `b`, running `tasks` and
+/// `chat`, takes it first; `a`, running `tasks` only, then builds on `b`'s record instead of
+/// signing over it, `chat`'s member kept, with a change kept on `a` too.
+#[tokio::test]
+async fn test_renewal_member_second_device_builds_on_the_first() {
+    for kept in [false, true] {
+        let p = Pair::new();
+        let request =
+            p.w.signer
+                .approve(
+                    &app_keys("wallet"),
+                    &AppSpec::new(&["tasks", "tasks_assign"])
+                        .with_permissions(&[Permission::ConversationAdd]),
+                )
+                .unwrap();
+        let mut b = App::join(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            p.set(),
+            World::config(),
+            request,
+        )
+        .await
+        .unwrap();
+        b.set_multi_device(true).await.unwrap();
+        b.set_protocol_member("tasks", Some(object(json!({ "list": "home" }))), None)
+            .await
+            .unwrap();
+        let backup = b.backup().await.unwrap();
+        let only_tasks =
+            ProtocolSet::new(vec![Arc::new(named("tasks")) as Arc<dyn Protocol>]).unwrap();
+        let mut a = App::restore(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            only_tasks,
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        a.end_reconcile(UserConfirmed::new()).await.ok();
+        let room = object(json!({ "room": 1 }));
+        b.set_protocol_member("chat", Some(room.clone()), None)
+            .await
+            .unwrap();
+        p.w.clock.advance_ms(1000);
+        let renewed = cert_put(&p, &b, &["tasks"]);
+        for app in [&mut a, &mut b] {
+            p.w.clock.advance_ms(1000);
+            app.receive(None).await.unwrap();
+        }
+        if kept {
+            p.w.switch.fail_next(Fault::Unreachable {
+                path: "/ops".into(),
+                after: 0,
+            });
+            a.set_protocol_member("tasks", Some(object(json!({ "list": "work" }))), None)
+                .await
+                .unwrap_err();
+        }
+        list(&p, &b, &renewed);
+        p.w.clock.advance_ms(1000);
+        b.receive(None).await.unwrap();
+        assert_eq!(b.cert().hash(), renewed.hash());
+        p.w.clock.advance_ms(1000);
+        let report = a.receive(None).await.unwrap();
+        assert_eq!(a.cert().hash(), renewed.hash(), "kept: {kept}");
+        assert!(dropped(&report.events).is_empty(), "kept: {kept}");
+        let held = p.w.switch.app(&a.app_id()).record.unwrap();
+        let held = AppRecord::verify(&held, &p.w.alice.public()).unwrap();
+        assert_eq!(held.cert().hash(), renewed.hash());
+        assert_eq!(
+            held.body().protocols.get("chat"),
+            Some(&room),
+            "kept: {kept}"
+        );
+        let list = if kept { "work" } else { "home" };
+        assert_eq!(
+            held.body().protocols.get("tasks"),
+            Some(&object(json!({ "list": list })))
+        );
+    }
+}
+
+/// A change another device makes under the same certificate reaches this one through
+/// the feed: each protocol whose member is new or gone is told.
+#[tokio::test]
+async fn test_renewal_member_other_device_change_is_told() {
+    let p = Pair::new();
+    let (mut a, _) = join(&p).await;
+    a.set_multi_device(true).await.unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(UserConfirmed::new()).await.ok();
+    p.w.clock.advance_ms(1000);
+    a.set_protocol_member("chat", None, None).await.unwrap();
+    p.w.clock.advance_ms(1000);
+    let report = b.receive(None).await.unwrap();
+    assert_eq!(changed(report.events), ["chat"]);
+    assert_eq!(b.record(), a.record());
+    assert!(!members(&b).contains_key("chat"));
+}
+
+/// A change kept here that meets another device's later record under the same certificate
+/// goes over it: the other device's members of protocols not changed here are kept, and
+/// those protocols are told.
+#[tokio::test]
+async fn test_renewal_member_conflict_builds_on_the_later_record() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
+    let mut body = held.body().clone();
+    body.updated_at = p.w.clock.now_ms() + 60_000;
+    body.protocols
+        .insert("tasks".into(), object(json!({ "list": "other" })));
+    body.protocols
+        .insert("notes".into(), object(json!({ "pinned": 3 })));
+    let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    p.w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: other.signed().clone(),
+            },
+        )
+        .unwrap();
+    p.w.clock.advance_ms(1000);
+    app.set_protocol_member("chat", Some(object(json!({ "room": 9 }))), None)
+        .await
+        .unwrap();
+    let held = p.w.switch.app(&me).record.unwrap();
+    let held = AppRecord::verify(&held, &p.w.alice.public()).unwrap();
+    assert_eq!(
+        held.body().protocols["tasks"],
+        object(json!({ "list": "other" }))
+    );
+    assert_eq!(held.body().protocols["chat"], object(json!({ "room": 9 })));
+    assert_eq!(
+        held.body().protocols["notes"],
+        object(json!({ "pinned": 3 }))
+    );
+    assert_eq!(changed(app.receive(None).await.unwrap().events), ["tasks"]);
+}
+
+/// A later record of the app on the Homeserver, another device's, is taken as it is by
+/// the publication check.
+#[tokio::test]
+async fn test_renewal_member_later_published_copy_is_taken() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
+    let mut body = held.body().clone();
+    body.updated_at = p.w.clock.now_ms() + 60_000;
+    body.protocols.remove("chat");
+    let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    p.w.homeserver.put(
+        p.w.alice.public(),
+        &app_record_path(&me),
+        serde_json::to_vec(other.signed()).unwrap(),
+    );
+    assert_eq!(
+        app.publish_record().await.unwrap(),
+        crate::app::Publication::Superseded
+    );
+    assert_eq!(app.record(), other.signed());
+    assert_eq!(changed(app.receive(None).await.unwrap().events), ["chat"]);
 }

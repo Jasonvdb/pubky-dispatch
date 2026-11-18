@@ -132,6 +132,7 @@ pub enum Publication {
 /// (Switch spec 4.2): the record's `expires_at` is the earliest asked.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RecordExpiry {
     /// No expiry.
     Never,
@@ -680,7 +681,12 @@ impl App {
         };
         let outcome = match copy {
             Some(held) if held == bytes => Publication::Published,
-            Some(held) if self.later_copy(&held, &record) => Publication::Superseded,
+            Some(held) if self.later_copy(&held, &record) => {
+                if let Ok(copy) = serde_json::from_slice::<SignedDoc>(&held) {
+                    self.take_own_later(&copy).await?;
+                }
+                Publication::Superseded
+            }
             None if self.state.device.multi_device && !current => {
                 self.owe_publication(&record).await?;
                 return Ok(Publication::AwaitingRead);

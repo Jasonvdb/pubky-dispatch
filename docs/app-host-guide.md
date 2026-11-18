@@ -24,7 +24,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `AppEvent::RenewalSeen` | The feed supplied a candidate renewal of this app's certificate. Keep using the held certificate while waiting for the identity to list the new one. |
 | `AppEvent::CertificateTaken` | The client committed a new certificate and its app record. Use the new permissions. A record delivery can still be pending. |
 | `AppEvent::MemberDropped` | The record signed for a renewal the app took has no member of the named protocol: the member it gave for the renewal broke the JSON rules or came with an expiry that can't be signed, or the protocol isn't registered on this device and the renewal removed a scope or permission. That protocol writes its member again on a device that runs it. |
-| `AppEvent::MemberChanged` | A duty event for the named protocol. The app took a record another device signed, and that protocol's member changed or is gone, with its expiry ask. Write the member again if it is still wanted, then acknowledge. |
+| `AppEvent::MemberChanged` | A duty event for the named protocol. The app took a record another device signed, and that protocol's member in it is new, changed or gone; a gone member takes its expiry ask. Write the member again if it is still wanted, then acknowledge. |
 | `AppEvent::CertificateRefused` | A proposed certificate could not run with the registered protocols. Tell every owner, show the reason and retain the current certificate. Ask the signer for a compatible renewal. |
 | `CertificateRefusal::UnownedRoot` | No registered protocol owns a scope root in the renewal. Correct the renewal or register the missing protocol at restore. |
 | `CertificateRefusal::Protocol` | The named protocol rejected this certificate. Use its reason to request a corrected one. |
@@ -252,7 +252,7 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 | `AppEvent::BundlePartSkipped` | A part failed a check, or the entire parts list could not be read. Show the reason and the range if available (a whole-list error carries `(0, 0)`). If `alert` is set, warn that the naming key differs and contact the signer. |
 | `AppEvent::FullBundleRequested` | The service accepted the request for a full key bundle. Wait for the signer to supply it and read again. |
 
-`member_for` takes and gives a protocol's expiry ask:
+`member_for` takes and gives a protocol's expiry ask. `RecordExpiry` is non-exhaustive, so match it with a wildcard arm:
 
 | Ask | Meaning |
 |---|---|

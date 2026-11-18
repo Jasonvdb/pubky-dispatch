@@ -543,7 +543,7 @@ pub enum AppEvent {
         protocol: String,
     },
     /// The app took a record of its own that another device signed, and `protocol`'s
-    /// member in it changed or is gone from the record it held (Switch spec 3.2 step 3,
+    /// member in it is new, changed or gone from the record it held (Switch spec 3.2 step 3,
     /// 4.2): the protocol writes it again if it still wants it
     /// ([`super::App::set_protocol_member`]). The ask of a member gone goes with it. A
     /// duty event, for that protocol.

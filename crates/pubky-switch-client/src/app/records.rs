@@ -57,8 +57,10 @@ use super::events::{AppEvent, Duty};
 use super::order::{Handover, Kept};
 use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
 use super::state::Tx;
-use super::{App, AppError, IdentityRefresh};
+use super::{App, AppError, FeedPosition, IdentityRefresh};
+use crate::client::Batch;
 use crate::client::answers::{ChainItem, SharedRecordView};
+use crate::client::read::Obj;
 use crate::error::ClientError;
 
 const RECORD_PREFIX: &str = "rec/";
@@ -1433,6 +1435,79 @@ impl App {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Compare a refused batch's record evidence at the head of that reply (Switch wire
+    /// 6.3, 7.6). A later read has its own head, even if it returns the same write.
+    pub(super) async fn note_record_conflict(
+        &mut self,
+        batch: &Batch,
+        current: &serde_json::Value,
+        head: Option<&SignedHead>,
+    ) -> Result<(), AppError> {
+        let Some(head) = head else {
+            if RecordConflict::read(current, batch)?.is_some() {
+                return Err(ClientError::InvalidResponse(
+                    "Switch wire 7.1: a record conflict for an own app carries no Switch-Head"
+                        .into(),
+                )
+                .into());
+            }
+            return Ok(());
+        };
+        let at = self.current_at(*head, None).await?;
+        let mut tx = self.tx()?;
+        match RecordConflict::read(current, batch)? {
+            Some(RecordConflict::View(view)) => {
+                if let Ok(op) = SignedOp::peek(&view.op)
+                    && let OpKind::RecordPut(put) = &op.body().kind
+                    && put.key == view.key
+                    && let Some(collection) = self.collection_for_write(put, &tx).await?
+                {
+                    self.take_view(&view, at, Some((&view.key, &collection)), &mut tx)
+                        .await?;
+                }
+            }
+            Some(RecordConflict::Absent(key)) => {
+                let at = FeedPosition {
+                    generation: head.generation,
+                    seq: head.seq,
+                };
+                let held = self.held_record(&key).await?;
+                if let Some(mut held) = held {
+                    // A later write, including one applied by upload, can overtake this answer.
+                    let (_, base, deleted) = held.base_write();
+                    let covered = |revision: ApplicationRef| {
+                        self.received_order(
+                            at,
+                            FeedPosition {
+                                generation: revision.generation,
+                                seq: revision.seq,
+                            },
+                        )
+                        .is_some_and(std::cmp::Ordering::is_ge)
+                    };
+                    if covered(held.applied) && covered(base) {
+                        self.check_absent(&held, head.generation).await?;
+                        if deleted && !held.gone {
+                            held.gone = true;
+                            put_held(&mut tx, &key, &held)?;
+                        }
+                    }
+                }
+                self.retire_absent_receipts(key, at, &mut tx)?;
+            }
+            // The service's position identifies neither the operation nor its writer. A
+            // caller that needs the value reads it through the ordinary record endpoint.
+            Some(RecordConflict::Position) | None => {}
+        }
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        if !tx.is_empty() {
+            self.commit(tx).await?;
+        }
+        Ok(())
     }
 
     /// What a record view read now with `head` is current at ([`CurrentAt::of`]), the head
@@ -3243,6 +3318,28 @@ impl App {
         .await
     }
 
+    /// The collection as held, registered, or named when building an own write.
+    async fn collection_for_write(
+        &self,
+        put: &RecordPut,
+        tx: &Tx,
+    ) -> Result<Option<Collection>, AppError> {
+        if let Some(held) = self
+            .read_in::<HeldRecord>(&record_key_of(&put.key), tx)
+            .await?
+        {
+            return Ok(Some(Collection::new(&held.collection, held.policy)));
+        }
+        if let Some(collection) = self.collection_of(put) {
+            return Ok(Some(collection));
+        }
+        Ok(self
+            .reader()
+            .get::<String>(&pending_name_key(&put.key))
+            .await?
+            .map(|name| Collection::new(&name, put.policy.clone())))
+    }
+
     /// The newest generation a record at `policy` was seen live in, once it is seen with
     /// `content` in the generation the app follows: that one for a live record at a
     /// permanent policy, else `held` (Switch spec 10.3.1 "Absence").
@@ -3265,6 +3362,10 @@ impl App {
         let Some(held) = self.held_record(key).await? else {
             return Ok(());
         };
+        self.check_absent(&held, self.state.meta.generation).await
+    }
+
+    async fn check_absent(&mut self, held: &HeldRecord, generation: u64) -> Result<(), AppError> {
         // The switch shows only records whose read scope the caller's certificate covers:
         // one the app no longer reads, after a renewal that dropped its scope, is left out
         // of a listing as any record it can't read is (Switch wire 7.4.9).
@@ -3272,9 +3373,13 @@ impl App {
             && self.state.cert.holds_scope(&held.policy.read_scope)
             && absence_is_rollback(
                 &held.policy,
-                held.live_in,
-                self.state.meta.generation,
-                self.state.own_doc.body().recovery_from,
+                held.live_in.filter(|seen| *seen <= generation),
+                generation,
+                self.state
+                    .own_doc
+                    .body()
+                    .recovery_from
+                    .filter(|lost| *lost < generation),
             )
         {
             let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
@@ -3341,22 +3446,8 @@ impl App {
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Ok(());
         };
-        let held = self
-            .read_in::<HeldRecord>(&record_key_of(&put.key), tx)
-            .await?;
-        let collection = match held.as_ref() {
-            Some(held) => Collection::new(&held.collection, held.policy.clone()),
-            None => match self.collection_of(put) {
-                Some(collection) => collection,
-                None => match self
-                    .reader()
-                    .get::<String>(&pending_name_key(&put.key))
-                    .await?
-                {
-                    Some(name) => Collection::new(&name, put.policy.clone()),
-                    None => return Ok(()),
-                },
-            },
+        let Some(collection) = self.collection_for_write(put, tx).await? else {
+            return Ok(());
         };
         tx.delete(&pending_name_key(&put.key))?;
         let signed = proof.signed().clone();
@@ -3883,25 +3974,97 @@ pub(crate) fn record_put(
     Ok((put, named))
 }
 
-/// The record a `409 conflict` shows the switch holding nothing for (Switch wire 6.3, 7.6):
-/// a `record.put`'s `record`, or a `record_version` condition's, at `{0, 0}`.
-pub(crate) fn conflict_absent_key(error: &AppError) -> Option<[u8; 32]> {
-    let AppError::Switch(ClientError::Switch {
-        code: ErrorCode::Conflict,
-        current,
-        ..
-    }) = error.unkept()
-    else {
-        return None;
-    };
-    let shown = current
-        .get("record")
-        .or_else(|| current.get("record_version"))?;
-    let at = |member: &str| shown.get(member).and_then(serde_json::Value::as_u64);
-    if at("generation") != Some(0) || at("version") != Some(0) {
-        return None;
+/// The record material a failed write or condition may return (Switch wire 6.3, 7.6).
+enum RecordConflict {
+    View(Box<SharedRecordView>),
+    Position,
+    Absent([u8; 32]),
+}
+
+impl RecordConflict {
+    fn read(current: &serde_json::Value, batch: &Batch) -> Result<Option<Self>, ClientError> {
+        let what = "Switch wire 6.3: the current record of a write conflict";
+        let unbound = || {
+            ClientError::InvalidResponse(
+                "Switch wire 6.3: the conflict does not match a submitted write or condition"
+                    .into(),
+            )
+        };
+        let conditions = || batch.ops().iter().flat_map(|op| &op.body().conditions);
+        let record = current.get("record");
+        let position = current.get("record_version");
+        let view = current.get("record_view");
+        let read_position = |shown| -> Result<_, ClientError> {
+            let o = Obj::of(shown, what)?;
+            Ok((
+                o.b64n::<32>("key")?,
+                RecordVersion::new(o.u64("generation")?, o.u64("version")?),
+            ))
+        };
+        let read_view = |value| SharedRecordView::read(Obj::of(value, what)?);
+        let record =
+            match (record, position, view) {
+                (None, None, None) => return Ok(None),
+                // An app.put refusal also names "record": the signed app registration.
+                (Some(_), None, None)
+                    if batch
+                        .ops()
+                        .iter()
+                        .any(|op| matches!(op.body().kind, OpKind::AppPut { .. })) =>
+                {
+                    return Ok(None);
+                }
+                (Some(shown), None, Some(view)) => {
+                    let (key, version) = read_position(shown)?;
+                    if !batch.ops().iter().any(
+                        |op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == key),
+                    ) {
+                        return Err(unbound());
+                    }
+                    if version.is_none() && view.is_null() {
+                        Self::Absent(key)
+                    } else {
+                        let view = read_view(view)?;
+                        if version.version == 0
+                            || view.key != key
+                            || version != RecordVersion::new(view.generation, view.version)
+                        {
+                            return Err(unbound());
+                        }
+                        Self::View(Box::new(view))
+                    }
+                }
+                (None, None, Some(view)) => {
+                    let view = read_view(view)?;
+                    if !conditions().any(
+                        |c| matches!(c, Condition::RecordCurrent { key, .. } if *key == view.key),
+                    ) {
+                        return Err(unbound());
+                    }
+                    Self::View(Box::new(view))
+                }
+                (None, Some(shown), None) => {
+                    let (key, version) = read_position(shown)?;
+                    if !conditions().any(|c| match c {
+                        Condition::RecordVersion { key: asked, .. } => *asked == key,
+                        Condition::RecordCurrent { key: asked, .. } => {
+                            version.is_none() && *asked == key
+                        }
+                        _ => false,
+                    }) || (version.version == 0 && !version.is_none())
+                    {
+                        return Err(unbound());
+                    }
+                    if version.is_none() {
+                        Self::Absent(key)
+                    } else {
+                        Self::Position
+                    }
+                }
+                _ => return Err(unbound()),
+            };
+        Ok(Some(record))
     }
-    unb64_array::<32>(shown.get("key")?.as_str()?).ok()
 }
 
 /// The condition on record `key` a write depending on it carries

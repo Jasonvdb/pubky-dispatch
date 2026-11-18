@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::order::{Handover, Kept};
 use super::records::{self, DeleteBase};
 use super::state::{Reader, Tx};
-use super::{App, AppError, ProtocolSet};
+use super::{App, AppError, FeedPosition, ProtocolSet};
 
 pub(super) const PREFIX: &str = "delobs/";
 pub(super) const RECEIPTS: &str = "delack/";
@@ -391,20 +391,50 @@ impl App {
         successor: Option<([u8; 32], RecordVersion)>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        self.retire_receipts_where(key, tx, |app, r| match successor {
+            Some((hash, at)) => {
+                hash != r.delete.item_hash
+                    && app.feed_order(at.generation, at.version)
+                        >= app.feed_order(r.generation, r.seq)
+            }
+            None => app.state.cert.holds_scope(&r.read_scope),
+        })
+    }
+
+    /// Absence at a verified head covers only deletes already applied by that position.
+    pub(super) fn retire_absent_receipts(
+        &mut self,
+        key: [u8; 32],
+        at: FeedPosition,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        self.retire_receipts_where(key, tx, |app, r| {
+            app.state.cert.holds_scope(&r.read_scope)
+                && app
+                    .received_order(
+                        at,
+                        FeedPosition {
+                            generation: r.generation,
+                            seq: r.seq,
+                        },
+                    )
+                    .is_some_and(std::cmp::Ordering::is_ge)
+        })
+    }
+
+    fn retire_receipts_where(
+        &mut self,
+        key: [u8; 32],
+        tx: &mut Tx,
+        obsolete: impl Fn(&Self, &Receipt) -> bool,
+    ) -> Result<(), AppError> {
         let first = (key, RecordVersion::NONE, [0; 32]);
         let obsolete: Vec<_> = self
             .state
             .deletion_receipts
             .range(first..)
             .take_while(|(id, _)| id.0 == key)
-            .filter(|(_, r)| match successor {
-                Some((hash, at)) => {
-                    hash != r.delete.item_hash
-                        && self.feed_order(at.generation, at.version)
-                            >= self.feed_order(r.generation, r.seq)
-                }
-                None => self.state.cert.holds_scope(&r.read_scope),
-            })
+            .filter(|(_, r)| obsolete(self, r))
             .map(|(id, _)| *id)
             .collect();
         for id in obsolete {

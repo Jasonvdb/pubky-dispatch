@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
 use pubky_switch_core::records::{
     AppCert, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
 };
@@ -97,6 +97,8 @@ pub(crate) fn sample_spec() -> ProtocolSpec {
 #[derive(Default)]
 pub(crate) struct SampleProtocol {
     pub(crate) received: Mutex<Vec<(u64, String, bool)>>,
+    /// The record a conversation entry depends on and the condition prepared before its first send.
+    conversation_guard: Mutex<Option<([u8; 32], Option<Condition>)>>,
     pub(crate) resends: Mutex<Vec<ResendNeeded>>,
     pub(crate) missed: Mutex<Vec<MissedEntries>>,
     /// How many of the next re-send and missed calls fail, as when the protocol can't read
@@ -113,6 +115,20 @@ pub(crate) struct SampleProtocol {
 }
 
 impl SampleProtocol {
+    /// Prepare the conversation entry while the record is absent, then create that record
+    /// in another batch. The original condition fails and the rebuilt entry names the new write.
+    async fn contend_conversation(&self, app: &mut App) {
+        let collection = super::Collection::new(
+            "sample.contacts",
+            pubky_switch_core::ident::Policy::new("sample-a", &["sample-a"]),
+        );
+        let target = super::RecordTarget::new(collection, b"contact");
+        let key = app.record_key(&target).unwrap();
+        let prepared = app.record_condition(&key).await.unwrap();
+        app.put_record(&target, b"{}", vec![]).await.unwrap();
+        *self.conversation_guard.lock().unwrap() = Some((key, Some(prepared)));
+    }
+
     /// Whether this call fails, counting it down.
     fn fails(&self) -> bool {
         let mut failing = self.failing.lock().unwrap();
@@ -168,7 +184,7 @@ impl Protocol for SampleProtocol {
     fn receive(
         &self,
         message: &ReceivedMessage,
-        _: &mut crate::app::ReceiveContext<'_>,
+        cx: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         let Some(text) = message.message.body.get("text").and_then(Value::as_str) else {
             return Outcome::Drop {
@@ -185,8 +201,16 @@ impl Protocol for SampleProtocol {
             value: text.as_bytes().to_vec(),
         }];
         let ops = if message.message.kind == "sample.note" {
+            let mut conditions = Vec::new();
+            if let Some((key, prepared)) = self.conversation_guard.lock().unwrap().as_mut() {
+                conditions.push(
+                    prepared
+                        .take()
+                        .unwrap_or_else(|| cx.record_condition(key).unwrap()),
+                );
+            }
             vec![(
-                Vec::new(),
+                conditions,
                 OpKind::AllowPut {
                     pubky: message.sender,
                     kind: AllowKind::Conversation,

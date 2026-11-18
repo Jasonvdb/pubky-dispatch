@@ -1172,12 +1172,8 @@ async fn test_app_quota_parks_the_entry_and_writes_later() {
 async fn test_app_conflict_rebuilds_the_effect_once() {
     let w = World::new();
     let mut app = w.join("wallet").await;
+    w.protocol.contend_conversation(&mut app).await;
     let (seq, _) = w.note(app.app_id(), "contended");
-    w.switch.fail_next(Fault::Error {
-        path: "ops".into(),
-        code: ErrorCode::Conflict,
-        current: json!({ "record": null }),
-    });
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq));
     let calls = w.protocol.received.lock().unwrap().clone();

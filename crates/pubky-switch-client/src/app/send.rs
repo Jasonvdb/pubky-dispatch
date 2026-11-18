@@ -67,7 +67,7 @@ use super::batch::OpBatch;
 use super::directory::Route;
 use super::error::{Refusal, WontDeliver};
 use super::events::{AppEvent, Duty};
-use super::records::{Collection, RecordTarget};
+use super::records::{Collection, DeleteBase, RecordTarget};
 use super::state::key;
 use super::{App, AppError};
 use crate::client::answers::AppendAnswer;
@@ -674,14 +674,14 @@ struct KeptJob {
     natural_key: Vec<u8>,
     #[serde(with = "serde_b64_vec")]
     tag: Vec<u8>,
-    /// The version of the delete the record's next write built on when the job was queued
+    /// The delete the record's next write built on when the job was queued
     /// ([`super::records::HeldRecord::delete_base`]); `None` when it built on no delete.
-    #[serde(with = "super::records::opt_version_serde")]
-    delete_base: Option<pubky_switch_core::ops::RecordVersion>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    delete_base: Option<DeleteBase>,
 }
 
 impl KeptJob {
-    fn of(job: &RecordJob, delete_base: Option<pubky_switch_core::ops::RecordVersion>) -> Self {
+    fn of(job: &RecordJob, delete_base: Option<DeleteBase>) -> Self {
         Self {
             collection: job.target.collection.name.clone(),
             policy: job.target.collection.policy.clone(),
@@ -2805,22 +2805,28 @@ impl App {
         &mut self,
         item: &mut OutboxItem,
         job: &KeptJob,
-        deleted: pubky_switch_core::ops::RecordVersion,
+        deleted: DeleteBase,
     ) -> Result<(), AppError> {
         let key = self.record_key(&job.job().target)?;
         item.record = None;
         item.record_done = true;
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
-        let to = self.owners_of_kind(&item.kind);
+        let mut to = self.owners_of_kind(&item.kind);
+        if let Some(owner) = self.protocols.of_collection(&job.collection)
+            && !to.contains(&owner.name)
+        {
+            to.push(owner.name.clone());
+        }
         self.keep_duty_for(
             &mut tx,
             to,
             Duty::RecordJobStopped {
                 msg_id: item.msg_id.clone(),
                 key,
-                generation: deleted.generation,
-                version: deleted.version,
+                generation: deleted.version.generation,
+                version: deleted.version.version,
+                item_hash: deleted.item_hash,
                 batch_id: item.record_batch.clone(),
             },
         )?;
@@ -3249,7 +3255,7 @@ impl App {
         &mut self,
         item: &OutboxItem,
         job: &KeptJob,
-    ) -> Result<Option<pubky_switch_core::ops::RecordVersion>, AppError> {
+    ) -> Result<Option<DeleteBase>, AppError> {
         let kept = self.read_sent(&item.msg_id).await?;
         let sent = SentMessage {
             to: item.to,
@@ -3460,6 +3466,20 @@ mod tests {
             record_batch: None,
             envelope_sent: true,
         }
+    }
+
+    #[test]
+    fn test_outbox_record_job_requires_its_delete_base() {
+        let mut stored = serde_json::to_value(accepted_item()).unwrap();
+        assert!(serde_json::from_value::<OutboxItem>(stored.clone()).is_ok());
+        assert_eq!(
+            stored["record"]
+                .as_object_mut()
+                .unwrap()
+                .remove("delete_base"),
+            Some(Value::Null)
+        );
+        assert!(serde_json::from_value::<OutboxItem>(stored).is_err());
     }
 
     #[test]

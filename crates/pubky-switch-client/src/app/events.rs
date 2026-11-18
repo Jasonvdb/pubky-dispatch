@@ -877,8 +877,9 @@ pub enum AppEvent {
     /// The stopping try wrote nothing. If the outbox kept a batch ID for an earlier try
     /// whose fate is unknown, `batch_id` names it and [`super::App::kept_batch`] shows
     /// its retained status. A restored outbox may predate an earlier applied write. The
-    /// protocol reads the record and decides again. A duty event, in the commit that stops
-    /// the job.
+    /// collection's protocol reads the record and decides again. The duty also goes to the
+    /// message kind's owner. The commit that stops the job keeps the duty until each
+    /// distinct owner acknowledges it.
     #[non_exhaustive]
     RecordJobStopped {
         /// The duty event's ID.

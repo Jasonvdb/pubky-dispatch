@@ -227,11 +227,19 @@ mod tests {
             wallet.delivery(&msg_id).await?,
             Some(Delivery::Accepted { .. })
         ));
-        assert!(wallet.unacknowledged_events().await?.iter().any(|event| matches!(
+        let owner = crate::parties::NOTES;
+        let duties = wallet.unacknowledged_events_for(owner).await?;
+        let [event] = duties.as_slice() else {
+            return Err("expected the record owner's stopped job".into());
+        };
+        assert!(matches!(
             event, AppEvent::RecordJobStopped { msg_id: stopped, key, generation, version, item_hash, batch_id: None, .. }
                 if stopped == &msg_id && key == &deleted.key && *generation == deleted.version.generation
                     && *version == deleted.version.version && *item_hash == hash
-        )));
+        ));
+        let id = event.id().ok_or("the stopped job has no event ID")?;
+        wallet.ack_event_with(owner, id, &[]).await?;
+        assert!(wallet.pending_duty_events().await?.is_empty());
         Ok(())
     }
 

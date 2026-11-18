@@ -47,6 +47,77 @@ async fn test_protocol_collection_members_survive_join_reload_and_restore() {
     }
 }
 
+#[tokio::test]
+async fn test_protocol_stopped_record_job_acknowledges_each_owner_once() {
+    use super::super::{protocol_api::Pair, shared_flows};
+    use crate::app::RecordJob;
+
+    let p = Pair::new();
+    let protocols = ProtocolSet::new(vec![
+        Arc::new(shared_flows::ItemsProtocol::default()),
+        Arc::new(named("chat")),
+        Arc::new(named("news")),
+    ])
+    .unwrap();
+    let scopes = ["sample-a", "chat"];
+    let mut wallet = Box::pin(p.join_set(&p.alice, "wallet", protocols.clone(), &scopes)).await;
+    let mut shop = Box::pin(p.join_set(&p.bob, "shop", protocols, &scopes)).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+
+    for kind in ["chat.item", "sample.note"] {
+        let target = RecordTarget::new(shared_flows::items(), kind.as_bytes());
+        let message = || {
+            let mut outgoing = Pair::note(&p.bob, "milk");
+            outgoing.kind = kind.to_owned();
+            outgoing.record = Some(RecordJob {
+                target: target.clone(),
+                tag: vec![],
+            });
+            outgoing
+        };
+        Box::pin(wallet.put_record(&target, &shared_flows::value(&[]), vec![]))
+            .await
+            .unwrap();
+        let (first, delivery) = Box::pin(wallet.send(message())).await.unwrap();
+        assert!(matches!(delivery, Delivery::Accepted { .. }));
+        Box::pin(wallet.flush_outbox()).await.unwrap();
+        let written = wallet.read_record(&target).await.unwrap().unwrap();
+        assert_eq!(shared_flows::ids(written.content.value()), [first]);
+
+        let msg_id = wallet.queue(message()).await.unwrap();
+        let delete = Box::pin(wallet.delete_record(&target, vec![]))
+            .await
+            .unwrap();
+        Box::pin(wallet.flush_outbox()).await.unwrap();
+        assert!(matches!(
+            wallet.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        let pending = wallet.pending_duty_events().await.unwrap();
+        let [stop] = pending.as_slice() else {
+            panic!("{pending:?}");
+        };
+        assert!(matches!(
+            &stop.event, AppEvent::RecordJobStopped { msg_id: stopped, key, .. }
+            if stopped == &msg_id && key == &delete.key
+        ));
+        let id = stop.event.id().unwrap();
+        let distinct = kind == "chat.item";
+        assert_eq!(stop.owners.len(), if distinct { 2 } else { 1 });
+        let chat = wallet.unacknowledged_events_for("chat").await.unwrap();
+        assert_eq!(chat.contains(&stop.event), distinct);
+        assert!(!wallet.event_is_for(&stop.event, "news"));
+        if distinct {
+            wallet.ack_event_with("chat", id, &[]).await.unwrap();
+        }
+        let records = wallet.unacknowledged_events_for("sample").await.unwrap();
+        assert_eq!(records.as_slice(), std::slice::from_ref(&stop.event));
+        assert_eq!(wallet.event_owners(id).unwrap(), ["sample"]);
+        wallet.ack_event_with("sample", id, &[]).await.unwrap();
+        assert!(wallet.pending_duty_events().await.unwrap().is_empty());
+    }
+}
+
 async fn check_ownership(raw: bool) {
     // Collection identity and read-scope ownership each suffice, regardless of whether
     // the registered collection admits the supplied policy. Own and unregistered

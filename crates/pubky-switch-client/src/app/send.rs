@@ -2812,7 +2812,12 @@ impl App {
         item.record_done = true;
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
-        let to = self.owners_of_kind(&item.kind);
+        let mut to = self.owners_of_kind(&item.kind);
+        if let Some(owner) = self.protocols.of_collection(&job.collection)
+            && !to.contains(&owner.name)
+        {
+            to.push(owner.name.clone());
+        }
         self.keep_duty_for(
             &mut tx,
             to,

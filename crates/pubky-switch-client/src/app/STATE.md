@@ -226,6 +226,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   kept-only original intent's origin without changing that batch; an existing reconstructed
   copy is never promoted by a later queue. The inventory scans every retained producer,
   not the latest message-status index, and uses dispatch's hold and protocol decisions.
+- **A protocol batch can mark its first local keep.** `OpBatch::keep_id_at` stores the stable 16-byte ID under its own local key in the transaction that first records `opq/`. Ordinary retries keep that ID. A batch resealed after a definitive stale-epoch refusal replaces its earlier marker in the new batch’s first commit. The protocol can delete its marker with the applied batch’s local writes. Its backup layer determines which outstanding markers survive a restore.
 - **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared

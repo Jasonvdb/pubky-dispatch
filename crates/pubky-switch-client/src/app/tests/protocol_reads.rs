@@ -562,12 +562,24 @@ async fn test_submit_batch_stale_epoch_seals_again_and_sends_once_more() {
     raise_epoch(&w, &app);
     app.submit_batch(
         OpBatch::for_protocol("sample")
+            .keep_id_at(b"reservation".to_vec())
             .entry(entry)
             .op(OpKind::DenyPut { pubky: [9; 32] })
             .local(local("written")),
     )
     .await
     .unwrap();
+    let id = app
+        .protocol_get("sample", b"reservation")
+        .await
+        .unwrap()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
     assert_eq!(app.data_epoch(), 2);
     assert_eq!(sealed_epoch(&w, &key), Some(2));
     let record = app.shared_record(&key).await.unwrap().unwrap();
@@ -578,6 +590,63 @@ async fn test_submit_batch_stale_epoch_seals_again_and_sends_once_more() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn test_kept_id_key_blocks_another_submission_until_its_owner_removes_it() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let entry = || OpKind::DenyPut { pubky: [9; 32] };
+    let key = b"outstanding".to_vec();
+    for unowned in [OpBatch::new(), OpBatch::for_protocol("other")] {
+        assert!(
+            app.submit_batch(unowned.op(entry()).keep_id_at(key.clone()))
+                .await
+                .is_err()
+        );
+    }
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
+    let batch = || {
+        OpBatch::for_protocol("sample")
+            .op(entry())
+            .keep_id_at(key.clone())
+    };
+    // The qualified marker key, its native ID and its write overhead count as well.
+    let room = crate::app::MAX_STEP_LOCAL_BYTES
+        - 2 * crate::app::LOCAL_WRITE_OVERHEAD_BYTES
+        - b"sample/outstanding".len()
+        - 16
+        - b"payload".len();
+    let payload = |bytes| LocalWrite::Put {
+        key: b"payload".to_vec(),
+        value: vec![1; bytes],
+    };
+    assert!(matches!(
+        app.submit_batch(batch().local(payload(room + 1))).await,
+        Err(crate::app::AppError::Refused(crate::app::Refusal::Usage(_)))
+    ));
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
+    app.submit_batch(batch().local(payload(room)))
+        .await
+        .unwrap();
+    let original = app.protocol_get("sample", &key).await.unwrap().unwrap();
+    assert!(matches!(
+        app.kept_batch(original.as_slice().try_into().unwrap())
+            .await
+            .unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
+    assert!(app.submit_batch(batch()).await.is_err());
+    assert_eq!(
+        app.protocol_get("sample", &key).await.unwrap(),
+        Some(original)
+    );
+    let remove = LocalWrite::Delete { key: key.clone() };
+    app.protocol_commit("sample", std::slice::from_ref(&remove))
+        .await
+        .unwrap();
+    app.submit_batch(batch().local(remove)).await.unwrap();
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
 }
 
 #[tokio::test]

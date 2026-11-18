@@ -1311,3 +1311,158 @@ async fn test_key_provider_loss_follows_a_copy_to_the_service_it_names() {
     assert_eq!(world.switch.identity_doc().unwrap().signed(), pointing.signed());
     assert_eq!((shown.version, shown.generation), (moved.version(), 2));
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_goes_on_past_a_service_that_flaps() {
+    // The service being left shows an app revoked when it is surveyed and can't be reached
+    // when the loss is declared, round after round: the declaration acts on what the user
+    // confirmed, and the app is removed.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 66).await;
+    let id = app.keys.app_id_bytes();
+    drop(old);
+    world.switch.revoke(id).unwrap();
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let (service, router) = picked_service(&world);
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert!(matches!(shown.apps[0], (_, AppFate::RemovedAtSwitch { .. })));
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    signs_at(&world, &service, &mut signer, 1).await;
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_refuses_only_what_the_user_didnt_see() {
+    // A revocation the service being left shows only at the declaration is new to the user:
+    // refused. Surveyed again, it is shown, and the declaration goes ahead, whatever the
+    // service shows then.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 68).await;
+    let id = app.keys.app_id_bytes();
+    drop(old);
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let (service, router) = picked_service(&world);
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!(shown.apps, vec![(id, AppFate::Stays)]);
+    world.switch.revoke(id).unwrap();
+    let refusal = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
+    let shown = survey(&world, &store, &router).await.unwrap();
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    signs_at(&world, &service, &mut signer, 1).await;
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_takes_the_earlier_of_a_pick_and_a_services_time() {
+    // The records picked a time to distrust an app from, and the service being left shows
+    // it revoked at another: whichever is earlier is the one taken, in either order.
+    for pick_first in [true, false] {
+        let world = World::new();
+        let (mut old, store) = world.enrolled().await;
+        let (app, _) = joined(&world, &mut old, 70).await;
+        let id = app.keys.app_id_bytes();
+        let now = pubky_switch_client::clock::Clock::now_ms(world.clock.as_ref());
+        world.switch.fail_next(SwitchFault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+        old.revoke(id, Some(now - 7_200_000), confirmed())
+            .await
+            .unwrap_err();
+        drop(old);
+        world.switch.revoke(id).unwrap();
+        // The records' pick, before or after the time the service shows.
+        let picked = if pick_first {
+            now - 7_200_000
+        } else {
+            now + 1_800_000
+        };
+        edit_state(&world, &store, |state| {
+            state["revoking"][0]["distrust_from"] = picked.into();
+        });
+        let expected = picked.min(now);
+        let (service, router) = picked_service(&world);
+        router.add_switch(SWITCH_ORIGIN, &world.switch);
+        let shown = survey(&world, &store, &router).await.unwrap();
+        assert_eq!(
+            shown.apps,
+            vec![(
+                id,
+                AppFate::RemovedAtSwitch {
+                    distrust_from: Some(expected)
+                }
+            )],
+            "{pick_first}"
+        );
+        let mut signer = Signer::declare_provider_loss_with_key(
+            env_on(&world, &store, &router),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+        )
+        .await
+        .unwrap();
+        let doc = signer.identity_doc().unwrap().unwrap();
+        assert_eq!(
+            doc.body().removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+            expected,
+            "{pick_first}"
+        );
+        signs_at(&world, &service, &mut signer, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_takes_the_later_of_the_device_and_service_clocks() {
+    // With nothing but the key, the first document's generation and version come from the
+    // later of the device's clock and the picked service's: a service behind the device
+    // can't set them lower, and one ahead raises them.
+    for skew in [-240_000_i64, 240_000] {
+        let world = World::new();
+        let (old, _) = world.enrolled().await;
+        drop(old);
+        remove_file(&world, IDENTITY_PATH);
+        remove_file(&world, SIGNER_BACKUP_PATH);
+        let service_time = START_MS.checked_add_signed(skew).unwrap();
+        let service = ScriptedSwitch::unenrolled_at(
+            &world.key,
+            [0x5e; 32],
+            Arc::new(pubky_switch_client::clock::TestClock::new(service_time)),
+            NEW_ORIGIN,
+        );
+        let router = Arc::new(Router::new());
+        router.add_switch(NEW_ORIGIN, &service);
+        let store = Arc::new(MemoryStore::new());
+        let signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+        let doc = signer.identity_doc().unwrap().unwrap();
+        let time = START_MS.max(service_time);
+        assert_eq!(doc.body().recovery_from, Some(time / 1_000), "{skew}");
+        assert!(doc.version() > time * 1_000, "{skew}");
+    }
+}

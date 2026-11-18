@@ -110,7 +110,28 @@ pub struct KeyRecoverySurvey {
     earlier: Vec<RemovedApp>,
     /// The highest version any source showed, which the version signed is above.
     versions: u64,
+    /// For a provider loss, what it read, which the declaration acts on.
+    carried: Option<Carried>,
     digest: [u8; 32],
+}
+
+/// What a provider loss's survey read ([`LossPlan`]), carried to the declaration with the
+/// user's confirmation of it. Surveys compare by everything they show, not by this.
+#[derive(Clone)]
+struct Carried(std::sync::Arc<LossPlan>);
+
+impl PartialEq for Carried {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Carried {}
+
+impl std::fmt::Debug for Carried {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carried")
+    }
 }
 
 /// What a recovery with the identity key alone does (Switch spec 12.8).
@@ -178,12 +199,11 @@ pub enum BackupFound {
 #[derive(Clone, Debug)]
 pub struct KeyRecoveryConfirmed {
     digest: [u8; 32],
-    /// The highest version the survey saw: the version signed stays above it, whatever a
-    /// source shows later.
-    versions: u64,
     dropped: Vec<[u8; 16]>,
     /// The service a provider loss goes to, which the user picked.
     to: Option<String>,
+    /// What the provider loss's survey read.
+    shown: Option<Carried>,
     /// The origin the user gave for the survey, if they gave one.
     asked: Option<String>,
 }
@@ -201,7 +221,7 @@ impl KeyRecoveryConfirmed {
     pub fn shown_and_confirmed(survey: &KeyRecoverySurvey, dropped: &[[u8; 16]]) -> Self {
         Self {
             digest: survey.digest,
-            versions: survey.versions,
+            shown: survey.carried.clone(),
             dropped: dropped.to_vec(),
             to: match survey.kind {
                 KeyRecoveryKind::AtService => None,
@@ -352,6 +372,7 @@ impl KeyRecoverySurvey {
             certs_dropped: fates.certs_dropped.clone(),
             earlier: fates.earlier.clone(),
             versions,
+            carried: None,
             digest: [0; 32],
         };
         survey.digest = digest_of(&survey);
@@ -1056,6 +1077,7 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
 }
 
 /// A provider loss's survey, with what it builds on.
+#[derive(Clone, Debug)]
 struct LossPlan {
     survey: KeyRecoverySurvey,
     observation: AccountObservation,
@@ -1064,6 +1086,89 @@ struct LossPlan {
     versions: u64,
     answer: AppsAnswer,
     view: Option<BackupView>,
+}
+
+impl LossPlan {
+    /// This plan, its survey carrying it.
+    fn carried(mut self) -> Self {
+        self.survey.carried = Some(Carried(std::sync::Arc::new(self.clone())));
+        self
+    }
+
+    /// The plan the declaration acts on: `shown`, the one the user confirmed, with what this
+    /// one, read again at the declaration, adds that doesn't change what the user saw. A
+    /// source that shows less now, or none, changes nothing. A copy above the one confirmed,
+    /// a revocation or an earlier time not shown, or another key or account at the service
+    /// picked is new to the user, and refused (Switch spec 12.8).
+    fn settle(self, shown: &Self) -> Result<Self> {
+        let changed = || stop(KeyRecoveryStop::SurveyChanged);
+        let (now, then) = (&self.survey, &shown.survey);
+        if now.identity != then.identity
+            || now.origin != then.origin
+            || now.service_key != then.service_key
+            || now.discovery != then.discovery
+        {
+            return Err(changed());
+        }
+        match (&shown.base, &self.base) {
+            (_, None) => {}
+            (None, Some(_)) => return Err(changed()),
+            (Some(confirmed), Some(read)) => {
+                if read.hash() != confirmed.hash()
+                    && (read.generation(), read.version())
+                        >= (confirmed.generation(), confirmed.version())
+                {
+                    return Err(changed());
+                }
+            }
+        }
+        if now.revoked.iter().any(|app| !then.revoked.contains(app)) {
+            return Err(changed());
+        }
+        let revoked_from = |fate: &AppFate| match fate {
+            AppFate::RemovedAtSwitch { distrust_from }
+            | AppFate::RevocationPending { distrust_from } => Some(*distrust_from),
+            _ => None,
+        };
+        for (app, fate) in &now.apps {
+            let Some(from_now) = revoked_from(fate) else {
+                continue;
+            };
+            let Some((_, confirmed)) = then.apps.iter().find(|(id, _)| id == app) else {
+                continue;
+            };
+            match revoked_from(confirmed) {
+                None => return Err(changed()),
+                Some(from_then) => {
+                    if from_now.is_some_and(|t| from_then.is_none_or(|c| t < c)) {
+                        return Err(changed());
+                    }
+                }
+            }
+        }
+        for earlier in &now.earlier {
+            let known = then.earlier.iter().any(|e| {
+                e.app_id == earlier.app_id && e.distrust_from <= earlier.distrust_from
+            });
+            if !known {
+                return Err(changed());
+            }
+        }
+        let mut settled = shown.clone();
+        settled.survey.carried = None;
+        settled.observation = self.observation;
+        settled.lost = settled.lost.max(self.lost);
+        settled.versions = settled.versions.max(self.versions);
+        if let (Some(view), Some(read)) = (&mut settled.view, &self.view) {
+            for cert in &read.certs {
+                if !view.certs.iter().any(|held| held.hash() == cert.hash()) {
+                    view.certs.push(cert.clone());
+                }
+            }
+        }
+        settled.answer.apps.extend(self.answer.apps);
+        Ok(settled)
+    }
 }
 
 /// The copy of the highest generation, then version, of `docs`, the first of equals: the
@@ -1139,14 +1244,13 @@ impl Signer {
         let Some(to) = confirmed.to.clone() else {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         };
-        let (mut signer, found) = Self::loss_target(env, keyring).await?;
-        let mut plan = Box::pin(signer.loss_plan(&found, &to)).await?;
-        if plan.survey.digest != confirmed.digest {
+        let Some(Carried(shown)) = confirmed.shown.clone() else {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
-        }
-        // A source that showed a higher version at the survey and a lower one now can't lower
-        // the version signed.
-        plan.versions = plan.versions.max(confirmed.versions);
+        };
+        let (mut signer, found) = Self::loss_target(env, keyring).await?;
+        let plan = Box::pin(signer.loss_plan(&found, &to))
+            .await?
+            .settle(&shown)?;
         let identity = signer.state.identity;
         let state = signer.loss_records(&plan, &found, &to, &confirmed.dropped)?;
         // In memory until the commit below: a refusal before it leaves the store as found.
@@ -1410,6 +1514,7 @@ impl Signer {
                 certs_dropped: Vec::new(),
                 earlier: Vec::new(),
                 versions: versions.max(floor),
+                carried: None,
                 digest: [0; 32],
             };
             survey.digest = digest_of(&survey);
@@ -1421,7 +1526,8 @@ impl Signer {
                 versions: versions.max(floor),
                 answer,
                 view: None,
-            });
+            }
+            .carried());
         };
         // The version signs the members this signer reads, as at the service.
         if carries_unknown_members(&base)? {
@@ -1454,7 +1560,8 @@ impl Signer {
             versions,
             answer,
             view: Some(view),
-        })
+        }
+        .carried())
     }
 
     /// The records a provider loss with the key alone commits from `plan` over what the store
@@ -1941,6 +2048,7 @@ mod tests {
                 distrust_from: 7,
             }],
             versions: 4,
+            carried: None,
             digest: [0; 32],
         };
         let changes: Vec<fn(&mut KeyRecoverySurvey)> = vec![

@@ -922,6 +922,49 @@ async fn test_identity_lookup_switch_alone_confirms_without_the_homeserver() {
     assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
 }
 
+/// A Homeserver that serves an older copy than the one held, later, with the switch
+/// unavailable: the copy held was not read again, so it isn't fresh, and no action is taken
+/// on it before another lookup.
+#[tokio::test]
+async fn test_identity_lookup_older_copy_leaves_the_read_time() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    // The switch holds a version the Homeserver doesn't publish.
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.switch().deliver_identity(&newer).unwrap();
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, start);
+    // Twenty minutes on, the Homeserver still serves the older copy, and the switch can't
+    // be read.
+    p.clock.advance_ms(20 * MINUTE);
+    p.router.remove(BOB_ORIGIN);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.homeserver, HomeserverCopy::Read);
+    assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, start);
+    for by in [Initiator::User, Initiator::Automatic] {
+        assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
+    }
+}
+
 #[tokio::test]
 async fn test_identity_lookup_split_waits_a_grace_then_takes_the_answer() {
     let p = Pair::new();

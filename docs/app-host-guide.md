@@ -146,6 +146,9 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 
 | Case | What happened and what to do |
 |---|---|
+| `AppendDecision::Send` | Send the imminent append. Each later attempt asks the owner again. |
+| `AppendDecision::Hold` | Keep the signed message queued for fresh observations on a later attempt. |
+| `AppendDecision::Withdraw` | Retire the outstanding delivery. Handle the duty notification, which can report an earlier possible delivery or the end of a resend. |
 | `DeliveryOrigin::Original` | The client has retained the original intent. Use this in the owning protocol's `may_send` check. The separate `resend` flag says whether a copy was accepted before. |
 | `DeliveryOrigin::Reconstructed` | The copy came from signed plaintext without a retained original intent. Apply the protocol's rules for reconstructed sends. |
 | `Delivery::Queued` | A pending resend also reads as queued. If the matching entry in the owning protocol's `queued_messages` has `resend: true`, the inbox accepted this message before. The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |
@@ -165,6 +168,8 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 | `WontDeliver::PastReplayWindow` | The signed creation time plus 30 days, less clock tolerance, has passed by the later of device and verified service time. Stop. A recipient may have forgotten its duplicate marker. |
 | `WontDeliver::GivenUp` | This store remembers giving up delivery. Preserve that decision. No further undelivered notice is needed for this refusal. |
 | `WontDeliver::TooLarge` | The reconstructed outbox item cannot fit the store. Show that it could not be queued. Repeating those bytes cannot help. |
+
+A protocol whose delivery depends on current records can implement `append_records` and `judge_append`. Derive up to two ordered targets from the signed message and select a fixed policy registered by that owner for each. Before each transport attempt, including a timestamp retry, the client reads those targets and passes each target with its `RecordRead` to the owner. A hosted, current `KeptReason::NotFound` reports absence. Treat an unavailable, refused or unreadable value as a reason to hold. `AppendDecision::Send` permits that attempt, `Hold` keeps the same signed message queued, and `Withdraw` ends the outstanding delivery through the usual duty notification. An earlier unanswered attempt can still result in `DeliveryUnknown`. Queued-message enumeration consults only local state.
 
 For admission or current-certificate refusals, the client gives up after five qualifying answers spread across at least 30 days (at least 7.5 days between counted tries). Once 45 days have passed since the first such answer, the next flush that reaches the message gives up without another delivery try. A held message can still reach a deadline. Only a new user intent should become a new message.
 

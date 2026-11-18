@@ -186,8 +186,10 @@ const LIST_PAGE: u32 = 1000;
 /// What taking one listed record writes, at most: its cached write (its operation, 512 KiB,
 /// and opened value, 256 KiB, in base64, with its proof: 1.2 MiB), its mark as stored
 /// ([`MAX_SEEN_MARK_BYTES`] in base64), a flagged write's rule, and its duty events.
-const LISTED_RECORD_ROOM_BYTES: u64 =
-    super::feed::CACHED_RECORD_BYTES + super::feed::KEPT_MARK_BYTES + (64 << 10);
+const LISTED_RECORD_ROOM_BYTES: u64 = super::feed::CACHED_RECORD_BYTES
+    + super::feed::KEPT_MARK_BYTES
+    + super::deletion::ROOM
+    + (64 << 10);
 
 // One listed record always fits a commit of its own.
 const _: () = assert!(LISTED_RECORD_ROOM_BYTES < crate::store::MAX_BATCH_BYTES);
@@ -484,7 +486,7 @@ pub struct SharedRecord {
 
 /// A signed operation the app keeps as evidence: a `record.put` or a claim entry, its
 /// writer's certificate, and its transition proof when held. Its `Debug` shows no content.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptOp {
     /// The signed operation, with its sealed value.
     pub op: SignedDoc,
@@ -1102,6 +1104,8 @@ pub struct ShownWrite {
 /// What [`App::take_write`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
+    /// The collection owner still has to take an earlier deletion.
+    Waits,
     /// A newer write, now held.
     New,
     /// The write held.
@@ -1422,7 +1426,10 @@ impl App {
             Err(AppError::Switch(error)) if error.is_not_hosted() => {
                 Ok(RecordAnswer::NotHosted(Box::new(error)))
             }
-            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(RecordAnswer::Absent),
+            Err(error) if error.code() == Some(ErrorCode::NotFound) => {
+                self.forget_deletion_receipts(*key).await?;
+                Ok(RecordAnswer::Absent)
+            }
             Err(error) => Err(error),
         }
     }
@@ -1834,6 +1841,7 @@ impl App {
             .unwrap_or_default()
             .kept();
         kept.extend(self.kept_calls().await?);
+        kept.extend(self.deletion_positions());
         kept.sort_by_key(|kept| self.feed_order(kept.generation, kept.seq));
         Ok(kept)
     }
@@ -2038,6 +2046,7 @@ impl App {
         &mut self,
         item: &ChainItem,
         envelope: &ChainEnvelope,
+        page_time_ms: u64,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
         let Ok(op) = SignedOp::peek(&item.item) else {
@@ -2058,7 +2067,7 @@ impl App {
         let key = put.key;
         let mut viewed = None;
         let read = self
-            .judge_write(&evidence, None, key, true, tx, &mut viewed)
+            .judge_write(&evidence, None, key, Some(page_time_ms), tx, &mut viewed)
             .await?;
         if read == WriteRead::Waits {
             return Ok(read);
@@ -2085,7 +2094,7 @@ impl App {
     ) -> Result<WriteRead, AppError> {
         let mut viewed = None;
         let read = self
-            .judge_write(evidence, expect, shown_key, false, tx, &mut viewed)
+            .judge_write(evidence, expect, shown_key, None, tx, &mut viewed)
             .await?;
         if let Some(divergent) = viewed.filter(|_| read.says_of_now()) {
             self.note_view_divergence(&shown_key, divergent, tx).await?;
@@ -2109,11 +2118,11 @@ impl App {
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
-        feed: bool,
+        page_time_ms: Option<u64>,
         tx: &mut Tx,
         viewed: &mut Option<bool>,
     ) -> Result<WriteRead, AppError> {
-        if feed {
+        if page_time_ms.is_some() {
             let protocol = self
                 .write_protocol(evidence, expect, &shown_key, tx)
                 .await?;
@@ -2168,16 +2177,27 @@ impl App {
         match outcome {
             Ok(accepted) => {
                 let key = accepted.key;
-                return Ok(match self.take_write(accepted, false, tx).await? {
-                    Taken::New => WriteRead::Taken,
-                    Taken::Equal | Taken::Reopened => WriteRead::Equal,
-                    Taken::Older(write) => {
-                        self.events.push(AppEvent::RecordShownOlder { key, write });
-                        WriteRead::Older(write)
-                    }
-                    Taken::Overtaken(write, at) => WriteRead::Overtaken(write, at),
-                    Taken::Flagged => WriteRead::Refused,
-                });
+                return Ok(
+                    match self
+                        .take_write(
+                            accepted,
+                            false,
+                            page_time_ms.filter(|_| evidence.stub.is_some()),
+                            tx,
+                        )
+                        .await?
+                    {
+                        Taken::Waits => WriteRead::Waits,
+                        Taken::New => WriteRead::Taken,
+                        Taken::Equal | Taken::Reopened => WriteRead::Equal,
+                        Taken::Older(write) => {
+                            self.events.push(AppEvent::RecordShownOlder { key, write });
+                            WriteRead::Older(write)
+                        }
+                        Taken::Overtaken(write, at) => WriteRead::Overtaken(write, at),
+                        Taken::Flagged => WriteRead::Refused,
+                    },
+                );
             }
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
@@ -2926,10 +2946,15 @@ impl App {
         &mut self,
         mut accepted: Accepted,
         own: bool,
+        page_time_ms: Option<u64>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         Box::pin(async move {
             let key = accepted.key;
+            if self.state.deletions.values().any(|d| (d.key == key || self.protocols.of_collection(&accepted.collection.name).is_some_and(|owner| owner.name == d.owner)) && self.feed_order(d.generation, d.seq)
+                < self.feed_order(accepted.revision.generation, accepted.revision.seq)) {
+                return Ok(Taken::Waits);
+            }
             self.keep_cert(&accepted.cert, tx)?;
             let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
             let reopened = held.as_ref().is_some_and(|held| {
@@ -3009,6 +3034,9 @@ impl App {
                     return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
                 }
             }
+            if accepted.version.authenticated || accepted.viewed {
+                self.retire_deletion_receipts(key, Some((&accepted.revision, accepted.viewed)), tx)?;
+            }
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
             let new_value = accepted.content.value();
             // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
@@ -3041,14 +3069,36 @@ impl App {
             let own = own || accepted.writer == self.state.meta.app_id;
             // Every write of another app the app would take is checked, the first of a
             // record included, against nothing seen yet (Switch spec 8.2).
-            if !own
-                && let Some(reason) = self.protocols.record_regression(
-                    &accepted.collection.name,
-                    seen.as_ref().map(|mark| mark.mark.as_slice()),
-                    new_value,
-                    base,
-                )
-            {
+            let mark = seen.as_ref().map(|mark| mark.mark.as_slice());
+            let regression = (!own).then(|| self.protocols.record_regression(
+                &accepted.collection.name, mark, new_value, base.clone(),
+            )).flatten();
+            if !own && accepted.content == RecordContent::Deleted
+                && let Some(owner) = self.protocols.of_collection(&accepted.collection.name) {
+                let needed = held.as_ref().and_then(|h| h.base(&key, self.state.own_doc.body().recovery_from).1);
+                let predecessor = held.as_ref().filter(|h| h.authenticated
+                    && h.policy == accepted.collection.policy && h.content.value().is_some())
+                    .map(|h| super::deletion::Predecessor {
+                        source: KeptOp { op: h.op.clone(), cert: h.cert.clone(), proof: h.proof.clone() },
+                        exact: h.version == expected_version && h.follow.is_none() && !h.gone
+                            && needed.as_ref().is_none_or(|c| base.conditions.contains(c))
+                            && base.conditions.iter().all(|c| !matches!(c, Condition::RecordCurrent {
+                                key: k, revision, deleted, .. } if *k == key && (*revision != h.applied || *deleted))),
+                    });
+                let hold = super::deletion::Observation {
+                    key, owner: owner.name.clone(), collection: accepted.collection.name.clone(),
+                    delete: DeleteBase { version: accepted.version.version, item_hash: accepted.item_hash },
+                    operation: accepted.op.clone(), cert: accepted.cert.signed().clone(),
+                    generation: accepted.revision.generation, seq: accepted.revision.seq,
+                    page_time_ms,
+                    seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
+                };
+                if held.as_ref().and_then(HeldRecord::delete_base) != Some(hold.delete) && !self.state.deletions.contains_key(&hold.id())
+                    && !self.state.deletion_receipts.contains_key(&hold.id()) {
+                    self.observe_deletion(hold, tx)?;
+                }
+            }
+            if let Some(reason) = regression {
                 let shown = Shown {
                     key,
                     version: accepted.version.version,
@@ -3299,7 +3349,7 @@ impl App {
             Ok(accepted) => {
                 // The app's own write at this service clears the record's divergent
                 // uploads there (Switch wire 7.4.14).
-                if self.take_write(accepted, true, tx).await? == Taken::New {
+                if self.take_write(accepted, true, None, tx).await? == Taken::New {
                     self.note_divergent(&key, false, tx).await?;
                 }
             }
@@ -3562,15 +3612,17 @@ impl App {
         &mut self,
         item: &ChainItem,
         envelope: &ChainEnvelope,
+        page_time_ms: u64,
         tx: &mut Tx,
     ) -> Result<bool, AppError> {
         let Ok(op) = SignedOp::peek(&item.item) else {
             return Ok(false);
         };
         match &op.body().kind {
-            OpKind::RecordPut(_) => {
-                Ok(self.feed_record_write(item, envelope, tx).await? == WriteRead::Waits)
-            }
+            OpKind::RecordPut(_) => Ok(self
+                .feed_record_write(item, envelope, page_time_ms, tx)
+                .await?
+                == WriteRead::Waits),
             OpKind::Claim(_) => self
                 .feed_claim_entry(item, envelope, tx)
                 .await

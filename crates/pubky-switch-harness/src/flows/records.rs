@@ -243,6 +243,63 @@ mod tests {
         Ok(())
     }
 
+    async fn observe_deleted_record(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+        let asking = |name| Asking::new(world.app_keys(&alice, name)?);
+        let (mut writer, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            asking("wallet")?,
+            notes_protocol_with_records(),
+        ))
+        .await?;
+        let spec = notes_protocol_with_records().spec().clone();
+        let protocol = std::sync::Arc::new(
+            pubky_switch_client::testing::TestProtocol::new(spec).observing_deletions(),
+        );
+        let (mut reader, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            asking("phone")?,
+            protocol,
+        ))
+        .await?;
+        let target = RecordTarget::new(notes_collection(), b"shopping list");
+        let value = br#"{"items":["milk"]}"#;
+        Box::pin(writer.put_record(&target, value, vec![])).await?;
+        Box::pin(reader.receive(None)).await?;
+        let delete = Box::pin(writer.delete_record(&target, vec![])).await?;
+        let evidence = writer.shared_evidence().await?;
+        let [write] = evidence.ops.as_slice() else {
+            return Err("expected the deleted record".into());
+        };
+        let hash = SignedOp::peek(&write.op)?.item_hash()?;
+        Box::pin(reader.receive(None)).await?;
+        assert_eq!(
+            reader
+                .protocol_get(crate::parties::NOTES, &hash)
+                .await?
+                .as_deref(),
+            Some(value.as_slice())
+        );
+        Box::pin(reader.flush_cursor()).await?;
+        assert!(reader.service_cursor().seq >= delete.version.version);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_deletion_observation_at_both_switches() {
+        for backend in [Backend::Service, Backend::Scripted] {
+            Box::pin(run_here(backend, observe_deleted_record))
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_record_job_stopped_names_the_signed_delete_at_both_switches() {
         for backend in [Backend::Service, Backend::Scripted] {

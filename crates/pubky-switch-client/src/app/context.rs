@@ -301,6 +301,7 @@ pub struct RestoreContext<'a> {
     app_id: [u8; 16],
     naming: &'a NamingKey,
     cert: &'a AppCert,
+    pub(super) previous: Option<LocalView<'a>>,
 }
 
 impl<'a> RestoreContext<'a> {
@@ -315,6 +316,21 @@ impl<'a> RestoreContext<'a> {
             app_id,
             naming,
             cert,
+            previous: None,
+        }
+    }
+
+    /// Values under this protocol's own prefix in the installation being replaced.
+    /// An empty destination and a backup being checked on its own return no values.
+    /// The owner can retain evidence it verifies alongside the selected layer.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn previous_local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
+        match &self.previous {
+            Some(view) => view.local_scan(prefix),
+            None => Ok(Vec::new()),
         }
     }
 

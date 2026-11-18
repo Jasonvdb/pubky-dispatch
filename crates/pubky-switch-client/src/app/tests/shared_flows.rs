@@ -48,11 +48,15 @@ pub(crate) struct ItemsProtocol {
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
+    observe_deletes: std::sync::atomic::AtomicBool,
+    observation_unavailable: std::sync::atomic::AtomicBool,
     /// Whether a delete fails a check of the protocol's own, seen or not.
     pub(crate) refuses_deletes: std::sync::atomic::AtomicBool,
     /// An item no write may hold, seen or not: a check of the protocol's own that a first
     /// write fails too.
     pub(crate) forbidden: std::sync::Mutex<Option<String>>,
+    keep_receipts: std::sync::atomic::AtomicBool,
+    large_receipt: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn items() -> Collection {
@@ -151,6 +155,62 @@ impl Protocol for ItemsProtocol {
         let pad = pad.unwrap_or(*self.pad.lock().unwrap());
         mark.extend(std::iter::repeat_n(b' ', pad));
         Some(mark)
+    }
+
+    fn record_put_back(
+        &self,
+        deletion: &crate::app::RecordDeletion<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.observe_deletes.load(SeqCst) {
+            return Ok(None);
+        }
+        if self.observation_unavailable.load(SeqCst) {
+            return Err(crate::app::StoreFailure::unavailable(
+                crate::error::StoreError::Unavailable,
+            ));
+        }
+        let mut receipts: Vec<serde_json::Value> = cx
+            .local_get(b"delete receipts")
+            .unwrap()
+            .map(|v| serde_json::from_slice(&v).unwrap())
+            .unwrap_or_default();
+        if self.large_receipt.load(SeqCst) {
+            return Ok(Some(crate::app::PutBack::Observe {
+                observed: vec![LocalWrite::Put {
+                    key: b"oversize".to_vec(),
+                    value: vec![1; crate::app::MAX_STEP_LOCAL_BYTES + 1],
+                }],
+            }));
+        }
+        receipts.push(json!({"key": deletion.key, "hash": deletion.item_hash, "writer":deletion.writer,
+            "version": [deletion.version.generation, deletion.version.version], "page": deletion.page_time_ms,
+            "seen": deletion.seen.map(|v| String::from_utf8_lossy(v)), "value": deletion.exact_value.map(|v|String::from_utf8_lossy(v)),
+            "policy": deletion.policy.is_some()}));
+        Ok(Some(crate::app::PutBack::Observe {
+            observed: vec![LocalWrite::Put {
+                key: b"delete receipts".to_vec(),
+                value: serde_json::to_vec(&receipts).unwrap(),
+            }],
+        }))
+    }
+
+    fn restore_layer(
+        &self,
+        layer: Option<&crate::app::ProtocolLayer>,
+        restoring: &crate::app::RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        let mut writes = self.sample.restore_layer(layer, restoring)?;
+        if self.keep_receipts.load(std::sync::atomic::Ordering::SeqCst) {
+            for (key, value) in restoring
+                .previous_local_scan(b"delete receipts")
+                .map_err(|e| e.to_string())?
+            {
+                writes.push(LocalWrite::Put { key, value });
+            }
+        }
+        Ok(writes)
     }
 
     fn record_regression(
@@ -9086,6 +9146,351 @@ async fn test_send_record_job_restored_before_its_write_stops_at_a_later_delete(
     assert_eq!(s.w.switch.record(&key).unwrap().revision, deleted);
 }
 
+async fn deletion_receipts(app: &App) -> Vec<serde_json::Value> {
+    app.protocol_get("sample", b"delete receipts")
+        .await
+        .unwrap()
+        .map(|v| serde_json::from_slice(&v).unwrap())
+        .unwrap_or_default()
+}
+
+async fn unread_deletion(
+    s: &Setup,
+    original: &[u8],
+) -> (App, App, RecordTarget, [u8; 32], RecordVersion) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let target = s.target("collection item");
+    writer.put_record(&target, original, vec![]).await.unwrap();
+    read_on(&mut reader).await;
+    s.protocol.observe_deletes.store(true, SeqCst);
+    let deleted = writer.delete_record(&target, vec![]).await.unwrap();
+    let evidence = writer.shared_evidence().await.unwrap();
+    let hash = SignedOp::peek(
+        &evidence
+            .ops
+            .iter()
+            .find(|op| {
+                SignedOp::peek(&op.op).is_ok_and(
+                    |p| matches!(&p.body().kind, OpKind::RecordPut(put) if put.key == deleted.key),
+                )
+            })
+            .unwrap()
+            .op,
+    )
+    .unwrap()
+    .item_hash()
+    .unwrap();
+    (writer, reader, target, hash, deleted.version)
+}
+
+#[tokio::test]
+async fn test_record_deletion_observes_the_signed_source_and_passes_its_cursor() {
+    let s = Setup::new();
+    let mut original = value(&["trusted"]);
+    original.resize(MAX_SEEN_MARK_BYTES + 30, b' ');
+    let (writer, mut reader, target, hash, ver) = unread_deletion(&s, &original).await;
+    read_on(&mut reader).await;
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["hash"], json!(hash));
+    assert_eq!(receipts[0]["writer"], json!(writer.app_id()));
+    assert_eq!(receipts[0]["version"], json!([ver.generation, ver.version]));
+    assert_eq!(receipts[0]["value"].as_str().unwrap().as_bytes(), original);
+    assert_eq!(
+        receipts[0]["seen"].as_str().unwrap().as_bytes(),
+        value(&["trusted"])
+    );
+    assert!(receipts[0]["page"].as_u64().is_some());
+    assert!(receipts[0]["policy"].as_bool().unwrap());
+    reader.flush_cursor().await.unwrap();
+    assert!(reader.service_cursor().seq >= ver.version);
+    reader.read_record(&target).await.unwrap();
+    read_on(&mut reader).await;
+    assert_eq!(deletion_receipts(&reader).await.len(), 1);
+    assert!(reader.state.deletions.is_empty());
+}
+
+#[derive(Clone, Copy)]
+enum DeletionInstall {
+    Original,
+    Fresh,
+    OlderInPlace,
+}
+
+async fn resume_deletion(install: DeletionInstall) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let original = value(&["first"]);
+    let (mut writer, mut reader, target, hash, _) = unread_deletion(&s, &original).await;
+    let older = reader.backup_layered().await.unwrap();
+    s.protocol.observation_unavailable.store(true, SeqCst);
+    read_on(&mut reader).await;
+    assert_eq!(reader.state.deletions.len(), 1);
+    assert!(deletion_receipts(&reader).await.is_empty());
+    let successor = value(&["first", "next"]);
+    writer
+        .put_record(&target, &successor, vec![])
+        .await
+        .unwrap();
+    read_on(&mut reader).await;
+    let key = reader.record_key(&target).unwrap();
+    assert_ne!(
+        reader
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value(),
+        Some(successor.as_slice())
+    );
+    let mut restored = match install {
+        DeletionInstall::Original => App::load(
+            s.env(),
+            s.protocol.clone(),
+            World::config(),
+            reader.app_id(),
+        )
+        .await
+        .unwrap(),
+        DeletionInstall::Fresh => {
+            let backup = reader.backup_layered().await.unwrap();
+            Box::pin(App::restore(
+                s.env_on(Arc::new(MemoryStore::new())),
+                s.protocol.clone(),
+                World::config(),
+                &backup,
+            ))
+            .await
+            .unwrap()
+        }
+        DeletionInstall::OlderInPlace => Box::pin(App::restore(
+            s.env(),
+            s.protocol.clone(),
+            World::config(),
+            &older,
+        ))
+        .await
+        .unwrap(),
+    };
+    assert_eq!(restored.state.deletions.len(), 1);
+    s.protocol.observation_unavailable.store(false, SeqCst);
+    restored.refresh_identity().await.unwrap();
+    read_on(&mut restored).await;
+    read_on(&mut restored).await;
+    let receipts = deletion_receipts(&restored).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["hash"], json!(hash));
+    assert_eq!(receipts[0]["value"].as_str().unwrap().as_bytes(), original);
+    assert!(restored.state.deletions.is_empty());
+    assert_eq!(
+        restored
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value(),
+        Some(successor.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn test_record_deletion_layered_receipt_survives_a_fresh_read_of_the_same_delete() {
+    let s = Setup::new();
+    let original = value(&["issued"]);
+    let (_writer, mut reader, target, _, _) = unread_deletion(&s, &original).await;
+    read_on(&mut reader).await;
+    let saved = deletion_receipts(&reader).await;
+    assert_eq!(saved.len(), 1);
+    let backup = reader.backup_layered().await.unwrap();
+    let mut restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    read_on(&mut restored).await;
+    let current = restored.read_record(&target).await.unwrap().unwrap();
+    assert_eq!(current.content, RecordContent::Deleted);
+    assert_eq!(deletion_receipts(&restored).await, saved);
+}
+
+#[tokio::test]
+async fn test_record_deletion_earlier_layer_can_observe_the_current_delete_again() {
+    let s = Setup::new();
+    let (_writer, mut reader, target, hash, _) = unread_deletion(&s, &value(&["issued"])).await;
+    let older = reader.backup_layered().await.unwrap();
+    read_on(&mut reader).await;
+    assert_eq!(deletion_receipts(&reader).await.len(), 1);
+    let mut restored = Box::pin(App::restore(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        &older,
+    ))
+    .await
+    .unwrap();
+    assert!(deletion_receipts(&restored).await.is_empty());
+    restored.refresh_identity().await.unwrap();
+    restored.read_record(&target).await.unwrap();
+    let receipts = deletion_receipts(&restored).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["hash"], json!(hash));
+    assert!(receipts[0]["value"].is_null());
+    assert_eq!(receipts[0]["policy"], false);
+}
+
+#[tokio::test]
+async fn test_record_deletion_owner_keeps_an_issued_receipt_when_installing_an_earlier_layer() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let (mut writer, mut reader, target, _, _) = unread_deletion(&s, &value(&["issued"])).await;
+    let older = reader.backup_layered().await.unwrap();
+    read_on(&mut reader).await;
+    let saved = deletion_receipts(&reader).await;
+    assert_eq!(saved.len(), 1);
+    writer
+        .put_record(&target, &value(&["issued", "renewed"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut reader).await;
+    assert!(reader.state.deletion_receipts.is_empty());
+    s.protocol.keep_receipts.store(true, SeqCst);
+    for (env, expect) in [
+        (s.env_on(Arc::new(MemoryStore::new())), false),
+        (s.env(), true),
+    ] {
+        let mut restored = Box::pin(App::restore(
+            env,
+            s.protocol.clone(),
+            World::config(),
+            &older,
+        ))
+        .await
+        .unwrap();
+        restored.refresh_identity().await.unwrap();
+        assert_eq!(
+            restored
+                .read_record(&target)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value(),
+            Some(value(&["issued", "renewed"]).as_slice())
+        );
+        assert_eq!(
+            deletion_receipts(&restored).await,
+            if expect { saved.clone() } else { vec![] }
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_record_deletion_next_delete_has_its_own_receipt_and_hosted_absence_retires_it() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, first, _) = unread_deletion(&s, &value(&["issued"])).await;
+    read_on(&mut reader).await;
+    assert_eq!(reader.state.deletion_receipts.len(), 1);
+    writer
+        .put_record(&target, &value(&["issued", "another"]), vec![])
+        .await
+        .unwrap();
+    reader.read_record(&target).await.unwrap();
+    assert!(reader.state.deletion_receipts.is_empty());
+    let key = writer.delete_record(&target, vec![]).await.unwrap().key;
+    reader.read_record(&target).await.unwrap();
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 2);
+    assert_ne!(receipts[1]["hash"], json!(first));
+    assert_eq!(reader.state.deletion_receipts.len(), 1);
+    s.w.switch.lock().shared.records.remove(&key);
+    reader.read_record(&target).await.unwrap();
+    assert!(reader.state.deletion_receipts.is_empty());
+    assert_eq!(deletion_receipts(&reader).await, receipts);
+}
+
+#[tokio::test]
+async fn test_record_deletion_large_owner_write_keeps_the_original_observation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let (_, mut reader, _, hash, _) = unread_deletion(&s, &value(&["issued"])).await;
+    s.protocol.large_receipt.store(true, SeqCst);
+    read_on(&mut reader).await;
+    assert_eq!(reader.state.deletions.len(), 1);
+    assert!(
+        reader
+            .protocol_get("sample", b"oversize")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    s.protocol.large_receipt.store(false, SeqCst);
+    read_on(&mut reader).await;
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["hash"], json!(hash));
+    assert!(reader.state.deletions.is_empty());
+}
+
+#[tokio::test]
+async fn test_record_deletion_restore_an_older_signed_source_is_not_the_exact_predecessor() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let target = s.target("protected");
+    writer
+        .put_record(&target, &value(&["older"]), vec![])
+        .await
+        .unwrap();
+    let older = writer.shared_evidence().await.unwrap().ops.pop().unwrap();
+    writer
+        .put_record(&target, &value(&["older", "current"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut reader).await;
+    s.protocol.observe_deletes.store(true, SeqCst);
+    s.protocol.observation_unavailable.store(true, SeqCst);
+    writer.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut reader).await;
+    let mut backup = reader.backup().await.unwrap();
+    backup.deletions[0].predecessor.as_mut().unwrap().source = older;
+    let mut restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    s.protocol.observation_unavailable.store(false, SeqCst);
+    read_on(&mut restored).await;
+    let receipts = deletion_receipts(&restored).await;
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0]["value"].is_null());
+}
+
+#[tokio::test]
+async fn test_record_deletion_unavailable_owner_resumes_before_the_successor() {
+    Box::pin(resume_deletion(DeletionInstall::Original)).await;
+}
+#[tokio::test]
+async fn test_record_deletion_fresh_restore_of_an_unanswered_observation() {
+    Box::pin(resume_deletion(DeletionInstall::Fresh)).await;
+}
+#[tokio::test]
+async fn test_record_deletion_older_in_place_restore_of_an_unanswered_observation() {
+    Box::pin(resume_deletion(DeletionInstall::OlderInPlace)).await;
+}
+
 #[tokio::test]
 async fn test_records_refused_reread_follows_the_delete_in_the_view() {
     use crate::client::answers::{FeedItem, FeedQuery};
@@ -9140,7 +9545,7 @@ async fn test_records_refused_reread_follows_the_delete_in_the_view() {
     let mut tx = phone.tx().unwrap();
     assert_eq!(
         phone
-            .feed_record_write(item, &envelope, &mut tx)
+            .feed_record_write(item, &envelope, page.server_time_ms, &mut tx)
             .await
             .unwrap(),
         crate::app::records::WriteRead::Refused

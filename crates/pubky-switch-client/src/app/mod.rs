@@ -36,6 +36,7 @@
 //! stack holds only a pointer to the call's state, debug builds included.
 
 mod chain;
+mod deletion;
 mod error;
 mod events;
 mod feed;
@@ -90,9 +91,9 @@ pub use protocol::{
     DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
     LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
-    ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state, encode_local_state,
-    local_writes_bytes,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, RETRY_EVENT_READS, ReceivedMessage,
+    RecordDeletion, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
+    encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -417,6 +418,8 @@ pub struct AppBackup {
     stored_next: u64,
     /// Unprocessed custody and its owed drop notices, independent of a protocol layer.
     waiting: unverified::WaitingOut,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deletions: Vec<deletion::Observation>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -471,6 +474,8 @@ pub struct AppBackup {
 struct LayerOut {
     name: String,
     data: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deletions: Vec<deletion::Receipt>,
 }
 
 /// What the app's feed holds beyond its cursor at the moment of a layered backup: the
@@ -567,6 +572,7 @@ enum Restorable {
 /// counting as no layer writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LayerCheck {
+    Install,
     Full,
     SizesOnly,
 }
@@ -601,6 +607,8 @@ pub(crate) struct AppState {
     pub(crate) cursor: Cursor,
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
+    deletions: deletion::Observations,
+    deletion_receipts: deletion::Receipts,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
     /// The counts of the store's retries at entries stored locally, by local ID.
     pub(crate) stored_retries: BTreeMap<u64, RetryEntry>,
@@ -1025,6 +1033,8 @@ impl App {
                 },
                 chain: None,
                 held: BTreeMap::new(),
+                deletions: BTreeMap::new(),
+                deletion_receipts: BTreeMap::new(),
                 retries: BTreeMap::new(),
                 stored_retries: BTreeMap::new(),
                 next_stored_id: FIRST_STORED_ID,
@@ -1263,6 +1273,9 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
             };
+            for observed in app.state.deletions.values() {
+                observed.check(&app.protocols, &app.state.meta.identity)?;
+            }
             app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
@@ -1325,6 +1338,8 @@ impl App {
             cursor: reader.get(key::CURSOR).await?.ok_or_else(missing)?,
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
+            deletions: deletion::load(reader).await?,
+            deletion_receipts: deletion::load_receipts(reader).await?,
             retries: reader.scan_numbered("retry/").await?,
             stored_retries: reader.scan_numbered("sretry/").await?,
             next_stored_id,
@@ -1457,6 +1472,7 @@ impl App {
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
             waiting: unverified::WaitingOut::of(state),
+            deletions: state.deletions.values().cloned().collect(),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
@@ -1746,6 +1762,12 @@ impl App {
                 backup.layers.push(LayerOut {
                     name: registered.name.clone(),
                     data: pubky_switch_core::enc::b64(&data),
+                    deletions: state
+                        .deletion_receipts
+                        .values()
+                        .filter(|r| r.owner == registered.name)
+                        .cloned()
+                        .collect(),
                 });
             }
             backup.beyond_cursor = Some(BeyondCursor {
@@ -1850,7 +1872,7 @@ impl App {
         Box::pin(async move {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
-            match Self::restore_commit(env, protocols, config, backup, LayerCheck::Full).await? {
+            match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
@@ -2052,15 +2074,38 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
+            let same_installation = old
+                .get::<Meta>(key::META)
+                .await?
+                .is_some_and(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+            let mut deletions = deletion::restore(
+                &old,
+                &backup.deletions,
+                &protocols,
+                same_installation,
+                &own_doc,
+            )
+            .await?;
+            let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();
             // Each protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written; its writes land under
             // its own prefix.
-            let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
             let mut layer_writes = Vec::new();
             for registered in protocols.iter() {
+                let mut restoring =
+                    RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
+                if same_installation && layer_check == LayerCheck::Install {
+                    restoring.previous = Some(LocalView::new(
+                        meta.identity,
+                        meta.app_id,
+                        env.store.store().as_ref(),
+                        &ns,
+                        &registered.name,
+                    ));
+                }
                 let layer = layers.iter().find(|l| l.protocol == registered.name);
                 match registered.protocol.restore_layer(layer, &restoring) {
                     Ok(writes) => layer_writes.extend(protocols::qualify(&registered.name, writes)),
@@ -2144,6 +2189,8 @@ impl App {
                 cursor,
                 chain: Some(chain),
                 held: backup.waiting.held.iter().copied().collect(),
+                deletions,
+                deletion_receipts,
                 retries: backup.waiting.feed_retries.iter().copied().collect(),
                 stored_retries: backup.waiting.retries.iter().copied().collect(),
                 next_stored_id: next_stored_id(None, &parked),
@@ -2490,6 +2537,12 @@ impl App {
         }
         for (id, parked) in &s.parked {
             tx.put(&key::parked(*id), parked)?;
+        }
+        for observed in s.deletions.values() {
+            tx.put(&observed.store_key(), observed)?;
+        }
+        for receipt in s.deletion_receipts.values() {
+            tx.put(&receipt.store_key(), receipt)?;
         }
         for (seq, held) in &s.held {
             tx.put(&key::held(*seq), held)?;
@@ -3635,6 +3688,8 @@ impl App {
             key::DUTY_PREFIX,
             key::OWED_PREFIX,
             order::TOLD_PREFIX,
+            deletion::PREFIX,
+            deletion::RECEIPTS,
         ] {
             tx.delete_prefix(prefix)?;
         }
@@ -3648,6 +3703,8 @@ impl App {
         self.state.receive_keys.clear();
         self.state.scope_keys = ScopeKeys::default();
         self.state.parked.clear();
+        self.state.deletions.clear();
+        self.state.deletion_receipts.clear();
         self.events.push(AppEvent::KeysDestroyed);
         Ok(())
     }

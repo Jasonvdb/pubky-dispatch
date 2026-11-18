@@ -633,6 +633,7 @@ impl App {
         // is handed over that may read the records it opens; only an alarm it raises fails
         // the read.
         self.reopen_if_due().await?;
+        self.retry_deletions(budget).await?;
         let mut report = ReceiveReport {
             more: kept_left || unfinished,
             ..ReceiveReport::default()
@@ -863,7 +864,8 @@ impl App {
         }
         // Held entries and failed callbacks need another read even when another protocol
         // reached the end of the feed and nothing new arrives (Switch spec 8.3).
-        let again = !self.state.held.is_empty()
+        let again = !self.state.deletions.is_empty()
+            || !self.state.held.is_empty()
             || !self.state.retries.is_empty()
             || self.owed_held_reads != 0;
         self.next_wait = if key_wait {
@@ -1103,6 +1105,17 @@ impl App {
             // Room for one more item, whatever it writes: the read's writes so far are
             // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
             self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
+            if let Some(envelope) = checked.envelopes.get(&seq) {
+                for deletion in self.state.deletions.values_mut().filter(|d| {
+                    d.generation == envelope.generation
+                        && d.seq == seq
+                        && d.delete.item_hash == envelope.item_hash
+                        && d.page_time_ms.is_none()
+                }) {
+                    deletion.page_time_ms = Some(page.server_time_ms);
+                    read.tx.put(&deletion.store_key(), deletion)?;
+                }
+            }
             let step = match item {
                 FeedItem::Entry(entry) => {
                     let receipt = self.observe_entry(entry, &page, &mut read.tx)?;
@@ -1140,7 +1153,8 @@ impl App {
                     let Some(envelope) = checked.envelopes.get(&seq).copied() else {
                         continue;
                     };
-                    self.handle_chain(chain_item, &envelope, &mut read).await?
+                    self.handle_chain(chain_item, &envelope, page.server_time_ms, &mut read)
+                        .await?
                 }
                 FeedItem::Stub { .. } => {
                     if !stub_noted
@@ -1155,6 +1169,19 @@ impl App {
                     Step::Pass
                 }
             };
+            if let Some(envelope) = checked.envelopes.get(&seq) {
+                read.left.extend(
+                    self.state
+                        .deletions
+                        .values()
+                        .filter(|d| {
+                            d.generation == envelope.generation
+                                && d.seq == seq
+                                && d.delete.item_hash == envelope.item_hash
+                        })
+                        .map(|d| d.owner.clone()),
+                );
+            }
             admission_declined.append(&mut read.admission_declined);
             match step {
                 Step::Pass => {
@@ -3887,6 +3914,7 @@ impl App {
         &mut self,
         item: &ChainItem,
         envelope: &ChainEnvelope,
+        page_time_ms: u64,
         read: &mut Read,
     ) -> Result<Step, AppError> {
         let bytes = item.item.doc_bytes()?;
@@ -3979,7 +4007,9 @@ impl App {
                     | OpKind::AllowDelete { .. }
                     | OpKind::DenyPut { .. }
                     | OpKind::DenyDelete { .. } => {
-                        let waits = self.feed_shared_item(item, envelope, &mut read.tx).await?;
+                        let waits = self
+                            .feed_shared_item(item, envelope, page_time_ms, &mut read.tx)
+                            .await?;
                         Ok(if waits { Step::Hold } else { Step::Pass })
                     }
                     _ => Ok(Step::Pass),
@@ -4340,10 +4370,11 @@ const _: () = assert!(KEPT_EFFECT_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
 const _: () = assert!(
     (MAX_STEP_LOCAL_BYTES as u64) + PARK_ROOM_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
 );
-// - a chain item's cached record write, its mark and a flagged write's rule.
+// - a chain item's cached record write, its mark, deletion observation and a flagged write's rule.
 const _: () = assert!(
     CACHED_RECORD_BYTES
         + KEPT_MARK_BYTES
+        + super::deletion::ROOM
         + (MAX_REGRESSION_REASON_BYTES as u64)
         + ENTRY_RESERVE_BYTES
         <= ITEM_ROOM_BYTES

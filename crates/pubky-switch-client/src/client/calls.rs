@@ -196,7 +196,7 @@ impl SwitchClient {
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
         let checked = self.enrollment_answer(enrollment, &sent, &response);
-        let Some(at) = stale_timestamp_hint(&checked) else {
+        let Some(at) = stale_timestamp_hint(checked.as_ref().err()) else {
             return checked;
         };
         let signed = self.build(
@@ -264,7 +264,7 @@ impl SwitchClient {
         let signed = self.build("GET", &path, Vec::new(), Body::Empty, Auth::default())?;
         let response = self.send_response(signed.request.clone()).await?;
         let checked = self.account_observation(&signed.request, &response);
-        let Some(at) = stale_timestamp_hint(&checked) else {
+        let Some(at) = stale_timestamp_hint(checked.as_ref().err()) else {
             return checked;
         };
         let signed = self.build(

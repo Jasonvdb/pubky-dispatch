@@ -1270,6 +1270,249 @@ async fn test_admission_list_changes_in_the_feed_are_followed() {
 // Shared records
 
 #[tokio::test]
+async fn test_record_conflict_batch_takes_the_competing_write_and_can_build_on_it() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let entry = wallet
+        .record_op(&target, Some(&value(&["first"])), vec![])
+        .await
+        .unwrap();
+    let won = phone
+        .put_record(&target, &value(&["second"]), vec![])
+        .await
+        .unwrap();
+
+    let error = wallet
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    let held = wallet.shared_record(&won.key).await.unwrap().unwrap();
+    assert!(held.authenticated);
+    assert_eq!((held.version, held.writer), (won.version, won.writer));
+    assert_eq!(held.content, won.content);
+    assert_eq!(wallet.read_record(&target).await.unwrap(), Some(held));
+    let built = wallet
+        .put_record(&target, &value(&["second", "third"]), vec![])
+        .await
+        .unwrap();
+    assert!(built.version > won.version);
+}
+
+#[tokio::test]
+async fn test_record_conflict_condition_judges_the_guarded_key() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let guard = s.target("guard");
+    let output = s.target("output");
+    let output_key = wallet.record_key(&output).unwrap();
+    let first = phone
+        .put_record(&guard, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    let view = wallet.client.record(&first.key).await.unwrap().view;
+    let condition = Condition::RecordCurrent {
+        key: first.key,
+        revision: view.revision,
+        deleted: false,
+    };
+    let entry = wallet
+        .record_op(&output, Some(&value(&["output"])), vec![condition])
+        .await
+        .unwrap();
+    let next = phone
+        .put_record(&guard, &value(&["first", "second"]), vec![])
+        .await
+        .unwrap();
+    let error = wallet
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    assert_eq!(wallet.shared_record(&output_key).await.unwrap(), None);
+    assert_eq!(wallet.shared_record(&first.key).await.unwrap(), Some(next));
+}
+
+#[tokio::test]
+async fn test_record_conflict_position_and_read_scope_preserve_held_content() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let mut wallet = s.join("wallet").await;
+    let mut limited = join_scoped(&s, "tablet", &["sample-b"]).await;
+    let target = s.target("guard");
+    let first = phone
+        .put_record(&target, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    let held = wallet.read_record(&target).await.unwrap().unwrap();
+    let newer = phone
+        .put_record(&target, &value(&["first", "second"]), vec![])
+        .await
+        .unwrap();
+    let batch = OpBatch::new().op_if(
+        OpKind::DenyPut { pubky: [9; 32] },
+        vec![Condition::RecordVersion {
+            key: first.key,
+            version: first.version,
+        }],
+    );
+    let current = |error: AppError| match error {
+        AppError::Switch(crate::error::ClientError::Switch {
+            code: ErrorCode::Conflict,
+            current,
+            ..
+        }) => current,
+        other => panic!("expected a write conflict, got {other:?}"),
+    };
+    let shown = current(wallet.submit_batch(batch.clone()).await.unwrap_err());
+    assert_eq!(shown["record_version"]["version"], newer.version.version);
+    assert_eq!(wallet.shared_record(&first.key).await.unwrap(), Some(held));
+    assert_eq!(wallet.read_record(&target).await.unwrap(), Some(newer));
+    assert_eq!(
+        current(limited.submit_batch(batch).await.unwrap_err()),
+        json!({})
+    );
+    assert_eq!(limited.shared_record(&first.key).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_record_conflict_stored_retry_takes_the_competing_write() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("shared");
+    let entry = wallet
+        .record_op(&target, Some(&value(&["first"])), vec![])
+        .await
+        .unwrap();
+    s.w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let error = wallet
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap_err();
+    let id = error.kept_batch().unwrap();
+    let winner = phone
+        .put_record(&target, &value(&["second"]), vec![])
+        .await
+        .unwrap();
+
+    let mut wallet = App::load(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        wallet.app_id(),
+    )
+    .await
+    .unwrap();
+    wallet.resume_batches().await.unwrap();
+    assert_eq!(
+        wallet.shared_record(&winner.key).await.unwrap(),
+        Some(winner)
+    );
+    assert!(
+        matches!(wallet.kept_batch(id).await.unwrap(), Some(crate::app::KeptBatchStatus::Dropped {
+        reason: crate::app::KeptBatchDrop::Refused {code}, ..
+    }) if code == "conflict")
+    );
+}
+
+#[tokio::test]
+async fn test_record_conflict_overtaken_by_a_later_read_keeps_the_later_write() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let entry = wallet
+        .record_op(&target, Some(&value(&["first"])), vec![])
+        .await
+        .unwrap();
+    let batch = wallet.sign_ops(vec![entry], None).unwrap();
+    phone
+        .put_record(&target, &value(&["second"]), vec![])
+        .await
+        .unwrap();
+    let service_key = wallet.client.pinned_key().unwrap();
+    let failure = wallet
+        .client
+        .submit_proved_by(&batch, &service_key)
+        .await
+        .unwrap_err();
+    let crate::error::ClientError::Switch {
+        code: ErrorCode::Conflict,
+        current,
+        ..
+    } = failure.error
+    else {
+        panic!("expected a competing write")
+    };
+    let later = phone
+        .put_record(&target, &value(&["second", "third"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        wallet.read_record(&target).await.unwrap(),
+        Some(later.clone())
+    );
+    wallet
+        .note_record_conflict(&batch, &current, failure.head.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(wallet.shared_record(&later.key).await.unwrap(), Some(later));
+}
+
+#[tokio::test]
+async fn test_record_conflict_absence_after_a_forgotten_delete_allows_a_new_create() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    let entry = wallet
+        .record_op(&target, Some(&value(&["new"])), vec![])
+        .await
+        .unwrap();
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key));
+    let error = wallet
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap_err();
+    let AppError::Switch(crate::error::ClientError::Switch {
+        code: ErrorCode::Conflict,
+        current,
+        ..
+    }) = error
+    else {
+        panic!("expected a forgotten delete")
+    };
+    assert_eq!(
+        current,
+        json!({"record": {"key": pubky_switch_core::enc::b64(&key), "generation": 0, "version": 0}, "record_view": null})
+    );
+    assert_eq!(
+        wallet.record_condition(&key).await.unwrap(),
+        Condition::RecordVersion {
+            key,
+            version: RecordVersion::NONE
+        }
+    );
+    let created = wallet
+        .put_record(&target, &value(&["new"]), vec![])
+        .await
+        .unwrap();
+    assert!(created.authenticated);
+    assert_eq!(wallet.read_record(&target).await.unwrap(), Some(created));
+}
+
+#[tokio::test]
 async fn test_records_put_conflict_reads_again_and_recomputes() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;

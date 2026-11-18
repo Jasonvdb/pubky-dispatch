@@ -9,7 +9,9 @@ use pubky_switch_core::ops::{
 };
 
 use super::read::{self, Obj};
-use super::{Auth, Body, Credentials, DynSigner, SwitchClient, verify_head};
+use super::{
+    Auth, Body, CallError, CheckedResponse, Credentials, DynSigner, SwitchClient, verify_head,
+};
 use crate::error::ClientError;
 use crate::transport::TimeoutClass;
 
@@ -205,7 +207,9 @@ impl SwitchClient {
     /// is misbehaviour (Switch spec 10.1). Otherwise as every call.
     pub async fn submit(&self, batch: &Batch) -> Result<Submitted, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
-        self.submit_proved_by(batch, &key).await
+        self.submit_proved_by(batch, &key)
+            .await
+            .map_err(ClientError::from)
     }
 
     /// [`SwitchClient::submit`], with the proofs checked with `proof_key`: the key of the
@@ -216,9 +220,9 @@ impl SwitchClient {
         &self,
         batch: &Batch,
         proof_key: &[u8; 32],
-    ) -> Result<Submitted, ClientError> {
+    ) -> Result<Submitted, CallError> {
         let checked = self
-            .call(
+            .call_with_head(
                 "POST",
                 &self.path("ops"),
                 batch.body.clone(),
@@ -229,6 +233,16 @@ impl SwitchClient {
                 },
             )
             .await?;
+        self.batch_answer(batch, proof_key, &checked)
+            .map_err(CallError::from)
+    }
+
+    fn batch_answer(
+        &self,
+        batch: &Batch,
+        proof_key: &[u8; 32],
+        checked: &CheckedResponse,
+    ) -> Result<Submitted, ClientError> {
         let (value, what) =
             read::body(&checked.body, Doc::Plain, "Switch wire 6.4: a batch answer")?;
         let o = Obj::of(&value, what)?;

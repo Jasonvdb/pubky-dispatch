@@ -296,6 +296,24 @@ pub struct CheckedResponse {
     pub head: Option<SignedHead>,
 }
 
+/// A call failure and the account head verified on that same error answer, if any.
+pub(crate) struct CallError {
+    pub(crate) error: ClientError,
+    pub(crate) head: Option<Box<SignedHead>>,
+}
+
+impl From<ClientError> for CallError {
+    fn from(error: ClientError) -> Self {
+        Self { error, head: None }
+    }
+}
+
+impl From<CallError> for ClientError {
+    fn from(failure: CallError) -> Self {
+        failure.error
+    }
+}
+
 pub(crate) enum CallStep {
     Answer(CheckedResponse),
     Retry(Box<TimestampRetry>),
@@ -334,6 +352,15 @@ pub fn check_response(
     sent: &SentRequest,
     response: &Response,
 ) -> Result<CheckedResponse, ClientError> {
+    check_response_with_head(service_key, account, sent, response).map_err(ClientError::from)
+}
+
+fn check_response_with_head(
+    service_key: &[u8; 32],
+    account: &[u8; 32],
+    sent: &SentRequest,
+    response: &Response,
+) -> Result<CheckedResponse, CallError> {
     let status = response.status;
     let unauthenticated = ClientError::BadServiceSignature { status };
     // Each header the signature decides on comes once at most (Switch wire 7.1).
@@ -348,7 +375,7 @@ pub fn check_response(
                 > 1
         });
     if repeated {
-        return Err(unauthenticated);
+        return Err(unauthenticated.into());
     }
     let signature = response
         .header(header::SERVICE_SIGNATURE)
@@ -377,7 +404,7 @@ pub fn check_response(
     } else if verifies(false) {
         false
     } else {
-        return Err(unauthenticated);
+        return Err(unauthenticated.into());
     };
     // A head that is there must be the account's (Switch wire 7.1).
     let head = match head_text {
@@ -400,8 +427,9 @@ pub fn check_response(
                 status,
                 code,
                 retry_after,
-            }),
-            _ => Err(unauthenticated),
+            }
+            .into()),
+            _ => Err(unauthenticated.into()),
         };
     }
     // Only a full binding and an accepted head can establish an authenticated malformed
@@ -410,7 +438,10 @@ pub fn check_response(
         ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
     })?;
     if !(200..300).contains(&status) {
-        return Err(parse_error(status, &response.body));
+        return Err(CallError {
+            error: parse_error(status, &response.body),
+            head: head.map(Box::new),
+        });
     }
     Ok(CheckedResponse {
         status,
@@ -464,9 +495,9 @@ pub(crate) fn parse_error(status: u16, body: &[u8]) -> ClientError {
 /// The `current.server_time` of a verified `401 stale_timestamp`: the service's time base,
 /// for the one retry's timestamp (Switch wire 7.1, 7.6). It isn't the identity's service
 /// time, and counts as no verified service time (Switch spec 10.1).
-fn stale_timestamp_hint<T>(checked: &Result<T, ClientError>) -> Option<u64> {
-    match checked {
-        Err(ClientError::Switch {
+fn stale_timestamp_hint(error: Option<&ClientError>) -> Option<u64> {
+    match error {
+        Some(ClientError::Switch {
             code: ErrorCode::StaleTimestamp,
             current,
             ..
@@ -722,7 +753,7 @@ impl SwitchClient {
     fn note_server_time(
         &self,
         sent: &SentRequest,
-        checked: &Result<CheckedResponse, ClientError>,
+        checked: Result<&CheckedResponse, &ClientError>,
         response: &Response,
     ) {
         let shown = || {
@@ -988,6 +1019,19 @@ impl SwitchClient {
         content: Body,
         auth: Auth<'_>,
     ) -> Result<CheckedResponse, ClientError> {
+        self.call_with_head(method, path_and_query, body, content, auth)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    async fn call_with_head(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Vec<u8>,
+        content: Body,
+        auth: Auth<'_>,
+    ) -> Result<CheckedResponse, CallError> {
         let step = self
             .start_call(method, path_and_query, body, content, auth)
             .await?;
@@ -1001,22 +1045,24 @@ impl SwitchClient {
         body: Vec<u8>,
         content: Body,
         auth: Auth<'_>,
-    ) -> Result<CallStep, ClientError> {
+    ) -> Result<CallStep, CallError> {
         let key = match self.pinned_key() {
             Some(key) => key,
             None if auth.public => {
                 return self
                     .unpinned_public_read(method, path_and_query)
                     .await
-                    .map(CallStep::Answer);
+                    .map(CallStep::Answer)
+                    .map_err(CallError::from);
             }
-            None => return Err(ClientError::Unpinned),
+            None => return Err(ClientError::Unpinned.into()),
         };
         self.forget_latest();
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
-        let checked = self.send_checked(signed, key, auth.success_key).await?;
-        let Some(at) = stale_timestamp_hint(&checked) else {
+        let checked = self.send_checked(signed, key, auth.success_key).await;
+        let Some(at) = stale_timestamp_hint(checked.as_ref().err().map(|failure| &failure.error))
+        else {
             return checked.map(CallStep::Answer);
         };
         let auth = Auth {
@@ -1031,12 +1077,12 @@ impl SwitchClient {
         })))
     }
 
-    pub(crate) async fn finish_call(&self, step: CallStep) -> Result<CheckedResponse, ClientError> {
+    pub(crate) async fn finish_call(&self, step: CallStep) -> Result<CheckedResponse, CallError> {
         match step {
             CallStep::Answer(answer) => Ok(answer),
             CallStep::Retry(retry) => {
                 self.send_checked(retry.signed, retry.key, retry.success_key)
-                    .await?
+                    .await
             }
         }
     }
@@ -1163,22 +1209,26 @@ impl SwitchClient {
     }
 
     /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
-    /// anything else with `key`. The outer error is the transport's.
+    /// anything else with `key`.
     async fn send_checked(
         &self,
         signed: SignedRequest,
         key: [u8; 32],
         success_key: Option<[u8; 32]>,
-    ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
+    ) -> Result<CheckedResponse, CallError> {
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
         };
-        let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&sent, &checked, &response);
-        Ok(checked)
+        let checked = check_response_with_head(&key, &self.account, &sent, &response);
+        self.note_server_time(
+            &sent,
+            checked.as_ref().map_err(|failure| &failure.error),
+            &response,
+        );
+        checked
     }
 
     /// The public read without a pinned key (Switch wire 7.1 "An unpinned public read",
@@ -1207,7 +1257,7 @@ impl SwitchClient {
                     status: response.status,
                 })?;
         let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&sent, &checked, &response);
+        self.note_server_time(&sent, checked.as_ref(), &response);
         if checked.is_ok() {
             self.pin(key);
         }
@@ -1234,7 +1284,9 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
-        self.send_checked(signed, key, None).await?
+        self.send_checked(signed, key, None)
+            .await
+            .map_err(ClientError::from)
     }
 
     /// The App ID as a path segment.

@@ -4029,14 +4029,29 @@ impl App {
         self.refuse_before_upload_of(Some(batch)).await?;
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
-        let result = match generation.filter(|g| *g < self.state.meta.generation) {
-            Some(earlier) => match self.service_key_of(earlier).await? {
-                Some(key) => self.client.submit_proved_by(batch, &key).await,
-                None => self.client.submit(batch).await,
-            },
-            None => self.client.submit(batch).await,
+        let earlier_key = match generation.filter(|g| *g < self.state.meta.generation) {
+            Some(earlier) => self.service_key_of(earlier).await?,
+            None => None,
         };
-        let submitted = self.take(result).await?;
+        let result = match earlier_key.or_else(|| self.client.pinned_key()) {
+            Some(key) => self.client.submit_proved_by(batch, &key).await,
+            None => Err(ClientError::Unpinned.into()),
+        };
+        let (result, error_head) = match result {
+            Ok(submitted) => (Ok(submitted), None),
+            Err(failure) => (Err(failure.error), failure.head),
+        };
+        let result = self.take(result).await;
+        if let Err(AppError::Switch(ClientError::Switch {
+            status: 409,
+            code: pubky_switch_core::http::ErrorCode::Conflict,
+            current,
+            ..
+        })) = &result
+        {
+            Box::pin(self.note_record_conflict(batch, current, error_head.as_deref())).await?;
+        }
+        let submitted = result?;
         if let Err(alarm) = self.note_answer_head(submitted.head, &submitted.proofs) {
             return Err(self.raise(alarm).await);
         }

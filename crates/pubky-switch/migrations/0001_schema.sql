@@ -30,6 +30,10 @@ CREATE TABLE accounts (
     state_version   BIGINT   NOT NULL DEFAULT 0 CHECK (state_version >= 0),
     -- The last service time the account stamped; it never goes back (Switch spec 10.1).
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
+    -- The run of the service that committed the stamped time (Switch wire 7.3, "Trusted
+    -- time"): a state another run committed, as after a restore, takes its mark's time
+    -- floor as the last time it committed.
+    stamped_by      BYTEA    NOT NULL CHECK (octet_length(stamped_by) = 16),
     -- When the account was created, in service time.
     created_at_ms   BIGINT   NOT NULL CHECK (created_at_ms >= 0),
     -- A replacement's retained baseline needs a durable higher recovery before use
@@ -663,6 +667,9 @@ LANGUAGE sql IMMUTABLE AS $$ VALUES
     ('column', 'accounts', 'stamped_time_ms',
      'service time, stamped at nearly every request; that it never goes back is a rule of '
      'its own (Switch spec 10.1)'),
+    ('column', 'accounts', 'stamped_by',
+     'the run that stamped the service time, written with it; the mark''s time floor keeps '
+     'that time from going back after a restore (Switch wire 7.3, "Trusted time")'),
     ('column', 'apps', 'last_seen_ms',
      'shown by GET /apps only; no decision reads it'),
     ('column', 'sender_flags', '*',

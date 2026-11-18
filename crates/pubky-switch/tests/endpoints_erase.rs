@@ -432,7 +432,7 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
         serde_json::json!({ "created": enrolled_time() })
     );
     assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
-    assert_eq!(held_mark(&replay, &alice_id()).await, mark);
+    assert_same_but_floor(held_mark(&replay, &alice_id()).await, mark);
     assert_eq!(record_of(&replay).await, None);
     replay.db.drop_database().await.expect("drop");
 }
@@ -1008,6 +1008,32 @@ async fn test_erase_naming_a_hash_at_an_account_holding_no_identity_json_is_conf
 }
 
 #[tokio::test]
+async fn test_erase_refused_past_the_time_floor_raises_it() {
+    // A refused erasure commits its stamp, which later answers show: where it passes the
+    // mark's time floor, the floor rises first, a minute past it, as for every request
+    // (Switch wire 7.3, "Trusted time").
+    let Some(replay) = replay().await else { return };
+    let at = ms(&enroll_alice(&replay).await) + 1000;
+    let before = held_mark(&replay, &alice_id()).await;
+    assert!(before.time_floor_ms < at);
+    replay.clock.set_wall_ms(at);
+    let refused = replay
+        .service
+        .handle(erasure(&replay, Some(&[9; 32]), at).await)
+        .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
+    assert_eq!(
+        held_mark(&replay, &alice_id()).await,
+        pubky_switch::marks::AccountMark {
+            time_floor_ms: at + pubky_switch::marks::TIME_FLOOR_STEP_MS,
+            ..before
+        }
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_erase_malformed_body_is_bad_request_not_conflict() {
     // A malformed `identity_hash` (short, not a string, null), an unknown member, or a body
     // that isn't an object is `400`, never a `409`, without a head, and nothing is deleted
@@ -1412,7 +1438,7 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     assert!(no_head(&answer));
     assert!(signed_with(&answer, &service_public(&replay), &sent));
     assert_eq!(rows(&replay, &alice_id()).await, before);
-    assert_eq!(held_mark(&replay, &alice_id()).await, mark);
+    assert_same_but_floor(held_mark(&replay, &alice_id()).await, mark);
     // A new authenticated retry performs the deletion; no completed record was published.
     let retry = erase_held(&replay, &at).await;
     assert_eq!(retry.status, 200, "{}", text(&retry));
@@ -1420,6 +1446,25 @@ async fn test_erase_record_that_cant_be_written_deletes_nothing() {
     // Either way the record is durable before the account goes.
     assert!(durable_record(&replay).is_some());
     replay.db.drop_database().await.expect("drop");
+}
+
+/// `held` is `mark` but for its time floor, which a refused erasure's stamp raises where it
+/// passes it (Switch wire 7.3, "Time base").
+fn assert_same_but_floor(
+    held: pubky_switch::marks::AccountMark,
+    mark: pubky_switch::marks::AccountMark,
+) {
+    assert!(
+        held.time_floor_ms >= mark.time_floor_ms,
+        "the floor never goes back"
+    );
+    assert_eq!(
+        pubky_switch::marks::AccountMark {
+            time_floor_ms: mark.time_floor_ms,
+            ..held
+        },
+        mark
+    );
 }
 
 /// alice's erasure's record as the mark store's files hold it, read by a view opened now.
@@ -2161,6 +2206,20 @@ async fn test_erase_aged_record_goes_only_after_its_leftover_mark() {
         serve_alice(&replay).await;
         let at = hash_vector_time();
         set_time(&replay.clock, &at);
+        // alice's time floor a minute past `at`, as a request at `at` leaves it: the
+        // erasure's stamp, the restarted run's first at alice, is the floor and raises
+        // nothing, so it writes no mark where the mark store is read-only (Switch wire 7.3,
+        // "Time base").
+        let floor_ms = ms(&at) + pubky_switch::marks::TIME_FLOOR_STEP_MS;
+        replay
+            .marks
+            .raise_floor(
+                &alice_id(),
+                mark_created_at(&replay, &alice_id()).await,
+                floor_ms,
+            )
+            .await
+            .expect("floor");
         // bob's erasure three days ago, its mark left over from an account created before.
         let bob = bob_id();
         replay
@@ -2197,7 +2256,8 @@ async fn test_erase_aged_record_goes_only_after_its_leftover_mark() {
                 "kept while its leftover stays"
             );
         }
-        assert_eq!(record_of(&replay).await, Some(ms(&at)), "alice's is young");
+        // Stamped by the restarted run, its first stamp at alice: the time floor.
+        assert_eq!(record_of(&replay).await, Some(floor_ms), "alice's is young");
         replay.db.drop_database().await.expect("drop");
     }
 }

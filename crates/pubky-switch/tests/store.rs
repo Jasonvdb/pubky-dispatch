@@ -83,6 +83,8 @@ fn new_account(id: &str) -> NewAccount {
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: [1; 16],
+        stamped_time_ms: T0,
+        stamped_by: [2; 16],
     }
 }
 
@@ -254,7 +256,10 @@ async fn test_store_commit_keeps_seq_chain_and_time() {
         .await
         .expect("begin")
         .expect("account");
-    assert_eq!(txn.stamp(T0 + 1_000), T0 + 1_000);
+    assert_eq!(
+        txn.stamp(T0 + 1_000, pubky_switch::store::ServiceRun::start()),
+        T0 + 1_000
+    );
     assert_eq!(txn.next_seq().expect("seq"), 1);
     assert_eq!(append(&mut txn, 0xaa), 2);
     let committed = txn.commit().await.expect("commit");
@@ -282,7 +287,7 @@ async fn test_store_stamped_time_never_goes_back() {
         .await
         .expect("begin")
         .expect("account");
-    txn.stamp(T0 + 60_000);
+    txn.stamp(T0 + 60_000, pubky_switch::store::ServiceRun::start());
     txn.commit().await.expect("commit");
     // The time base went back, as after a wall-clock correction: the account keeps the
     // later time.
@@ -292,7 +297,10 @@ async fn test_store_stamped_time_never_goes_back() {
         .await
         .expect("begin")
         .expect("account");
-    assert_eq!(txn.stamp(T0 + 1_000), T0 + 60_000);
+    assert_eq!(
+        txn.stamp(T0 + 1_000, pubky_switch::store::ServiceRun::start()),
+        T0 + 60_000
+    );
     txn.commit().await.expect("commit");
     let txn = fx
         .store()
@@ -352,7 +360,7 @@ async fn test_store_dropped_request_leaves_no_trace() {
         .expect("begin")
         .expect("account");
     append(&mut txn, 1);
-    txn.stamp(T0 + 5_000);
+    txn.stamp(T0 + 5_000, pubky_switch::store::ServiceRun::start());
     // A batch that fails part way: the request ends without a commit.
     drop(txn);
     let txn = fx
@@ -1580,6 +1588,7 @@ async fn test_store_creation_commits_at_the_time_asked_for() {
         let account = NewAccount {
             activation: pubky_switch_core::records::AccountActivation::Ordinary,
             created_at_ms: at,
+            stamped_time_ms: at,
             ..new_account(id)
         };
         fx.store()
@@ -1922,7 +1931,7 @@ async fn test_store_lookup_reads_generation_chain_and_document() {
         .await
         .expect("begin")
         .expect("account");
-    txn.stamp(T0 + 1_000);
+    txn.stamp(T0 + 1_000, pubky_switch::store::ServiceRun::start());
     append(&mut txn, 0xab);
     txn.set_identity(&HeldIdentity {
         doc: doc.clone(),

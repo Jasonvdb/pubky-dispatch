@@ -41,6 +41,8 @@ async fn test_changes_committed_change_wakes_its_account_only() {
                 revoked_apps: Vec::new(),
                 enrollment_hash: [0; 32],
                 enrollment_store_id: [1; 16],
+                stamped_time_ms: 0,
+                stamped_by: [2; 16],
             })
             .await
             .expect("create");
@@ -99,7 +101,7 @@ async fn test_changes_committed_change_wakes_its_account_only() {
     };
     begin().await.commit().await.expect("commit");
     let mut txn = begin().await;
-    txn.stamp(60_000);
+    txn.stamp(60_000, pubky_switch::store::ServiceRun::start());
     txn.commit().await.expect("commit");
     assert!(!woken(&mut waiting_a, Duration::from_millis(300)).await);
     assert_eq!(

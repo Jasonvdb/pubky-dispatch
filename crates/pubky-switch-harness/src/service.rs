@@ -361,6 +361,7 @@ impl RealSwitch {
                     chain_hash: [0x5a; 32],
                 },
                 state_version: mark.state_version + 1,
+                stamped_ms: mark.time_floor_ms,
             };
             match marks
                 .advance(identity, past, mark.key, mark.created_at_ms)
@@ -388,6 +389,7 @@ impl RealSwitch {
             let mut other = MarkTarget {
                 head: mark.head(),
                 state_version: mark.state_version,
+                stamped_ms: mark.time_floor_ms,
             };
             other.head.chain_hash[0] ^= 0xff;
             marks.delete(identity).await.map_err(setup)?;

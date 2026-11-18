@@ -575,18 +575,32 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     );
     let head = head_of(&answer);
     assert_eq!((head.generation, head.seq), (2, 2));
+    let held = mark_of(&replay).await;
     assert_eq!(
-        mark_of(&replay).await,
+        held,
         AccountMark {
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
             state_version: state_version_of(&replay, &alice_id()).await,
+            time_floor_ms: held.time_floor_ms,
             key,
             created_at_ms: mark_before.created_at_ms,
         }
     );
+    assert_floor_covers(&held, &answer);
     replay.db.drop_database().await.expect("drop");
+}
+
+/// The mark's time floor is at or above the time `answer` carried, and at most one step past
+/// it (Switch wire 7.3, "Trusted time").
+fn assert_floor_covers(mark: &AccountMark, answer: &SwitchResponse) {
+    let shown = ms(header_text(answer, header::SERVER_TIME).expect("server time"));
+    assert!(
+        (shown..=shown + pubky_switch::marks::TIME_FLOOR_STEP_MS).contains(&mark.time_floor_ms),
+        "floor {} against {shown}",
+        mark.time_floor_ms
+    );
 }
 
 /// The App IDs alice's account holds for the next generation, and whether [`HELD_REVOKED`]
@@ -1444,17 +1458,20 @@ async fn test_recovery_failing_mark_lost_start_writes_the_mark_anew() {
     );
     assert!(signed_by(&answer, &key, &signature));
     let head = head_of(&answer);
+    let held = mark_of(&replay).await;
     assert_eq!(
-        mark_of(&replay).await,
+        held,
         AccountMark {
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
             state_version: state_version_of(&replay, &alice_id()).await,
+            time_floor_ms: held.time_floor_ms,
             key,
             created_at_ms: created,
         }
     );
+    assert_floor_covers(&held, &answer);
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -64,6 +64,7 @@ use sqlx::{
 
 pub use account::{
     AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
+    ServiceRun, committed_time_ms,
 };
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
@@ -501,7 +502,8 @@ impl Store {
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
             "SELECT generation, chain_seq, chain_hash, state_version, stamped_time_ms, \
-             created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
+             stamped_by, created_at_ms, identity_doc, activation_requirement FROM accounts \
+             WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -531,6 +533,7 @@ impl Store {
             chain,
             state_version: from_db(row.try_get("state_version")?, "state_version")?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+            stamped_by: account::stamped_by(&row)?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
             identity_doc: doc
                 .map(|doc| identity::decode_doc(&doc, "identity_doc"))
@@ -767,10 +770,20 @@ pub struct FoundAccount {
     pub state_version: u64,
     /// The service time it last committed.
     pub stamped_time_ms: u64,
+    /// The run of the service that stamped it (Switch wire 7.3, "Trusted time").
+    pub stamped_by: [u8; 16],
     /// When it was created, in service time.
     pub created_at_ms: u64,
     /// The newest `identity.json` it holds, as signed; it was verified when it was taken.
     pub identity_doc: Option<pubky_switch_core::sig::SignedDoc>,
+}
+
+impl FoundAccount {
+    /// The last time the service committed for it in `run`, under the mark's time floor
+    /// `mark_floor_ms` ([`committed_time_ms`]).
+    pub fn committed_ms(&self, run: ServiceRun, mark_floor_ms: Option<u64>) -> u64 {
+        committed_time_ms(self.stamped_time_ms, &self.stamped_by, run, mark_floor_ms)
+    }
 }
 
 /// The readiness check of the database: a round trip on a pooled connection.

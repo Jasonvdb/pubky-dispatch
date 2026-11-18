@@ -200,9 +200,9 @@ impl Service {
             .map_err(|error| (error, at_base))?;
         // The last time the service committed for the identity, or the time base where it
         // holds no account (Switch wire 7.1 Timestamp).
-        let committed = found
-            .as_ref()
-            .map_or(at_base, |found| AnswerTime::Account(found.stamped_time_ms));
+        let committed = found.as_ref().map_or(at_base, |found| {
+            AnswerTime::Account(found.committed_ms(self.run, judged.time_floor_ms()))
+        });
         let at = |error: ApiError| (error, committed);
         let enrollment_hash = enrollment
             .signed()
@@ -230,11 +230,16 @@ impl Service {
             }
             _ => return Err(at(unavailable())),
         }
-        self.enroll_at_account(enrollment, identity_text, enrollment_hash, base_ms)
-            .await
-            .map_err(|(error, under_lock)| {
-                (error, under_lock.map_or(committed, AnswerTime::Account))
-            })
+        let mark_floor_ms = judged.time_floor_ms();
+        self.enroll_at_account(
+            enrollment,
+            identity_text,
+            enrollment_hash,
+            base_ms,
+            mark_floor_ms,
+        )
+        .await
+        .map_err(|(error, under_lock)| (error, under_lock.map_or(committed, AnswerTime::Account)))
     }
 
     /// Create the identity's account (Switch wire 7.3, Table 3), all under the identity's
@@ -361,7 +366,9 @@ impl Service {
             earlier.checked_add(1).map(|after| at.max(after))
         })
         .ok_or_else(unavailable)?
-        .max(older_head.map_or(0, |head| head.stamped_time_ms));
+        .max(older_head.map_or(0, |head| {
+            head.committed_ms(self.run, judged.time_floor_ms())
+        }));
         if now < floor {
             return Err(unavailable());
         }
@@ -416,6 +423,11 @@ impl Service {
             revoked_apps: enrollment.revoked_apps().to_vec(),
             enrollment_hash,
             enrollment_store_id,
+            // A mark taken over keeps the time floor of the lifetime before, whose answers
+            // showed times up to it: the account's first stamp is not before it (Switch
+            // wire 7.3, "Trusted time").
+            stamped_time_ms: created_at_ms.max(judged.mark().map_or(0, |mark| mark.time_floor_ms)),
+            stamped_by: self.run.id(),
         };
         let creation = match source {
             Source::Empty(lock) => lock
@@ -429,9 +441,9 @@ impl Service {
                 .map_err(|e| store_error(&e))?,
         };
         creation.commit().await.map_err(|e| store_error(&e))?;
-        // Answered at the time it was created, which may be past `base_ms`.
+        // Answered at the time it first stamped, which may be past `base_ms`.
         Ok(Some(Enrolled {
-            time_ms: created_at_ms,
+            time_ms: account.stamped_time_ms,
             limits,
             created: created_at_ms,
             mark_key: None,
@@ -511,14 +523,16 @@ impl Service {
     /// that no document names yet the mark's key becomes the key the answer names, durably
     /// before the commit. At a healthy account the mark moves to the count it commits before
     /// the answer is released (Switch wire 7.3, "Moving it"). A refusal comes with the time
-    /// the account last committed, read under its lock, or `None` where it came before the
-    /// lock.
+    /// the account last committed, read under its lock under the time floor `mark_floor_ms`
+    /// of the mark read before it (Switch wire 7.3, "Trusted time"), or `None` where it came
+    /// before the lock.
     async fn enroll_at_account(
         &self,
         enrollment: &Enrollment,
         identity_text: &str,
         enrollment_hash: [u8; 32],
         base_ms: u64,
+        mark_floor_ms: Option<u64>,
     ) -> Result<Enrolled, (ApiError, Option<u64>)> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let mut txn = self
@@ -527,7 +541,7 @@ impl Service {
             .await
             .map_err(|e| (store_error(&e), None))?
             .ok_or_else(|| (unavailable(), None))?;
-        let committed_ms = txn.head().stamped_time_ms;
+        let committed_ms = txn.head().committed_ms(self.run, mark_floor_ms);
         let refused = |error: ApiError| (error, Some(committed_ms));
         let enrolled = self
             .enroll_under_lock(
@@ -552,6 +566,7 @@ impl Service {
             let target = crate::marks::MarkTarget {
                 head,
                 state_version: committed.head().state_version,
+                stamped_ms: enrolled.time_ms,
             };
             let created_at_ms = committed.head().created_at_ms;
             if self
@@ -652,7 +667,7 @@ impl Service {
                 return Err(unavailable());
             }
             return Ok(Enrolled {
-                time_ms: txn.head().stamped_time_ms,
+                time_ms: txn.head().committed_ms(self.run, judged.time_floor_ms()),
                 limits,
                 created,
                 mark_key: None,
@@ -666,7 +681,9 @@ impl Service {
         if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
             return Err(unavailable());
         }
-        let time_ms = txn.stamp(base_ms);
+        // Step 3, under the mark's time floor, which rises first where the stamp passes it
+        // (Switch wire 7.3, "Trusted time").
+        let time_ms = self.stamp_under_lock(txn, base_ms, judged.mark()).await?;
         let key = self.current_key();
         let serving = txn.head().activation == AccountActivation::Recovery
             || held.as_ref().is_some_and(|doc| {

@@ -4,7 +4,8 @@
 //! For each identity it holds an account for, the service keeps one mark, apart from the
 //! state a backup restores: the newest head it signed for the identity (generation, `seq`,
 //! chain hash), the account's count of changed commits as of its last acknowledged one, the
-//! service key the account is answered with, and the time the account was created. Beside the marks lie the retirements of generations, one-way, and the records of
+//! time floor, the service key the account is answered with, and the time the account was
+//! created. Beside the marks lie the retirements of generations, one-way, and the records of
 //! erasures and their unresolved attempts (Switch wire 7.4.16). They lie in one store, under
 //! one identity record, in
 //! `accounts/` under the key store's directory, which no backup of the state restores:
@@ -67,6 +68,12 @@ const MAX_ERASURE_FILE: u64 = 20;
 /// The store's directories under `accounts/`.
 const STORE_DIRS: [&str; 4] = ["marks", "retired", "erasures", "erasure-attempts"];
 
+/// How far past the time step 3 stamps the mark's time floor rises once that time passes it,
+/// in milliseconds: one minute, so the mark is written for time at most once a minute per
+/// account, and after a restore the service time is at most this far ahead of the last time
+/// it showed (Switch wire 7.3, "Trusted time").
+pub const TIME_FLOOR_STEP_MS: u64 = 60_000;
+
 /// An identity's mark (Switch wire 7.3, "Accounts and marks").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +88,9 @@ pub struct AccountMark {
     /// The account's count of changed commits as of the last commit acknowledged under the
     /// mark, 0 before any head (Switch wire 7.3, "The mark").
     pub state_version: u64,
+    /// The time floor, in Unix milliseconds: at or above every time an answer for the
+    /// identity carried (Switch wire 7.3, "Trusted time").
+    pub time_floor_ms: u64,
     /// The service key the account is answered with.
     #[serde(with = "hex_bytes")]
     pub key: [u8; 32],
@@ -101,13 +111,14 @@ impl From<&AccountMark> for crate::account::Mark {
 }
 
 impl AccountMark {
-    /// A mark that has recorded no head: (0, 0), its count 0.
+    /// A mark that has recorded no head: (0, 0), its count 0 and no time floor.
     pub fn zero(key: [u8; 32], created_at_ms: u64) -> Self {
         Self {
             generation: 0,
             seq: 0,
             chain_hash: ZERO_HASH,
             state_version: 0,
+            time_floor_ms: 0,
             key,
             created_at_ms,
         }
@@ -128,13 +139,15 @@ impl AccountMark {
     }
 
     /// Whether it is a mark some writer stores: (0, 0) with the zero hash and count 0, or a
-    /// head at a generation and a `seq` of at least 1 each.
+    /// head at a generation and a `seq` of at least 1 each; its time floor a time the
+    /// service can show.
     fn is_valid(&self) -> bool {
-        if self.generation == 0 {
+        let head = if self.generation == 0 {
             self.seq == 0 && self.chain_hash == ZERO_HASH && self.state_version == 0
         } else {
             self.seq != 0
-        }
+        };
+        head && self.time_floor_ms <= pubky_switch_core::time::MAX_TIME_MS
     }
 }
 
@@ -144,24 +157,35 @@ fn is_head(head: &ChainTip) -> bool {
 }
 
 /// What a mark moves to once the commit that holds it is durable (Switch wire 7.3, "The
-/// mark", "Moving it"): the committed chain head and the account's count of changed commits
-/// as committed.
+/// mark", "Moving it"): the committed chain head, the account's count of changed commits as
+/// committed, and the time the commit stamped, which a mark written anew takes as its time
+/// floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarkTarget {
     /// The committed chain head.
     pub head: ChainTip,
     /// The account's count of changed commits, as committed.
     pub state_version: u64,
+    /// The service time the commit stamped, in Unix milliseconds.
+    pub stamped_ms: u64,
 }
 
 impl MarkTarget {
-    /// The mark it makes, with `key` and `created_at_ms`.
-    fn mark(&self, key: [u8; 32], created_at_ms: u64) -> AccountMark {
+    /// Whether a mark can move to it: a head at a generation and a `seq` of at least 1
+    /// each, and a time the service can show.
+    fn is_valid(&self) -> bool {
+        is_head(&self.head) && self.stamped_ms <= pubky_switch_core::time::MAX_TIME_MS
+    }
+
+    /// The mark it makes, with `key`, `created_at_ms` and the time floor `time_floor_ms`, or
+    /// the time the commit stamped where that is later.
+    fn mark(&self, key: [u8; 32], created_at_ms: u64, time_floor_ms: u64) -> AccountMark {
         AccountMark {
             generation: self.head.generation,
             seq: self.head.seq,
             chain_hash: self.head.chain_hash,
             state_version: self.state_version,
+            time_floor_ms: time_floor_ms.max(self.stamped_ms),
             key,
             created_at_ms,
         }
@@ -173,10 +197,10 @@ impl MarkTarget {
 /// the head's `seq` and the count move together: neither lower and one higher moves it,
 /// neither higher and one lower is overtaken, both equal is the same mark; another chain
 /// hash at the mark's `seq`, or one of the two lower and the other higher, is a fork. The
-/// mark moved to carries `key`.
+/// mark moved to carries `key`, and keeps its time floor.
 fn order(held: &AccountMark, target: &MarkTarget, key: [u8; 32]) -> Advance {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    let moved = || Advance::Moved(target.mark(key, held.created_at_ms));
+    let moved = || Advance::Moved(target.mark(key, held.created_at_ms, held.time_floor_ms));
     match target.head.generation.cmp(&held.generation) {
         Less => return Advance::Overtaken(*held),
         Greater => return moved(),
@@ -456,7 +480,8 @@ impl MarkStore {
     }
 
     /// A new account takes the identity's mark `read`, the one it was judged with: its
-    /// generation, `seq` and chain hash stay, as do the identity's retirements; its key and
+    /// generation, `seq`, chain hash and time floor stay, as do the identity's retirements;
+    /// its key and
     /// creation time become `key` and `created_at_ms`, and its count the new account's, 0
     /// (Switch wire 7.3, Table 3, "The mark"). Where the
     /// store holds another mark than `read`, or none, nothing changes.
@@ -490,7 +515,9 @@ impl MarkStore {
     }
 
     /// Replace an exact older lifetime only with the committed head and count of an
-    /// authorized recovery of the selected newer SQL lifetime (Switch account binding 3.2).
+    /// authorized recovery of the selected newer SQL lifetime (Switch account binding 3.2),
+    /// its time floor the older mark's or the time the recovery stamped, whichever is later
+    /// (Switch wire 7.3, "Trusted time").
     pub(crate) async fn recover_older(
         &self,
         identity: &str,
@@ -501,7 +528,7 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
-        if !is_head(&target.head)
+        if !target.is_valid()
             || target.head.generation <= read.generation
             || created_at_ms <= read.created_at_ms
             || created_at_ms > pubky_switch_core::time::MAX_TIME_MS
@@ -513,7 +540,11 @@ impl MarkStore {
         let identity = valid_identity(identity)?;
         blocking(move || {
             inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
-                (held == MarkRead::Mark(read)).then_some(target.mark(key, created_at_ms))
+                (held == MarkRead::Mark(read)).then_some(target.mark(
+                    key,
+                    created_at_ms,
+                    read.time_floor_ms,
+                ))
             })
         })
         .await
@@ -549,11 +580,51 @@ impl MarkStore {
         .await
     }
 
+    /// Raise the time floor of the mark of the identity's account created at
+    /// `created_at_ms` to `floor_ms`, durably, before the commit of a time step 3 stamped
+    /// past it (Switch wire 7.3, "Trusted time"). The floor only rises: at or above
+    /// `floor_ms` already, nothing changes, nor without a mark, with another account's, or
+    /// with a file that doesn't read as one.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`];
+    /// [`MarkStoreError::InvalidHead`] for a floor past the latest time the service shows.
+    pub async fn raise_floor(
+        &self,
+        identity: &str,
+        created_at_ms: u64,
+        floor_ms: u64,
+    ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
+        if floor_ms > pubky_switch_core::time::MAX_TIME_MS {
+            return Err(MarkStoreError::InvalidHead);
+        }
+        let gate = self.gate.clone();
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            inner.write_sync(gate.as_ref(), &identity, |held| match held {
+                MarkRead::Mark(mark)
+                    if mark.created_at_ms == created_at_ms && mark.time_floor_ms < floor_ms =>
+                {
+                    Some(AccountMark {
+                        time_floor_ms: floor_ms,
+                        ..mark
+                    })
+                }
+                MarkRead::Mark(_) | MarkRead::Missing | MarkRead::NotAMark => None,
+            })
+        })
+        .await
+    }
+
     /// Move the mark of the identity's account created at `created_at_ms` to `target`,
     /// answered with `key`, once the commit that holds it is durable (Switch wire 7.3,
     /// "Moving it"). The mark moves only forward, by generation, then `seq` and count,
-    /// durably before this returns; at the same head and count it stays, behind a later move
-    /// it stays, and a fork is refused.
+    /// durably before this returns, its time floor kept or raised to the time the commit
+    /// stamped; at the same head and count it stays, behind a later move it stays, and a
+    /// fork is refused.
     ///
     /// A move runs after its commit, outside the identity's lock: the account may have been
     /// erased, and another enrolled, meanwhile. Every writer keeps a mark's creation time
@@ -563,7 +634,8 @@ impl MarkStore {
     /// # Errors
     ///
     /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`];
-    /// [`MarkStoreError::InvalidHead`] for a head at generation or `seq` 0.
+    /// [`MarkStoreError::InvalidHead`] for a head at generation or `seq` 0, or a stamp past
+    /// the latest time the service shows.
     pub async fn advance(
         &self,
         identity: &str,
@@ -575,15 +647,15 @@ impl MarkStore {
         let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        if !is_head(&target.head) {
+        if !target.is_valid() {
             return Err(MarkStoreError::InvalidHead);
         }
         blocking(move || inner.advance_sync(gate.as_ref(), &identity, target, key, created_at_ms))
             .await
     }
 
-    /// Write the mark anew at `target`, with `key` and `created_at_ms`, where the identity's
-    /// mark is lost: missing, or a file that doesn't read as a mark (Switch wire 7.3,
+    /// Write the mark anew at `target`, with `key` and `created_at_ms`, its time floor the
+    /// time the commit stamped, where the identity's mark is lost: missing, or a file that doesn't read as a mark (Switch wire 7.3,
     /// Table 3: a delivery that starts a generation where the mark is lost). A mark it
     /// holds stays: [`MarkStore::advance`] moves it. Nothing is written for an account an
     /// erasure's record covers, one created at or before the record: it was erased since
@@ -592,7 +664,8 @@ impl MarkStore {
     /// # Errors
     ///
     /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`];
-    /// [`MarkStoreError::InvalidHead`] for a head at generation or `seq` 0.
+    /// [`MarkStoreError::InvalidHead`] for a head at generation or `seq` 0, or a stamp past
+    /// the latest time the service shows.
     pub async fn write_anew(
         &self,
         identity: &str,
@@ -604,7 +677,7 @@ impl MarkStore {
         let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        if !is_head(&target.head) {
+        if !target.is_valid() {
             return Err(MarkStoreError::InvalidHead);
         }
         blocking(move || {
@@ -615,7 +688,7 @@ impl MarkStore {
                 {
                     None
                 }
-                MarkRead::Missing | MarkRead::NotAMark => Some(target.mark(key, created_at_ms)),
+                MarkRead::Missing | MarkRead::NotAMark => Some(target.mark(key, created_at_ms, 0)),
                 MarkRead::Mark(_) => None,
             })
         })
@@ -1827,16 +1900,18 @@ mod tests {
             seq,
             chain_hash: [hash; 32],
             state_version: 0,
+            time_floor_ms: 0,
             key: KEY,
             created_at_ms,
         }
     }
 
-    /// A move to `head` with count 0.
+    /// A move to `head` with count 0, stamped at time 0.
     fn at(head: ChainTip) -> MarkTarget {
         MarkTarget {
             head,
             state_version: 0,
+            stamped_ms: 0,
         }
     }
 
@@ -1952,8 +2027,8 @@ mod tests {
         let (dir, store) = open();
         store.create_zero(ALICE, KEY, 100).await.expect("zero");
         let held = MarkTarget {
-            head: head(2, 9, 1),
             state_version: 50,
+            ..at(head(2, 9, 1))
         };
         let Advance::Moved(mark) = store.advance(ALICE, held, KEY, 100).await.expect("held") else {
             panic!("not moved");
@@ -1973,8 +2048,8 @@ mod tests {
         // The new account's first write at the mark's head moves the mark, and the state
         // there is judged healthy, not behind (Switch wire 7.3, Table 3).
         let first = MarkTarget {
-            head: head(2, 9, 1),
             state_version: 1,
+            ..at(head(2, 9, 1))
         };
         let Advance::Moved(moved) = store
             .advance(ALICE, first, OTHER_KEY, 500)
@@ -2003,21 +2078,31 @@ mod tests {
 
     #[test]
     fn test_marks_order_by_generation_head_and_count() {
-        // The mark held: head (2, 5) with hash 1, count 8 (Switch wire 7.3, "The mark").
+        // The mark held: head (2, 5) with hash 1, count 8, time floor 1_000 (Switch wire
+        // 7.3, "The mark", "Trusted time").
         let held = AccountMark {
             state_version: 8,
+            time_floor_ms: 1_000,
             ..mark_at(2, 5, 1, 100)
         };
-        let to = |generation, seq, hash, state_version| MarkTarget {
+        let stamped = |generation, seq, hash, state_version, stamped_ms| MarkTarget {
             head: head(generation, seq, hash),
             state_version,
+            stamped_ms,
         };
-        let moved = |generation, seq, hash, state_version| {
+        let to = |generation, seq, hash, state_version| {
+            stamped(generation, seq, hash, state_version, 500)
+        };
+        let floored = |generation, seq, hash, state_version, time_floor_ms| {
             Advance::Moved(AccountMark {
                 state_version,
+                time_floor_ms,
                 key: OTHER_KEY,
                 ..mark_at(generation, seq, hash, 100)
             })
+        };
+        let moved = |generation, seq, hash, state_version| {
+            floored(generation, seq, hash, state_version, 1_000)
         };
         let cases = [
             (
@@ -2044,6 +2129,11 @@ mod tests {
                 Advance::Overtaken(held),
             ),
             ("a later generation", to(3, 1, 5, 0), moved(3, 1, 5, 0)),
+            (
+                "a stamp past the floor",
+                stamped(2, 7, 4, 9, 2_000),
+                floored(2, 7, 4, 9, 2_000),
+            ),
             (
                 "another hash at the head",
                 to(2, 5, 2, 8),
@@ -2196,6 +2286,87 @@ mod tests {
             Advance::Fork(mark)
         );
         assert_eq!(store.read(ALICE).await.expect("read"), MarkRead::Mark(mark));
+    }
+
+    #[tokio::test]
+    async fn test_marks_raise_floor_only_rises_and_only_for_its_account() {
+        let (dir, store) = open();
+        let mark = with_mark(&store, ALICE, head(1, 3, 1)).await;
+        let bob = with_mark(&store, BOB, head(1, 9, 2)).await;
+        let raised = AccountMark {
+            time_floor_ms: 5_000,
+            ..mark
+        };
+        assert_eq!(
+            store.raise_floor(ALICE, 100, 5_000).await.expect("raise"),
+            MarkWrite::Written(raised)
+        );
+        // A lower or equal floor leaves it: the floor never goes back.
+        for lower in [3_000, 5_000] {
+            assert_eq!(
+                store.raise_floor(ALICE, 100, lower).await.expect("lower"),
+                MarkWrite::Unchanged(MarkRead::Mark(raised))
+            );
+        }
+        // Another account's mark, or none, stays.
+        assert_eq!(
+            store.raise_floor(ALICE, 99, 9_000).await.expect("other"),
+            MarkWrite::Unchanged(MarkRead::Mark(raised))
+        );
+        assert_eq!(
+            store.raise_floor("carol", 100, 9_000).await.expect("none"),
+            MarkWrite::Unchanged(MarkRead::Missing)
+        );
+        assert!(matches!(
+            store
+                .raise_floor(ALICE, 100, pubky_switch_core::time::MAX_TIME_MS + 1)
+                .await,
+            Err(MarkStoreError::InvalidHead)
+        ));
+        assert_eq!(store.read(BOB).await.expect("bob"), MarkRead::Mark(bob));
+        // Every later write keeps it: a move, a takeover.
+        let moved = match store
+            .advance(ALICE, at(head(1, 4, 1)), KEY, 100)
+            .await
+            .expect("advance")
+        {
+            Advance::Moved(moved) => moved,
+            other => panic!("not moved: {other:?}"),
+        };
+        assert_eq!(moved.time_floor_ms, 5_000);
+        let taken = store
+            .take(ALICE, moved, OTHER_KEY, 200)
+            .await
+            .expect("take");
+        assert!(matches!(taken, MarkWrite::Written(mark) if mark.time_floor_ms == 5_000));
+        drop(store);
+        let store = MarkStore::open(dir.path()).expect("reopen");
+        assert!(matches!(
+            store.read(ALICE).await.expect("read"),
+            MarkRead::Mark(mark) if mark.time_floor_ms == 5_000 && mark.created_at_ms == 200
+        ));
+        // A mark written anew takes the time its commit stamped as its floor; no writer takes
+        // a stamp past the latest time.
+        let stamped = MarkTarget {
+            stamped_ms: 7_000,
+            ..at(head(2, 1, 4))
+        };
+        assert!(matches!(
+            store.write_anew("carol", stamped, KEY, 300).await.expect("anew"),
+            MarkWrite::Written(mark) if mark.time_floor_ms == 7_000
+        ));
+        let far = MarkTarget {
+            stamped_ms: pubky_switch_core::time::MAX_TIME_MS + 1,
+            ..stamped
+        };
+        assert!(matches!(
+            store.advance(ALICE, far, KEY, 200).await,
+            Err(MarkStoreError::InvalidHead)
+        ));
+        assert!(matches!(
+            store.write_anew("dave", far, KEY, 300).await,
+            Err(MarkStoreError::InvalidHead)
+        ));
     }
 
     #[tokio::test]
@@ -2490,6 +2661,14 @@ mod tests {
         upper["key"] = hex::encode_upper([0xab_u8; 32]).into();
         let mut short = good.clone();
         short["chain_hash"] = "0101".into();
+        // A time floor past the latest time the service shows, and a mark without one.
+        let mut far_floor = good.clone();
+        far_floor["time_floor_ms"] = (pubky_switch_core::time::MAX_TIME_MS + 1).into();
+        let mut no_floor = good.clone();
+        no_floor
+            .as_object_mut()
+            .expect("object")
+            .remove("time_floor_ms");
         for value in [
             extra,
             zero_seq,
@@ -2497,6 +2676,8 @@ mod tests {
             zero_with_hash,
             upper,
             short,
+            far_floor,
+            no_floor,
         ] {
             cases.push(serde_json::to_vec(&value).expect("bytes"));
         }
@@ -2510,11 +2691,12 @@ mod tests {
                 "case {n}"
             );
         }
-        // The same shape, valid, reads as a mark.
+        // The same shape, valid, reads as a mark, a time floor on (0, 0) included.
         let mut zero = good;
         zero["generation"] = 0.into();
         zero["seq"] = 0.into();
         zero["chain_hash"] = zero_hash.into();
+        zero["time_floor_ms"] = 9.into();
         fs::write(
             marks_dir(&dir).join("zero"),
             serde_json::to_vec(&zero).expect("bytes"),
@@ -3295,6 +3477,7 @@ mod tests {
         stale(store.create_zero(BOB, KEY, 1).await.map(|_| ()));
         stale(store.take(ALICE, mark, OTHER_KEY, 9).await.map(|_| ()));
         stale(store.set_key(ALICE, OTHER_KEY, 100).await.map(|_| ()));
+        stale(store.raise_floor(ALICE, 100, 5_000).await.map(|_| ()));
         stale(
             store
                 .advance(ALICE, at(head(1, 5, 2)), KEY, 100)

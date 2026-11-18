@@ -31,7 +31,10 @@ use crate::{
     },
     keys::{ServiceSigner, sign_head},
     marks::MarkTarget,
-    store::{AccountHead, AccountTxn, CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
+    store::{
+        AccountHead, AccountTxn, CurrentDocs, FeedRow, FeedSnapshot, PageReader, ServiceRun,
+        StoreError, committed_time_ms,
+    },
 };
 
 /// Positions one page examines at most, before it runs on to the end of a batch (Switch
@@ -114,6 +117,9 @@ impl FeedQuery {
 #[derive(Debug)]
 pub(super) struct FeedRead {
     account: AccountHead,
+    /// The time floor of the account's mark as the request read it under the lock (Switch
+    /// wire 7.3, "Trusted time").
+    mark_floor_ms: Option<u64>,
     /// The key the verdict answered the request with.
     key: [u8; 32],
     /// The reader, with the signing key its request verified with.
@@ -178,10 +184,23 @@ pub(super) struct SnapshotHead {
     /// The account's count of changed commits in the snapshot, which the mark moves to with
     /// the head (Switch wire 7.3, "Moving it").
     state_version: u64,
+    /// The time the snapshot's account last stamped.
+    stamped_ms: u64,
     /// The creation time of the account the snapshot shows, whose mark the head moves.
     created_at_ms: u64,
     identity_key: [u8; 32],
     signer: ServiceSigner,
+}
+
+impl SnapshotHead {
+    /// What the mark moves to before the snapshot's head goes out.
+    fn target(&self) -> MarkTarget {
+        MarkTarget {
+            head: self.tip,
+            state_version: self.state_version,
+            stamped_ms: self.stamped_ms,
+        }
+    }
 }
 
 impl FeedStop {
@@ -408,6 +427,10 @@ enum Reader {
         origin: String,
         verified: VerifiedApp,
         time_ms: u64,
+        /// The time floor of the account's mark, read before the snapshot.
+        mark_floor_ms: Option<u64>,
+        /// This run of the service (Switch wire 7.3, "Trusted time").
+        run: ServiceRun,
     },
     /// A certificate taken as it is, for tests of the visibility rules.
     #[cfg(test)]
@@ -575,12 +598,20 @@ impl PageReader for PageBuilder {
                 origin,
                 verified,
                 time_ms,
+                mark_floor_ms,
+                run,
             } => {
                 // Expiry is judged in service time: the later of the request's stamp and the
-                // last time the account committed. A quiet wait with no commit can so answer
-                // an empty page a few seconds past the certificate's expiry; nothing new
-                // reaches the app, and any commit after the expiry refuses it.
-                self.time_ms = (*time_ms).max(snapshot.stamped_time_ms);
+                // last time the account committed, under its mark's time floor (Switch wire
+                // 7.3, "Trusted time"). A quiet wait with no commit can so answer an empty
+                // page a few seconds past the certificate's expiry; nothing new reaches the
+                // app, and any commit after the expiry refuses it.
+                self.time_ms = (*time_ms).max(committed_time_ms(
+                    snapshot.stamped_time_ms,
+                    &snapshot.stamped_by,
+                    *run,
+                    *mark_floor_ms,
+                ));
                 let doc = match snapshot
                     .identity_doc
                     .as_ref()
@@ -721,6 +752,7 @@ impl Service {
     pub(super) fn feed(
         &self,
         account: &AccountHead,
+        mark_floor_ms: Option<u64>,
         key: [u8; 32],
         writer: Option<&AppCert>,
         query: &Result<BTreeMap<String, String>, crate::http::route::QueryError>,
@@ -739,6 +771,7 @@ impl Service {
         let mut answer = Answer::ok(Vec::new());
         answer.deferred = Some(super::Deferred::Feed(Box::new(FeedRead {
             account: account.clone(),
+            mark_floor_ms,
             key,
             reader: VerifiedApp::reading(reader.app_id(), reader.signing_key()),
             query,
@@ -797,10 +830,7 @@ impl Service {
                     } else {
                         self.move_mark(
                             &read.account.id,
-                            MarkTarget {
-                                head: snapshot.tip,
-                                state_version: snapshot.state_version,
-                            },
+                            snapshot.target(),
                             super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
                             snapshot.created_at_ms,
                             false,
@@ -834,10 +864,7 @@ impl Service {
             match self
                 .move_mark(
                     &read.account.id,
-                    MarkTarget {
-                        head: answered.head.tip,
-                        state_version: answered.head.state_version,
-                    },
+                    answered.head.target(),
                     super::PublicKeyBytes::public_key_bytes(&answered.head.signer),
                     answered.head.created_at_ms,
                     false,
@@ -912,7 +939,7 @@ impl Service {
                 return failed(AnswerTime::TimeBase(base_ms, Uncompared::Unavailable));
             }
         };
-        let at = AnswerTime::Account(txn.head().stamped_time_ms);
+        let at = AnswerTime::Account(txn.head().committed_ms(self.run, read.mark_floor_ms));
         let snapshot = match &result {
             Ok(page) => Some(&page.head),
             Err(refusal) => refusal.snapshot.as_ref(),
@@ -940,8 +967,12 @@ impl Service {
             head.activation,
         );
         let judged = self.judge(&read.account.id, Some(account)).await;
+        // The last time the service committed for the identity, under the time floor of the
+        // mark as read now (Switch wire 7.3, "Trusted time").
+        let committed_ms = txn
+            .head()
+            .committed_ms(self.run, judged.time_floor_ms().max(read.mark_floor_ms));
         if judged.judgement.decision.erase_account_again {
-            let committed_ms = txn.head().stamped_time_ms;
             drop(txn);
             return self
                 .answer_after_account_change(
@@ -964,7 +995,7 @@ impl Service {
             &routed,
             asked,
             self.time.read().base_ms,
-            Some(txn.head().stamped_time_ms),
+            Some(committed_ms),
         ) {
             return response;
         }
@@ -1004,7 +1035,7 @@ impl Service {
                 )
             }
         };
-        let at = AnswerTime::Account(time_ms.max(txn.head().stamped_time_ms));
+        let at = AnswerTime::Account(time_ms.max(committed_ms));
         let response = sign_answer(&signer, asked, at, answer);
         // This turn changed no state; the snapshot's state and mark are already durable.
         // Keep its lock through signing and finish the turn before releasing the answer.
@@ -1052,6 +1083,8 @@ impl Service {
                 origin: self.origin.clone(),
                 verified: read.reader.clone(),
                 time_ms: read.time_ms,
+                mark_floor_ms: inputs.time_floor_ms(),
+                run: self.run,
             },
             read.query.limit,
             budget,
@@ -1145,6 +1178,7 @@ impl Service {
                     snapshot: Some(SnapshotHead {
                         tip,
                         state_version: snapshot.state_version,
+                        stamped_ms: snapshot.stamped_time_ms,
                         created_at_ms: snapshot.created_at_ms,
                         identity_key: read.account.identity_key,
                         signer: signer.clone(),
@@ -1176,6 +1210,7 @@ impl Service {
             head: SnapshotHead {
                 tip,
                 state_version: snapshot.state_version,
+                stamped_ms: snapshot.stamped_time_ms,
                 created_at_ms: snapshot.created_at_ms,
                 identity_key: read.account.identity_key,
                 signer,
@@ -1725,6 +1760,8 @@ mod tests {
                 origin: identity.inbox().url.clone(),
                 verified: VerifiedApp::reading(app, held.cert().signing_key()),
                 time_ms: 0,
+                mark_floor_ms: None,
+                run: ServiceRun::start(),
             },
             100,
             usize::MAX,
@@ -1780,6 +1817,7 @@ mod tests {
             activation: pubky_switch_core::records::AccountActivation::Ordinary,
             created_at_ms: 0,
             stamped_time_ms: 0,
+            stamped_by: [0; 16],
             identity_doc: None,
             reader: None,
             reader_kept: false,

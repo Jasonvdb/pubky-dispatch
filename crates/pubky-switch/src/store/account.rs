@@ -38,10 +38,65 @@ pub struct NewAccount {
     pub enrollment_hash: [u8; 32],
     /// The confirmed mark-store identity associated with the creating enrollment.
     pub enrollment_store_id: [u8; 16],
+    /// Its first stamped service time: the creation time, or the time floor of a mark it
+    /// takes over where that is later (Switch wire 7.3, "Trusted time").
+    pub stamped_time_ms: u64,
+    /// The run of the service that creates it, which commits that time (Switch wire 7.3,
+    /// "Trusted time").
+    pub stamped_by: [u8; 16],
+}
+
+/// One run of the service, from one start to its stop, named by a random id (Switch wire
+/// 7.3, "Trusted time"). A state is restored or failed over only across a restart, so a
+/// state a run committed itself is no restored one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceRun {
+    id: [u8; 16],
+    /// Whether the id came from the system's randomness; without it no state counts as
+    /// this run's, so each stamp takes the mark's time floor.
+    random: bool,
+}
+
+impl ServiceRun {
+    /// A new run, with a random id.
+    pub fn start() -> Self {
+        let mut id = [0u8; 16];
+        let random = getrandom::fill(&mut id).is_ok();
+        Self { id, random }
+    }
+
+    /// The id the states it stamps record.
+    pub fn id(&self) -> [u8; 16] {
+        self.id
+    }
+
+    /// Whether this run committed a state that records `stamped_by`.
+    pub fn stamped(&self, stamped_by: &[u8; 16]) -> bool {
+        self.random && *stamped_by == self.id
+    }
+}
+
+/// The last time the service committed for an account, as answers show it and the next
+/// stamp starts from (Switch wire 7.1 Timestamp, 7.3 "Trusted time"): the time it stamped,
+/// `stamped_time_ms`, where `run` stamped it, `stamped_by`; otherwise, as for a restored
+/// state, that time or its mark's time floor, `mark_floor_ms`, whichever is later, so
+/// service time never goes back for the identity. With the mark lost there is no floor. A
+/// reader before the account's lock reads the mark before the state: a floor it reads, a
+/// state it then reads that another run stamped committed no time after it since.
+pub fn committed_time_ms(
+    stamped_time_ms: u64,
+    stamped_by: &[u8; 16],
+    run: ServiceRun,
+    mark_floor_ms: Option<u64>,
+) -> u64 {
+    match mark_floor_ms {
+        Some(floor) if !run.stamped(stamped_by) => stamped_time_ms.max(floor),
+        _ => stamped_time_ms,
+    }
 }
 
 /// An account's position: its generation and key, the last `seq` given out, the chain head,
-/// its count of changed commits and the stamped service time.
+/// its count of changed commits, the stamped service time and the run that stamped it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountHead {
     /// The persisted activation requirement of this lifetime.
@@ -61,11 +116,19 @@ pub struct AccountHead {
     pub state_version: u64,
     /// The last service time the account stamped.
     pub stamped_time_ms: u64,
+    /// The run of the service that stamped it (Switch wire 7.3, "Trusted time").
+    pub stamped_by: [u8; 16],
     /// When the account was created.
     pub created_at_ms: u64,
 }
 
 impl AccountHead {
+    /// The last time the service committed for the account in `run`, under the mark's time
+    /// floor `mark_floor_ms` ([`committed_time_ms`]).
+    pub fn committed_ms(&self, run: ServiceRun, mark_floor_ms: Option<u64>) -> u64 {
+        committed_time_ms(self.stamped_time_ms, &self.stamped_by, run, mark_floor_ms)
+    }
+
     /// The chain tip the next chain item links to: the newest item's `seq` and chain hash,
     /// or `seq` 0 and the zero hash before any (Switch wire 6.6).
     pub fn chain_tip(&self) -> pubky_switch_core::chain::ChainTip {
@@ -213,8 +276,8 @@ pub(super) async fn create(
         .transpose()?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, created_at_ms, \
-         stamped_time_ms, announced_limits, identity_doc, activation_requirement) VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
-         ON CONFLICT (id) DO NOTHING",
+         stamped_time_ms, stamped_by, announced_limits, identity_doc, activation_requirement) \
+         VALUES ($1, $2, $3, $4, $9, $8, $5, $6, $7) ON CONFLICT (id) DO NOTHING",
     )
     .bind(&account.id)
     .bind(account.identity_key.as_slice())
@@ -226,6 +289,8 @@ pub(super) async fn create(
     )
     .bind(identity_doc)
     .bind(account.activation.as_str())
+    .bind(account.stamped_by.as_slice())
+    .bind(to_db(account.stamped_time_ms, "stamped_time_ms")?)
     .execute(&mut *tx)
     .await
     .map_err(StoreError::from_db)?
@@ -355,8 +420,8 @@ impl AccountTxn {
     ) -> Result<Option<Self>, StoreError> {
         let row = sqlx::query(
             "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, state_version, \
-             stamped_time_ms, created_at_ms, activation_requirement FROM accounts WHERE id = $1 \
-             FOR UPDATE",
+             stamped_time_ms, stamped_by, created_at_ms, activation_requirement FROM accounts \
+             WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -388,6 +453,7 @@ impl AccountTxn {
             chain,
             state_version: from_db(row.try_get("state_version")?, "state_version")?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+            stamped_by: stamped_by(&row)?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         };
         Ok(Some(Self {
@@ -415,11 +481,13 @@ impl AccountTxn {
         &self.head
     }
 
-    /// Stamp the service time for this request: the time base, or the last time the account
-    /// stamped if the time base is earlier, so service time never goes back for an
-    /// identity (Switch spec 10.1, Switch wire 7.3 step 3). Kept only if the request commits.
-    pub fn stamp(&mut self, base_ms: u64) -> u64 {
-        self.head.stamped_time_ms = self.head.stamped_time_ms.max(base_ms);
+    /// Stamp the service time `time_ms` for this request in `run`, or the last time the
+    /// account stamped if that is later, so service time never goes back for an identity
+    /// (Switch spec 10.1, Switch wire 7.3 step 3, "Trusted time"); the state records that
+    /// `run` stamped it. Kept only if the request commits. The time stamped.
+    pub fn stamp(&mut self, time_ms: u64, run: ServiceRun) -> u64 {
+        self.head.stamped_time_ms = self.head.stamped_time_ms.max(time_ms);
+        self.head.stamped_by = run.id();
         self.head.stamped_time_ms
     }
 
@@ -485,17 +553,20 @@ impl AccountTxn {
         })
     }
 
-    /// Undo everything written since `savepoint`, keeping the time this request stamped:
-    /// a refused request commits its stamp and nothing else (Switch wire 7.3 steps 3 and
-    /// 10). If this fails the transaction must not be committed.
+    /// Undo everything written since `savepoint`, keeping the time this request stamped and
+    /// the run that stamped it: a refused request commits its stamp and nothing else
+    /// (Switch wire 7.3 steps 3 and 10). If this fails the transaction must not be
+    /// committed.
     pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<(), StoreError> {
         sqlx::query("ROLLBACK TO SAVEPOINT endpoint")
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;
         let stamped_time_ms = self.head.stamped_time_ms;
+        let stamped_by = self.head.stamped_by;
         self.head = AccountHead {
             stamped_time_ms,
+            stamped_by,
             ..savepoint.head
         };
         self.changed = savepoint.changed;
@@ -575,7 +646,7 @@ impl AccountTxn {
         } else {
             sqlx::query_scalar(
                 "UPDATE accounts SET last_seq = $2, chain_seq = $3, chain_hash = $4, \
-             stamped_time_ms = $5, state_version = CASE \
+             stamped_time_ms = $5, stamped_by = $7, state_version = CASE \
              WHEN $6 OR coalesce(current_setting('switch.changed', true), '') = 'on' \
              THEN state_version + 1 ELSE state_version END \
              WHERE id = $1 RETURNING state_version",
@@ -586,6 +657,7 @@ impl AccountTxn {
             .bind(chain_hash)
             .bind(to_db(self.head.stamped_time_ms, "stamped_time_ms")?)
             .bind(moved)
+            .bind(self.head.stamped_by.as_slice())
             .fetch_optional(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?
@@ -761,4 +833,10 @@ impl AccountTxn {
     pub fn loaded(&self) -> &AccountHead {
         &self.loaded
     }
+}
+
+/// The run that stamped the account row `row` (Switch wire 7.3, "Trusted time").
+pub(super) fn stamped_by(row: &sqlx::postgres::PgRow) -> Result<[u8; 16], StoreError> {
+    let stamped_by: Vec<u8> = row.try_get("stamped_by")?;
+    <[u8; 16]>::try_from(stamped_by.as_slice()).map_err(|_| StoreError::Corrupt("stamped_by"))
 }

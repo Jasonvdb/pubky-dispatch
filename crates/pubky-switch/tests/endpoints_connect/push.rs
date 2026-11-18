@@ -170,11 +170,24 @@ async fn test_connect_push_minute_across_senders() {
     register(&replay, "wallet", &["one", "two"]).await;
     assert!(pending(&ask(&replay).await));
     assert_eq!(take_handles(&replay).await, ["one", "two"]);
-    replay.clock.advance_ms(59_999);
+    let pushed_ms = replay.time.peek().base_ms;
+    // The minute holds across a restart. The restarted run's first stamp at the account is
+    // its mark's time floor, a minute past the account's first request (Switch wire 7.3,
+    // "Time base"): restarted just before the floor, the account's time jumps to it, still
+    // inside the push's minute.
+    let floor_ms = match replay.marks.read(&alice_id()).await.expect("mark") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.time_floor_ms,
+        other => panic!("no mark: {other:?}"),
+    };
+    assert!((pushed_ms..pushed_ms + 60_000).contains(&floor_ms));
+    replay.clock.advance_ms(floor_ms - 1 - pushed_ms);
     replay.service = replay
         .restarted_with(Limits::default())
         .with_isolated_relays();
     assert!(pending(&ask_fresh(&replay, 33).await));
+    assert!(take_handles(&replay).await.is_empty());
+    replay.clock.advance_ms(pushed_ms + 59_999 - (floor_ms - 1));
+    assert!(pending(&ask_fresh(&replay, 35).await));
     assert!(take_handles(&replay).await.is_empty());
     replay.clock.advance_ms(1);
     // The duplicate still gets the pending answer after its push window has elapsed.

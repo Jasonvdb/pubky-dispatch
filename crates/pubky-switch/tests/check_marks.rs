@@ -65,6 +65,8 @@ fn new_account(id: &str, service_key: [u8; 32], store_id: [u8; 16], serving: boo
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: store_id,
+        stamped_time_ms: T0,
+        stamped_by: [2; 16],
     }
 }
 

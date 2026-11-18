@@ -1427,6 +1427,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
             seq: 5,
             chain_hash: [9; 32],
             state_version: 0,
+            time_floor_ms: 0,
             key,
             created_at_ms: ms(T),
         },

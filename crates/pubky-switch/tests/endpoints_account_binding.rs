@@ -1988,7 +1988,20 @@ async fn test_account_enrollment_removed_app_stays_excluded_after_recovery() {
         .await;
     status(&answer, 400);
     assert_eq!(value(&answer)["code"], "bad_request");
-    assert_eq!(replay.db.store().lookup(&key().id()).await.unwrap(), before);
+    // The refusal commits only its stamp: the reopened run's first, at the mark's time
+    // floor (Switch wire 7.3, "Time base").
+    let floor = match replay.marks.read(&key().id()).await.unwrap() {
+        MarkRead::Mark(mark) => mark.time_floor_ms,
+        other => panic!("no mark: {other:?}"),
+    };
+    assert_eq!(
+        replay.db.store().lookup(&key().id()).await.unwrap(),
+        before.map(|before| pubky_switch::store::FoundAccount {
+            stamped_time_ms: floor,
+            stamped_by: reopened.run().id(),
+            ..before
+        })
+    );
     let apps = reopened
         .handle(signed("GET", &path("apps"), vec![], Some(created), NOW))
         .await;

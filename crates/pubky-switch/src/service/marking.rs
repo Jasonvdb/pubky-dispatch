@@ -26,7 +26,10 @@ use crate::{
         error::{ApiError, ErrorCode},
         route::Call,
     },
-    marks::{AccountMark, Advance, MarkRead, MarkStoreError, MarkTarget, MarkWrite},
+    marks::{
+        AccountMark, Advance, MarkRead, MarkStoreError, MarkTarget, MarkWrite, TIME_FLOOR_STEP_MS,
+    },
+    store::AccountTxn,
 };
 
 /// How many accounts' notices one process logs, each once.
@@ -49,6 +52,15 @@ enum ErasureCheck {
 }
 
 impl MarkInputs {
+    /// The time floor of the mark read, where it reads as one (Switch wire 7.3, "Trusted
+    /// time").
+    pub(super) fn time_floor_ms(&self) -> Option<u64> {
+        match &self.mark {
+            MarkInput::Mark(mark) => Some(mark.time_floor_ms),
+            MarkInput::StoreUnreadable | MarkInput::Missing | MarkInput::NotAMark => None,
+        }
+    }
+
     pub(super) fn has_pending_erasure(&self) -> bool {
         matches!(self.erasure, ErasureCheck::Pending(_))
     }
@@ -85,6 +97,11 @@ impl Judged {
             MarkInput::Mark(mark) => Some(mark),
             MarkInput::StoreUnreadable | MarkInput::Missing | MarkInput::NotAMark => None,
         }
+    }
+
+    /// The mark's time floor, where it reads as one (Switch wire 7.3, "Trusted time").
+    pub(super) fn time_floor_ms(&self) -> Option<u64> {
+        self.mark().map(|mark| mark.time_floor_ms)
     }
 
     /// Select the lifetime without discarding either physical input's bounds
@@ -424,7 +441,9 @@ impl Service {
                 .await;
         }
         let routed = verdict::answer(&judged.judgement, class, self.current_key());
-        let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
+        let committed_ms = found
+            .as_ref()
+            .map(|found| found.committed_ms(self.run, judged.time_floor_ms()));
         self.verdict_answer(identity, &routed, asked, base_ms, committed_ms)
             .unwrap_or_else(|| {
                 self.keyed_error(
@@ -673,6 +692,67 @@ impl Service {
                 None
             }
         }
+    }
+
+    /// Step 3 under the account's lock (Switch wire 7.3, "Trusted time"): the time base, or
+    /// the last time the service committed for the identity where that is later, under
+    /// `mark`, the identity's mark as read under the lock; so service time never goes back,
+    /// also across a restore of the state. Where that time passes the time floor of the
+    /// account's own mark, the floor rises durably to it plus [`TIME_FLOOR_STEP_MS`] first,
+    /// before the commit. A state another run of the service stamped, as a restored one, is
+    /// stamped at the floor, after it rose: at or above every time an answer before the lock
+    /// showed for it. The stamp records this run. Without a mark of the account's creation
+    /// time there is no floor. The time stamped.
+    ///
+    /// # Errors
+    ///
+    /// `503` where the floor doesn't rise: nothing stamped past it is committed or shown.
+    pub(super) async fn stamp_under_lock(
+        &self,
+        txn: &mut AccountTxn,
+        base_ms: u64,
+        mark: Option<&AccountMark>,
+    ) -> Result<u64, ApiError> {
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let head = txn.head();
+        let time_ms = base_ms.max(head.committed_ms(self.run, mark.map(|mark| mark.time_floor_ms)));
+        let own = self.run.stamped(&head.stamped_by);
+        let created_at_ms = head.created_at_ms;
+        let Some(mark) = mark.filter(|mark| mark.created_at_ms == created_at_ms) else {
+            return Ok(txn.stamp(time_ms, self.run));
+        };
+        let mut floor_ms = mark.time_floor_ms;
+        if time_ms > floor_ms {
+            let raised = time_ms
+                .saturating_add(TIME_FLOOR_STEP_MS)
+                .min(pubky_switch_core::time::MAX_TIME_MS);
+            if raised < time_ms {
+                return Err(unavailable());
+            }
+            let identity = txn.head().id.clone();
+            floor_ms = match self
+                .marks
+                .raise_floor(&identity, created_at_ms, raised)
+                .await
+            {
+                Ok(MarkWrite::Written(raised)) => raised.time_floor_ms,
+                // Raised meanwhile, as far or further.
+                Ok(MarkWrite::Unchanged(MarkRead::Mark(held)))
+                    if held.created_at_ms == created_at_ms && held.time_floor_ms >= raised =>
+                {
+                    held.time_floor_ms
+                }
+                Ok(MarkWrite::Unchanged(_)) => {
+                    tracing::error!("a mark changed under the account's lock");
+                    return Err(unavailable());
+                }
+                Err(failure) => {
+                    tracing::error!(%failure, "raising a mark's time floor");
+                    return Err(unavailable());
+                }
+            };
+        }
+        Ok(txn.stamp(if own { time_ms } else { floor_ms }, self.run))
     }
 
     /// Whether the instance lock was confirmed recently enough for a commit that gives out a

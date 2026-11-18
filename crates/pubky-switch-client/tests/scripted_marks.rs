@@ -398,7 +398,11 @@ async fn test_marks_lost_account_is_taken_over_by_an_enrollment() {
     let client = bound_client(&alice, answer.created);
     assert_eq!(answer.service_key, switch.service_key(), "the one key");
     assert_eq!(switch.mark(), Some(marked));
-    assert_eq!(switch.mark_state_version(), Some(0), "the new account's count");
+    assert_eq!(
+        switch.mark_state_version(),
+        Some(0),
+        "the new account's count"
+    );
     assert_eq!(notice(&client.apps().await.unwrap_err()), behind(1, false));
     // A first document at generation 1 doesn't start above the mark: the notice. The
     // start above it goes through.

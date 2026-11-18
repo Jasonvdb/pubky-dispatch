@@ -1020,72 +1020,80 @@ fn test_credentials_debug_shows_no_key() {
     }
 }
 
-/// A public-read answer holding the account's `identity.json`, naming `origin` and
-/// `named` as its inbox, signed by `signing` as the switch signs it.
-fn public_read_switch(origin: &str, named: [u8; 32], signing: SigningKey) -> Arc<MockTransport> {
-    let body = IdentityBody::first(
-        identity().public(),
-        [0; 16],
-        Inbox::new(origin, named),
-        IdentityPolicy::default(),
-    );
-    let doc = IdentityDoc::sign(&identity(), body).unwrap();
-    fixed(signing, 200, json!({ "identity": doc.signed() }))
+#[tokio::test]
+async fn test_public_read_unreadable_signed_header_fails_authentication() {
+    let pin = Some(service_public());
+    for status in [200, 503] {
+        let transport = Arc::new(MockTransport::new());
+        transport.push_error(TransportError::UnreadableSignedHeader { status });
+        let client = client_with(app(), pin, transport);
+        assert_eq!(
+            client.public_identity().await.unwrap_err(),
+            ClientError::BadServiceSignature { status }
+        );
+        assert_eq!(client.pinned_key(), pin);
+        assert_eq!(client.last_server_time(), None);
+    }
 }
 
 #[tokio::test]
-async fn test_public_read_unreadable_signed_header_fails_authentication() {
-    for pin in [None, Some(service_public())] {
-        for status in [200, 503] {
-            let transport = Arc::new(MockTransport::new());
-            transport.push_error(TransportError::UnreadableSignedHeader { status });
-            let client = client_with(app(), pin, transport);
-            assert_eq!(
-                client.public_identity().await.unwrap_err(),
-                ClientError::BadServiceSignature { status }
-            );
-            assert_eq!(client.pinned_key(), pin);
-            assert_eq!(client.last_server_time(), None);
+async fn test_public_read_signed_time_window() {
+    let window = http::PUBLIC_READ_CACHE_MS + 2 * pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+    let doc = IdentityDoc::sign(
+        &identity(),
+        IdentityBody::first(
+            identity().public(),
+            [0; 16],
+            Inbox::new(ORIGIN, service_public()),
+            IdentityPolicy::default(),
+        ),
+    )
+    .unwrap();
+    for (offset, accepted) in [(0, true), (window, true), (window + 1, false)] {
+        for at in [NOW - offset, NOW + offset] {
+            for status in [200, 503] {
+                let body = if status == 200 {
+                    json!({ "identity": doc.signed() })
+                } else {
+                    json!({ "code": "staged", "message": "waiting" })
+                };
+                let transport = Arc::new(MockTransport::with_handler(move |request| {
+                    Ok(timed_response(request, status, body.clone(), None, at))
+                }));
+                let client = client_with(app(), Some(service_public()), transport);
+                let answer = client.public_identity().await;
+                if !accepted {
+                    assert_eq!(
+                        answer.unwrap_err(),
+                        ClientError::StaleAnswer { server_time_ms: at }
+                    );
+                } else if status == 200 {
+                    let public = answer.unwrap();
+                    assert_eq!(public.identity.version(), doc.version());
+                    assert_eq!(public.server_time_ms(), at);
+                } else {
+                    assert!(matches!(
+                        answer,
+                        Err(ClientError::Switch {
+                            code: ErrorCode::Staged,
+                            ..
+                        })
+                    ));
+                }
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn test_public_read_unpinned_pins_the_named_key() {
-    let transport = public_read_switch(ORIGIN, service_public(), service_key());
+async fn test_public_read_requires_a_pin_before_sending() {
+    let transport = Arc::new(MockTransport::new());
     let client = client_with(app(), None, Arc::clone(&transport));
-    let public = client.public_identity().await.unwrap();
-    assert_eq!(public.identity.inbox().service_key, service_public());
-    assert_eq!(client.pinned_key(), Some(service_public()));
-    let sent = transport.last_request().unwrap();
-    assert!(sent.headers.iter().all(|h| !h.name.starts_with("switch-")));
-}
-
-#[tokio::test]
-async fn test_public_read_unpinned_refuses_what_it_cant_check() {
-    let other = SigningKey::from_bytes(&[6; 32]);
-    let cases = [
-        // Signed with another key than the document names.
-        public_read_switch(ORIGIN, service_public(), other.clone()),
-        // A document naming another origin.
-        public_read_switch("https://other.example", service_public(), service_key()),
-        // An error answer: nothing names a key.
-        fixed(
-            service_key(),
-            404,
-            json!({ "code": "not_found", "message": "m" }),
-        ),
-    ];
-    for transport in cases {
-        let client = client_with(app(), None, Arc::clone(&transport));
-        let error = client.public_identity().await.unwrap_err();
-        assert!(
-            matches!(error, ClientError::BadServiceSignature { .. }),
-            "{error:?}"
-        );
-        assert_eq!(client.pinned_key(), None);
-        assert_eq!(client.last_server_time(), None);
-    }
+    assert_eq!(
+        client.public_identity().await.unwrap_err(),
+        ClientError::Unpinned
+    );
+    assert!(transport.last_request().is_none());
 }
 
 /// A delivery of the account's `identity.json` naming `named` as its service key here.

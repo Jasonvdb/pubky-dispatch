@@ -46,6 +46,17 @@ pub mod header {
 /// 7.1).
 pub const TIMESTAMP_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
+/// Maximum cache age of a public identity response (Switch wire 7.4.15).
+pub const PUBLIC_READ_CACHE_MS: u64 = 60_000;
+
+/// Cache-Control for a successful public identity read (Switch wire 7.4.15).
+pub fn public_read_cache_control() -> String {
+    format!(
+        "public, max-age={}, must-revalidate",
+        PUBLIC_READ_CACHE_MS / 1000
+    )
+}
+
 /// The headers a request to the switch signs, as their exact text; `None` when absent
 /// (Switch wire 7.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -231,7 +231,16 @@ mod tests {
             body: Vec::new(),
             timeout: TimeoutClass::default(),
         };
+        let checked = client.public_identity().await?;
+        if checked.identity.identity() != alice.public() || checked.freeze.is_some() {
+            return Err("the public read must return the enrolled identity".into());
+        }
         let baseline = world.transport().send(bare.clone()).await?;
+        if baseline.header("cache-control")
+            != Some(pubky_switch_core::http::public_read_cache_control().as_str())
+        {
+            return Err("the public identity cache lifetime differs".into());
+        }
         let cases = if seen_only {
             vec![vec![
                 Header::new(header::IDENTITY, &id),

@@ -24,7 +24,7 @@ use pubky_switch_core::records::IdentityDoc;
 
 use super::App;
 use super::error::{AppError, Refusal};
-use super::identity::{self, DOC_CACHE_MS};
+use super::identity;
 use super::protocol::ReceivedMessage;
 use super::protocols::Rules;
 use super::state::{Processed, key};
@@ -260,7 +260,7 @@ impl App {
         let now = self.now();
         Ok(identity::held_copy(&reader, sender)
             .await?
-            .filter(|(_, fetched)| now.saturating_sub(*fetched) < DOC_CACHE_MS)
+            .filter(|(_, reads)| reads.is_fresh(now))
             .map(|(doc, _)| doc))
     }
 }

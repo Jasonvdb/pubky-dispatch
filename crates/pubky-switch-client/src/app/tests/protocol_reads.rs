@@ -835,7 +835,7 @@ async fn test_identity_lookup_reports_each_source_and_its_time() {
     let found = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(found.homeserver, HomeserverCopy::Read);
     assert_eq!(found.switch_copy, SwitchCopy::Read);
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     assert_eq!(found.homeserver_read_ms, Some(start));
     assert_eq!(found.switch_read_ms, Some(start));
     assert_eq!(
@@ -846,7 +846,7 @@ async fn test_identity_lookup_reports_each_source_and_its_time() {
     p.clock.advance_ms(MINUTE);
     let held = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(held.homeserver, HomeserverCopy::Held);
-    assert_eq!(held.read_at_ms, start);
+    assert_eq!(held.read_at_ms, Some(start));
     assert_eq!(held.switch_lookup_ms, start);
     assert_eq!(held.fresh_until_ms(), start + DOC_CACHE_MS);
     // Past them, the copy must be looked up again before acting.
@@ -882,7 +882,7 @@ async fn test_identity_lookup_with_no_source_keeps_the_last_read_time() {
     assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
     assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
     // The copy held was read at the start, not now.
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     assert_eq!(found.homeserver_read_ms, Some(start));
     assert_eq!(found.switch_read_ms, Some(start));
     assert_eq!(found.switch_lookup_ms, start + 11 * MINUTE);
@@ -918,13 +918,196 @@ async fn test_identity_lookup_switch_alone_confirms_without_the_homeserver() {
     assert_eq!(found.homeserver_read_ms, Some(start));
     assert_eq!(found.switch_copy, SwitchCopy::Read);
     assert_eq!(found.switch_read_ms, Some(now));
-    assert_eq!(found.read_at_ms, now);
+    assert_eq!(found.read_at_ms, Some(now));
     assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
 }
 
 /// A Homeserver that serves an older copy than the one held, later, with the switch
 /// unavailable: the copy held was not read again, so it isn't fresh, and no action is taken
 /// on it before another lookup.
+#[tokio::test]
+async fn test_identity_lookup_directory_version_needs_its_own_read() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let before = wallet.identity_of(&bob, true).await.unwrap();
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.switch().deliver_identity(&newer).unwrap();
+    wallet.directory_of(&bob, None).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    assert_eq!(lookup.identity.doc.version(), newer.version());
+    assert!(lookup.identity.read_at_ms.is_none());
+    assert!(lookup.identity.homeserver_read_ms.is_none());
+    assert!(lookup.identity.switch_read_ms.is_none());
+    assert_eq!(lookup.identity.fresh_until_ms(), 0);
+    let answer = lookup.switch.unwrap().await;
+    let current = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(current.switch_read_ms, Some(p.clock.now_ms()));
+    assert_eq!(
+        current.may_act(p.clock.now_ms(), Initiator::Automatic, 0),
+        MayAct::Now
+    );
+    assert!(current.doc.version() > before.doc.version());
+}
+
+#[tokio::test]
+async fn test_peer_lookup_reports_successor_service_observation_after_a_move() {
+    use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
+    for homeserver_before_finish in [false, true] {
+        let p = Pair::new();
+        let protocol = ReadsProtocol::new(Mode::Settle);
+        let mut wallet = p
+            .join_on(
+                &p.alice,
+                "wallet",
+                protocol.clone(),
+                Arc::new(MemoryStore::new()),
+            )
+            .await;
+        let _shop = p
+            .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+            .await;
+        let bob = p.bob.identity().public();
+        let old_body = p.bob.body();
+        let next_origin = "https://next.example";
+        let secret = [23; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let next_inbox = Inbox::new(next_origin, key.verifying_key().to_bytes());
+        let generation = old_body.generation + 1;
+        let freeze = Freeze::sign(
+            p.bob.identity().key(),
+            FreezeBody {
+                identity: bob,
+                inbox: next_inbox.clone(),
+                next_generation: generation,
+                issued_at: p.clock.now_ms(),
+                nonce: [17; 16],
+            },
+        )
+        .unwrap();
+        p.bob.switch().freeze(&freeze).unwrap();
+        let next = p.bob.switch().import_into_at(secret, next_origin);
+        let service_time = p.clock.now_ms();
+        next.lock().clock = Arc::new(crate::clock::TestClock::new(service_time));
+        p.router.add_switch(next_origin, &next);
+        let mut body = old_body;
+        body.version += 1;
+        body.generation = generation;
+        body.inbox = next_inbox;
+        let moved = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+        next.deliver_identity(&moved).unwrap();
+        p.clock.advance_ms(4 * MINUTE);
+        let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+        let switch = lookup.switch.unwrap().await;
+        assert!(switch.read());
+        p.bob.homeserver().publish(&moved).unwrap();
+        if homeserver_before_finish {
+            let routed = wallet.peer_identity(&bob, true).await.unwrap();
+            assert_eq!(routed.version(), moved.version());
+        }
+        let first = wallet.finish_identity_lookup(switch).await.unwrap();
+        assert_eq!(first.doc.version(), moved.version());
+        assert_eq!(
+            first.homeserver_read_ms,
+            homeserver_before_finish.then(|| p.clock.now_ms())
+        );
+        assert_eq!(first.switch_lookup_ms, service_time);
+        assert_eq!(first.switch_read_ms, Some(service_time));
+        assert_eq!(first.fresh_until_ms(), service_time + DOC_CACHE_MS);
+        p.clock.set_ms(service_time + DOC_CACHE_MS);
+        // Ordinary routing refreshes an expired document from the Homeserver.
+        let routed = wallet.peer_identity(&bob, false).await.unwrap();
+        assert_eq!(routed.version(), moved.version());
+        let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+        assert_eq!(lookup.identity.homeserver_read_ms, Some(p.clock.now_ms()));
+        assert_eq!(lookup.identity.switch_read_ms, Some(service_time));
+        assert!(
+            lookup.switch.is_some(),
+            "the successor's public observation is ten minutes old; it needs a new switch lookup"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_identity_lookup_freeze_retains_the_first_source() {
+    use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.switch().deliver_identity(&newer).unwrap();
+    let next_origin = "https://next.example";
+    let secret = [23; 32];
+    let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    let freeze = Freeze::sign(
+        p.bob.identity().key(),
+        FreezeBody {
+            identity: bob,
+            inbox: Inbox::new(next_origin, key.verifying_key().to_bytes()),
+            next_generation: newer.generation() + 1,
+            issued_at: p.clock.now_ms(),
+            nonce: [17; 16],
+        },
+    )
+    .unwrap();
+    p.bob.switch().freeze(&freeze).unwrap();
+    let first = p.clock.now_ms();
+    let unavailable = wallet.identity_of(&bob, true).await.unwrap();
+    assert_eq!(unavailable.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(unavailable.doc.version(), newer.version());
+    assert_eq!(unavailable.read_at_ms, Some(first));
+    assert_eq!(unavailable.switch_read_ms, Some(first));
+    let next = p.bob.switch().import_into_at(secret, next_origin);
+    p.router.add_switch(next_origin, &next);
+    let staged_time = first;
+    next.lock().clock = Arc::new(crate::clock::TestClock::new(staged_time));
+    p.clock.advance_ms(4 * MINUTE);
+    let predecessor_time = p.clock.now_ms();
+    let staged = wallet.identity_of(&bob, true).await.unwrap();
+    assert_eq!(staged.switch_copy, SwitchCopy::Read);
+    assert_eq!(staged.read_at_ms, Some(predecessor_time));
+    assert_eq!(staged.switch_read_ms, Some(predecessor_time));
+    assert_eq!(staged.switch_lookup_ms, staged_time);
+    assert_eq!(staged.fresh_until_ms(), staged_time + DOC_CACHE_MS);
+    next.lock().clock = Arc::new(crate::clock::TestClock::new(first + 20 * MINUTE));
+    let refused = wallet.identity_of(&bob, true).await.unwrap();
+    assert_eq!(refused.switch_copy, SwitchCopy::Stale);
+    assert_eq!(refused.switch_read_ms, Some(predecessor_time));
+    assert_eq!(
+        refused.may_act(predecessor_time, Initiator::Automatic, 0),
+        MayAct::No
+    );
+    let kept = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(kept.switch_copy, SwitchCopy::Stale);
+}
+
 #[tokio::test]
 async fn test_identity_lookup_older_copy_leaves_the_read_time() {
     let p = Pair::new();
@@ -949,7 +1132,7 @@ async fn test_identity_lookup_older_copy_leaves_the_read_time() {
     let start = p.clock.now_ms();
     let found = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(found.doc.version(), newer.version());
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     // Twenty minutes on, the Homeserver still serves the older copy, and the switch can't
     // be read.
     p.clock.advance_ms(20 * MINUTE);
@@ -959,7 +1142,7 @@ async fn test_identity_lookup_older_copy_leaves_the_read_time() {
     assert_eq!(found.homeserver, HomeserverCopy::Read);
     assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
     assert_eq!(found.doc.version(), newer.version());
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     for by in [Initiator::User, Initiator::Automatic] {
         assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
     }
@@ -992,7 +1175,7 @@ async fn test_identity_lookup_older_switch_copy_asks_to_look_up_again() {
     let start = p.clock.now_ms();
     let found = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(found.doc.version(), newer.version());
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     // Twenty minutes on, only the switch answers, with the older copy.
     p.clock.advance_ms(20 * MINUTE);
     p.alice.homeserver().set_down(true);
@@ -1001,7 +1184,7 @@ async fn test_identity_lookup_older_switch_copy_asks_to_look_up_again() {
     assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
     assert_eq!(found.switch_copy, SwitchCopy::Read);
     assert_eq!(found.doc.version(), newer.version());
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     for by in [Initiator::User, Initiator::Automatic] {
         assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
     }
@@ -1036,7 +1219,7 @@ async fn test_identity_lookup_split_earlier_answer_of_the_same_copy_keeps_the_la
     wallet.finish_identity_lookup(later).await.unwrap();
     let found = wallet.finish_identity_lookup(earlier).await.unwrap();
     let now = p.clock.now_ms();
-    assert_eq!(found.read_at_ms, later_ms);
+    assert_eq!(found.read_at_ms, Some(later_ms));
     assert_eq!(found.switch_read_ms, Some(later_ms));
     assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
 }
@@ -1061,12 +1244,12 @@ async fn test_identity_lookup_after_the_clock_is_set_back_keeps_no_time_ahead() 
     let bob = p.bob.identity().public();
     let start = p.clock.now_ms();
     let found = wallet.identity_of(&bob, false).await.unwrap();
-    assert_eq!(found.read_at_ms, start);
+    assert_eq!(found.read_at_ms, Some(start));
     p.clock.set_ms(start - MINUTE);
     let found = wallet.identity_of(&bob, true).await.unwrap();
     let now = p.clock.now_ms();
     assert_eq!(found.switch_copy, SwitchCopy::Read);
-    assert_eq!(found.read_at_ms, now);
+    assert_eq!(found.read_at_ms, Some(now));
     assert_eq!(found.homeserver_read_ms, Some(now));
     assert_eq!(found.switch_read_ms, Some(now));
 }
@@ -1157,7 +1340,7 @@ async fn test_identity_lookup_split_answer_held_past_ten_minutes_is_stale() {
     assert_eq!(found.switch_copy, SwitchCopy::Read);
     assert_eq!(found.switch_lookup_ms, read_ms);
     assert_eq!(found.switch_read_ms, Some(read_ms));
-    assert_eq!(found.read_at_ms, read_ms);
+    assert_eq!(found.read_at_ms, Some(read_ms));
     assert_eq!(
         found.may_act(now, Initiator::Automatic, GRACE),
         MayAct::LookUpAgain
@@ -1358,7 +1541,7 @@ fn test_may_act_follows_the_rule_of_the_switch_copy() {
     let doc = doc.unwrap_or_else(|| World::new().next_doc(|_| {}));
     let at = |switch_copy| PeerIdentity {
         doc: doc.clone(),
-        read_at_ms: START,
+        read_at_ms: Some(START),
         homeserver: HomeserverCopy::Read,
         homeserver_read_ms: Some(START),
         switch_copy,
@@ -1372,6 +1555,20 @@ fn test_may_act_follows_the_rule_of_the_switch_copy() {
         read.may_act(START + DOC_CACHE_MS, auto, GRACE),
         MayAct::LookUpAgain
     );
+    let mut epoch = at(SwitchCopy::Read);
+    epoch.read_at_ms = Some(0);
+    epoch.switch_lookup_ms = 0;
+    assert_eq!(epoch.fresh_until_ms(), DOC_CACHE_MS);
+    assert_eq!(epoch.may_act(0, auto, GRACE), MayAct::Now);
+    epoch.read_at_ms = None;
+    assert_eq!(epoch.fresh_until_ms(), 0);
+    assert_eq!(epoch.may_act(0, auto, GRACE), MayAct::LookUpAgain);
+    let refused_time = at(SwitchCopy::Stale);
+    assert_eq!(
+        refused_time.may_act(START, user, GRACE),
+        MayAct::IfUserConfirms
+    );
+    assert_eq!(refused_time.may_act(START, auto, GRACE), MayAct::No);
     let pending = at(SwitchCopy::Pending);
     assert_eq!(
         pending.may_act(START + 1, auto, GRACE),
@@ -1387,7 +1584,7 @@ fn test_may_act_follows_the_rule_of_the_switch_copy() {
     );
     // A pending lookup on a copy past 10 minutes: every action waits for it.
     let mut stale = at(SwitchCopy::Pending);
-    stale.read_at_ms = START - DOC_CACHE_MS;
+    stale.read_at_ms = Some(START - DOC_CACHE_MS);
     assert_eq!(
         stale.may_act(START + GRACE, user, GRACE),
         MayAct::WaitForLookup

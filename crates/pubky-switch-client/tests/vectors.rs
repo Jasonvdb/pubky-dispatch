@@ -746,7 +746,9 @@ async fn test_vectors_http_answers_read_by_the_typed_calls() {
             wallet.clone(),
             pinned,
             transport,
-            clock(),
+            Arc::new(TestClock::new(
+                parse_rfc3339(header_of(answer, header::SERVER_TIME).unwrap()).unwrap(),
+            )),
         )
         .unwrap();
         let read = client.public_identity().await.unwrap();

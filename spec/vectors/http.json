@@ -2268,7 +2268,7 @@
         }
       ],
       "headers": {
-        "cache-control": "public, max-age=60",
+        "cache-control": "public, max-age=60, must-revalidate",
         "switch-server-time": "2026-01-01T00:05:00.700Z",
         "switch-service-signature": "s_tx2YG4m_WKq8ygGcQfWgf46959Dq2ZXUOntSiY3WS0WyPoS_eP_kvQmA0-_VB5AzrrxoWyGWqihZliM3GUAA"
       },
@@ -2359,7 +2359,7 @@
         }
       ],
       "headers": {
-        "cache-control": "public, max-age=60",
+        "cache-control": "public, max-age=60, must-revalidate",
         "switch-server-time": "2026-04-11T00:02:00.000Z",
         "switch-service-signature": "aRqq6886EB1sPU2_734Lzp_cIoZOVvFORNOmwvXIEzAL656BmEXLLgg1RyOvjXoYXwz8mEqS1h4XAFCYpWnwCw"
       },

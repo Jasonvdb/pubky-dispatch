@@ -3188,9 +3188,9 @@ impl App {
         }
         let held = identity::held_copy(&reader, sender).await?;
         let now = self.now();
-        if let Some((doc, fetched)) = &held
+        if let Some((doc, reads)) = &held
             && !force
-            && now.saturating_sub(*fetched) < DOC_CACHE_MS
+            && reads.is_fresh(now)
         {
             return Ok(Some((doc.clone(), false)));
         }
@@ -3198,24 +3198,20 @@ impl App {
             Ok(Some(doc)) => doc,
             Ok(None) | Err(_) => return Ok(None),
         };
-        let mut tx = self.tx()?;
-        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now, now).await?;
-        let (doc, read_ms) = match taken {
-            Err(equivocation) => {
-                self.events.push(AppEvent::PeerEquivocation {
-                    identity: *sender,
-                    version: equivocation.version,
-                });
-                self.commit(tx).await?;
-                return Ok(None);
-            }
-            Ok(taken) => taken,
+        let Some((doc, read_ms)) = self
+            .observe_peer_copy(
+                sender,
+                fetched,
+                super::directory::CopySource::Homeserver(now),
+            )
+            .await?
+        else {
+            return Ok(None);
         };
-        self.commit(tx).await?;
-        // A read that served an older copy doesn't confirm the one held: past its 10
-        // minutes when the read ends, it verifies no sender until a read gives it again, or
-        // a newer one.
-        if self.now().saturating_sub(read_ms) >= DOC_CACHE_MS {
+        if !read_ms
+            .and_then(|at| self.now().checked_sub(at))
+            .is_some_and(|age| age < DOC_CACHE_MS)
+        {
             return Ok(None);
         }
         Ok(Some((doc, true)))
@@ -4088,9 +4084,10 @@ impl App {
         {
             return Err(self.raise(alarm).await);
         }
-        let now = self.now();
         let reader = self.reader();
-        let taken = identity::take_copy(&reader, &mut read.tx, &doc, Some(&held), now).await?;
+        let taken =
+            identity::take_copy(&reader, &mut read.tx, &doc, Some(&held), Default::default())
+                .await?;
         let doc = match taken {
             Err(equivocation) => {
                 return Err(self

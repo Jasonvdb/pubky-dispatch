@@ -905,6 +905,27 @@ async fn test_own_record_restore_from_an_older_backup_never_rolls_the_copy_back(
     assert_eq!(w.published(id), Some(bytes_of(&newer)));
 }
 
+#[tokio::test]
+async fn test_own_record_later_publication_is_checked_for_the_accepted_record() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let accepted = app.record().clone();
+    w.clock.advance_ms(1_000);
+    let keys = app_keys("wallet");
+    let renewed = cert_for(&w.alice, &keys, w.clock.now_ms(), &["sample-a"]);
+    let body = AppRecordBody::new(&renewed, w.protocol.accepts(&renewed), w.clock.now_ms());
+    let later = AppRecord::sign(&keys, body).unwrap();
+    w.homeserver.put(
+        w.alice.public(),
+        &app_record_path(&app.app_id()),
+        bytes_of(later.signed()),
+    );
+    assert_eq!(app.publish_record().await.unwrap(), Publication::Superseded);
+    assert_eq!(app.update_accepts().await.unwrap(), Publication::Superseded);
+    assert_eq!(app.record(), &accepted);
+    assert_eq!(w.published(app.app_id()), Some(bytes_of(later.signed())));
+}
+
 /// A key of the app's own that no device of it made is registered: a compromise.
 fn register_foreign_key(w: &World, app: &App) {
     use pubky_switch_core::keys::ReceiveKey;

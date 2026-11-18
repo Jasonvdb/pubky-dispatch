@@ -12,7 +12,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Additions still to come**
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events). Public reads used to establish freshness will gain an age check on the signed answer.
+- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events).
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
@@ -41,9 +41,7 @@ The client's public API for protocols and hosts is in place: record answers that
 - [data] **One stalled protocol can cost another messages.** A shared deny-list change or missing list baseline can stop the whole app's feed until every protocol catches up. Monitor stalled callbacks and listings because other protocols can miss entries if the app falls behind retention or fills its inbox.
 - [data] **Senders share the limit on messages waiting locally.** At the total limit, traffic from two admitted senders can cause another sender's waiting entries to be discarded. Consume the durable drop notices and request the missing messages again where the protocol permits it.
 - [data] **Some discarded work cannot be identified after restart.** A stored message outside the bounded waiting pool can fail a check on retry and disappear with only an in-memory event, while an in-place restore can reduce some unreadable pending duties to a count. An empty queue cannot establish that every obligation completed.
-- [keys] **An old public directory answer can still authorize action.** A previously valid answer can count as a current peer lookup or establish an obsolete service key on a client without a pin. Require fresh independent evidence before using a public lookup to change trust or authorize an irreversible action.
 - [wrong result] **A recovery notice does not reliably suspend saved writes.** The client can retry a saved batch after `recovery_required`, and a signed `not_hosted` response can surface only as a call error while the identity document still names that service. Pause submissions and confirm the current service and generation before resuming.
-- [wrong result] **A restore can be declared clean using confirmation of a different identity version.** The cursor check uses the time of confirmation even if the app has since taken a newer identity document. Confirm that exact document before resuming automatic actions.
 - [wrong result] **A newly held peer can still gain inbox admission.** If a batch adding its conversation was already sent and the answer was lost, the client can retry that batch after the host places the hold. Treat admission as unresolved until the earlier write is reconciled.
 - [availability] **Two successive provider losses can leave a record readable but unwritable.** The client can retain the original proven version while the latest service reconstructs a lower version for the same write. Retrying the same conditional update keeps failing, and treating the record as absent risks repeating its effect.
 - [availability] **An incorrect service clock can make an app's records unusable.** A far-future signed time can become the minimum timestamp for later app records, including after the device clock moves backward. Other apps can reject every such record as too far in the future even after the service clock is corrected.
@@ -72,7 +70,6 @@ The client's public API for protocols and hosts is in place: record answers that
 
 - [keys] **Changing a service key does not retire its authority for every account.** The specification leaves the signer notification and authenticated link between successive keys undefined, so clients can continue trusting a compromised old key while their identity documents name it. Replacing the operator's key alone is insufficient to secure those accounts.
 - [specification] **A failover during a running service can briefly expose an older account time.** A fresh service run uses the separate mark's time floor. If the database switches underneath a running process, a restored stamp can still belong to that same run until it detects the lost instance lock. Stop the service before restoring or switching databases and restart it afterwards.
-- [specification] **`ProviderStatus::Current` can be reported for a frozen account.** The wire rules require a signed request to establish the absence of a freeze, but `check_for_move` can return `Current` after a public read that shows none. Use a response to a signed account request before telling the user that the account can accept writes.
 - [specification] **Enrollment reports only some effective service limits.** Clients receive limits such as batch size and storage quota, but must assume defaults for others, including contact and conversation counts. Handle limit refusals even when a request fits the published default.
 
 ## Not yet covered by tests or measurements

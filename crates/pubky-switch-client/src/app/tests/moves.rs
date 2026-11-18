@@ -444,6 +444,20 @@ async fn test_move_followed_from_a_410_answer() {
 }
 
 #[tokio::test]
+async fn test_move_check_uses_the_signed_feed_when_public_time_is_stale() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.switch.lock().clock = Arc::new(crate::clock::TestClock::new(w.clock.now_ms() + 20 * 60_000));
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Current);
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(app.check_for_move().await.is_err());
+}
+
+#[tokio::test]
 async fn test_move_found_through_the_public_read() {
     let w = World::new();
     let router = Router::of(&w);
@@ -2589,6 +2603,25 @@ async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
     w.switch.lock().not_hosted_unpinned = false;
     let _ = app.check_for_move().await;
     assert_eq!(app.state.erasing, None);
+}
+
+#[tokio::test]
+async fn test_erasure_wait_survives_an_unanswered_signed_read() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    w.switch.lock().not_hosted_unpinned = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    let waiting = app.state.erasing;
+    assert!(waiting.is_some());
+    w.switch.lock().not_hosted_unpinned = false;
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(app.check_for_move().await.is_err());
+    assert_eq!(app.state.erasing, waiting);
 }
 
 #[tokio::test]

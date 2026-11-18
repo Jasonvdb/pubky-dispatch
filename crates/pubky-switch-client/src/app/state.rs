@@ -529,8 +529,26 @@ pub(crate) struct ParkedEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedDoc {
     pub(crate) doc: SignedDoc,
-    /// When it was read from its source (app clock).
-    pub(crate) fetched_ms: u64,
+    /// The qualifying reads that supplied this exact version (Switch spec 4.3).
+    pub(crate) reads: SourceReads,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceReads {
+    pub(crate) homeserver_ms: Option<u64>,
+    pub(crate) switch_ms: Option<u64>,
+}
+
+impl SourceReads {
+    pub(crate) fn latest(self) -> Option<u64> {
+        self.homeserver_ms.max(self.switch_ms)
+    }
+
+    pub(crate) fn is_fresh(self, now: u64) -> bool {
+        self.latest()
+            .and_then(|at| now.checked_sub(at))
+            .is_some_and(|age| age < super::DOC_CACHE_MS)
+    }
 }
 
 /// `ident/<identity>/floor`: the highest version and generation seen (Switch spec 4.3).

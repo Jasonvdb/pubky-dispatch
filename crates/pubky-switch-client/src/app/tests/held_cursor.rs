@@ -136,6 +136,27 @@ async fn test_held_cursor_restore_after_progress_since_the_backup_is_ahead() {
 }
 
 #[tokio::test]
+async fn test_held_cursor_restore_waits_for_the_current_document() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let mut app = restored(&w, &backup).await;
+    let newer = w.next_doc(|_| {});
+    app.take_own_copy(newer.clone()).await.unwrap();
+    w.homeserver
+        .remove(w.alice.public(), pubky_switch_core::records::IDENTITY_PATH);
+    assert!(app.identity_confirmed_at().is_none());
+    app.receive(None).await.unwrap();
+    assert_eq!(app.restore_held_cursor(), None);
+    w.homeserver.publish(&newer).unwrap();
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.restore_held_cursor(), Some(HeldCursor::Clean));
+}
+
+#[tokio::test]
 async fn test_held_cursor_restore_moving_its_cursor_before_a_page_is_unknown() {
     // Switch spec 12.4 condition 1: the page is read before any cursor move of the app.
     let w = World::new();

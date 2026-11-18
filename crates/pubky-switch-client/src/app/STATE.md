@@ -176,6 +176,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   live store reserves first by moving `parkid` on, on a halted app too (its commit also
   keeps a service time not yet committed), so no later
   entry of the live store takes it.
+  When the protocol bounds first handoff, the queued batch also keeps that exclusive
+  deadline. A body-bound service answer can establish timely handoff for the hash of
+  those exact bytes. The pre-send stamp alone leaves that question open.
 
 - A kept message and its signed plaintext queued again use the common message fields even if the protocol narrows its body rules. The protocol still decides whether to send it.
 

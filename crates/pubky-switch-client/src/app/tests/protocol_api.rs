@@ -2431,6 +2431,14 @@ async fn test_queue_stored_past_the_replay_window_is_refused_and_queues_nothing(
     );
 }
 
+/// How many [`AppEvent::DeliveryUnknown`] events for `msg_id` are among `events`.
+fn unknown(events: &[AppEvent], msg_id: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::DeliveryUnknown { msg_id: m, .. } if m == msg_id))
+        .count()
+}
+
 /// The `MessageUndelivered` events for `msg_id` among `events`, with their `resend`.
 fn undelivered(events: &[AppEvent], msg_id: &str) -> Vec<bool> {
     events
@@ -2461,7 +2469,7 @@ async fn test_queue_stored_given_up_once_is_refused_after() {
     p.clock.advance_ms(5 * DAY_MS);
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);
-    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     for _ in 0..2 {
         let error = wallet.queue_stored(signed.plaintext()).await.unwrap_err();
         assert!(
@@ -2476,8 +2484,8 @@ async fn test_queue_stored_given_up_once_is_refused_after() {
     }
     assert!(wallet.take_events().is_empty());
     assert_eq!(
-        undelivered(&wallet.unacknowledged_events().await.unwrap(), &msg_id),
-        vec![false],
+        unknown(&wallet.unacknowledged_events().await.unwrap(), &msg_id),
+        1,
         "one duty event"
     );
     assert_eq!(p.bob.switch().entries_from(&alice), 0);
@@ -2675,7 +2683,7 @@ async fn test_queue_stored_after_a_too_large_give_up_is_refused() {
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
-    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     let error = wallet.queue_stored(signed.plaintext()).await.unwrap_err();
     assert!(
         matches!(
@@ -2766,7 +2774,7 @@ async fn test_queue_stored_given_up_then_its_kept_batch_settles_queues_nothing()
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
-    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     p.alice.switch().lock().faults.clear();
     let mut shop = shop;
     shop.invite(&alice).await.unwrap();
@@ -3984,11 +3992,72 @@ async fn test_backup_outbox_past_the_window_gives_the_delivery_up() {
     restored.take_events();
     let report = restored.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);
-    assert!(undelivered_once(&restored.take_events(), &msg_id, false));
+    let events = restored.take_events();
+    assert_eq!(unknown(&events, &msg_id), 1);
+    assert!(undelivered(&events, &msg_id).is_empty());
     assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
     restored.flush_outbox().await.unwrap();
     assert!(restored.take_events().is_empty(), "told once");
     assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+}
+
+/// A try whose answer was lost may have been accepted: withdrawing the message then tells
+/// "unknown", and here the recipient's switch does hold it.
+#[tokio::test]
+async fn test_withdraw_message_after_a_lost_answer_is_unknown() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    p.bob.switch().fail_next(Fault::LoseAnswer {
+        path: "inbox".into(),
+    });
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    wallet.take_events();
+    assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+    let events = wallet.take_events();
+    assert_eq!(unknown(&events, &msg_id), 1);
+    assert!(undelivered(&events, &msg_id).is_empty());
+}
+
+/// A restored app knows of no acceptance of a message the backup carried, and the device
+/// the backup came from may have delivered it: giving it up tells "unknown", even for one
+/// no try of this store ever sent. A message no request can have carried, withdrawn before
+/// any try, is still told undelivered.
+#[tokio::test]
+async fn test_backup_outbox_give_up_without_a_known_acceptance_is_unknown() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let _shop = p.join(&p.bob, "shop", &protocol).await;
+    let mut ids = Vec::new();
+    for text in ["carried", "gone"] {
+        let signed = wallet.sign_message(Pair::note(&p.bob, text)).unwrap();
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        ids.push(signed.msg_id().to_owned());
+    }
+    let [carried, withdrawn]: [String; 2] = ids.try_into().unwrap();
+    wallet.take_events();
+    assert!(wallet.withdraw_message("sample", &withdrawn).await.unwrap());
+    let events = wallet.take_events();
+    assert_eq!(undelivered(&events, &withdrawn), vec![false]);
+    assert_eq!(unknown(&events, &withdrawn), 0);
+    // A backup that carries the other message, never tried.
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    restored.take_events();
+    // Past the replay deadline, the carried message is given up untried.
+    p.clock.advance_ms(SENT_RETENTION_MS + MINUTE);
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![carried.clone()]);
+    let events = restored.take_events();
+    assert_eq!(unknown(&events, &carried), 1);
+    assert!(undelivered(&events, &carried).is_empty());
 }
 
 /// The deadline is checked at every try, not at the restore: a message put back 29 days
@@ -4189,7 +4258,8 @@ async fn test_backup_outbox_carries_failed_messages() {
 }
 
 /// An outbox over the byte budget is carried oldest first; the rest are told to the
-/// protocol as undelivered, and the restore fits one commit.
+/// protocol as unknown, since the device the backup came from may deliver them, and the
+/// restore fits one commit.
 #[tokio::test]
 async fn test_backup_outbox_over_its_budget_carries_the_oldest() {
     let p = Pair::new();
@@ -4210,17 +4280,14 @@ async fn test_backup_outbox_over_its_budget_carries_the_oldest() {
     assert!(restored.delivery(first).await.unwrap().is_some());
     assert_eq!(restored.delivery(last).await.unwrap(), None);
     let events = restored.take_events();
-    assert!(
-        undelivered_once(&events, last, false),
-        "{} events",
-        events.len()
-    );
+    assert_eq!(unknown(&events, last), 1, "{} events", events.len());
     let mut carried = 0;
     for msg_id in &queued {
         if restored.delivery(msg_id).await.unwrap().is_some() {
             carried += 1;
         } else {
-            assert!(undelivered_once(&events, msg_id, false));
+            assert_eq!(unknown(&events, msg_id), 1);
+            assert!(undelivered(&events, msg_id).is_empty());
         }
     }
     assert!(carried > 0 && carried < queued.len(), "{carried}");
@@ -4525,7 +4592,7 @@ async fn test_hold_queued_copy_past_its_deadline_is_given_up_once() {
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);
-    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     wallet.release_queued(&bob).await.unwrap();
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 0);
@@ -5037,7 +5104,7 @@ async fn test_hold_message_past_its_deadline_is_given_up_and_the_hold_ends() {
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);
-    assert_eq!(undelivered(&wallet.take_events(), &msg_id), vec![false]);
+    assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     assert!(
         wallet
             .reader()

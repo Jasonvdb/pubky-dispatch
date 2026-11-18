@@ -1350,14 +1350,17 @@ impl App {
     ///
     /// The backup takes outbox items oldest first within [`MAX_CARRIED_OUTBOX_BYTES`]
     /// (8 MiB), including messages refused for good. Restore reports each omitted message
-    /// ID through [`AppEvent::MessageUndelivered`]. Each carried item keeps its signed
+    /// ID, as [`AppEvent::DeliveryUnknown`] since the source device may still deliver it,
+    /// or [`AppEvent::MessageUndelivered`] with `resend: true` for a re-send of a message it
+    /// had accepted. Each carried item keeps its signed
     /// plaintext and any sealed envelope. If the original device delivered it after the
     /// backup, the restored app may send the same `msg_id` and plaintext again. The recipient's
     /// switch answers a retry of the same envelope with its first answer while it holds the
     /// entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a second copy by its
     /// processed pair, kept at least 30 days from the first acceptance plus the clock
     /// tolerance (Switch spec 11). Restore sets a replay deadline on each owed delivery.
-    /// A flush that reaches it past that deadline gives it up ([`AppEvent::MessageUndelivered`]).
+    /// A flush that reaches it past that deadline gives it up: the source device may have
+    /// delivered it, so a first delivery is told [`AppEvent::DeliveryUnknown`].
     ///
     /// A backup is only ever of committed state. After a failed commit the app's memory may
     /// be ahead of its store, such as a cursor past an entry whose processed pair and local
@@ -1463,7 +1466,7 @@ impl App {
     /// ([`send::OutboxItem::replay_until`]), from the backup's verified service time, or its
     /// device time without one, less the clock tolerance. The deadline is checked at every
     /// try, not here. The messages the backup left out past its budget are told to the
-    /// protocol as undelivered, in the same commit.
+    /// protocol, in the same commit.
     fn reinstall_outbox(&mut self, backup: &AppBackup, tx: &mut Tx) -> Result<(), AppError> {
         let baseline = backup
             .taken_service_ms
@@ -1503,14 +1506,19 @@ impl App {
             }
             send::put_message_hold(tx, msg_id)?;
         }
+        // The device the backup came from still holds each message it left out, and may
+        // deliver it: only one it had accepted is known delivered (Switch spec 11).
         for (msg_id, resend) in &backup.outbox_left_out {
-            self.keep_duty(
-                tx,
+            let msg_id = msg_id.clone();
+            let duty = if *resend {
                 events::Duty::MessageUndelivered {
-                    msg_id: msg_id.clone(),
-                    resend: *resend,
-                },
-            )?;
+                    msg_id,
+                    resend: true,
+                }
+            } else {
+                events::Duty::DeliveryUnknown { msg_id }
+            };
+            self.keep_duty(tx, duty)?;
         }
         Ok(())
     }
@@ -1743,7 +1751,7 @@ impl App {
     ///
     /// The backup's outbox goes back in, to be delivered by the next flush with the same
     /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still
-    /// owed is given up instead, with [`AppEvent::MessageUndelivered`] ([`App::backup`]).
+    /// owed is given up instead, with [`AppEvent::DeliveryUnknown`] ([`App::backup`]).
     ///
     /// The protocols' layers ([`App::backup_layered`]) are installed with the app's own
     /// state, and with the entries and processed pairs of the same moment that the backup
@@ -3070,7 +3078,7 @@ impl App {
         let next = n.checked_add(1).ok_or_else(corrupt)?;
         // A message's hold ends in the commit that tells it undelivered: its delivery is no
         // longer owed (`App::hold_message`).
-        if let events::Duty::MessageUndelivered { msg_id, .. } = &duty {
+        if let Some(msg_id) = duty.given_up() {
             send::end_message_hold(tx, msg_id)?;
             // Retaining an accepted item's record job never queues its ended delivery
             // again through the sent-message cache (Switch spec 11).

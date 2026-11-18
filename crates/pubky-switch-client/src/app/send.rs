@@ -42,7 +42,8 @@
 //! again (Switch spec 7, Switch wire 3.8), but only for [`UNDELIVERABLE_MS`] from the
 //! first such answer: once a try is answered so again past that time, at
 //! [`UNDELIVERABLE_TRIES`] tries spread over it, the message is deleted, plaintext and all,
-//! and [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). Whatever the
+//! and the protocol is told (Switch spec 11): [`AppEvent::MessageUndelivered`] when no try
+//! of it can have reached the recipient's switch, else [`AppEvent::DeliveryUnknown`]. Whatever the
 //! tries, it is deleted so at [`UNDELIVERABLE_MAX_MS`] from that first answer, at the next
 //! flush, without another try: plaintext at rest has a firm bound, and a forward jump of
 //! the clock shorter than that still deletes nothing. A failed message
@@ -634,9 +635,11 @@ pub struct OutboxReport {
     pub queued: Vec<String>,
     /// The messages refused for good.
     pub failed: Vec<String>,
-    /// The messages given up after [`UNDELIVERABLE_MS`] of `403 not_admitted` or `403
-    /// not_current` (Switch spec 11), or because a try's writes were too large for the
-    /// store ([`StoreError::TooLarge`]).
+    /// The messages whose delivery was given up: after [`UNDELIVERABLE_MS`] of `403
+    /// not_admitted` or `403 not_current` (Switch spec 11), past a replay deadline, or
+    /// because a try's writes were too large for the store ([`StoreError::TooLarge`]). Not
+    /// all were left undelivered: the duty event of each, [`AppEvent::MessageUndelivered`]
+    /// or [`AppEvent::DeliveryUnknown`], says whether it may have been delivered.
     pub undelivered: Vec<String>,
     /// The flush stopped on its budget, [`OUTBOX_TRIES_PER_FLUSH`] messages or the call's
     /// time ([`super::AppConfig::call_budget_ms`]), with messages of its pass, or owed
@@ -750,6 +753,11 @@ pub(crate) struct OutboxItem {
     /// may have applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record_batch: Option<String>,
+    /// An envelope of it was committed to be sent, so a request carrying it may have
+    /// reached the recipient's switch, its answer lost. Never cleared: a give-up of it then
+    /// can't say the message was not delivered ([`OutboxItem::give_up_duty`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    envelope_sent: bool,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -838,16 +846,37 @@ impl OutboxItem {
     /// all; one accepted before stays while its record job is owed, its sealed envelope
     /// dropped. `None` for nothing left.
     pub(crate) fn give_up_delivery(mut self) -> (Option<Self>, Duty) {
-        let duty = Duty::MessageUndelivered {
-            msg_id: self.msg_id.clone(),
-            resend: self.accepted_at_ms.is_some() || self.resend_queued,
-        };
+        let duty = self.give_up_duty(self.accepted_at_ms.is_some() || self.resend_queued);
         self.resend = false;
         self.resend_queued = false;
         self.sealed = None;
         self.clear_undeliverable();
         let kept = (self.accepted_at_ms.is_some() && !self.complete()).then_some(self);
         (kept, duty)
+    }
+
+    /// The duty event that tells the protocol this delivery is given up (Switch spec 11).
+    /// With `accepted_before`, this app had the message accepted, and only a re-send ends.
+    /// Otherwise the message is told undelivered only when no request carrying it can have
+    /// reached the recipient's switch: this app committed no envelope of it to be sent, and
+    /// no other copy of its store held it, which a replay deadline marks (one a restore put
+    /// back, a [`App::queue_stored`] copy, or a re-send of either). Else its delivery is
+    /// unknown.
+    pub(crate) fn give_up_duty(&self, accepted_before: bool) -> Duty {
+        let msg_id = self.msg_id.clone();
+        if accepted_before {
+            Duty::MessageUndelivered {
+                msg_id,
+                resend: true,
+            }
+        } else if self.envelope_sent || self.replay_until_ms.is_some() {
+            Duty::DeliveryUnknown { msg_id }
+        } else {
+            Duty::MessageUndelivered {
+                msg_id,
+                resend: false,
+            }
+        }
     }
 
     /// The replay deadline a restore gives the item (Switch spec 11): the earliest of the
@@ -1276,7 +1305,7 @@ impl App {
     ///   the calls the host makes itself: [`App::ask_to_connect`], and the directory reads
     ///   of [`App::recipients_for`].
     /// - **The replay deadline keeps running** ([`App::queue_stored`]): a message still held
-    ///   past it is given up and the protocol told ([`AppEvent::MessageUndelivered`]).
+    ///   past it is given up and the protocol told ([`AppEvent::DeliveryUnknown`]).
     /// - **Where it holds:** in this app's store. Another app or device of the same identity
     ///   has an outbox of its own, and keeps delivering until its host holds there too.
     /// - **A backup carries it**, so an app restored from that backup holds it too. A restore
@@ -1357,7 +1386,7 @@ impl App {
     /// - **What isn't held:** its record job, once the counterparty's inbox accepted it, and
     ///   the app's other messages to the same counterparty.
     /// - **The replay deadline keeps running** ([`App::queue_stored`]): a message still held
-    ///   past it is given up and the protocol told ([`AppEvent::MessageUndelivered`]).
+    ///   past it is given up and the protocol told ([`AppEvent::DeliveryUnknown`]).
     /// - **It lasts as long as the delivery:** it ends with the release, and in the commit
     ///   that ends the delivery, whatever ends it: the message delivered, refused for good,
     ///   given up or withdrawn, the kept batch that would queue it dropped (unless the
@@ -1537,7 +1566,8 @@ impl App {
     /// Give up every message to `pubky` that isn't delivered yet, held or not: each is
     /// deleted from the outbox, plaintext and all, and the protocol told once
     /// ([`AppEvent::MessageUndelivered`], a duty event, `resend: true` for a re-send of one
-    /// accepted before, which keeps its record job). So is each message to `pubky` that a
+    /// accepted before, which keeps its record job; [`AppEvent::DeliveryUnknown`] for one
+    /// that may have been delivered, such as one tried before). So is each message to `pubky` that a
     /// batch kept from an earlier call would put in the outbox once it settles: the batch's
     /// other operations still go, and the message isn't queued. A message given up so is
     /// never queued again by this store: [`App::queue_stored`] refuses it, and a re-send
@@ -1565,7 +1595,8 @@ impl App {
     /// exceptions (a re-send whose record job is still owed keeps its outbox item for that
     /// job; [`App::queue_signed`] checks no give-up): its delivery ends, in the outbox or in
     /// what a batch kept from an earlier call puts there once it settles, and the protocol
-    /// is told once ([`AppEvent::MessageUndelivered`]); its hold, if any, ends. Returns
+    /// is told once ([`AppEvent::MessageUndelivered`] or [`AppEvent::DeliveryUnknown`]); its
+    /// hold, if any, ends. Returns
     /// whether it gave it up: `false`, changing nothing, when the app owes no delivery of
     /// `msg_id`. Local only: it sends nothing.
     ///
@@ -1624,7 +1655,8 @@ impl App {
             self.commit(tx).await?;
             withdrawn.push(msg_id);
         }
-        // The messages kept batches would queue once they settle.
+        // The messages kept batches would queue once they settle: never in an outbox, so
+        // never sent.
         for (_, pending) in self.kept_batches().await? {
             for item in pending.queued.iter().filter(|item| matches(item)) {
                 let msg_id = item.msg_id.clone();
@@ -1657,7 +1689,8 @@ impl App {
     ///
     /// It is for a message just signed. It checks neither a give-up nor the message's age,
     /// so a host doesn't queue a kept [`SignedMessage`] again once its delivery was given up
-    /// ([`AppEvent::MessageUndelivered`]), or 30 days after it was signed: past that a
+    /// ([`AppEvent::MessageUndelivered`], [`AppEvent::DeliveryUnknown`]), or 30 days after
+    /// it was signed: past that a
     /// recipient that processed it may have forgotten the pair, and would process it as new
     /// (Switch spec 11). A message signed before is queued again with [`App::queue_stored`],
     /// which refuses those.
@@ -1713,14 +1746,14 @@ impl App {
     ///   service time the app verified. A recipient that processed the message drops a copy
     ///   as a duplicate only while it keeps the pair, so a copy, and any re-send of it, goes
     ///   only until then; one queued in time and still undelivered then is given up, and
-    ///   [`AppEvent::MessageUndelivered`] tells the protocol, once.
+    ///   [`AppEvent::DeliveryUnknown`] tells the protocol, once: an earlier copy may have
+    ///   been delivered.
     /// - [`WontDeliver::GivenUp`]: the app gave its delivery up already, and told the
     ///   protocol then.
     /// - [`WontDeliver::TooLarge`]: its outbox record is over the store's sizes.
     ///
-    /// So for one message, within one store, the call never leads to a second
-    /// [`AppEvent::MessageUndelivered`], nor to one with `resend: false` once this app had a
-    /// copy of it accepted. A backup carries neither the sent messages nor the give-up
+    /// So for one message, within one store, the call never leads to a second give-up event,
+    /// nor to [`AppEvent::MessageUndelivered`] with `resend: false`. A backup carries neither the sent messages nor the give-up
     /// marks, so a restored app may queue again a message given up or accepted before the
     /// backup: within its window it goes again. A recipient that processed a copy accepted
     /// before the backup drops it as a duplicate; a message given up before the backup goes
@@ -1824,6 +1857,7 @@ impl App {
             resend_queued: false,
             replay_until_ms: Some(deadline),
             record_batch: None,
+            envelope_sent: false,
         })
     }
 
@@ -1876,6 +1910,7 @@ impl App {
             resend_queued: false,
             replay_until_ms: None,
             record_batch: None,
+            envelope_sent: false,
         })
     }
 
@@ -2003,6 +2038,7 @@ impl App {
             .flatten()
             .min(),
             record_batch: None,
+            envelope_sent: false,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -2348,15 +2384,16 @@ impl App {
     }
 
     /// Give up the delivery of a message whose try is too large for the store, in one
-    /// commit with [`AppEvent::MessageUndelivered`](super::AppEvent::MessageUndelivered): a
+    /// commit with its duty event ([`OutboxItem::give_up_duty`]): a
     /// message never accepted is deleted, plaintext and all; one accepted before keeps its
     /// record while its record job is owed, and only the re-send is given up.
     async fn give_up_too_large(&mut self, msg_id: &str) -> Result<(), AppError> {
         let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(());
         };
-        let resend =
-            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(msg_id)).await?;
+        let duty = item.give_up_duty(
+            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(msg_id)).await?,
+        );
         item.resend = false;
         item.sealed = None;
         item.clear_undeliverable();
@@ -2372,14 +2409,7 @@ impl App {
             }
             self.end_delivery(msg_id, &mut tx).await?;
             let to = self.owners_of_kind(&item.kind);
-            self.keep_duty_for(
-                &mut tx,
-                to,
-                Duty::MessageUndelivered {
-                    msg_id: msg_id.to_owned(),
-                    resend,
-                },
-            )?;
+            self.keep_duty_for(&mut tx, to, duty.clone())?;
             match self.commit(tx).await {
                 // A record that still doesn't fit goes too, its record job with it.
                 Err(AppError::Store(StoreError::TooLarge { .. })) if !gone => {
@@ -2563,8 +2593,9 @@ impl App {
             return Ok(false);
         }
         // A re-send: of an item accepted before, or queued again from `sent/`.
-        let resend =
-            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(&item.msg_id)).await?;
+        let duty = item.give_up_duty(
+            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(&item.msg_id)).await?,
+        );
         item.resend = false;
         item.clear_undeliverable();
         let gone = item.accepted_at_ms.is_none() || item.complete();
@@ -2578,14 +2609,7 @@ impl App {
         // A duty event for the protocol of the message's kind, kept in the commit that
         // gives the delivery up.
         let to = self.owners_of_kind(&item.kind);
-        self.keep_duty_for(
-            &mut tx,
-            to,
-            Duty::MessageUndelivered {
-                msg_id: item.msg_id.clone(),
-                resend,
-            },
-        )?;
+        self.keep_duty_for(&mut tx, to, duty)?;
         self.commit(tx).await?;
         Ok(true)
     }
@@ -3143,6 +3167,8 @@ impl App {
             origin: doc.inbox().url.clone(),
             generation: doc.generation(),
         });
+        // Committed with the envelope, before it is first sent.
+        item.envelope_sent = true;
         self.save_item(item).await
     }
 
@@ -3381,6 +3407,7 @@ mod tests {
             resend_queued: false,
             replay_until_ms: None,
             record_batch: None,
+            envelope_sent: true,
         }
     }
 
@@ -3402,12 +3429,54 @@ mod tests {
         let mut never = accepted_item();
         never.accepted_at_ms = None;
         never.resend = false;
-        let (kept, duty) = never.give_up_delivery();
+        let (kept, _) = never.give_up_delivery();
         assert!(kept.is_none());
-        assert!(matches!(
-            duty,
-            Duty::MessageUndelivered { resend: false, .. }
-        ));
+    }
+
+    #[test]
+    fn test_outbox_give_up_is_unknown_unless_no_request_can_have_carried_it() {
+        // A message never accepted here, never sealed, and held by no other store.
+        let unsent = || {
+            let mut item = accepted_item();
+            item.accepted_at_ms = None;
+            item.resend = false;
+            item.sealed = None;
+            item.envelope_sent = false;
+            item
+        };
+        let restored = || {
+            let mut item = unsent();
+            item.replay_until(5_000);
+            item
+        };
+        let mut sent = unsent();
+        sent.envelope_sent = true;
+        let mut stored_copy = unsent();
+        stored_copy.origin = DeliveryOrigin::Reconstructed;
+        stored_copy.replay_until_ms = Some(9_000);
+        let mut resend_of_restored = restored();
+        resend_of_restored.resend_queued = true;
+        // `Some(resend)` for `MessageUndelivered`, `None` for `DeliveryUnknown`.
+        let cases = [
+            ("every try refused before sending", unsent(), Some(false)),
+            ("a 403 or withdrawal after a sent try", sent, None),
+            ("put back by a restore", restored(), None),
+            ("a queue_stored copy", stored_copy, None),
+            (
+                "a re-send of a restored copy",
+                resend_of_restored,
+                Some(true),
+            ),
+        ];
+        for (case, item, expected) in cases {
+            let (_, duty) = item.give_up_delivery();
+            let told = match duty {
+                Duty::MessageUndelivered { resend, .. } => Some(resend),
+                Duty::DeliveryUnknown { .. } => None,
+                other => panic!("{case}: {other:?}"),
+            };
+            assert_eq!(told, expected, "{case}");
+        }
     }
 
     #[test]

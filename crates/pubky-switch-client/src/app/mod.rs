@@ -4025,8 +4025,11 @@ impl App {
     /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
     /// step 3). A kept batch signed for an earlier generation has its proofs checked with
     /// that generation's key (Switch wire 6.4 step 6).
-    pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
-        self.submit_before(batch, None).await
+    pub(crate) fn submit<'a>(
+        &'a mut self,
+        batch: &'a Batch,
+    ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
+        self.submit_before(batch, None)
     }
 
     async fn submit_before(

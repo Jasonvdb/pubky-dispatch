@@ -925,9 +925,7 @@ impl App {
             }
             if past {
                 if pending.first_send.is_some()
-                    && self
-                        .settle_from_shared_evidence(&id, &pending, &batch)
-                        .await?
+                    && Box::pin(self.settle_from_shared_evidence(&id, &pending, &batch)).await?
                 {
                     continue;
                 }
@@ -963,9 +961,7 @@ impl App {
                                 | crate::error::TransportError::FirstSendUnavailable
                         )
                     )
-                    && self
-                        .settle_from_shared_evidence(&id, &pending, &batch)
-                        .await?
+                    && Box::pin(self.settle_from_shared_evidence(&id, &pending, &batch)).await?
                 {
                     continue;
                 }
@@ -1193,15 +1189,27 @@ impl App {
         }
     }
 
-    async fn submit_pending(
+    fn submit_pending<'a>(
+        &'a mut self,
+        id: &'a [u8; 16],
+        pending: &'a PendingBatch,
+        batch: &'a Batch,
+    ) -> crate::transport::BoxFuture<'a, Result<Submitted, AppError>> {
+        // A provider change can resume this write from inside a read. Keep the
+        // guarded submission and its service-time read off that caller's stack.
+        match &pending.first_send {
+            None => Box::pin(self.submit(batch)),
+            Some(first) => Box::pin(self.submit_guarded(id, pending, batch, first)),
+        }
+    }
+
+    async fn submit_guarded(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
         batch: &Batch,
+        first: &BatchFirstSend,
     ) -> Result<Submitted, AppError> {
-        let Some(first) = &pending.first_send else {
-            return self.submit(batch).await;
-        };
         let hash = pubky_switch_core::enc::hash(batch.body());
         if first.confirmed_body == Some(hash) {
             return self.submit(batch).await;

@@ -1,10 +1,64 @@
 //! The client's clock. The core reads no clock; the client takes every time it signs or
 //! compares from a [`Clock`], so tests can fix it.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 /// A source of the current time in Unix milliseconds.
 pub trait Clock: Send + Sync {
     /// The current wall time in Unix milliseconds.
     fn now_ms(&self) -> u64;
+}
+
+/// The samples of one app and its host. A backwards sample ends every observation
+/// made on the previous run of its wall clock.
+pub(crate) struct AppClock {
+    source: Arc<dyn Clock>,
+    last: Mutex<ClockSample>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClockSample {
+    pub(crate) at_ms: u64,
+    run: Arc<()>,
+}
+
+impl AppClock {
+    pub(crate) fn new(source: Arc<dyn Clock>) -> Self {
+        Self {
+            source,
+            last: Mutex::new(ClockSample {
+                at_ms: 0,
+                run: Arc::new(()),
+            }),
+        }
+    }
+
+    // Read the host clock under the same lock as its predecessor. Concurrent callers
+    // cannot insert an older sample after a later one by acquiring the lock out of order.
+    fn observe(&self) -> MutexGuard<'_, ClockSample> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = self.source.now_ms();
+        if now < last.at_ms {
+            last.run = Arc::new(());
+        }
+        last.at_ms = now;
+        last
+    }
+
+    pub(crate) fn sample(&self) -> ClockSample {
+        self.observe().clone()
+    }
+
+    pub(crate) fn elapsed(&self, start: &ClockSample) -> Option<u64> {
+        let now = self.observe();
+        Arc::ptr_eq(&now.run, &start.run).then(|| now.at_ms - start.at_ms)
+    }
+}
+
+impl Clock for AppClock {
+    fn now_ms(&self) -> u64 {
+        self.observe().at_ms
+    }
 }
 
 /// The system's wall clock.

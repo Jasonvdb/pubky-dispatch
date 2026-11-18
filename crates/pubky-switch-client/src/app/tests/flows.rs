@@ -3556,6 +3556,18 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
         }
     );
     assert_eq!(app.identity_confirmed_at(), Some(START + 5_000));
+    // The host and app share these clock observations. Catching up preserves
+    // the signed version, but a fresh Homeserver read must confirm it again.
+    let host_clock = app.clock();
+    w.clock.set_ms(START + 4_999);
+    assert_eq!(host_clock.now_ms(), START + 4_999);
+    w.clock.set_ms(START + 5_000);
+    assert_eq!(app.identity_confirmed_at(), None);
+    assert_eq!(
+        app.refresh_identity().await.unwrap().confirmed_at(),
+        Some(START + 5_000)
+    );
+    assert_eq!(app.identity_confirmed_at(), Some(START + 5_000));
     // Another body at that version, from the switch: equivocation across sources.
     body.data_epoch += 1;
     let other = IdentityDoc::sign(&w.alice, body).unwrap();

@@ -45,6 +45,16 @@ pub struct HeldApp {
     pub full_completed: Option<u64>,
 }
 
+impl HeldApp {
+    pub(super) fn current_in(&self, doc: &IdentityDoc, app: &[u8; 16]) -> bool {
+        let record_cert = self.record.as_ref().map(AppRecord::cert);
+        [self.renewed.as_ref(), record_cert]
+            .into_iter()
+            .flatten()
+            .any(|cert| doc.current_now(app, &cert.hash()))
+    }
+}
+
 /// A shared record as the account holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeldRecord {
@@ -419,11 +429,7 @@ impl OpsState {
         if self.kept.contains(app) {
             return false;
         }
-        let record_cert = held.record.as_ref().map(AppRecord::cert);
-        [held.renewed.as_ref(), record_cert]
-            .into_iter()
-            .flatten()
-            .any(|cert| doc.current_now(app, &cert.hash()))
+        held.current_in(doc, app)
     }
 
     /// The App IDs reachable (Switch wire 7.4.10): current ([`Self::is_current`]) and with

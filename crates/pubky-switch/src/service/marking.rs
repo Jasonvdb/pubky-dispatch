@@ -9,6 +9,8 @@
 //! are answered in place of whatever later steps would answer. Nothing else in the service
 //! compares a state with its mark.
 
+mod recovery;
+
 use pubky_switch_core::{
     http::{IdentityDelivery, NoticeReason, RecoveryNotice, Uncompared, not_hosted_current},
     records::{AccountActivation, AccountBinding, IdentityBody},
@@ -584,12 +586,32 @@ impl Service {
         created_at_ms: u64,
         starts_generation: bool,
     ) -> MarkMove {
+        self.move_mark_with_source(
+            identity,
+            target,
+            key,
+            created_at_ms,
+            starts_generation,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn move_mark_with_source(
+        &self,
+        identity: &str,
+        target: MarkTarget,
+        key: [u8; 32],
+        created_at_ms: u64,
+        starts_generation: bool,
+        source: Option<std::sync::Arc<crate::marks::coverage::RecoveryUpdate>>,
+    ) -> MarkMove {
         #[cfg(any(test, feature = "test-util"))]
         self.wait_before_mark_move().await;
         for _ in 0..2 {
             match self
                 .marks
-                .advance(identity, target, key, created_at_ms)
+                .advance_with_source(identity, target, key, created_at_ms, source.clone())
                 .await
             {
                 Ok(Advance::Moved(_) | Advance::Unchanged(_) | Advance::Overtaken(_)) => {

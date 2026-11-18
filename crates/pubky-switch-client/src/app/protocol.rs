@@ -65,8 +65,10 @@ pub struct WriteBase {
     /// `{0, 0}` for a create.
     pub expected_version: RecordVersion,
     /// Whether the app holds that version: the write it holds of the record is at
-    /// `expected_version`, or, for a create (`{0, 0}`), it holds none or holds the record
-    /// deleted, as a writer that holds a deleted record creates it again (Switch wire 6.2).
+    /// `expected_version`, a delete's included, or, for a create (`{0, 0}`), it holds none or
+    /// holds the record deleted: a create applies only where the service holds nothing, so
+    /// over a delete the app holds it follows the service forgetting that delete (Switch
+    /// wire 6.2).
     /// `false` when the write builds on a version the app never took, such as one it skipped
     /// by reading the record's current view, or on a write it refused and only follows. The
     /// held version is the one the app holds, authenticated by a proof or a stub or only the

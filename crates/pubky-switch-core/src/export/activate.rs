@@ -1578,8 +1578,9 @@ fn same_state(state: &ClaimState, claim: &Claim) -> std::result::Result<(), Refu
 /// claim's verified entries after that proof wrote another ([`resolved_after`]), or, for an
 /// uploaded attempt of a rebuilt claim, an upload settled it `done`, or the attempt is one a
 /// reopened tombstone kept ([`kept_attempt`]), on a claim that stays SETTLED; a record a proof shows at a version is that
-/// very write, or one whose signed `expected_version` is that version or later, or absent
-/// when that version deletes.
+/// very write, or one whose signed `expected_version` is that version or later, or a create
+/// at a later version, made after the service forgot the record's delete, or absent when
+/// that version deletes.
 fn check_evidence(
     cx: &Activation<'_>,
     claims: &[ImportedClaim],
@@ -1674,9 +1675,14 @@ fn check_evidence(
                     let by_item =
                         r.op.item_hash()
                             .is_ok_and(|h| h == uploaded.proof.envelope().item_hash);
+                    // A record created again at a key whose delete the old service forgot
+                    // builds on `{0, 0}`, which holds only where the service held nothing
+                    // (Switch spec 10.3): its version, which the verified chain binds,
+                    // shows it after what an app uploaded.
                     let by_expected = matches!(
                         &r.op.body().kind,
                         OpKind::RecordPut(put) if put.expected_version >= shown
+                            || (put.expected_version.is_none() && r.state.version > shown)
                     );
                     by_item || by_expected
                 }

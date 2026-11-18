@@ -487,7 +487,9 @@ impl Signer {
                     } else {
                         key_recovery::Held::InPlace
                     };
-                    Box::pin(self.key_recover(&origin, &enrollment, digest, &dropped, held)).await?
+                    let marks = key_recovery::marks_of(&self.state)?;
+                    Box::pin(self.key_recover(&origin, &enrollment, digest, &dropped, held, &marks))
+                        .await?
                 }
                 Flow::Erase {
                     unpublished,

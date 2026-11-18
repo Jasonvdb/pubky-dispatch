@@ -1747,6 +1747,102 @@ async fn test_key_recovery_over_unusable_records_keeps_their_floors_and_marks() 
 }
 
 #[tokio::test]
+async fn test_key_recovery_over_unusable_records_keeps_the_signed_distrust_time() {
+    // A replacement service started from the last backup before the revocation. The old
+    // install's signed copy still holds the time the user picked, even after local damage.
+    let old = World::new();
+    let (mut first, store) = old.enrolled().await;
+    let (app, _) = joined(&old, &mut first, 3).await;
+    let id = app.keys.app_id_bytes();
+    let backup = old.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+    let picked = START_MS - 3_600_000;
+    first.revoke(id, Some(picked), confirmed()).await.unwrap();
+    drop(first);
+    damage_flow(&old, &store);
+
+    let world = World::new();
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup.clone());
+    let replacement = Arc::new(MemoryStore::new());
+    let loss = Signer::survey_provider_loss_with_key(
+        world.env(replacement.clone()),
+        world.keyring(),
+        pubky_switch_client::testing::SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    let mut signer = Box::pin(Signer::declare_provider_loss_with_key(
+        world.env(replacement),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&loss, &[]),
+    ))
+    .await
+    .unwrap();
+    let served = signer.set_record_max_age(Some(60)).await.unwrap();
+    assert!(served.listed_cert(&id).is_some());
+    drop(signer);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+
+    let shown = survey(&world, &store).await.unwrap();
+    assert_eq!(
+        shown.apps,
+        [(
+            id,
+            AppFate::RevocationPending {
+                distrust_from: Some(picked)
+            }
+        )]
+    );
+    let confirm = |shown: &KeyRecoverySurvey| {
+        RecordsDiscarded::shown_and_confirmed()
+            .and_key_recovery(KeyRecoveryConfirmed::shown_and_confirmed(shown, &[]))
+    };
+    // The older backup reappears after the first confirmation read. The enrollment
+    // can go through, but the signer must still ask again before replacing the store.
+    let home = Arc::clone(&world.homeserver);
+    *world.homeserver.after_get.lock().unwrap() = Some((
+        IDENTITY_PATH.into(),
+        1,
+        Box::new(move || home.set(SIGNER_BACKUP_PATH, backup)),
+    ));
+    let snapshot = || {
+        store
+            .scan(&signer_namespace(&world.key.public()), b"", None, 10)
+            .unwrap()
+    };
+    let before = snapshot();
+    let enrollments = world.distinct_requests("POST", "/enroll");
+    assert_eq!(
+        Signer::restore_over_unusable(world.env(store.clone()), world.keyring(), confirm(&shown))
+            .await
+            .unwrap_err(),
+        refused(KeyRecoveryStop::SurveyChanged)
+    );
+    assert_eq!(world.distinct_requests("POST", "/enroll"), enrollments + 1);
+    assert_eq!(snapshot(), before);
+    let again = survey(&world, &store).await.unwrap();
+    assert!(matches!(again.backup, BackupFound::Stale { .. }));
+    assert_eq!(again.apps, shown.apps);
+    let mut signer =
+        Signer::restore_over_unusable(world.env(store), world.keyring(), confirm(&again))
+            .await
+            .unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert!(
+        newest
+            .body()
+            .removed
+            .iter()
+            .any(|r| r.app_id == id && r.distrust_from == picked)
+    );
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_over_unusable_records_goes_on_at_the_service_they_named() {
     // The only copy naming the service is the unusable records' own. The recovery's
     // enrollment doesn't arrive: nothing was written over the records, and run again the

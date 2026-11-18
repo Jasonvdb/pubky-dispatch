@@ -137,6 +137,7 @@ fn test_vectors_operations() {
     check_attempt_deadlines(&v, &by_name);
     check_invite_context(&keys, &v, &identity);
     check_shape_rejections(&keys, &v, &identity);
+    check_permanent_policies(&keys, &identity, &by_name["record.put create"]);
 }
 
 /// One case of `shape_rejections`: the operation `based_on` with each `(from, to)` of
@@ -290,8 +291,69 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         bundle_base,
         &[(&held, &range(last, last - 1))],
     ));
+    // A permanent policy's rule (wire 6.2 "Permanent policies", spec 10.3.1), the policy
+    // made permanent by its member after `write_scopes`, each key derived again for its
+    // policy: the `record.put delete`, at a policy naming no generation, and the `record.put
+    // create`, of generation 1, at a policy naming generation 2.
+    let scopes = format!(
+        r#""write_scopes":{},"expected_version""#,
+        text(&json!(writes))
+    );
+    let made_permanent = |generation: &str| {
+        format!(
+            r#""write_scopes":{},"permanent":{{"generation":{generation}}},"expected_version""#,
+            text(&json!(writes))
+        )
+    };
+    let refs: Vec<&str> = writes.iter().map(String::as_str).collect();
+    let named = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(Some(2));
+    let named_key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded,
+        &named.hash().unwrap(),
+    );
+    let unnamed = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(None);
+    let unnamed_key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded,
+        &unnamed.hash().unwrap(),
+    );
+    let (old_key, new_key, delete_key) = (
+        format!(r#""key":{}"#, text(&json!(key))),
+        format!(r#""key":{}"#, text(&json!(b64e(&named_key)))),
+        format!(r#""key":{}"#, text(&json!(b64e(&unnamed_key)))),
+    );
+    // The delete without its claim condition: a service checks conditions before shapes
+    // (wire 6.4 steps 8 and 9), so a failing condition would answer first.
+    let delete = arr(v, "operations")
+        .iter()
+        .find(|o| st(o, "name") == "record.put delete")
+        .unwrap();
+    let delete = st(delete, "body");
+    let start = delete.find(r#""conditions":"#).unwrap();
+    let conditions = &delete[start..start + delete[start..].find(r#""op":"#).unwrap()];
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "record.put: a delete at a permanent policy",
+        "record.put delete",
+        &[
+            (conditions, ""),
+            (&old_key, &delete_key),
+            (&scopes, &made_permanent("null")),
+        ],
+    ));
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "record.put: a create at a permanent policy of another generation",
+        based_on,
+        &[(&old_key, &new_key), (&scopes, &made_permanent("2"))],
+    ));
     let section = json!({
-        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2).",
+        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2); a record.put at a permanent policy, its permanent member written after write_scopes, deletes only in a generation above the one the policy names, never when it names none, and creates only in the generation it names (wire 6.2 \"Permanent policies\", spec 10.3.1).",
         "cases": cases,
     });
     generated(
@@ -307,6 +369,193 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         let op = SignedOp::verify(&signed, &key, identity, app_id.as_ref())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         expect_refusal(c, &check_shape(op.body()).unwrap_err(), name);
+    }
+}
+
+/// The `permanent` members `permanent_policies.rejections` writes in place of `{"generation":1}`
+/// (Switch wire 1.1, 6.2): a generation named twice, out of the integer rule or of another
+/// type, a `null` or empty member, an unknown member beside `generation`, and a member that
+/// isn't an object.
+const PERMANENT_REJECTIONS: [(&str, &str); 11] = [
+    (
+        "generation named twice",
+        r#"{"generation":1,"generation":1}"#,
+    ),
+    ("a negative generation", r#"{"generation":-1}"#),
+    ("a fraction", r#"{"generation":4.5}"#),
+    ("a fraction of zero", r#"{"generation":4.0}"#),
+    (
+        "2^53, one above the largest",
+        r#"{"generation":9007199254740992}"#,
+    ),
+    ("a boolean", r#"{"generation":true}"#),
+    ("a string", r#"{"generation":"1"}"#),
+    ("no generation", "{}"),
+    (
+        "an unknown member",
+        r#"{"generation":1,"future_restriction":1}"#,
+    ),
+    ("null", "null"),
+    ("an array", "[1]"),
+];
+
+/// `permanent_policies`, which `pubky-switch-core` generates (README "How the files were
+/// generated"): `cases`, the `record.put create` of `operations` at its policy made
+/// permanent, naming no generation and naming generation 1, the account's, so the service
+/// takes each (wire 6.2, spec 10.3.1). Each key is derived again for its policy (wire 1.5),
+/// its value sealed again for that key with the seed `operations/permanent/<g>/nonce`, and
+/// each is a batch of its own, of the batch ID of the seed `operations/permanent/<g>/batch`,
+/// signed again by the wallet. And `rejections`: the case naming generation 1 with its
+/// `permanent` member written as [`PERMANENT_REJECTIONS`] gives, signed again by the
+/// wallet, so its signature verifies and only the member's form refuses it, `400
+/// bad_request`, as the operation is read.
+fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp) {
+    let wallet = keys.app("wallet");
+    let app_id = app_id_decode(&wallet.app_id).unwrap();
+    let signer = SwitchAppKeys::from_secrets(wallet.signing_secret, wallet.bundle_secret);
+    let OpKind::RecordPut(base) = &create.body().kind else {
+        panic!("record.put create is a record.put");
+    };
+    let inputs = base.id_inputs.as_ref().unwrap();
+    let sealed = &base.value_sealed;
+    let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
+        .scope_key(sealed.data_epoch, &sealed.scope);
+    let RecordValue::Json(value) = sealed.open(&scope_key, identity, &base.key).unwrap() else {
+        panic!("the create writes a value");
+    };
+    let accepted = |label: &str, generation: Option<u64>| -> Value {
+        let mut put = base.clone();
+        put.policy = put.policy.permanent(generation);
+        put.key = pubky_switch_core::ident::record_key_from_blinded(
+            &inputs.collection,
+            &inputs.blinded_key,
+            &put.policy.hash().unwrap(),
+        );
+        let nonce: [u8; 24] = seed(&format!("operations/permanent/{label}/nonce"))[..24]
+            .try_into()
+            .unwrap();
+        put.value_sealed = pubky_switch_core::sealed::SealedValue::seal_with_nonce(
+            &scope_key,
+            identity,
+            sealed.data_epoch,
+            &sealed.scope,
+            &put.key,
+            &value,
+            &nonce,
+        )
+        .unwrap();
+        let batch: [u8; 16] = seed(&format!("operations/permanent/{label}/batch"))[..16]
+            .try_into()
+            .unwrap();
+        let op = ops::sign_batch(
+            &signer,
+            identity,
+            Some(app_id),
+            create.body().generation,
+            batch,
+            vec![(create.body().conditions.clone(), OpKind::RecordPut(put))],
+        )
+        .unwrap()
+        .remove(0);
+        let body = String::from_utf8(op.body().to_json().unwrap()).unwrap();
+        json!({
+            "name": format!("record.put create at a permanent policy naming {}", match generation {
+                Some(g) => format!("generation {g}"),
+                None => "no generation".to_owned(),
+            }),
+            "based_on": "record.put create",
+            "writer": "wallet",
+            "generation": generation,
+            "body": body,
+            "signed": op.signed(),
+            "expect": { "valid": true },
+        })
+    };
+    let cases = vec![accepted("null", None), accepted("1", Some(1))];
+    let named = st(&cases[1], "body").to_owned();
+    let member = r#""permanent":{"generation":1}"#;
+    assert_eq!(named.matches(member).count(), 1);
+    let rejections: Vec<Value> = PERMANENT_REJECTIONS
+        .iter()
+        .map(|(name, written)| {
+            let body = named.replace(member, &format!(r#""permanent":{written}"#));
+            let sig = sig::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&wallet.signing_secret),
+                labels::sig::OP,
+                &[identity, body.as_bytes()],
+            );
+            let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
+            let refused =
+                SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id))
+                    .expect_err(name);
+            json!({
+                "name": format!("permanent: {name}"),
+                "based_on": st(&cases[1], "name"),
+                "writer": "wallet",
+                "permanent": written,
+                "body": body,
+                "signed": signed,
+                "expect": { "status": refused.status(), "code": refused.code.as_str() },
+            })
+        })
+        .collect();
+    let section = json!({
+        "description": "Wire 6.2, spec 10.3.1: a record.put at a permanent policy. cases are the record.put create of operations at its policy made permanent, its permanent member written after write_scopes as { \"generation\": g }, naming no generation and naming generation 1, the account's: each key derived again for its policy (wire 1.5), its value sealed again for that key, each a batch of its own, signed again by the wallet, which the service takes. rejections are the case naming generation 1 with its permanent member written as permanent gives, signed again by the wallet, so its signature verifies and only the member's form refuses it, 400 bad_request, as the operation is read: generation is required, an int (wire 1.1) or null, and the only member, and permanent is an object.",
+        "cases": cases,
+        "rejections": rejections,
+    });
+    generated(
+        "operations.json",
+        &[(Place::Member("/permanent_policies"), section)],
+    );
+    let file = load("operations.json");
+    let section = &file["permanent_policies"];
+    let cases = arr(section, "cases");
+    assert_eq!(cases.len(), 2);
+    for c in cases {
+        let name = st(c, "name");
+        let body = st(c, "body");
+        let signed = signed_of(&c["signed"]);
+        assert_eq!(signed.body, b64e(body.as_bytes()), "{name}");
+        let op = SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(op.body().to_json().unwrap(), body.as_bytes(), "{name}");
+        check_shape(op.body()).unwrap_or_else(|e| panic!("{name}: shape: {e}"));
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            panic!("{name}: a record.put");
+        };
+        let named = put.policy.permanent.map(|p| p.generation);
+        assert_eq!(named, Some(c["generation"].as_u64()), "{name}");
+        assert_eq!(
+            put.value_sealed
+                .open(&scope_key, identity, &put.key)
+                .unwrap(),
+            RecordValue::Json(value.clone()),
+            "{name}"
+        );
+    }
+    let rejections = arr(section, "rejections");
+    assert_eq!(rejections.len(), PERMANENT_REJECTIONS.len());
+    for c in rejections {
+        let name = st(c, "name");
+        let body = st(c, "body");
+        let signed = signed_of(&c["signed"]);
+        assert_eq!(signed.body, b64e(body.as_bytes()), "{name}");
+        sig::verify(
+            &wallet.signing_public,
+            labels::sig::OP,
+            &[identity, body.as_bytes()],
+            &signed.sig_bytes().unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: the signature verifies: {e}"));
+        let refused =
+            SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id)).unwrap_err();
+        expect_refusal(c, &refused, name);
+        // The member written as the case it is based on reads.
+        let written = format!(r#""permanent":{}"#, st(c, "permanent"));
+        assert_eq!(body.matches(&written).count(), 1, "{name}");
+        ops::OpBody::parse(body.replace(&written, member).as_bytes())
+            .unwrap_or_else(|e| panic!("{name}: with the member as based_on: {e}"));
     }
 }
 

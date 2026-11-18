@@ -829,10 +829,11 @@ pub enum AppEvent {
         /// The acceptance time, the recipient's service time.
         accepted_at_ms: u64,
     },
-    /// A message answered `403 not_admitted` or `403 not_current` for
-    /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
-    /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up. Also a message whose try needed writes over
+    /// The app gave up delivery after `403 not_admitted` or `403 not_current` refusals
+    /// ([`super::UNDELIVERABLE_MS`], Switch spec 11). If its store had no record of
+    /// acceptance, the app deleted the outbox entry and its plaintext. The recipient may
+    /// have accepted a try whose answer was lost. For a re-send, only the re-send was
+    /// given up. Also a message whose try needed writes over
     /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
     /// make: it was deleted from the outbox at once. Also a message a restore didn't
     /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the

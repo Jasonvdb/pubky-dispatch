@@ -1063,11 +1063,21 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         .unwrap_or(0)
         .max(kept.records_behind.unwrap_or(0));
     kept.epoch_through = local.epoch_through.unwrap_or(0);
-    // A recovery declared already sent a start for the generation after the lost one.
+    // A hand-over in progress lets its target sign the next version, which nothing may show.
+    if let Some(handed) = kept
+        .handing_over
+        .as_ref()
+        .and_then(|h| state::stored_identity(&h.doc, &identity).ok())
+    {
+        kept.signed_through = kept.signed_through.max(handed.version().saturating_add(1));
+    }
+    // A recovery declared already may have sent a start for the generation after the lost
+    // one, and the records may have seen a version of their own at a higher one.
     let generations = kept
         .lost_generation
         .filter(|_| kept.recovering)
-        .map_or(0, |lost| lost.saturating_add(1));
+        .map_or(0, |lost| lost.saturating_add(1))
+        .max(kept.generation_seen);
     LossFound {
         kept,
         local,

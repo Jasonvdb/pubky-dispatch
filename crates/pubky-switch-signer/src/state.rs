@@ -373,6 +373,10 @@ pub(crate) struct SignerState {
     /// `removed` entries, which a recovery with the key alone found picked: every version
     /// built from then on takes them (Switch spec 12.8).
     pub(crate) earlier_distrust: Vec<pubky_switch_core::records::RemovedApp>,
+    /// The highest generation of a version of this install's own it saw ahead of its
+    /// records, with `records_behind`: a recovery with the key alone starts above it, whatever
+    /// copies it finds then (Switch spec 12.8).
+    pub(crate) generation_seen: u64,
     /// The renewals the user asked for, each as its app and the new certificate's hash, whose
     /// flow is in progress: one delivered ends that app's [`Alert::RenewalRefused`] for a
     /// renewal that reduced nothing, as the user's newest choice, and one refused is the
@@ -617,6 +621,7 @@ impl SignerState {
             homeserver_copy_waived: false,
             revoke_at_service: false,
             earlier_distrust: Vec::new(),
+            generation_seen: 0,
             user_renewals: Vec::new(),
             asked_renewals: Vec::new(),
             ever_published: false,

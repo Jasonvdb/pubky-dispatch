@@ -811,7 +811,9 @@ impl Signer {
             return self.managed_by(doc.body().signer).await;
         }
         if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
-            return self.records_behind(Source::Backup, doc.version()).await;
+            return self
+                .records_behind(Source::Backup, doc.version(), doc.generation())
+                .await;
         }
         Ok(())
     }
@@ -1444,7 +1446,7 @@ impl Signer {
         }
         if signer == self.state.install && copy.version() > self.state.signed_through {
             return self
-                .records_behind(Source::Homeserver, copy.version())
+                .records_behind(Source::Homeserver, copy.version(), copy.generation())
                 .await;
         }
         Ok(())
@@ -2003,7 +2005,9 @@ impl Signer {
             }
         }
         if signer == self.state.install {
-            return self.records_behind(source, version).await;
+            return self
+                .records_behind(source, version, copy.generation())
+                .await;
         }
         let mut state = self.state.clone();
         state.handing_over = None;
@@ -2024,10 +2028,11 @@ impl Signer {
         Err(SignerError::NotNamed { install: signer })
     }
 
-    /// A newer version of this install's own, `version`, seen at `source`: its records are
-    /// behind, and it signs nothing more until a restore, ending the flow.
-    async fn records_behind(&mut self, source: Source, version: u64) -> Result<()> {
+    /// A newer version of this install's own, `version` at `generation`, seen at `source`:
+    /// its records are behind, and it signs nothing more until a restore, ending the flow.
+    async fn records_behind(&mut self, source: Source, version: u64, generation: u64) -> Result<()> {
         let mut state = self.state.clone();
+        state.generation_seen = state.generation_seen.max(generation);
         // A backup owed would hold the older records: the one there is newer.
         state.backup_owed = false;
         state.records_behind = Some(version);

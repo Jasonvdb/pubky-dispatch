@@ -233,10 +233,16 @@ async fn test_key_provider_loss_old_signer_mid_hand_over_at_a_dead_service() {
         .unwrap();
     assert!(matches!(old.status(), SignerStatus::HandingOver { .. }));
     let install = old.install_id();
+    let handed = old.identity_doc().unwrap().unwrap();
     drop(old);
     let (service, router) = picked_service(&world);
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
     assert_eq!(signer.install_id(), install);
+    // Above the version the hand-over's target may have signed first.
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().version(),
+        handed.version() + 2
+    );
     assert!(
         signer
             .identity_doc()
@@ -1465,4 +1471,19 @@ async fn test_key_provider_loss_takes_the_later_of_the_device_and_service_clocks
         assert_eq!(doc.body().recovery_from, Some(time / 1_000), "{skew}");
         assert!(doc.version() > time * 1_000, "{skew}");
     }
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_starts_above_a_generation_its_records_saw() {
+    // The records saw a version of their own at a later generation that no source shows any
+    // more: the declaration starts above that generation.
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    drop(old);
+    edit_state(&world, &store, |state| state["generation_seen"] = 4.into());
+    let (service, router) = picked_service(&world);
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!(shown.kind, KeyRecoveryKind::ProviderLoss { lost: Some(4) });
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    signs_at(&world, &service, &mut signer, 4).await;
 }

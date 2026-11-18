@@ -26,7 +26,7 @@ use pubky_switch::store::testing::{
 use pubky_switch::time::{Clock as ServiceClock, TimeSample, TrustedTime, TrustedTimeConfig};
 use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::{Clock, TestClock};
-use pubky_switch_client::transport::{BoxFuture, Header, Request, Response, Transport};
+use pubky_switch_client::transport::{BoxFuture, FirstSend, Header, Request, Response, Transport};
 use pubky_switch_core::chain::ChainTip;
 use tower::ServiceExt;
 
@@ -116,7 +116,11 @@ impl ServiceTransport {
         *lock(&self.router) = Some(Self::router_of(service));
     }
 
-    async fn carry(&self, request: Request) -> Result<Response, TransportError> {
+    async fn carry(
+        &self,
+        request: Request,
+        first: Option<&FirstSend>,
+    ) -> Result<Response, TransportError> {
         if request.origin != self.origin {
             return Err(TransportError::Connect(format!(
                 "no service at {}",
@@ -132,10 +136,17 @@ impl ServiceTransport {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let request = builder.body(Body::from(request.body)).map_err(invalid)?;
-        let router = lock(&self.router).clone().ok_or_else(|| {
+        let mut router = lock(&self.router).clone().ok_or_else(|| {
             TransportError::Connect(format!("the service at {} is stopped", self.origin))
         })?;
-        let answer = match router.oneshot(request).await {
+        let ready = match ServiceExt::<HttpRequest<Body>>::ready(&mut router).await {
+            Ok(ready) => ready,
+            Err(never) => match never {},
+        };
+        if let Some(first) = first {
+            first.check()?;
+        }
+        let answer = match tower::Service::call(ready, request).await {
             Ok(answer) => answer,
             Err(never) => match never {},
         };
@@ -160,7 +171,15 @@ impl ServiceTransport {
 
 impl Transport for ServiceTransport {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        Box::pin(self.carry(request))
+        Box::pin(self.carry(request, None))
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(self.carry(request, Some(first)))
     }
 }
 

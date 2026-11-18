@@ -250,6 +250,10 @@ impl std::fmt::Display for Refusal {
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AppError {
+    /// The caller's new batch reached its first-handoff cutoff before sending. The
+    /// client has durably retired it. No earlier body from this submission can apply.
+    #[error("the batch expired before its first handoff and was retired")]
+    ExpiredUnsent,
     /// An answer of the switch, or a check of the base client, that failed. A `409
     /// conflict` and the like arrive here; the app decided what to do with it.
     #[error(transparent)]

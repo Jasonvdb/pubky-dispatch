@@ -84,6 +84,17 @@ impl Router {
 }
 
 impl Transport for Router {
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a crate::transport::FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(async move {
+            first.check()?;
+            self.route(&request)?.send_before(request, first).await
+        })
+    }
+
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         let routed = self.route(&request);
         Box::pin(async move { routed?.send(request).await })

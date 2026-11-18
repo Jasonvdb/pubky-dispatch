@@ -54,7 +54,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::ident::NamingKey;
-use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::{AppCert, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
@@ -1842,16 +1841,9 @@ impl App {
         if plaintext.sender_app_id() != app_id {
             return Err(not_ours());
         }
-        let rules = self.protocols.opaque_of_json(plaintext.json());
-        let opaque: Vec<OpaqueMember<'_>> = rules
-            .iter()
-            .map(|rule| OpaqueMember {
-                kind: rule.kind.as_deref(),
-                member: rule.member.as_str(),
-            })
-            .collect();
-        let message = Message::parse(plaintext.json(), &opaque)
-            .map_err(|_| Refusal::Usage("a stored plaintext that isn't a message".into()))?;
+        let message = super::protocols::kept_message(plaintext.json()).ok_or_else(|| {
+            Refusal::Usage("a stored plaintext without valid message fields".into())
+        })?;
         if message.from.identity != me || message.from.app_id != app_id {
             return Err(not_ours());
         }

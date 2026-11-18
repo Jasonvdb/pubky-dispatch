@@ -208,7 +208,7 @@ pub(super) fn sign_answer(
         put(header::RETRY_AFTER, seconds.to_string());
     }
     if answer.cacheable {
-        put("cache-control", "public, max-age=60".into());
+        put("cache-control", wire_http::public_read_cache_control());
     }
     if answer.no_store {
         put("cache-control", "no-store".into());

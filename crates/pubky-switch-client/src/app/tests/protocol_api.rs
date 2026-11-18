@@ -2589,7 +2589,7 @@ async fn test_queue_stored_refuses_a_plaintext_that_isnt_a_message() {
     let plaintext = MessagePlaintext::from_parts(wallet.app_id(), signature, json).unwrap();
     let error = wallet.queue_stored(&plaintext).await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Refused(Refusal::Usage(why)) if why.contains("isn't a message")),
+        matches!(&error, AppError::Refused(Refusal::Usage(why)) if why.contains("without valid message fields")),
         "{error:?}"
     );
 }
@@ -2631,8 +2631,8 @@ async fn test_queue_stored_narrowed_opaque_members_still_deliver() {
     body.insert("score".into(), json!(1.5));
     let message = OutgoingMessage::new(p.bob.identity().public(), "sample.note", body);
     let signed = wallet.sign_message(message).unwrap();
-    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
     protocol.opaque.lock().unwrap().clear();
+    let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
     let delivery = wallet.flush_message(&msg_id).await;
     assert!(
         matches!(delivery, Ok(Some(Delivery::Accepted { .. }))),
@@ -3007,7 +3007,7 @@ async fn test_identity_of_takes_the_switch_copy_when_higher() {
     let found = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(found.doc.version(), newer.version());
     assert_eq!(found.switch_copy, SwitchCopy::Read);
-    assert_eq!(found.read_at_ms, START);
+    assert_eq!(found.read_at_ms, Some(START));
     // Within 10 minutes the copy held is used, nothing read.
     let reads = p.router.log().len();
     p.clock.advance_ms(9 * MINUTE);

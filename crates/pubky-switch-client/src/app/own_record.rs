@@ -464,7 +464,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             // The copy is read whatever the last check.
-            self.published_checked_ms = None;
+            self.published_check = None;
             self.deliver_record().await
         })
         .await
@@ -664,11 +664,18 @@ impl App {
         let owed = self.state.pending_publish.is_some();
         let now = self.now();
         let checked_lately = self
-            .published_checked_ms
-            .is_some_and(|at| at <= now && now - at < PUBLISHED_CHECK_MS);
+            .published_check
+            .as_ref()
+            .is_some_and(|(at, signature)| {
+                signature == &record.sig
+                    && now
+                        .checked_sub(*at)
+                        .is_some_and(|age| age < PUBLISHED_CHECK_MS)
+            });
         if !owed && !check && checked_lately {
             return Ok(Publication::Published);
         }
+        self.published_check = None;
         let writer = self.publisher()?;
         let identity = self.state.meta.identity;
         let path = app_record_path(&self.state.meta.app_id);
@@ -714,7 +721,7 @@ impl App {
         // owed write-back failed to commit would leave nothing owed in the store and skip
         // the next read's repair for the interval; the branches that owe a publication
         // need no mark, since what is owed goes at every call.
-        self.published_checked_ms = Some(now);
+        self.published_check = (outcome == Publication::Published).then_some((now, record.sig));
         Ok(outcome)
     }
 

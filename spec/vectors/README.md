@@ -79,3 +79,5 @@ Its vector tests build each of these cases again and compare it with the file, v
 After an intended wire change, the vectors are generated again, by the prototype or, for the cases above, by `pubky-switch-core`'s vector tests with `PUBKY_SWITCH_WRITE_VECTORS` set, and the diff is reviewed.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
+
+The reader clock for each public identity response in `http.json` is its signed `Switch-Server-Time`.

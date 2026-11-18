@@ -1481,7 +1481,14 @@ impl ScriptedSwitch {
             let answer = inner
                 .gate(&request.method, &path)
                 .unwrap_or_else(|| inner.identity_answer());
-            return finish(inner, answer);
+            let mut response = finish(inner, answer)?;
+            if response.status == 200 {
+                response.headers.push(Header::new(
+                    "cache-control",
+                    &pubky_switch_core::http::public_read_cache_control(),
+                ));
+            }
+            return Ok(response);
         }
         let stamped_before = inner.stamped_ms;
         if let Some(answer) = inner.stale_timestamp(request) {

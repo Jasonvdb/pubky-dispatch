@@ -656,6 +656,7 @@ pub struct RecordAnswer {
 
 /// A page of `GET /v1/{id}/records?collection=` (Switch wire 7.4.9).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecordPage {
     /// The current records the caller may read, deleted ones left out.
     pub records: Vec<SharedRecordView>,

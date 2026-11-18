@@ -2687,36 +2687,39 @@ impl App {
     /// kept batches, and waits when that doesn't settle it. One known never applied is
     /// cleared from `item`, so a stop names only a batch that may have applied.
     async fn settle_job_batch(&mut self, item: &mut OutboxItem) -> Result<JobBatch, AppError> {
-        use super::{KeptBatchDrop, KeptBatchStatus};
-        let Some(named) = &item.record_batch else {
-            return Ok(JobBatch::NotApplied);
-        };
-        let id = pubky_switch_core::enc::unb64_array::<16>(named)
-            .map_err(|_| AppError::Store(StoreError::Corrupt))?;
-        let mut status = self.kept_batch(id).await?;
-        if matches!(status, Some(KeptBatchStatus::Kept { .. })) {
-            match self
-                .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
-                .await
-            {
-                Err(error) if is_local(&error) => return Err(error),
-                Err(error) => item.last_error = Some(error.to_string()),
-                Ok(_) => {}
+        Box::pin(async move {
+            use super::{KeptBatchDrop, KeptBatchStatus};
+            let Some(named) = &item.record_batch else {
+                return Ok(JobBatch::NotApplied);
+            };
+            let id = pubky_switch_core::enc::unb64_array::<16>(named)
+                .map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            let mut status = self.kept_batch(id).await?;
+            if matches!(status, Some(KeptBatchStatus::Kept { .. })) {
+                match self
+                    .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
+                    .await
+                {
+                    Err(error) if is_local(&error) => return Err(error),
+                    Err(error) => item.last_error = Some(error.to_string()),
+                    Ok(_) => {}
+                }
+                status = self.kept_batch(id).await?;
             }
-            status = self.kept_batch(id).await?;
-        }
-        Ok(match status {
-            Some(KeptBatchStatus::Applied { .. }) => JobBatch::Applied,
-            Some(KeptBatchStatus::Kept { .. }) => JobBatch::Waits,
-            Some(KeptBatchStatus::Dropped {
-                reason: KeptBatchDrop::Refused { .. } | KeptBatchDrop::Unsent,
-                ..
-            }) => {
-                item.record_batch = None;
-                JobBatch::NotApplied
-            }
-            Some(KeptBatchStatus::Dropped { .. }) | None => JobBatch::Unknown,
+            Ok(match status {
+                Some(KeptBatchStatus::Applied { .. }) => JobBatch::Applied,
+                Some(KeptBatchStatus::Kept { .. }) => JobBatch::Waits,
+                Some(KeptBatchStatus::Dropped {
+                    reason: KeptBatchDrop::Refused { .. } | KeptBatchDrop::Unsent,
+                    ..
+                }) => {
+                    item.record_batch = None;
+                    JobBatch::NotApplied
+                }
+                Some(KeptBatchStatus::Dropped { .. }) | None => JobBatch::Unknown,
+            })
         })
+        .await
     }
 
     /// Stop the record job of `item` at `deleted`, a delete of its record the job wasn't

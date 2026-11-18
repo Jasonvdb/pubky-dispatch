@@ -1053,16 +1053,19 @@ impl App {
     /// forgot it (Switch spec 10.3), and the next write creates the record. Over a live
     /// write it changes nothing.
     pub(crate) async fn note_gone(&mut self, key: &[u8; 32]) -> Result<(), AppError> {
-        if let Some(mut held) = self.held_record(key).await?
-            && held.delete_base().is_some()
-            && !held.gone
-        {
-            held.gone = true;
-            let mut tx = self.tx()?;
-            tx.put(&record_key_of(key), &held)?;
-            self.commit(tx).await?;
-        }
-        Ok(())
+        Box::pin(async move {
+            if let Some(mut held) = self.held_record(key).await?
+                && held.delete_base().is_some()
+                && !held.gone
+            {
+                held.gone = true;
+                let mut tx = self.tx()?;
+                tx.put(&record_key_of(key), &held)?;
+                self.commit(tx).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Read the record at `key` from the switch and take its write; what came of it, `None`
@@ -2568,189 +2571,194 @@ impl App {
         own: bool,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
-        let key = accepted.key;
-        self.keep_cert(&accepted.cert, tx)?;
-        let held = self.held_record(&key).await?;
-        let reopened = held.as_ref().is_some_and(|held| {
-            held.item_hash == accepted.item_hash
-                && held.content.waits_for_key()
-                && !matches!(accepted.content, RecordContent::Unreadable(_))
-        });
-        if let Some(held) = held.as_ref().filter(|_| reopened)
-            && held.authenticated
-            && !accepted.version.authenticated
-        {
-            accepted.version = held.write_version();
-            accepted.proof = accepted.proof.take().or(held.proof.clone());
-            accepted.time = held.written_at_ms.or(accepted.time);
-        }
-        if let Some(held) = held.as_ref().filter(|_| !reopened) {
-            if held.item_hash == accepted.item_hash {
-                let mut upgraded = held.clone();
-                if accepted.version.authenticated && !held.authenticated {
-                    upgraded.version = accepted.version.version;
-                    upgraded.authenticated = true;
-                    upgraded.written_at_ms = accepted.time.or(held.written_at_ms);
-                    upgraded.proof = accepted.proof.clone().or(held.proof.clone());
-                }
-                // A view shows the held write as the switch's current one: at the
-                // application it shows, such as a recovery upload's, which the next write
-                // names; and neither forgotten nor behind another write at its version.
-                if accepted.viewed {
-                    upgraded.applied = accepted.revision;
-                    upgraded.gone = false;
-                    if upgraded.follow == Some(upgraded.version) {
-                        upgraded.follow = None;
-                        upgraded.follow_applied = None;
-                        upgraded.follow_deleted = false;
-                        upgraded.follow_named = true;
+        Box::pin(async move {
+            let key = accepted.key;
+            self.keep_cert(&accepted.cert, tx)?;
+            let held = self.held_record(&key).await?;
+            let reopened = held.as_ref().is_some_and(|held| {
+                held.item_hash == accepted.item_hash
+                    && held.content.waits_for_key()
+                    && !matches!(accepted.content, RecordContent::Unreadable(_))
+            });
+            if let Some(held) = held.as_ref().filter(|_| reopened)
+                && held.authenticated
+                && !accepted.version.authenticated
+            {
+                accepted.version = held.write_version();
+                accepted.proof = accepted.proof.take().or(held.proof.clone());
+                accepted.time = held.written_at_ms.or(accepted.time);
+            }
+            if let Some(held) = held.as_ref().filter(|_| !reopened) {
+                if held.item_hash == accepted.item_hash {
+                    let mut upgraded = held.clone();
+                    if accepted.version.authenticated && !held.authenticated {
+                        upgraded.version = accepted.version.version;
+                        upgraded.authenticated = true;
+                        upgraded.written_at_ms = accepted.time.or(held.written_at_ms);
+                        upgraded.proof = accepted.proof.clone().or(held.proof.clone());
                     }
+                    // A view shows the held write as the switch's current one: at the
+                    // application it shows, such as a recovery upload's, which the next write
+                    // names; and neither forgotten nor behind another write at its version.
+                    if accepted.viewed {
+                        upgraded.applied = accepted.revision;
+                        upgraded.gone = false;
+                        if upgraded.follow == Some(upgraded.version) {
+                            upgraded.follow = None;
+                            upgraded.follow_applied = None;
+                            upgraded.follow_deleted = false;
+                            upgraded.follow_named = true;
+                        }
+                    }
+                    if upgraded != *held {
+                        tx.put(&record_key_of(&key), &upgraded)?;
+                    }
+                    return Ok(Taken::Same);
                 }
-                if upgraded != *held {
-                    tx.put(&record_key_of(&key), &upgraded)?;
+                if !accepted.version.replaces(&held.write_version()) {
+                    // Another write at the held version, which a view shows as the switch's
+                    // current one: after recovery uploads two writes can share a version
+                    // (Switch spec 12.6 step 3). It isn't taken, but the next write builds on it.
+                    if accepted.viewed && accepted.version.version == held.version {
+                        let deleted = accepted.content == RecordContent::Deleted;
+                        let shown = (accepted.version.version, accepted.revision);
+                        self.follow_write(&key, shown, deleted, false, tx).await?;
+                    }
+                    return Ok(Taken::NotNewer);
                 }
-                return Ok(Taken::Same);
             }
-            if !accepted.version.replaces(&held.write_version()) {
-                // Another write at the held version, which a view shows as the switch's
-                // current one: after recovery uploads two writes can share a version
-                // (Switch spec 12.6 step 3). It isn't taken, but the next write builds on it.
-                if accepted.viewed && accepted.version.version == held.version {
-                    let deleted = accepted.content == RecordContent::Deleted;
-                    let shown = (accepted.version.version, accepted.revision);
-                    self.follow_write(&key, shown, deleted, false, tx).await?;
-                }
-                return Ok(Taken::NotNewer);
-            }
-        }
-        let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
-        let new_value = accepted.content.value();
-        // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
-        let expected_version = accepted.version.expected_version;
-        // The write was verified before it got here, so its operation reads; its conditions
-        // are the ones it signed (Switch wire 6.3).
-        let conditions = SignedOp::peek(&accepted.op)
-            .map(|op| op.body().conditions.clone())
-            .unwrap_or_default();
-        let base = WriteBase {
-            expected_version,
-            held: match &held {
-                // A create applies only where the service holds nothing: over a delete
-                // this app holds, it follows the service forgetting that delete (Switch wire
-                // 6.2), so it builds on the absence the delete left.
-                Some(held) if expected_version.is_none() => held.content == RecordContent::Deleted,
-                Some(held) => held.version == expected_version,
-                None => expected_version.is_none(),
-            },
-            conditions,
-        };
-        // A write by this app is its own, also when the feed or a view shows it before its
-        // answer, or another device of the app made it: one app is one principal (Switch
-        // spec 3.1), so it is never checked against what this device saw, and it is marked
-        // from the value written, as at its answer, once this device can read that value. A
-        // flag would name the app itself.
-        let own = own || accepted.writer == self.state.meta.app_id;
-        if !own
-            && let Some(mark) = &seen
-            && let Some(reason) = self.protocols.record_regression(
-                &accepted.collection.name,
-                &mark.mark,
-                new_value,
-                base,
-            )
-        {
-            let shown = Shown {
-                key,
-                version: accepted.version.version,
-                write: accepted.item_hash,
-                revision: accepted.revision,
-            };
-            let deleted = accepted.content == RecordContent::Deleted;
-            self.flag_write(shown, accepted.writer, reason, deleted, tx)
-                .await?;
-            return Ok(Taken::Flagged);
-        }
-        // What the app saw of a record stays seen after its own delete (Switch spec 8.2):
-        // the mark it holds stays, so a write that brings the record back without it is
-        // checked against it. So does an own write this device can't read yet, such as
-        // another device's at a data epoch whose key it hasn't fetched: the mark is set from
-        // its value when the key comes and the record reopens (`reopen_unreadable`), which
-        // takes it here again. Any other own write marks from the value it wrote.
-        let keeps_mark =
-            own && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key());
-        let marked = if keeps_mark {
-            None
-        } else {
-            self.protocols.record_seen(
-                &accepted.collection.name,
-                if own {
-                    None
-                } else {
-                    seen.as_ref().map(|m| m.mark.as_slice())
+            let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
+            let new_value = accepted.content.value();
+            // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
+            let expected_version = accepted.version.expected_version;
+            // The write was verified before it got here, so its operation reads; its conditions
+            // are the ones it signed (Switch wire 6.3).
+            let conditions = SignedOp::peek(&accepted.op)
+                .map(|op| op.body().conditions.clone())
+                .unwrap_or_default();
+            let base = WriteBase {
+                expected_version,
+                held: match &held {
+                    // A create applies only where the service holds nothing: over a delete
+                    // this app holds, it follows the service forgetting that delete (Switch wire
+                    // 6.2), so it builds on the absence the delete left.
+                    Some(held) if expected_version.is_none() => {
+                        held.content == RecordContent::Deleted
+                    }
+                    Some(held) => held.version == expected_version,
+                    None => expected_version.is_none(),
                 },
-                new_value,
-            )
-        };
-        match marked {
-            // A mark over its bound isn't kept, and nothing of it is silent: another app's
-            // write leaves the mark held, so what was seen before is still checked; an own
-            // write's never leaves a mark that doesn't describe it. Either way the protocol
-            // is told, in this change's commit, that the record can't be checked from here.
-            Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => {
-                if own {
-                    tx.delete(&seen_key(&key))?;
-                }
-                let to = self.owners_of_collection(&accepted.collection.name);
-                self.keep_duty_for(
-                    tx,
-                    to,
-                    Duty::RecordUncheckable {
-                        key,
-                        writer: accepted.writer,
-                        generation: accepted.version.version.generation,
-                        version: accepted.version.version.version,
-                        mark_bytes: u64::try_from(mark.len()).unwrap_or(u64::MAX),
-                    },
-                )?;
+                conditions,
+            };
+            // A write by this app is its own, also when the feed or a view shows it before its
+            // answer, or another device of the app made it: one app is one principal (Switch
+            // spec 3.1), so it is never checked against what this device saw, and it is marked
+            // from the value written, as at its answer, once this device can read that value. A
+            // flag would name the app itself.
+            let own = own || accepted.writer == self.state.meta.app_id;
+            if !own
+                && let Some(mark) = &seen
+                && let Some(reason) = self.protocols.record_regression(
+                    &accepted.collection.name,
+                    &mark.mark,
+                    new_value,
+                    base,
+                )
+            {
+                let shown = Shown {
+                    key,
+                    version: accepted.version.version,
+                    write: accepted.item_hash,
+                    revision: accepted.revision,
+                };
+                let deleted = accepted.content == RecordContent::Deleted;
+                self.flag_write(shown, accepted.writer, reason, deleted, tx)
+                    .await?;
+                return Ok(Taken::Flagged);
             }
-            Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-            None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
-            None => {}
-        }
-        let record = HeldRecord {
-            collection: accepted.collection.name.clone(),
-            policy: accepted.collection.policy.clone(),
-            op: accepted.op,
-            cert: accepted.cert.signed().clone(),
-            proof: accepted.proof,
-            version: accepted.version.version,
-            authenticated: accepted.version.authenticated,
-            expected: accepted.version.expected_version,
-            written_at_ms: accepted.time,
-            writer: accepted.writer,
-            item_hash: accepted.item_hash,
-            content: accepted.content,
-            doubtful: accepted.doubtful,
-            applied: accepted.revision,
-            follow: held
-                .as_ref()
-                .and_then(|held| held.follow)
-                .filter(|_| reopened),
-            follow_applied: held
-                .as_ref()
-                .and_then(|held| held.follow_applied)
-                .filter(|_| reopened),
-            follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
-            gone: false,
-            follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
-        };
-        tx.put(&record_key_of(&key), &record)?;
-        self.events.push(AppEvent::RecordChanged { key });
-        Ok(if reopened {
-            Taken::Reopened
-        } else {
-            Taken::New
+            // What the app saw of a record stays seen after its own delete (Switch spec 8.2):
+            // the mark it holds stays, so a write that brings the record back without it is
+            // checked against it. So does an own write this device can't read yet, such as
+            // another device's at a data epoch whose key it hasn't fetched: the mark is set from
+            // its value when the key comes and the record reopens (`reopen_unreadable`), which
+            // takes it here again. Any other own write marks from the value it wrote.
+            let keeps_mark = own
+                && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key());
+            let marked = if keeps_mark {
+                None
+            } else {
+                self.protocols.record_seen(
+                    &accepted.collection.name,
+                    if own {
+                        None
+                    } else {
+                        seen.as_ref().map(|m| m.mark.as_slice())
+                    },
+                    new_value,
+                )
+            };
+            match marked {
+                // A mark over its bound isn't kept, and nothing of it is silent: another app's
+                // write leaves the mark held, so what was seen before is still checked; an own
+                // write's never leaves a mark that doesn't describe it. Either way the protocol
+                // is told, in this change's commit, that the record can't be checked from here.
+                Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => {
+                    if own {
+                        tx.delete(&seen_key(&key))?;
+                    }
+                    let to = self.owners_of_collection(&accepted.collection.name);
+                    self.keep_duty_for(
+                        tx,
+                        to,
+                        Duty::RecordUncheckable {
+                            key,
+                            writer: accepted.writer,
+                            generation: accepted.version.version.generation,
+                            version: accepted.version.version.version,
+                            mark_bytes: u64::try_from(mark.len()).unwrap_or(u64::MAX),
+                        },
+                    )?;
+                }
+                Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
+                None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
+                None => {}
+            }
+            let record = HeldRecord {
+                collection: accepted.collection.name.clone(),
+                policy: accepted.collection.policy.clone(),
+                op: accepted.op,
+                cert: accepted.cert.signed().clone(),
+                proof: accepted.proof,
+                version: accepted.version.version,
+                authenticated: accepted.version.authenticated,
+                expected: accepted.version.expected_version,
+                written_at_ms: accepted.time,
+                writer: accepted.writer,
+                item_hash: accepted.item_hash,
+                content: accepted.content,
+                doubtful: accepted.doubtful,
+                applied: accepted.revision,
+                follow: held
+                    .as_ref()
+                    .and_then(|held| held.follow)
+                    .filter(|_| reopened),
+                follow_applied: held
+                    .as_ref()
+                    .and_then(|held| held.follow_applied)
+                    .filter(|_| reopened),
+                follow_deleted: held.as_ref().is_some_and(|held| held.follow_deleted) && reopened,
+                gone: false,
+                follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
+            };
+            tx.put(&record_key_of(&key), &record)?;
+            self.events.push(AppEvent::RecordChanged { key });
+            Ok(if reopened {
+                Taken::Reopened
+            } else {
+                Taken::New
+            })
         })
+        .await
     }
 
     /// An own `record.put` the switch answered: taken at the version its proof gives.
@@ -3002,51 +3010,54 @@ impl App {
         base: Option<Option<RecordVersion>>,
         mut change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
     ) -> Result<Updated, AppError> {
-        let key = self.record_key(target)?;
-        let budget = self.begin_budget();
-        let mut last = None;
-        let mut base = base;
-        for attempt in 0..UPDATE_TRIES {
-            // A further try only within the call's time budget: past it the call returns
-            // the conflict it last met.
-            if attempt > 0 && self.spent(&budget) {
-                break;
+        Box::pin(async move {
+            let key = self.record_key(target)?;
+            let budget = self.begin_budget();
+            let mut last = None;
+            let mut base = base;
+            for attempt in 0..UPDATE_TRIES {
+                // A further try only within the call's time budget: past it the call returns
+                // the conflict it last met.
+                if attempt > 0 && self.spent(&budget) {
+                    break;
+                }
+                let now = self
+                    .held_record(&key)
+                    .await?
+                    .and_then(|held| held.delete_base());
+                let from = *base.get_or_insert(now);
+                if let Some(deleted) = now
+                    && from != now
+                {
+                    return Ok(Updated::Stopped { deleted, last });
+                }
+                let current = self.shared_record(&key).await?;
+                if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
+                    return Err(Refusal::NotNow(
+                        "Switch spec 3.5: the record's value is sealed under a key the app \
+                         doesn't hold yet"
+                            .into(),
+                    )
+                    .into());
+                }
+                let value = current.as_ref().and_then(|r| r.content.value());
+                let Some(next) = change(value) else {
+                    return Ok(Updated::Written(None));
+                };
+                match self
+                    .write_record(target, Some(&next), conditions.clone(), attempt > 0)
+                    .await
+                {
+                    Ok(record) => return Ok(Updated::Written(Some(record))),
+                    Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
+                    Err(error) => return Err(error),
+                }
             }
-            let now = self
-                .held_record(&key)
-                .await?
-                .and_then(|held| held.delete_base());
-            let from = *base.get_or_insert(now);
-            if let Some(deleted) = now
-                && from != now
-            {
-                return Ok(Updated::Stopped { deleted, last });
-            }
-            let current = self.shared_record(&key).await?;
-            if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
-                return Err(Refusal::NotNow(
-                    "Switch spec 3.5: the record's value is sealed under a key the app \
-                     doesn't hold yet"
-                        .into(),
-                )
-                .into());
-            }
-            let value = current.as_ref().and_then(|r| r.content.value());
-            let Some(next) = change(value) else {
-                return Ok(Updated::Written(None));
-            };
-            match self
-                .write_record(target, Some(&next), conditions.clone(), attempt > 0)
-                .await
-            {
-                Ok(record) => return Ok(Updated::Written(Some(record))),
-                Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            AppError::Switch(ClientError::Usage("the record kept changing".into()))
-        }))
+            Err(last.unwrap_or_else(|| {
+                AppError::Switch(ClientError::Usage("the record kept changing".into()))
+            }))
+        })
+        .await
     }
 
     /// A chain item of the shared state in the feed: a record write, a claim entry, a list

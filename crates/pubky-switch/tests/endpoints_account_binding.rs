@@ -437,65 +437,85 @@ async fn test_first_counted_change_checks_the_actual_opening_contents() {
 
 #[tokio::test]
 async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
-    let Some(replay) = support::replay().await else {
-        return;
-    };
-    let (opening, _) = create(&replay, NOW, 43).await;
-    let path = replay.key_dir().join("accounts/marks").join(key().id());
-    let completed = std::fs::read(&path).unwrap();
-    let mut reserved: serde_json::Value = serde_json::from_slice(&completed).unwrap();
-    let confirmed = reserved
-        .pointer_mut("/position/creation_anchor/bound/confirmed")
-        .unwrap();
-    assert_eq!(*confirmed, true);
-    *confirmed = false.into();
-    // SQL committed before the process could sync the confirmation into its mark.
-    let reopened = service_with_restored_mark(&replay, &serde_json::to_vec(&reserved).unwrap());
-    let request = enrollment_request(&opening, NOW);
-    let sent = support::Sent::of(&request);
-    let answer = reopened.handle(request).await;
-    status(&answer, 200);
-    assert!(support::signed_with(
-        &answer,
-        &support::service_public(&replay),
-        &sent
-    ));
-    assert_eq!(std::fs::read(path).unwrap(), completed);
-    replay.db.drop_database().await.unwrap();
+    check_opening_confirmation(false).await;
 }
 
 #[tokio::test]
-async fn test_opening_receipt_confirms_a_mark_written_without_a_confirmation_flag() {
+async fn test_opening_receipt_confirms_a_sql_required_mark_after_restart() {
+    check_opening_confirmation(true).await;
+}
+
+async fn check_opening_confirmation(overflow: bool) {
     let Some(replay) = support::replay().await else {
         return;
     };
     let observation = discover(&replay, NOW).await;
-    let opening = make_enrollment(EnrollmentIntent::Create { observation }, 45);
-    let original = replay
-        .service
-        .handle(enrollment_request(&opening, NOW))
-        .await;
-    status(&original, 200);
-    let MarkRead::Mark(position) = replay.marks.read(&key().id()).await.unwrap() else {
-        panic!("missing opening mark");
-    };
-    let mut flat = serde_json::to_value(position).unwrap();
-    let anchor = flat["creation_anchor"]["bound"].as_object_mut().unwrap();
-    assert_eq!(anchor.remove("confirmed"), Some(json!(true)));
-    let service = service_with_restored_mark(&replay, &serde_json::to_vec(&flat).unwrap());
-    let read_position = || async {
-        let marks = MarkStore::open(replay.key_dir()).unwrap();
-        let MarkRead::Mark(mark) = marks.read(&key().id()).await.unwrap() else {
-            panic!("missing restored opening mark");
-        };
-        serde_json::to_value(mark).unwrap()
-    };
-    flat["creation_anchor"]["bound"]["confirmed"] = json!(false);
-    assert_eq!(read_position().await, flat);
+    let mut body = make_enrollment(EnrollmentIntent::Create { observation }, 43)
+        .body()
+        .clone();
+    if overflow {
+        let mut apps: Vec<_> = (0..=255).map(|n| [n; 16]).collect();
+        apps.sort_by_key(|id| pubky_switch_core::enc::zbase32_encode(id));
+        body.revoked_apps = Some(apps);
+    }
+    let opening = Enrollment::sign(&key(), body).unwrap();
 
+    // Hold the creating transaction at COMMIT so the saved bytes come from the
+    // service's reservation writer (Switch account binding 3).
+    sql(
+        &replay,
+        "CREATE FUNCTION wait_for_opening() RETURNS trigger LANGUAGE plpgsql AS \
+        $$ BEGIN PERFORM pg_advisory_xact_lock(792043); RETURN NEW; END $$; \
+        CREATE CONSTRAINT TRIGGER wait_for_opening AFTER INSERT ON accounts \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION wait_for_opening()",
+    )
+    .await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .unwrap();
+    let mut gate = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(792043)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let (original, reserved) = tokio::join!(
+        replay.service.handle(enrollment_request(&opening, NOW)),
+        async {
+            let reserved = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                std::fs::read(&path).unwrap()
+            })
+            .await
+            .expect("opening reservation");
+            gate.commit().await.unwrap();
+            reserved
+        }
+    );
+    conn.close().await.unwrap();
+    status(&original, 200);
+    let completed = std::fs::read(&path).unwrap();
+    let mut expected: Value = serde_json::from_slice(&reserved).unwrap();
+    assert_eq!(expected.get("recovery").is_none(), overflow);
+    let position = if overflow {
+        &mut expected
+    } else {
+        &mut expected["position"]
+    };
+    let flag = &mut position["creation_anchor"]["bound"]["confirmed"];
+    assert_eq!(*flag, false);
+    *flag = true.into();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&completed).unwrap(),
+        expected
+    );
+
+    let reopened = service_with_restored_mark(&replay, &reserved);
     let request = enrollment_request(&opening, NOW);
     let sent = support::Sent::of(&request);
-    let answer = service.handle(request).await;
+    let answer = reopened.handle(request).await;
     status(&answer, 200);
     assert_eq!(answer.body, original.body);
     assert!(support::signed_with(
@@ -503,13 +523,7 @@ async fn test_opening_receipt_confirms_a_mark_written_without_a_confirmation_fla
         &support::service_public(&replay),
         &sent
     ));
-    let confirmed = serde_json::to_value(position).unwrap();
-    assert_eq!(read_position().await, confirmed);
-    let path = replay.key_dir().join("accounts/marks").join(key().id());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
-        confirmed
-    );
+    assert_eq!(std::fs::read(path).unwrap(), completed);
     replay.db.drop_database().await.unwrap();
 }
 

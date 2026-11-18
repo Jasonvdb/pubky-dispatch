@@ -248,10 +248,12 @@ pub(crate) async fn take_copy(
 }
 
 /// Take a counterparty's copy `doc`, given by a source at `read_ms`, app clock, against
-/// `held`, the newest copy held ([`take_copy`]), and return the newest copy held after it.
-/// The copy held counts as read at `read_ms` only when the source gave it: a newer copy, or
-/// the one held again. An older copy leaves its read time as it was, so a source serving a
-/// copy rolled back doesn't make the one held count as fresh (Switch spec 4.3).
+/// `held`, the newest copy held and when it was last read ([`take_copy`]), and return the
+/// newest copy held after it, with when it was last read. The copy held counts as read at
+/// `read_ms` only when the source gave it: a newer copy, or the one held again, and then
+/// never earlier than a read of it that finished first. An older copy leaves its read time
+/// as it was, so a source serving a copy rolled back doesn't make the one held count as
+/// fresh (Switch spec 4.3).
 ///
 /// # Errors
 ///
@@ -260,16 +262,18 @@ pub(crate) async fn take_peer_read(
     reader: &Reader,
     tx: &mut Tx,
     doc: IdentityDoc,
-    held: Option<IdentityDoc>,
+    held: Option<(IdentityDoc, u64)>,
     read_ms: u64,
-) -> Result<Result<IdentityDoc, Equivocation>, AppError> {
-    let taken = match take_copy(reader, tx, &doc, held.as_ref(), read_ms).await? {
+) -> Result<Result<(IdentityDoc, u64), Equivocation>, AppError> {
+    let held_doc = held.as_ref().map(|(held, _)| held);
+    let taken = match take_copy(reader, tx, &doc, held_doc, read_ms).await? {
         Ok(taken) => taken,
         Err(equivocation) => return Ok(Err(equivocation)),
     };
     Ok(Ok(match (taken, held) {
-        (Taken::Newer, _) | (_, None) => doc,
-        (Taken::Same, Some(held)) => {
+        (Taken::Newer, _) | (_, None) => (doc, read_ms),
+        (Taken::Same, Some((held, held_ms))) => {
+            let read_ms = read_ms.max(held_ms);
             tx.put(
                 &key::ident_doc(&held.identity()),
                 &CachedDoc {
@@ -277,7 +281,7 @@ pub(crate) async fn take_peer_read(
                     fetched_ms: read_ms,
                 },
             )?;
-            held
+            (held, read_ms)
         }
         (Taken::Older, Some(held)) => held,
     }))

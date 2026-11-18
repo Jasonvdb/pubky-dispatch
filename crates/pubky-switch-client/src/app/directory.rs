@@ -769,7 +769,8 @@ impl App {
                 .unwrap_or_default();
             match source {
                 CopySource::Homeserver => reads.homeserver_ms = Some(read_ms),
-                CopySource::Switch { .. } => reads.switch_ms = Some(read_ms),
+                // A lookup that finished first keeps its later time.
+                CopySource::Switch { .. } => reads.switch_ms = reads.switch_ms.max(Some(read_ms)),
                 CopySource::Directory => {}
             }
             tx.put(&source_reads_key(pubky), &reads)?;
@@ -779,7 +780,6 @@ impl App {
         } else {
             held.as_ref().map_or(0, |(_, at)| *at)
         };
-        let held = held.map(|(doc, _)| doc);
         let taken = identity::take_peer_read(&reader, &mut tx, doc, held, fetched_ms).await?;
         let newest = match taken {
             Err(equivocation) => {
@@ -793,7 +793,7 @@ impl App {
                 )
                 .into());
             }
-            Ok(newest) => newest,
+            Ok((newest, _)) => newest,
         };
         self.commit(tx).await?;
         Ok(newest)

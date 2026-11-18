@@ -965,6 +965,82 @@ async fn test_identity_lookup_older_copy_leaves_the_read_time() {
     }
 }
 
+/// The mirror of the case above: the switch serves an older copy than the one held, later,
+/// with the Homeserver down. The switch was read, but the copy held was not read again, so
+/// no action is taken on it before another lookup.
+#[tokio::test]
+async fn test_identity_lookup_older_switch_copy_leaves_the_read_time() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    // The Homeserver publishes a version the switch doesn't hold.
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.alice.homeserver().publish(&newer).unwrap();
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, start);
+    // Twenty minutes on, only the switch answers, with the older copy.
+    p.clock.advance_ms(20 * MINUTE);
+    p.alice.homeserver().set_down(true);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
+    assert_eq!(found.switch_copy, SwitchCopy::Read);
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, start);
+    for by in [Initiator::User, Initiator::Automatic] {
+        assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
+    }
+}
+
+/// Two lookups whose switches give the same copy, the later one finished first: the earlier
+/// answer, finished last, leaves the later read time, and the copy may be acted on.
+#[tokio::test]
+async fn test_identity_lookup_split_earlier_answer_of_the_same_copy_keeps_the_later_read() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let earlier = first.switch.unwrap().await;
+    assert!(earlier.read());
+    p.clock.advance_ms(11 * MINUTE);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let later = second.switch.unwrap().await;
+    assert!(later.read());
+    let later_ms = later.read_ms();
+    wallet.finish_identity_lookup(later).await.unwrap();
+    let found = wallet.finish_identity_lookup(earlier).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.read_at_ms, later_ms);
+    assert_eq!(found.switch_read_ms, Some(later_ms));
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
+}
+
 #[tokio::test]
 async fn test_identity_lookup_split_waits_a_grace_then_takes_the_answer() {
     let p = Pair::new();

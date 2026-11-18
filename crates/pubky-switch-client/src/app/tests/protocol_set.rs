@@ -84,15 +84,17 @@ struct Named {
     member_for: Mutex<Option<MemberFor>>,
     /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
     assign_kind: Mutex<bool>,
-    /// More kinds it accepts under a certificate without `<name>_assign`.
-    unassigned_kinds: Mutex<Vec<String>>,
 }
 
 /// A [`Protocol::member_for`] of a test protocol.
 type MemberFor = fn(
     Option<&serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
     &AppCert,
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String>;
+) -> (
+    Option<serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+);
 
 fn named(name: &str) -> Named {
     Named {
@@ -287,9 +289,6 @@ impl Protocol for Named {
         if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
             kinds.push(format!("{}.assign", self.name));
         }
-        if !cert.holds_scope(&format!("{}_assign", self.name)) {
-            kinds.extend(self.unassigned_kinds.lock().unwrap().clone());
-        }
         kinds.extend(self.foreign.clone());
         kinds
     }
@@ -439,11 +438,15 @@ impl Protocol for Named {
     fn member_for(
         &self,
         member: Option<&serde_json::Map<String, serde_json::Value>>,
+        ask: crate::app::RecordExpiry,
         cert: &AppCert,
-    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    ) -> (
+        Option<serde_json::Map<String, serde_json::Value>>,
+        crate::app::RecordExpiry,
+    ) {
         match *self.member_for.lock().unwrap() {
-            Some(member_for) => member_for(member, cert),
-            None => Ok(member.cloned()),
+            Some(member_for) => member_for(member, ask, cert),
+            None => (member.cloned(), ask),
         }
     }
 

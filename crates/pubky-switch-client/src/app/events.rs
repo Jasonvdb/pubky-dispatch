@@ -525,72 +525,34 @@ pub enum AppEvent {
     /// A renewed certificate was seen in the feed; it is taken once the own
     /// `identity.json` lists it (Switch spec 3.2).
     RenewalSeen,
-    /// A renewed certificate the own `identity.json` lists wasn't taken: the registered
-    /// protocol `protocol` refused to give its member for it, or gave one the record check
-    /// refused ([`super::Protocol::member_for`]; a member removed is a valid answer), or,
-    /// with no protocol, the check refused the record for the certificate alone. Told once
-    /// per certificate and protocol (`cert/waits`). One refusal holds the certificate back
-    /// from every protocol of the app: the record and certificate are one.
-    ///
-    /// Nothing of it is signed or taken: the app keeps presenting the certificate and record
-    /// it holds, the read goes on, and the renewal is tried again at each later read, at most
-    /// every [`super::DOC_CACHE_MS`] for one found in the directory. A record change waits
-    /// unsent meanwhile ([`super::Publication::RenewalWaits`]), one at a time: the switch
-    /// refuses a record under the earlier certificate. Once another device of the app
-    /// delivers its record under the renewal, the app takes that record as it is, and a
-    /// change it kept is given up if a protocol still refuses
-    /// ([`AppEvent::RecordChangeDropped`]).
-    ///
-    /// The earlier certificate closes at its cutoff whatever the app does: at once for a
-    /// renewal that reduces it (Switch spec 3.2 "Reductions close at once"), otherwise once
-    /// the service holds a record under the renewal. Its own switch still serves the app,
-    /// which it checks against the renewal, but from then on recipients reject the app's
-    /// messages and other switches refuse its appends. With the protocol still refusing, the
-    /// move is the app's or the host's: the protocol removes or changes its member
-    /// ([`super::App::set_protocol_member`]) or is updated to give one; the signer renews
-    /// again with a certificate the protocol runs with; or the app is approved again (Switch
-    /// spec 3.2 step 3).
-    #[non_exhaustive]
-    RenewalWaits {
-        /// The renewed certificate's `issued_at`.
-        issued_at: u64,
-        /// The protocol's name; `None` when the record check refused the certificate alone.
-        protocol: Option<String>,
-        /// Its reason, without content.
-        reason: String,
-    },
     /// The app saved its renewed certificate and app record. Record delivery may still be pending.
     CertificateTaken {
         /// The new certificate's `issued_at`.
         issued_at: u64,
     },
-    /// The record the app signed with a renewed certificate it took dropped the member of
-    /// `protocol`, which isn't registered here, as when the same app runs other protocols on
-    /// another device: no protocol here could give that member for the certificate (Switch
-    /// spec 3.2 step 3). Told once, when the certificate is taken. Its protocol, where it
-    /// runs, writes it again when it next runs ([`super::App::set_protocol_member`]).
+    /// The record the app signed with a renewed certificate it took has no member of
+    /// `protocol` (Switch spec 3.2 step 3): the member its protocol gave for the certificate
+    /// broke the JSON rules or came with an ask that can't be signed, or the protocol isn't
+    /// registered here and the certificate lacks a scope or permission of the one before.
+    /// Its protocol, where it runs, writes it again ([`super::App::set_protocol_member`]).
     #[non_exhaustive]
     MemberDropped {
         /// The renewed certificate's `issued_at`.
         issued_at: u64,
-        /// The name of the protocol whose member was dropped.
+        /// The protocol's name.
         protocol: String,
     },
-    /// A record change the app kept under its earlier certificate, unsent while a protocol
-    /// refused the renewal ([`AppEvent::RenewalWaits`]), was given up when the app took the
-    /// record another device of the app delivered under that renewal, as that device signed
-    /// it: `protocol` still refused to give its member for the renewal, or, with no
-    /// protocol, the record check refused it (Switch spec 3.2 step 3). Each protocol whose
-    /// member the change set sets it again ([`super::App::set_protocol_member`]). A duty
-    /// event, for every protocol.
+    /// The app took a record of its own that another device signed, and `protocol`'s
+    /// member in it changed or is gone from the record it held (Switch spec 3.2 step 3,
+    /// 4.2): the protocol writes it again if it still wants it
+    /// ([`super::App::set_protocol_member`]). The ask of a member gone goes with it. A
+    /// duty event, for that protocol.
     #[non_exhaustive]
-    RecordChangeDropped {
+    MemberChanged {
         /// The duty event's ID.
         id: EventId,
-        /// The renewed certificate's `issued_at`.
-        issued_at: u64,
-        /// The protocol that refused; `None` when the record check refused the record.
-        protocol: Option<String>,
+        /// The protocol's name.
+        protocol: String,
     },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
@@ -1050,7 +1012,7 @@ impl AppEvent {
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
-            | Self::RecordChangeDropped { id, .. }
+            | Self::MemberChanged { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -1299,9 +1261,8 @@ pub(crate) enum Duty {
         issued_at: u64,
         refusal: CertificateRefusal,
     },
-    RecordChangeDropped {
-        issued_at: u64,
-        protocol: Option<String>,
+    MemberChanged {
+        protocol: String,
     },
 }
 
@@ -1469,14 +1430,7 @@ impl Duty {
                 issued_at,
                 refusal,
             },
-            Self::RecordChangeDropped {
-                issued_at,
-                protocol,
-            } => AppEvent::RecordChangeDropped {
-                id,
-                issued_at,
-                protocol,
-            },
+            Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
         }
     }
 }

@@ -50,6 +50,7 @@ use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
+use super::own_record::RecordExpiry;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
@@ -849,37 +850,27 @@ pub trait Protocol: Send + Sync {
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
 
-    /// The protocol's member of the app's record under `cert`, a certificate other than the
-    /// one the record carries, such as a renewal, from `member`, the one it carries now
-    /// (Switch spec 3.2 step 3, 4.2). The app asks every registered protocol before it signs
-    /// the record carrying `cert`, builds that record from the answers alone, and signs it
-    /// once, in the commit that takes `cert`: a member whose content `cert` no longer
-    /// covers, such as one that names a scope the certificate dropped, is changed or removed
-    /// here, and the earlier member is never signed under `cert`. `None` removes the member,
-    /// and its expiry ask with it. A member of a protocol not registered here is removed: no
-    /// protocol here can give it ([`super::AppEvent::MemberDropped`]); its protocol, where
-    /// it runs, writes it again when it next runs. Keeps `member` by default, so a protocol
-    /// whose member depends on the certificate's scopes overrides this.
-    ///
-    /// Pure and synchronous: it reads no store and writes nothing. It must not panic: a
-    /// panic unwinds through the read, as from any other method of the protocol.
-    ///
-    /// The record built is checked as [`super::App::set_protocol_member`] checks one.
-    ///
-    /// # Errors
-    ///
-    /// Why the protocol can't give a member for `cert`, without content; the same, named
-    /// for a protocol whose member it refuses, for a record the check refuses. Nothing is
-    /// signed: the app keeps presenting the certificate and record it holds, the renewal
-    /// stays owed and is tried again at a later read, and the host is told once
-    /// ([`super::AppEvent::RenewalWaits`]).
+    /// The protocol's member of the app's record, and its expiry ask, under `cert`, a
+    /// renewal the app takes, from `member` and `ask`, the ones it has now (Switch spec 3.2
+    /// step 3, 4.2). The app builds the record carrying `cert` from these answers alone and
+    /// signs it once, in the commit that takes `cert`: a member whose content `cert` no
+    /// longer covers, such as one naming a scope it dropped, is changed or removed here, and
+    /// the earlier member is never signed under `cert`. `None` removes the member and its
+    /// ask. A member that breaks the JSON rules (Switch wire 1.1), or an ask that can't be
+    /// signed, removes the member and its ask ([`super::AppEvent::MemberDropped`]). A member
+    /// of a protocol not registered here stays while `cert` holds every scope and
+    /// permission of the one before, and is removed otherwise, for its protocol to write
+    /// again where it runs. Keeps both by default, so a protocol whose member depends on
+    /// the certificate's scopes overrides this. Pure and synchronous: it reads no store,
+    /// writes nothing, and must not panic, which would unwind through the read.
     fn member_for(
         &self,
         member: Option<&Map<String, Value>>,
+        ask: RecordExpiry,
         cert: &AppCert,
-    ) -> Result<Option<Map<String, Value>>, String> {
+    ) -> (Option<Map<String, Value>>, RecordExpiry) {
         let _ = cert;
-        Ok(member.cloned())
+        (member.cloned(), ask)
     }
 
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:

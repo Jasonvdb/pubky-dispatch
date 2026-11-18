@@ -22,10 +22,9 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `IdentityRefresh::Unavailable` | The homeserver read failed in transport. Retry later. A failed document check instead raises an error. |
 | `AppEvent::IdentityUpdated` | The client took a newer own identity document. Refresh the displayed membership and provider from it. |
 | `AppEvent::RenewalSeen` | The feed supplied a candidate renewal of this app's certificate. Keep using the held certificate while waiting for the identity to list the new one. |
-| `AppEvent::RenewalWaits` | The named protocol refused to give its record member for a listed renewal, or gave one the record check refused; with no protocol named, the check refused the record for the certificate and kinds alone. Raised once per renewal and protocol. One refusal holds the renewal back from every protocol of the app, since the app has one record and one certificate. The app keeps presenting the held certificate and record, keeps reading, and keeps a record change unsent (`Publication::RenewalWaits`). If another device of the app takes the renewal, the app takes that device's record as it is (`AppEvent::RecordChangeDropped` if a kept change is given up). The earlier certificate still closes at its cutoff: at once for a renewal that removes a scope or permission or expires earlier, otherwise once the service holds a record under the renewal. The app's own service keeps serving it, but recipients then reject its messages and other services refuse its appends, so the move is then yours: have the protocol remove or change its member, update the protocol, have the signer issue a renewal the protocol accepts, or approve the app again. Show the reason to that protocol's owner. Each read retries, at most every 10 minutes for a renewal found in the directory. |
 | `AppEvent::CertificateTaken` | The client committed a new certificate and its app record. Use the new permissions. A record delivery can still be pending. |
-| `AppEvent::MemberDropped` | The record signed for a renewal the app took dropped the member of a protocol not registered on this device, as when the same app runs other protocols on another device. Raised once. That protocol writes its member again on the device that runs it, when it next runs. |
-| `AppEvent::RecordChangeDropped` | A duty event. A record change the app kept unsent while a protocol refused a renewal was given up when the app took the record another device delivered under that renewal; the named protocol, or the record check when none is named, still refused it. Each protocol whose member the change set sets it again. Acknowledge it once every protocol has. |
+| `AppEvent::MemberDropped` | The record signed for a renewal the app took has no member of the named protocol: the member it gave for the renewal broke the JSON rules or came with an expiry that can't be signed, or the protocol isn't registered on this device and the renewal removed a scope or permission. That protocol writes its member again on a device that runs it. |
+| `AppEvent::MemberChanged` | A duty event for the named protocol. The app took a record another device signed, and that protocol's member changed or is gone, with its expiry ask. Write the member again if it is still wanted, then acknowledge. |
 | `AppEvent::CertificateRefused` | A proposed certificate could not run with the registered protocols. Tell every owner, show the reason and retain the current certificate. Ask the signer for a compatible renewal. |
 | `CertificateRefusal::UnownedRoot` | No registered protocol owns a scope root in the renewal. Correct the renewal or register the missing protocol at restore. |
 | `CertificateRefusal::Protocol` | The named protocol rejected this certificate. Use its reason to request a corrected one. |
@@ -232,7 +231,7 @@ Keep the local batch ID returned in `AppError::Kept`. Look it up with `kept_batc
 
 ## Publishing the app's own record and rotating keys
 
-Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member under that certificate; the default keeps it, so a protocol whose member depends on its scopes overrides it, and must not panic. A member removed there drops its expiry ask; a protocol whose readers need an expiry sets its ask before it adds a member. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
+Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member and expiry ask under that certificate; the default keeps both, so a protocol whose member depends on its scopes overrides it, and must not panic. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
 
 | Case | What happened and what to do |
 |---|---|
@@ -243,7 +242,6 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 | `Publication::Owed` | A required read or put failed. Show that the service accepted the record but publication is pending. The client retries on reads or changes. |
 | `Publication::Unchecked` | No publication was outstanding, but the check of the public copy failed. Show its status as unconfirmed and check again. |
 | `Publication::AwaitingRead` | A shared-key app's public copy is absent. Another device may be leaving. Read the service to establish current membership before restoring it. |
-| `Publication::RenewalWaits` | The change is kept but not sent: a protocol refused its member for the renewal the identity lists (`AppEvent::RenewalWaits`). It goes, signed under the renewal, once that is taken. A later change replaces it. |
 | `AppEvent::RecordPublishFailed` | A required public write failed, or deleting the file during immediate or compromise leave failed. While active, publication remains owed. After leaving, ask the signer to clean up the public record. |
 | `AppEvent::Rotated` | The new receive key was registered. Update the encrypted backup and sync the new key to other devices. |
 | `AppEvent::RotationLost` | Another registration won this key number. The losing private key was discarded. Use the winning key if known, otherwise follow the sync or security notice. |
@@ -253,6 +251,14 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 | `AppEvent::KeysThrough` | The contiguous range for which the app holds its granted scope keys changed. Use the reported epoch to update readiness. |
 | `AppEvent::BundlePartSkipped` | A part failed a check, or the entire parts list could not be read. Show the reason and the range if available (a whole-list error carries `(0, 0)`). If `alert` is set, warn that the naming key differs and contact the signer. |
 | `AppEvent::FullBundleRequested` | The service accepted the request for a full key bundle. Wait for the signer to supply it and read again. |
+
+`member_for` takes and gives a protocol's expiry ask:
+
+| Ask | Meaning |
+|---|---|
+| `RecordExpiry::Never` | No expiry asked. |
+| `RecordExpiry::At` | An absolute expiry time. It must be later than the new record's time, or the member is dropped. |
+| `RecordExpiry::Lifetime` | A lifetime from each new record's time, capped by the identity's maximum record age. |
 
 `rotate` handles receive-key registration. `receive_key_numbers` shows the keys held. Use `fetch_key_bundle`, `keys_through`, `data_epoch` and `scope_key` for scope-key availability. Use `blind` for names derived under the app's `naming_key`. Treat keys and decrypted values as secrets. For devices sharing the same App ID, use authenticated private sync for `device_keys` and `take_device_keys`. Set `set_multi_device` on the giving device too. Sharing a cursor means missing history behind a checkpoint can require reconciliation with the other devices.
 

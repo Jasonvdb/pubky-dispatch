@@ -126,20 +126,19 @@ pub enum Publication {
     /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
     /// then.
     AwaitingRead,
-    /// The change is kept and waits unsent: the own `identity.json` lists a renewed
-    /// certificate a protocol refused its member for ([`super::AppEvent::RenewalWaits`]),
-    /// and the switch refuses a record under the earlier one. It goes, signed anew under
-    /// the renewed certificate, once that is taken (Switch spec 3.2 step 3). A later change
-    /// replaces it.
-    RenewalWaits,
 }
 
-/// A protocol's own expiry policy, resolved only for a newly signed record.
+/// A protocol's own expiry ask of the app's record, resolved only for a newly signed record
+/// (Switch spec 4.2): the record's `expires_at` is the earliest asked.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum RecordExpiry {
+pub enum RecordExpiry {
+    /// No expiry.
     Never,
+    /// An absolute time, Unix milliseconds.
     At(u64),
+    /// A lifetime in milliseconds from each newly signed record's `updated_at`, capped by
+    /// the identity's `record_max_age`.
     Lifetime(u64),
 }
 
@@ -151,7 +150,7 @@ impl RecordExpiry {
         }
     }
 
-    fn at(self, updated_at: u64, max_age: u64) -> Option<Option<u64>> {
+    pub(super) fn at(self, updated_at: u64, max_age: u64) -> Option<Option<u64>> {
         match self {
             Self::Never => Some(None),
             Self::At(at) => (at > updated_at && at <= MAX_TIME_MS).then_some(Some(at)),
@@ -576,9 +575,7 @@ impl App {
         self.read_back(&record)
     }
 
-    /// `record`, signed by the app, as the switch and its readers read it: one that doesn't
-    /// read back, such as one with a member outside the JSON rules (Switch wire 1.1), is
-    /// refused before it is kept.
+    /// `record`, signed by the app, as the switch and its readers read it.
     pub(super) fn read_back(&self, record: &AppRecord) -> Result<AppRecord, AppError> {
         AppRecord::verify(record.signed(), &self.state.meta.identity).map_err(refused)
     }

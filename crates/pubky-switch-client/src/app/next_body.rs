@@ -1,38 +1,22 @@
-//! The body of the app's next own record, and the rule on its certificate: each protocol's
-//! member is judged for the certificate a record carries before that record is signed
-//! (Switch spec 3.2, 4.2).
-//!
-//! The app signs its own records here only: nothing else in it calls [`AppRecord::sign`].
-//! A body to sign is one of two kinds:
-//!
-//! - a [`NextBody`], the body of the record the app holds ([`NextBody::held`]), under the
-//!   certificate that record carries, whose members were given for it; its members, kinds
-//!   and expiry may change before it is signed;
-//! - a [`CertBody`], a body under a certificate the record held doesn't carry: the first
-//!   record of a join, which has no member ([`CertBody::first`]), or the record held under
-//!   a renewed certificate, with only the members the registered protocols gave for it
-//!   ([`CertBody::judged`]). Nothing of it changes before it is signed.
-//!
-//! So the app signs no member under a certificate its protocol didn't give it for.
+//! The body of the app's next own record (Switch spec 3.2 step 3, 4.2). The app signs its
+//! own records only here: a [`NextBody`] is the record it holds, under that record's
+//! certificate, and a [`CertBody`] a record under a certificate the held one doesn't
+//! carry, the first at a join or the record held under a renewal with each member as its
+//! protocol gives it for the renewal. So no member is signed under a certificate its
+//! protocol didn't give it for.
 
+use pubky_switch_core::json::check_json;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppCert, AppRecord, AppRecordBody};
+use pubky_switch_core::scopes::holds;
 use serde_json::{Map, Value};
 
 use super::AppState;
+use super::own_record::{RecordExpiries, RecordExpiry};
 use super::protocols::ProtocolSet;
 
 /// The body of the app's next record under the certificate of the record it holds.
 pub(super) struct NextBody(AppRecordBody);
-
-/// A registered protocol that refused to give a member for a certificate, or whose member
-/// the record check refused ([`super::Protocol::member_for`]).
-pub(super) struct MemberRefusal {
-    /// The protocol's name; `None` when the record check refused the certificate alone.
-    pub(super) protocol: Option<String>,
-    /// Its reason, or the check's, without content.
-    pub(super) reason: String,
-}
 
 impl NextBody {
     /// The body of the record the app holds.
@@ -41,7 +25,6 @@ impl NextBody {
         Ok(Self(record.body().clone()))
     }
 
-    /// The body as it stands.
     pub(super) fn body(&self) -> &AppRecordBody {
         &self.0
     }
@@ -54,17 +37,14 @@ impl NextBody {
         };
     }
 
-    /// Set the kinds the record accepts.
     pub(super) fn set_accepts(&mut self, accepts: Vec<String>) {
         self.0.accepts = accepts;
     }
 
-    /// Set the record's `expires_at`.
     pub(super) fn set_expires_at(&mut self, expires_at: Option<u64>) {
         self.0.expires_at = expires_at;
     }
 
-    /// Sign the body as the app's record at `updated_at`, expiring at `expires_at`.
     pub(super) fn sign(
         self,
         keys: &AppKeys,
@@ -75,119 +55,88 @@ impl NextBody {
     }
 }
 
-/// The body of a record under a certificate the record held doesn't carry.
-pub(super) struct CertBody {
-    body: AppRecordBody,
-    /// The registered protocols that had a member and gave none for the certificate.
-    removed: Vec<String>,
-    /// The protocols not registered here whose member was dropped.
-    dropped: Vec<String>,
+/// A body under a certificate the record held doesn't carry; nothing of it changes before
+/// it is signed.
+pub(super) struct CertBody(AppRecordBody);
+
+/// [`CertBody::judged`]: the body, the expiry asks it is signed with, and the protocols
+/// whose member it dropped.
+pub(super) struct Judging {
+    pub(super) body: CertBody,
+    pub(super) asks: RecordExpiries,
+    pub(super) dropped: Vec<String>,
 }
 
 impl CertBody {
-    /// The first record of an app joining under `cert`: it accepts `accepts`, and no
-    /// protocol has a member yet.
+    /// The first record of an app joining under `cert`: no protocol has a member yet.
     pub(super) fn first(cert: &AppCert, accepts: Vec<String>, label: Option<String>) -> Self {
         let mut body = AppRecordBody::new(cert, accepts, 0);
         body.label = label;
-        Self {
-            body,
-            removed: Vec::new(),
-            dropped: Vec::new(),
-        }
+        Self(body)
     }
 
-    /// `held` under `cert`, a renewed certificate: `accepts` as the protocols give it for
-    /// `cert` ([`ProtocolSet::accepts`]), and as members only those the registered
-    /// protocols give for it ([`super::Protocol::member_for`]), each asked with the member it
-    /// has in `held`. A member of a protocol not registered here is dropped: no protocol
-    /// here can give it for `cert`. The first refusal, in registration order, is returned.
+    /// `held`, the record held under `old`, under `cert`, its renewal: `accepts` and each
+    /// registered protocol's member and expiry ask as it gives them for `cert`
+    /// ([`super::Protocol::member_for`]). A member that breaks the JSON rules (Switch wire
+    /// 1.1), or whose ask isn't `writable`, is dropped with its ask; `None` drops the ask.
+    /// A member of a protocol not registered here is kept when `cert` holds every scope and
+    /// permission of `old`, and dropped otherwise.
     pub(super) fn judged(
         held: NextBody,
+        old: &AppCert,
         cert: &AppCert,
         protocols: &ProtocolSet,
-    ) -> Result<Self, MemberRefusal> {
+        asks: &RecordExpiries,
+        writable: impl Fn(RecordExpiry) -> bool,
+    ) -> Judging {
         let mut body = held.0;
         body.cert = cert.signed().clone();
         body.accepts = protocols.accepts(cert);
         let carried = std::mem::take(&mut body.protocols);
-        let mut removed = Vec::new();
+        let mut judging_asks = RecordExpiries::new();
+        let mut dropped = Vec::new();
         for name in protocols.names() {
             let Some(protocol) = protocols.get(&name) else {
                 continue;
             };
-            let member = protocol
-                .member_for(carried.get(&name), cert)
-                .map_err(|reason| MemberRefusal {
-                    protocol: Some(name.clone()),
-                    reason,
-                })?;
-            match member {
-                Some(member) => {
-                    body.protocols.insert(name, member);
-                }
-                None if carried.contains_key(&name) => removed.push(name),
-                None => {}
+            let ask = asks.get(&name).copied().unwrap_or(RecordExpiry::Never);
+            let (member, ask) = protocol.member_for(carried.get(&name), ask, cert);
+            let Some(member) = member else {
+                continue;
+            };
+            let json = serde_json::to_vec(&member).ok();
+            if json.is_some_and(|json| check_json(&json).is_ok()) && ask.valid() && writable(ask) {
+                body.protocols.insert(name.clone(), member);
+                judging_asks.insert(name, ask);
+            } else {
+                dropped.push(name);
             }
         }
-        let dropped = carried
-            .into_keys()
-            .filter(|name| !protocols.contains(name))
-            .collect();
-        Ok(Self {
-            body,
-            removed,
-            dropped,
-        })
-    }
-
-    /// The registered protocols whose member the body no longer has.
-    pub(super) fn removed(&self) -> &[String] {
-        &self.removed
-    }
-
-    /// The protocols not registered here whose member the body no longer has.
-    pub(super) fn dropped(&self) -> &[String] {
-        &self.dropped
-    }
-
-    /// The body with `protocol`'s member alone, if it has one, or with no member for
-    /// `None`: it holds nothing the protocols didn't give for its certificate, so it may be
-    /// signed to check that member, or the certificate and kinds alone, apart from the
-    /// others.
-    pub(super) fn only(&self, protocol: Option<&str>) -> Option<Self> {
-        let mut body = self.body.clone();
-        body.protocols = match protocol {
-            Some(protocol) => {
-                let member = self.body.protocols.get(protocol)?;
-                [(protocol.to_owned(), member.clone())].into()
+        let covers = old.scopes().iter().all(|s| holds(cert.scopes(), s))
+            && old.permissions().iter().all(|p| cert.has_permission(*p));
+        for (name, member) in carried {
+            if !protocols.contains(&name) {
+                if covers {
+                    body.protocols.insert(name, member);
+                } else {
+                    dropped.push(name);
+                }
             }
-            None => Default::default(),
-        };
-        Some(Self {
-            body,
-            removed: Vec::new(),
-            dropped: Vec::new(),
-        })
+        }
+        Judging {
+            body: Self(body),
+            asks: judging_asks,
+            dropped,
+        }
     }
 
-    /// The length of `protocol`'s member as JSON, 0 for none.
-    pub(super) fn member_len(&self, protocol: &str) -> usize {
-        self.body
-            .protocols
-            .get(protocol)
-            .and_then(|member| serde_json::to_vec(member).ok())
-            .map_or(0, |bytes| bytes.len())
-    }
-
-    /// Sign the body as the app's record at `updated_at`, expiring at `expires_at`.
     pub(super) fn sign(
-        &self,
+        self,
         keys: &AppKeys,
         updated_at: u64,
         expires_at: Option<u64>,
     ) -> pubky_switch_core::Result<AppRecord> {
-        sign(keys, self.body.clone(), updated_at, expires_at)
+        sign(keys, self.0, updated_at, expires_at)
     }
 }
 

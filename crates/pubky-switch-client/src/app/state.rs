@@ -97,9 +97,6 @@ pub(crate) mod key {
     /// (`cert/refused`, [`super::events::AppEvent::CertificateRefused`]): never taken, and
     /// never refused with a second event.
     pub(crate) const CERT_REFUSED: &str = "cert/refused";
-    /// The listed renewal a protocol refused its member for, and that protocol
-    /// (`cert/waits`, [`super::RenewalWait`]).
-    pub(crate) const CERT_WAITS: &str = "cert/waits";
     pub(crate) const RECORD: &str = "record";
     pub(crate) const NAMING: &str = "naming";
     pub(crate) const BUNDLE: &str = "bundle";
@@ -617,19 +614,6 @@ impl std::fmt::Debug for PendingEffect {
             self.body.len()
         )
     }
-}
-
-/// `cert/waits`: the renewed certificate the own `identity.json` lists that the app didn't
-/// take because a registered protocol refused to give its member for it, or the record check
-/// refused the record (Switch spec 3.2 step 3), with the protocols the host was told of
-/// (`None` for the check alone). Bounded by the registered protocols; a refusal of another
-/// certificate replaces it, and taking a certificate deletes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RenewalWait {
-    /// The certificate's hash, in base64.
-    pub(crate) cert: String,
-    /// The protocols told of as refusing it.
-    pub(crate) told: BTreeSet<Option<String>>,
 }
 
 /// `pending/record`: the app's record, signed and kept before `app.put` is sent.

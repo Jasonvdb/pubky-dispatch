@@ -15,8 +15,9 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `Refusal::Approval` | Approval bytes failed a check against the request, keys or identity. Show the reason and return to the signer for a matching approval. |
 | `Refusal::NotJoined` | There is no app metadata for this ID. Check the ID and store, then offer restore or join. |
 | `Refusal::Certificate` | A registered protocol refused the app's own certificate during setup, load or restore. Show the protocol and its reason. Correct the registration or obtain suitable authority from the signer. |
-| `IdentityRefresh::Newer` | A homeserver read supplied a newer verified own document. Use the new version and its confirmation time. |
-| `IdentityRefresh::Current` | The homeserver confirmed the held version. Use the time the read completed. |
+| `IdentityRefresh::Newer` | The app took the newer verified Homeserver document. Its confirmation time is the start of the read. Check `identity_confirmation_age_ms` immediately before acting. |
+| `IdentityRefresh::Current` | The Homeserver served the exact document the app holds. Its confirmation time is the start of the read. Check `identity_confirmation_age_ms` immediately before acting. |
+| `IdentityRefresh::ClockMovedBack` | The device clock moved backwards during the read. The app took a newer verified document if `newer` is true and kept the same document otherwise. The current document awaits confirmation. Call `refresh_identity` again before an action that requires a current observation. |
 | `IdentityRefresh::Older` | The homeserver served an older version. Keep the higher version and repeat the lookup later for confirmation. |
 | `IdentityRefresh::Missing` | The homeserver has no own document. Check publication with the signer. This read gives no confirmation. |
 | `IdentityRefresh::Unavailable` | The homeserver read failed in transport. Retry later. A failed document check instead raises an error. |

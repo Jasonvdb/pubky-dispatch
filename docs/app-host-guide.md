@@ -144,6 +144,9 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 
 | Case | What happened and what to do |
 |---|---|
+| `AppendDecision::Send` | Send the imminent append. Each later attempt asks the owner again. |
+| `AppendDecision::Hold` | Keep the signed message queued for fresh observations on a later attempt. |
+| `AppendDecision::Withdraw` | Retire the outstanding delivery. Handle the duty notification, which can report an earlier possible delivery or the end of a resend. |
 | `DeliveryOrigin::Original` | The client has retained the original intent. Use this in the owning protocol's `may_send` check. The separate `resend` flag says whether a copy was accepted before. |
 | `DeliveryOrigin::Reconstructed` | The copy came from signed plaintext without a retained original intent. Apply the protocol's rules for reconstructed sends. |
 | `Delivery::Queued` | A pending resend also reads as queued. If the matching entry in the owning protocol's `queued_messages` has `resend: true`, the inbox accepted this message before. The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |

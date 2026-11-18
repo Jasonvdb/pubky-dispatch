@@ -1634,6 +1634,7 @@ async fn test_key_provider_loss_keeps_a_declared_enrollments_revocations() {
     let mut batch = WriteBatch::new();
     batch.put(&ns, b"state".to_vec(), b"{".to_vec()).unwrap();
     store.commit(batch).unwrap();
+    remove_file(&world, SIGNER_BACKUP_PATH);
     let shown = survey(&world, &store, &router).await.unwrap();
     assert!(shown.revoked.contains(&id));
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();

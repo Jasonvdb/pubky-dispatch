@@ -4,7 +4,9 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
-The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. Upcoming client additions are listed below.
+The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, record reads and collection pages used to discover uploaded records must cover the relevant upload. An earlier or unordered answer keeps the read or page outstanding across restart. A direct fresh lookup reports an inconclusive result when its answer predates an outstanding upload. A replay can learn the signed write from that earlier view and keep the divergence flag until a covering observation settles it. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. Upcoming client additions are listed below.
+
+A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
 **Caller changes already on main**
 
@@ -13,6 +15,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
+- **Client.** A pending collection listing records its upload position. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
 **Additions still to come**

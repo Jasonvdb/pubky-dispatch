@@ -187,6 +187,19 @@ impl std::str::FromStr for EventId {
 #[error("not an event ID")]
 pub struct EventIdError;
 
+/// A duty event kept and not acknowledged yet, as [`super::App::pending_duty_events`]
+/// inspects it, with the protocols it is for. Inspecting hands nothing over: until a report
+/// or a listing hands the event to the host, [`super::App::event_owners`] doesn't know it,
+/// so `owners` is how a host that gates one protocol on a pending duty tells whose it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingDuty {
+    /// The duty event.
+    pub event: AppEvent,
+    /// The protocols it is for that haven't acknowledged it yet, in registration order.
+    pub owners: Vec<String>,
+}
+
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]

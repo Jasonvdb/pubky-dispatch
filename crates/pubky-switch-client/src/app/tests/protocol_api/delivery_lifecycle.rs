@@ -77,7 +77,12 @@ async fn withdrawn_explicit_resend(with_record: bool, reachable: bool) {
     assert!(item.is_none_or(|item| !item.delivery_owed()));
     assert_eq!(undelivered(&wallet.take_events(), msg_id), [true]);
     assert_eq!(
-        undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+        undelivered(
+            &crate::app::tests::pending_events(&mut wallet)
+                .await
+                .unwrap(),
+            msg_id
+        ),
         [true]
     );
     assert!(
@@ -103,7 +108,12 @@ async fn withdrawn_explicit_resend(with_record: bool, reachable: bool) {
     let appends_before = inbox_appends(&p);
     let result = wallet.resend(msg_id).await;
     let fresh_notices = undelivered(&wallet.take_events(), msg_id);
-    let notices = undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id);
+    let notices = undelivered(
+        &crate::app::tests::pending_events(&mut wallet)
+            .await
+            .unwrap(),
+        msg_id,
+    );
     let delivery_owed = wallet
         .outbox_record(msg_id)
         .await
@@ -160,13 +170,13 @@ async fn test_explicit_resend_expired_record_message_keeps_one_notice() {
         );
         assert_eq!(undelivered(&wallet.take_events(), msg_id), [true]);
         assert_eq!(
-            undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+            undelivered(&crate::app::tests::pending_events(&mut wallet).await.unwrap(), msg_id),
             [true]
         );
         let appends_before = inbox_appends(&p);
         let result = wallet.resend(msg_id).await;
         let fresh_notices = undelivered(&wallet.take_events(), msg_id);
-        let notices = undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id);
+        let notices = undelivered(&crate::app::tests::pending_events(&mut wallet).await.unwrap(), msg_id);
         let delivery_owed = wallet
             .outbox_record(msg_id)
             .await
@@ -201,7 +211,9 @@ async fn test_explicit_resend_before_withdrawal_delivers_again() {
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
             assert!(
                 undelivered(
-                    &wallet.pending_duty_events().await.unwrap(),
+                    &crate::app::tests::pending_events(&mut wallet)
+                        .await
+                        .unwrap(),
                     signed.msg_id()
                 )
                 .is_empty()
@@ -237,7 +249,9 @@ async fn test_explicit_resend_from_restored_host_delivers_again() {
         assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 2);
         assert!(
             undelivered(
-                &restored.pending_duty_events().await.unwrap(),
+                &crate::app::tests::pending_events(&mut restored)
+                    .await
+                    .unwrap(),
                 signed.msg_id()
             )
             .is_empty()
@@ -278,7 +292,12 @@ async fn test_explicit_resend_terminal_mark_outlives_retained_plaintext() {
                         .outbox_record(msg_id)
                         .await
                         .is_some_and(|item| item.delivery_owed()),
-                    undelivered(&loaded.pending_duty_events().await.unwrap(), msg_id),
+                    undelivered(
+                        &crate::app::tests::pending_events(&mut loaded)
+                            .await
+                            .unwrap(),
+                        msg_id
+                    ),
                     undelivered(&loaded.take_events(), msg_id),
                 ),
                 (0, false, vec![true], Vec::<bool>::new()),
@@ -332,7 +351,12 @@ async fn test_explicit_resend_bounded_flush_keeps_terminal_record_mark() {
                     .outbox_record(msg_id)
                     .await
                     .is_some_and(|item| item.delivery_owed()),
-                undelivered(&wallet.pending_duty_events().await.unwrap(), msg_id),
+                undelivered(
+                    &crate::app::tests::pending_events(&mut wallet)
+                        .await
+                        .unwrap(),
+                    msg_id
+                ),
                 undelivered(&wallet.take_events(), msg_id),
             ),
             (0, false, vec![true], Vec::<bool>::new()),
@@ -875,7 +899,9 @@ async fn test_withdraw_message_commits_retained_copies_with_its_notice() {
                 );
                 assert_eq!(
                     undelivered(
-                        &loaded.pending_duty_events().await.unwrap(),
+                        &crate::app::tests::pending_events(&mut loaded)
+                            .await
+                            .unwrap(),
                         signed.msg_id()
                     ),
                     if applied { vec![false] } else { vec![] }
@@ -889,7 +915,9 @@ async fn test_withdraw_message_commits_retained_copies_with_its_notice() {
                 );
                 assert_eq!(
                     undelivered(
-                        &loaded.pending_duty_events().await.unwrap(),
+                        &crate::app::tests::pending_events(&mut loaded)
+                            .await
+                            .unwrap(),
                         signed.msg_id()
                     ),
                     [false]
@@ -1015,7 +1043,9 @@ async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retent
         assert!(wallet.held_messages("sample").await.unwrap().is_empty());
         assert_eq!(
             undelivered(
-                &wallet.pending_duty_events().await.unwrap(),
+                &crate::app::tests::pending_events(&mut wallet)
+                    .await
+                    .unwrap(),
                 signed.msg_id()
             ),
             [false]
@@ -1033,7 +1063,9 @@ async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retent
         );
         assert_eq!(
             undelivered(
-                &wallet.pending_duty_events().await.unwrap(),
+                &crate::app::tests::pending_events(&mut wallet)
+                    .await
+                    .unwrap(),
                 signed.msg_id()
             ),
             [false]
@@ -1194,7 +1226,9 @@ async fn terminal_delivery_keeps_unrelated_work(terminal: TerminalDelivery) {
     assert_eq!(wallet.held_messages("sample").await.unwrap().len(), 1);
     assert_eq!(
         undelivered(
-            &wallet.pending_duty_events().await.unwrap(),
+            &crate::app::tests::pending_events(&mut wallet)
+                .await
+                .unwrap(),
             signed.msg_id()
         ),
         if matches!(
@@ -1502,7 +1536,9 @@ async fn test_delivery_lifecycle_expired_resend_keeps_its_record_without_requeue
         assert!(!item.delivery_owed());
         assert_eq!(
             undelivered(
-                &wallet.pending_duty_events().await.unwrap(),
+                &crate::app::tests::pending_events(&mut wallet)
+                    .await
+                    .unwrap(),
                 signed.msg_id()
             ),
             [true]
@@ -1608,7 +1644,9 @@ async fn test_delivery_lifecycle_expiry_commits_producers_with_its_notice() {
             );
             assert_eq!(
                 undelivered(
-                    &loaded.pending_duty_events().await.unwrap(),
+                    &crate::app::tests::pending_events(&mut loaded)
+                        .await
+                        .unwrap(),
                     signed.msg_id()
                 ),
                 if applied { vec![false] } else { vec![] }

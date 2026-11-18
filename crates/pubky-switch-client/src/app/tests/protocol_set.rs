@@ -1065,6 +1065,32 @@ async fn test_protocol_set_join_refuses_a_certificate_a_protocol_refuses() {
     assert!(p.store.is_empty(&ns));
 }
 
+/// Inspecting the kept duties names each one's owners, so a host gating `chat` on a pending
+/// duty sees that it is `tasks`'s alone, without taking it from the reports.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_names_its_owners() {
+    let p = Pair::with(
+        Named {
+            huge_missed: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(1, now, now);
+    read(&mut app, 2).await;
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert!(matches!(duty.event, AppEvent::LocalWritesRefused { .. }));
+    assert_eq!(duty.owners, ["tasks"]);
+}
+
 #[tokio::test]
 async fn test_protocol_set_duty_event_stays_for_its_owner_until_it_acknowledges() {
     let p = Pair::with(

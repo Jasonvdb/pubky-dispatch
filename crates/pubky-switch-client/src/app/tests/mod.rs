@@ -58,6 +58,16 @@ use crate::testing::{
 pub(crate) const START: u64 = crate::testing::START_MS;
 
 /// A fixed secret of the test seeds.
+/// The duty events [`App::pending_duty_events`] inspects, without their owners.
+pub(crate) async fn pending_events(app: &mut App) -> Result<Vec<super::AppEvent>, super::AppError> {
+    Ok(app
+        .pending_duty_events()
+        .await?
+        .into_iter()
+        .map(|pending| pending.event)
+        .collect())
+}
+
 pub(crate) fn seed(label: &str) -> [u8; 32] {
     Seeds::default().seed(label)
 }

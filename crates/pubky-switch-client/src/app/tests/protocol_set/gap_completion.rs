@@ -131,7 +131,7 @@ async fn test_protocol_gap_replacement_failure_invalidates_the_previous_copy() {
             Err(AppError::Store(StoreError::Unavailable))
         ));
         // A public local read reloads automatically after a failed commit.
-        c.app.pending_duty_events().await.unwrap();
+        crate::app::tests::pending_events(&mut c.app).await.unwrap();
         assert!(!c.app.lists_copy().await.unwrap().deny.contains(&c.denied));
         assert!(!c.app.reader().exists(LISTS_AT).await.unwrap());
         assert!(!c.app.reader().exists(DENY_GAP).await.unwrap());
@@ -170,7 +170,7 @@ async fn test_protocol_gap_completion_survives_every_commit_failure() {
             let _ = c.app.receive(None).await;
             assert!(store.commits() >= nth, "{fault:?} was reached");
             if !store.stopped() {
-                c.app.pending_duty_events().await.unwrap();
+                crate::app::tests::pending_events(&mut c.app).await.unwrap();
                 c.assert_boundary().await;
             }
             c.reload().await;

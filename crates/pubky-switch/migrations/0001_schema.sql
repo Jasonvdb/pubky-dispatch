@@ -87,6 +87,9 @@ CREATE TABLE state_history (
     account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     state_version BIGINT NOT NULL CHECK (state_version > 0),
     state_tag BYTEA NOT NULL CHECK (octet_length(state_tag) = 16),
+    -- Computed from the actual opening contents before the first changed write, then
+    -- inherited from the exact preceding count and tag (Switch account binding 3).
+    creation_anchor BYTEA CHECK (octet_length(creation_anchor) = 32),
     PRIMARY KEY (account_id, state_version)
 );
 

@@ -116,24 +116,79 @@ pub(super) async fn contents(
     Ok(anchor)
 }
 
+/// Recover the SQL witness before this transaction can change the opening contents.
+/// The unique creating receipt supplies the original store and document hash. The mark
+/// remains the independent authority for using the resulting commitment.
+pub(super) async fn opening_origin(
+    conn: &mut PgConnection,
+    head: &super::AccountHead,
+    stored: &[u8],
+) -> Result<Option<[u8; 32]>, StoreError> {
+    let receipt: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT store_id, enrollment_hash FROM enrollment_answers \
+         WHERE account_id = $1 AND creating AND created_at_ms = $2",
+    )
+    .bind(&head.id)
+    .bind(super::to_db(head.created_at_ms, "created_at_ms")?)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((store, enrollment)) = receipt else {
+        return Ok(None);
+    };
+    let (Ok(store), Ok(enrollment)) = (store.try_into(), enrollment.try_into()) else {
+        return Ok(None);
+    };
+    match contents(conn, &head.id, store, enrollment).await {
+        Ok(origin) => Ok((origin.as_slice() == stored).then_some(origin)),
+        Err(
+            StoreError::Corrupt(_)
+            | StoreError::OutOfRange(_)
+            | StoreError::Database(sqlx::Error::RowNotFound),
+        ) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl AccountTxn {
-    /// Check a pristine creating receipt against the durable contents and the mark
-    /// outside SQL. Later receipts have their own covered position.
-    pub(crate) async fn matches_creation_anchor(
+    /// Verify the opening receipt against the creation and actual retained positions.
+    /// The account's common verdict separately checks the chain at the mark.
+    pub(crate) async fn covers_opening_receipt(
         &mut self,
         store_id: [u8; 16],
         enrollment: [u8; 32],
-        marked: [u8; 32],
+        mark: &crate::marks::AccountMark,
     ) -> Result<bool, StoreError> {
-        let id = self.head().id.clone();
-        let stored: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT creation_anchor FROM accounts WHERE id = $1")
-                .bind(&id)
-                .fetch_one(self.conn())
-                .await?;
-        if stored.as_deref() != Some(marked.as_slice()) || marked == [0; 32] {
+        let head = self.head();
+        let Some(anchor) = mark.creation_anchor.for_creation(head.created_at_ms) else {
+            return Ok(false);
+        };
+        if mark.created_at_ms != head.created_at_ms
+            || self.creation_origin() != Some(anchor)
+            || mark.state_version > head.state_version
+        {
             return Ok(false);
         }
-        Ok(contents(self.conn(), &id, store_id, enrollment).await? == marked)
+        if head.state_version == 0 && (mark.generation != 0 || head.last_seq != 0) {
+            return Ok(false);
+        }
+        let id = head.id.clone();
+        // A positive marked position must carry this same origin at its tagged history
+        // row. A zero mark can attest to the immutable opening receipt only; it never
+        // establishes coverage of later exclusion changes.
+        let covered: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM enrollment_answers WHERE account_id = $1 AND \
+             enrollment_hash = $2 AND store_id = $3 AND creating) AND ($4::bigint = 0 OR EXISTS( \
+             SELECT 1 FROM state_history WHERE account_id = $1 AND state_version = $4 \
+             AND state_tag = $5 AND creation_anchor = $6))",
+        )
+        .bind(id)
+        .bind(enrollment.as_slice())
+        .bind(store_id.as_slice())
+        .bind(super::to_db(mark.state_version, "state_version")?)
+        .bind(mark.state_tag.as_slice())
+        .bind(anchor.as_slice())
+        .fetch_one(self.conn())
+        .await?;
+        Ok(covered)
     }
 }

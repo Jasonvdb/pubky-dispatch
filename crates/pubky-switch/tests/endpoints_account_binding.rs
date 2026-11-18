@@ -387,6 +387,134 @@ async fn test_fresh_enrollment_receipt_verifies_the_initial_exclusions_after_res
 }
 
 #[tokio::test]
+async fn test_first_counted_change_checks_the_actual_opening_contents() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let mut body = make_enrollment(EnrollmentIntent::Create { observation }, 91)
+        .body()
+        .clone();
+    body.revoked_apps = Some(vec![[9; 16]]);
+    let opening = Enrollment::sign(&key(), body).unwrap();
+    let answer = replay
+        .service
+        .handle(enrollment_request(&opening, NOW))
+        .await;
+    status(&answer, 200);
+    sql(
+        &replay,
+        "CREATE TABLE saved_opening_id AS TABLE kept_app_ids; DELETE FROM kept_app_ids",
+    )
+    .await;
+    let mut txn = replay.db.store().begin(&key().id()).await.unwrap().unwrap();
+    txn.next_seq().unwrap();
+    txn.commit().await.unwrap();
+    // Restoring the original exclusion later cannot give the counted change an origin it
+    // did not inherit, even though the original SQL and mark commitments are intact.
+    sql(
+        &replay,
+        "INSERT INTO kept_app_ids SELECT * FROM saved_opening_id",
+    )
+    .await;
+    let request = enrollment_request(&opening, NOW);
+    let sent = support::Sent::of(&request);
+    let refused = replay.service.handle(request).await;
+    status(&refused, 503);
+    assert!(support::signed_with(
+        &refused,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert!(support::header_text(&refused, header::HEAD).is_none());
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let (opening, created) = create(&replay, NOW, 83).await;
+    let original = replay
+        .service
+        .handle(enrollment_request(&opening, NOW))
+        .await;
+    status(&original, 200);
+    let first: SignedDoc = serde_json::from_value(
+        support::named(
+            &support::vectors("documents.json")["documents"],
+            "alice identity.json, first delivery (version 1)",
+        )["signed"]
+            .clone(),
+    )
+    .unwrap();
+    let deliver = |doc: SignedDoc, prev| {
+        signed(
+            "PUT",
+            &path("identity"),
+            http::IdentityDelivery {
+                identity: doc,
+                prev,
+            }
+            .to_json(),
+            Some(created),
+            NOW,
+        )
+    };
+    status(
+        &replay.service.handle(deliver(first.clone(), None)).await,
+        200,
+    );
+    let initial = pubky_switch_core::records::IdentityDoc::verify(&first, &key().public()).unwrap();
+    let mut body = initial.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.recovery_from = Some(initial.generation());
+    let second = pubky_switch_core::records::IdentityDoc::sign(&key(), body).unwrap();
+    status(
+        &replay
+            .service
+            .handle(deliver(second.signed().clone(), Some(initial.hash())))
+            .await,
+        200,
+    );
+    let mark_path = replay.key_dir().join("accounts/marks").join(key().id());
+    let mark_bytes = std::fs::read(mark_path).unwrap();
+    let mark: pubky_switch::marks::AccountMark = serde_json::from_slice(&mark_bytes).unwrap();
+    assert_eq!(mark.generation, 2);
+    assert!(mark.state_version > 0 && mark.state_tag != [0; 16]);
+    let restored = service_with_restored_mark(&replay, &mark_bytes);
+    let retry = || enrollment_request(&opening, NOW);
+    let request = retry();
+    let sent = support::Sent::of(&request);
+    let covered = restored.handle(request).await;
+    status(&covered, 200);
+    assert!(support::signed_with(
+        &covered,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(covered.body, original.body);
+
+    // Keep the count, tag and chain, changing only the retained origin at the covered position.
+    sql(&replay,"CREATE TABLE saved_origins AS TABLE state_history; UPDATE state_history SET creation_anchor = NULL").await;
+    let request = retry();
+    let sent = support::Sent::of(&request);
+    let unavailable = restored.handle(request).await;
+    status(&unavailable, 503);
+    assert!(support::signed_with(
+        &unavailable,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert!(support::header_text(&unavailable, header::HEAD).is_none());
+    sql(&replay,"UPDATE state_history h SET creation_anchor = s.creation_anchor FROM saved_origins s WHERE h.account_id = s.account_id AND h.state_version = s.state_version").await;
+    assert_eq!(restored.handle(retry()).await.body, original.body);
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_account_binding_saved_delivery_cannot_activate_recreated_account() {
     let Some(replay) = support::replay().await else {
         return;

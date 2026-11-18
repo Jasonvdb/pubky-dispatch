@@ -51,12 +51,14 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
 pub async fn signer_retries(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
-    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let store = Arc::new(crate::store::KeptCommits::new());
+    let env = world.signer_env(&alice, store.clone())?;
     let mut signer = Signer::create(env, world.keyring(&alice)?, ORIGIN).await?;
 
     world.lose_answer("POST", "/v1/enroll");
     let lost = signer.resume().await;
     world.outcome("the enrollment's answer was lost", &ended(&lost));
+    let pending_enrollment = store.as_of(store.commits())?;
     world.advance_ms(STEP_MS);
     world.unreachable("PUT", "/identity");
     let unreached = signer.resume().await;
@@ -68,6 +70,31 @@ pub async fn signer_retries(world: &World) -> FlowResult {
     signer.resume().await?;
     world.outcome("enrolled and delivered", &status(&signer)?);
     world.advance_ms(STEP_MS);
+
+    // The saved install still holds its opening enrollment. The delivery has since given
+    // the account a positive count and head (Switch account binding 3).
+    let from = world.trace().lines.len();
+    let env = world.signer_env(&alice, Arc::new(pending_enrollment))?;
+    let mut restored = Signer::open(env, world.keyring(&alice)?).await?;
+    world.unreachable("PUT", "/identity");
+    let resumed = restored.resume().await;
+    let confirmed = world.trace().lines.iter().skip(from).any(|line| {
+        line.label == "{alice} POST /v1/enroll"
+            && line
+                .facts
+                .get("status")
+                .is_some_and(|status| status == "200")
+    });
+    if !confirmed {
+        return Err(
+            "the saved opening enrollment did not recover its receipt after delivery".into(),
+        );
+    }
+    world.outcome(
+        "the restored signer recovered its opening receipt",
+        &ended(&resumed),
+    );
+    drop(restored);
 
     // An approval whose delivery the switch took, and whose answer was lost.
     let asking = Asking::new(world.app_keys(&alice, "wallet")?)?;

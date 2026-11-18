@@ -25,9 +25,17 @@ use crate::testing::ScriptError;
 /// A generation and the service key that verifies its proofs (Switch wire 3.3).
 type GenerationKey = (u64, [u8; 32]);
 
+#[derive(Clone, Copy, Debug)]
+struct OpeningEnrollment {
+    enrollment_hash: [u8; 32],
+    store_id: [u8; 16],
+    digest: [u8; 32],
+}
+
 /// What an enrolled account holds of its enrollments (Switch wire 3.7).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Enrolled {
+    opening: Option<OpeningEnrollment>,
     /// The limits the answers announce.
     pub(crate) limits: Limits,
     /// The answer to each enrollment taken, by enrollment hash, so the same enrollment again
@@ -203,7 +211,7 @@ impl Inner {
     /// The scripted store's fresh enrollment contents (Switch account binding 3).
     fn opening_anchor(
         &self,
-        enrollment: &Enrollment,
+        enrollment_hash: [u8; 32],
         store_id: [u8; 16],
     ) -> Result<Option<[u8; 32]>, ScriptError> {
         let max_rows = pubky_switch_core::records::MAX_ENROLLMENT_BYTES / 16;
@@ -233,7 +241,7 @@ impl Inner {
             store_id,
             self.identity.public(),
             self.created_at_ms,
-            enrollment.hash(),
+            enrollment_hash,
             self.tip.generation,
             self.doc.as_ref().map(IdentityDoc::hash),
             self.enrolled.as_ref().map(|e| e.limits),
@@ -244,6 +252,44 @@ impl Inner {
         Ok(Some(pubky_switch_core::enc::hash(&serde_json::to_vec(
             &facts,
         )?)))
+    }
+
+    /// Read the SQL-side origin before any changes to the simulated transaction.
+    pub(super) fn opening_origin(&self) -> Option<[u8; 32]> {
+        let opening = self.enrolled.as_ref()?.opening?;
+        let found = if self.state_version == 0 && self.seq == 0 {
+            self.opening_anchor(opening.enrollment_hash, opening.store_id)
+                .ok()?
+        } else {
+            let (tag, stored) = self.state_history.get(&self.state_version)?;
+            (*tag == self.state_tag).then_some(*stored).flatten()
+        };
+        found.filter(|found| *found == opening.digest)
+    }
+
+    fn covers_opening_receipt(&self, hash: [u8; 32], receipt: &EnrollmentReceipt) -> bool {
+        let Some(opening) = self.enrolled.as_ref().and_then(|enrolled| enrolled.opening) else {
+            return false;
+        };
+        let super::marks::MarkSlot::At(mark) = self.marks.slot else {
+            return false;
+        };
+        if opening.enrollment_hash != hash
+            || opening.store_id != receipt.store_id
+            || self.creation_origin != Some(opening.digest)
+            || mark.created_at_ms != receipt.created
+            || mark.creation_anchor != Some((receipt.created, opening.digest))
+            || mark.state_version > self.state_version
+            || (self.state_version == 0 && (self.seq != 0 || mark.generation != 0))
+        {
+            return false;
+        }
+        matches!(
+            self.judge(),
+            super::marks::Verdict::Staged | super::marks::Verdict::Healthy
+        ) && (mark.state_version == 0
+            || self.state_history.get(&mark.state_version)
+                == Some(&(mark.state_tag, self.creation_origin)))
     }
 
     /// `POST /v1/enroll` after authentication and the current locked judgement (Switch
@@ -274,20 +320,13 @@ impl Inner {
             if matches!(
                 enrollment.body().intent,
                 pubky_switch_core::records::EnrollmentIntent::Create { .. }
-            ) && self.state_version == 0
-                && self.seq == 0
+            ) && !self.covers_opening_receipt(enrollment.hash(), &answer)
             {
-                let observed = self.opening_anchor(enrollment, store_id)?;
-                if !matches!(self.marks.slot, super::marks::MarkSlot::At(mark)
-                    if mark.created_at_ms == answer.created && mark.generation == 0 && mark.state_version == 0
-                    && observed.is_some_and(|digest| mark.creation_anchor == Some((answer.created, digest))))
-                {
-                    return Ok(bad(
-                        ErrorCode::Unavailable,
-                        "account binding: fresh enrollment contents unavailable",
-                        Value::Null,
-                    ));
-                }
+                return Ok(bad(
+                    ErrorCode::Unavailable,
+                    "account binding: fresh enrollment contents unavailable",
+                    Value::Null,
+                ));
             }
             return Ok((200, answer.answer));
         }
@@ -377,6 +416,7 @@ impl Inner {
         // The account's creation time, fixed for the account (Switch wire 3.7).
         let created = self.created_at_ms;
         let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
+            opening: None,
             limits,
             answers: HashMap::new(),
         });
@@ -409,7 +449,15 @@ impl Inner {
             enrollment.body().intent,
             pubky_switch_core::records::EnrollmentIntent::Create { .. }
         ) {
-            let anchor = self.opening_anchor(enrollment, store_id)?;
+            let anchor = self.opening_anchor(enrollment.hash(), store_id)?;
+            if let Some(held) = &mut self.enrolled {
+                held.opening = anchor.map(|digest| OpeningEnrollment {
+                    enrollment_hash: enrollment.hash(),
+                    store_id,
+                    digest,
+                });
+            }
+            self.creation_origin = anchor;
             if let super::marks::MarkSlot::At(mark) = &mut self.marks.slot {
                 mark.creation_anchor = anchor.map(|digest| (created, digest));
             }
@@ -556,6 +604,10 @@ impl Inner {
         fresh.marks = std::mem::take(&mut self.marks);
         fresh.created_at_ms = self.created_at_ms;
         fresh.enrolled = self.enrolled.take();
+        fresh.creation_origin = self.creation_origin;
+        fresh.state_version = self.state_version;
+        fresh.state_tag = self.state_tag;
+        fresh.tags_made = self.tags_made;
         fresh.enroll_limits = self.enroll_limits;
         // The upload limits are the service's configuration, and its upload counts are kept
         // by account and app, which a recovery in place doesn't forget (Switch wire 9.4).

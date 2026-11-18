@@ -49,6 +49,7 @@ pub(crate) struct ItemsProtocol {
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
     observe_deletes: std::sync::atomic::AtomicBool,
+    end_mark_at_delete: std::sync::atomic::AtomicBool,
     observation_unavailable: std::sync::atomic::AtomicBool,
     /// Whether a delete fails a check of the protocol's own, seen or not.
     pub(crate) refuses_deletes: std::sync::atomic::AtomicBool,
@@ -143,6 +144,13 @@ impl Protocol for ItemsProtocol {
             .unwrap()
             .clone()
             .unwrap_or_else(|| vec![items()])
+    }
+
+    fn mark_ends_at_delete(&self, collection: &str) -> bool {
+        collection == items().name
+            && self
+                .end_mark_at_delete
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -11365,6 +11373,135 @@ async fn seen_then_deleted(s: &Setup) -> (App, App, RecordTarget, [u8; 32]) {
     let key = wallet.record_key(&target).unwrap();
     wallet.delete_record(&target, vec![]).await.unwrap();
     (wallet, phone, target, key)
+}
+
+/// Both the author and an app reading a verified deletion accept a new first value
+/// after reloading. A live write that drops a seen item still fails its ordinary check.
+#[tokio::test]
+async fn test_record_lifetime_ends_for_the_deleting_app_and_its_reader() {
+    let s = Setup::new();
+    s.protocol
+        .end_mark_at_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (wallet, mut phone, target, key) = seen_then_deleted(&s).await;
+    let wallet_id = wallet.app_id();
+    assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    assert!(matches!(phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+    assert_eq!(phone.record_seen(&key).await.unwrap(), None);
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), wallet_id)
+        .await
+        .unwrap();
+    phone
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if ids(r.content.value()) == ["b"]));
+    phone
+        .put_record(&target, &value(&["c"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::Refused,
+            ..
+        }
+    ));
+    assert_eq!(
+        ids(wallet.record_seen(&key).await.unwrap().as_deref()),
+        ["b"]
+    );
+}
+
+#[tokio::test]
+async fn test_record_lifetime_keeps_its_mark_through_an_unreadable_value_and_reload() {
+    let s = Setup::new();
+    s.protocol
+        .end_mark_at_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (wallet, _phone, target, key) = second_device_write_unopened(&s).await;
+    let id = wallet.app_id();
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert!(
+        wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .waits_for_key()
+    );
+    assert_eq!(
+        ids(wallet.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x"]
+    );
+    wallet.receive(None).await.unwrap();
+    assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if ids(r.content.value()) == ["a", "x", "y"]));
+    assert_eq!(
+        ids(wallet.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "x", "y"]
+    );
+}
+
+#[tokio::test]
+async fn test_record_lifetime_commits_the_deleted_value_and_mark_together() {
+    let s = Setup::new();
+    s.protocol
+        .end_mark_at_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let store = Arc::new(FailingRecordCommit {
+        inner: MemoryStore::new(),
+        armed: std::sync::Mutex::new(None),
+    });
+    let env = || s.env_on(Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut wallet = App::join(
+        env(),
+        s.protocol.clone(),
+        World::config(),
+        s.approve(&app_keys("wallet"), &ALL_PERMISSIONS),
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let key = wallet.record_key(&target).unwrap();
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    wallet.read_record_fresh(&target).await.unwrap();
+    phone.delete_record(&target, vec![]).await.unwrap();
+    *store.armed.lock().unwrap() = Some(0);
+    assert!(wallet.read_record_fresh(&target).await.is_err());
+    let id = wallet.app_id();
+    drop(wallet);
+    let mut wallet = App::load(env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["a"]
+    );
+    assert_eq!(
+        ids(wallet.record_seen(&key).await.unwrap().as_deref()),
+        ["a"]
+    );
+    assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+    assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
 }
 
 /// The mark after an own delete is the one before it, not a mark of nothing.

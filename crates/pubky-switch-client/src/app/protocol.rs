@@ -1159,6 +1159,14 @@ pub trait Protocol: Send + Sync {
         None
     }
 
+    /// Whether the seen mark of records in this collection lasts until a verified
+    /// current deletion (Switch spec 8.2). The client clears it in the same commit
+    /// that takes the deletion. A live unreadable value keeps its previous mark.
+    fn mark_ends_at_delete(&self, collection: &str) -> bool {
+        let _ = collection;
+        false
+    }
+
     /// Observe another app's verified deletion of a record in this collection. The
     /// callback follows the regression check and sees the evidence from before the
     /// delete. Its bounded local writes commit under this protocol's namespace.

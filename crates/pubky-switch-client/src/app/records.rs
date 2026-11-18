@@ -3017,6 +3017,10 @@ impl App {
             let selects_base = current.is_some() && (matches!(placement.base, Order::Newer | Order::Equal)
                 || (accepted.current_at.viewed() && held.as_ref().is_some_and(|h|
                     accepted.write.version.version == h.base_write().0)));
+            let lifetime_mark = accepted.collection.policy.permanent.is_none() && owner.is_some_and(|owner|
+                owner.protocol.mark_ends_at_delete(&accepted.collection.name));
+            let ends_mark = lifetime_mark && selects_base && accepted.write.version.authenticated
+                && !accepted.doubtful && accepted.content == RecordContent::Deleted;
             if selects_base && let Some(at) = current {
                 self.retire_deletion_receipts(key, Some((accepted.write.applied.item_hash, RecordVersion::new(at.generation, at.seq))), tx)?;
             }
@@ -3041,6 +3045,10 @@ impl App {
                         } else {
                             upgraded.follow = None;
                         }
+                    }
+                    // A fresh proof may be the first evidence that a held delete was current.
+                    if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
+                        tx.delete(&seen_key(&key))?;
                     }
                     if upgraded != *held {
                         put_held(tx, &key, &upgraded)?;
@@ -3187,8 +3195,8 @@ impl App {
             // another device's at a data epoch whose key it hasn't fetched: the mark is set from
             // its value when the key comes and the record reopens (`reopen_unreadable`), which
             // takes it here again. Any other own write marks from the value it wrote.
-            let keeps_mark = own
-                && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key());
+            let keeps_mark = (own && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key()))
+                || (lifetime_mark && new_value.is_none());
             let marked = if keeps_mark {
                 None
             } else {
@@ -3225,7 +3233,7 @@ impl App {
                     )?;
                 }
                 Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-                None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
+                None if ends_mark || (own && !keeps_mark) => tx.delete(&seen_key(&key))?,
                 None => {}
             }
             let live_in = self.live_in(

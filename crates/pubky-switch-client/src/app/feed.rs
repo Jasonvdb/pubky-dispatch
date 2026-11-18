@@ -98,8 +98,8 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
-    Processed, RetryEntry, Tx, encode, key,
+    HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -3144,7 +3144,7 @@ impl App {
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
     /// minutes old, read again from the Homeserver otherwise (`force` reads it again
     /// whatever its age), with whether it was read in this call. `None` when it can't be
-    /// read now, or the identity equivocated.
+    /// read now, the read gave no copy under 10 minutes old, or the identity equivocated.
     async fn sender_doc(
         &mut self,
         sender: &[u8; 32],
@@ -3170,9 +3170,8 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let held_doc = held.as_ref().map(|(doc, _)| doc);
-        let taken = identity::take_copy(&reader, &mut tx, &fetched, held_doc, now).await?;
-        let doc = match taken {
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now, now).await?;
+        let (doc, read_ms) = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
                     identity: *sender,
@@ -3181,20 +3180,15 @@ impl App {
                 self.commit(tx).await?;
                 return Ok(None);
             }
-            Ok(Taken::Newer) => fetched,
-            Ok(Taken::Same | Taken::Older) => {
-                let doc = held_doc.cloned().unwrap_or(fetched);
-                tx.put(
-                    &key::ident_doc(sender),
-                    &CachedDoc {
-                        doc: doc.signed().clone(),
-                        fetched_ms: now,
-                    },
-                )?;
-                doc
-            }
+            Ok(taken) => taken,
         };
         self.commit(tx).await?;
+        // A read that served an older copy doesn't confirm the one held: past its 10
+        // minutes when the read ends, it verifies no sender until a read gives it again, or
+        // a newer one.
+        if self.now().saturating_sub(read_ms) >= DOC_CACHE_MS {
+            return Ok(None);
+        }
         Ok(Some((doc, true)))
     }
 

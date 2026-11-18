@@ -29,7 +29,11 @@ use crate::parties::{
 use crate::{FlowResult, World};
 
 /// alice's service is lost, and her signer recovers at another.
-async fn lose_and_recover(world: &World, alice: &TestIdentity, signer: &mut Signer) -> FlowResult {
+pub(super) async fn lose_and_recover(
+    world: &World,
+    alice: &TestIdentity,
+    signer: &mut Signer,
+) -> FlowResult {
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[alice]).await?;
     let doc = signer
@@ -740,7 +744,7 @@ pub(super) const CAROLS_FIRST_CALL: &str = "{carol/stall} PUT /v1/{alice}/peers"
 /// A client that sends requests as alice's app `name`, signed with the app's key, to the
 /// service `origin` whose key for her account is `service_key`: for an upload no app of
 /// the client crate would send.
-fn client_of(
+pub(super) fn client_of(
     world: &World,
     alice: &TestIdentity,
     name: &str,

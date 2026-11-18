@@ -141,6 +141,36 @@ pub fn sample_protocol(name: &str) -> Arc<TestProtocol> {
     }))
 }
 
+/// The `tasks` collection of closed tasks, one record per task, under a permanent policy
+/// naming no generation: no app deletes a record of it (Switch spec 10.3.1).
+pub fn task_closures() -> Collection {
+    Collection::new(
+        "task_closures",
+        Policy::new(TASKS, &[TASKS]).permanent(None),
+    )
+}
+
+/// The `tasks` collection of share counts for generation 1, under a permanent policy naming
+/// it: created only in generation 1, and deleted once the account is past it (Switch spec
+/// 10.3.1).
+pub fn share_counts() -> Collection {
+    Collection::new(
+        "share_counts",
+        Policy::new(TASKS, &[TASKS]).permanent(Some(1)),
+    )
+}
+
+/// The app's side of the [`Sample`] protocol [`TASKS`] with its permanent collections,
+/// [`task_closures`] and [`share_counts`].
+pub fn tasks_protocol_with_permanent() -> Arc<TestProtocol> {
+    Arc::new(TestProtocol::new(ProtocolSpec {
+        name: TASKS.to_owned(),
+        keyed_scopes: vec![TASKS.to_owned()],
+        accepts: vec![format!("{TASKS}.item")],
+        collections: vec![task_closures(), share_counts()],
+    }))
+}
+
 /// The app's side of the [`Notes`] protocol: a protocol that records what it receives.
 pub fn notes_protocol() -> Arc<TestProtocol> {
     Arc::new(TestProtocol::new(ProtocolSpec {

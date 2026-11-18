@@ -225,6 +225,8 @@ impl Inner {
         if effect == BatchEffect::NoOp {
             return Ok(self.answer(&[]));
         }
+        // A faulty switch's skipped shape check, for this batch only (`skip_next_shape_check`).
+        let skip_shape = std::mem::take(&mut self.skip_shape_once);
         let (mut draft, states) = {
             let is_current = |app: &[u8; 16]| self.app_current(&self.apps, app);
             let cx = OpContext {
@@ -249,7 +251,9 @@ impl Inner {
             let mut states = Vec::with_capacity(ops.len());
             for (seq, op) in (self.seq + 1..).zip(&ops) {
                 check_permission(&op.body().kind, writer)?;
-                check_shape(op.body())?;
+                if !skip_shape {
+                    check_shape(op.body())?;
+                }
                 states.push(self.apply_op(&mut draft, op, &cx, cert.as_ref(), seq)?);
             }
             (draft, states)

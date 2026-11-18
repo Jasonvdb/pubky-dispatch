@@ -26,6 +26,7 @@ mod messaging;
 mod notice;
 mod own_record;
 mod pages;
+mod permanent;
 mod protocols;
 mod push;
 mod records;
@@ -78,6 +79,7 @@ pub use notice::{
 };
 pub use own_record::own_record;
 pub use pages::pages;
+pub use permanent::permanent_records;
 pub use protocols::{protocol_deny_barrier, protocol_retry_after_deny, two_protocols};
 pub use push::push_registration;
 pub use records::records;
@@ -164,6 +166,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("records, a deleted key forgotten", |world| {
         Box::pin(deleted_key_forgotten(world))
+    }),
+    ("records, permanent", |world| {
+        Box::pin(permanent_records(world))
     }),
     ("invite code, spent and expired codes swept", |world| {
         Box::pin(invite_codes_swept(world))

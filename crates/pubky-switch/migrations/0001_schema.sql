@@ -15,6 +15,8 @@ CREATE TABLE accounts (
     id              TEXT     PRIMARY KEY,
     -- The identity's Ed25519 public key.
     identity_key    BYTEA    NOT NULL CHECK (octet_length(identity_key) = 32),
+    -- Independent content witness for a fresh enrollment (Switch account binding 3).
+    creation_anchor BYTEA CHECK (octet_length(creation_anchor) = 32),
     -- The generation the account serves (Switch spec 12.6).
     generation      BIGINT   NOT NULL CHECK (generation >= 0),
     -- The last seq given out in this generation, shared by inbox entries and chain items

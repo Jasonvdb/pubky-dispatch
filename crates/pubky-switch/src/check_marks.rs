@@ -598,6 +598,7 @@ mod tests {
             seq,
             chain_hash: [hash; 32],
             key: KEY,
+            creation_anchor: Default::default(),
             state_version: 0,
             time_floor_ms: 0,
             created_at_ms: 10,

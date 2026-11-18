@@ -422,6 +422,13 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
         )
         .await
         .expect("write");
+    let rebuilt = mark_in(&replay.marks).await;
+    assert!(
+        rebuilt
+            .creation_anchor
+            .for_creation(rebuilt.created_at_ms)
+            .is_none()
+    );
     let at = time_of(3) + 60_000;
     replay.clock.set_wall_ms(at);
     let answer = replay.service.handle(apps_read(at)).await;
@@ -441,7 +448,7 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
     // The answer carried a head: the mark moved to it (Table 3).
     assert_moved(
         mark_in(&replay.marks).await,
-        moved_to(&replay, &mark, 4).await,
+        moved_to(&replay, &rebuilt, 4).await,
     );
     assert_eq!(replay.service.mark_refusals(), 0);
     replay.db.drop_database().await.expect("drop");

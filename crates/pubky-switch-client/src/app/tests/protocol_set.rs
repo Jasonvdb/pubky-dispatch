@@ -10,6 +10,7 @@ mod retained_authority;
 
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::message::Message;
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
 use pubky_switch_core::records::{AppCert, AppRecord};
@@ -18,8 +19,8 @@ use serde_json::json;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, OpBatch,
-    OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
+    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, Need,
+    OpBatch, OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
     UserConfirmed,
 };
 use crate::error::StoreError;
@@ -61,6 +62,8 @@ struct Named {
     failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
     retrying: Mutex<u32>,
+    /// Its receive step reads a claim from the switch first.
+    needs_claim: bool,
     /// Its effects carry a conversation entry for the sender.
     with_ops: bool,
     /// Raw operations returned by each receive step.
@@ -282,10 +285,13 @@ impl Protocol for Named {
     fn receive(
         &self,
         message: &ReceivedMessage,
-        _: &mut crate::app::ReceiveContext<'_>,
+        cx: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         if count_down(&self.retrying) {
             return Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable));
+        }
+        if self.needs_claim && cx.switch_claim(&[7; 32]).is_none() {
+            return Outcome::Need(vec![Need::Claim([7; 32])]);
         }
         self.received
             .lock()
@@ -724,6 +730,91 @@ async fn test_protocol_set_owed_call_holds_only_its_own_protocol() {
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert_eq!(*p.chat.missed.lock().unwrap(), [gap]);
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+}
+
+/// Whatever an entry of the feed waits for while the cursor stays before it, the first
+/// observation of it is kept, through later reads that hold it again and a reload, so a later
+/// page that shows anything else at its `seq` raises the alarm; it goes once the entry is
+/// processed (Switch spec 8.2, 10.1; wire 7.4.4).
+#[tokio::test]
+async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold() {
+    #[derive(Clone, Copy, Debug)]
+    enum Hold {
+        /// Its protocol owes a call made before it.
+        OwedCall,
+        /// A claim its step reads can't be read for now.
+        ClaimRead,
+        /// Its effect conflicts at every try.
+        Conflict,
+        /// Its effect is sealed under a data epoch the switch has moved past: a key wait.
+        StaleEpoch,
+        /// The protocol's store fails.
+        Retry,
+    }
+    for hold in [
+        Hold::OwedCall,
+        Hold::ClaimRead,
+        Hold::Conflict,
+        Hold::StaleEpoch,
+        Hold::Retry,
+    ] {
+        let tasks = Named {
+            with_ops: matches!(hold, Hold::Conflict | Hold::StaleEpoch),
+            needs_claim: matches!(hold, Hold::ClaimRead),
+            ..named("tasks")
+        };
+        let p = Pair::with(tasks, named("chat"));
+        match hold {
+            Hold::OwedCall => *p.tasks.failing_missed.lock().unwrap() = 3,
+            Hold::Retry => *p.tasks.retrying.lock().unwrap() = 2,
+            _ => {}
+        }
+        let mut app = p.join().await;
+        let me = app.app_id();
+        if matches!(hold, Hold::OwedCall) {
+            // The call `tasks` fails, and owes, at a read of its own.
+            let now = p.w.clock.now_ms();
+            p.w.switch.push_missed(3, now, now);
+            app.receive(None).await.unwrap();
+        }
+        let seq = p.send(me, "tasks.item");
+        // Twice the hold's cause, for two reads.
+        let (path, code, times) = match hold {
+            Hold::ClaimRead => ("claims/", ErrorCode::Unavailable, 2),
+            Hold::Conflict => ("ops", ErrorCode::Conflict, 4),
+            Hold::StaleEpoch => ("ops", ErrorCode::StaleEpoch, 2),
+            Hold::OwedCall | Hold::Retry => ("", ErrorCode::Unavailable, 0),
+        };
+        for _ in 0..times {
+            p.w.switch.fail_next(Fault::Error {
+                path: path.into(),
+                code,
+                current: json!(null),
+            });
+        }
+        app.receive(None).await.unwrap();
+        assert!(app.cursor().seq < seq, "{hold:?}: held");
+        let Some(first) = app.state.held.get(&seq).copied() else {
+            panic!("{hold:?}: no observation kept")
+        };
+        p.w.clock.advance_ms(1);
+        app.receive(None).await.unwrap();
+        assert!(app.cursor().seq < seq, "{hold:?}: held again");
+        drop(app);
+        let mut app = p.load(me).await.unwrap();
+        assert_eq!(
+            app.state.held.get(&seq),
+            Some(&first),
+            "{hold:?}: the first observation stays, through a reload"
+        );
+        read(&mut app, 2).await;
+        assert!(app.cursor().seq >= seq, "{hold:?}: processed");
+        assert!(p.tasks.taken.lock().unwrap().contains(&seq), "{hold:?}");
+        assert!(
+            !app.state.held.contains_key(&seq),
+            "{hold:?}: the observation goes with it"
+        );
+    }
 }
 
 #[tokio::test]

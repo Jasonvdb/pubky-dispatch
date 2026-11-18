@@ -456,9 +456,13 @@ impl ParkedRound {
     }
 }
 
-/// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).
+/// `held/<seq>`: an entry of the feed the cursor stays before, unprocessed, whatever it
+/// waits for, with the first observation of it, kept until the cursor passes it or it is
+/// stored locally (Switch spec 8.2, wire 7.4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
+    /// When it was first held: the bounded wait of an entry whose sender can't be checked
+    /// runs from it.
     pub(crate) since_ms: u64,
     pub(crate) receipt: EntryReceipt,
 }

@@ -1039,6 +1039,12 @@ impl App {
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
         let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
+        // What this page shows of an entry, its first observation unless one is held.
+        let observed = |entry: &EntryItem| EntryReceipt {
+            entry_id: entry.entry_id,
+            service_key: page.service_key,
+            read_at_ms: page.server_time_ms,
+        };
         for item in &page.items {
             if stopped.is_some() {
                 break;
@@ -1108,12 +1114,7 @@ impl App {
                 // Processed past a held entry in an earlier read.
                 FeedItem::Entry(_) if self.state.seen.contains(&seq) => Step::Pass,
                 FeedItem::Entry(entry) => {
-                    let receipt = EntryReceipt {
-                        entry_id: entry.entry_id,
-                        service_key: page.service_key,
-                        read_at_ms: page.server_time_ms,
-                    };
-                    self.handle_entry(entry, receipt, &mut read).await?
+                    self.handle_entry(entry, observed(entry), &mut read).await?
                 }
                 FeedItem::Unreadable {
                     seq,
@@ -1170,7 +1171,23 @@ impl App {
                         self.state.seen.insert(seq);
                     }
                 }
-                Step::Hold => read.block(seq),
+                Step::Hold => {
+                    // Whatever an entry waits for, the cursor stays before it: the first
+                    // observation of it is kept, here alone, until the cursor passes it or
+                    // it is stored locally, so a later page that shows anything else at its
+                    // `seq` raises the alarm (Switch spec 8.2, 10.1; wire 7.4.4).
+                    if let FeedItem::Entry(entry) = item
+                        && !self.state.held.contains_key(&seq)
+                    {
+                        let held = HeldEntry {
+                            receipt: observed(entry),
+                            since_ms: self.now(),
+                        };
+                        read.tx.put(&key::held(seq), &held)?;
+                        self.state.held.insert(seq, held);
+                    }
+                    read.block(seq);
+                }
                 Step::Stop => {
                     stopped = Some(seq);
                     break;
@@ -2530,14 +2547,6 @@ impl App {
             return Ok(Step::Pass);
         }
         let now = self.now();
-        if entry.stored.is_none() && !self.state.held.contains_key(&entry.seq) {
-            let held = HeldEntry {
-                receipt: entry.receipt,
-                since_ms: now,
-            };
-            read.tx.put(&key::held(entry.seq), &held)?;
-            self.state.held.insert(entry.seq, held);
-        }
         let fresh = RetryEntry {
             reads: 0,
             since_ms: now,
@@ -2604,19 +2613,14 @@ impl App {
         plaintext: &MessagePlaintext,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        // Held since its first hold, whatever that waited for; the read keeps its
+        // observation as it holds it.
         let now = self.now();
-        let since = match self.state.held.get(&entry.seq) {
-            Some(held) => held.since_ms,
-            None => {
-                let held = HeldEntry {
-                    receipt: entry.receipt,
-                    since_ms: now,
-                };
-                read.tx.put(&key::held(entry.seq), &held)?;
-                self.state.held.insert(entry.seq, held);
-                now
-            }
-        };
+        let since = self
+            .state
+            .held
+            .get(&entry.seq)
+            .map_or(now, |held| held.since_ms);
         if now.saturating_sub(since) >= self.config.park_after_ms {
             self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read)
                 .await?;

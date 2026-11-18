@@ -27,7 +27,7 @@ const WALLET_OPS: &str = "{alice/wallet} POST /v1/{alice}/ops";
 /// conflict`. It creates generation 1's share count, which it can't delete in generation 1.
 ///
 /// The service is lost and alice recovers at another: generation 2, `recovery_from` 1. Both
-/// apps upload what they hold. The task's record still can't be deleted, by the app or by a
+/// apps upload what they hold, and the wallet reads both records there. The task's record still can't be deleted, by the app or by a
 /// delete sent as no app would. The share count, of a generation the account is past, is
 /// deleted; a create of another share count of generation 1 is refused, locally and by the
 /// switch. The phone reads the task's record at the new switch, which then loses it: the
@@ -124,6 +124,23 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     lose_and_recover(world, &alice, &mut signer).await?;
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     follow_recovery(world, &mut phone, "phone", 1).await?;
+    // A write over a record taken from a recovery upload names that upload with
+    // `record_current` (Switch spec 10.3): the wallet reads both records at the new switch,
+    // so its writes there name the uploads and reach the permanent rule.
+    for (target, what) in [
+        (&closure, "the closed task"),
+        (&count, "generation 1's count"),
+    ] {
+        let read = wallet.read_record_fresh(target).await?;
+        let RecordRead::Fresh(record) = &read else {
+            return Err(format!("the wallet doesn't read {what} fresh: {read:?}").into());
+        };
+        world.outcome(
+            &format!("the wallet read {what} at the new switch"),
+            &shown(Some(record)),
+        );
+        world.advance_ms(STEP_MS);
+    }
 
     refused_here(
         world,

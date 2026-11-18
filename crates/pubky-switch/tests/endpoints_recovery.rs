@@ -562,6 +562,12 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     let (key, at) = serving_with_a_held_app(&replay).await;
     let mark_before = mark_of(&replay).await;
     assert_eq!(mark_before.generation, 1);
+    assert!(
+        mark_before
+            .creation_anchor
+            .for_creation(mark_before.created_at_ms)
+            .is_some()
+    );
     let before = held(&replay).await;
     let mut ordinary: IdentityBody = before.body().clone();
     ordinary.version += 1;
@@ -569,6 +575,7 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     let (answer, _) = deliver(&replay, ordinary.signed().clone(), Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
     let moved = mark_of(&replay).await;
+    assert_eq!(moved.creation_anchor, mark_before.creation_anchor);
     assert_eq!(
         (moved.generation, moved.seq),
         (1, mark_before.seq + 1),
@@ -597,7 +604,7 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
-            creation_anchor: Default::default(),
+            creation_anchor: mark_before.creation_anchor,
             state_version: state_version_of(&replay, &alice_id()).await,
             time_floor_ms: held.time_floor_ms,
             key,

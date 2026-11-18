@@ -3630,6 +3630,17 @@ async fn test_recovery_enrollment_retry_after_a_failed_mark_move_moves_the_mark(
     let at = replay.clock.now_ms() + 60_000;
     set_time(&replay.clock, &rfc3339(at));
     let body = alice_enrollment_body(&replay, 3, Some(vec![HELD_REVOKED]), None, at).await;
+    // Reserve the enrollment's time so only the mark move after its commit can fail.
+    let read = request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    assert_eq!(replay.service.handle(read).await.status, 200);
+    let reserved = mark_of(&replay).await;
+    assert!(reserved.time_floor_ms >= at);
+    assert_eq!(reserved.state_version, count);
     let marks_dir = replay.key_dir().join("accounts").join("marks");
     std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
         .expect("read-only");

@@ -111,6 +111,9 @@ pub(crate) struct Shared {
     /// A faulty listing: every page names these two keys as `next` in turn, for the first
     /// 50 pages.
     pub(crate) alternate_next: Option<([u8; 32], [u8; 32])>,
+    /// Record keys requested, in order.
+    #[cfg(test)]
+    pub(crate) record_reads: Vec<[u8; 32]>,
     /// Listing pages answered.
     pub(crate) listings: u64,
     /// The service time of the last minute's sweep (Switch wire 9.1); none yet.
@@ -826,7 +829,7 @@ impl Inner {
     /// key read (`400`), the record found (`404`), then its `read_scope` held by the reader's
     /// certificate (`403 permission_missing`). An own app the switch holds no certificate
     /// for holds no scope.
-    fn record_answer(&self, caller: Option<[u8; 16]>, key: &str) -> Answer {
+    fn record_answer(&mut self, caller: Option<[u8; 16]>, key: &str) -> Answer {
         let cert = match self.record_reader(caller) {
             Ok(cert) => cert,
             Err(refused) => return refused,
@@ -838,6 +841,8 @@ impl Inner {
                 json!(null),
             );
         };
+        #[cfg(test)]
+        self.shared.record_reads.push(key);
         let Some(held) = self.shared.records.get(&key) else {
             return bad(ErrorCode::NotFound, "no record", json!(null));
         };

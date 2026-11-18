@@ -107,6 +107,10 @@ fn listc_key(id: &[u8; 32]) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ListDue {
     pub(crate) to: Vec<(String, Option<(u64, u64)>)>,
+    /// A page settling an upload must cover this transition, even when a protocol's
+    /// earlier handover remains outstanding.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub(crate) upload: Option<FeedPosition>,
 }
 
 impl ListDue {
@@ -155,6 +159,7 @@ pub(crate) async fn list_due_in(
 pub(crate) fn owe_listing(tx: &mut Tx, names: &[String]) -> Result<(), AppError> {
     let due = ListDue {
         to: names.iter().map(|name| (name.clone(), None)).collect(),
+        upload: None,
     };
     put_list_due(tx, &due)
 }
@@ -260,12 +265,21 @@ impl ListProgress {
     }
 }
 
+/// A record view, its checked observation, and whether it covers the pending uploads.
+pub(super) struct ObservedView {
+    pub(super) view: SharedRecordView,
+    pub(super) at: CurrentAt,
+    pub(super) covers_uploads: bool,
+}
+
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
-enum RecordAnswer {
+pub(super) enum RecordAnswer {
     /// The record's view, with what it is current at.
-    View(Box<(SharedRecordView, CurrentAt)>),
-    /// A hosted `404`, and whether its head covers what the app already saw at the key.
-    Absent { current: bool },
+    View(Box<ObservedView>),
+    /// A hosted `404` covering the observations at this key.
+    Absent,
+    /// The answer does not cover the applicable record or upload observation.
+    Inconclusive,
     /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
     /// (Switch wire 7.3 step 2). That says nothing of the record: the service reads as
     /// unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
@@ -1043,7 +1057,7 @@ pub(crate) enum WriteRead {
     /// Older than the write held, by an answer current before it: overtaken
     /// ([`KeptReason::Overtaken`]).
     Overtaken(ShownWrite, RecordVersion),
-    /// The application and the selected one fall in sequences the app cannot order.
+    /// The observation cannot be placed in this key's history.
     Unordered,
     /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
     /// take.
@@ -1060,6 +1074,13 @@ impl WriteRead {
     fn says_of_now(self) -> bool {
         !matches!(self, Self::Overtaken(..) | Self::Unordered | Self::Waits)
     }
+}
+
+/// The view read to obtain a missing writer certificate (Switch wire 6.2).
+enum WriterView {
+    NotRead,
+    Historical,
+    Current { divergent: bool },
 }
 
 /// What a read of one record came to ([`App::read_record_fresh`], Switch wire 7.4.9).
@@ -1184,7 +1205,7 @@ impl App {
     /// value. Every judging of a write reads through the transaction it writes in, so two
     /// writes of one record in one commit, such as two views of one key on a list page, are
     /// each judged against what the other left.
-    async fn read_in<T: serde::de::DeserializeOwned>(
+    pub(super) async fn read_in<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
         tx: &Tx,
@@ -1324,28 +1345,36 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Fetched, AppError> {
-        let (view, at) = match Box::pin(self.record_answer(key)).await? {
-            RecordAnswer::View(view) => *view,
-            RecordAnswer::Absent { current: true }
-                if self.state.cert.holds_scope(&collection.policy.read_scope) =>
-            {
+        let uploads = self.record_uploads(key, collection).await?;
+        let record = match Box::pin(self.record_answer(key, uploads)).await? {
+            RecordAnswer::View(record) => record,
+            RecordAnswer::Absent if self.state.cert.holds_scope(&collection.policy.read_scope) => {
                 return Ok(Fetched::Absent);
             }
-            RecordAnswer::Absent { .. } => return Ok(Fetched::Read(WriteRead::Unordered)),
+            RecordAnswer::Absent | RecordAnswer::Inconclusive => {
+                return Ok(Fetched::Read(WriteRead::Unordered));
+            }
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
             RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
         };
         let mut tx = self.tx()?;
+        let expect = Some((key, collection));
         let read = self
-            .take_view(&view, at, Some((key, collection)), &mut tx)
+            .take_view(
+                &record.view,
+                record.at,
+                expect,
+                record.covers_uploads,
+                &mut tx,
+            )
             .await?;
         self.commit(tx).await?;
         // A view can still supply historical write evidence after a provider change.
         // Only the service generation the app follows can report this key as fresh now.
         let current =
-            matches!(at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
-        Ok(Fetched::Read(if current {
+            matches!(record.at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
+        Ok(Fetched::Read(if current && record.covers_uploads {
             read
         } else {
             WriteRead::Unordered
@@ -1422,15 +1451,71 @@ impl App {
     /// is: the service reads as unreachable, and the record isn't absent (Switch spec
     /// 10.3.1 "Absence", 12.7 step 5). The rollback alarm for a permanent record the app
     /// holds live that reads absent; a failed call.
-    pub(crate) async fn record_view(
+    pub(super) async fn record_view(
         &mut self,
         key: &[u8; 32],
-    ) -> Result<Option<(SharedRecordView, CurrentAt)>, AppError> {
-        match Box::pin(self.record_answer(key)).await? {
-            RecordAnswer::View(view) => Ok(Some(*view)),
-            RecordAnswer::Absent { .. } => Ok(None),
+        collection: &Collection,
+    ) -> Result<Option<Box<ObservedView>>, AppError> {
+        let uploads = self.record_uploads(key, collection).await?;
+        match Box::pin(self.record_answer(key, uploads)).await? {
+            RecordAnswer::View(record) => Ok(Some(record)),
+            RecordAnswer::Absent | RecordAnswer::Inconclusive => Ok(None),
             RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
         }
+    }
+
+    async fn listing_upload(&self, collection: &str) -> Result<Option<FeedPosition>, AppError> {
+        let Some(due) = self.reader().get::<ListDue>(LIST_DUE).await? else {
+            return Ok(None);
+        };
+        Ok(due.upload.filter(|_| {
+            self.protocols
+                .of_collection(collection)
+                .is_some_and(|owner| due.at(&owner.name).is_some())
+        }))
+    }
+
+    async fn record_uploads(
+        &self,
+        key: &[u8; 32],
+        collection: &Collection,
+    ) -> Result<[Option<FeedPosition>; 2], AppError> {
+        Ok([
+            self.record_upload(key).await?,
+            self.listing_upload(&collection.name).await?,
+        ])
+    }
+
+    fn covers_upload(&self, at: FeedPosition, upload: FeedPosition) -> bool {
+        at.generation == self.state.meta.generation && self.covers(at, upload)
+    }
+
+    fn covers_uploads(&self, at: FeedPosition, uploads: [Option<FeedPosition>; 2]) -> bool {
+        uploads
+            .into_iter()
+            .flatten()
+            .all(|upload| self.covers_upload(at, upload))
+    }
+
+    /// A covering key GET can have an earlier chain head than a collection snapshot
+    /// that already showed the same application and divergence (Switch wire 7.4.9).
+    pub(super) async fn upload_view_already_held(
+        &self,
+        view: &SharedRecordView,
+        upload: FeedPosition,
+        tx: &Tx,
+    ) -> Result<bool, AppError> {
+        let Some(held) = self
+            .read_in::<HeldRecord>(&record_key_of(&view.key), tx)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(self.covers_upload(held.observed, upload)
+            && held.op == view.op
+            && held.applied == view.revision
+            && held.base_write().1 == view.revision
+            && self.is_divergent(&view.key).await? == view.divergent)
     }
 
     /// Read a held delete's current signed operation without delivering it ahead of the
@@ -1439,10 +1524,14 @@ impl App {
         &mut self,
         deletion: &super::deletion::Observation,
     ) -> Result<Option<Accepted>, AppError> {
-        let Some((view, at)) = self.record_view(&deletion.key).await? else {
+        let collection = Collection::new(&deletion.collection, deletion.put()?.policy);
+        let Some(observed) = self.record_view(&deletion.key, &collection).await? else {
             return Ok(None);
         };
-        let collection = Collection::new(&deletion.collection, deletion.put()?.policy);
+        if !observed.covers_uploads {
+            return Ok(None);
+        }
+        let ObservedView { view, at, .. } = *observed;
         let evidence = Evidence {
             op: &view.op,
             cert: Some(&view.cert),
@@ -1484,18 +1573,19 @@ impl App {
 
     /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
     /// doesn't hold from an identity it doesn't host.
-    async fn record_answer(&mut self, key: &[u8; 32]) -> Result<RecordAnswer, AppError> {
+    pub(super) async fn record_answer(
+        &mut self,
+        key: &[u8; 32],
+        uploads: [Option<FeedPosition>; 2],
+    ) -> Result<RecordAnswer, AppError> {
         let (result, head) = match self.client.record_with_head(key).await {
             Ok(answer) => (Ok(answer), None),
             Err(failure) => (Err(failure.error), failure.head),
         };
-        match self.take(result).await {
-            Ok(answer) => {
-                let at = self.current_at(answer.head, None).await?;
-                Ok(RecordAnswer::View(Box::new((answer.view, at))))
-            }
+        let (view, head) = match self.take(result).await {
+            Ok(answer) => (Some(answer.view), answer.head),
             Err(AppError::Switch(error)) if error.is_not_hosted() => {
-                Ok(RecordAnswer::NotHosted(Box::new(error)))
+                return Ok(RecordAnswer::NotHosted(Box::new(error)));
             }
             Err(error) if error.code() == Some(ErrorCode::NotFound) => {
                 let head = head.ok_or_else(|| {
@@ -1503,16 +1593,34 @@ impl App {
                         "Switch wire 7.1: a hosted record absence carries a head".into(),
                     )
                 })?;
-                let at = self.current_at(*head, None).await?;
-                let mut tx = self.tx()?;
-                let current = self.note_absent(key, at, &mut tx).await?;
-                if !tx.is_empty() {
-                    self.commit(tx).await?;
-                }
-                Ok(RecordAnswer::Absent { current })
+                (None, *head)
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+        let at = self.current_at(head, None).await?;
+        // An upload has no record.put of its own. Only an observation covering that
+        // transition can judge what the upload changed, even at a previously unknown key.
+        let covers_uploads = self.covers_uploads(position(head.generation, head.seq), uploads);
+        if let Some(view) = view {
+            return Ok(RecordAnswer::View(Box::new(ObservedView {
+                view,
+                at,
+                covers_uploads,
+            })));
         }
+        if !covers_uploads {
+            return Ok(RecordAnswer::Inconclusive);
+        }
+        let mut tx = self.tx()?;
+        let current = self.note_absent(key, at, &mut tx).await?;
+        if !tx.is_empty() {
+            self.commit(tx).await?;
+        }
+        Ok(if current {
+            RecordAnswer::Absent
+        } else {
+            RecordAnswer::Inconclusive
+        })
     }
 
     /// Compare a refused batch's record evidence at the head of that reply (Switch wire
@@ -1542,7 +1650,9 @@ impl App {
                     && put.key == view.key
                     && let Some(collection) = self.collection_for_write(put, &tx).await?
                 {
-                    self.take_view(&view, at, Some((&view.key, &collection)), &mut tx)
+                    let uploads = self.record_uploads(&view.key, &collection).await?;
+                    let covers = self.covers_uploads(position(head.generation, head.seq), uploads);
+                    self.take_view(&view, at, Some((&view.key, &collection)), covers, &mut tx)
                         .await?;
                 }
             }
@@ -1651,6 +1761,7 @@ impl App {
         budget: Option<&super::CallBudget>,
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
+        let upload = self.listing_upload(&collection.name).await?;
         let mut listed = 0u64;
         loop {
             // Past a read's time budget, once it asked for one page, it pauses as on its
@@ -1669,6 +1780,12 @@ impl App {
             // A page is current at its `seq`, in the generation of the head it came with,
             // never another's (Switch spec 10.3).
             let at = self.current_at(page.head, Some(page.seq)).await?;
+            // Inbox entries can advance the snapshot past the last chain item. Both
+            // positions in this generation must have reached the applicable upload.
+            let upload_at = position(page.head.generation, page.seq.min(page.head.seq));
+            if upload.is_some_and(|upload| !self.covers_upload(upload_at, upload)) {
+                return Ok(Listed::Paused(listed));
+            }
             let mut tx = self.tx()?;
             for view in &page.records {
                 // A page holds up to 1,000 views, each cached with its mark: the views taken
@@ -1693,7 +1810,9 @@ impl App {
                         })
                     })
                     .unwrap_or(collection);
-                self.take_view(view, at, Some((&view.key, member)), &mut tx)
+                let mark = self.record_upload(&view.key).await?;
+                let covers = mark.is_none_or(|upload| self.covers_upload(upload_at, upload));
+                self.take_view(view, at, Some((&view.key, member)), covers, &mut tx)
                     .await?;
                 listed = listed.saturating_add(1);
             }
@@ -1716,6 +1835,7 @@ impl App {
                 next.as_ref(),
                 &shown,
                 at,
+                upload_at,
             ))
             .await?;
             match next {
@@ -1873,7 +1993,10 @@ impl App {
         // kept for it, and may be told what comes after.
         let calls = self.kept_calls().await?;
         let mut tx = self.tx()?;
-        let mut left = ListDue::default();
+        let mut left = ListDue {
+            upload: due.upload,
+            ..ListDue::default()
+        };
         for (name, at) in &due.to {
             if !listing.contains(name) {
                 left.to.push((name.clone(), *at));
@@ -2151,13 +2274,14 @@ impl App {
         view: &SharedRecordView,
         at: CurrentAt,
         expect: Option<(&[u8; 32], &Collection)>,
+        covers_uploads: bool,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
         let key = expect.map_or(view.key, |(key, _)| *key);
         if !SignedOp::peek(&view.op)
             .is_ok_and(|op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == key))
         {
-            return Ok(WriteRead::Refused);
+            return Ok(WriteRead::Unordered);
         }
         let evidence = Evidence {
             op: &view.op,
@@ -2169,11 +2293,10 @@ impl App {
             current_at: at,
         };
         let read = self.read_write(&evidence, expect, key, tx).await?;
-        // Only a view of the key asked for says anything of that record's uploads, and only
-        // one current now: an overtaken one says nothing of the record now (Switch spec 10.3).
-        if expect.is_none_or(|(asked, _)| *asked == view.key) && read.says_of_now() {
-            self.note_view_divergence(&view.key, view.divergent, tx)
-                .await?;
+        // An earlier view can supply the signed write, while the latest upload's
+        // divergence remains unknown (Switch wire 7.4.14).
+        if covers_uploads && key == view.key && read.says_of_now() {
+            self.note_view_divergence(&key, view.divergent, tx).await?;
         }
         Ok(read)
     }
@@ -2205,20 +2328,29 @@ impl App {
             current_at: CurrentAt::Itself,
         };
         let key = put.key;
-        let mut viewed = None;
+        let mut viewed = WriterView::NotRead;
         let read = self
             .judge_write(&evidence, None, key, Some(page_time_ms), tx, &mut viewed)
             .await?;
         if read == WriteRead::Waits {
             return Ok(read);
         }
-        match viewed.filter(|_| read.says_of_now()) {
+        match viewed {
             // The record's view, read to judge the write, is the switch's latest word.
-            Some(divergent) => self.note_view_divergence(&key, divergent, tx).await?,
+            WriterView::Current { divergent } if read.says_of_now() => {
+                self.note_view_divergence(&key, divergent, tx).await?;
+            }
             // A newer write clears the record's divergent uploads before it (Switch wire
             // 7.4.14); the write held doesn't: uploads after it may conflict with it.
-            None if read == WriteRead::Taken => self.note_divergent(&key, false, tx).await?,
-            None => {}
+            WriterView::NotRead if read == WriteRead::Taken => {
+                if let Some(collection) = self.collection_for_write(put, tx).await? {
+                    let uploads = self.record_uploads(&key, &collection).await?;
+                    if self.covers_uploads(position(envelope.generation, item.seq), uploads) {
+                        self.note_divergent(&key, false, tx).await?;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(read)
     }
@@ -2232,18 +2364,20 @@ impl App {
         shown_key: [u8; 32],
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
-        let mut viewed = None;
+        let mut viewed = WriterView::NotRead;
         let read = self
             .judge_write(evidence, expect, shown_key, None, tx, &mut viewed)
             .await?;
-        if let Some(divergent) = viewed.filter(|_| read.says_of_now()) {
+        if let WriterView::Current { divergent } = viewed
+            && read.says_of_now()
+        {
             self.note_view_divergence(&shown_key, divergent, tx).await?;
         }
         Ok(read)
     }
 
-    /// [`App::read_write`], with `viewed` set to the `divergent` of a view of `shown_key`
-    /// read to judge the write, if one was.
+    /// [`App::read_write`], with `viewed` recording whether a view of `shown_key`
+    /// supplied its writer certificate and covered its pending uploads.
     ///
     /// A write the feed shows (`feed`) is judged at its item, for the protocol of its
     /// collection: one that protocol isn't told through everything before
@@ -2260,7 +2394,7 @@ impl App {
         shown_key: [u8; 32],
         page_time_ms: Option<u64>,
         tx: &mut Tx,
-        viewed: &mut Option<bool>,
+        viewed: &mut WriterView,
     ) -> Result<WriteRead, AppError> {
         if page_time_ms.is_some() {
             let protocol = self
@@ -2278,10 +2412,11 @@ impl App {
         // wire 6.2 "Accepting a write" step 1, 7.4.9).
         let current_view;
         if let Err(Refused::Unheld(collection)) = outcome {
-            let Some((view, at)) = self.record_view(&shown_key).await? else {
+            let Some(observed) = self.record_view(&shown_key, &collection).await? else {
                 return Ok(WriteRead::Refused);
             };
-            current_view = view;
+            let at = observed.at;
+            current_view = observed.view;
             if current_view.key != shown_key
                 || !SignedOp::peek(&current_view.op).is_ok_and(
                     |op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == shown_key),
@@ -2289,7 +2424,13 @@ impl App {
             {
                 return Ok(WriteRead::Refused);
             }
-            *viewed = Some(current_view.divergent);
+            *viewed = if observed.covers_uploads {
+                WriterView::Current {
+                    divergent: current_view.divergent,
+                }
+            } else {
+                WriterView::Historical
+            };
             // A re-read of the feed operation keeps its stub and proof. When the view
             // shows another operation, both acceptance and refusal judge only that one.
             let same = current_view.op == *evidence.op;
@@ -3611,7 +3752,22 @@ impl App {
             return Ok(false);
         };
         let at = position(v.generation, v.version);
+        if self
+            .record_upload(key)
+            .await?
+            .is_some_and(|upload| !self.covers_upload(at, upload))
+        {
+            return Ok(false);
+        }
         let held = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?;
+        if let Some(held) = &held
+            && self
+                .listing_upload(&held.collection)
+                .await?
+                .is_some_and(|upload| !self.covers_upload(at, upload))
+        {
+            return Ok(false);
+        }
         // A protected delete must still exist throughout its protected interval,
         // including before a later observation of the same key (Switch spec 10.3).
         let can_report_absence = v.generation == self.state.meta.generation
@@ -3672,6 +3828,7 @@ impl App {
         last: Option<&[u8; 32]>,
         listed: &[[u8; 32]],
         at: CurrentAt,
+        upload_at: FeedPosition,
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
         let permanent = self.reader().scan::<String>(PERMANENT_PREFIX).await?;
@@ -3695,7 +3852,12 @@ impl App {
                 continue;
             }
             let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
-            if !listed.contains(&key) {
+            if !listed.contains(&key)
+                && self
+                    .record_upload(&key)
+                    .await?
+                    .is_none_or(|upload| self.covers_upload(upload_at, upload))
+            {
                 let mut tx = self.tx()?;
                 Box::pin(self.note_absent(&key, at, &mut tx)).await?;
                 if !tx.is_empty() {

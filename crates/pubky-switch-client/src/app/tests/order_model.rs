@@ -1870,6 +1870,7 @@ fn test_order_model_listing_owed_outside_the_feed_waiting_for_a_key_holds_its_pr
         }
         let due = crate::app::records::ListDue {
             to: vec![("tasks".into(), None), ("chat".into(), None)],
+            upload: None,
         };
         tx.put(crate::app::records::LIST_DUE, &due).unwrap();
         b.app.commit(tx).await.unwrap();
@@ -1914,7 +1915,13 @@ fn test_order_model_one_protocol_reads_its_marks_in_a_read_that_ends_for_a_secon
         b.missed();
         b.entry("tasks", "item");
         b.missed();
+        b.w.switch.lock().shared.record_reads.clear();
         let report = b.read().await;
+        assert_eq!(
+            b.w.switch.lock().shared.record_reads,
+            [b.own["tasks"]],
+            "the ready protocol reads its upload once"
+        );
         assert!(!report.stopped && report.more, "{report:?}");
         let marks = b.app.reader().scan_raw("rcread/").await.unwrap();
         assert!(marks.is_empty(), "the upload's mark was read");

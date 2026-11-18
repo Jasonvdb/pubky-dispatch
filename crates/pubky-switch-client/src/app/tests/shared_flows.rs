@@ -2136,6 +2136,7 @@ async fn test_records_followed_write_survives_an_overtaken_read_and_reload() {
             &earlier.view,
             at,
             Some((&held.key, &target.collection)),
+            true,
             &mut tx,
         )
         .await
@@ -2247,7 +2248,13 @@ async fn test_records_followed_upload_keeps_its_application_across_an_earlier_vi
         first.head.seq,
     ));
     let read = phone
-        .take_view(&first.view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(
+            &first.view,
+            at,
+            Some((&key, &target.collection)),
+            true,
+            &mut tx,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -10595,13 +10602,19 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
         .unwrap();
     let before = phone.read_record(&target).await.unwrap().unwrap();
     let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
-    let (mut view, at) = phone.record_view(&key).await.unwrap().unwrap();
+    let observed = phone
+        .record_view(&key, &target.collection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observed.covers_uploads);
+    let (mut view, at) = (observed.view, observed.at);
     let signed = SignedOp::peek(&view.op).unwrap().item_hash().unwrap();
     view.revision.item_hash[0] ^= 1;
     view.divergent = true;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
         .await;
     assert!(
         matches!(
@@ -10620,7 +10633,7 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
     view.revision.item_hash = signed;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
         .await
         .unwrap();
     assert_eq!(read, crate::app::records::WriteRead::Taken);
@@ -13511,7 +13524,12 @@ async fn test_record_publication_protection_covers_the_interval_before_a_later_r
             .await
             .unwrap();
         reader.read_record(&target).await.unwrap();
-        let (_, latest) = reader.record_view(&key).await.unwrap().unwrap();
+        let latest = reader
+            .record_view(&key, &target.collection)
+            .await
+            .unwrap()
+            .unwrap()
+            .at;
         assert!(matches!(latest, crate::app::records::CurrentAt::Answer(v) if v.version > deleted));
 
         let at = |seq| crate::app::records::CurrentAt::Answer(RecordVersion::new(generation, seq));

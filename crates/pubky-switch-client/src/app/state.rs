@@ -844,12 +844,6 @@ impl Tx {
             })
     }
 
-    /// How many keys under `prefix` the batch puts and doesn't delete after, not yet
-    /// committed.
-    pub(crate) fn pending_puts(&self, prefix: &str) -> usize {
-        self.pending_put_keys(prefix).len()
-    }
-
     /// The keys under `prefix` the batch puts and doesn't delete after, not yet committed,
     /// without the prefix.
     pub(crate) fn pending_put_keys(&self, prefix: &str) -> Vec<String> {

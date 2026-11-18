@@ -554,8 +554,25 @@ impl SwitchClient {
     ///
     /// As every call; `404` for an unknown or forgotten key.
     pub async fn record(&self, key: &[u8; 32]) -> Result<RecordAnswer, ClientError> {
+        self.record_with_head(key).await.map_err(ClientError::from)
+    }
+
+    /// Keep a hosted absence's own verified position for the write the app follows.
+    pub(crate) async fn record_with_head(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<RecordAnswer, super::CallError> {
         let checked = self
-            .get(&format!("records/{}", b64(key)), TimeoutClass::Bulk)
+            .call_with_head(
+                "GET",
+                &self.path(&format!("records/{}", b64(key))),
+                Vec::new(),
+                Body::Empty,
+                Auth {
+                    timeout: TimeoutClass::Bulk,
+                    ..Auth::default()
+                },
+            )
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;

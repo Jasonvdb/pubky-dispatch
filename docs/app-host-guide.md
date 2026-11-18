@@ -330,6 +330,11 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::EvidenceRefused` | The upload received a service refusal, or was too large to send. The client reports the code and goes on. Keep the evidence and involve the signer for import conflicts. Other transport failures can be retried. |
 | `AppEvent::ProviderLost` | The identity declared the old generation lost. Suspend new attempts. Show that old inbox entries and unbacked records may be unavailable, and that an unanswered action may already have run. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
+| `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
+| `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |
+| `LossUploadOutcome::TooLarge` | The inventory exceeded the request limit. Keep its outstanding duties until their effects can be verified. |
+| `LossUploadOutcome::Refused` | The service refused the upload. Use the refusal code to explain the pending recovery work. |
+| `LossUploadOutcome::Answered` | The authenticated head and transition identify the changes the service accepted. Compare the exact retained inputs with the current applications before resolving each duty. |
 | `Evidence::Op` | Use `keep_evidence` for a signed record write or claim entry with writer certificate and any held proof. This gives recovery a copy to upload. |
 | `Evidence::Proof` | Keep a transition proof available for upload even without an operation. Use `forget_evidence` only when the protocol no longer needs that evidence. |
 | `AppError::NotAnsweringAsAccount` | An unverified 404 and a genuinely absent homeserver identity document suggest erasure. Show unreachable since the supplied device time. Keep local state. Five matching observations spaced at least six hours apart over at least a day are required on this path. |

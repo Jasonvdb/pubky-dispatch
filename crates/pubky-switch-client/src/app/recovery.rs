@@ -814,7 +814,7 @@ impl App {
         let generation = self.state.meta.generation;
         let query = FeedQuery {
             after: Some(Position { generation, seq: 0 }),
-            limit: Some(2),
+            limit: Some(1),
             wait: None,
         };
         let result = self.client.feed(query).await;
@@ -829,12 +829,7 @@ impl App {
             Err(AppError::Alarm(alarm)) => return Err(self.raise(alarm).await),
             Err(error) => return Err(error),
         };
-        if let [first, second, ..] = page.items.as_slice()
-            && let Some(doc) = roster::opening(first, second, &self.state.own_doc, loss)
-        {
-            self.keep_recovery_opening(&doc, tx).await?;
-        }
-        let Some(FeedItem::Chain(item)) = page.items.first() else {
+        let Some(first @ FeedItem::Chain(item)) = page.items.first() else {
             return Ok(fallback);
         };
         let Some(envelope) = checked.envelopes.get(&item.seq) else {
@@ -847,10 +842,31 @@ impl App {
             return Ok(fallback);
         }
         let identity = self.state.meta.identity;
-        match ServiceTransition::verify(&item.item, &self.state.meta.service_key, &identity) {
-            Ok(ServiceTransition::Recovery { at, .. }) => Ok(at),
-            _ => Ok(fallback),
+        let Ok(ServiceTransition::Recovery { at, .. }) =
+            ServiceTransition::verify(&item.item, &self.state.meta.service_key, &identity)
+        else {
+            return Ok(fallback);
+        };
+        if item.seq == 1 && page.more {
+            // The roster's historical read does not advance the ordinary feed position.
+            let mut history = chain.clone();
+            match self
+                .recovery_prefix_page(&mut history, generation, 1, 1)
+                .await
+            {
+                Ok(next) => {
+                    if let Some(second) = next.items.first()
+                        && let Some(doc) = roster::opening(first, second, &self.state.own_doc, loss)
+                    {
+                        self.keep_recovery_opening(&doc, tx).await?;
+                    }
+                }
+                // An unavailable prefix can be requested later by recovery_roster.
+                Err(AppError::Transport(_) | AppError::Switch(ClientError::Switch { .. })) => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(at)
     }
 
     /// Step 3: upload what the app holds, before its first record write at the new service

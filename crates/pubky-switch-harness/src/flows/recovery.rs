@@ -153,6 +153,7 @@ pub(super) async fn follow_recovery(
     lost: u64,
 ) -> FlowResult {
     // As when the Homeserver's event stream names the document (Switch spec 4.3).
+    let start = world.trace().lines.len();
     let refreshed = app.refresh_identity().await;
     let followed = app.follow_provider().await;
     world.outcome(
@@ -169,7 +170,12 @@ pub(super) async fn follow_recovery(
         return Err(format!("the {name}'s follow ended {}", ended(&followed)).into());
     }
     let read = format!("{{alice/{name}}} GET /v1/{{alice}}/feed");
-    let fact = |fact: &str| world.last_fact(&read, &format!("body.items[0].{fact}"));
+    let trace = world.trace();
+    let opening = trace.lines[start..]
+        .iter()
+        .find(|line| line.label == read)
+        .ok_or("the app didn't read the new chain")?;
+    let fact = |fact: &str| opening.facts.get(&format!("body.items[0].{fact}")).cloned();
     let first = (
         fact("seq"),
         fact("item.body~.type"),

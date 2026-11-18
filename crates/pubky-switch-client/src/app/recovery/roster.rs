@@ -233,7 +233,7 @@ impl App {
         Ok(Some(doc))
     }
 
-    async fn recovery_prefix_page(
+    pub(super) async fn recovery_prefix_page(
         &mut self,
         chain: &mut ChainView,
         generation: u64,

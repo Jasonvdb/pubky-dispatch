@@ -1033,6 +1033,8 @@ impl Signer {
 /// hold, and the generation a recovery they declared sent a start for.
 pub(super) struct LossFound {
     kept: SignerState,
+    /// A backup a delivery in flight sealed, as the store's flow holds it.
+    sealed: Option<Vec<u8>>,
     local: RestoreLocal,
     marks: Vec<IdentityDoc>,
     generations: u64,
@@ -1052,12 +1054,39 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
         _ => None,
     };
+    // The backup a delivery sealed, and the App IDs a declared recovery's enrollment names
+    // revoked, count as the records' own, whether the state decodes or not.
+    let sealed = match &flow {
+        Some(Flow::Deliver {
+            backup: Some(backup),
+            ..
+        }) => serde_json::to_vec(backup).ok(),
+        _ => None,
+    };
+    let enrolled_revoked: Vec<[u8; 16]> = match &flow {
+        Some(Flow::Recover {
+            origin,
+            enrollment: RecoveryEnrollment::Ready { enrollment, .. },
+        }) => Enrollment::verify(enrollment, &identity, origin)
+            .map(|signed| signed.revoked_apps().to_vec())
+            .unwrap_or_default(),
+        Some(Flow::Recover {
+            enrollment: RecoveryEnrollment::Preparing { revoked_apps, .. },
+            ..
+        }) => revoked_apps.clone(),
+        _ => Vec::new(),
+    };
     if let Some(doc) = signed.and_then(|signed| state::stored_identity(signed, &identity).ok()) {
         local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
         local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
         marks.push(doc);
     }
     let mut kept = state.unwrap_or_else(|| SignerState::new(identity, install));
+    for app in enrolled_revoked {
+        if !kept.tombstones.contains(&app) {
+            kept.tombstones.push(app);
+        }
+    }
     kept.signed_through = local
         .signed_through
         .unwrap_or(0)
@@ -1080,9 +1109,33 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         .max(kept.generation_seen);
     LossFound {
         kept,
+        sealed,
         local,
         marks,
         generations,
+    }
+}
+
+/// The backup on the Homeserver, `found`, and one the store's flow sealed, `sealed`, as one:
+/// the revoked App IDs, the certificates and the picked times of both. The Homeserver's
+/// document stands, else the sealed one's.
+fn merged_views(found: Option<BackupView>, sealed: Option<BackupView>) -> Option<BackupView> {
+    match (found, sealed) {
+        (Some(mut view), Some(other)) => {
+            for app in other.revoked_apps {
+                if !view.revoked_apps.contains(&app) {
+                    view.revoked_apps.push(app);
+                }
+            }
+            for cert in other.certs {
+                if !view.certs.iter().any(|held| held.hash() == cert.hash()) {
+                    view.certs.push(cert);
+                }
+            }
+            view.pending_distrust.extend(other.pending_distrust);
+            Some(view)
+        }
+        (view, other) => view.or(other),
     }
 }
 
@@ -1407,11 +1460,17 @@ impl Signer {
             )));
         }
         let (opened, published) = self.read_published().await?;
-        let backed_up = opened.as_ref().and_then(Option::as_ref);
+        let sealed = match &found.sealed {
+            Some(bytes) => self.open_backup(bytes)?,
+            None => None,
+        };
+        let merged = merged_views(opened.clone().flatten(), sealed.clone());
+        let backed_up = merged.as_ref();
         let mut held: Vec<IdentityDoc> = published
             .iter()
             .cloned()
-            .chain(backed_up.map(|view| view.identity_doc.clone()))
+            .chain(opened.iter().flatten().map(|view| view.identity_doc.clone()))
+            .chain(sealed.iter().map(|view| view.identity_doc.clone()))
             .chain(found.marks.iter().cloned())
             .collect();
         let copy_of = |answer: &AppsAnswer| {

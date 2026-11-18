@@ -1487,3 +1487,39 @@ async fn test_key_provider_loss_starts_above_a_generation_its_records_saw() {
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
     signs_at(&world, &service, &mut signer, 4).await;
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_reads_the_backup_a_delivery_sealed() {
+    // The records don't read, the Homeserver lost the backup, but the delivery in flight kept
+    // the backup it sealed, which holds a revocation the switch never took: the app is
+    // revoked, not signed back in.
+    let world = World::new();
+    let (mut old, store) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 72).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    old.revoke(id, None, confirmed()).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    old.set_record_max_age(Some(60)).await.unwrap_err();
+    drop(old);
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let ns = signer_namespace(&world.key.public());
+    let mut batch = WriteBatch::new();
+    batch.put(&ns, b"state".to_vec(), b"{".to_vec()).unwrap();
+    store.commit(batch).unwrap();
+    let (service, router) = picked_service(&world);
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert!(matches!(
+        shown.apps.iter().find(|(a, _)| *a == id).unwrap().1,
+        AppFate::RevocationPending { .. }
+    ));
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    signs_at(&world, &service, &mut signer, 1).await;
+}

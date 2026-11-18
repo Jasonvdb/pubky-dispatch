@@ -10,6 +10,10 @@ The client's public API for protocols and hosts is in place: record answers that
 
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
+- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs` and `put_back_notices`, even when both lists are empty.
+
+If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
+
 **Additions still to come**
 
 - **Client.** Automatic conditional publication over a deleted record or a competing live write still needs durable signed retry state.

@@ -37,7 +37,7 @@ mod collection;
 
 pub use collection::{Collection, PolicyFamily, RecordTarget};
 
-use pubky_switch_core::chain::{ChainEnvelope, TransitionProof};
+use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, record_key_from_blinded};
@@ -725,8 +725,102 @@ pub(crate) struct Evidence<'a> {
     /// The write's application, from a record view's `revision` or the record held: the
     /// service's word.
     pub(crate) view_revision: Option<ApplicationRef>,
-    /// Whether a record view read now shows it: the switch's current write.
-    pub(crate) viewed: bool,
+    /// What the answer showing the write is current at.
+    pub(crate) current_at: CurrentAt,
+}
+
+/// What an answer showing a write is current at (Switch spec 10.3): what an older write
+/// than the one held means comes from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentAt {
+    /// A write shown only as of its own version: a feed item, the answer to an own write,
+    /// or the write held, read again.
+    Itself,
+    /// A record view of an answer current at this version: a read's head, a list page's
+    /// `seq` in its head's generation (Switch wire 7.4.9).
+    Answer(RecordVersion),
+    /// A record view of an answer that doesn't say what it is current at, such as a read
+    /// without a head: never a rollback.
+    Unknown,
+}
+
+impl CurrentAt {
+    /// What a record view read now with `head` is current at: `seq` in the head's
+    /// generation, the head's own `seq` when `seq` is `None`; never another generation's.
+    fn of(head: Option<&SignedHead>, seq: Option<u64>) -> Self {
+        head.map_or(Self::Unknown, |head| {
+            Self::Answer(RecordVersion::new(head.generation, seq.unwrap_or(head.seq)))
+        })
+    }
+
+    /// Whether a record view read now shows the write: the switch's current write.
+    fn viewed(self) -> bool {
+        self != Self::Itself
+    }
+}
+
+/// How a write shown compares with the write held ([`compare_with_held`], Switch spec 10.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    /// Newer: it replaces the write held ([`WriteVersion::replaces`]), or nothing is held.
+    Newer,
+    /// The same write, by its item hash.
+    Equal,
+    /// Older, or not shown newer, by an answer current past the write held or one that
+    /// doesn't say what it is current at.
+    Older(ShownWrite),
+    /// Older, by an answer current at the version given, before the write held: overtaken.
+    Overtaken(ShownWrite, RecordVersion),
+}
+
+/// The one comparison of a write shown with the write held, for every path that reads one
+/// (Switch spec 10.1, 10.3): the same write by its item hash; newer by
+/// [`WriteVersion::replaces`]; otherwise older. An older write is a rollback, `Err` with the
+/// rule, when both versions are authenticated and the answer is current at or past the
+/// held version, which also makes another write at the held version one. It was
+/// overtaken when the answer is current before the held write: before its version, or,
+/// for one held with the service's word only, at or before the version it was built on.
+/// An answer that doesn't say what it is current at is neither.
+fn compare_with_held(
+    shown: &WriteVersion,
+    (item_hash, writer): ([u8; 32], [u8; 16]),
+    held: &WriteVersion,
+    held_hash: [u8; 32],
+    at: CurrentAt,
+) -> Result<Order, String> {
+    if held_hash == item_hash {
+        return Ok(Order::Equal);
+    }
+    if shown.replaces(held) {
+        return Ok(Order::Newer);
+    }
+    let write = ShownWrite {
+        version: shown.version,
+        authenticated: shown.authenticated,
+        item_hash,
+        writer,
+    };
+    let current_at = match at {
+        CurrentAt::Itself => shown.version,
+        CurrentAt::Answer(version) => version,
+        CurrentAt::Unknown => return Ok(Order::Older(write)),
+    };
+    let before_held = if held.authenticated {
+        current_at < held.version
+    } else {
+        current_at <= held.expected_version
+    };
+    if before_held {
+        return Ok(Order::Overtaken(write, current_at));
+    }
+    if shown.authenticated && held.authenticated {
+        return Err(
+            "Switch spec 10.1, 10.3: an answer current at or past the record write held \
+             shows an older one, or another at its version, both versions authenticated"
+                .into(),
+        );
+    }
+    Ok(Order::Older(write))
 }
 
 /// Whether a certificate of `standing` counts for a write at `time` (Switch wire 6.2
@@ -780,6 +874,8 @@ struct Accepted {
     viewed: bool,
     content: RecordContent,
     doubtful: bool,
+    /// How it compares with the write held ([`compare_with_held`]).
+    order: Order,
 }
 
 /// Why a write wasn't taken.
@@ -839,9 +935,12 @@ pub(crate) enum WriteRead {
     /// Taken: newer than the write held.
     Taken,
     /// The very write the app held.
-    Held,
-    /// No newer than the write held.
-    NotNewer,
+    Equal,
+    /// Older than the write held, or not shown newer ([`KeptReason::Older`]).
+    Older(ShownWrite),
+    /// Older than the write held, by an answer current before it: overtaken
+    /// ([`KeptReason::Overtaken`]).
+    Overtaken(ShownWrite, RecordVersion),
     /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
     /// take.
     Refused,
@@ -874,8 +973,26 @@ pub enum KeptReason {
     /// The switch's write was refused: a failed check, or one that goes back on what the
     /// app has seen ([`super::AppEvent::WriteFlagged`]).
     Refused,
-    /// The switch's write is no newer than the one the app holds.
-    NotNewer,
+    /// The switch shows another write than the one the app holds that isn't newer by the
+    /// rule of Switch spec 10.3, by an answer current past the write held, or one that
+    /// doesn't say what it is current at, such as a read without a head: older, or built on
+    /// an earlier version than the one held. Both versions authenticated by an answer
+    /// current at or past the write held would be a rollback instead (an alarm, Switch spec
+    /// 10.1). So `write.authenticated` `false`, or a held version that is the service's
+    /// word only ([`SharedRecord::authenticated`]), says this is the service's claim of the
+    /// record now, as for a record taken from a recovery upload; with both authenticated
+    /// it says the answer didn't say what it was current at.
+    Older(ShownWrite),
+    /// The switch shows an older write than the one the app holds, by an answer current at
+    /// `current_at`, before the write held: overtaken by it, it says nothing of the record
+    /// now (Switch spec 10.3).
+    #[non_exhaustive]
+    Overtaken {
+        /// The write shown.
+        write: ShownWrite,
+        /// What the answer is current at: a read's head, a list page's `seq`.
+        current_at: RecordVersion,
+    },
     /// The switch refused the read with an answer the same request won't change, such as
     /// `403 permission_missing` or `400` (the Retry column of Switch spec 6.4 saying "No"):
     /// reading again won't help as things stand.
@@ -888,18 +1005,40 @@ pub enum KeptReason {
     Unreachable(String),
 }
 
+/// A write the switch showed that the app didn't take for being older than the one it
+/// holds ([`KeptReason::Older`], [`KeptReason::Overtaken`]). It passed the checks of Switch
+/// spec 10.3, so its writer signed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShownWrite {
+    /// Its version: from a transition proof or a verified stub when `authenticated`, else the
+    /// record view's.
+    pub version: RecordVersion,
+    /// Whether a transition proof naming the write, or its verified chain stub, gives
+    /// `version` (Switch spec 10.3).
+    pub authenticated: bool,
+    /// Its item hash, which its writer signed.
+    pub item_hash: [u8; 32],
+    /// The app that signed it.
+    pub writer: [u8; 16],
+}
+
 /// What [`App::take_write`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
     /// A newer write, now held.
     New,
     /// The write held.
-    Same,
+    Equal,
     /// The write held, unopened before, now opened: no newer write. No path from the feed
     /// reaches it today: a key that arrives reopens the record through `reopen_unreadable`
     /// before the feed meets the write again. It stays so that `New` keeps meaning newer.
     Reopened,
-    NotNewer,
+    /// Older than the write held ([`Order::Older`]).
+    Older(ShownWrite),
+    /// Older, by an answer current before the write held ([`Order::Overtaken`]).
+    Overtaken(ShownWrite, RecordVersion),
+    /// Newer, and refused by the protocol's regression check.
     Flagged,
 }
 
@@ -1075,13 +1214,13 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Option<WriteRead>, AppError> {
-        let Some(view) = self.record_view(key).await? else {
+        let Some((view, at)) = self.record_view(key).await? else {
             self.note_gone(key).await?;
             return Ok(None);
         };
         let mut tx = self.tx()?;
         let read = self
-            .take_view(&view, Some((key, collection)), &mut tx)
+            .take_view(&view, at, Some((key, collection)), &mut tx)
             .await?;
         self.commit(tx).await?;
         Ok(Some(read))
@@ -1091,8 +1230,9 @@ impl App {
     /// (Switch wire 7.4.9): [`RecordRead::Fresh`] when the switch's current write is what the
     /// app holds after the read, taken now or the very write it held; otherwise
     /// [`RecordRead::Kept`], with the copy the app keeps, if any, and why nothing read now
-    /// replaced it: a `404`, a write refused or no newer than the one held, a read the
-    /// switch refused for good, or a switch it couldn't read for now. A kept copy isn't evidence of the switch's state now.
+    /// replaced it: a `404`, a write refused, an older write than the one held, shown by an
+    /// answer current past it or overtaken by it, a read the switch refused for good, or a
+    /// switch it couldn't read for now. A kept copy isn't evidence of the switch's state now.
     ///
     /// # Errors
     ///
@@ -1108,13 +1248,16 @@ impl App {
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
             let reason = match self.fetch_record(&key, &target.collection).await {
-                Ok(Some(WriteRead::Taken | WriteRead::Held)) => {
+                Ok(Some(WriteRead::Taken | WriteRead::Equal)) => {
                     if let Some(record) = self.shared_record(&key).await? {
                         return Ok(RecordRead::Fresh(record));
                     }
                     KeptReason::Refused
                 }
-                Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
+                Ok(Some(WriteRead::Older(write))) => KeptReason::Older(write),
+                Ok(Some(WriteRead::Overtaken(write, current_at))) => {
+                    KeptReason::Overtaken { write, current_at }
+                }
                 Ok(Some(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
                 Ok(None) => KeptReason::NotFound,
                 Err(AppError::Switch(ClientError::Switch { code, .. }))
@@ -1135,15 +1278,19 @@ impl App {
         .await
     }
 
-    /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
-    /// for a key it doesn't know, or forgot.
+    /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what
+    /// it is current at: the answer's head, of the generation it names; `None` for a key it
+    /// doesn't know, or forgot.
     pub(crate) async fn record_view(
         &mut self,
         key: &[u8; 32],
-    ) -> Result<Option<SharedRecordView>, AppError> {
+    ) -> Result<Option<(SharedRecordView, CurrentAt)>, AppError> {
         let result = self.client.record(key).await;
         match self.take(result).await {
-            Ok(view) => Ok(Some(view)),
+            Ok(answer) => {
+                let at = CurrentAt::of(answer.head.as_ref(), None);
+                Ok(Some((answer.view, at)))
+            }
             Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -1236,6 +1383,9 @@ impl App {
                 .records(&id, after.as_ref(), Some(LIST_PAGE))
                 .await;
             let page = self.take(result).await?;
+            // A page is current at its `seq`, in the generation of the head it came with,
+            // never another's (Switch spec 10.3).
+            let at = CurrentAt::of(page.head.as_ref(), Some(page.seq));
             let mut tx = self.tx()?;
             for view in &page.records {
                 // A page holds up to 1,000 views, each cached with its mark: the views taken
@@ -1260,7 +1410,7 @@ impl App {
                         })
                     })
                     .unwrap_or(collection);
-                self.take_view(view, Some((&view.key, member)), &mut tx)
+                self.take_view(view, at, Some((&view.key, member)), &mut tx)
                     .await?;
                 listed = listed.saturating_add(1);
             }
@@ -1648,7 +1798,7 @@ impl App {
                 stub: None,
                 view_version: Some(record.version),
                 view_revision: Some(record.applied),
-                viewed: false,
+                current_at: CurrentAt::Itself,
             };
             self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
                 .await?;
@@ -1700,11 +1850,13 @@ impl App {
         Ok(())
     }
 
-    /// Take a record view, from a read, a list page, after a conflict or after an upload;
-    /// then hold what it says of divergent uploads, once the write is judged.
+    /// Take a record view, from a read, a list page, after a conflict or after an upload,
+    /// current at `at`; then hold what it says of divergent uploads, once the write is
+    /// judged.
     pub(crate) async fn take_view(
         &mut self,
         view: &SharedRecordView,
+        at: CurrentAt,
         expect: Option<(&[u8; 32], &Collection)>,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
@@ -1715,7 +1867,7 @@ impl App {
             stub: None,
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
-            viewed: true,
+            current_at: at,
         };
         let read = self.read_write(&evidence, expect, view.key, tx).await?;
         // Only a view of the key asked for says anything of that record's uploads.
@@ -1749,7 +1901,7 @@ impl App {
             stub: Some(envelope),
             view_version: None,
             view_revision: None,
-            viewed: false,
+            current_at: CurrentAt::Itself,
         };
         let key = put.key;
         let mut viewed = None;
@@ -1817,7 +1969,8 @@ impl App {
                 return Ok(WriteRead::Waits);
             }
         }
-        let mut outcome = self.accept_write(evidence, expect, tx).await?;
+        // Boxed: the checks hold a deep future, which a receive on a small stack can't.
+        let mut outcome = Box::pin(self.accept_write(evidence, expect, tx)).await?;
         let mut version = evidence
             .stub
             .map(|env| RecordVersion::new(env.generation, env.seq))
@@ -1830,7 +1983,7 @@ impl App {
         if let Err(Refused::Unheld(collection)) = &outcome {
             let collection = collection.clone();
             outcome = match self.record_view(&shown_key).await? {
-                Some(view) => {
+                Some((view, at)) => {
                     if view.key == shown_key {
                         *viewed = Some(view.divergent);
                     }
@@ -1852,9 +2005,9 @@ impl App {
                         stub,
                         view_version: Some(view_version),
                         view_revision: Some(view.revision),
-                        viewed: true,
+                        current_at: at,
                     };
-                    self.accept_write(&evidence, Some((&shown_key, &collection)), tx)
+                    Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx))
                         .await?
                 }
                 None => Err(Refused::Ignored),
@@ -1868,8 +2021,9 @@ impl App {
             Ok(accepted) => {
                 return Ok(match self.take_write(accepted, false, tx).await? {
                     Taken::New => WriteRead::Taken,
-                    Taken::Same | Taken::Reopened => WriteRead::Held,
-                    Taken::NotNewer => WriteRead::NotNewer,
+                    Taken::Equal | Taken::Reopened => WriteRead::Equal,
+                    Taken::Older(write) => WriteRead::Older(write),
+                    Taken::Overtaken(write, at) => WriteRead::Overtaken(write, at),
                     Taken::Flagged => WriteRead::Refused,
                 });
             }
@@ -2137,6 +2291,25 @@ impl App {
             (None, None) => None,
         };
         let plausible = shown.is_some_and(|version| version.plausible(body.generation));
+        // How it compares with the write held, before anything about its writer's standing:
+        // an older write a current answer shows with both versions authenticated is the
+        // service's rollback, whoever signed it (Switch spec 10.1, 10.3).
+        let order = match (
+            self.held_record(&put.key).await?,
+            shown.filter(|_| plausible),
+        ) {
+            (Some(held), Some(version)) => match compare_with_held(
+                &version,
+                (item_hash, writer),
+                &held.write_version(),
+                held.item_hash,
+                evidence.current_at,
+            ) {
+                Ok(order) => order,
+                Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
+            },
+            _ => Order::Newer,
+        };
         // A write refused on the service's word only, at the key read: followed, naming
         // nobody, when its version is plausible, so an honest service's record stays
         // writable, as one taken from a recovery upload under a renewal closed since; else
@@ -2308,9 +2481,10 @@ impl App {
             revision: evidence
                 .view_revision
                 .unwrap_or(applied_at(version.version, item_hash)),
-            viewed: evidence.viewed,
+            viewed: evidence.current_at.viewed(),
             content,
             doubtful,
+            order,
         }))
     }
 
@@ -2531,7 +2705,12 @@ impl App {
         };
         let identity = self.state.meta.identity;
         let current_key = self.state.own_doc.inbox().service_key;
-        if let Ok(checked) = TransitionProof::verify(proof, &current_key, &identity) {
+        // Checked with the current key only for a proof of the newest own `identity.json`'s
+        // generation: after a provider loss at the same service a lost generation's proofs
+        // verify with that key too, and date nothing (Switch wire 3.3, 6.2 step 2).
+        if let Ok(checked) = TransitionProof::verify(proof, &current_key, &identity)
+            && checked.envelope().generation == self.state.own_doc.generation()
+        {
             let env = checked.envelope();
             if let Some(chain) = self.state.chain.as_ref()
                 && env.generation == self.state.meta.generation
@@ -2589,7 +2768,7 @@ impl App {
                 accepted.time = held.written_at_ms.or(accepted.time);
             }
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
-                if held.item_hash == accepted.item_hash {
+                if accepted.order == Order::Equal {
                     let mut upgraded = held.clone();
                     if accepted.version.authenticated && !held.authenticated {
                         upgraded.version = accepted.version.version;
@@ -2613,9 +2792,9 @@ impl App {
                     if upgraded != *held {
                         tx.put(&record_key_of(&key), &upgraded)?;
                     }
-                    return Ok(Taken::Same);
+                    return Ok(Taken::Equal);
                 }
-                if !accepted.version.replaces(&held.write_version()) {
+                if let Order::Older(write) | Order::Overtaken(write, _) = accepted.order {
                     // Another write at the held version, which a view shows as the switch's
                     // current one: after recovery uploads two writes can share a version
                     // (Switch spec 12.6 step 3). It isn't taken, but the next write builds on it.
@@ -2624,7 +2803,10 @@ impl App {
                         let shown = (accepted.version.version, accepted.revision);
                         self.follow_write(&key, shown, deleted, false, tx).await?;
                     }
-                    return Ok(Taken::NotNewer);
+                    return Ok(match accepted.order {
+                        Order::Overtaken(_, at) => Taken::Overtaken(write, at),
+                        _ => Taken::Older(write),
+                    });
                 }
             }
             let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
@@ -2649,6 +2831,7 @@ impl App {
                     None => expected_version.is_none(),
                 },
                 conditions,
+                written_at_ms: accepted.time,
             };
             // A write by this app is its own, also when the feed or a view shows it before its
             // answer, or another device of the app made it: one app is one principal (Switch
@@ -2656,11 +2839,12 @@ impl App {
             // from the value written, as at its answer, once this device can read that value. A
             // flag would name the app itself.
             let own = own || accepted.writer == self.state.meta.app_id;
+            // Every write of another app the app would take is checked, the first of a
+            // record included, against nothing seen yet (Switch spec 8.2).
             if !own
-                && let Some(mark) = &seen
                 && let Some(reason) = self.protocols.record_regression(
                     &accepted.collection.name,
-                    &mark.mark,
+                    seen.as_ref().map(|mark| mark.mark.as_slice()),
                     new_value,
                     base,
                 )
@@ -2796,7 +2980,7 @@ impl App {
             stub: None,
             view_version: None,
             view_revision: None,
-            viewed: false,
+            current_at: CurrentAt::Itself,
         };
         let key = put.key;
         match self
@@ -3445,6 +3629,126 @@ pub(crate) fn cut_reason(mut reason: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record view is current in the generation of the head its answer carries, at the
+    /// page's `seq` for a list page; one without a head doesn't say (Switch spec 10.3).
+    #[test]
+    fn test_records_current_at_is_the_heads_generation() {
+        let head = SignedHead {
+            chain_version: 1,
+            generation: 2,
+            seq: 40,
+            chain_hash: [0; 32],
+            sig: [0; 64],
+        };
+        assert_eq!(
+            CurrentAt::of(Some(&head), Some(3)),
+            CurrentAt::Answer(RecordVersion::new(2, 3))
+        );
+        assert_eq!(
+            CurrentAt::of(Some(&head), None),
+            CurrentAt::Answer(RecordVersion::new(2, 40))
+        );
+        assert_eq!(CurrentAt::of(None, Some(3)), CurrentAt::Unknown);
+    }
+
+    /// One comparison for every path that shows a write (Switch spec 10.1, 10.3): the same
+    /// write by its item hash, a newer one, an older one by an answer current past the held
+    /// write or one that doesn't say, an overtaken one, and the rollback, two authenticated
+    /// versions by an answer current at or past the held one.
+    #[test]
+    fn test_records_compare_with_held_by_what_the_answer_is_current_at() {
+        let v = RecordVersion::new;
+        let write = |version, authenticated, expected| WriteVersion {
+            version,
+            authenticated,
+            expected_version: expected,
+        };
+        let held = write(v(1, 10), true, v(1, 5));
+        let held_unproven = write(v(1, 10), false, v(1, 9));
+        let older = write(v(1, 8), true, v(1, 3));
+        let older_unproven = write(v(1, 8), false, v(1, 3));
+        let at_held = write(v(1, 10), true, v(1, 5));
+        let shown = |w: WriteVersion| ShownWrite {
+            version: w.version,
+            authenticated: w.authenticated,
+            item_hash: [2; 32],
+            writer: [3; 16],
+        };
+        let rollback = Err(String::new());
+        let cases = [
+            (older, held, [1; 32], CurrentAt::Itself, Ok(Order::Equal)),
+            (
+                write(v(1, 12), true, v(1, 10)),
+                held,
+                [2; 32],
+                CurrentAt::Answer(v(1, 12)),
+                Ok(Order::Newer),
+            ),
+            (
+                older,
+                held,
+                [2; 32],
+                CurrentAt::Answer(v(1, 20)),
+                rollback.clone(),
+            ),
+            (
+                older,
+                held,
+                [2; 32],
+                CurrentAt::Answer(v(1, 10)),
+                rollback.clone(),
+            ),
+            (at_held, held, [2; 32], CurrentAt::Itself, rollback.clone()),
+            (
+                older,
+                held,
+                [2; 32],
+                CurrentAt::Answer(v(1, 9)),
+                Ok(Order::Overtaken(shown(older), v(1, 9))),
+            ),
+            (
+                older,
+                held,
+                [2; 32],
+                CurrentAt::Itself,
+                Ok(Order::Overtaken(shown(older), v(1, 8))),
+            ),
+            (
+                older,
+                held,
+                [2; 32],
+                CurrentAt::Unknown,
+                Ok(Order::Older(shown(older))),
+            ),
+            (
+                older_unproven,
+                held,
+                [2; 32],
+                CurrentAt::Answer(v(1, 20)),
+                Ok(Order::Older(shown(older_unproven))),
+            ),
+            (
+                older,
+                held_unproven,
+                [2; 32],
+                CurrentAt::Answer(v(1, 10)),
+                Ok(Order::Older(shown(older))),
+            ),
+            (
+                older,
+                held_unproven,
+                [2; 32],
+                CurrentAt::Answer(v(1, 9)),
+                Ok(Order::Overtaken(shown(older), v(1, 9))),
+            ),
+        ];
+        for (i, (shown_write, held, hash, at, wanted)) in cases.into_iter().enumerate() {
+            let got = compare_with_held(&shown_write, (hash, [3; 16]), &held, [1; 32], at)
+                .map_err(|_| String::new());
+            assert_eq!(got, wanted, "case {i}");
+        }
+    }
 
     fn collection() -> Collection {
         Collection::new("sample.items", Policy::new("scope-a", &["scope-a"]))

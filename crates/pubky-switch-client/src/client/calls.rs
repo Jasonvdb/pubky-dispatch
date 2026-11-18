@@ -16,8 +16,8 @@ use pubky_switch_core::sig::SignedDoc;
 use super::answers::{
     AllowList, AppendAnswer, AppsAnswer, ClaimAnswer, ConnectAnswer, ConnectList, Directory,
     FeedPage, FeedQuery, HandoverStored, KeysAnswer, PeersAnswer, PublicIdentity, PushAnswer,
-    PushSetting, RecordPage, RecoveryUpload, SharedRecordView, StoredHandover, UploadAnswer,
-    WriteAnswer,
+    PushSetting, RecordAnswer, RecordPage, RecoveryUpload, SharedRecordView, StoredHandover,
+    UploadAnswer, WriteAnswer,
 };
 use super::read::{self, Obj};
 use super::{
@@ -552,13 +552,16 @@ impl SwitchClient {
     /// # Errors
     ///
     /// As every call; `404` for an unknown or forgotten key.
-    pub async fn record(&self, key: &[u8; 32]) -> Result<SharedRecordView, ClientError> {
+    pub async fn record(&self, key: &[u8; 32]) -> Result<RecordAnswer, ClientError> {
         let checked = self
             .get(&format!("records/{}", b64(key)), TimeoutClass::Bulk)
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
-        SharedRecordView::read(Obj::of(&value, what)?)
+        Ok(RecordAnswer {
+            view: SharedRecordView::read(Obj::of(&value, what)?)?,
+            head: checked.head,
+        })
     }
 
     /// `GET /v1/{id}/records?collection=&after=&limit=` (own app, Switch wire 7.4.9).
@@ -582,7 +585,9 @@ impl SwitchClient {
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
-        RecordPage::read(Obj::of(&value, what)?)
+        let mut page = RecordPage::read(Obj::of(&value, what)?)?;
+        page.head = checked.head;
+        Ok(page)
     }
 
     /// `GET /v1/{id}/directory` (own app, or an admitted app of another identity, Switch wire

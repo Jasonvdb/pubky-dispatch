@@ -642,6 +642,18 @@ impl SharedRecordView {
     }
 }
 
+/// The answer of `GET /v1/{id}/records/{key}` (Switch wire 7.4.9): the record view and the
+/// head it came with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordAnswer {
+    /// The record's view: its current write as of `head`.
+    pub view: SharedRecordView,
+    /// `Switch-Head`, where present and verified with the service key: what the view is
+    /// current at (Switch spec 10.3). `None` when the answer carries none.
+    pub head: Option<SignedHead>,
+}
+
 /// A page of `GET /v1/{id}/records?collection=` (Switch wire 7.4.9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordPage {
@@ -651,6 +663,10 @@ pub struct RecordPage {
     pub seq: u64,
     /// The key to pass as `after` for the next page; `None` on the last page.
     pub next: Option<[u8; 32]>,
+    /// `Switch-Head` of the answer the page came with, where present and verified with the
+    /// service key: its generation is the one `seq` counts in (Switch spec 10.3). Not in the
+    /// body; `None` when the answer carries none.
+    pub head: Option<SignedHead>,
 }
 
 impl RecordPage {
@@ -663,6 +679,7 @@ impl RecordPage {
                 .collect::<Result<_, _>>()?,
             seq: o.u64("seq")?,
             next: o.opt_b64n("next")?,
+            head: None,
         })
     }
 }

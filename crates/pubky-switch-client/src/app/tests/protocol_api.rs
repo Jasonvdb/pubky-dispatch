@@ -316,7 +316,7 @@ impl Protocol for ApiProtocol {
     fn record_regression(
         &self,
         c: &str,
-        seen: &[u8],
+        seen: Option<&[u8]>,
         value: Option<&[u8]>,
         base: crate::app::WriteBase,
     ) -> Option<String> {

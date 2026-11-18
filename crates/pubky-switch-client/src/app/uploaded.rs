@@ -209,7 +209,7 @@ impl App {
                 return Ok(true);
             }
             let view = match self.record_view(&key).await {
-                Ok(view) => view.filter(|view| view.key == key),
+                Ok(view) => view.filter(|(view, _)| view.key == key),
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::PermissionMissing,
                     ..
@@ -221,8 +221,8 @@ impl App {
             // any read of it is; another as the protocol's collections take it.
             let collection = self.held_collection(&key).await?;
             let mut tx = self.tx()?;
-            if let Some(view) = view {
-                self.take_view(&view, collection.as_ref().map(|c| (&key, c)), &mut tx)
+            if let Some((view, at)) = view {
+                self.take_view(&view, at, collection.as_ref().map(|c| (&key, c)), &mut tx)
                     .await?;
             }
             tx.delete(&record_reread_key(&key))?;

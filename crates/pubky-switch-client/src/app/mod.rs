@@ -122,7 +122,8 @@ pub use directory::{
 };
 pub use records::{
     Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord,
+    ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,

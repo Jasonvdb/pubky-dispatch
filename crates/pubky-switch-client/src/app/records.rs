@@ -1786,27 +1786,33 @@ impl App {
             let next = page
                 .next
                 .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
-            self.commit(tx).await?;
             let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
             Box::pin(self.note_unlisted(
                 &collection.name,
-                after.as_ref(),
-                next.as_ref(),
+                (after.as_ref(), next.as_ref()),
                 &shown,
                 at,
                 upload_at,
+                &mut tx,
             ))
             .await?;
-            // A page's omissions have now been checked. A reload before this commit
-            // repeats the page, including those checks, from the previous continuation.
-            let mut tx = self.tx()?;
+            // Keep the continuation and the covered inventory with the page's records.
+            // Only a page too large for one batch leaves earlier records to be read again.
+            let mut checkpoint = Tx::new(&self.ns);
             if members.is_some() {
-                self.keep_inventory_page(collection, after, &page, listed_members, &mut tx)?;
+                self.keep_inventory_page(
+                    collection,
+                    after,
+                    &page,
+                    listed_members,
+                    &mut checkpoint,
+                )?;
             }
             if let Some((progress, key)) = progress.as_mut() {
                 progress.reached(&id, next.as_ref());
-                tx.put(key, &**progress)?;
+                checkpoint.put(key, &**progress)?;
             }
+            self.append_listing_writes(&mut tx, checkpoint).await?;
             if !tx.is_empty() {
                 self.commit(tx).await?;
             }
@@ -3678,11 +3684,11 @@ impl App {
     async fn note_unlisted(
         &mut self,
         collection: &str,
-        after: Option<&[u8; 32]>,
-        last: Option<&[u8; 32]>,
+        (after, last): (Option<&[u8; 32]>, Option<&[u8; 32]>),
         listed: &[[u8; 32]],
         at: CurrentAt,
         upload_at: FeedPosition,
+        tx: &mut Tx,
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
         for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
@@ -3699,14 +3705,21 @@ impl App {
                     .await?
                     .is_none_or(|upload| self.covers_upload(upload_at, upload))
             {
-                let mut tx = self.tx()?;
-                Box::pin(self.note_absent(&key, at, &mut tx)).await?;
-                if !tx.is_empty() {
-                    self.commit(tx).await?;
-                }
+                let mut omitted = Tx::new(&self.ns);
+                Box::pin(self.note_absent(&key, at, &mut omitted)).await?;
+                self.append_listing_writes(tx, omitted).await?;
             }
         }
         Ok(())
+    }
+
+    /// Flush earlier records only when adding the next listing writes would exceed a batch.
+    async fn append_listing_writes(&mut self, tx: &mut Tx, writes: Tx) -> Result<(), AppError> {
+        if tx.size().saturating_add(writes.size()) > crate::store::MAX_BATCH_BYTES {
+            let full = std::mem::replace(tx, self.tx()?);
+            self.commit(full).await?;
+        }
+        tx.append(writes)
     }
 
     /// A pending observation may finish after the app settled an own write or read

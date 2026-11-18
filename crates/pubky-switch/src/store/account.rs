@@ -114,11 +114,20 @@ impl AccountHead {
     }
 }
 
+/// The position this request will cover before releasing its answer (Switch wire 7.3).
+#[derive(Clone, Copy)]
+pub(crate) enum MarkCoverage {
+    None,
+    ChainHead,
+    ServingPosition,
+}
+
 /// A committed request: what it committed is durable, so its answer may go out once the
 /// mark has moved to its head and count (Switch wire 7.3 step 10, "Moving it"). Only
 /// [`AccountTxn::commit`] makes one.
 #[derive(Debug)]
 pub struct Committed {
+    pub(crate) mark_target: Option<crate::marks::MarkTarget>,
     head: AccountHead,
     counted: bool,
 }
@@ -553,7 +562,14 @@ impl AccountTxn {
     /// Each move writes a fresh random tag beside the count. It is read after the superseded
     /// documents go and before the request's last-seen time and flags are written, which
     /// count nothing (Switch wire 7.3, "The state").
-    pub async fn commit(mut self) -> Result<Committed, StoreError> {
+    pub async fn commit(self) -> Result<Committed, StoreError> {
+        self.commit_with_mark(MarkCoverage::None).await
+    }
+
+    pub(crate) async fn commit_with_mark(
+        mut self,
+        coverage: MarkCoverage,
+    ) -> Result<Committed, StoreError> {
         // The documents this request superseded go with it (Switch wire 7.5).
         self.drop_stale_documents().await?;
         let moved = self.head.generation != self.loaded.generation
@@ -609,6 +625,11 @@ impl AccountTxn {
         };
         self.head.state_version = from_db(state_version, "state_version")?;
         self.head.state_tag = super::state_tag(state_tag)?;
+        let mark_target = match coverage {
+            MarkCoverage::None => None,
+            MarkCoverage::ChainHead => self.head.mark_target(false),
+            MarkCoverage::ServingPosition => self.head.mark_target(true),
+        };
         let counted = self.head.state_version != self.loaded.state_version;
         if counted {
             sqlx::query("DELETE FROM state_history WHERE account_id = $1 AND state_version < $2")
@@ -617,15 +638,20 @@ impl AccountTxn {
                 .execute(&mut *self.tx)
                 .await
                 .map_err(StoreError::from_db)?;
+            // Keep the final slot for a commit that has a position to publish. A staged
+            // receipt or sweep must leave room for the first identity delivery.
+            const HISTORY_LIMIT: i64 = 1024;
+            let limit = HISTORY_LIMIT - i64::from(mark_target.is_none());
             let inserted = sqlx::query(
                 "INSERT INTO state_history (account_id, state_version, state_tag) \
                  SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM state_history \
-                 WHERE account_id = $1 AND state_version > $4 LIMIT 1 OFFSET 1023)",
+                 WHERE account_id = $1 AND state_version > $4 LIMIT 1 OFFSET $5)",
             )
             .bind(&self.head.id)
             .bind(state_version)
             .bind(self.head.state_tag.as_slice())
             .bind(to_db(self.covered_version, "state_version")?)
+            .bind(limit - 1)
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;
@@ -688,6 +714,7 @@ impl AccountTxn {
         }
         self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(Committed {
+            mark_target,
             head: self.head,
             counted,
         })

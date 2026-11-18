@@ -88,7 +88,7 @@ use crate::{
     limits::Limits,
     marks::MarkStore,
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
-    store::{AccountTxn, LockFreshness, Store, StoreError},
+    store::{AccountTxn, LockFreshness, MarkCoverage, Store, StoreError},
     time::TrustedTime,
 };
 
@@ -1348,8 +1348,15 @@ impl Service {
         // stamped the time, which must be durable before it is shown. The commit runs to its
         // end in a task of its own, also when the request is dropped meanwhile (a client that
         // hangs up).
+        let coverage = if healthy {
+            MarkCoverage::ServingPosition
+        } else if carries_head || answer.starts_generation {
+            MarkCoverage::ChainHead
+        } else {
+            MarkCoverage::None
+        };
         let commit = async move {
-            txn.commit().await.map_err(|failure| {
+            txn.commit_with_mark(coverage).await.map_err(|failure| {
                 tracing::error!(%failure, "commit");
             })
         };
@@ -1369,10 +1376,7 @@ impl Service {
         // savepoint (Switch wire 7.3). No answer carries a head where the verdict is behind or a fork,
         // so no mark moves there but by a start. A commit that held whose mark didn't move
         // answers `503`, and its retry is answered as a retry (Switch wire 7.3, "Moving it").
-        let target = committed
-            .head()
-            .mark_target(healthy)
-            .filter(|_| healthy || carries_head || answer.starts_generation);
+        let target = committed.mark_target;
         if let Some(target) = target {
             let moved = if answer.starts_generation
                 && matches!(routed.route, Route::StartAfresh)

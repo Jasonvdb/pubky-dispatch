@@ -62,6 +62,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
+pub(crate) use account::MarkCoverage;
 pub use account::{
     AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
 };

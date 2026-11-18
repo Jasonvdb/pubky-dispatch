@@ -552,12 +552,20 @@ impl Service {
         if enrolled.mark_key.is_some() && !self.lock_is_fresh() {
             return Err(refused(unavailable()));
         }
-        let committed = txn.commit().await.map_err(|e| refused(store_error(&e)))?;
+        let coverage = if enrolled.mark_key.is_some() {
+            crate::store::MarkCoverage::ServingPosition
+        } else {
+            crate::store::MarkCoverage::None
+        };
+        let committed = txn
+            .commit_with_mark(coverage)
+            .await
+            .map_err(|e| refused(store_error(&e)))?;
         // At a healthy account the mark covers the committed position before any answer,
         // a retry's included: the first answer may have failed after the commit, before its
         // mark moved (Switch wire 7.3, "Moving it").
         if let Some(key) = enrolled.mark_key
-            && let Some(target) = committed.head().mark_target(true)
+            && let Some(target) = committed.mark_target
         {
             let created_at_ms = committed.head().created_at_ms;
             if self

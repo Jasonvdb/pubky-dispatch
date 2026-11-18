@@ -903,3 +903,32 @@ async fn test_renewal_member_remote_deadline_is_not_carried() {
     assert_eq!(members(&b)["chat"], json!({ "room": 5 }));
     assert_ne!(held.body().expires_at, Some(deadline));
 }
+
+/// An ask whose member was absent already stays when another device's later record is
+/// taken as it is.
+#[tokio::test]
+async fn test_renewal_member_ask_without_member_survives_a_take() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    let deadline = p.w.clock.now_ms() + HOUR;
+    app.set_protocol_member("chat", None, None).await.unwrap();
+    app.renew_record("chat", Some(deadline)).await.unwrap();
+    let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
+    let mut body = held.body().clone();
+    body.updated_at = p.w.clock.now_ms() + 60_000;
+    body.protocols
+        .insert("tasks".into(), object(json!({ "list": "other" })));
+    let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    p.w.homeserver.put(
+        p.w.alice.public(),
+        &app_record_path(&me),
+        serde_json::to_vec(other.signed()).unwrap(),
+    );
+    app.publish_record().await.unwrap();
+    assert_eq!(app.record(), other.signed());
+    assert_eq!(
+        app.record_expiries().await.unwrap().get("chat"),
+        Some(&RecordExpiry::At(deadline))
+    );
+}

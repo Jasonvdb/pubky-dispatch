@@ -382,12 +382,36 @@ async fn test_admission_entries_consumed_ahead_keep_their_observations_until_pas
     let mut app = App::load(w.env(), p.clone(), World::config(), me)
         .await
         .unwrap();
-    assert_eq!(app.state.held[&parked].receipt, first);
     assert!(app.state.held.contains_key(&direct));
+    assert_eq!(app.state.held[&parked].receipt, first);
     p.hold.store(false, Ordering::SeqCst);
     app.receive(None).await.unwrap();
     assert!(app.cursor().seq >= direct);
     assert!(app.state.held.is_empty());
+}
+
+#[tokio::test]
+async fn test_admission_drops_observations_passed_by_a_shared_cursor() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    app.set_multi_device(true).await.unwrap();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    app.receive(None).await.unwrap();
+    assert!(app.state.held.contains_key(&held));
+    assert!(!app.state.seen.contains(&held));
+
+    // Another device of the app passes the entry. The switch releases its copy.
+    w.switch.move_cursor(me, held).unwrap();
+    assert!(!w.switch.shown(me).iter().any(|item| item["seq"] == held));
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= held);
+    assert!(!app.state.held.contains_key(&held));
+    drop(app);
+    let app = App::load(w.env(), p, World::config(), me).await.unwrap();
+    assert!(!app.state.held.contains_key(&held));
 }
 
 #[tokio::test]

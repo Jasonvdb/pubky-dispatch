@@ -1250,9 +1250,7 @@ impl App {
             (None, Some(blocked)) => blocked.saturating_sub(1).min(through),
             (None, None) => through,
         };
-        if end > self.state.cursor.seq {
-            self.state.cursor.seq = end;
-        }
+        self.advance_feed_cursor(end, None, &mut read.tx)?;
         // The page is covered through its end, for the protocols in step with it.
         if stopped.is_none() {
             let none = std::collections::BTreeSet::new();
@@ -1290,7 +1288,6 @@ impl App {
         for seq in passed {
             read.tx.delete(&key::seen(seq))?;
             self.state.seen.remove(&seq);
-            self.drop_observation(seq, &mut read.tx)?;
         }
         let asked: Vec<u64> = self.state.asked.range(..=cursor).copied().collect();
         for seq in asked {
@@ -1316,11 +1313,7 @@ impl App {
             FeedItem::Unreadable { accepted_at, .. } => Some(*accepted_at),
             _ => None,
         };
-        if let Some(at) = accepted {
-            self.state.cursor.time_ms = self.state.cursor.time_ms.max(at);
-        }
-        self.state.cursor.seq = self.state.cursor.seq.max(seq);
-        self.drop_observation(seq, &mut read.tx)
+        self.advance_feed_cursor(seq, accepted, &mut read.tx)
     }
 
     /// Keeps the first observation of an entry of the feed the cursor stays before, at
@@ -1348,10 +1341,23 @@ impl App {
         Ok(())
     }
 
-    /// The cursor passed the entry at `seq` of the feed.
-    fn drop_observation(&mut self, seq: u64, tx: &mut Tx) -> Result<(), AppError> {
-        if self.state.held.remove(&seq).is_some() {
-            tx.delete(&key::held(seq))?;
+    /// Keep observations only for feed positions the local cursor can still read.
+    fn advance_feed_cursor(
+        &mut self,
+        seq: u64,
+        accepted_at: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let cursor = &mut self.state.cursor;
+        cursor.seq = cursor.seq.max(seq);
+        if let Some(at) = accepted_at {
+            cursor.time_ms = cursor.time_ms.max(at);
+        }
+        while let Some((&passed, _)) = self.state.held.first_key_value()
+            && passed <= cursor.seq
+        {
+            tx.delete(&key::held(passed))?;
+            self.state.held.pop_first();
         }
         Ok(())
     }
@@ -2352,9 +2358,7 @@ impl App {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
-            self.state.cursor.seq = self.state.cursor.seq.max(pending.seq);
-            self.state.cursor.time_ms = self.state.cursor.time_ms.max(pending.accepted_at_ms);
-            self.drop_observation(pending.seq, &mut tx)?;
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), &mut tx)?;
         }
         tx.delete(key::PENDING_EFFECT)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
@@ -2487,10 +2491,8 @@ impl App {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
-            self.drop_observation(pending.seq, tx)?;
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), tx)?;
             let cursor = &mut self.state.cursor;
-            cursor.seq = cursor.seq.max(pending.seq);
-            cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
             if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
                 cursor.deferred_since_ms = Some(now);
             }

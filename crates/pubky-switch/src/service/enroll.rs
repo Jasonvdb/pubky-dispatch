@@ -382,22 +382,15 @@ impl Service {
             return Err(unavailable());
         }
         let created_at_ms = now;
-        let marked = match judged.mark() {
-            Some(held) => self
+        if let Some(held) = judged.mark() {
+            let marked = self
                 .marks
                 .take(identity_text, *held, key, created_at_ms)
                 .await
-                .map_err(|failure| mark_failure(failure, "taking a mark over"))?,
-            _ => self
-                .marks
-                .create_zero(identity_text, key, created_at_ms)
-                .await
-                .map_err(|failure| mark_failure(failure, "writing a new account's mark"))?,
-        };
-        if !matches!(marked, MarkWrite::Written(_)) {
-            // Under the lock nothing else writes the mark: one changed meanwhile is a store
-            // that changed under the service.
-            return Err(unavailable());
+                .map_err(|failure| mark_failure(failure, "taking a mark over"))?;
+            if !matches!(marked, MarkWrite::Written(_)) {
+                return Err(unavailable());
+            }
         }
         let limits = announced_limits(&self.limits);
         if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
@@ -449,7 +442,25 @@ impl Service {
                 .await
                 .map_err(|e| store_error(&e))?,
         };
-        creation.commit().await.map_err(|e| store_error(&e))?;
+        if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. }) {
+            let (tx, anchor) = creation
+                .prepare_fresh()
+                .await
+                .map_err(|e| store_error(&e))?;
+            let bound = self
+                .marks
+                .create_anchored(identity_text, store_id, key, created_at_ms, anchor)
+                .await
+                .map_err(|failure| mark_failure(failure, "binding fresh enrollment contents"))?;
+            if !matches!(bound, MarkWrite::Written(_)) {
+                return Err(unavailable());
+            }
+            tx.commit()
+                .await
+                .map_err(|e| store_error(&crate::store::StoreError::from_db(e)))?;
+        } else {
+            creation.commit().await.map_err(|e| store_error(&e))?;
+        }
         // Answered at the time it first stamped, which may be past `base_ms`.
         Ok(Some(Enrolled {
             time_ms: account.stamped_time_ms,
@@ -680,6 +691,28 @@ impl Service {
             }
             if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
                 return Err(unavailable());
+            }
+            if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. })
+                && txn.head().state_version == 0
+                && txn.head().last_seq == 0
+            {
+                let mark = judged
+                    .mark()
+                    .filter(|m| {
+                        m.created_at_ms == created && m.generation == 0 && m.state_version == 0
+                    })
+                    .ok_or_else(unavailable)?;
+                let anchor = mark
+                    .creation_anchor
+                    .for_creation(created)
+                    .ok_or_else(unavailable)?;
+                if !txn
+                    .matches_creation_anchor(store_id, enrollment_hash, anchor)
+                    .await
+                    .map_err(|e| store_error(&e))?
+                {
+                    return Err(unavailable());
+                }
             }
             return Ok(Enrolled {
                 time_ms: txn.head().committed_ms(self.run, judged.time_floor_ms()),

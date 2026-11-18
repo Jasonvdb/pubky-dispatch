@@ -307,6 +307,86 @@ async fn test_account_binding_discovery_and_expired_receipt_are_read_only() {
 }
 
 #[tokio::test]
+async fn test_fresh_enrollment_receipt_verifies_the_initial_exclusions_after_restart() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let initial = make_enrollment(EnrollmentIntent::Create { observation }, 37);
+    let mut body = initial.body().clone();
+    let mut revoked = (0..=255).map(|n| [n; 16]).collect::<Vec<_>>();
+    revoked.sort_by_key(|id| pubky_switch_core::enc::zbase32_encode(id));
+    body.revoked_apps = Some(revoked);
+    let enrollment = Enrollment::sign(&key(), body).unwrap();
+    let original = replay
+        .service
+        .handle(enrollment_request(&enrollment, NOW))
+        .await;
+    status(&original, 200);
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() <= 4096);
+    let reopened = service_with_restored_mark(&replay, &bytes);
+    let MarkRead::Mark(mark) = MarkStore::open(replay.key_dir())
+        .unwrap()
+        .read(&key().id())
+        .await
+        .unwrap()
+    else {
+        panic!("fresh mark");
+    };
+    assert_ne!(
+        mark.creation_anchor
+            .for_creation(mark.created_at_ms)
+            .unwrap(),
+        [0; 32]
+    );
+    assert_eq!((mark.generation, mark.seq, mark.state_version), (0, 0, 0));
+    let retry = || enrollment_request(&enrollment, NOW);
+    let request = retry();
+    let sent = support::Sent::of(&request);
+    let matched = reopened.handle(request).await;
+    status(&matched, 200);
+    assert!(support::signed_with(
+        &matched,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(matched.body, original.body);
+
+    // Restore the same account and receipt with an incomplete set of exclusions. The
+    // original independent mark and creation still match the SQL witness column.
+    sql(&replay, "CREATE TABLE saved_exclusion AS SELECT * FROM kept_app_ids ORDER BY app_id LIMIT 1;         DELETE FROM kept_app_ids WHERE app_id IN (SELECT app_id FROM saved_exclusion)").await;
+    let request = retry();
+    let sent = support::Sent::of(&request);
+    let refused = reopened.handle(request).await;
+    status(&refused, 503);
+    assert!(support::signed_with(
+        &refused,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    sql(
+        &replay,
+        "INSERT INTO kept_app_ids SELECT * FROM saved_exclusion",
+    )
+    .await;
+    sql(&replay, "CREATE TABLE saved_anchor AS SELECT id, creation_anchor FROM accounts; UPDATE accounts SET creation_anchor = NULL").await;
+    status(&reopened.handle(retry()).await, 503);
+    sql(&replay, "UPDATE accounts SET creation_anchor = saved_anchor.creation_anchor FROM saved_anchor WHERE accounts.id = saved_anchor.id").await;
+    assert_eq!(reopened.handle(retry()).await.body, original.body);
+
+    let unproven = pubky_switch::marks::AccountMark::zero(mark.key, mark.created_at_ms);
+    let without_anchor =
+        service_with_restored_mark(&replay, &serde_json::to_vec(&unproven).unwrap());
+    status(&without_anchor.handle(retry()).await, 503);
+    let complete = service_with_restored_mark(&replay, &bytes);
+    assert_eq!(complete.handle(retry()).await.body, original.body);
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_account_binding_saved_delivery_cannot_activate_recreated_account() {
     let Some(replay) = support::replay().await else {
         return;

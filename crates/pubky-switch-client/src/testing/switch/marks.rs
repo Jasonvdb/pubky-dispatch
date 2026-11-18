@@ -32,6 +32,7 @@ pub(crate) struct Mark {
     pub(crate) state_tag: u64,
     pub(crate) key: [u8; 32],
     pub(crate) created_at_ms: u64,
+    pub(super) creation_anchor: Option<(u64, [u8; 32])>,
 }
 
 impl Mark {
@@ -45,6 +46,7 @@ impl Mark {
             state_tag: 0,
             key,
             created_at_ms,
+            creation_anchor: None,
         }
     }
 
@@ -528,7 +530,10 @@ impl Inner {
         let key = self.service.verifying_key().to_bytes();
         self.created_at_ms = created;
         self.marks.slot = MarkSlot::At(match self.marks.slot {
-            MarkSlot::At(mark) if !mark.records_head() => Mark::zero(key, created),
+            MarkSlot::At(mark) if !mark.records_head() => Mark {
+                creation_anchor: mark.creation_anchor,
+                ..Mark::zero(key, created)
+            },
             MarkSlot::At(mark) => Mark {
                 key,
                 created_at_ms: created,
@@ -580,6 +585,7 @@ impl Inner {
             state_tag: self.state_tag,
             key: self.service.verifying_key().to_bytes(),
             created_at_ms: created,
+            creation_anchor: self.marks.mark().and_then(|m| m.creation_anchor),
         });
     }
 
@@ -599,6 +605,7 @@ impl Inner {
                 state_tag: self.state_tag,
                 key,
                 created_at_ms: self.created_at_ms,
+                creation_anchor: None,
             }
         });
     }

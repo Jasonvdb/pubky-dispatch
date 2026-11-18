@@ -342,6 +342,32 @@ pub(super) async fn create(
 impl Creation {
     /// Commit the account, at the creation time asked for, and let its identity's lock go.
     pub async fn commit(mut self) -> Result<(), StoreError> {
+        self.populate().await?;
+        self.tx.commit().await.map_err(StoreError::from_db)
+    }
+
+    /// Materialize the fresh account and its immutable witness, still under the identity lock.
+    pub(crate) async fn prepare_fresh(
+        mut self,
+    ) -> Result<(Transaction<'static, Postgres>, [u8; 32]), StoreError> {
+        self.populate().await?;
+        let anchor = super::creation_anchor::contents(
+            &mut self.tx,
+            &self.account.id,
+            self.account.enrollment_store_id,
+            self.account.enrollment_hash,
+        )
+        .await?;
+        sqlx::query("UPDATE accounts SET creation_anchor = $2 WHERE id = $1")
+            .bind(&self.account.id)
+            .bind(anchor.as_slice())
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok((self.tx, anchor))
+    }
+
+    async fn populate(&mut self) -> Result<(), StoreError> {
         let account = &self.account;
         let created_at_ms = account.created_at_ms;
         for kept in &self.kept {
@@ -407,7 +433,6 @@ impl Creation {
             true,
         )
         .await?;
-        self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(())
     }
 }

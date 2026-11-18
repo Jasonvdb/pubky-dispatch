@@ -32,6 +32,7 @@ mod apps;
 mod chain;
 mod claim_codec;
 mod connect;
+mod creation_anchor;
 mod documents;
 mod enrollments;
 pub use enrollments::EnrollmentReceipt;

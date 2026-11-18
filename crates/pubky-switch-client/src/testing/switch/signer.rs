@@ -200,6 +200,52 @@ impl Inner {
         Ok(enrollment)
     }
 
+    /// The scripted store's fresh enrollment contents (Switch account binding 3).
+    fn opening_anchor(
+        &self,
+        enrollment: &Enrollment,
+        store_id: [u8; 16],
+    ) -> Result<Option<[u8; 32]>, ScriptError> {
+        let max_rows = pubky_switch_core::records::MAX_ENROLLMENT_BYTES / 16;
+        if self.apps.len() > max_rows
+            || self.kept_app_ids.len() > max_rows
+            || !self.held_app_ids.is_empty()
+            || self.directory_version != 0
+            || self.apps_version != 0
+        {
+            return Ok(None);
+        }
+        let permanent: Vec<_> = self
+            .apps
+            .iter()
+            .map(|(id, app)| {
+                (
+                    id,
+                    app.departed,
+                    app.revoked_at,
+                    app.departed_at,
+                    app.rotated,
+                    app.receive_key.is_some(),
+                )
+            })
+            .collect();
+        let facts = (
+            store_id,
+            self.identity.public(),
+            self.created_at_ms,
+            enrollment.hash(),
+            self.tip.generation,
+            self.doc.as_ref().map(IdentityDoc::hash),
+            self.enrolled.as_ref().map(|e| e.limits),
+            &self.kept_app_ids,
+            self.kept_at,
+            permanent,
+        );
+        Ok(Some(pubky_switch_core::enc::hash(&serde_json::to_vec(
+            &facts,
+        )?)))
+    }
+
     /// `POST /v1/enroll` after authentication and the current locked judgement (Switch
     /// wire 3.7, 7.4.1; account binding 3).
     pub(super) fn enroll(&mut self, enrollment: &Enrollment) -> Result<Answer, ScriptError> {
@@ -224,6 +270,24 @@ impl Inner {
         {
             if Some(answer.created) != binding.created() || answer.store_id != store_id {
                 return Ok(super::account::binding_changed());
+            }
+            if matches!(
+                enrollment.body().intent,
+                pubky_switch_core::records::EnrollmentIntent::Create { .. }
+            ) && self.state_version == 0
+                && self.seq == 0
+            {
+                let observed = self.opening_anchor(enrollment, store_id)?;
+                if !matches!(self.marks.slot, super::marks::MarkSlot::At(mark)
+                    if mark.created_at_ms == answer.created && mark.generation == 0 && mark.state_version == 0
+                    && observed.is_some_and(|digest| mark.creation_anchor == Some((answer.created, digest))))
+                {
+                    return Ok(bad(
+                        ErrorCode::Unavailable,
+                        "account binding: fresh enrollment contents unavailable",
+                        Value::Null,
+                    ));
+                }
             }
             return Ok((200, answer.answer));
         }
@@ -339,6 +403,15 @@ impl Inner {
             self.kept_at = self.now();
             if let Some(doc) = self.doc.clone() {
                 self.keep_document_exclusions(&doc);
+            }
+        }
+        if matches!(
+            enrollment.body().intent,
+            pubky_switch_core::records::EnrollmentIntent::Create { .. }
+        ) {
+            let anchor = self.opening_anchor(enrollment, store_id)?;
+            if let super::marks::MarkSlot::At(mark) = &mut self.marks.slot {
+                mark.creation_anchor = anchor.map(|digest| (created, digest));
             }
         }
         Ok((200, value))

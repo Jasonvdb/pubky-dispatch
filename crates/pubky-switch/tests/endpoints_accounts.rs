@@ -1270,6 +1270,21 @@ async fn created_at_of(replay: &Replay, id: &str) -> u64 {
     u64::try_from(at).expect("a time")
 }
 
+fn assert_fresh_creation_mark(mark: AccountMark, key: [u8; 32], created: u64) {
+    let anchor = mark
+        .creation_anchor
+        .for_creation(created)
+        .expect("fresh creation commitment");
+    assert_ne!(anchor, [0; 32]);
+    assert_eq!(
+        mark,
+        AccountMark {
+            creation_anchor: mark.creation_anchor,
+            ..AccountMark::zero(key, created)
+        }
+    );
+}
+
 #[tokio::test]
 async fn test_enroll_writes_the_zero_mark_before_the_account() {
     // An enrollment that creates an account writes (0, 0) durably first, with the current
@@ -1286,11 +1301,7 @@ async fn test_enroll_writes_the_zero_mark_before_the_account() {
         (503, "unavailable")
     );
     assert_eq!(accounts_of(&replay, &alice.id).await, 0, "no account");
-    assert_eq!(
-        mark_of(&replay, &alice.id).await,
-        AccountMark::zero(key, ms(T)),
-        "the mark came first"
-    );
+    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T));
     replay.db.drop_database().await.expect("drop");
 
     // Where the creation commits: the same mark, and the account's creation time is its.
@@ -1300,10 +1311,7 @@ async fn test_enroll_writes_the_zero_mark_before_the_account() {
     set_time(&replay.clock, T);
     let enrolled = enroll(&replay, 1).await;
     assert_eq!(enrolled.status, 200);
-    assert_eq!(
-        mark_of(&replay, &alice.id).await,
-        AccountMark::zero(key, ms(T))
-    );
+    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T));
     assert_eq!(created_at_of(&replay, &alice.id).await, ms(T));
     replay.db.drop_database().await.expect("drop");
 }
@@ -1319,6 +1327,8 @@ async fn test_enroll_takes_a_zero_mark_left_without_an_account() {
     refuse(&replay, "INSERT").await;
     assert_eq!(enroll(&replay, 1).await.status, 503);
     assert_eq!(accounts_of(&replay, &alice.id).await, 0);
+    let previous = mark_of(&replay, &alice.id).await.creation_anchor;
+    assert!(previous.for_creation(ms(T)).is_some());
     run_sql(&replay, "DROP TRIGGER refuse ON accounts").await;
     let later = ms(T) + 60_000;
     set_time(&replay.clock, &pubky_switch_core::time::rfc3339(later));
@@ -1341,7 +1351,10 @@ async fn test_enroll_takes_a_zero_mark_left_without_an_account() {
     assert_eq!(created_at_of(&replay, &alice.id).await, later);
     assert_eq!(
         mark_of(&replay, &alice.id).await,
-        AccountMark::zero(service_public(&replay), later),
+        AccountMark {
+            creation_anchor: previous,
+            ..AccountMark::zero(service_public(&replay), later)
+        },
         "taken, with the new creation time"
     );
     replay.db.drop_database().await.expect("drop");
@@ -1427,6 +1440,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
             generation: 1,
             seq: 5,
             chain_hash: [9; 32],
+            creation_anchor: Default::default(),
             state_version: 0,
             time_floor_ms: 0,
             key,
@@ -1523,9 +1537,10 @@ async fn test_enroll_while_the_mark_store_cant_be_read_is_503() {
         "no mark"
     );
     assert_eq!(enroll(&replay, 1).await.status, 200);
-    assert_eq!(
+    assert_fresh_creation_mark(
         mark_of(&replay, &alice.id).await,
-        AccountMark::zero(service_public(&replay), ms(T))
+        service_public(&replay),
+        ms(T),
     );
     replay.db.drop_database().await.expect("drop");
 }

@@ -270,6 +270,8 @@ pub(super) struct ObservedView {
     pub(super) view: SharedRecordView,
     pub(super) at: CurrentAt,
     pub(super) covers_uploads: bool,
+    /// This GET repeated the active service's already observed signed chain tip.
+    at_known_tip: bool,
 }
 
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
@@ -644,6 +646,18 @@ pub(crate) struct DeleteBase {
 }
 
 impl HeldRecord {
+    /// The accepted view still selects the exact content and application the app
+    /// trusts. A refused, followed or forgotten write retains its own disposition.
+    fn matches_accepted_view(&self, accepted: &Accepted) -> bool {
+        !self.gone
+            && self.follow.is_none()
+            && self.op == accepted.op
+            && self.applied == accepted.write.applied
+            && self.content == accepted.content
+            && self.content != RecordContent::Unreadable(Unopened::Refused)
+            && self.doubtful == accepted.doubtful
+    }
+
     /// The write the next one builds on: the switch's current write, also when the app
     /// refused it or held an older one at its version: its version, its application and
     /// whether it is a delete.
@@ -779,6 +793,8 @@ pub(crate) enum CurrentAt {
     /// A record view of an answer current at this version: a read's head, a list page's
     /// `seq` in its head's generation (Switch wire 7.4.9).
     Answer(RecordVersion),
+    /// A direct GET at the already known signed tip, with its checked view's divergence.
+    KeyAtKnownTip(RecordVersion, bool),
 }
 
 impl CurrentAt {
@@ -790,7 +806,7 @@ impl CurrentAt {
 
     /// Whether a record view read now shows the write: the switch's current write.
     fn viewed(self) -> bool {
-        matches!(self, Self::Answer(_))
+        matches!(self, Self::Answer(_) | Self::KeyAtKnownTip(..))
     }
 }
 
@@ -836,7 +852,7 @@ fn compare_with_held(
     let current_at = match at {
         CurrentAt::Local => return Ok(Order::Overtaken(write, shown.version)),
         CurrentAt::Itself => shown.version,
-        CurrentAt::Answer(version) => version,
+        CurrentAt::Answer(version) | CurrentAt::KeyAtKnownTip(version, _) => version,
     };
     let before_held = if held.authenticated {
         current_at < held.version
@@ -1287,14 +1303,16 @@ impl App {
         };
         let mut tx = self.tx()?;
         let expect = Some((key, collection));
+        let at = match record.at {
+            CurrentAt::Answer(v)
+                if record.at_known_tip && record.covers_uploads && record.view.key == *key =>
+            {
+                CurrentAt::KeyAtKnownTip(v, record.view.divergent)
+            }
+            at => at,
+        };
         let read = self
-            .take_view(
-                &record.view,
-                record.at,
-                expect,
-                record.covers_uploads,
-                &mut tx,
-            )
+            .take_view(&record.view, at, expect, record.covers_uploads, &mut tx)
             .await?;
         self.commit(tx).await?;
         // A view can still supply historical write evidence after a provider change.
@@ -1471,7 +1489,28 @@ impl App {
             }
             Err(error) => return Err(error),
         };
+        let active = head.generation == self.state.meta.generation;
+        let at_known_tip = active
+            && self.state.chain.as_ref().is_some_and(|chain| {
+                chain.newest == Some(head) && chain.verified_seq() <= head.seq
+            });
         let at = self.current_at(head, None).await?;
+        // A later key observation, including an absence, must still disqualify an
+        // earlier GET after a restart (Switch wire 7.1, 7.4.9).
+        if active
+            && (!at_known_tip || view.is_none())
+            && self
+                .state
+                .chain
+                .as_ref()
+                .is_some_and(|chain| chain.newest == Some(head))
+        {
+            let mut tx = self.tx()?;
+            if let Some(chain) = self.state.chain.as_mut() {
+                chain.write(&mut tx)?;
+                self.commit(tx).await?;
+            }
+        }
         // An upload has no record.put of its own. Only an observation covering that
         // transition can judge what the upload changed, even at a previously unknown key.
         let covers_uploads = self.covers_uploads(position(head.generation, head.seq), uploads);
@@ -1480,6 +1519,7 @@ impl App {
                 view,
                 at,
                 covers_uploads,
+                at_known_tip,
             })));
         }
         if !covers_uploads {
@@ -1661,6 +1701,13 @@ impl App {
                 return Ok(Listed::Paused(listed));
             }
             let mut tx = self.tx()?;
+            // A page's last inbox position can exceed its signed chain tip. Keep
+            // that tip before any selected record can survive a split page or reload.
+            if page.head.generation == self.state.meta.generation
+                && let Some(chain) = self.state.chain.as_mut()
+            {
+                chain.write(&mut tx)?;
+            }
             for view in &page.records {
                 // A page holds up to 1,000 views, each cached with its mark: the views taken
                 // so far are committed first once one more might not fit.
@@ -3159,6 +3206,21 @@ impl App {
             }
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
                 if placement.content == Order::Equal {
+                    // A page may have ended at an inbox entry after its latest
+                    // chain operation (Switch wire 7.4.9). A matching key GET at
+                    // that exact signed tip confirms the content without moving
+                    // the stronger feed observation back.
+                    let confirms = if let CurrentAt::KeyAtKnownTip(tip, divergent) = accepted.current_at
+                        && matches!(placement.historical, Some(Historical::Overtaken(..)))
+                        && held.observed.generation == tip.generation
+                        && held.observed.seq > tip.version
+                        && self.state.cert.holds_scope(&held.policy.read_scope)
+                        && held.matches_accepted_view(&accepted)
+                    {
+                        self.is_divergent(&key).await? == divergent
+                    } else {
+                        false
+                    };
                     let mut upgraded = held.clone();
                     upgraded.version = accepted.write.version.version;
                     upgraded.authenticated = accepted.write.version.authenticated;
@@ -3182,7 +3244,7 @@ impl App {
                     if upgraded != *held {
                         put_held(tx, &key, &upgraded)?;
                     }
-                    if let Some(h) = placement.historical {
+                    if let Some(h) = placement.historical && !confirms {
                         return Ok(Taken::Historical(h));
                     }
                     return Ok(Taken::Equal);

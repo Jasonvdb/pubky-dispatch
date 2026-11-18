@@ -5977,6 +5977,8 @@ async fn test_records_listing_stops_when_next_doesnt_move_on() {
 async fn test_records_listing_page_of_full_marks_commits_early() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let id = phone.app_id();
     // 420 records on one page, each listed with a mark near the bound: 87 KiB each as
     // stored, about 35 MiB in all, more than one commit takes.
     let names: Vec<String> = (0..420).map(|n| format!("n{n:03}")).collect();
@@ -5987,7 +5989,40 @@ async fn test_records_listing_page_of_full_marks_commits_early() {
             .unwrap();
     }
     *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES - 64;
-    let mut phone = s.join("phone").await;
+    s.w.note(id, "after the writes");
+    let mut ordered: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let target = s.target(name);
+            let key = phone.record_key(&target).unwrap();
+            (pubky_switch_core::enc::b64(&key), key, target)
+        })
+        .collect();
+    ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let (_, first, target) = ordered.first().unwrap();
+    let (_, last, _) = ordered.last().unwrap();
+    drop(phone);
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    let mut phone = App::load(
+        s.env_on(store.clone()),
+        s.protocol.clone(),
+        World::config(),
+        id,
+    )
+    .await
+    .unwrap();
+    store.fail_put_once(crate::app::records::record_key_of(last).as_bytes());
+    assert!(phone.list_collection(&items()).await.is_err());
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert!(phone.shared_record(first).await.unwrap().is_some());
+    assert!(phone.shared_record(last).await.unwrap().is_none());
+    assert!(matches!(
+        phone.read_record_fresh(target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
     assert_eq!(phone.list_collection(&items()).await.unwrap().records, 420);
     for name in [&names[0], &names[419]] {
         let key = phone.record_key(&s.target(name)).unwrap();
@@ -6923,6 +6958,87 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
 
 // -------------------------------------------------------------------------------------
 // A record read now, or an earlier copy kept (Switch wire 7.4.9)
+
+#[tokio::test]
+async fn test_records_fresh_read_after_a_list_ending_at_an_inbox_entry() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("notes");
+    let written = phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let id = wallet.app_id();
+    let (entry, _) = s.w.note(id, "after the record");
+    let page = wallet
+        .client
+        .records(&target.collection.id(&s.w.alice.public()), None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(page.seq, entry);
+    assert!(page.seq > page.head.seq);
+    let get = wallet.client.record(&written.key).await.unwrap();
+    assert_eq!(get.head, page.head);
+    let listed = page.records.iter().find(|r| r.key == written.key).unwrap();
+    assert_eq!(get.view.op, listed.op);
+    assert_eq!(get.view.revision, listed.revision);
+    assert!(
+        !wallet
+            .list_collection(&target.collection)
+            .await
+            .unwrap()
+            .more
+    );
+    for reopen in [false, true] {
+        if reopen {
+            drop(wallet);
+            wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+                .await
+                .unwrap();
+        }
+        match wallet.read_record_fresh(&target).await.unwrap() {
+            RecordRead::Fresh(record) => {
+                assert_eq!(record.version, written.version);
+                assert_eq!(ids(record.content.value()), ["a"]);
+            }
+            other => panic!("read after listing: {other:?}"),
+        }
+    }
+    // A later hosted absence carries a newer chain head even when the key
+    // doesn't have a cached row. Remember it across a cold start.
+    phone
+        .put_record(&s.target("another"), &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&s.target("absent")).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::NotFound,
+            ..
+        }
+    ));
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: Some(page.head.seq),
+        forked: false,
+    });
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::Overtaken { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+}
 
 #[tokio::test]
 async fn test_records_read_fresh_tells_a_fresh_read_from_a_kept_copy() {

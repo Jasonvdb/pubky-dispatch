@@ -35,7 +35,9 @@ use super::claims::ObligationDeadline;
 use super::error::{KeptAhead, Refusal, RefusalPlace, never_left, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::kept::{Ended, KeptBatchDrop, index_kept};
-use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
+use super::protocol::{
+    LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
+};
 use super::recovery::LossStep;
 use super::send::{OutboxItem, SignedMessage};
 use super::state::{Tx, key};
@@ -149,6 +151,16 @@ pub struct OpBatch {
     local: Vec<LocalWrite>,
     queued: Vec<SignedMessage>,
     protocol: Option<String>,
+    kept_id_key: Option<KeptIdKey>,
+}
+
+#[derive(Clone)]
+struct KeptIdKey(Vec<u8>);
+
+impl std::fmt::Debug for KeptIdKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeptIdKey({} bytes)", self.0.len())
+    }
 }
 
 /// An invite code registered in a batch, kept by the app once the switch takes it.
@@ -229,6 +241,18 @@ impl OpBatch {
     /// Writes of the protocol's own local state, as [`OpBatch::local`].
     pub fn locals(mut self, writes: impl IntoIterator<Item = LocalWrite>) -> Self {
         self.local.extend(writes);
+        self
+    }
+
+    /// Save the original 16-byte [`App::kept_batch`] ID at this protocol-local key in
+    /// the same commit that first keeps the batch, before sending it. The key must be
+    /// vacant and the batch must belong to a registered protocol. An automatic reseal
+    /// after a definitive stale-epoch refusal replaces only that original ID.
+    ///
+    /// The protocol owns the marker. It can remove it with an applied-only
+    /// [`Self::local`] write and inspect it after an interrupted submission.
+    pub fn keep_id_at(mut self, key: Vec<u8>) -> Self {
+        self.kept_id_key = Some(KeptIdKey(key));
         self
     }
 
@@ -465,7 +489,7 @@ impl App {
             .iter()
             .any(|(_, kind)| matches!(kind, OpKind::RecordPut(_)))
             .then(|| batch.clone());
-        let submitted = match (self.submit_new_behind(batch, behind).await, unsigned) {
+        let submitted = match (self.submit_new_behind(batch, behind, None).await, unsigned) {
             (Ok(submitted), _) => submitted,
             (Err(stale), Some(unsigned)) if stale.code() == Some(ErrorCode::StaleEpoch) => {
                 self.submit_resealed(unsigned, stale).await?
@@ -561,7 +585,7 @@ impl App {
     /// Sign `batch` once, keep it, send it and commit its outcome, without sending the
     /// batches kept from earlier calls first.
     pub(crate) async fn submit_new(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
-        self.submit_new_behind(batch, None).await
+        self.submit_new_behind(batch, None, None).await
     }
 
     /// [`App::submit_new`], keeping the batch unsent when batches kept from earlier calls
@@ -571,6 +595,7 @@ impl App {
         &mut self,
         batch: OpBatch,
         behind: Option<AppError>,
+        replace: Option<[u8; 16]>,
     ) -> Result<Submitted, AppError> {
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
@@ -579,7 +604,26 @@ impl App {
         }
         // Local writes over the bound are refused at hand-over, before anything is signed
         // or kept (`Protocol`, "Limits a receive step plans for").
-        if local_writes_bytes(&batch.local) > MAX_STEP_LOCAL_BYTES {
+        let marker = match &batch.kept_id_key {
+            Some(key) => {
+                let owner = batch.protocol.as_deref().ok_or_else(|| {
+                    Refusal::Usage("a kept batch ID key needs a registered protocol".into())
+                })?;
+                let previous = self.protocol_get(owner, &key.0).await?;
+                if previous.as_deref() != replace.as_ref().map(<[_; 16]>::as_slice) {
+                    return Err(Refusal::NotNow(
+                        "the protocol's kept batch ID key is in use".into(),
+                    )
+                    .into());
+                }
+                Some(super::protocols::qualified_key(owner, &key.0))
+            }
+            None => None,
+        };
+        let marker_bytes = marker.as_ref().map_or(0, |k| {
+            k.len().saturating_add(16 + LOCAL_WRITE_OVERHEAD_BYTES)
+        });
+        if local_writes_bytes(&batch.local).saturating_add(marker_bytes) > MAX_STEP_LOCAL_BYTES {
             return Err(Refusal::Usage(format!(
                 "a batch's local writes are at most {MAX_STEP_LOCAL_BYTES} bytes"
             ))
@@ -670,6 +714,12 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
         tx.put(&pending_key(&id), &pending)?;
+        if let Some(key) = marker {
+            tx.local(&[LocalWrite::Put {
+                key,
+                value: id.to_vec(),
+            }])?;
+        }
         index_kept(&mut tx, &id, &pending, &signed)?;
         if let Some(error) = behind {
             // Kept behind the batches from earlier calls: it goes after them, by the reads
@@ -724,6 +774,24 @@ impl App {
         batch: OpBatch,
         stale: AppError,
     ) -> Result<Submitted, AppError> {
+        let replace = if let (Some(name), Some(key)) = (&batch.protocol, &batch.kept_id_key) {
+            let Some(id) = self
+                .protocol_get(name, &key.0)
+                .await?
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            else {
+                return Err(stale);
+            };
+            if !matches!(self.kept_batch(id).await?, Some(super::KeptBatchStatus::Dropped {
+                reason: KeptBatchDrop::Refused { code }, ..
+            }) if code == ErrorCode::StaleEpoch.as_str())
+            {
+                return Err(stale);
+            }
+            Some(id)
+        } else {
+            None
+        };
         let refreshed = match self.refresh_identity().await {
             Ok(_) => self.fetch_key_bundle().await,
             Err(error) => Err(error),
@@ -734,7 +802,7 @@ impl App {
             Err(_) => return Err(stale),
         }
         match self.reseal(batch)? {
-            Some(resealed) => self.submit_new(resealed).await,
+            Some(resealed) => self.submit_new_behind(resealed, None, replace).await,
             None => Err(stale),
         }
     }

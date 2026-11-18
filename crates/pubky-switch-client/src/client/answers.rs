@@ -294,8 +294,23 @@ impl FeedPage {
             None => None,
             Some(signed) => Some(Freeze::verify(&signed, account)?),
         };
-        let items: Vec<FeedItem> = o
-            .required_objects("items")?
+        let scanned_through = o.u64("scanned_through")?;
+        let objects = o.required_objects("items")?;
+        // Each position holds one item, and a page shows its items in `seq` order within the
+        // positions it covers, those of a type this version skips included: a page showing
+        // two items at one `seq`, or one past `scanned_through`, is malformed and refused
+        // before anything of it is used (Switch wire 7.4.4).
+        let mut last = None;
+        for item in &objects {
+            let seq = item.u64("seq")?;
+            if last.is_some_and(|last| seq <= last) || seq > scanned_through {
+                return Err(bad(
+                    "Switch wire 7.4.4: a feed page's items aren't in increasing seq order within the positions it covers",
+                ));
+            }
+            last = Some(seq);
+        }
+        let items: Vec<FeedItem> = objects
             .into_iter()
             .filter_map(|item| FeedItem::read(item).transpose())
             .collect::<Result<_, _>>()?;
@@ -317,7 +332,7 @@ impl FeedPage {
             service_key,
             items,
             next,
-            scanned_through: o.u64("scanned_through")?,
+            scanned_through,
             more: o.bool("more")?,
             cursor: o.u64("cursor")?,
             head: o.head("head")?,
@@ -1432,6 +1447,39 @@ mod tests {
             assert_eq!(page.cursor, 3);
             Ok(())
         });
+    }
+
+    /// Switch wire 7.4.4: a page holds one item per position, in `seq` order within the
+    /// positions it covers; a page that shows two at one `seq`, an unknown type's among
+    /// them, one out of order, or one past `scanned_through` is refused.
+    #[test]
+    fn test_feed_page_items_out_of_seq_order_are_refused() {
+        let missed = |seq: u64| json!({ "type": "missed", "seq": seq, "entries": 1 });
+        let page = |items: Vec<Value>| {
+            json!({
+                "items": items, "next": "1:9", "scanned_through": 9, "more": false,
+                "cursor": 0, "head": head_value()
+            })
+        };
+        let read = |value: &Value| FeedPage::read(Obj::of(value, "feed")?, &account(), 1, [1; 32]);
+        let shown = read(&page(vec![
+            missed(4),
+            json!({ "type": "later", "seq": 5 }),
+            missed(9),
+        ]));
+        assert_eq!(shown.unwrap().items.len(), 2);
+        for items in [
+            vec![missed(4), missed(4)],
+            vec![json!({ "type": "later", "seq": 4 }), missed(4)],
+            vec![missed(5), missed(4)],
+            vec![missed(10)],
+        ] {
+            let error = read(&page(items.clone())).unwrap_err();
+            assert!(
+                matches!(&error, ClientError::InvalidResponse(why) if why.contains("increasing seq order")),
+                "{items:?}: {error:?}"
+            );
+        }
     }
 
     #[test]

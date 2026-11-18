@@ -941,9 +941,10 @@ impl App {
             chain.restore = None;
         }
         // Two signed pages that contradict each other at a `seq` tell two histories: a
-        // rollback or fork. Nothing of the page is kept: the cursor and the observation stay
-        // as they were, and the alarm stops the app until the user resolves it (Switch spec
-        // 10.1, wire 7.4.4).
+        // rollback or fork. Nothing of the page is kept but its service time, as of every
+        // verified answer: the cursor and the observation stay as they were, the chain view
+        // is read again from the store at the next call, and the alarm stops the app until
+        // the user resolves it (Switch spec 10.1, wire 7.4.4).
         if let Some(seq) = self.contradicted_observation(&page) {
             return Err(self
                 .raise(Alarm::Rollback {
@@ -1275,17 +1276,6 @@ impl App {
             read.tx.delete(&key::asked(seq))?;
             self.state.asked.remove(&seq);
         }
-        // A held entry a page covered without showing it, as the service deletes one for a
-        // lagging app (its `missed` item takes a new `seq`): the cursor passed it, and its
-        // observation and retry count go with it (Switch wire 7.4.4).
-        let gone: Vec<u64> = self.state.held.range(..=cursor).map(|(k, _)| *k).collect();
-        for seq in gone {
-            read.tx.delete(&key::held(seq))?;
-            self.state.held.remove(&seq);
-            if self.state.retries.remove(&seq).is_some() {
-                read.tx.delete(&key::retry(seq))?;
-            }
-        }
         read.tx.put(key::CURSOR, &self.state.cursor)?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
@@ -1317,18 +1307,21 @@ impl App {
 
     /// The first `seq` at which `page` contradicts the first observation the app keeps of an
     /// entry an earlier page showed there: the observation of a held entry, and that of an
-    /// entry stored locally whose `seq` the cursor hasn't passed, which later reads meet
-    /// again. Every item a page carries is compared, whatever its type: only that entry,
-    /// accepted by the observation's time, may stand there. Another entry, an `unreadable`
-    /// or `missed` item, which take new `seq`s, or a chain item or stub at that `seq` means
-    /// the service signed two histories (Switch spec 10.1, wire 7.4.4).
+    /// entry stored locally from the sequence the cursor follows, which a cooperative move
+    /// continues, at a `seq` the cursor hasn't passed, which later reads meet again. Every
+    /// item the page carries of a type this version reads is compared (Switch wire 7.5):
+    /// only that entry, accepted by the observation's time, may stand there. Another entry,
+    /// an `unreadable` or `missed` item, which take new `seq`s, or a chain item or stub at
+    /// that `seq` means the service signed two histories (Switch spec 10.1, wire 7.4.4).
     fn contradicted_observation(&self, page: &FeedPage) -> Option<u64> {
         let cursor = self.state.cursor;
         let stored: HashMap<u64, EntryReceipt> = self
             .state
             .parked
             .values()
-            .filter(|stored| stored.generation == cursor.generation && stored.seq > cursor.seq)
+            .filter(|stored| {
+                self.same_sequence(stored.generation, cursor.generation) && stored.seq > cursor.seq
+            })
             .map(|stored| (stored.seq, stored.receipt))
             .collect();
         page.items.iter().find_map(|item| {
@@ -1365,15 +1358,26 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        // The first observation of an entry held at this `seq` is kept. A page that
-        // contradicts it raised the alarm before any of its items was handled
-        // (`contradicted_observation`), so no kept observation ever precedes its entry's
-        // acceptance (Switch wire 7.4.4).
-        let receipt = self
-            .state
-            .held
-            .get(&item.seq)
-            .map_or(receipt, |held| held.receipt);
+        // The first observation of an entry held at this `seq` is kept, and only for that
+        // entry, accepted by then. A page that contradicts what an earlier page showed raised
+        // the alarm before any of its items was handled (`contradicted_observation`), and a page
+        // shows one item per `seq` (`FeedPage`), so no other entry takes the held receipt
+        // and no kept observation precedes its entry's acceptance (Switch wire 7.4.4).
+        let receipt = match self.state.held.get(&item.seq) {
+            Some(held)
+                if held.receipt.entry_id == item.entry_id
+                    && item.accepted_at <= held.receipt.read_at_ms =>
+            {
+                held.receipt
+            }
+            Some(_) => {
+                return Err(AppError::InvalidData(
+                    "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at its seq"
+                        .into(),
+                ));
+            }
+            None => receipt,
+        };
         let entry = Entry {
             receipt,
             seq: item.seq,

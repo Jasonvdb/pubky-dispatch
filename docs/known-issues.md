@@ -4,7 +4,12 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
-The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. The changes still planned add to it; they do not rename or remove what is there.
+The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. Upcoming client additions are listed below.
+
+**Caller changes already on main**
+
+- `PeerIdentity::read_at_ms` changed from `u64` to `Option<u64>`. `Some(at)` is the time a Homeserver or Switch read supplied the selected identity version. `None` means that version has no qualifying read time, as can happen when it came only from the directory. Before acting on the peer's public records, call `PeerIdentity::may_act` and follow its wait or refresh result. Substituting the current time would make a directory-only version appear fresh.
+- `PublicIdentity` now carries the verified service time. Callers that constructed this response with a struct literal must obtain it from `SwitchClient::public_identity`. Callers that destructure it can use `PublicIdentity { identity, freeze, .. }`. The signed time is available through `server_time_ms()`.
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 

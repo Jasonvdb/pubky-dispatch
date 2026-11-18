@@ -158,7 +158,7 @@ use self::state::{
     RestorePending, RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
-use crate::clock::Clock;
+use crate::clock::{AppClock, Clock};
 use crate::error::{ClientError, StoreError};
 use crate::store::{StoreHandle, client_namespace};
 use crate::transport::Transport;
@@ -294,6 +294,14 @@ pub struct AppEnv {
     /// Writes to the own identity's Homeserver, for an app that publishes its record
     /// ([`AppConfig::publishes_record`]); `None` for one that doesn't.
     pub homeserver_writer: Option<Arc<dyn HomeserverWriter>>,
+}
+
+impl AppEnv {
+    fn observe_clock(&mut self) -> Arc<AppClock> {
+        let clock = Arc::new(AppClock::new(Arc::clone(&self.clock)));
+        self.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        clock
+    }
 }
 
 impl std::fmt::Debug for AppEnv {
@@ -652,6 +660,7 @@ pub(crate) struct AppState {
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
+    clock: Arc<AppClock>,
     protocols: ProtocolSet,
     config: AppConfig,
     ns: String,
@@ -924,12 +933,13 @@ impl App {
     /// store or the registration. After a store error nothing was kept; after a network
     /// error the registration is kept and resent on the next call.
     pub async fn join(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         request: JoinRequest,
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
@@ -1066,6 +1076,7 @@ impl App {
             };
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -1210,12 +1221,13 @@ impl App {
     /// [`Refusal::NotJoined`] when the store holds no such app, [`Refusal::Left`] once it
     /// deleted its keys, and [`AppError::Store`] for a store failure or a corrupt record.
     pub async fn load(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
@@ -1235,6 +1247,7 @@ impl App {
             let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -1927,13 +1940,14 @@ impl App {
     /// The app a backup restores and the one commit that installs it, checked and built
     /// within the store's sizes; nothing is written.
     async fn restore_commit(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: ProtocolSet,
         config: AppConfig,
         backup: &AppBackup,
         layer_check: LayerCheck,
     ) -> Result<Restorable, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             // As at a join and a load: an app that publishes needs its writer.
             own_record::check_publisher(&env, &config)?;
             let meta = backup.meta.clone();
@@ -2350,6 +2364,7 @@ impl App {
             let protocols_names = protocols.names();
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -3823,6 +3838,12 @@ impl App {
             Arc::clone(&env.transport),
             Arc::clone(&env.clock),
         )?)
+    }
+
+    /// The app's device clock. A host checking an action against the app's own
+    /// identity uses this clock so both observe the same backwards adjustments.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.env.clock)
     }
 
     pub(crate) fn now(&self) -> u64 {

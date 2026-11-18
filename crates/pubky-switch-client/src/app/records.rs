@@ -2692,7 +2692,7 @@ impl App {
             && standing == Standing::None
             && matches!(
                 self.refresh_identity().await,
-                Ok(IdentityRefresh::Newer { .. })
+                Ok(IdentityRefresh::Newer { .. } | IdentityRefresh::ClockMovedBack { newer: true })
             )
             && let Some(again) = self.write_cert(&certs, time, write_scopes)
         {

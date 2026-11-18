@@ -1801,7 +1801,7 @@ impl App {
             // repeats the page, including those checks, from the previous continuation.
             let mut tx = self.tx()?;
             if members.is_some() {
-                self.keep_inventory_page(&id, after, &page, listed_members, &mut tx)?;
+                self.keep_inventory_page(collection, after, &page, listed_members, &mut tx)?;
             }
             if let Some((progress, key)) = progress.as_mut() {
                 progress.reached(&id, next.as_ref());

@@ -72,7 +72,7 @@ struct InventoryPage {
     at: FeedPosition,
     next: Option<String>,
     members: Vec<ListedMember>,
-    ordered: bool,
+    complete: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,13 +84,13 @@ struct Observation {
 impl App {
     pub(super) fn keep_inventory_page(
         &self,
-        id: &[u8; 32],
+        collection: &Collection,
         after: Option<[u8; 32]>,
         page: &RecordPage,
         members: Vec<ListedMember>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let prefix = format!("clpage/{}/", b64(id));
+        let prefix = format!("clpage/{}/", b64(&collection.id(&self.identity())));
         let after = after.as_ref().map(|key| b64(key)).unwrap_or_default();
         if after.is_empty() {
             tx.delete_prefix(&prefix)?;
@@ -105,6 +105,20 @@ impl App {
         }) && next
             .as_ref()
             .is_none_or(|next| !members.is_empty() && *next == previous);
+        // An old listing can supply historical writes. Its omissions cannot fill a
+        // gap that extends past its snapshot or past the chain head it came with.
+        let covers_owner = self
+            .protocols
+            .of_collection(&collection.name)
+            .is_some_and(|owner| {
+                let (generation, seq) = self.told(&owner.name);
+                generation == page.head.generation && seq <= page.seq
+            });
+        let current = page.head.generation == self.state.cursor.generation
+            && page.seq >= self.state.cursor.seq.max(page.head.seq)
+            && self.state.chain.as_ref().is_some_and(|chain| {
+                chain.newest == Some(page.head) && chain.verified_seq() <= page.head.seq
+            });
         tx.put(
             &format!("{prefix}{after}"),
             &InventoryPage {
@@ -112,7 +126,7 @@ impl App {
                 at: position(page.head.generation, page.seq),
                 next,
                 members,
-                ordered,
+                complete: ordered && covers_owner && current,
             },
         )
     }
@@ -230,7 +244,7 @@ impl App {
                 .get::<InventoryPage>(&format!("clpage/{id}/{after}"))
                 .await?;
             let Some(page) = page.filter(|page| {
-                page.ordered && page.cert == coverage.cert && page.at.generation == generation
+                page.complete && page.cert == coverage.cert && page.at.generation == generation
             }) else {
                 let mut due = self
                     .reader()

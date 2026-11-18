@@ -48,13 +48,19 @@ pub enum IdentityRefresh {
     Newer {
         /// The version taken.
         version: u64,
-        /// When the request began, capped at the clock when it answered.
+        /// When the request began, on the device clock.
         confirmed_at: u64,
     },
     /// The Homeserver serves the version the app holds: it is confirmed.
     Current {
-        /// When the request began, capped at the clock when it answered.
+        /// When the request began, on the device clock.
         confirmed_at: u64,
+    },
+    /// The exact signed copy was taken, but the device clock moved backwards during
+    /// the read. A new read is needed to confirm its time.
+    ClockMovedBack {
+        /// Whether the app took a newer version.
+        newer: bool,
     },
     /// The Homeserver serves a version the app doesn't take, older than the one it took from
     /// its switch: the Homeserver lags, and confirms nothing.
@@ -69,7 +75,8 @@ pub enum IdentityRefresh {
 }
 
 impl IdentityRefresh {
-    /// When the read confirmed the copy held, for the outcomes that confirm it.
+    /// When this read confirmed the copy it found. Before acting, check the current
+    /// [`App::identity_confirmation_age_ms`], which also observes later clock changes.
     pub fn confirmed_at(&self) -> Option<u64> {
         match self {
             IdentityRefresh::Newer { confirmed_at, .. }
@@ -80,10 +87,9 @@ impl IdentityRefresh {
 }
 
 /// The last read that confirmed the own copy: the version confirmed, and when.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Confirmed {
     pub(crate) version: u64,
-    pub(crate) at_ms: u64,
+    pub(crate) start: crate::clock::ClockSample,
 }
 
 impl App {
@@ -92,11 +98,10 @@ impl App {
     /// waking, and before an attempt that needs a fresh copy.
     ///
     /// An app makes no attempt without an `identity.json` revalidated in the last
-    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Before an attempt, compare
-    /// the time from [`IdentityRefresh::confirmed_at`] or [`App::identity_confirmed_at`]
-    /// with the device clock after the read completes. The time must be at or before now
-    /// and less than [`REVALIDATION_MS`] old. A missing, older or unavailable copy and a
-    /// failed read leave the current version without a new confirmation.
+    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Immediately before an attempt,
+    /// [`App::identity_confirmation_age_ms`] must give an age below that limit. A backwards
+    /// sample during or after the read invalidates it. A missing, older or unavailable
+    /// copy and a failed read leave the current version without a new confirmation.
     ///
     /// # Errors
     ///
@@ -107,8 +112,10 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let identity = self.state.meta.identity;
-            let started = self.now();
-            let doc = match read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+            let start = self.clock.sample();
+            let read = read_homeserver(self.env.homeserver.as_ref(), &identity).await;
+            self.now();
+            let doc = match read {
                 Ok(Some(doc)) => doc,
                 Ok(None) => return Ok(IdentityRefresh::Missing),
                 Err(AppError::Transport(_)) => return Ok(IdentityRefresh::Unavailable),
@@ -116,16 +123,19 @@ impl App {
             };
             // The read's own time: taking the copy may commit and fetch keys first, and the
             // confirmation is only as fresh as the read (Switch spec 12.6).
-            let confirmed_at = started.min(self.now());
             let served = doc.version();
             let newer = self.take_own_copy(doc).await?;
             let held = self.state.own_doc.version();
             if served != held {
                 return Ok(IdentityRefresh::Older { served });
             }
+            if self.clock.elapsed(&start).is_none() {
+                return Ok(IdentityRefresh::ClockMovedBack { newer });
+            }
+            let confirmed_at = start.at_ms;
             self.identity_confirmed = Some(Confirmed {
                 version: held,
-                at_ms: confirmed_at,
+                start,
             });
             Ok(if newer {
                 IdentityRefresh::Newer {
@@ -142,11 +152,24 @@ impl App {
     /// When a Homeserver read last confirmed the own `identity.json` the app holds now, on
     /// the app's clock, in Unix milliseconds ([`App::refresh_identity`]). `None` when none
     /// has since the app was loaded, or the app took a newer copy from another source since,
-    /// which needs its own confirmation.
+    /// or the device clock has moved backwards since the read began.
     pub fn identity_confirmed_at(&self) -> Option<u64> {
-        self.identity_confirmed
-            .filter(|confirmed| confirmed.version == self.state.own_doc.version())
-            .map(|confirmed| confirmed.at_ms)
+        self.confirmed_read().map(|(read, _)| read.start.at_ms)
+    }
+
+    /// Age of the last exact own Homeserver observation on the current run of the
+    /// device clock. A backwards sample invalidates the observation, even after
+    /// the device clock catches up. Compare this age with [`REVALIDATION_MS`].
+    pub fn identity_confirmation_age_ms(&self) -> Option<u64> {
+        self.confirmed_read().map(|(_, age)| age)
+    }
+
+    fn confirmed_read(&self) -> Option<(&Confirmed, u64)> {
+        let read = self.identity_confirmed.as_ref()?;
+        if read.version != self.state.own_doc.version() {
+            return None;
+        }
+        Some((read, self.clock.elapsed(&read.start)?))
     }
 }
 

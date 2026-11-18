@@ -579,6 +579,306 @@ async fn test_opening_mark_keeps_the_confirmed_limits_and_exclusions() {
     replay.db.drop_database().await.unwrap();
 }
 
+fn existing_with_held(created: u64, nonce: u8, mut apps: Vec<[u8; 16]>) -> Enrollment {
+    apps.sort_by_key(|app| pubky_switch_core::enc::zbase32_encode(app));
+    let mut body = make_enrollment(EnrollmentIntent::Existing { created }, nonce)
+        .body()
+        .clone();
+    body.revoked_apps = Some(apps);
+    Enrollment::sign(&key(), body).unwrap()
+}
+
+#[tokio::test]
+async fn test_existing_enrollment_keeps_accepted_exclusions_at_its_marked_position() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    support::replay_chain_through_revoke(&replay).await;
+    let created = support::alice_created();
+    let at = replay.clock.now_ms();
+    let document: SignedDoc = serde_json::from_value(
+        support::named(
+            &support::vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .unwrap();
+    let file = replay.key_dir().join("accounts/marks").join(key().id());
+    let read = || std::fs::read(&file).unwrap();
+    let held = existing_with_held(created, 86, vec![[11; 16], [13; 16]]);
+    let request = enrollment_request(&held, at);
+    let sent = support::Sent::of(&request);
+    let accepted = replay.service.handle(request).await;
+    status(&accepted, 200);
+    assert!(support::signed_with(
+        &accepted,
+        &support::service_public(&replay),
+        &sent
+    ));
+    let complete = read();
+    let record: Value = serde_json::from_slice(&complete).unwrap();
+    let position: pubky_switch::marks::AccountMark =
+        serde_json::from_value(record["position"].clone()).unwrap();
+    assert!(position.state_version > 0 && position.state_tag != [0; 16]);
+    let source = &record["recovery"];
+    assert_eq!(
+        source["prior"],
+        json!({"hash": hex::encode(document.doc_hash().unwrap()), "version": 3})
+    );
+    assert_eq!(source["generation_floor"], 1);
+    assert_eq!(source["limits"], value(&accepted)["limits"]);
+    let phone = hex::encode(support::app_id_of("phone"));
+    assert!(
+        source["kept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|app| { app["app_id"] == phone && app["reason"] == "revoked" })
+    );
+    assert_eq!(
+        source["held"],
+        json!([hex::encode([11; 16]), hex::encode([13; 16])])
+    );
+    let mut txn = replay.db.store().begin(&key().id()).await.unwrap().unwrap();
+    let (directory, apps) = txn.directory_versions().await.unwrap();
+    assert_eq!(source["directory_version"], directory);
+    assert_eq!(source["apps_version"], apps);
+    assert!(directory > 0 && apps > 0);
+    assert_eq!(source["had_reachable_apps"], true);
+    assert_eq!(
+        source["kept"],
+        serde_json::to_value(txn.kept_entries().await.unwrap()).unwrap()
+    );
+    txn.commit().await.unwrap();
+
+    let restarted = service_with_restored_mark(&replay, &complete);
+    let retried = restarted.handle(enrollment_request(&held, at)).await;
+    status(&retried, 200);
+    assert_eq!(retried.body, accepted.body);
+    assert_eq!(read(), complete);
+
+    let many = existing_with_held(
+        created,
+        87,
+        (0..=255)
+            .map(|n| {
+                let mut id = [165; 16];
+                id[0] = n;
+                id
+            })
+            .collect(),
+    );
+    let answer = restarted.handle(enrollment_request(&many, at)).await;
+    status(&answer, 200);
+    let flat = read();
+    let marked: pubky_switch::marks::AccountMark = serde_json::from_slice(&flat).unwrap();
+    assert!(
+        marked.state_version > position.state_version && marked.state_tag != position.state_tag
+    );
+    let reopened = service_with_restored_mark(&replay, &flat);
+    let matched = reopened.handle(enrollment_request(&many, at)).await;
+    status(&matched, 200);
+    assert_eq!(matched.body, answer.body);
+    let mut txn = replay.db.store().begin(&key().id()).await.unwrap().unwrap();
+    assert_eq!(txn.held_revoked_apps().await.unwrap().len(), 258);
+    txn.commit().await.unwrap();
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_recovery_material_follows_ordinary_writes_and_reachable_apps() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    support::replay_chain_through_revoke(&replay).await;
+    let file = replay.key_dir().join("accounts/marks").join(key().id());
+    let read = || serde_json::from_slice::<Value>(&std::fs::read(&file).unwrap()).unwrap();
+    let before = read();
+    assert_eq!(before["recovery"]["had_reachable_apps"], true);
+    let at = replay.clock.now_ms();
+    let ordinary = support::app_batch(
+        &replay,
+        "wallet",
+        92,
+        vec![pubky_switch_core::ops::OpKind::DenyPut { pubky: [7; 32] }],
+        at,
+    )
+    .await;
+    status(&ordinary, 200);
+    let carried = read();
+    assert_eq!(carried["recovery"], before["recovery"]);
+    assert_ne!(
+        carried["position"]["state_tag"],
+        before["position"]["state_tag"]
+    );
+    let id = support::app_id_of("wallet");
+    let revoke = path(&format!(
+        "apps/{}/revoke",
+        pubky_switch_core::enc::zbase32_encode(&id)
+    ));
+    let request = signed("POST", &revoke, vec![], Some(support::alice_created()), at);
+    status(&replay.service.handle(request).await, 200);
+    let latest = read();
+    assert_eq!(latest["recovery"]["had_reachable_apps"], false);
+    assert!(
+        latest["recovery"]["kept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|app| { app["app_id"] == hex::encode(id) && app["reason"] == "revoked" })
+    );
+    assert!(
+        latest["recovery"]["apps_version"].as_u64().unwrap()
+            > carried["recovery"]["apps_version"].as_u64().unwrap()
+    );
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_recovery_material_follows_only_its_own_committed_position() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    support::replay_chain_through_revoke(&replay).await;
+    let created = support::alice_created();
+    let at = replay.clock.now_ms();
+    let file = replay.key_dir().join("accounts/marks").join(key().id());
+    let read = || serde_json::from_slice::<Value>(&std::fs::read(&file).unwrap()).unwrap();
+    for (nonce, later_write) in [(93, false), (94, true)] {
+        let first = existing_with_held(created, nonce, vec![[nonce; 16]]);
+        let pause = replay.service.pause_next_mark_move();
+        let (answer, overtaking) = tokio::join!(
+            Box::pin(replay.service.handle(enrollment_request(&first, at))),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached())
+                    .await
+                    .unwrap();
+                if later_write {
+                    let later = existing_with_held(created, 95, vec![[95; 16]]);
+                    status(
+                        &replay.service.handle(enrollment_request(&later, at)).await,
+                        200,
+                    );
+                } else {
+                    status(
+                        &replay
+                            .service
+                            .handle(signed("GET", &path("apps"), vec![], Some(created), at))
+                            .await,
+                        200,
+                    );
+                }
+                let record = read();
+                pause.release();
+                record
+            }
+        );
+        status(&answer, 200);
+        let final_record = read();
+        if later_write {
+            assert_eq!(final_record, overtaking);
+            assert_eq!(
+                final_record["recovery"]["held"],
+                json!([
+                    hex::encode([93; 16]),
+                    hex::encode([94; 16]),
+                    hex::encode([95; 16])
+                ])
+            );
+        } else {
+            assert!(overtaking.get("recovery").is_none());
+            assert_eq!(overtaking, final_record["position"]);
+            assert_eq!(
+                final_record["recovery"]["held"],
+                json!([hex::encode([93; 16])])
+            );
+        }
+    }
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_recovery_mark_tracks_registration_and_held_ids_joining_a_generation() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    support::serve_alice(&replay).await;
+    let file = replay.key_dir().join("accounts/marks").join(key().id());
+    let source = || {
+        serde_json::from_slice::<Value>(&std::fs::read(&file).unwrap()).unwrap()["recovery"].clone()
+    };
+    let staged = source();
+    assert_eq!(staged["had_reachable_apps"], false);
+    support::replay_batch(&replay, &support::vectors("chain.json"), &[3, 4]).await;
+    let reachable = source();
+    assert_eq!(reachable["had_reachable_apps"], true);
+    assert!(reachable["apps_version"].as_u64().unwrap() > staged["apps_version"].as_u64().unwrap());
+    let at = replay.clock.now_ms();
+    let retained_id = [19; 16];
+    let intent = existing_with_held(support::alice_created(), 96, vec![retained_id]);
+    status(
+        &replay.service.handle(enrollment_request(&intent, at)).await,
+        200,
+    );
+    let held = source();
+    assert_eq!(held["held"], json!([hex::encode(retained_id)]));
+
+    let mut txn = replay.db.store().begin(&key().id()).await.unwrap().unwrap();
+    let savepoint = txn.savepoint().await.unwrap();
+    txn.hold_revoked_apps(&[[20; 16]]).await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT retained_recovery_change()")
+            .fetch_one(txn.conn())
+            .await
+            .unwrap()
+    );
+    txn.rollback_to(savepoint).await.unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT retained_recovery_change()")
+            .fetch_one(txn.conn())
+            .await
+            .unwrap()
+    );
+    txn.commit().await.unwrap();
+
+    let doc: SignedDoc = serde_json::from_value(
+        support::named(
+            &support::vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .unwrap();
+    let next = support::deliver_next(&replay, &doc, at, |body| {
+        body.recovery_from = Some(body.generation);
+        body.generation += 1;
+    })
+    .await;
+    let after = source();
+    assert_eq!(after["held"], json!([]));
+    assert_eq!(after["generation_floor"], 2);
+    assert_eq!(
+        after["prior"]["hash"],
+        hex::encode(next.doc_hash().unwrap())
+    );
+    assert_eq!(after["had_reachable_apps"], false);
+    assert!(after["apps_version"].as_u64().unwrap() > held["apps_version"].as_u64().unwrap());
+    assert!(
+        after["kept"].as_array().unwrap().iter().any(|app| {
+            app["app_id"] == hex::encode(retained_id) && app["reason"] == "enrolled"
+        })
+    );
+    assert!(
+        after["kept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|app| app["app_id"] != hex::encode([20; 16]))
+    );
+    replay.db.drop_database().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
     let Some(replay) = support::replay().await else {
@@ -630,7 +930,14 @@ async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
     );
     let mark_path = replay.key_dir().join("accounts/marks").join(key().id());
     let mark_bytes = std::fs::read(mark_path).unwrap();
-    let mark: pubky_switch::marks::AccountMark = serde_json::from_slice(&mark_bytes).unwrap();
+    let MarkRead::Mark(mark) = MarkStore::open(replay.key_dir())
+        .unwrap()
+        .read(&key().id())
+        .await
+        .unwrap()
+    else {
+        panic!("missing recovery position")
+    };
     assert_eq!(mark.generation, 2);
     assert!(mark.state_version > 0 && mark.state_tag != [0; 16]);
     let restored = service_with_restored_mark(&replay, &mark_bytes);

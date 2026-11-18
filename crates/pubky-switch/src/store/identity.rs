@@ -2,7 +2,7 @@
 //! delivery that took it, the app limit, and the App IDs kept for good
 //! (Switch wire 3.3, 3.7, 9.1). Every read and write runs in the request's transaction.
 
-use pubky_switch_core::sig::SignedDoc;
+use pubky_switch_core::{records::IdentityDoc, sig::SignedDoc};
 use sqlx::Row;
 
 use super::{AccountTxn, StoreError, to_db};
@@ -103,6 +103,15 @@ impl AccountTxn {
             })
             .collect()
     }
+}
+
+pub(super) fn listed_ids(document: &IdentityDoc) -> Vec<Vec<u8>> {
+    document
+        .body()
+        .apps
+        .iter()
+        .map(|app| app.app_id.to_vec())
+        .collect()
 }
 
 /// Keep `at_ms` within the store's range.

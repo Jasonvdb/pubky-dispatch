@@ -786,6 +786,32 @@ BEGIN
 END
 $$;
 
+-- Recovery uses the permanent and held exclusions, the document and directory, and
+-- the app records and keys that determine reachability (Switch account binding 3).
+-- Examine only the rows this transaction retained, after any savepoint rollback.
+CREATE FUNCTION retained_recovery_change() RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        RETURN false;
+    END IF;
+    RETURN EXISTS (
+        SELECT FROM pg_temp.switch_state_rows r
+        WHERE r.initial IS DISTINCT FROM r.final_value AND (
+            r.relation IN ('kept_app_ids'::regclass, 'held_revoked_apps'::regclass)
+            OR (r.relation IN ('accounts'::regclass, 'apps'::regclass) AND EXISTS (
+                SELECT FROM unnest(CASE r.relation WHEN 'apps'::regclass THEN
+                    ARRAY['record', 'renewed_cert', 'receive_key']
+                ELSE ARRAY['id', 'identity_key', 'creation_anchor', 'opening_material',
+                           'created_at_ms', 'generation', 'activation_requirement',
+                           'announced_limits', 'identity_doc', 'directory_version', 'apps_version']
+                END) AS field(name)
+                WHERE (r.initial -> field.name) IS DISTINCT FROM (r.final_value -> field.name)
+            ))
+        )
+    );
+END
+$$;
+
 -- Every table with an account column, and `accounts`, carries the trigger: a table is
 -- counted unless the list above leaves it out.
 DO $$

@@ -6,11 +6,13 @@
 //! Signed documents are stored in their carrying form, as received. Sealed values stay
 //! sealed: nothing here opens or interprets them (Switch spec 1).
 
+use futures_util::TryStreamExt;
 use pubky_switch_core::{
     chain::{ItemType, TransitionProof, item_hash},
     claims::{Claim, ClaimTally},
     ident::Policy,
     ops::{BatchRecord, OpKind, Position, SignedOp},
+    records::IdentityDoc,
     recovery::UploadBase,
     shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
@@ -305,6 +307,30 @@ impl AccountTxn {
         .await
         .map_err(db)?;
         rows.iter().map(app_of).collect()
+    }
+
+    /// Whether any listed app with a receive key and no permanent exclusion passes the
+    /// caller's certificate check (Switch wire 7.4.10). Read one candidate at a time.
+    pub(crate) async fn any_listed_receiver(
+        &mut self,
+        doc: &IdentityDoc,
+        current: impl Fn(&StoredApp) -> Result<bool, StoreError>,
+    ) -> Result<bool, StoreError> {
+        let mut rows = sqlx::query(
+            "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
+             cursor_seq, reachable_since, full_requested_ms, full_completed_seq FROM apps a \
+             WHERE account_id = $1 AND app_id = ANY($2::bytea[]) AND receive_key IS NOT NULL \
+             AND NOT EXISTS (SELECT FROM kept_app_ids k WHERE k.account_id = a.account_id AND k.app_id = a.app_id)",
+        )
+        .bind(self.head().id.clone())
+        .bind(super::identity::listed_ids(doc))
+        .fetch(self.conn());
+        while let Some(row) = rows.try_next().await? {
+            if current(&app_of(&row)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Store an own app, replacing what the account held for it.

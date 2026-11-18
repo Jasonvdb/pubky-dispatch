@@ -333,6 +333,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `Evidence::Op` | Use `keep_evidence` for a signed record write or claim entry with writer certificate and any held proof. This gives recovery a copy to upload. |
 | `Evidence::Proof` | Keep a transition proof available for upload even without an operation. Use `forget_evidence` only when the protocol no longer needs that evidence. |
+| `AppError::ExpiredUnsent` | The client retired this batch before its first handoff. Account for earlier candidates before issuing a replacement. |
 | `AppError::NotAnsweringAsAccount` | An unverified 404 and a genuinely absent homeserver identity document suggest erasure. Show unreachable since the supplied device time. Keep local state. Five matching observations spaced at least six hours apart over at least a day are required on this path. |
 | `AppEvent::AccountGone` | The client concluded the account was erased. A signed, request-bound account-not-hosted answer plus an absent identity document can establish this immediately. The unverified path needs the repeated checks above. Tell the protocol and retain local state for possible reappearance. |
 | `ProviderStatus::Gone` | The app is no longer current or its account is gone. Stop ordinary service work. Let provider checks look for a current identity document. |
@@ -428,6 +429,8 @@ Implement `StateStore::get`, `scan`, `commit`, `acquire` and `commit_if` with th
 
 The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
 
+For a batch with `OpBatch::first_send_before`, the HTTPS transport checks the exclusive deadline at the nonblocking socket write, after waiting for writability. A custom transport implements `Transport::send_before` at its own last cancellable handoff. Its default leaves the batch pending. Only report `FirstSendExpired` if no request bytes left. A partial write has an uncertain outcome. Network transit and service scheduling take additional time, so use a `server_time_in` condition to bound application as well.
+
 | Case | What happened and what to do |
 |---|---|
 | `TimeoutClass::Ordinary` | Use a deadline for a small call, such as a setting or service-time read. |
@@ -435,6 +438,8 @@ The supplied HTTPS transport restricts connections to allowed public destination
 | `TimeoutClass::LongPoll` | Allow the requested `wait_s` at the service plus time to return a bulk page. |
 | `TransportError::Refused` | Local origin or address policy prevented sending. Return this only when zero request bytes left. Correct the destination. |
 | `TransportError::Connect` | A connection could not be made and zero request bytes left. Retry connection later. |
+| `TransportError::FirstSendExpired` | The cutoff passed before this request left. An earlier submission of these bytes may still be unresolved. |
+| `TransportError::FirstSendUnavailable` | The transport or clock cannot establish a timely first handoff. Keep the batch for a later decision. |
 | `TransportError::Timeout` | The deadline passed. The service may have applied the request. Resume with the same saved bytes. |
 | `TransportError::TooLarge` | The answer exceeded the transport's limit. No usable answer is available. Check the limit and resume the original operation. |
 | `TransportError::InvalidRequest` | The transport could not construct a request, for example because of an invalid header. Fix the input. This error does not give a kept batch the never-sent exception. |

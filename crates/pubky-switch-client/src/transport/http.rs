@@ -11,6 +11,9 @@
 //! aren't followed. A path or query the URL parser changes is refused before connecting:
 //! the request target must be exactly the bytes signed (Switch wire 7.1).
 
+#[path = "http_first_send.rs"]
+mod first_send;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +108,8 @@ impl reqwest::dns::Resolve for PublicOnly {
 /// The HTTPS transport.
 pub struct HttpTransport {
     client: reqwest::Client,
+    first_send_tls: Arc<tokio_rustls::rustls::ClientConfig>,
+    connect_timeout: Duration,
     /// The origin policy; `None` only for the loopback test constructor.
     origin_use: Option<UrlUse>,
     max_response_bytes: u64,
@@ -180,6 +185,10 @@ impl HttpTransport {
                 extra_ports: config.extra_ports.clone(),
             }),
             max_response_bytes: config.max_response_bytes,
+            connect_timeout: Duration::from_millis(config.connect_timeout_ms),
+            first_send_tls: Self::first_send_tls(tokio_rustls::rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))?,
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             long_timeout: Duration::from_millis(config.long_timeout_ms),
         })
@@ -199,12 +208,20 @@ impl HttpTransport {
             client: built(builder(&config))?,
             origin_use: None,
             max_response_bytes: config.max_response_bytes,
+            connect_timeout: Duration::from_millis(config.connect_timeout_ms),
+            first_send_tls: Self::first_send_tls(tokio_rustls::rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))?,
             request_timeout: Duration::from_millis(config.request_timeout_ms),
             long_timeout: Duration::from_millis(config.long_timeout_ms),
         })
     }
 
-    async fn call(&self, request: Request) -> Result<Response, TransportError> {
+    async fn call(
+        &self,
+        request: Request,
+        first: Option<&super::FirstSend>,
+    ) -> Result<Response, TransportError> {
         if !request.path_and_query.starts_with('/') {
             return Err(TransportError::InvalidRequest(
                 "the path doesn't start with '/'".into(),
@@ -236,18 +253,33 @@ impl HttpTransport {
         if !request.body.is_empty() {
             call = call.body(request.body);
         }
-        let mut response = call.send().await.map_err(map_error)?;
+        if let Some(first) = first {
+            let native = call.build().map_err(map_error)?;
+            return tokio::time::timeout(
+                timeout,
+                self.send_connected(native, first, &request.method, &request.path_and_query),
+            )
+            .await
+            .map_err(|_| TransportError::Timeout)?;
+        }
+        let response = call.send().await.map_err(map_error)?;
+        self.read_response(response, &request.method, &request.path_and_query)
+            .await
+    }
+
+    async fn read_response(
+        &self,
+        mut response: reqwest::Response,
+        method: &str,
+        path: &str,
+    ) -> Result<Response, TransportError> {
         let status = response.status().as_u16();
         let headers = response_headers(status, response.headers())?;
-        let limit = pubky_switch_core::http::response_body_cap(
-            &request.method,
-            &request.path_and_query,
-            status,
-        )
-        .and_then(|cap| u64::try_from(cap).ok())
-        .map_or(self.max_response_bytes, |cap| {
-            self.max_response_bytes.min(cap)
-        });
+        let limit = pubky_switch_core::http::response_body_cap(method, path, status)
+            .and_then(|cap| u64::try_from(cap).ok())
+            .map_or(self.max_response_bytes, |cap| {
+                self.max_response_bytes.min(cap)
+            });
         if response.content_length().is_some_and(|len| len > limit) {
             return Err(TransportError::TooLarge(limit));
         }
@@ -355,8 +387,16 @@ fn map_error(error: reqwest::Error) -> TransportError {
 }
 
 impl Transport for HttpTransport {
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a super::FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(self.call(request, Some(first)))
+    }
+
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        Box::pin(self.call(request))
+        Box::pin(self.call(request, None))
     }
 }
 
@@ -889,3 +929,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "http_first_send_tests.rs"]
+mod first_send_tests;

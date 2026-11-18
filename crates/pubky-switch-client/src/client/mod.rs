@@ -196,6 +196,8 @@ impl Signs for DynSigner<'_> {
 /// How a request is authenticated, beyond the caller's credentials.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Auth<'a> {
+    /// The first transport handoff of a kept operation (Switch spec 10.1).
+    first_send: Option<&'a crate::transport::FirstSend>,
     /// `Switch-Invite-Code`.
     pub(crate) invite_code: Option<&'a str>,
     /// Send `Switch-Cert` even at the caller's own account: the staged head upload (Switch
@@ -1035,7 +1037,8 @@ impl SwitchClient {
         let step = self
             .start_call(method, path_and_query, body, content, auth, &mut None)
             .await?;
-        self.finish_call(step, &mut None).await
+        self.finish_call_before(step, &mut None, auth.first_send)
+            .await
     }
 
     pub(crate) async fn start_call(
@@ -1052,7 +1055,7 @@ impl SwitchClient {
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
         let checked = self
-            .send_checked(signed, key, auth.success_key, public_time)
+            .send_checked(signed, key, auth.success_key, public_time, auth.first_send)
             .await;
         let Some(at) = stale_timestamp_hint(checked.as_ref().err().map(|failure| &failure.error))
         else {
@@ -1075,28 +1078,55 @@ impl SwitchClient {
         step: CallStep,
         public_time: &mut Option<u64>,
     ) -> Result<CheckedResponse, CallError> {
+        self.finish_call_before(step, public_time, None).await
+    }
+
+    async fn finish_call_before(
+        &self,
+        step: CallStep,
+        public_time: &mut Option<u64>,
+        first: Option<&crate::transport::FirstSend>,
+    ) -> Result<CheckedResponse, CallError> {
         match step {
             CallStep::Answer(answer) => Ok(answer),
             CallStep::Retry(retry) => {
-                self.send_checked(retry.signed, retry.key, retry.success_key, public_time)
-                    .await
+                self.send_checked(
+                    retry.signed,
+                    retry.key,
+                    retry.success_key,
+                    public_time,
+                    first,
+                )
+                .await
             }
         }
     }
 
     /// Receive an answer without losing a protected header (Switch wire 7.1).
     async fn send_response(&self, request: Request) -> Result<Response, ClientError> {
+        self.send_response_before(request, None).await
+    }
+
+    async fn send_response_before(
+        &self,
+        request: Request,
+        first: Option<&crate::transport::FirstSend>,
+    ) -> Result<Response, ClientError> {
         check_body_cap(&request.method, &request.path_and_query, &request.body)?;
         self.check_request_binding(&request)?;
-        self.transport
-            .send(request)
-            .await
-            .map_err(|error| match error {
-                TransportError::UnreadableSignedHeader { status } => {
-                    ClientError::BadServiceSignature { status }
-                }
-                error => error.into(),
-            })
+        match first {
+            Some(first) if !first.confirmed() => {
+                first.check()?;
+                self.transport.send_before(request, first).await
+            }
+            _ => self.transport.send(request).await,
+        }
+        .map_err(|error| match error {
+            TransportError::UnreadableSignedHeader { status } => {
+                ClientError::BadServiceSignature { status }
+            }
+            error => error.into(),
+        })
     }
 
     /// The creation selected by this request, never by an answer (account-binding 1-3).
@@ -1213,15 +1243,27 @@ impl SwitchClient {
         key: [u8; 32],
         success_key: Option<[u8; 32]>,
         public_time: &mut Option<u64>,
+        first: Option<&crate::transport::FirstSend>,
     ) -> Result<CheckedResponse, CallError> {
         *public_time = None;
         let sent = SentRequest::of(&signed.request);
-        let response = self.send_response(signed.request).await?;
+        let response = self.send_response_before(signed.request, first).await?;
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
         };
         let checked = check_response_with_head(&key, &self.account, &sent, &response);
+        // The service signed an answer bound to this exact request body. A header-only
+        // refusal or a possibly-sent stamp does not establish handoff (Switch wire 7.1).
+        if let Some(first) = first
+            && (checked.is_ok()
+                || matches!(
+                    checked.as_ref().map_err(|error| &error.error),
+                    Err(ClientError::Switch { .. })
+                ))
+        {
+            first.confirm();
+        }
         let checked = if http::is_public_read(&sent.method, &sent.path_and_query) {
             // Only an authenticated answer supplies the time for this check (Switch wire 7.1).
             let signed_ms = match checked.as_ref().map_err(|failure| &failure.error) {
@@ -1273,7 +1315,7 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
-        self.send_checked(signed, key, None, &mut None)
+        self.send_checked(signed, key, None, &mut None, None)
             .await
             .map_err(ClientError::from)
     }

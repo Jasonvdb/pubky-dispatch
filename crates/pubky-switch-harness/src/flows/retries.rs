@@ -677,3 +677,52 @@ async fn held(app: &App, own: &str) -> Result<Value, Box<dyn std::error::Error>>
 
 /// The key of the claim whose entries' answers are lost.
 const LOST_CLAIM: [u8; 32] = [0x2e; 32];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Backend, run_here};
+    use pubky_switch_client::app::{AppError, OpBatch, server_time_in};
+
+    async fn guarded_claim(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+        let batch = |end| {
+            OpBatch::new()
+                .op_if(
+                    ClaimOp::attempt(LOST_CLAIM, 0, [4; 16], 3600, Some(end)).kind(),
+                    vec![server_time_in(None, Some(end))],
+                )
+                .first_send_before(end)
+        };
+        world.hold_back("POST", "/ops");
+        let mut pending = Box::pin(wallet.submit_batch(batch(world.now_ms() + 60_000)));
+        tokio::select! {
+            result = &mut pending => return Err(format!("batch ended before the hold: {result:?}").into()),
+            () = async { while world.held_back_now() == 0 { tokio::task::yield_now().await; } } => {}
+        }
+        world.advance_ms(60_000);
+        world.let_go();
+        assert!(matches!(pending.await, Err(AppError::ExpiredUnsent)));
+        assert!(wallet.read_claim(&LOST_CLAIM).await?.is_none());
+
+        let result = wallet.submit_batch(batch(world.now_ms() + 60_000)).await?;
+        assert_eq!(result.proofs.len(), 1);
+        let claim = wallet
+            .read_claim(&LOST_CLAIM)
+            .await?
+            .ok_or("missing claim")?;
+        assert_eq!(claim.view.attempts.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deadline_after_held_request_on_each_transport() -> FlowResult {
+        for backend in [Backend::Scripted, Backend::Service] {
+            run_here(backend, guarded_claim).await?;
+        }
+        Ok(())
+    }
+}

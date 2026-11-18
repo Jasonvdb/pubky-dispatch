@@ -68,6 +68,17 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a super::FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(async move {
+            first.check()?;
+            self.send(request).await
+        })
+    }
+
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         let scripted = lock(&self.script).pop_front();
         let answer = match scripted {

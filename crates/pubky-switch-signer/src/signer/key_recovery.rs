@@ -867,13 +867,16 @@ impl Signer {
             return Err(behind(kept.signed_through));
         }
         let docs: Vec<&IdentityDoc> = std::iter::once(&copy).chain(seen.iter().copied()).collect();
-        let fates = self.fates(&copy, &docs, backed_up, kept, &answer).await?;
+        let kind = KeyRecoveryKind::AtService;
+        let fates = self
+            .fates(&copy, &docs, backed_up, kept, &answer, kind)
+            .await?;
         let survey = KeyRecoverySurvey::of(
             origin,
             &copy,
             &fates,
             backup,
-            KeyRecoveryKind::AtService,
+            kind,
             &observation,
             copy.version(),
         );
@@ -920,10 +923,11 @@ impl Signer {
         backed_up: Option<&BackupView>,
         kept: &SignerState,
         answer: &AppsAnswer,
+        kind: KeyRecoveryKind,
     ) -> Result<Fates> {
         let certs = self.found_certs(copy, backed_up, kept).await?;
         let held = |cert: &[u8; 32]| certs.iter().any(|found| &found.hash() == cert);
-        let (revoked, picked) = revoked_for_good(copy, docs, backed_up, kept, answer)?;
+        let (revoked, picked) = revoked_for_good(copy, docs, backed_up, kept, answer, kind)?;
         let mut apps = Vec::new();
         let mut not_found = Vec::new();
         for listed in &copy.body().apps {
@@ -1659,9 +1663,10 @@ impl Signer {
             return Err(stop(KeyRecoveryStop::UnknownMembers));
         }
         let lost = base.generation().max(found.generations);
+        let kind = KeyRecoveryKind::ProviderLoss { lost: Some(lost) };
         let docs: Vec<&IdentityDoc> = seen.iter().collect();
         let mut fates = self
-            .fates(&base, &docs, backed_up, &found.kept, &answer)
+            .fates(&base, &docs, backed_up, &found.kept, &answer, kind)
             .await?;
         fates.removed_elsewhere(&answer);
         fates.revoked = enrollable(Some(&base), fates.revoked)?;
@@ -1670,7 +1675,7 @@ impl Signer {
             &base,
             &fates,
             backup,
-            KeyRecoveryKind::ProviderLoss { lost: Some(lost) },
+            kind,
             &observation,
             versions,
         );
@@ -1845,6 +1850,7 @@ fn revoked_for_good(
     backed_up: Option<&BackupView>,
     kept: &SignerState,
     answer: &AppsAnswer,
+    kind: KeyRecoveryKind,
 ) -> Result<(Vec<[u8; 16]>, Vec<RemovedApp>)> {
     let listed = |app: &[u8; 16]| copy.listed_cert(app).is_some();
     let mut revoked: Vec<[u8; 16]> = kept.tombstones.clone();
@@ -1899,7 +1905,7 @@ fn revoked_for_good(
         .collect();
     carried.sort_unstable();
     carried.dedup();
-    extras.truncate(enrollment_room(copy, &carried, &extras)?);
+    extras.truncate(enrollment_room(copy, &carried, &extras, kind)?);
     revoked.extend(extras);
     revoked.sort_unstable();
     revoked.dedup();
@@ -1910,7 +1916,12 @@ fn revoked_for_good(
 /// `carried` can still hold, with the headroom every version keeps (Switch wire 3.7, 7.1),
 /// and within an eighth of that enrollment's cap: App IDs taken on a switch's word alone never
 /// take the room the identity's own later versions need.
-fn enrollment_room(copy: &IdentityDoc, carried: &[[u8; 16]], extras: &[[u8; 16]]) -> Result<usize> {
+fn enrollment_room(
+    copy: &IdentityDoc,
+    carried: &[[u8; 16]],
+    extras: &[[u8; 16]],
+    kind: KeyRecoveryKind,
+) -> Result<usize> {
     let Some(limit) = enrollment_limit() else {
         return Ok(extras.len());
     };
@@ -1924,9 +1935,16 @@ fn enrollment_room(copy: &IdentityDoc, carried: &[[u8; 16]], extras: &[[u8; 16]]
         )?)
     };
     let without = size(0)?;
+    // At a serving account all previously held IDs stay, so each addition must leave room
+    // for later versions. A provider loss applies its reserve to the combined sources in
+    // `enrollable` (Switch spec 12.8).
+    let available = match kind {
+        KeyRecoveryKind::AtService => limit - limit / 8,
+        KeyRecoveryKind::ProviderLoss { .. } => limit,
+    };
     let fits = |taken: usize| -> Result<bool> {
         let bytes = size(taken)?;
-        Ok(bytes.saturating_add(CAP_HEADROOM) <= limit
+        Ok(bytes.saturating_add(CAP_HEADROOM) <= available
             && bytes.saturating_sub(without) <= limit / 8)
     };
     if fits(extras.len())? {
@@ -2116,7 +2134,8 @@ mod tests {
                 id
             })
             .collect();
-        let room = enrollment_room(&copy, &carried, &extras).unwrap();
+        let at_service = KeyRecoveryKind::AtService;
+        let room = enrollment_room(&copy, &carried, &extras, at_service).unwrap();
         assert!(room > 0 && room < extras.len());
         let policy = copy.body().policy;
         let measure = |n: usize| {
@@ -2128,20 +2147,28 @@ mod tests {
         assert!(measure(room) - measure(0) <= limit / 8);
         assert!(measure(room + 1) - measure(0) > limit / 8);
         assert!(measure(room) + CAP_HEADROOM <= limit);
-        assert_eq!(enrollment_room(&copy, &carried, &extras[..5]).unwrap(), 5);
-        // Near the cap already, the headroom bounds it first.
-        let full: Vec<[u8; 16]> = extras[..room * 7].to_vec();
-        let near = enrollment_room(&copy, &full, &extras[room * 7..]).unwrap();
-        let ids: Vec<[u8; 16]> = full
-            .iter()
-            .chain(&extras[room * 7..room * 7 + near])
-            .copied()
-            .collect();
-        assert!(
-            Enrollment::max_request_len(&policy, Some(copy.signed()), &ids).unwrap() + CAP_HEADROOM
-                <= limit
+        assert_eq!(
+            enrollment_room(&copy, &carried, &extras[..5], at_service).unwrap(),
+            5
         );
-        assert!(near < room);
+        // A serving account reserves the last eighth immediately. A provider loss still
+        // gathers IDs up to the cap before choosing which fit across all its sources.
+        let loss = KeyRecoveryKind::ProviderLoss { lost: Some(1) };
+        for (kind, held, budget) in [
+            (at_service, room * 6, limit - limit / 8),
+            (loss, room * 7, limit),
+        ] {
+            let (carried, remaining) = extras.split_at(held);
+            let near = enrollment_room(&copy, carried, remaining, kind).unwrap();
+            assert!(near > 0 && near < room);
+            let total = |n| {
+                Enrollment::max_request_len(&policy, Some(copy.signed()), &extras[..held + n])
+                    .unwrap()
+                    + CAP_HEADROOM
+            };
+            assert!(total(near) <= budget);
+            assert!(total(near + 1) > budget);
+        }
     }
 
     #[test]

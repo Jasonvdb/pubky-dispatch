@@ -163,10 +163,20 @@ impl RecordVersion {
 
     fn read(value: &Value, what: &str) -> Result<Self> {
         only(value, &["generation", "version"], what)?;
-        Ok(Self {
-            generation: req_int(value, "generation", what)?,
-            version: req_int(value, "version", what)?,
-        })
+        Self::named(
+            req_int(value, "generation", what)?,
+            req_int(value, "version", what)?,
+        )
+    }
+
+    /// A version an operation names, as `expected_version` or in a `record_version`
+    /// condition: `{0, 0}` names no record, and no other version has `version` 0 (Switch
+    /// wire 6.2, 6.3).
+    fn named(generation: u64, version: u64) -> Result<Self> {
+        if version == 0 && generation != 0 {
+            return invalid("Switch wire 6.3: a version 0 names generation 0");
+        }
+        Ok(Self::new(generation, version))
     }
 }
 
@@ -313,10 +323,10 @@ impl Condition {
             only(inner, &["key", "generation", "version"], what)?;
             return Ok(Condition::RecordVersion {
                 key: req_b64n::<32>(inner, "key", what)?,
-                version: RecordVersion::new(
+                version: RecordVersion::named(
                     req_int(inner, "generation", what)?,
                     req_int(inner, "version", what)?,
-                ),
+                )?,
             });
         }
         if let Some(inner) = value.get("claim_step") {
@@ -1452,6 +1462,34 @@ mod tests {
         assert!(RecordVersion::new(1, 8) > RecordVersion::new(1, 6));
         assert!(RecordVersion::NONE.is_none());
         assert!(!RecordVersion::new(0, 1).is_none());
+    }
+
+    #[test]
+    fn test_record_version_named_version_zero_is_only_generation_zero() {
+        // Both places an operation names a version: `expected_version` and a
+        // `record_version` condition.
+        let readers: [fn(u64, u64) -> Result<RecordVersion>; 2] = [
+            |g, v| {
+                RecordVersion::read(
+                    &serde_json::json!({"generation": g, "version": v}),
+                    "expected_version",
+                )
+            },
+            |g, v| {
+                let condition = serde_json::json!({"record_version": {
+                    "key": b64(&[1; 32]), "generation": g, "version": v,
+                }});
+                match Condition::read(&condition)? {
+                    Condition::RecordVersion { version, .. } => Ok(version),
+                    _ => unreachable!(),
+                }
+            },
+        ];
+        for read in readers {
+            assert_eq!(read(0, 0).unwrap(), RecordVersion::NONE);
+            assert_eq!(read(9, 1).unwrap(), RecordVersion::new(9, 1));
+            assert!(read(9, 0).is_err());
+        }
     }
 
     #[test]

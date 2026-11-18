@@ -13,6 +13,7 @@ use pubky_switch_core::ops::Position;
 use pubky_switch_core::records::{
     AppRecord, Freeze, IdentityDoc, KeyBundle, ReceiveKeyRecord, SignerHandover,
 };
+use pubky_switch_core::shared::ApplicationRef;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Map, Value, json};
 
@@ -605,6 +606,10 @@ pub struct SharedRecordView {
     pub version: u64,
     /// The write's `seq`.
     pub seq: u64,
+    /// The current write's application at the service (Switch wire 6.3): at its version
+    /// for a write a batch applied, the `upload` transition's for one taken from a recovery
+    /// upload.
+    pub revision: ApplicationRef,
     /// Whether the current write is a delete.
     pub deleted: bool,
     /// The writer.
@@ -630,6 +635,18 @@ impl SharedRecordView {
             generation: o.u64("generation")?,
             version: o.u64("version")?,
             seq: o.u64("seq")?,
+            revision: {
+                let shown = o.object("revision")?;
+                let revision = ApplicationRef {
+                    generation: shown.u64("generation")?,
+                    seq: shown.u64("seq")?,
+                    item_hash: shown.b64n("item_hash")?,
+                };
+                revision
+                    .check()
+                    .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+                revision
+            },
             deleted: o.bool("deleted")?,
             writer: o.app_id("writer")?,
             op: o.doc("op")?,
@@ -1304,7 +1321,8 @@ mod tests {
             "key": b64(&[1; 32]), "collection": b64(&[2; 32]), "read_scope": "scope-a",
             "write_scopes": ["scope-a"], "generation": 1, "version": 1, "seq": 3,
             "deleted": false, "writer": zbase32_encode(&[3; 16]), "op": doc_value(),
-            "cert": doc_value()
+            "cert": doc_value(),
+            "revision": { "generation": 1, "seq": 3, "item_hash": b64(&[4; 32]) }
         })
     }
 
@@ -1523,6 +1541,18 @@ mod tests {
             assert_eq!(view.write_scopes, ["scope-a"]);
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_record_view_requires_a_revision() {
+        requires(&record_view(), "/revision", |value| {
+            let view = SharedRecordView::read(Obj::of(value, "record")?)?;
+            assert_eq!(view.revision.item_hash, [4; 32]);
+            Ok(())
+        });
+        let mut zero = record_view();
+        zero["revision"]["seq"] = json!(0);
+        assert!(SharedRecordView::read(Obj::of(&zero, "record").unwrap()).is_err());
     }
 
     #[test]

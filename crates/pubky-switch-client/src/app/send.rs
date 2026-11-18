@@ -24,7 +24,11 @@
 //!    ([`super::Protocol::sent_record`]), compare-and-swap. One still not made
 //!    [`SENT_RETENTION_MS`] after the message's first acceptance, such as one whose held
 //!    value waits for a key that never comes, is given up, and the protocol told
-//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever.
+//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever. A
+//!    job whose earlier try left a batch kept settles it first: once it applied, the job is
+//!    done. A job never writes over a delete its protocol hasn't seen: when the app takes a
+//!    delete of the record that the job wasn't queued against, the job stops and the
+//!    protocol is told ([`AppEvent::RecordJobStopped`]), to decide again.
 //!
 //! The acceptance is committed as soon as the append is answered, before anything else is
 //! done with the answer, so a crash never sends the same bytes again: with it the message
@@ -662,15 +666,20 @@ struct KeptJob {
     natural_key: Vec<u8>,
     #[serde(with = "serde_b64_vec")]
     tag: Vec<u8>,
+    /// The version of the delete the record's next write built on when the job was queued
+    /// ([`super::records::HeldRecord::delete_base`]); `None` when it built on no delete.
+    #[serde(with = "super::records::opt_version_serde")]
+    delete_base: Option<pubky_switch_core::ops::RecordVersion>,
 }
 
 impl KeptJob {
-    fn of(job: &RecordJob) -> Self {
+    fn of(job: &RecordJob, delete_base: Option<pubky_switch_core::ops::RecordVersion>) -> Self {
         Self {
             collection: job.target.collection.name.clone(),
             policy: job.target.collection.policy.clone(),
             natural_key: job.target.natural_key.clone(),
             tag: job.tag.clone(),
+            delete_base,
         }
     }
 
@@ -735,8 +744,10 @@ pub(crate) struct OutboxItem {
     /// the deadline too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
-    /// The batch a try of the record job left kept, the latest one, in base64: named when
-    /// the job is given up ([`AppEvent::RecordJobDropped`]), as it may still apply.
+    /// The batch a try of the record job left kept, the latest one, in base64: settled
+    /// before the next try, and named when the job is given up
+    /// ([`AppEvent::RecordJobDropped`]) or stopped ([`AppEvent::RecordJobStopped`]) while it
+    /// may have applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record_batch: Option<String>,
 }
@@ -1156,7 +1167,7 @@ impl App {
             retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let mut items = Vec::new();
         for message in messages {
-            let mut item = self.outbox_item(message)?;
+            let mut item = self.outbox_item(message).await?;
             self.inherit_origin(&mut item, &mut copies)?;
             items.push(item);
         }
@@ -1659,7 +1670,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            let mut item = self.outbox_item(&message)?;
+            let mut item = self.outbox_item(&message).await?;
             let mut copies =
                 retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
             self.inherit_origin(&mut item, &mut copies)?;
@@ -1822,11 +1833,24 @@ impl App {
         Ok(reader.exists(&out_key(msg_id)).await? || reader.exists(&sent_key(msg_id)).await?)
     }
 
-    /// The outbox item of a signed message, its jobs owed.
-    pub(crate) fn outbox_item(&self, message: &SignedMessage) -> Result<OutboxItem, AppError> {
+    /// The outbox item of a signed message, its jobs owed; a record job keeps the delete
+    /// its record's next write builds on now, if any.
+    pub(crate) async fn outbox_item(
+        &self,
+        message: &SignedMessage,
+    ) -> Result<OutboxItem, AppError> {
         if message.plaintext.sender_app_id() != self.state.meta.app_id {
             return Err(Refusal::Usage("a message this app didn't sign".into()).into());
         }
+        let record = match &message.record {
+            Some(job) => {
+                let key = self.record_key(&job.target)?;
+                let held = self.held_record(&key).await?;
+                let delete_base = held.and_then(|held| held.delete_base());
+                Some(KeptJob::of(job, delete_base))
+            }
+            None => None,
+        };
         Ok(OutboxItem {
             origin: DeliveryOrigin::Original,
             to: message.to,
@@ -1837,7 +1861,7 @@ impl App {
             invite_code: message.invite_code.clone(),
             conversation: message.conversation,
             sealed: None,
-            record: message.record.as_ref().map(KeptJob::of),
+            record,
             record_done: false,
             accepted_at_ms: None,
             failed: None,
@@ -2487,8 +2511,26 @@ impl App {
                 self.drop_record_job(item).await?;
                 return Ok(false);
             }
-            match self.record_job(&item, &job).await {
-                Ok(()) => item.record_done = true,
+            // The batch an earlier try left kept is settled first: once it applied, the
+            // job's write is made, and a later write of the record is another writer's,
+            // which the protocol sees in the record.
+            let tried = match self.settle_job_batch(&mut item).await? {
+                JobBatch::Applied => Ok(None),
+                JobBatch::Waits => {
+                    self.save_item(&item).await?;
+                    return Ok(false);
+                }
+                JobBatch::NotApplied | JobBatch::Unknown => self.record_job(&item, &job).await,
+            };
+            match tried {
+                Ok(None) => item.record_done = true,
+                Ok(Some(deleted)) => {
+                    self.stop_record_job(&mut item, &job, deleted).await?;
+                    if item.complete() {
+                        self.finish_item(&item).await?;
+                    }
+                    return Ok(false);
+                }
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
                     if let Some(batch_id) = error.kept_batch() {
@@ -2634,6 +2676,76 @@ impl App {
             to,
             Duty::RecordJobDropped {
                 msg_id: item.msg_id.clone(),
+                batch_id: item.record_batch.clone(),
+            },
+        )?;
+        self.commit(tx).await
+    }
+
+    /// What became of the batch the latest try of `item`'s record job left kept
+    /// (`item.record_batch`): a batch still kept is sent again first, in the order of the
+    /// kept batches, and waits when that doesn't settle it. One known never applied is
+    /// cleared from `item`, so a stop names only a batch that may have applied.
+    async fn settle_job_batch(&mut self, item: &mut OutboxItem) -> Result<JobBatch, AppError> {
+        Box::pin(async move {
+            use super::{KeptBatchDrop, KeptBatchStatus};
+            let Some(named) = &item.record_batch else {
+                return Ok(JobBatch::NotApplied);
+            };
+            let id = pubky_switch_core::enc::unb64_array::<16>(named)
+                .map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            let mut status = self.kept_batch(id).await?;
+            if matches!(status, Some(KeptBatchStatus::Kept { .. })) {
+                match self
+                    .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
+                    .await
+                {
+                    Err(error) if is_local(&error) => return Err(error),
+                    Err(error) => item.last_error = Some(error.to_string()),
+                    Ok(_) => {}
+                }
+                status = self.kept_batch(id).await?;
+            }
+            Ok(match status {
+                Some(KeptBatchStatus::Applied { .. }) => JobBatch::Applied,
+                Some(KeptBatchStatus::Kept { .. }) => JobBatch::Waits,
+                Some(KeptBatchStatus::Dropped {
+                    reason: KeptBatchDrop::Refused { .. } | KeptBatchDrop::Unsent,
+                    ..
+                }) => {
+                    item.record_batch = None;
+                    JobBatch::NotApplied
+                }
+                Some(KeptBatchStatus::Dropped { .. }) | None => JobBatch::Unknown,
+            })
+        })
+        .await
+    }
+
+    /// Stop the record job of `item` at `deleted`, a delete of its record the job wasn't
+    /// queued against ([`App::record_job`]): in one commit with
+    /// [`AppEvent::RecordJobStopped`], which names the record, the delete, and the batch an
+    /// earlier try left kept whose fate isn't known, so the protocol decides again.
+    async fn stop_record_job(
+        &mut self,
+        item: &mut OutboxItem,
+        job: &KeptJob,
+        deleted: pubky_switch_core::ops::RecordVersion,
+    ) -> Result<(), AppError> {
+        let key = self.record_key(&job.job().target)?;
+        item.record = None;
+        item.record_done = true;
+        let mut tx = self.tx()?;
+        tx.put(&out_key(&item.msg_id), &*item)?;
+        let to = self.owners_of_kind(&item.kind);
+        self.keep_duty_for(
+            &mut tx,
+            to,
+            Duty::RecordJobStopped {
+                msg_id: item.msg_id.clone(),
+                key,
+                generation: deleted.generation,
+                version: deleted.version,
                 batch_id: item.record_batch.clone(),
             },
         )?;
@@ -3053,8 +3165,14 @@ impl App {
     }
 
     /// The record job: the protocol builds the record's next value from what the app holds,
-    /// written compare-and-swap.
-    async fn record_job(&mut self, item: &OutboxItem, job: &KeptJob) -> Result<(), AppError> {
+    /// written compare-and-swap, from the delete the job was queued against
+    /// ([`App::update_record_on`]). It never writes over another delete, which the protocol
+    /// hasn't seen (Switch spec 10.3): at any try it returns that delete instead.
+    async fn record_job(
+        &mut self,
+        item: &OutboxItem,
+        job: &KeptJob,
+    ) -> Result<Option<pubky_switch_core::ops::RecordVersion>, AppError> {
         let kept = self.read_sent(&item.msg_id).await?;
         let sent = SentMessage {
             to: item.to,
@@ -3070,14 +3188,32 @@ impl App {
                 .map(SentStored::resent_ascending)
                 .unwrap_or_default(),
         };
+        let base = Some(job.delete_base);
         let job = job.job();
         let protocols = self.protocols.clone();
-        self.update_record(&job.target, Vec::new(), |current| {
-            protocols.sent_record(&job, &sent, current)
+        let updated = self
+            .update_record_on(&job.target, Vec::new(), base, |current| {
+                protocols.sent_record(&job, &sent, current)
+            })
+            .await?;
+        Ok(match updated {
+            super::records::Updated::Written(_) => None,
+            super::records::Updated::Stopped { deleted, .. } => Some(deleted),
         })
-        .await?;
-        Ok(())
     }
+}
+
+/// What became of the batch a try of a record job left kept ([`App::settle_job_batch`]).
+enum JobBatch {
+    /// Applied: the job's write is made.
+    Applied,
+    /// Still kept after a send that didn't settle it: the job waits for a later flush.
+    Waits,
+    /// None was kept, or the one kept was never applied.
+    NotApplied,
+    /// Its fate can't be known any more: dropped after a send that wasn't answered, or
+    /// ended before a restore or longer ago than the store keeps.
+    Unknown,
 }
 
 /// What one try of a delivery came to.
@@ -3229,6 +3365,7 @@ mod tests {
                 policy: pubky_switch_core::ident::Policy::new("scope-a", &["scope-a"]),
                 natural_key: b"n1".to_vec(),
                 tag: Vec::new(),
+                delete_base: None,
             }),
             record_done: false,
             accepted_at_ms: Some(1_000),

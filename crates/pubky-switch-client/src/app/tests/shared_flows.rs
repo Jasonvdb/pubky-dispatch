@@ -163,11 +163,21 @@ impl Protocol for ItemsProtocol {
     }
 
     fn record_put_back_successor(
-        &self, deletion: &crate::app::RecordDeletion<'_>, successor: &crate::app::RecordSuccessor<'_>, _: &crate::app::ReceiveContext<'_>,
+        &self,
+        deletion: &crate::app::RecordDeletion<'_>,
+        successor: &crate::app::RecordSuccessor<'_>,
+        _: &crate::app::ReceiveContext<'_>,
     ) -> Result<crate::app::PutBackSuccessor, crate::app::StoreFailure> {
         let current = ids(Some(successor.value));
-        let covered= *self.pending_publication.lock().unwrap() != Some(deletion.version) && deletion.exact_value.is_some_and(|v| ids(Some(v)).iter().all(|id|current.contains(id)));
-        Ok(if covered { crate::app::PutBackSuccessor::Covered } else { crate::app::PutBackSuccessor::Wait })
+        let covered = *self.pending_publication.lock().unwrap() != Some(deletion.version)
+            && deletion
+                .exact_value
+                .is_some_and(|v| ids(Some(v)).iter().all(|id| current.contains(id)));
+        Ok(if covered {
+            crate::app::PutBackSuccessor::Covered
+        } else {
+            crate::app::PutBackSuccessor::Wait
+        })
     }
 
     fn record_put_back(
@@ -9986,23 +9996,43 @@ async fn test_record_deletion_restored_named_source_needs_its_own_version_proof(
     let mut reader = s.join("phone").await;
     let target = s.target("collection item");
     let source = value(&["issued"]);
-    let key = writer.put_record(&target, &source, vec![]).await.unwrap().key;
+    let key = writer
+        .put_record(&target, &source, vec![])
+        .await
+        .unwrap()
+        .key;
     read_on(&mut reader).await;
     let applied = s.w.switch.record(&key).unwrap().revision;
-    let when = Condition::RecordCurrent { key, revision:applied, deleted:false };
-    s.protocol.observe_deletes.store(true,SeqCst);
-    s.protocol.observation_unavailable.store(true,SeqCst);
-    writer.delete_record(&target,vec![when]).await.unwrap();
+    let when = Condition::RecordCurrent {
+        key,
+        revision: applied,
+        deleted: false,
+    };
+    s.protocol.observe_deletes.store(true, SeqCst);
+    s.protocol.observation_unavailable.store(true, SeqCst);
+    writer.delete_record(&target, vec![when]).await.unwrap();
     read_on(&mut reader).await;
     let mut backup = reader.backup_layered().await.unwrap();
-    backup.deletions[0].predecessor.as_mut().unwrap().source.proof = None;
-    let mut restored = Box::pin(App::restore(s.env_on(Arc::new(MemoryStore::new())),s.protocol.clone(),World::config(),&backup)).await.unwrap();
-    s.protocol.observation_unavailable.store(false,SeqCst);
+    backup.deletions[0]
+        .predecessor
+        .as_mut()
+        .unwrap()
+        .source
+        .proof = None;
+    let mut restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    s.protocol.observation_unavailable.store(false, SeqCst);
     restored.refresh_identity().await.unwrap();
     read_on(&mut restored).await;
     let receipt = &deletion_receipts(&restored).await[0];
     assert_eq!(receipt["value"].as_str().unwrap().as_bytes(), source);
-    assert_eq!(receipt["dated"],false);
+    assert_eq!(receipt["dated"], false);
 }
 
 #[tokio::test]
@@ -12871,7 +12901,6 @@ async fn test_permanent_create_over_a_record_seen_live_raises_the_alarm() {
     }
 }
 
-
 fn replacement_at<'a>(
     app: &'a App,
     key: &[u8; 32],
@@ -13119,18 +13148,27 @@ async fn test_record_publication_checks_a_second_delete_while_the_first_waits() 
     let (mut writer, mut reader, target, first) = delete_for_put_back(&s).await;
     let key = reader.record_key(&target).unwrap();
     read_on(&mut reader).await;
-    *s.protocol.pending_publication.lock().unwrap() = Some(replacement_at(&reader,&key).unwrap().observation.delete.version);
-    let updated = value(&["trusted","next"]);
-    writer.put_record(&target,&updated,vec![]).await.unwrap();
+    *s.protocol.pending_publication.lock().unwrap() = Some(
+        replacement_at(&reader, &key)
+            .unwrap()
+            .observation
+            .delete
+            .version,
+    );
+    let updated = value(&["trusted", "next"]);
+    writer.put_record(&target, &updated, vec![]).await.unwrap();
     read_on(&mut reader).await;
-    let second=writer.delete_record(&target,vec![]).await.unwrap().version;
+    let second = writer.delete_record(&target, vec![]).await.unwrap().version;
     read_on(&mut reader).await;
-    assert_eq!(reader.state.put_backs.len(),2);
-    writer.put_record(&target,&updated,vec![]).await.unwrap();
+    assert_eq!(reader.state.put_backs.len(), 2);
+    writer.put_record(&target, &updated, vec![]).await.unwrap();
     read_on(&mut reader).await;
     read_on(&mut reader).await;
-    assert_eq!(reader.state.put_backs.len(),1);
-    assert_eq!(replacement_at(&reader,&key).unwrap().observation.seq,first);
+    assert_eq!(reader.state.put_backs.len(), 1);
+    assert_eq!(
+        replacement_at(&reader, &key).unwrap().observation.seq,
+        first
+    );
     reader.flush_cursor().await.unwrap();
     assert!(s.w.switch.app(&reader.app_id()).cursor < first);
     *s.protocol.pending_publication.lock().unwrap() = None;
@@ -13172,7 +13210,10 @@ async fn test_record_publication_shared_store_handoff_keeps_the_real_service_cur
     next.flush_cursor().await.unwrap();
     assert!(s.w.switch.app(&id).cursor < delete.version.version);
     assert!(held_at_switch(&s, &key));
-    writer.put_record(&target, &value(&["trusted","next"]), vec![]).await.unwrap();
+    writer
+        .put_record(&target, &value(&["trusted", "next"]), vec![])
+        .await
+        .unwrap();
     read_on(&mut next).await;
     next.flush_cursor().await.unwrap();
     assert!(s.w.switch.app(&id).cursor >= delete.version.version);

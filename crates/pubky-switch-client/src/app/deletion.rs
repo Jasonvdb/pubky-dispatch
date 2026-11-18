@@ -397,7 +397,11 @@ impl App {
             seen: hold.seen.as_ref().map(|m| m.mark.as_slice()),
             page_time_ms: hold.page_time_ms,
             policy: opened.as_ref().map(|_| &put.policy),
-            exact_version_authenticated: opened.is_some() && hold.predecessor.as_ref().is_some_and(|prior| prior.exact && prior.dated_at_expected),
+            exact_version_authenticated: opened.is_some()
+                && hold
+                    .predecessor
+                    .as_ref()
+                    .is_some_and(|prior| prior.exact && prior.dated_at_expected),
             exact_value: opened
                 .as_deref()
                 .filter(|_| hold.predecessor.as_ref().is_some_and(|prior| prior.exact)),

@@ -503,13 +503,26 @@ impl Protocol for TestProtocol {
         &self,
         deletion: &crate::app::RecordDeletion<'_>,
         successor: &crate::app::RecordSuccessor<'_>,
-        _: &crate::app::ReceiveContext<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
     ) -> Result<crate::app::PutBackSuccessor, crate::app::StoreFailure> {
         let complete = serde_json::from_slice::<serde_json::Value>(successor.value)
             .ok()
             .is_some_and(|current| {
-                current["hold"] != true
-                    && successor.repair.is_some_and(|repair| preserves_list(&current, &repair.held_value))
+                let bound = current["list"].as_str().is_some_and(|name| {
+                    let collection = Collection::new(deletion.collection, successor.policy.clone());
+                    let target = crate::app::RecordTarget::new(collection, name.as_bytes());
+                    cx.record_key(&target).is_ok_and(|key| key == *deletion.key)
+                });
+                let approved = current["approval"] != true
+                    || cx
+                        .local_get(&deletion.item_hash)
+                        .is_ok_and(|saved| saved.as_deref() == Some(b"approved".as_slice()));
+                bound
+                    && approved
+                    && current["hold"] != true
+                    && successor
+                        .repair
+                        .is_some_and(|repair| preserves_list(&current, &repair.held_value))
                     && deletion
                         .exact_value
                         .is_some_and(|source| preserves_list(&current, source))
@@ -560,7 +573,8 @@ fn preserves_list(current: &serde_json::Value, bytes: &[u8]) -> bool {
     let Ok(source) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return false;
     };
-    current["items"] == source["items"]
+    current["list"] == source["list"]
+        && current["items"] == source["items"]
         && source["notes"].as_object().is_some_and(|notes| {
             notes
                 .iter()

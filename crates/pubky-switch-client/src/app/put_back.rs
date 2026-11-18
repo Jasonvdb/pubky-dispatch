@@ -43,6 +43,13 @@ impl RecordHold {
     }
 }
 
+/// Whether this observation may proceed to the ordinary record check.
+pub(super) enum Publication {
+    PendingObservation,
+    Observed,
+    Covered(ApplicationRef),
+}
+
 pub(super) type Holds = BTreeMap<Id, RecordHold>;
 
 pub(super) fn at_key<'a>(
@@ -186,7 +193,7 @@ impl App {
         write: Option<(&records::Accepted, Option<&super::RecordRepair>)>,
         feed_time: Option<u64>,
         tx: &mut Tx,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Publication, AppError> {
         let id = due.copied().or_else(|| {
             at_key(&self.state.put_backs, key)
                 .find(|h| {
@@ -197,7 +204,7 @@ impl App {
                 .map(|h| h.observation.id())
         });
         let Some(mut hold) = id.and_then(|id| self.state.put_backs.get(&id)).cloned() else {
-            return Ok(false);
+            return Ok(Publication::Observed);
         };
         let original = &hold.observation;
         if revision.generation == original.generation
@@ -224,20 +231,23 @@ impl App {
                 > self.feed_order(original.generation, original.seq)
         {
             if hold.observing {
-                return Ok(true);
+                return Ok(Publication::PendingObservation);
             }
             if hold.protects
                 || hold.observation.page_time_ms.is_some()
                 || hold.observation.seq <= self.state.cursor.seq
             {
                 match write.check_publication(self, &hold.observation, repair, tx) {
-                    Ok(super::PutBackSuccessor::Covered) => self.forget_put_back(&hold.observation.id(), tx)?,
+                    Ok(super::PutBackSuccessor::Covered) => {
+                        self.forget_put_back(&original.id(), tx)?;
+                        return Ok(Publication::Covered(original.revision()));
+                    }
                     Ok(super::PutBackSuccessor::Wait) | Err(AppError::Protocol(_)) => (),
                     Err(error) => return Err(error),
                 }
             }
         }
-        Ok(false)
+        Ok(Publication::Observed)
     }
 
     pub(super) async fn try_put_back(&mut self, mut hold: RecordHold) -> Result<(), AppError> {
@@ -280,7 +290,9 @@ impl App {
                 SignedOp::peek(&hold.observation.operation).map_err(|_| super::corrupt())?;
             match self.consult_deletion(&hold.observation, &signed, &tx) {
                 Ok(Some(PutBack::Observe { .. })) => self.forget_put_back(&id, &mut tx)?,
-                Ok(_) | Err(AppError::Protocol(_)) if changed => self.keep_put_back(hold, &mut tx)?,
+                Ok(_) | Err(AppError::Protocol(_)) if changed => {
+                    self.keep_put_back(hold, &mut tx)?
+                }
                 Ok(_) | Err(AppError::Protocol(_)) => (),
                 Err(error) => return Err(error),
             }
@@ -339,11 +351,21 @@ impl App {
         self.commit(tx).await
     }
 
-    pub(super) async fn check_put_back_absence(&mut self, key: &[u8; 32], through: Option<super::FeedPosition>) -> Result<(), AppError> {
+    pub(super) async fn check_put_back_absence(
+        &mut self,
+        key: &[u8; 32],
+        through: Option<super::FeedPosition>,
+    ) -> Result<(), AppError> {
         let mut protected = false;
         for hold in at_key(&self.state.put_backs, key).filter(|h| h.protects && !h.needs_cursor) {
-            let at = super::FeedPosition {generation: hold.observation.generation, seq:hold.observation.seq};
-            if through.is_some_and(|head| self.received_order(head, at).is_none_or(std::cmp::Ordering::is_lt)) {
+            let at = super::FeedPosition {
+                generation: hold.observation.generation,
+                seq: hold.observation.seq,
+            };
+            if through.is_some_and(|head| {
+                self.received_order(head, at)
+                    .is_none_or(std::cmp::Ordering::is_lt)
+            }) {
                 continue;
             }
             protected |= self
@@ -458,7 +480,10 @@ impl App {
         if position.seq <= limit || position.generation != self.state.cursor.generation {
             return Ok(None);
         }
-        let cursor = Some(Position { generation: position.generation, seq: limit });
+        let cursor = Some(Position {
+            generation: position.generation,
+            seq: limit,
+        });
         Ok(Some(Batch::new(batch.ops().to_vec(), cursor)?))
     }
 

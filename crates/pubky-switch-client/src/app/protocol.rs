@@ -63,7 +63,8 @@ use crate::store::KeyValue;
 #[non_exhaustive]
 pub struct WriteBase {
     /// The evidence of a repair over a held record that directly answered a deletion.
-    /// Present only when both signed writes name their exact predecessors.
+    /// Present only when both signed writes name their exact predecessors and the
+    /// collection owner accepted this application for that deletion as `Covered`.
     pub repair: Option<RecordRepair>,
     /// The version the write builds on: the `expected_version` its operation signed,
     /// `{0, 0}` for a create.

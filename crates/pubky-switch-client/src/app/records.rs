@@ -953,10 +953,14 @@ pub(super) struct Accepted {
 
 impl Accepted {
     pub(super) fn confirm_deletion(&self, observed: &mut super::deletion::Observation) -> bool {
-        if !self.version.authenticated || self.doubtful { return false; }
+        if !self.version.authenticated || self.doubtful {
+            return false;
+        }
         let changed = !observed.authenticated || (observed.proof.is_none() && self.proof.is_some());
         observed.authenticated = true;
-        if observed.proof.is_none() { observed.proof.clone_from(&self.proof); }
+        if observed.proof.is_none() {
+            observed.proof.clone_from(&self.proof);
+        }
         changed
     }
 
@@ -1004,7 +1008,6 @@ impl Accepted {
             owner.record_put_back_successor(original, &successor, cx)
         })
     }
-
 }
 
 /// Why a write wasn't taken.
@@ -1347,7 +1350,7 @@ impl App {
     /// write it changes nothing.
     pub(crate) async fn note_gone(&mut self, key: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.check_put_back_absence(key,None).await?;
+            self.check_put_back_absence(key, None).await?;
             if let Some(mut held) = self.held_record(key).await?
                 && held.delete_base().is_some()
                 && !held.gone
@@ -1579,7 +1582,7 @@ impl App {
                     generation: head.generation,
                     seq: head.seq,
                 };
-                self.check_put_back_absence(&key,Some(at)).await?;
+                self.check_put_back_absence(&key, Some(at)).await?;
                 let held = self.held_record(&key).await?;
                 if let Some(mut held) = held {
                     // A later write, including one applied by upload, can overtake this answer.
@@ -3132,7 +3135,7 @@ impl App {
             h.authenticated
                 && !h.doubtful
                 && !h.gone
-                && h.follow.is_none()
+                && (h.follow.is_none() || h.follow_applied == Some(candidate.revision))
                 && h.content.value().is_some()
                 && h.applied == applied_at(h.version, h.item_hash)
                 && h.version.generation == generation
@@ -3283,10 +3286,33 @@ impl App {
             }
             self.keep_cert(&accepted.cert, tx)?;
             let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
-            let repair = self.record_repair(&accepted, held.as_ref(), tx)?;
-            if accepted.version.authenticated && !matches!(accepted.order, Order::Older(_) | Order::Overtaken(_, _))
-                && self.saw_put_back_write(&key, due, accepted.revision, Some((&accepted, repair.as_ref())), page_time_ms, tx)? && !settling_own {
-                return Ok(Taken::Waits);
+            let mut repair = None;
+            if accepted.version.authenticated
+                && !matches!(accepted.order, Order::Older(_) | Order::Overtaken(_, _))
+            {
+                use super::put_back::Publication;
+                let evidence = self.record_repair(&accepted, held.as_ref(), tx)?;
+                let original = evidence.as_ref().map(|r| {
+                    let version = RecordVersion::new(r.deletion.generation, r.deletion.seq);
+                    (key, version, r.deletion.item_hash)
+                });
+                let decision = self.saw_put_back_write(
+                    &key,
+                    due.or(original.as_ref()),
+                    accepted.revision,
+                    Some((&accepted, evidence.as_ref())),
+                    page_time_ms,
+                    tx,
+                )?;
+                // A retry for a different deletion checks only that duty. The feed or
+                // the matching duty takes the repair with its own owner's decision.
+                let other_delete = due.zip(original.as_ref()).is_some_and(|(due, original)| due != original);
+                if !settling_own && (matches!(decision, Publication::PendingObservation) || other_delete) {
+                    return Ok(Taken::Waits);
+                }
+                if let Publication::Covered(deletion) = decision {
+                    repair = evidence.filter(|r| r.deletion == deletion);
+                }
             }
             let reopened = held.as_ref().is_some_and(|held| {
                 held.item_hash == accepted.item_hash
@@ -3611,7 +3637,7 @@ impl App {
     ///
     /// The alarm; a store failure.
     async fn note_absent(&mut self, key: &[u8; 32]) -> Result<(), AppError> {
-        self.check_put_back_absence(key,None).await?;
+        self.check_put_back_absence(key, None).await?;
         let Some(held) = self.held_record(key).await? else {
             return Ok(());
         };

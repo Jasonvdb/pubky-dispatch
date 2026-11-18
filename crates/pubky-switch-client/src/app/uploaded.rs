@@ -31,6 +31,8 @@
 //!
 //! [`SharedRecord::divergent`]: super::records::SharedRecord::divergent
 
+use std::collections::BTreeMap;
+
 use pubky_switch_core::enc::{b64, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::scopes::Permission;
@@ -91,6 +93,34 @@ struct RecordReread {
 }
 
 impl App {
+    pub(super) async fn record_upload(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Option<FeedPosition>, AppError> {
+        Ok(self
+            .reader()
+            .get::<RecordReread>(&record_reread_key(key))
+            .await?
+            .map(|mark| mark.upload))
+    }
+
+    /// A replay before the cursor can revisit an earlier upload. Retain the higher
+    /// verified position when individual obligations or listings are combined.
+    pub(super) fn latest_upload(
+        &self,
+        a: FeedPosition,
+        b: FeedPosition,
+    ) -> Result<FeedPosition, AppError> {
+        match self.received_order(a, b) {
+            Some(std::cmp::Ordering::Less) => Ok(b),
+            Some(_) => Ok(a),
+            None => Err(super::Refusal::NotNow(
+                "the outstanding upload positions cannot be ordered".into(),
+            )
+            .into()),
+        }
+    }
+
     /// Mark for reading again the records an upload changed or made divergent, and the
     /// claims among those it lists that the app holds, from its `upload` transition in the
     /// feed (Switch wire 7.4.14), in `tx`. A key already marked is marked again, at the
@@ -98,80 +128,82 @@ impl App {
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
     /// listing instead, but for records the app holds outside the protocol's collections:
-    /// returns whether it does, and the caller owes the listing at the transition's item.
+    /// returns the newest upload the listing must cover.
     pub(crate) async fn mark_uploaded(
         &self,
         upload: FeedPosition,
         mut records: Vec<[u8; 32]>,
         mut claims: Vec<[u8; 32]>,
         tx: &mut Tx,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Option<FeedPosition>, AppError> {
         let at = self.now();
         let mark = RecordReread {
             marked_ms: at,
             upload,
         };
-        let mut lists = false;
+        let mut listing = None;
         records.truncate(MAX_MARKED_KEYS);
         claims.truncate(MAX_MARKED_KEYS);
         if !records.is_empty() {
             // The marks held, at most: those committed, unless `tx` dropped them (a key no
             // mark has shows the drop), and those `tx` puts.
             let dropped = tx.pending_state(&format!("{RECORD_REREAD_PREFIX}~")) == Some(false);
-            let committed = if dropped {
-                0
+            let mut held: BTreeMap<String, RecordReread> = if dropped {
+                BTreeMap::new()
             } else {
-                self.reader().scan_raw(RECORD_REREAD_PREFIX).await?.len()
+                self.reader()
+                    .scan(RECORD_REREAD_PREFIX)
+                    .await?
+                    .into_iter()
+                    .collect()
             };
-            let marked = committed.saturating_add(tx.pending_puts(RECORD_REREAD_PREFIX));
-            if marked.saturating_add(records.len()) > MAX_RECORD_MARKS {
-                // The listing reads only the protocol's collections: the marks of records
-                // the app holds outside them stay, bounded by the records it holds.
-                records.sort_unstable();
-                let mut keys = records.clone();
-                let committed = if dropped {
-                    Vec::new()
+            let staged = tx.pending_put_keys(RECORD_REREAD_PREFIX);
+            let capped = held
+                .len()
+                .saturating_add(staged.len())
+                .saturating_add(records.len())
+                > MAX_RECORD_MARKS;
+            for rest in staged {
+                let entry = format!("{RECORD_REREAD_PREFIX}{rest}");
+                let prior = tx
+                    .pending_get::<RecordReread>(&entry)?
+                    .flatten()
+                    .ok_or(StoreError::Corrupt)?;
+                held.insert(rest, prior);
+            }
+            for key in records {
+                let rest = b64(&key);
+                let mut next = mark;
+                if let Some(prior) = held.get(&rest) {
+                    next.upload = self.latest_upload(upload, prior.upload)?;
+                }
+                if capped {
+                    held.insert(rest, next);
                 } else {
-                    self.reader().scan_raw(RECORD_REREAD_PREFIX).await?
-                };
-                let rests = committed
-                    .into_iter()
-                    .map(|(rest, _)| rest)
-                    .chain(tx.pending_put_keys(RECORD_REREAD_PREFIX));
-                keys.extend(rests.filter_map(|rest| unb64_array::<32>(&rest).ok()));
-                keys.sort_unstable();
-                keys.dedup();
-                let listed: Vec<String> = self
-                    .protocols
-                    .collections()
-                    .into_iter()
-                    .map(|collection| collection.name)
-                    .collect();
+                    tx.put(&record_reread_key(&key), &next)?;
+                }
+            }
+            if capped {
+                let collections = self.protocols.collections();
+                let mut minimum = upload;
                 let mut keep = Vec::new();
-                for key in keys {
-                    if let Some(held) = self.held_collection(&key).await?
-                        && !listed.contains(&held.name)
+                for (rest, mark) in held {
+                    let key = unb64_array::<32>(&rest).map_err(|_| StoreError::Corrupt)?;
+                    if let Some(collection) = self.held_collection(&key).await?
+                        && !collections
+                            .iter()
+                            .any(|listed| listed.name == collection.name)
                     {
-                        let entry = record_reread_key(&key);
-                        let retained = if records.binary_search(&key).is_ok() {
-                            mark
-                        } else {
-                            self.read_in::<RecordReread>(&entry, tx)
-                                .await?
-                                .ok_or(StoreError::Corrupt)?
-                        };
-                        keep.push((entry, retained));
+                        keep.push((key, mark));
+                    } else {
+                        minimum = self.latest_upload(minimum, mark.upload)?;
                     }
                 }
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                lists = true;
-                for (entry, retained) in keep {
-                    tx.put(&entry, &retained)?;
+                for (key, mark) in keep {
+                    tx.put(&record_reread_key(&key), &mark)?;
                 }
-            } else {
-                for key in &records {
-                    tx.put(&record_reread_key(key), &mark)?;
-                }
+                listing = Some(minimum);
             }
         }
         if self.state.cert.has_permission(Permission::ClaimsRead) {
@@ -186,7 +218,7 @@ impl App {
                 }
             }
         }
-        Ok(lists)
+        Ok(listing)
     }
 
     /// At the end of a read: read again the records an upload listed (Switch wire 7.4.14),
@@ -240,8 +272,12 @@ impl App {
             if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
                 return Ok(true);
             }
-            let view = match self.record_answer(&key, Some(upload)).await {
-                Ok(RecordAnswer::View(view)) if view.0.key == key => Some(*view),
+            let view = match self.record_answer(&key, [Some(upload), None]).await {
+                Ok(RecordAnswer::View(record))
+                    if record.view.key == key && record.covers_uploads =>
+                {
+                    Some((record.view, record.at))
+                }
                 Ok(RecordAnswer::Absent) => None,
                 Ok(
                     RecordAnswer::Inconclusive | RecordAnswer::NotHosted(_) | RecordAnswer::View(_),

@@ -1870,6 +1870,7 @@ fn test_order_model_listing_owed_outside_the_feed_waiting_for_a_key_holds_its_pr
         }
         let due = crate::app::records::ListDue {
             to: vec![("tasks".into(), None), ("chat".into(), None)],
+            upload: None,
         };
         tx.put(crate::app::records::LIST_DUE, &due).unwrap();
         b.app.commit(tx).await.unwrap();

@@ -75,7 +75,11 @@ async fn followed(store: &Arc<MemoryStore>, record: bool) -> (Lost, App) {
 /// A record of the lost generation the app doesn't hold, uploaded to the next switch with
 /// no proof, as another device's app would (Switch wire 7.4.14): taken there. Its key.
 async fn upload_unheld_record(lost: &Lost, app: &mut App) -> [u8; 32] {
-    let target = RecordTarget::new(items(), b"uploaded");
+    upload_named_record(lost, app, b"uploaded", [98; 16]).await
+}
+
+async fn upload_named_record(lost: &Lost, app: &mut App, name: &[u8], batch: [u8; 16]) -> [u8; 32] {
+    let target = RecordTarget::new(items(), name);
     let (_, kind) = app
         .record_op(&target, Some(&value(&["u"])), vec![])
         .await
@@ -89,7 +93,7 @@ async fn upload_unheld_record(lost: &Lost, app: &mut App) -> [u8; 32] {
         &lost.w.alice.public(),
         Some(app_keys("wallet").app_id_bytes()),
         1,
-        [98; 16],
+        batch,
         vec![(Vec::new(), kind)],
     )
     .unwrap();
@@ -150,6 +154,18 @@ async fn test_upload_record_reread_before_its_transition_survives_reload() {
         assert!(!changed(&earlier.events, key));
         assert!(app.shared_record(&key).await.unwrap().is_none());
         assert_eq!(marks(&store, "rcread/"), 1);
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(matches!(
+            app.read_record_fresh(&target).await.unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::Refused
+            }
+        ));
         lost.next.lock().shared.records.insert(key, uploaded);
 
         let id = app.app_id();
@@ -307,6 +323,42 @@ async fn test_upload_divergent_record_is_held_divergent_until_a_newer_write() {
     let report = app.receive(None).await.unwrap();
     assert_eq!(divergent(&report.events, key), 0, "{:?}", report.events);
     assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+}
+
+#[tokio::test]
+async fn test_upload_direct_read_keeps_divergence_until_its_observation_covers() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, true).await;
+        let target = RecordTarget::new(items(), b"key");
+        let before = lost.next.seq();
+        let key = upload_fork(&lost, [99; 16]);
+        app.receive(None).await.unwrap();
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+        upload_fork(&lost, [97; 16]);
+        lost.next.fail_next(Fault::Unreachable {
+            path: "/records/".into(),
+            after: 0,
+        });
+        app.receive(None).await.unwrap();
+        let divergent = lost.next.lock().shared.divergent.remove(&key).unwrap();
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        let old = app.read_record_fresh(&target).await.unwrap();
+        assert!(matches!(
+            old,
+            crate::app::RecordRead::Kept { record: Some(held), .. } if held.divergent
+        ));
+        lost.next.lock().shared.divergent.insert(key, divergent);
+        let current = app.read_record_fresh(&target).await.unwrap();
+        assert!(matches!(current, crate::app::RecordRead::Fresh(record) if record.divergent));
+        app.receive(None).await.unwrap();
+        assert_eq!(marks(&store, "rcread/"), 0);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -710,6 +762,181 @@ async fn test_upload_divergent_flag_follows_the_last_note_in_one_commit() {
     assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
     let report = app.receive(None).await.unwrap();
     assert_eq!(divergent(&report.events, key), 2, "{:?}", report.events);
+}
+
+fn cap_record_reads(lost: &Lost) {
+    let records = (0..MAX_RECORD_MARKS)
+        .map(|i| {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+            key
+        })
+        .collect();
+    lost.next
+        .chain_upload(
+            PHONE,
+            UploadChanges {
+                records,
+                ..UploadChanges::default()
+            }
+            .to_value(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_upload_listing_waits_for_a_covering_page_across_reload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let before = lost.next.seq();
+        let baseline = app.list_collection(&items()).await.unwrap();
+        assert_eq!((baseline.records, baseline.more), (0, false));
+        let key = upload_unheld_record(&lost, &mut app).await;
+        cap_record_reads(&lost);
+        let uploaded = lost.next.lock().shared.records.remove(&key).unwrap();
+        let earlier_page = || {
+            lost.next.fail_next(Fault::Head {
+                path: "records?collection".into(),
+                at: Some(before),
+                forked: false,
+            })
+        };
+        // The page was read before the upload, though the service signed a later head.
+        lost.next.fail_next(Fault::Replace {
+            path: "records?collection".into(),
+            member: "seq".into(),
+            value: json!(before),
+        });
+        let report = app.receive(None).await.unwrap();
+        assert!(!changed(&report.events, key));
+        assert!(app.listing_owed().await.unwrap());
+        // The host listing sees the empty collection and head from that same snapshot.
+        let current = std::mem::replace(&mut lost.next.lock().seq, before);
+        earlier_page();
+        assert!(app.list_collections().await.unwrap());
+        assert!(app.listing_owed().await.unwrap());
+        // The per-key marks have given way to the collection listing.
+        assert_eq!(marks(&store, "rcread/"), 0);
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(matches!(
+            app.read_record_fresh(&RecordTarget::new(items(), b"uploaded"))
+                .await
+                .unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::Refused
+            }
+        ));
+        let app_id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store),
+            lost.protocol.clone(),
+            World::config(),
+            app_id,
+        )
+        .await
+        .unwrap();
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().seq = current;
+        lost.next.lock().shared.records.insert(key, uploaded);
+        assert!(matches!(
+            app.read_record_fresh(&RecordTarget::new(items(), b"never uploaded"))
+                .await
+                .unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::NotFound
+            }
+        ));
+        assert!(app.listing_owed().await.unwrap());
+        assert!(changed(&app.receive(None).await.unwrap().events, key));
+        assert_eq!(
+            ids(app
+                .shared_record(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value()),
+            ["u"]
+        );
+        assert!(!app.listing_owed().await.unwrap());
+        assert!(!changed(&app.receive(None).await.unwrap().events, key));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_upload_listing_keeps_its_continuation_until_the_page_covers_the_upload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let before = lost.next.seq();
+        assert_eq!(app.list_collection(&items()).await.unwrap().records, 0);
+        let mut keys = [
+            upload_named_record(&lost, &mut app, b"first", [90; 16]).await,
+            upload_named_record(&lost, &mut app, b"second", [91; 16]).await,
+        ];
+        keys.sort_by_key(|key| b64(key));
+        let [first, second] = keys;
+        cap_record_reads(&lost);
+        lost.next.fail_next(Fault::Unreachable {
+            path: "records?collection".into(),
+            after: 0,
+        });
+        assert!(app.receive(None).await.is_err());
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().max_page_bytes = 1;
+        let continuation = format!("&after={}", b64(&first));
+        lost.next.fail_next(Fault::Unreachable {
+            path: continuation.clone(),
+            after: 0,
+        });
+        assert!(app.list_collections().await.is_err());
+        assert!(app.shared_record(&first).await.unwrap().is_some());
+        assert!(app.shared_record(&second).await.unwrap().is_none());
+        let cursor = || {
+            let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+            store.get(&ns, b"list_at").unwrap()
+        };
+        let after_first = cursor().unwrap();
+        let saved = lost.next.lock().shared.records.remove(&second).unwrap();
+        let current = std::mem::replace(&mut lost.next.lock().seq, before);
+        lost.next.fail_next(Fault::Head {
+            path: continuation.clone(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(app.list_collections().await.unwrap());
+        assert_eq!(cursor().unwrap(), after_first);
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().seq = current;
+        lost.next.lock().shared.records.insert(second, saved);
+        let id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store.clone()),
+            lost.protocol.clone(),
+            World::config(),
+            id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cursor().unwrap(), after_first);
+        let listed = lost.next.lock().shared.listings;
+        assert!(!app.list_collections().await.unwrap());
+        assert_eq!(lost.next.lock().shared.listings - listed, 1);
+        assert!(app.shared_record(&second).await.unwrap().is_some());
+        assert!(!app.listing_owed().await.unwrap());
+        assert!(cursor().is_none());
+    })
+    .await;
 }
 
 #[tokio::test]

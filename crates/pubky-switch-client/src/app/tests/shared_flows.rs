@@ -10519,7 +10519,13 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
         .unwrap();
     let before = phone.read_record(&target).await.unwrap().unwrap();
     let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
-    let (mut view, at) = phone.record_view(&key).await.unwrap().unwrap();
+    let observed = phone
+        .record_view(&key, &target.collection)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observed.covers_uploads);
+    let (mut view, at) = (observed.view, observed.at);
     let signed = SignedOp::peek(&view.op).unwrap().item_hash().unwrap();
     view.revision.item_hash[0] ^= 1;
     view.divergent = true;

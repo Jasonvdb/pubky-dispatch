@@ -3248,7 +3248,7 @@ impl App {
         self.commit_read(read).await?;
         self.gap_handed(held, &mut read.tx)?;
         if list {
-            self.owe_item_listing(position, false, read).await?;
+            self.owe_item_listing(position, false, None, read).await?;
         }
         self.hand_call(position, call, read).await?;
         Ok(())
@@ -3388,10 +3388,17 @@ impl App {
         &mut self,
         seq: u64,
         item: bool,
+        upload: Option<FeedPosition>,
         read: &mut Read,
     ) -> Result<(), AppError> {
         let at = (self.state.cursor.generation, seq);
         let mut due = super::records::list_due_in(&self.reader(), &read.tx).await?;
+        if let Some(upload) = upload {
+            due.upload = Some(match due.upload {
+                Some(held) => self.latest_upload(upload, held)?,
+                None => upload,
+            });
+        }
         // The protocols that didn't take the item's call wait for it too, behind the
         // listing.
         let failed = read.left.clone();
@@ -3401,6 +3408,14 @@ impl App {
             // first met the item.
             let (told_generation, told) = self.told(&name);
             if item && self.feed_order(told_generation, told) >= self.feed_order(at.0, at.1) {
+                // Replaying this item can fold other pending upload reads into a listing.
+                // This protocol has passed the item and can make that listing at once.
+                if upload.is_some() {
+                    if due.at(&name).is_none() {
+                        due.to.push((name, None));
+                    }
+                    owed_now = true;
+                }
                 continue;
             }
             owed_now = true;
@@ -3883,7 +3898,7 @@ impl App {
             // but still owes the listing (Switch spec 8.2, wire 7.4.4).
             if self.state.asked.insert(seq) {
                 read.tx.put(&key::asked(seq), &())?;
-                self.owe_item_listing(seq, true, read).await?;
+                self.owe_item_listing(seq, true, None, read).await?;
             }
             return Ok(Step::Pass);
         };
@@ -3896,7 +3911,7 @@ impl App {
                 accepted_from_ms,
                 accepted_until_ms: until.max(accepted_from_ms),
             };
-            self.owe_item_listing(seq, true, read).await?;
+            self.owe_item_listing(seq, true, None, read).await?;
             self.hand_call(seq, call, read).await?;
             self.events.push(AppEvent::Missed { seq, entries });
         }
@@ -4044,12 +4059,13 @@ impl App {
                             // Owned keys: the read's future stays `Send` across the awaits.
                             let records = changes.records.iter().chain(&changes.divergent);
                             let claims = changes.claims.iter().chain(&changes.divergent_claims);
+                            let upload = FeedPosition {
+                                generation: envelope.generation,
+                                seq: item.seq,
+                            };
                             let lists = self
                                 .mark_uploaded(
-                                    FeedPosition {
-                                        generation: envelope.generation,
-                                        seq: item.seq,
-                                    },
+                                    upload,
                                     records.copied().collect(),
                                     claims.copied().collect(),
                                     &mut read.tx,
@@ -4057,8 +4073,9 @@ impl App {
                                 .await?;
                             // One past the record marks owes a listing: made before any
                             // later entry is handed over, as a `missed` item's is.
-                            if lists {
-                                self.owe_item_listing(item.seq, true, read).await?;
+                            if let Some(minimum) = lists {
+                                self.owe_item_listing(item.seq, true, Some(minimum), read)
+                                    .await?;
                             }
                         }
                         Ok(Step::Pass)

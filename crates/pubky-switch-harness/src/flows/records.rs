@@ -300,6 +300,152 @@ mod tests {
         }
     }
 
+    async fn exact_application(app: &App, record: &SharedRecord, deleted: bool) -> Result<pubky_switch_core::ops::Condition, Box<dyn std::error::Error>> {
+        use pubky_switch_core::ops::{Condition, OpKind, SignedOp};
+        use pubky_switch_core::shared::ApplicationRef;
+        assert!(record.authenticated);
+        for kept in app.shared_evidence().await?.ops {
+            let op = SignedOp::peek(&kept.op)?;
+            if matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == record.key) {
+                return Ok(Condition::RecordCurrent {
+                    key: record.key,
+                    revision: ApplicationRef {generation: record.version.generation, seq: record.version.version, item_hash: op.item_hash()?},
+                    deleted,
+                });
+            }
+        }
+        Err("record writer lacks its signed operation".into())
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ListRepair {
+        Complete,
+        VersionOnlyDelete,
+        VersionOnlyLive,
+        DropsAddedNote,
+    }
+
+    async fn read_repaired_list(world: &World, how: ListRepair) -> FlowResult {
+        use pubky_switch_client::app::AppConfig;
+        use pubky_switch_client::store::MemoryStore;
+        use std::sync::Arc;
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+        let asking = |name| Asking::new(world.app_keys(&alice, name)?);
+        let spec = notes_protocol_with_records().spec().clone();
+        let reader_protocol =
+            Arc::new(pubky_switch_client::testing::TestProtocol::new(spec).waiting_for_records());
+        let (mut writer, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            asking("wallet")?,
+            notes_protocol_with_records(),
+        ))
+        .await?;
+        let (mut witnessed, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            asking("phone")?,
+            reader_protocol.clone(),
+        ))
+        .await?;
+        let (mut late, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            asking("tablet")?,
+            reader_protocol.clone(),
+        ))
+        .await?;
+        let target = RecordTarget::new(notes_collection(), b"shopping list");
+        let source = br#"{"items":["milk"],"notes":{"original":"bring a bag"}}"#;
+        let marked = br#"{"items":["milk"],"hold":true,"notes":{"added":"use the back door"}}"#;
+        let repair =
+            br#"{"items":["milk"],"notes":{"original":"bring a bag","added":"use the back door"}}"#;
+        Box::pin(writer.put_record(&target, source, vec![])).await?;
+        Box::pin(witnessed.receive(None)).await?;
+        let deletion = Box::pin(writer.delete_record(&target, vec![])).await?;
+        Box::pin(witnessed.receive(None)).await?;
+        Box::pin(witnessed.flush_cursor()).await?;
+        assert!(witnessed.service_cursor().seq < deletion.version.version);
+        let when = if how == ListRepair::VersionOnlyDelete {
+            writer.record_condition(&deletion.key).await?
+        } else {
+            exact_application(&writer, &deletion, true).await?
+        };
+        let eager = Box::pin(writer.put_record(&target, marked, vec![when])).await?;
+        for reader in [&mut witnessed, &mut late] {
+            let held = Box::pin(reader.read_record(&target))
+                .await?
+                .ok_or("missing marked record")?;
+            assert_eq!(held.content.value(), Some(marked.as_slice()));
+        }
+        Box::pin(witnessed.flush_cursor()).await?;
+        assert!(witnessed.service_cursor().seq < deletion.version.version);
+        let backup = witnessed.backup_layered().await?;
+        drop(witnessed);
+        let restored_store = Arc::new(MemoryStore::new());
+        let mut witnessed = Box::pin(App::restore(
+            world.app_env(restored_store.clone()),
+            reader_protocol.clone(),
+            AppConfig::default(),
+            &backup,
+        ))
+        .await?;
+        witnessed.refresh_identity().await?;
+        Box::pin(witnessed.receive(None)).await?;
+        let id = witnessed.app_id();
+        drop(witnessed);
+        let when = if how == ListRepair::VersionOnlyLive {
+            writer.record_condition(&eager.key).await?
+        } else {
+            exact_application(&writer, &eager, false).await?
+        };
+        let repair = if how == ListRepair::DropsAddedNote { source.as_slice() } else { repair.as_slice() };
+        let published = Box::pin(writer.put_record(&target, repair, vec![when])).await?;
+        let mut witnessed = Box::pin(App::load(world.app_env(restored_store), reader_protocol, AppConfig::default(), id)).await?;
+        Box::pin(witnessed.receive(None)).await?;
+        let held = Box::pin(witnessed.read_record(&target))
+            .await?
+            .ok_or("missing repaired record")?;
+        Box::pin(witnessed.flush_cursor()).await?;
+        if how == ListRepair::Complete {
+            assert!(!held.flagged && held.authenticated);
+            assert_eq!(held.version, published.version);
+            assert_eq!(held.content.value(), Some(repair));
+            assert!(witnessed.service_cursor().seq >= deletion.version.version);
+        } else {
+            assert!(held.flagged);
+            assert_eq!(held.content.value(), Some(marked.as_slice()));
+            assert!(witnessed.service_cursor().seq < deletion.version.version);
+        }
+        let unproved = Box::pin(late.read_record(&target))
+            .await?
+            .ok_or("missing restricted record")?;
+        assert!(unproved.flagged);
+        assert_eq!(unproved.content.value(), Some(marked.as_slice()));
+        assert_eq!(
+            Box::pin(writer.read_record(&target))
+                .await?
+                .ok_or("missing current record")?
+                .version,
+            published.version
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_publication_two_readers_at_both_switches() {
+        for backend in [Backend::Scripted, Backend::Service] {
+            for how in [ListRepair::Complete, ListRepair::VersionOnlyDelete, ListRepair::VersionOnlyLive, ListRepair::DropsAddedNote] {
+                assert!(Box::pin(run_here(backend, async |world| read_repaired_list(world, how).await)).await.unwrap().is_some());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_record_job_stopped_names_the_signed_delete_at_both_switches() {
         for backend in [Backend::Service, Backend::Scripted] {

@@ -12,7 +12,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Additions still to come**
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events).
+- **Client.** Automatic conditional publication over a deleted record or a competing live write still needs durable signed retry state.
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
@@ -30,7 +30,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 ### Client
 
-- [data] **A deleted record can be forgotten before its repair applies.** The client can durably deliver a deletion to its collection owner. The service cursor can still advance past the delete before a replacement write succeeds, including across restart or restore. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
+- [data] **A waiting collection relies on another authorized writer to publish.** A collection owner can hold this app's service cursor at a feed deletion and release it after checking the applied successor. The client has no automatic conditional replacement from that callback. Installations sharing an App ID require one authoritative synchronized state to protect their shared cursor. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
 - [wrong result] **A refused write the app follows is not compared with later ones.** After a protocol refuses a record's first write, a later answer showing an older write is not checked against it. Keep the protocol's own evidence of the refused version.
 - [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.
 - [wrong result] **A restored backup can deliver a message the app already gave up on.** A backup taken before a message was withdrawn still holds it for delivery. Restoring that backup onto another store, after the protocol was told `MessageUndelivered` and acknowledged it, can deliver the original. Keep the original message ID, and do not issue a replacement the recipient would act on twice while an older backup can still be restored.

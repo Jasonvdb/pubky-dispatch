@@ -264,8 +264,8 @@ impl ListProgress {
 enum RecordAnswer {
     /// The record's view, with what it is current at.
     View(Box<(SharedRecordView, CurrentAt)>),
-    /// `404`: the switch holds no record at the key.
-    Absent,
+    /// A hosted `404`, and whether its head covers what the app already saw at the key.
+    Absent { current: bool },
     /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
     /// (Switch wire 7.3 step 2). That says nothing of the record: the service reads as
     /// unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
@@ -1008,7 +1008,8 @@ pub enum RecordRead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeptReason {
-    /// The switch holds no record at the key, or forgot it (`404`, at an account it hosts).
+    /// The current service holds no record at the key, or forgot it. Its signed hosted
+    /// `404` covers the app's observations at the key, within its current read scope.
     NotFound,
     /// The switch's write was refused: a failed check, or one that goes back on what the
     /// app has seen ([`super::AppEvent::WriteFlagged`]).
@@ -1252,7 +1253,12 @@ impl App {
     ) -> Result<Fetched, AppError> {
         let (view, at) = match Box::pin(self.record_answer(key)).await? {
             RecordAnswer::View(view) => *view,
-            RecordAnswer::Absent => return Ok(Fetched::Absent),
+            RecordAnswer::Absent { current: true }
+                if self.state.cert.holds_scope(&collection.policy.read_scope) =>
+            {
+                return Ok(Fetched::Absent);
+            }
+            RecordAnswer::Absent { .. } => return Ok(Fetched::Read(WriteRead::Unordered)),
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
             RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
@@ -1262,7 +1268,15 @@ impl App {
             .take_view(&view, at, Some((key, collection)), &mut tx)
             .await?;
         self.commit(tx).await?;
-        Ok(Fetched::Read(read))
+        // A view can still supply historical write evidence after a provider change.
+        // Only the service generation the app follows can report this key as fresh now.
+        let current =
+            matches!(at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
+        Ok(Fetched::Read(if current {
+            read
+        } else {
+            WriteRead::Unordered
+        }))
     }
 
     /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
@@ -1341,7 +1355,7 @@ impl App {
     ) -> Result<Option<(SharedRecordView, CurrentAt)>, AppError> {
         match Box::pin(self.record_answer(key)).await? {
             RecordAnswer::View(view) => Ok(Some(*view)),
-            RecordAnswer::Absent => Ok(None),
+            RecordAnswer::Absent { .. } => Ok(None),
             RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
         }
     }
@@ -1369,11 +1383,11 @@ impl App {
                 })?;
                 let at = self.current_at(*head, None).await?;
                 let mut tx = self.tx()?;
-                self.note_absent(key, at, &mut tx).await?;
+                let current = self.note_absent(key, at, &mut tx).await?;
                 if !tx.is_empty() {
                     self.commit(tx).await?;
                 }
-                Ok(RecordAnswer::Absent)
+                Ok(RecordAnswer::Absent { current })
             }
             Err(error) => Err(error),
         }
@@ -3297,18 +3311,21 @@ impl App {
         key: &[u8; 32],
         current: CurrentAt,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let CurrentAt::Answer(v) = current else {
-            return Ok(());
+            return Ok(false);
         };
         let at = position(v.generation, v.version);
-        if let Some(mut held) = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?
-            && self.state.cert.holds_scope(&held.policy.read_scope)
-            && self.covers(at, held.observed)
-            && self.covers(at, position(held.applied.generation, held.applied.seq))
-            && let (_, applied, _) = held.base_write()
-            && self.covers(at, position(applied.generation, applied.seq))
-        {
+        let held = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?;
+        let current = v.generation == self.state.meta.generation
+            && held.as_ref().is_none_or(|held| {
+                let (_, applied, _) = held.base_write();
+                self.state.cert.holds_scope(&held.policy.read_scope)
+                    && self.covers(at, held.observed)
+                    && self.covers(at, position(held.applied.generation, held.applied.seq))
+                    && self.covers(at, position(applied.generation, applied.seq))
+            });
+        if let Some(mut held) = held.filter(|_| current) {
             self.check_absent(&held, at.generation).await?;
             if held.delete_base().is_some() && (!held.gone || held.observed != at) {
                 held.gone = true;
@@ -3316,7 +3333,8 @@ impl App {
                 put_held(tx, key, &held)?;
             }
         }
-        self.retire_absent_receipts(*key, at, tx)
+        self.retire_absent_receipts(*key, at, tx)?;
+        Ok(current)
     }
 
     async fn check_absent(&mut self, held: &HeldRecord, generation: u64) -> Result<(), AppError> {

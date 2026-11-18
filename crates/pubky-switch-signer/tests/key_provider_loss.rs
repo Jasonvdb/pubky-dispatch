@@ -1168,9 +1168,10 @@ async fn test_key_provider_loss_keeps_the_version_floor_it_showed() {
     let shown = survey(&world, &store, &router).await.unwrap();
     assert_eq!((shown.version, shown.generation), (5, 2));
     let rolled_back = signed_at(&world, &doc, 4, 1, 7);
-    world
-        .homeserver
-        .set(IDENTITY_PATH, serde_json::to_vec(rolled_back.signed()).unwrap());
+    world.homeserver.set(
+        IDENTITY_PATH,
+        serde_json::to_vec(rolled_back.signed()).unwrap(),
+    );
     let mut signer = Signer::declare_provider_loss_with_key(
         env_on(&world, &store, &router),
         world.keyring(),
@@ -1228,21 +1229,38 @@ async fn test_key_provider_loss_takes_an_earlier_time_for_a_removed_app() {
         distrust_from: START_MS,
     });
     let removing = IdentityDoc::sign(&world.key, body).unwrap();
-    world
-        .homeserver
-        .set(IDENTITY_PATH, serde_json::to_vec(removing.signed()).unwrap());
+    world.homeserver.set(
+        IDENTITY_PATH,
+        serde_json::to_vec(removing.signed()).unwrap(),
+    );
     let (service, router) = picked_service(&world);
     let store = Arc::new(MemoryStore::new());
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
-    let removed = signer.identity_doc().unwrap().unwrap().body().removed.clone();
+    let removed = signer
+        .identity_doc()
+        .unwrap()
+        .unwrap()
+        .body()
+        .removed
+        .clone();
     assert_eq!(
-        removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+        removed
+            .iter()
+            .find(|r| r.app_id == id)
+            .unwrap()
+            .distrust_from,
         picked
     );
     signs_at(&world, &service, &mut signer, 1).await;
     let later = world.published().unwrap();
     assert_eq!(
-        later.body().removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+        later
+            .body()
+            .removed
+            .iter()
+            .find(|r| r.app_id == id)
+            .unwrap()
+            .distrust_from,
         picked
     );
 }
@@ -1310,11 +1328,17 @@ async fn test_key_provider_loss_follows_a_copy_to_the_service_it_names() {
     router.add_switch(NEW_ORIGIN, &second);
     router.add_switch(THIRD, &third);
     let store = Arc::new(MemoryStore::new());
-    let shown =
-        Signer::survey_provider_loss_with_key(env_on(&world, &store, &router), world.keyring(), THIRD)
-            .await
-            .unwrap();
-    assert_eq!(world.switch.identity_doc().unwrap().signed(), pointing.signed());
+    let shown = Signer::survey_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        THIRD,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        pointing.signed()
+    );
     assert_eq!((shown.version, shown.generation), (moved.version(), 2));
 }
 
@@ -1334,7 +1358,10 @@ async fn test_key_provider_loss_goes_on_past_a_service_that_flaps() {
     router.add_switch(SWITCH_ORIGIN, &world.switch);
     let store = Arc::new(MemoryStore::new());
     let shown = survey(&world, &store, &router).await.unwrap();
-    assert!(matches!(shown.apps[0], (_, AppFate::RemovedAtSwitch { .. })));
+    assert!(matches!(
+        shown.apps[0],
+        (_, AppFate::RemovedAtSwitch { .. })
+    ));
     router.remove(SWITCH_ORIGIN);
     let mut signer = Signer::declare_provider_loss_with_key(
         env_on(&world, &store, &router),
@@ -1343,7 +1370,14 @@ async fn test_key_provider_loss_goes_on_past_a_service_that_flaps() {
     )
     .await
     .unwrap();
-    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
     signs_at(&world, &service, &mut signer, 1).await;
 }
 
@@ -1381,7 +1415,14 @@ async fn test_key_provider_loss_refuses_only_what_the_user_didnt_see() {
     )
     .await
     .unwrap();
-    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
     signs_at(&world, &service, &mut signer, 1).await;
 }
 
@@ -1436,7 +1477,12 @@ async fn test_key_provider_loss_takes_the_earlier_of_a_pick_and_a_services_time(
         .unwrap();
         let doc = signer.identity_doc().unwrap().unwrap();
         assert_eq!(
-            doc.body().removed.iter().find(|r| r.app_id == id).unwrap().distrust_from,
+            doc.body()
+                .removed
+                .iter()
+                .find(|r| r.app_id == id)
+                .unwrap()
+                .distrust_from,
             expected,
             "{pick_first}"
         );
@@ -1520,7 +1566,14 @@ async fn test_key_provider_loss_reads_the_backup_a_delivery_sealed() {
         AppFate::RevocationPending { .. }
     ));
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
-    assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
     signs_at(&world, &service, &mut signer, 1).await;
 }
 

@@ -291,7 +291,10 @@ impl Signer {
             .await?;
         let key = confirmed.into().0;
         // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
-        if key.as_ref().is_some_and(KeyRecoveryConfirmed::is_provider_loss) {
+        if key
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
         if state::set_up(&store, &identity).await? {
@@ -417,7 +420,10 @@ impl Signer {
         self.refresh().await?;
         let key = confirmed.into().0;
         // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
-        if key.as_ref().is_some_and(KeyRecoveryConfirmed::is_provider_loss) {
+        if key
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {

@@ -867,16 +867,15 @@ impl Signer {
         }
         let docs: Vec<&IdentityDoc> = std::iter::once(&copy).chain(seen.iter().copied()).collect();
         let fates = self.fates(&copy, &docs, backed_up, kept, &answer).await?;
-        let survey =
-            KeyRecoverySurvey::of(
-                origin,
-                &copy,
-                &fates,
-                backup,
-                KeyRecoveryKind::AtService,
-                &observation,
-                copy.version(),
-            );
+        let survey = KeyRecoverySurvey::of(
+            origin,
+            &copy,
+            &fates,
+            backup,
+            KeyRecoveryKind::AtService,
+            &observation,
+            copy.version(),
+        );
         let view = fates.view(&copy, created, Limits::default());
         Ok(KeyPlan {
             survey,
@@ -1152,7 +1151,10 @@ fn enrollable(base: Option<&IdentityDoc>, revoked: Vec<[u8; 16]>) -> Result<Vec<
     } else {
         fitting = over;
     }
-    let mut taken: Vec<[u8; 16]> = kept.into_iter().chain(rest.into_iter().take(fitting)).collect();
+    let mut taken: Vec<[u8; 16]> = kept
+        .into_iter()
+        .chain(rest.into_iter().take(fitting))
+        .collect();
     taken.sort_unstable();
     Ok(taken)
 }
@@ -1251,9 +1253,10 @@ impl LossPlan {
             }
         }
         for earlier in &now.earlier {
-            let known = then.earlier.iter().any(|e| {
-                e.app_id == earlier.app_id && e.distrust_from <= earlier.distrust_from
-            });
+            let known = then
+                .earlier
+                .iter()
+                .any(|e| e.app_id == earlier.app_id && e.distrust_from <= earlier.distrust_from);
             if !known {
                 return Err(changed());
             }
@@ -1515,7 +1518,12 @@ impl Signer {
         let mut held: Vec<IdentityDoc> = published
             .iter()
             .cloned()
-            .chain(opened.iter().flatten().map(|view| view.identity_doc.clone()))
+            .chain(
+                opened
+                    .iter()
+                    .flatten()
+                    .map(|view| view.identity_doc.clone()),
+            )
             .chain(sealed.iter().map(|view| view.identity_doc.clone()))
             .chain(found.marks.iter().cloned())
             .collect();

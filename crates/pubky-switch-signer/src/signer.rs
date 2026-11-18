@@ -2030,7 +2030,12 @@ impl Signer {
 
     /// A newer version of this install's own, `version` at `generation`, seen at `source`:
     /// its records are behind, and it signs nothing more until a restore, ending the flow.
-    async fn records_behind(&mut self, source: Source, version: u64, generation: u64) -> Result<()> {
+    async fn records_behind(
+        &mut self,
+        source: Source,
+        version: u64,
+        generation: u64,
+    ) -> Result<()> {
         let mut state = self.state.clone();
         state.generation_seen = state.generation_seen.max(generation);
         // A backup owed would hold the older records: the one there is newer.

@@ -8234,6 +8234,51 @@ async fn test_records_read_finding_a_delete_forgotten_lets_the_next_write_create
 }
 
 #[tokio::test]
+async fn test_records_not_hosted_read_over_a_held_delete_marks_nothing_gone() {
+    // The `404` saying the switch doesn't host the identity says nothing of the record
+    // (Switch spec 12.7 step 5): over a held delete the switch still keeps, the next write
+    // names that delete, as before the read, rather than creating at `{0, 0}`.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    assert!(held_at_switch(&s, &key), "kept");
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let read = wallet.read_record_fresh(&target).await;
+    assert!(
+        matches!(
+            read,
+            Ok(RecordRead::Kept {
+                reason: KeptReason::Unreachable(_),
+                ..
+            })
+        ),
+        "{read:?}"
+    );
+    let written = wallet.put_record(&target, &value(&["b"]), vec![]).await;
+    assert!(written.is_ok(), "{written:?}");
+    // A `404` at an account the switch hosts does mark the delete gone: the next write
+    // creates, and the switch, which still keeps the delete, refuses it.
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: serde_json::Value::Null,
+    });
+    wallet.read_record_fresh(&target).await.unwrap();
+    let refused = wallet.put_record(&target, &value(&["c"]), vec![]).await;
+    assert_eq!(
+        refused.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_records_write_followed_after_a_forgotten_delete_is_named() {
     // The wallet's delete is forgotten, and a read marks it so. The phone then creates the
     // record without what the wallet saw, which the wallet follows rather than takes

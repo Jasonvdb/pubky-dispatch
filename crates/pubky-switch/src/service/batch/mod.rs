@@ -367,7 +367,21 @@ pub(super) async fn load_apps(
     Ok(load_apps_and_rows(txn, held, now).await?.0)
 }
 
-/// As [`load_apps`], with the app rows it read. The one loader behind every judgment of
+/// Whether clearing the account's registrations changes the reachable directory
+/// (Switch wire 7.4.10). Only apps in the verified document can be current.
+pub(super) async fn had_reachable_apps(
+    txn: &mut AccountTxn,
+    doc: Option<&IdentityDoc>,
+) -> Result<bool, StoreError> {
+    let Some(doc) = doc else { return Ok(false) };
+    let key = txn.head().identity_key;
+    txn.any_listed_receiver(doc, |app| {
+        Ok(held_app(app, &key)?.current_in(doc, &app.app_id))
+    })
+    .await
+}
+
+/// As [`load_apps`], with the app rows it read. The loader behind judgments of
 /// which apps are current ([`OpsState::is_current`]) or served ([`OpsState::is_served`])
 /// outside a batch: the inbox's targets, the entries' release and the directory take
 /// current, and the claims' views served; `GET /apps` builds the same state

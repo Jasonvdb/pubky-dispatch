@@ -46,7 +46,7 @@ impl RecoverySource {
     // Even the shortest entry needs the 32 hex digits of an App ID.
     pub(crate) const MAX_ROWS: usize = MAX_MARK_FILE as usize / 32;
 
-    fn belongs_to(&self, identity: &str, store_id: &str) -> bool {
+    pub(super) fn belongs_to(&self, identity: &str, store_id: &str) -> bool {
         pubky_id(&self.identity) == identity && hex::encode(self.store_id) == store_id
     }
 
@@ -88,6 +88,31 @@ struct CompleteMark<T> {
 pub(super) struct Observed {
     pub(super) position: MarkRead,
     pub(super) recovery: Option<Arc<RecoverySource>>,
+}
+
+/// Recovery material collected under the account lock and the full independent record
+/// selected there. The writer compares that record before publishing the new source.
+pub(crate) struct RecoveryUpdate {
+    pub(super) before: Observed,
+    pub(super) source: Arc<RecoverySource>,
+}
+
+pub(crate) struct RecoveryPosition {
+    pub(crate) store_id: [u8; 16],
+    pub(super) before: Observed,
+}
+
+impl RecoveryPosition {
+    pub(crate) fn material(&self) -> Option<Arc<RecoverySource>> {
+        self.before.recovery.clone()
+    }
+
+    pub(crate) fn with_material(self, source: Arc<RecoverySource>) -> Arc<RecoveryUpdate> {
+        Arc::new(RecoveryUpdate {
+            before: self.before,
+            source,
+        })
+    }
 }
 
 impl From<MarkRead> for Observed {

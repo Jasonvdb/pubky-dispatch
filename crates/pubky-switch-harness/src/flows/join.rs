@@ -37,13 +37,16 @@ pub async fn join(world: &World) -> FlowResult {
 
     let request = asking.join_request(alice.public(), &approved)?;
     let store = Arc::new(MemoryStore::new());
-    let mut app = App::join(
-        world.app_env(store),
-        notes_protocol(),
-        AppConfig::default(),
-        request,
-    )
-    .await?;
+    let env = world.app_env(store);
+    let config = AppConfig::default();
+    let homeserver = Arc::clone(&env.homeserver);
+    let publishes_record = config.publishes_record;
+    let mut app = App::join(env, notes_protocol(), config, request).await?;
+    if !Arc::ptr_eq(&app.homeserver_reader(), &homeserver)
+        || app.publishes_record() != publishes_record
+    {
+        return Err("the joined app does not expose its own read settings".into());
+    }
     world.outcome("joined", &app_status(&mut app));
     world.advance_ms(STEP_MS);
 

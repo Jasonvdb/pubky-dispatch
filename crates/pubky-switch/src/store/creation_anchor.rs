@@ -140,10 +140,7 @@ pub(super) async fn contents(
         }
         if let Some(source) = &mut recovery {
             let kept = super::KeptAppId::from_row(&row)?;
-            kept_bytes += serde_json::to_vec(&kept)
-                .map_err(|_| StoreError::Corrupt("a kept ID does not encode"))?
-                .len()
-                + 1;
+            kept_bytes += kept.encoded_len()? + 1;
             if source.kept.len() == RecoverySource::MAX_ROWS
                 || kept_bytes > crate::marks::MAX_MARK_FILE as usize
             {
@@ -220,6 +217,39 @@ pub(super) async fn opening_origin(
 }
 
 impl AccountTxn {
+    /// Check the SQL source for a recovery snapshot at a healthy locked position
+    /// (account binding 3). A later descendant of just the opening cannot establish
+    /// later exclusions. The caller checks the ordinary chain verdict.
+    pub(crate) async fn covers_recovery_state(
+        &mut self,
+        store_id: [u8; 16],
+        limits: &Limits,
+        mark: &crate::marks::AccountMark,
+    ) -> Result<bool, StoreError> {
+        if !matches!(
+            mark.creation_anchor,
+            crate::marks::CreationAnchor::Bound {
+                confirmed: true,
+                ..
+            }
+        ) || (mark.state_version == 0 && self.loaded().state_version != 0)
+            || (mark.state_version > 0 && mark.state_tag == [0; 16])
+        {
+            return Ok(false);
+        }
+        let opening: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT enrollment_hash FROM enrollment_answers WHERE account_id = $1 AND creating",
+        )
+        .bind(self.head().id.clone())
+        .fetch_optional(self.conn())
+        .await?;
+        let Some(hash) = opening.and_then(|bytes| bytes.try_into().ok()) else {
+            return Ok(false);
+        };
+        self.covers_opening_receipt(store_id, hash, limits, mark)
+            .await
+    }
+
     /// Verify the opening receipt against the creation and actual retained positions.
     /// The account's common verdict separately checks the chain at the mark.
     pub(crate) async fn covers_opening_receipt(
@@ -229,7 +259,7 @@ impl AccountTxn {
         limits: &Limits,
         mark: &crate::marks::AccountMark,
     ) -> Result<bool, StoreError> {
-        let head = self.head();
+        let head = self.loaded();
         let Some(anchor) = mark.creation_anchor.for_creation(head.created_at_ms) else {
             return Ok(false);
         };

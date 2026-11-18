@@ -157,7 +157,7 @@ use self::state::{
     RestorePending, RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
-use crate::clock::Clock;
+use crate::clock::{AppClock, Clock};
 use crate::error::{ClientError, StoreError};
 use crate::store::{StoreHandle, client_namespace};
 use crate::transport::Transport;
@@ -293,6 +293,14 @@ pub struct AppEnv {
     /// Writes to the own identity's Homeserver, for an app that publishes its record
     /// ([`AppConfig::publishes_record`]); `None` for one that doesn't.
     pub homeserver_writer: Option<Arc<dyn HomeserverWriter>>,
+}
+
+impl AppEnv {
+    fn observe_clock(&mut self) -> Arc<AppClock> {
+        let clock = Arc::new(AppClock::new(Arc::clone(&self.clock)));
+        self.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        clock
+    }
 }
 
 impl std::fmt::Debug for AppEnv {
@@ -648,6 +656,7 @@ pub(crate) struct AppState {
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
+    clock: Arc<AppClock>,
     protocols: ProtocolSet,
     config: AppConfig,
     ns: String,
@@ -920,12 +929,13 @@ impl App {
     /// store or the registration. After a store error nothing was kept; after a network
     /// error the registration is kept and resent on the next call.
     pub async fn join(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         request: JoinRequest,
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
@@ -1061,6 +1071,7 @@ impl App {
             };
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -1205,12 +1216,13 @@ impl App {
     /// [`Refusal::NotJoined`] when the store holds no such app, [`Refusal::Left`] once it
     /// deleted its keys, and [`AppError::Store`] for a store failure or a corrupt record.
     pub async fn load(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: impl Into<ProtocolSet>,
         config: AppConfig,
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             own_record::check_publisher(&env, &config)?;
@@ -1230,6 +1242,7 @@ impl App {
             let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -1899,13 +1912,14 @@ impl App {
     /// The app a backup restores and the one commit that installs it, checked and built
     /// within the store's sizes; nothing is written.
     async fn restore_commit(
-        env: AppEnv,
+        mut env: AppEnv,
         protocols: ProtocolSet,
         config: AppConfig,
         backup: &AppBackup,
         layer_check: LayerCheck,
     ) -> Result<Restorable, AppError> {
         Box::pin(async move {
+            let clock = env.observe_clock();
             // As at a join and a load: an app that publishes needs its writer.
             own_record::check_publisher(&env, &config)?;
             let meta = backup.meta.clone();
@@ -2311,6 +2325,7 @@ impl App {
             let protocols_names = protocols.names();
             let mut app = App {
                 env,
+                clock,
                 protocols,
                 config,
                 ns,
@@ -3749,6 +3764,22 @@ impl App {
         )?)
     }
 
+    /// The app's device clock. A host checking an action against the app's own
+    /// identity uses this clock so both observe the same backwards adjustments.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.env.clock)
+    }
+
+    /// The reader this app uses for Homeserver files.
+    pub fn homeserver_reader(&self) -> Arc<dyn HomeserverReader> {
+        Arc::clone(&self.env.homeserver)
+    }
+
+    /// Whether this app is configured to publish its record on its Homeserver.
+    pub fn publishes_record(&self) -> bool {
+        self.config.publishes_record
+    }
+
     pub(crate) fn now(&self) -> u64 {
         self.env.clock.now_ms()
     }
@@ -4025,7 +4056,18 @@ impl App {
     /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
     /// step 3). A kept batch signed for an earlier generation has its proofs checked with
     /// that generation's key (Switch wire 6.4 step 6).
-    pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
+    pub(crate) fn submit<'a>(
+        &'a mut self,
+        batch: &'a Batch,
+    ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
+        self.submit_before(batch, None)
+    }
+
+    async fn submit_before(
+        &mut self,
+        batch: &Batch,
+        first: Option<&crate::transport::FirstSend>,
+    ) -> Result<Submitted, AppError> {
         self.refuse_before_upload_of(Some(batch)).await?;
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
@@ -4034,7 +4076,7 @@ impl App {
             None => None,
         };
         let result = match earlier_key.or_else(|| self.client.pinned_key()) {
-            Some(key) => self.client.submit_proved_by(batch, &key).await,
+            Some(key) => self.client.submit_before(batch, &key, first).await,
             None => Err(ClientError::Unpinned.into()),
         };
         let (result, error_head) = match result {

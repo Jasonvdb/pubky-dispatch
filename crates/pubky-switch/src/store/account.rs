@@ -186,6 +186,13 @@ pub(crate) enum MarkCoverage {
     ServingPosition,
 }
 
+/// Net changes under the identity lock, after superseded documents and savepoint rollbacks.
+pub(crate) struct PendingChanges {
+    moved: bool,
+    pub(crate) counts: bool,
+    pub(crate) recovery_changed: bool,
+}
+
 /// A committed request: what it committed is durable, so its answer may go out once the
 /// mark has moved to its head and count (Switch wire 7.3 step 10, "Moving it"). Only
 /// [`AccountTxn::commit`] makes one.
@@ -701,17 +708,46 @@ impl AccountTxn {
         mut self,
         coverage: MarkCoverage,
     ) -> Result<Committed, StoreError> {
-        // The documents this request superseded go with it (Switch wire 7.5).
+        let changes = self.pending_changes(false).await?;
+        self.commit_prepared(coverage, changes).await
+    }
+
+    pub(crate) async fn pending_changes(
+        &mut self,
+        check_recovery: bool,
+    ) -> Result<PendingChanges, StoreError> {
         self.drop_stale_documents().await?;
         let moved = self.head.generation != self.loaded.generation
             || self.head.last_seq != self.loaded.last_seq
             || self.head.chain != self.loaded.chain;
-        // With the position unchanged, the row is written only where the count moves.
-        let counts = moved
-            || sqlx::query_scalar::<_, bool>("SELECT retained_state_change()")
+        let (retained, recovery_changed) = if check_recovery {
+            sqlx::query_as("SELECT retained_state_change(), retained_recovery_change()")
                 .fetch_one(&mut *self.tx)
-                .await
-                .map_err(StoreError::from_db)?;
+                .await?
+        } else if moved {
+            (true, false)
+        } else {
+            (
+                sqlx::query_scalar("SELECT retained_state_change()")
+                    .fetch_one(&mut *self.tx)
+                    .await?,
+                false,
+            )
+        };
+        Ok(PendingChanges {
+            counts: moved || retained,
+            moved,
+            recovery_changed: recovery_changed || self.head.generation != self.loaded.generation,
+        })
+    }
+
+    /// Commit the prepared transaction after any read of the facts it will cover.
+    pub(crate) async fn commit_prepared(
+        mut self,
+        coverage: MarkCoverage,
+        changes: PendingChanges,
+    ) -> Result<Committed, StoreError> {
+        let PendingChanges { moved, counts, .. } = changes;
         let chain_seq = self
             .head
             .chain

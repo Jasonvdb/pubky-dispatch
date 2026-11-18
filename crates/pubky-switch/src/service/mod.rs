@@ -1394,12 +1394,23 @@ impl Service {
         } else {
             MarkCoverage::None
         };
-        let commit = async move {
-            txn.commit_with_mark(coverage).await.map_err(|failure| {
-                tracing::error!(%failure, "commit");
+        let marks = self.marks.clone();
+        let prior = judged
+            .mark()
+            .filter(|_| {
+                healthy
+                    || (matches!(judged.judgement.decision.verdict, verdict::Verdict::Staged)
+                        && !matches!(coverage, MarkCoverage::None))
             })
+            .copied();
+        let commit = async move {
+            Self::commit_marked(&marks, txn, coverage, prior, false)
+                .await
+                .map_err(|failure| {
+                    tracing::error!(?failure, "commit");
+                })
         };
-        let Ok(committed) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
+        let Ok((committed, update)) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
             // Nothing committed, the stamp included: the mark doesn't move.
             return Self::signed_error(
                 &signer,
@@ -1438,12 +1449,13 @@ impl Service {
                     None => marking::MarkMove::Failed,
                 }
             } else {
-                self.move_mark(
+                self.move_mark_with_source(
                     &identity,
                     target,
                     answer_key,
                     created_at_ms,
                     answer.starts_generation,
+                    update,
                 )
                 .await
             };

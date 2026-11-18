@@ -9,14 +9,16 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 - Serialize writers to the same app namespace across threads, extensions and processes. `App` uses ordinary store commits. The store also has an ownership API for callers that acquire a namespace. A memory store cannot preserve keys or unanswered writes across a restart.
 - Have the signer approve the request for this app's keys. Verify the enclosing companion claim's signature before passing the approval bytes, original request, identity and keys in `JoinRequest`. `App::join` checks the approval against them, the certificate against the registered protocols, and saves the first app record and receive-key registration before sending. Keep the App ID. If a call failed after that save, use `App::load` and `receive` to resume. A second join on that store is refused.
 - On startup, load the same App ID and protocols. Loading reads local state. Use `app_id`, `identity`, `own_identity`, `cert` and `record` for the app's current details. The app signs its own requests. The identity signing key stays with the signer.
+- A protocol SDK taking ownership of a built `App` can check its registered protocol with `protocols()` and use the app's `clock()`, `homeserver_reader()` and `publishes_record()` so its reads and publication decisions use the same settings.
 
 | Case | What happened and what to do |
 |---|---|
 | `Refusal::Approval` | Approval bytes failed a check against the request, keys or identity. Show the reason and return to the signer for a matching approval. |
 | `Refusal::NotJoined` | There is no app metadata for this ID. Check the ID and store, then offer restore or join. |
 | `Refusal::Certificate` | A registered protocol refused the app's own certificate during setup, load or restore. Show the protocol and its reason. Correct the registration or obtain suitable authority from the signer. |
-| `IdentityRefresh::Newer` | A homeserver read supplied a newer verified own document. Use the new version and its confirmation time. |
-| `IdentityRefresh::Current` | The homeserver confirmed the held version. Use the time the read completed. |
+| `IdentityRefresh::Newer` | The app took the newer verified Homeserver document. Its confirmation time is the start of the read. Check `identity_confirmation_age_ms` immediately before acting. |
+| `IdentityRefresh::Current` | The Homeserver served the exact document the app holds. Its confirmation time is the start of the read. Check `identity_confirmation_age_ms` immediately before acting. |
+| `IdentityRefresh::ClockMovedBack` | The device clock moved backwards during the read. The app took a newer verified document if `newer` is true and kept the same document otherwise. The current document awaits confirmation. Call `refresh_identity` again before an action that requires a current observation. |
 | `IdentityRefresh::Older` | The homeserver served an older version. Keep the higher version and repeat the lookup later for confirmation. |
 | `IdentityRefresh::Missing` | The homeserver has no own document. Check publication with the signer. This read gives no confirmation. |
 | `IdentityRefresh::Unavailable` | The homeserver read failed in transport. Retry later. A failed document check instead raises an error. |
@@ -168,7 +170,7 @@ For admission or current-certificate refusals, the client gives up after five qu
 
 ## Writing records and claims
 
-A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings.
+A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings. After recovery uploads, an older page leaves the listing at the same continuation. A fresh lookup for an outstanding upload returns `KeptReason::Refused` if the service observation cannot establish its current state.
 
 | Case | What happened and what to do |
 |---|---|
@@ -206,9 +208,11 @@ A layered backup carries a completed observation with its owner's layer. During 
 
 Use `record_op` to build a write in a batch, `put_record` or `delete_record` for a single change, and `update_record` for a bounded read/modify/write. A protocol's update function can be called again on conflict. Build an `OpBatch` with operations and conditions, optionally local writes and queued messages, then `submit_batch`. Use `for_protocol` to identify the owner of local state. Use `record_condition` and `claim_condition` for the version or step the change depends on. Add operations with `op`, `op_if` or `entry` and conditions with `when`. `server_time_in` constrains service time to a half-open interval. `obligation_deadline`, `local`, `locals` and `queue` attach the deadline, local changes and deliveries to settle with the batch. Inspect `ops`, `len` and `is_empty`, or take the operations with `into_ops`.
 
+Use `keep_id_at` on a protocol batch when a restart must associate an outstanding operation with its original batch. It stores the original 16-byte batch ID under a vacant protocol-local key in the first commit that keeps the batch. Read it with `protocol_get` and check `kept_batch`. An applied-only local write can remove the marker. A backup omits native pending batches and their outcomes, so let the protocol preserve unresolved markers in its layer. After a provider loss a refusal of newly signed bytes can leave the earlier send uncertain.
+
 A refused batch can report the competing write on the key it tried to write or the key of a record condition. The app checks that write at the signed head of the refusal, including when it retries a stored batch. A conflict that reports only a version leaves the held value in place. Use `read_record` when the protocol needs the current value of that key.
 
-A claim coordinates attempts between apps. Use `read_claim`, `claim_evidence`, `set_obligation_deadline` and `write_claim`. `ClaimOp` constructs an attempt, done, failed or unknown entry. Before carrying out an attempt, verify its operation and proof with `check_attempt` and apply the protocol's own rules. `may_attempt` checks local gates. The protocol should use `refresh_identity` and `identity_confirmed_at` to ensure the own document was confirmed within 60 seconds before authorizing an outside action. `confirmed_at` is set on a successful current or newer read. `claim_doubt`, `doubtful_claims` and `claim_conflict` expose unresolved evidence. `ClaimDoubt::doubtful` also covers a possible duplicate, divergence, distrust or an early pin. Consult the individual reasons before acting. `shared_evidence` collects record and claim evidence for recovery. `prune_claim_evidence` removes evidence only within the client's retention rules.
+A claim coordinates attempts between apps. Use `read_claim`, `claim_evidence`, `set_obligation_deadline` and `write_claim`. `ClaimOp` constructs an attempt, done, failed or unknown entry. Before carrying out an attempt, verify its operation and proof with `check_attempt` and apply the protocol's own rules. `may_attempt` checks local gates. Call `refresh_identity` when needed and check `identity_confirmation_age_ms` immediately before authorizing an outside action. The exact own document must have been observed less than 60 seconds ago. Sample device time through `App::clock` so the host and client observe backwards adjustments together. A backwards sample during or after the read requires a new Homeserver observation. `claim_doubt`, `doubtful_claims` and `claim_conflict` expose unresolved evidence. `ClaimDoubt::doubtful` also covers a possible duplicate, divergence, distrust or an early pin. Consult the individual reasons before acting. `shared_evidence` collects record and claim evidence for recovery. `prune_claim_evidence` removes evidence only within the client's retention rules.
 
 | Case | What happened and what to do |
 |---|---|
@@ -333,6 +337,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `Evidence::Op` | Use `keep_evidence` for a signed record write or claim entry with writer certificate and any held proof. This gives recovery a copy to upload. |
 | `Evidence::Proof` | Keep a transition proof available for upload even without an operation. Use `forget_evidence` only when the protocol no longer needs that evidence. |
+| `AppError::ExpiredUnsent` | The client retired this batch before its first handoff. Account for earlier candidates before issuing a replacement. |
 | `AppError::NotAnsweringAsAccount` | An unverified 404 and a genuinely absent homeserver identity document suggest erasure. Show unreachable since the supplied device time. Keep local state. Five matching observations spaced at least six hours apart over at least a day are required on this path. |
 | `AppEvent::AccountGone` | The client concluded the account was erased. A signed, request-bound account-not-hosted answer plus an absent identity document can establish this immediately. The unverified path needs the repeated checks above. Tell the protocol and retain local state for possible reappearance. |
 | `ProviderStatus::Gone` | The app is no longer current or its account is gone. Stop ordinary service work. Let provider checks look for a current identity document. |
@@ -428,6 +433,8 @@ Implement `StateStore::get`, `scan`, `commit`, `acquire` and `commit_if` with th
 
 The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
 
+For a batch with `OpBatch::first_send_before`, the HTTPS transport checks the exclusive deadline at the nonblocking socket write, after waiting for writability. A custom transport implements `Transport::send_before` at its own last cancellable handoff. Its default leaves the batch pending. Only report `FirstSendExpired` if no request bytes left. A partial write has an uncertain outcome. Network transit and service scheduling take additional time, so use a `server_time_in` condition to bound application as well.
+
 | Case | What happened and what to do |
 |---|---|
 | `TimeoutClass::Ordinary` | Use a deadline for a small call, such as a setting or service-time read. |
@@ -435,6 +442,8 @@ The supplied HTTPS transport restricts connections to allowed public destination
 | `TimeoutClass::LongPoll` | Allow the requested `wait_s` at the service plus time to return a bulk page. |
 | `TransportError::Refused` | Local origin or address policy prevented sending. Return this only when zero request bytes left. Correct the destination. |
 | `TransportError::Connect` | A connection could not be made and zero request bytes left. Retry connection later. |
+| `TransportError::FirstSendExpired` | The cutoff passed before this request left. An earlier submission of these bytes may still be unresolved. |
+| `TransportError::FirstSendUnavailable` | The transport or clock cannot establish a timely first handoff. Keep the batch for a later decision. |
 | `TransportError::Timeout` | The deadline passed. The service may have applied the request. Resume with the same saved bytes. |
 | `TransportError::TooLarge` | The answer exceeded the transport's limit. No usable answer is available. Check the limit and resume the original operation. |
 | `TransportError::InvalidRequest` | The transport could not construct a request, for example because of an invalid header. Fix the input. This error does not give a kept batch the never-sent exception. |

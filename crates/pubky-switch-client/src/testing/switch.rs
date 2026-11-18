@@ -579,6 +579,17 @@ fn feed_wait(text: &str) -> Option<u64> {
 struct Holding(Arc<ScriptedSwitch>);
 
 impl Transport for Holding {
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a crate::transport::FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(async move {
+            first.check()?;
+            self.0.handle(&request)
+        })
+    }
+
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
             let Some(held) = (match self.0.waiting_read(&request) {

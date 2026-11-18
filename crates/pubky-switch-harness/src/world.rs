@@ -16,7 +16,7 @@ use pubky_switch_client::store::{StateStore, StoreHandle};
 use pubky_switch_client::testing::{
     Router, START_MS, ScriptedSwitch, Seeds, TestHomeserver, TestIdentity,
 };
-use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
+use pubky_switch_client::transport::{BoxFuture, FirstSend, Request, Response, Transport};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::http::header;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
@@ -813,8 +813,12 @@ struct Accounts {
     accounts: Vec<(String, Arc<dyn Transport>)>,
 }
 
-impl Transport for Accounts {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+impl Accounts {
+    async fn carry(
+        &self,
+        request: Request,
+        first: Option<&FirstSend>,
+    ) -> Result<Response, TransportError> {
         let named = match request.path_and_query.strip_prefix("/v1/") {
             Some("enroll") => request.header(header::IDENTITY),
             Some(rest) => rest.split(['/', '?']).next(),
@@ -825,12 +829,27 @@ impl Transport for Accounts {
             .iter()
             .find(|(id, _)| Some(id.as_str()) == named)
             .map(|(_, transport)| transport.clone());
-        Box::pin(async move {
-            match account {
-                Some(transport) => transport.send(request).await,
-                None => Err(TransportError::Connect("no scripted account".into())),
-            }
-        })
+        match account {
+            Some(transport) => match first {
+                Some(first) => transport.send_before(request, first).await,
+                None => transport.send(request).await,
+            },
+            None => Err(TransportError::Connect("no scripted account".into())),
+        }
+    }
+}
+
+impl Transport for Accounts {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(self.carry(request, None))
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(self.carry(request, Some(first)))
     }
 }
 

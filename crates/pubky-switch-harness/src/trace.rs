@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pubky_switch::http::route::route;
 use pubky_switch_client::TransportError;
-use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
+use pubky_switch_client::transport::{BoxFuture, FirstSend, Request, Response, Transport};
 use pubky_switch_core::enc::unb64;
 use pubky_switch_core::http::header;
 use pubky_switch_core::time::parse_rfc3339;
@@ -489,8 +489,12 @@ impl Recorder {
     }
 }
 
-impl Transport for Recorder {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+impl Recorder {
+    fn carry<'a>(
+        &'a self,
+        request: Request,
+        first: Option<&'a FirstSend>,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
         Box::pin(async move {
             // Held back, the request isn't on its way yet: it takes its place in the trace
             // when it goes.
@@ -500,6 +504,9 @@ impl Transport for Recorder {
                     tokio::task::yield_now().await;
                 }
                 *lock(&self.waiting) -= 1;
+            }
+            if let Some(first) = first {
+                first.check()?;
             }
             let label = self.label(&request);
             let mut facts = BTreeMap::new();
@@ -556,7 +563,10 @@ impl Transport for Recorder {
                 self.fill(at, Line { label, facts, call });
                 return Ok(refusal);
             }
-            let answer = self.inner.send(request).await;
+            let answer = match first {
+                Some(first) => self.inner.send_before(request, first).await,
+                None => self.inner.send(request).await,
+            };
             match &answer {
                 Ok(answer) => {
                     let mut violations = Vec::new();
@@ -602,6 +612,20 @@ impl Transport for Recorder {
             self.fill(at, Line { label, facts, call });
             answer
         })
+    }
+}
+
+impl Transport for Recorder {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        self.carry(request, None)
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        request: Request,
+        first: &'a FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        self.carry(request, Some(first))
     }
 }
 

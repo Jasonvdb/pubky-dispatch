@@ -108,6 +108,12 @@ fn reason(text: &str) -> Result<KeptReason, StoreError> {
 }
 
 impl KeptAppId {
+    pub(super) fn encoded_len(&self) -> Result<usize, StoreError> {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .map_err(|_| StoreError::Corrupt("a kept ID does not encode"))
+    }
+
     pub(super) fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, StoreError> {
         let reason = reason(row.try_get("reason")?)?;
         let at: Option<i64> = row.try_get("at_ms")?;

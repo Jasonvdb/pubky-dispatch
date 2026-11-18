@@ -9040,6 +9040,338 @@ async fn test_send_record_job_unknown_try_stops_naming_its_batch() {
 }
 
 #[tokio::test]
+async fn test_send_record_job_restored_before_its_write_stops_at_a_later_delete() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("bob");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    let mut message = s.note("hello");
+    message.record = Some(RecordJob {
+        target: target.clone(),
+        tag: vec![],
+    });
+    let msg_id = wallet.queue(message).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+
+    wallet.flush_outbox().await.unwrap();
+    let written = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(written.content.value()), std::slice::from_ref(&msg_id));
+    read_on(&mut phone).await;
+    phone.delete_record(&target, vec![]).await.unwrap();
+    let deleted = s.w.switch.record(&key).unwrap().revision;
+
+    drop(wallet);
+    let mut restored = Box::pin(App::restore(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    restored
+        .end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    restored.flush_outbox().await.unwrap();
+    let events = record_jobs_stopped(&mut restored).await;
+    assert!(
+        matches!(events.as_slice(), [AppEvent::RecordJobStopped {
+        msg_id: stopped, item_hash, batch_id: None, ..
+    }] if stopped == &msg_id && *item_hash == deleted.item_hash),
+        "{events:?}"
+    );
+    assert_eq!(s.w.switch.record(&key).unwrap().revision, deleted);
+}
+
+#[tokio::test]
+async fn test_records_refused_reread_follows_the_delete_in_the_view() {
+    use crate::client::answers::{FeedItem, FeedQuery};
+    use pubky_switch_core::chain::ChainEnvelope;
+    use pubky_switch_core::ops::Position;
+
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    let key = phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    wallet.receive(None).await.unwrap();
+    let first = wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let page = phone
+        .client
+        .feed(FeedQuery {
+            after: Some(Position {
+                generation: first.version.generation,
+                seq: first.version.version - 1,
+            }),
+            limit: Some(1),
+            wait: None,
+        })
+        .await
+        .unwrap();
+    let [FeedItem::Chain(item)] = page.items.as_slice() else {
+        panic!("expected the first write");
+    };
+    let envelope = ChainEnvelope::parse(&item.stub.envelope).unwrap();
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    let deleted = s.w.switch.record(&key).unwrap();
+
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    phone.refresh_identity().await.unwrap();
+    // The read has the earlier certificate, but no proof to date its delete before
+    // the reduction. The phone keeps its own value and follows the delete.
+    s.w.switch.lock().shared.hide_proofs = true;
+    let mut tx = phone.tx().unwrap();
+    assert_eq!(
+        phone
+            .feed_record_write(item, &envelope, &mut tx)
+            .await
+            .unwrap(),
+        crate::app::records::WriteRead::Refused
+    );
+    phone.commit(tx).await.unwrap();
+    let held = phone.held_record(&key).await.unwrap().unwrap();
+    let base = held
+        .delete_base()
+        .expect("the followed write is the reread delete");
+    assert_eq!(base.version, deleted.state.version);
+    assert_eq!(base.item_hash, deleted.revision.item_hash);
+}
+
+#[tokio::test]
+async fn test_records_delete_view_requires_the_signed_operation_hash() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("bob");
+    wallet
+        .put_record(&target, &value(&["one"]), vec![])
+        .await
+        .unwrap();
+    let before = phone.read_record(&target).await.unwrap().unwrap();
+    let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
+    let (mut view, at) = phone.record_view(&key).await.unwrap().unwrap();
+    let signed = SignedOp::peek(&view.op).unwrap().item_hash().unwrap();
+    view.revision.item_hash[0] ^= 1;
+    view.divergent = true;
+    let mut tx = phone.tx().unwrap();
+    let read = phone
+        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .await;
+    assert!(
+        matches!(
+            read,
+            Err(AppError::Switch(
+                crate::error::ClientError::InvalidResponse(_)
+            ))
+        ),
+        "{read:?}"
+    );
+    assert!(tx.is_empty());
+    assert!(!phone.is_divergent(&key).await.unwrap());
+    assert_eq!(phone.shared_record(&key).await.unwrap(), Some(before));
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+
+    view.revision.item_hash = signed;
+    let mut tx = phone.tx().unwrap();
+    let read = phone
+        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .await
+        .unwrap();
+    assert_eq!(read, crate::app::records::WriteRead::Taken);
+    phone.commit(tx).await.unwrap();
+    assert_eq!(
+        phone
+            .held_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .delete_base()
+            .unwrap()
+            .item_hash,
+        signed
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadedDelete {
+    Same,
+    Other,
+    // A delete without its proof takes the next version after the one it was built on.
+    SameAtEarlierVersion,
+}
+
+/// Queue a job on a delete, then recover the account with that operation or a different
+/// delete at its version. A restore in place takes the queued job back from backup bytes.
+async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool) {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("bob");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    if uploaded == UploadedDelete::SameAtEarlierVersion {
+        wallet
+            .put_record(&s.target("other"), &value(&["b"]), vec![])
+            .await
+            .unwrap();
+    }
+    let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
+    let original_delete = s.w.switch.record(&key).unwrap();
+    assert!(original_delete.state.deleted);
+    wallet.send(s.note("first")).await.unwrap();
+    let mut message = s.note("hello");
+    message.record = Some(RecordJob {
+        target: target.clone(),
+        tag: b"sent".to_vec(),
+    });
+    s.w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let (msg_id, delivery) = wallet.send(message).await.unwrap();
+    assert!(accepted(&delivery), "{delivery:?}");
+    if restore {
+        let bytes = wallet.backup().await.unwrap().to_bytes().unwrap();
+        let backup = crate::app::AppBackup::from_bytes(&bytes).unwrap();
+        drop(wallet);
+        wallet = Box::pin(App::restore(
+            s.env(),
+            s.protocol.clone(),
+            World::config(),
+            &backup,
+        ))
+        .await
+        .unwrap();
+    }
+    let original = SignedOp::peek(&original_delete.op).unwrap();
+    let (op, cert) = if uploaded != UploadedDelete::Other {
+        (original, wallet.cert().signed().clone())
+    } else {
+        let mut body = original.body().clone();
+        body.batch.id = [70; 16];
+        body.app_id = Some(app_keys("phone").app_id_bytes());
+        (
+            SignedOp::sign(&app_keys("phone"), body).unwrap(),
+            phone.cert().signed().clone(),
+        )
+    };
+    let prev = s.w.switch.identity_doc().unwrap().hash();
+    let doc =
+        s.w.signer
+            .sign_next(|body| {
+                body.generation = 2;
+                body.recovery_from = Some(1);
+            })
+            .unwrap();
+    s.w.switch.recover_in_place(&doc, prev).unwrap();
+    phone.receive(None).await.unwrap();
+    let upload = json!({ "records": [{ "op": op.signed(), "cert": cert }] });
+    let answer =
+        s.w.switch
+            .handle(&crate::transport::Request {
+                method: "POST".into(),
+                origin: ORIGIN.into(),
+                path_and_query: format!("/v1/{}/recovery/upload", s.w.alice.id()),
+                headers: vec![crate::transport::Header::new(
+                    "switch-app",
+                    &pubky_switch_core::enc::zbase32_encode(&app_keys("phone").app_id_bytes()),
+                )],
+                body: upload.to_string().into_bytes(),
+                timeout: crate::transport::TimeoutClass::default(),
+            })
+            .unwrap();
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let taken = s.w.switch.record(&key).unwrap();
+    assert_eq!(
+        taken.state.version == original_delete.state.version,
+        uploaded != UploadedDelete::SameAtEarlierVersion
+    );
+    assert_ne!(
+        taken.revision.generation,
+        original_delete.revision.generation
+    );
+    assert_eq!(
+        taken.revision.item_hash == original_delete.revision.item_hash,
+        uploaded != UploadedDelete::Other
+    );
+    wallet.receive(None).await.unwrap();
+    if wallet.reconcile_mode() {
+        wallet
+            .end_reconcile(crate::app::UserConfirmed::new())
+            .await
+            .unwrap();
+    }
+    wallet.flush_outbox().await.unwrap();
+    let at_switch = s.w.switch.record(&key).unwrap();
+    let told = record_jobs_stopped(&mut wallet).await;
+    if uploaded == UploadedDelete::Same {
+        assert!(!at_switch.state.deleted, "the queued write applied");
+        let held = wallet.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), [msg_id]);
+        assert!(told.is_empty(), "{told:?}");
+    } else {
+        assert_eq!(
+            at_switch.revision, taken.revision,
+            "the delete stays current"
+        );
+        assert!(
+            matches!(told.as_slice(), [AppEvent::RecordJobStopped {
+                msg_id: stopped, key: record, generation, version, item_hash, ..
+            }] if stopped == &msg_id && *record == key
+                && RecordVersion::new(*generation, *version) == taken.state.version
+                && *item_hash == op.item_hash().unwrap()),
+            "{told:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_send_record_job_stops_at_another_delete_at_its_version() {
+    Box::pin(record_job_after_delete_upload(UploadedDelete::Other, false)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_applies_over_the_same_uploaded_delete() {
+    Box::pin(record_job_after_delete_upload(UploadedDelete::Same, false)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_restored_in_place_keeps_its_delete() {
+    for uploaded in [
+        UploadedDelete::Same,
+        UploadedDelete::Other,
+        UploadedDelete::SameAtEarlierVersion,
+    ] {
+        Box::pin(record_job_after_delete_upload(uploaded, true)).await;
+    }
+}
+
+#[tokio::test]
 async fn test_scripted_records_current_condition_on_a_forgotten_delete_shows_zero() {
     // A `record_current` naming a delete the switch forgot fails with version 0 current
     // (Switch wire 6.3): the app takes the key as absent, so its next condition holds.
@@ -10858,7 +11190,13 @@ async fn test_records_write_of_another_collection_at_the_key_read_is_flagged() {
         put.collection = [7; 32];
     }
     let resigned = SignedOp::sign(&app_keys("phone"), body).unwrap();
-    s.w.switch.lock().shared.records.get_mut(&key).unwrap().op = resigned.signed().clone();
+    {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        held.op = resigned.signed().clone();
+        held.revision.item_hash = resigned.item_hash().unwrap();
+        held.proof = None;
+    }
     wallet.read_record(&target).await.unwrap();
     let events = wallet.take_events();
     assert!(

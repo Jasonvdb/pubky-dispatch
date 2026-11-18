@@ -179,3 +179,68 @@ pub(crate) async fn look(world: &World, app: &mut App, name: &str) -> FlowResult
     world.advance_ms(STEP_MS);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flows::{admission::note, messaging::joined};
+    use crate::{Backend, run_here};
+    use pubky_switch_client::app::{AppEvent, Delivery, RecordJob};
+    use pubky_switch_core::ops::SignedOp;
+
+    async fn stopped_record_job(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let mut alice_signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+        let mut bob_signer = Box::pin(enroll(world, &bob, ORIGIN)).await?;
+        let (mut wallet, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut alice_signer,
+            Asking::new(world.app_keys(&alice, "wallet")?)?,
+            notes_protocol_with_records(),
+        ))
+        .await?;
+        let (mut recipient, _) =
+            Box::pin(joined(world, &bob, &mut bob_signer, "recipient")).await?;
+        Box::pin(recipient.add_contact(&alice.public())).await?;
+
+        let target = RecordTarget::new(notes_collection(), b"shopping list");
+        Box::pin(wallet.put_record(&target, b"{}", vec![])).await?;
+        let message = wallet
+            .sign_message(note(bob.public(), "milk", None))?
+            .with_record(RecordJob {
+                target: target.clone(),
+                tag: vec![],
+            });
+        let msg_id = wallet.queue_signed(message).await?;
+        let deleted = Box::pin(wallet.delete_record(&target, vec![])).await?;
+        let evidence = wallet.shared_evidence().await?;
+        let [write] = evidence.ops.as_slice() else {
+            return Err("expected the delete of the only shared record".into());
+        };
+        let hash = SignedOp::peek(&write.op)?.item_hash()?;
+
+        Box::pin(wallet.flush_outbox()).await?;
+        assert!(matches!(
+            wallet.delivery(&msg_id).await?,
+            Some(Delivery::Accepted { .. })
+        ));
+        assert!(wallet.unacknowledged_events().await?.iter().any(|event| matches!(
+            event, AppEvent::RecordJobStopped { msg_id: stopped, key, generation, version, item_hash, batch_id: None, .. }
+                if stopped == &msg_id && key == &deleted.key && *generation == deleted.version.generation
+                    && *version == deleted.version.version && *item_hash == hash
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_job_stopped_names_the_signed_delete_at_both_switches() {
+        for backend in [Backend::Service, Backend::Scripted] {
+            Box::pin(run_here(backend, stopped_record_job))
+                .await
+                .unwrap();
+        }
+    }
+}

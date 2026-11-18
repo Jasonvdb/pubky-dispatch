@@ -8,12 +8,12 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
-- **Client.** What a kept record job remembers about the delete it follows, and what the app keeps about feed entries it holds or processes ahead of a held one.
+- **Client.** What the app keeps about feed entries it holds or processes ahead of a held one.
 - **Service.** The rollback mark, kept separately from the account database, will cover every acknowledged write and a lower bound on the time the service can report. This changes the database schema and the mark files.
 
 **Additions still to come**
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events). `AppEvent::RecordJobStopped` will also name the delete that stopped the job. Public reads used to establish freshness will gain an age check on the signed answer.
+- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events). Public reads used to establish freshness will gain an age check on the signed answer.
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
@@ -32,7 +32,6 @@ The client's public API for protocols and hosts is in place: record answers that
 - [data] **A deleted record can be forgotten before its repair applies.** A protocol can observe a deletion without holding the service cursor until its replacement write succeeds, including across a restart or restore from an older backup. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
 - [wrong result] **A write conflict can hide a rollback.** The client does not judge the view and head in a `409` answer for an older write, so a service showing an older version there raises no alarm. Treat a conflict that repeats against a version older than the one you hold as a possible rollback.
 - [wrong result] **A refused write the app follows is not compared with later ones.** After a protocol refuses a record's first write, a later answer showing an older write is not checked against it. Keep the protocol's own evidence of the refused version.
-- [data] **A record job can write over a different deletion at the same version.** After a recovery, two deletions can share a version, and an automatic retry of a record job can apply over the one its protocol never saw. Re-read a record after a recovery before relying on a job that was queued before it.
 - [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.
 - [wrong result] **A restored backup can deliver a message the app already gave up on.** A backup taken before a message was withdrawn still holds it for delivery. Restoring that backup onto another store, after the protocol was told `MessageUndelivered` and acknowledged it, can deliver the original. Keep the original message ID, and do not issue a replacement the recipient would act on twice while an older backup can still be restored.
 - [data] **A device clock change can reopen a batch's retry window.** After a long suspension, a clock set back close to its earlier value can make an old service-time sample look recent, allowing a retry after the service forgot the batch ID. Reconcile the original effect before repeating work that could apply twice.

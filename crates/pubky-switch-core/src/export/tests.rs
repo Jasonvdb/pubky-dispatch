@@ -3540,6 +3540,29 @@ fn test_activation_evidence() {
     .unwrap();
     f.uploads.proofs = vec![upload(absent)];
     refused(f.run(), ErrorCode::Conflict, "a record at a version");
+    // The held record is a create at (1, 4): one of its key's earlier deletes, which the
+    // old service forgot before the create, holds; a later delete doesn't.
+    let key = record_put().key;
+    let delete_at = |stub: usize, version: u64| {
+        TransitionProof::sign(
+            &old_key(),
+            &f.id,
+            ProofBody::new(
+                f.stubs[stub].clone(),
+                b64(&key),
+                &ProofState::Record {
+                    version: RecordVersion::new(1, version),
+                    deleted: true,
+                    revision: record_revision(&f.stubs[stub]),
+                },
+            ),
+        )
+        .unwrap()
+    };
+    f.uploads.proofs = vec![upload(delete_at(2, 3))];
+    f.run().unwrap();
+    f.uploads.proofs = vec![upload(delete_at(4, 6))];
+    refused(f.run(), ErrorCode::Conflict, "a record at a version");
 }
 
 #[test]

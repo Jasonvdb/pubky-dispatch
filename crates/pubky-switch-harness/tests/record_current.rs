@@ -433,7 +433,29 @@ async fn upload(world: &World) {
     let answer = w.client.send(send(invalid)).await.unwrap();
     assert_eq!(body(&answer)["result"]["unverified"], 1);
     assert_eq!(current(&body(&w.get(&key).await)), current(&made_exact));
-    let own = w.write(9, b"upload", old_version, b"{\"new\":true}").await;
+    // Over a record taken from an upload a write names it exactly: a bare version is
+    // refused, since two uploads can share one.
+    let held = body(&w.get(&key).await);
+    let bare = w.batch(
+        9,
+        vec![(
+            Vec::new(),
+            OpKind::RecordPut(w.put(b"upload", old_version, b"{\"new\":true}")),
+        )],
+    );
+    assert_eq!(
+        conflict(w.post(&bare).await)["record"]["version"],
+        held["version"]
+    );
+    let named = w.batch(
+        10,
+        vec![(
+            vec![guard(key, &held)],
+            OpKind::RecordPut(w.put(b"upload", old_version, b"{\"new\":true}")),
+        )],
+    );
+    w.post(&named).await.unwrap();
+    let own = body(&w.get(&key).await);
     assert_eq!(current(&own).generation, w.generation);
     assert_eq!(current(&own).seq, version(&own).version);
     assert_ne!(current(&own).item_hash, current(&made_exact).item_hash);

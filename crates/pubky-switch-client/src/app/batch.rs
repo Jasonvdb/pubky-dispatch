@@ -26,7 +26,7 @@ use pubky_switch_core::chain::TransitionProof;
 use pubky_switch_core::claims::{ClaimEntry, ClaimType, ClaimView, EntryKind};
 use pubky_switch_core::enc::{b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
+use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, SignedOp};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
@@ -470,7 +470,14 @@ impl App {
             (Err(stale), Some(unsigned)) if stale.code() == Some(ErrorCode::StaleEpoch) => {
                 self.submit_resealed(unsigned, stale).await?
             }
-            (Err(error), _) => return Err(error),
+            (Err(error), _) => {
+                // A condition or write naming a delete the service forgot since: the next
+                // write builds on the absent record.
+                if let Some(key) = super::records::conflict_absent_key(&error) {
+                    self.note_gone(&key).await?;
+                }
+                return Err(error);
+            }
         };
         let mut views = Vec::new();
         let mut refused = Vec::new();
@@ -1292,22 +1299,25 @@ impl App {
         Ok(())
     }
 
-    /// A `record_version` condition on the version of record `key` the app holds, or the
-    /// version the switch showed for it when the app refused that write: the next write
-    /// builds on it (Switch wire 6.3, Switch spec 10.3). `{0, 0}` for a record the app holds
-    /// nothing of, and when that write, held or refused, is a delete: `{0, 0}` matches a
-    /// deleted record as an absent or forgotten one, so the condition holds once the service
-    /// forgets the key.
+    /// The condition on record `key` a write depending on it carries (Switch wire 6.3,
+    /// Switch spec 10.3): a `record_version` on the version of the switch's current write as
+    /// the app holds it, held or refused, a delete's included; `{0, 0}` only for a record the
+    /// app holds nothing of, or whose delete a read found forgotten. Over a write taken from
+    /// a recovery upload, or not read at the new service since a provider loss, a
+    /// `record_current` naming that write instead, since two uploads can share a version
+    /// (Switch spec 12.6 step 3). A condition naming a delete the service forgets meanwhile
+    /// fails with `409 conflict`, and the app then builds on the absent record.
     ///
     /// # Errors
     ///
     /// A store failure.
     pub async fn record_condition(&self, key: &[u8; 32]) -> Result<Condition, AppError> {
-        let version = self
-            .held_record(key)
-            .await?
-            .map_or(RecordVersion::NONE, |held| held.write_base());
-        Ok(Condition::RecordVersion { key: *key, version })
+        let held = self.held_record(key).await?;
+        Ok(super::records::record_condition(
+            key,
+            held.as_ref(),
+            self.state.own_doc.body().recovery_from,
+        ))
     }
 
     /// A `claim_step` condition on the step of the claim view the app keeps for

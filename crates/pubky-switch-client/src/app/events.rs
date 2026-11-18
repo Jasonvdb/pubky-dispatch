@@ -767,10 +767,11 @@ pub enum AppEvent {
         /// The acceptance time, the recipient's service time.
         accepted_at_ms: u64,
     },
-    /// A message answered `403 not_admitted` or `403 not_current` for
-    /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
-    /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up. Also a message whose try needed writes over
+    /// The app gave up delivery after `403 not_admitted` or `403 not_current` refusals
+    /// ([`super::UNDELIVERABLE_MS`], Switch spec 11). If its store had no record of
+    /// acceptance, the app deleted the outbox entry and its plaintext. The recipient may
+    /// have accepted a try whose answer was lost. For a re-send, only the re-send was
+    /// given up. Also a message whose try needed writes over
     /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
     /// make: it was deleted from the outbox at once. Also a message a restore didn't
     /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the
@@ -805,6 +806,30 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
         /// The batch the job's latest try left kept, if one did.
+        batch_id: Option<[u8; 16]>,
+    },
+    /// The shared record write a sent message named ([`super::RecordJob`]) was stopped: the
+    /// app took a delete of the record that the job wasn't queued against, and the job
+    /// never writes over a delete its protocol hasn't seen (Switch spec 10.3). The delete is
+    /// at (`generation`, `version`), which the service may have forgotten since. With
+    /// `batch_id` `None` the write was never made. With a `batch_id`, an earlier try left
+    /// that batch kept and its fate can't be known: the write may have applied before the
+    /// delete, and [`super::App::kept_batch`] tells what the store still keeps of it. The
+    /// protocol reads the record and decides again. A duty event, in the commit that stops
+    /// the job.
+    #[non_exhaustive]
+    RecordJobStopped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The message ID.
+        msg_id: String,
+        /// The record key.
+        key: [u8; 32],
+        /// The delete's generation.
+        generation: u64,
+        /// The delete's version.
+        version: u64,
+        /// The batch an earlier try left kept that may have applied, if one did.
         batch_id: Option<[u8; 16]>,
     },
     /// The local writes the protocol answered `call` with were over
@@ -958,6 +983,7 @@ impl AppEvent {
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
             | Self::RecordJobDropped { id, .. }
+            | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
@@ -1176,6 +1202,15 @@ pub(crate) enum Duty {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<String>,
     },
+    RecordJobStopped {
+        msg_id: String,
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        generation: u64,
+        version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+    },
     LocalWritesRefused {
         call: KeptRefusal,
     },
@@ -1317,6 +1352,21 @@ impl Duty {
             Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
                 id,
                 msg_id,
+                batch_id: batch_id
+                    .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
+            },
+            Self::RecordJobStopped {
+                msg_id,
+                key,
+                generation,
+                version,
+                batch_id,
+            } => AppEvent::RecordJobStopped {
+                id,
+                msg_id,
+                key,
+                generation,
+                version,
                 batch_id: batch_id
                     .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
             },

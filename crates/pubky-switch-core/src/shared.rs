@@ -16,7 +16,7 @@ use crate::http::ErrorCode;
 use crate::ident::Policy;
 use crate::json::{MAX_INT, parse_json, reject_unknown_members};
 use crate::ops::body::Obj;
-use crate::ops::{RecordPut, RecordVersion, Refusal, SignedOp};
+use crate::ops::{Condition, RecordPut, RecordVersion, Refusal, SignedOp};
 use crate::records::IdentityDoc;
 
 /// One application of a record write at the service, ordered by generation, sequence, then
@@ -134,27 +134,61 @@ impl RecordState {
     }
 }
 
+/// Whether a write or a `record_version` condition that names `named` builds on what the
+/// service holds at `key` (Switch spec 10.3, Switch wire 6.2, 6.3), the one judge of a named
+/// version, for the service and every switch that applies operations:
+///
+/// - `{0, 0}` holds only when the service holds nothing at the key: no live record and no
+///   delete it keeps. A write over a kept delete names that delete;
+/// - any other version holds when it is the held write's version (`held`, with that write's
+///   application). When that write was taken from a recovery upload, its application isn't
+///   at its version, and two uploads can share a version (Switch spec 12.6 step 3): the
+///   version holds then only beside a `record_current` among the operation's `conditions`
+///   that names that application.
+pub fn version_holds<'a>(
+    key: &[u8; 32],
+    named: RecordVersion,
+    held: Option<(RecordVersion, ApplicationRef)>,
+    conditions: impl IntoIterator<Item = &'a Condition>,
+) -> bool {
+    let Some((version, revision)) = held else {
+        return named.is_none();
+    };
+    if named != version {
+        return false;
+    }
+    let from_upload = revision.generation != version.generation || revision.seq != version.version;
+    !from_upload
+        || conditions.into_iter().any(|condition| {
+            matches!(condition, Condition::RecordCurrent { key: k, revision: r, .. }
+                if k == key && *r == revision)
+        })
+}
+
 /// The service's rules for a `record.put` against the record it holds, after the writer's
 /// permission and the operation's shape (Switch wire 6.2, 6.4 step 9, Switch spec 10.3):
 ///
 /// - the sealed value's data epoch is the current one (`data_epoch`), else `409 stale_epoch`
 ///   with `current.data_epoch`;
-/// - a write over a record the service holds, a later write or a create over a deleted
-///   one, repeats the record's collection and policy, its `permanent` member included, else
-///   `400`: a create's key derives from its policy (Switch wire 1.5), so a record held at
-///   that key under another policy came in without a derivation, from a recovery upload
-///   or an import, and a permanent key is never created again over it (Switch spec 10.3.1);
-/// - `expected_version` is the record's current version, and `{0, 0}` matches a record that
-///   is absent, forgotten (`current` `None`) or deleted; else `409 conflict`, whose `current`
+/// - a write over a record the service holds, live or deleted, a create included, repeats
+///   the record's collection and policy, its `permanent` member included, else `400`, before
+///   the versions are compared: a create's key derives from its policy (Switch wire 1.5), so
+///   a record held at that key under another policy came in without a derivation, from a
+///   recovery upload or an import, and a permanent key is never created again over it
+///   (Switch spec 10.3.1);
+/// - `expected_version` holds by [`version_holds`] against the held write (`current`, with
+///   its application) and the operation's `conditions`; else `409 conflict`, whose `current`
 ///   carries `record` and the current write's `record_view` to a writer with the read scope
-///   (`may_read`), and `{}` otherwise.
+///   (`may_read`), `{}` to one without, and `record` at `{0, 0}` with a null `record_view`
+///   to every writer when the service holds nothing at the key.
 ///
 /// # Errors
 ///
 /// As above.
-pub fn check_record_put(
+pub fn check_record_put<'a>(
     put: &RecordPut,
-    current: Option<&RecordState>,
+    conditions: impl IntoIterator<Item = &'a Condition>,
+    current: Option<(&RecordState, ApplicationRef)>,
     data_epoch: u64,
     may_read: bool,
     record_view: Option<&Value>,
@@ -166,25 +200,19 @@ pub fn check_record_put(
         )
         .with_current(json!({ "data_epoch": data_epoch })));
     }
-    if let Some(held) = current
+    if let Some((held, _)) = current
         && (held.collection != put.collection || held.policy != put.policy)
     {
         return Err(Refusal::bad_request(
             "Switch spec 10.3: a write repeats the record's collection and policy",
         ));
     }
-    let matches = match current {
-        None => put.expected_version.is_none(),
-        Some(held) => {
-            (put.expected_version.is_none() && held.deleted)
-                || (!put.expected_version.is_none() && put.expected_version == held.version)
-        }
-    };
-    if matches {
+    let held = current.map(|(held, revision)| (held.version, revision));
+    if version_holds(&put.key, put.expected_version, held, conditions) {
         return Ok(());
     }
     let current = match (current, may_read) {
-        (Some(held), true) => json!({
+        (Some((held, _)), true) => json!({
             "record": {
                 "key": b64(&held.key),
                 "generation": held.version.generation,
@@ -192,7 +220,11 @@ pub fn check_record_put(
             },
             "record_view": record_view.cloned().unwrap_or(Value::Null),
         }),
-        _ => json!({}),
+        (Some(_), false) => json!({}),
+        (None, _) => json!({
+            "record": { "key": b64(&put.key), "generation": 0, "version": 0 },
+            "record_view": null,
+        }),
     };
     Err(
         Refusal::conflict("Switch wire 6.2: expected_version isn't the record's current version")
@@ -434,69 +466,173 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_record_put_compare_and_swap() {
-        let create = put(RecordVersion::NONE, 1, false);
-        assert!(check_record_put(&create, None, 1, true, None).is_ok());
-        let held = RecordState::after(&create, 1, 6);
-        assert_eq!(held.version, RecordVersion::new(1, 6));
-        // A create at a live record conflicts; with the read scope, current shows it.
-        let refused =
-            check_record_put(&create, Some(&held), 1, true, Some(&json!({"v": 1}))).unwrap_err();
-        assert_eq!(refused.status(), 409);
-        let current = refused.current.unwrap();
-        assert_eq!(current["record"]["version"], 6);
-        assert_eq!(current["record_view"], json!({"v": 1}));
-        let blind = check_record_put(&create, Some(&held), 1, false, None).unwrap_err();
-        assert_eq!(blind.current, Some(json!({})));
-        let update = put(RecordVersion::new(1, 6), 1, false);
-        assert!(check_record_put(&update, Some(&held), 1, true, None).is_ok());
-        let stale = put(RecordVersion::new(1, 5), 1, false);
-        assert!(check_record_put(&stale, Some(&held), 1, true, None).is_err());
-        assert!(
-            check_record_put(&update, None, 1, true, None).is_err(),
-            "the key was forgotten"
-        );
+    /// The application of a write chained at (`generation`, `seq`).
+    fn applied(generation: u64, seq: u64) -> ApplicationRef {
+        ApplicationRef {
+            generation,
+            seq,
+            item_hash: [7; 32],
+        }
     }
 
     #[test]
-    fn test_record_put_deleted_record_is_created_again_or_continued() {
-        let delete = put(RecordVersion::new(1, 6), 1, true);
-        let deleted = RecordState::after(&delete, 1, 9);
-        assert!(deleted.deleted);
-        assert!(
-            check_record_put(
-                &put(RecordVersion::NONE, 1, false),
-                Some(&deleted),
-                1,
-                true,
-                None
-            )
-            .is_ok()
-        );
-        assert!(
-            check_record_put(
-                &put(RecordVersion::new(1, 9), 1, false),
-                Some(&deleted),
-                1,
-                true,
-                None
-            )
-            .is_ok()
-        );
+    fn test_record_put_compare_and_swap() {
+        let create = put(RecordVersion::NONE, 1, false);
+        let none: [Condition; 0] = [];
+        assert!(check_record_put(&create, &none, None, 1, true, None).is_ok());
+        let held = RecordState::after(&create, 1, 6);
+        assert_eq!(held.version, RecordVersion::new(1, 6));
+        let current = Some((&held, applied(1, 6)));
+        // A create at a live record conflicts; with the read scope, current shows it.
+        let refused =
+            check_record_put(&create, &none, current, 1, true, Some(&json!({"v": 1}))).unwrap_err();
+        assert_eq!(refused.status(), 409);
+        let shown = refused.current.unwrap();
+        assert_eq!(shown["record"]["version"], 6);
+        assert_eq!(shown["record_view"], json!({"v": 1}));
+        let blind = check_record_put(&create, &none, current, 1, false, None).unwrap_err();
+        assert_eq!(blind.current, Some(json!({})));
+        let update = put(RecordVersion::new(1, 6), 1, false);
+        assert!(check_record_put(&update, &none, current, 1, true, None).is_ok());
+        let stale = put(RecordVersion::new(1, 5), 1, false);
+        assert!(check_record_put(&stale, &none, current, 1, true, None).is_err());
+        // A key the service holds nothing for, never written or forgotten, shows version 0
+        // to every writer.
+        for may_read in [true, false] {
+            let forgotten = check_record_put(&update, &none, None, 1, may_read, None).unwrap_err();
+            assert_eq!(
+                forgotten.current,
+                Some(json!({
+                    "record": {"key": b64(&update.key), "generation": 0, "version": 0},
+                    "record_view": null,
+                }))
+            );
+        }
+    }
+
+    /// The service's state at one record key, for its conditions.
+    struct AtKey {
+        key: [u8; 32],
+        held: Option<(RecordVersion, ApplicationRef, bool)>,
+        readable: bool,
+    }
+
+    impl crate::ops::ConditionState for AtKey {
+        fn record_current(&self, key: &[u8; 32]) -> Option<CurrentRecord> {
+            self.held
+                .filter(|_| *key == self.key)
+                .map(|(_, revision, deleted)| CurrentRecord { revision, deleted })
+        }
+        fn record_view(&self, _: &[u8; 32]) -> Option<Value> {
+            None
+        }
+        fn record_version(&self, key: &[u8; 32]) -> RecordVersion {
+            self.held
+                .filter(|_| *key == self.key)
+                .map_or(RecordVersion::NONE, |(version, ..)| version)
+        }
+        fn may_read_record(&self, _: &[u8; 32]) -> bool {
+            self.readable
+        }
+        fn claim_step(&self, _: &[u8; 32]) -> u64 {
+            0
+        }
+        fn claim_view(&self, _: &[u8; 32]) -> Option<Value> {
+            None
+        }
+        fn may_read_claims(&self) -> bool {
+            false
+        }
+        fn server_time(&self) -> u64 {
+            0
+        }
+    }
+
+    /// One rule judges every named version, a write's `expected_version` and a
+    /// `record_version` condition alike: `{0, 0}` only where the service holds nothing,
+    /// another version only where it is the held write's, and a write taken from a recovery
+    /// upload only beside a `record_current` naming it.
+    #[test]
+    fn test_version_holds_for_writes_and_conditions() {
+        let v = RecordVersion::new;
+        let from_upload = ApplicationRef {
+            generation: 2,
+            seq: 3,
+            item_hash: [8; 32],
+        };
+        let other_upload = ApplicationRef {
+            item_hash: [9; 32],
+            ..from_upload
+        };
+        let nothing = None;
+        let live = Some((v(1, 6), applied(1, 6), false));
+        let kept_delete = Some((v(1, 9), applied(1, 9), true));
+        let uploaded = Some((v(1, 6), from_upload, false));
+        // (held, named, a `record_current` beside it, holds)
+        let cases = [
+            (nothing, RecordVersion::NONE, None, true),
+            (nothing, v(1, 6), None, false),
+            (live, RecordVersion::NONE, None, false),
+            (live, v(1, 6), None, true),
+            (live, v(1, 5), None, false),
+            (kept_delete, RecordVersion::NONE, None, false),
+            (kept_delete, v(1, 9), None, true),
+            (kept_delete, v(1, 6), None, false),
+            (uploaded, v(1, 6), None, false),
+            (uploaded, v(1, 6), Some(from_upload), true),
+            (uploaded, v(1, 6), Some(other_upload), false),
+            (uploaded, RecordVersion::NONE, Some(from_upload), false),
+        ];
+        for (i, (held, named, current, holds)) in cases.into_iter().enumerate() {
+            let write = put(named, 1, false);
+            let conditions: Vec<Condition> = current
+                .map(|revision| Condition::RecordCurrent {
+                    key: write.key,
+                    revision,
+                    deleted: false,
+                })
+                .into_iter()
+                .collect();
+            let state = held.map(|(version, revision, deleted)| {
+                let mut state = RecordState::after(&put(RecordVersion::NONE, 1, deleted), 1, 1);
+                state.version = version;
+                (state, revision)
+            });
+            let current = state.as_ref().map(|(state, revision)| (state, *revision));
+            let written = check_record_put(&write, &conditions, current, 1, true, None);
+            assert_eq!(written.is_ok(), holds, "record.put, case {i}: {written:?}");
+            for readable in [true, false] {
+                let at = AtKey {
+                    key: write.key,
+                    held,
+                    readable,
+                };
+                let mut guarded = conditions.clone();
+                guarded.push(Condition::RecordVersion {
+                    key: write.key,
+                    version: named,
+                });
+                let checked = crate::ops::check_conditions(&guarded, &at);
+                assert_eq!(
+                    checked.is_ok(),
+                    holds,
+                    "record_version, case {i}: {checked:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn test_record_put_stale_epoch_and_fixed_policy() {
         let create = put(RecordVersion::NONE, 1, false);
-        let refused = check_record_put(&create, None, 2, true, None).unwrap_err();
+        let refused = check_record_put(&create, &[], None, 2, true, None).unwrap_err();
         assert_eq!(refused.code, ErrorCode::StaleEpoch);
         assert_eq!(refused.current, Some(json!({"data_epoch": 2})));
         let held = RecordState::after(&create, 1, 6);
         let mut other = put(RecordVersion::new(1, 6), 1, false);
         other.policy = Policy::new("scope-a", &["scope-a", "scope-b"]);
         assert_eq!(
-            check_record_put(&other, Some(&held), 1, true, None)
+            check_record_put(&other, &[], Some((&held, applied(1, 6))), 1, true, None)
                 .unwrap_err()
                 .status(),
             400
@@ -504,7 +640,7 @@ mod tests {
         let mut moved = put(RecordVersion::new(1, 6), 1, false);
         moved.collection = [0; 32];
         assert_eq!(
-            check_record_put(&moved, Some(&held), 1, true, None)
+            check_record_put(&moved, &[], Some((&held, applied(1, 6))), 1, true, None)
                 .unwrap_err()
                 .status(),
             400
@@ -532,7 +668,9 @@ mod tests {
             let held = RecordState::after(&put_at(&policy, RecordVersion::NONE, 1, false), 1, 6);
             let at = RecordVersion::new(1, 6);
             let mut same = put_at(&policy, at, 1, false);
-            assert!(check_record_put(&same, Some(&held), 1, true, None).is_ok());
+            assert!(
+                check_record_put(&same, &[], Some((&held, applied(1, 6))), 1, true, None).is_ok()
+            );
             for other in [
                 ordinary.clone(),
                 ordinary.clone().permanent(Some(3)),
@@ -541,7 +679,9 @@ mod tests {
                     .permanent(if named.is_some() { None } else { Some(2) }),
             ] {
                 same.policy = other.clone();
-                let refused = check_record_put(&same, Some(&held), 1, true, None).unwrap_err();
+                let refused =
+                    check_record_put(&same, &[], Some((&held, applied(1, 6))), 1, true, None)
+                        .unwrap_err();
                 assert_eq!(refused.status(), 400, "{policy:?} then {other:?}");
                 assert_eq!(refused.code, ErrorCode::BadRequest);
             }
@@ -549,7 +689,7 @@ mod tests {
             let mut dropped = put_at(&policy, at, 1, true);
             dropped.policy = ordinary.clone();
             assert_eq!(
-                check_record_put(&dropped, Some(&held), 1, true, None)
+                check_record_put(&dropped, &[], Some((&held, applied(1, 6))), 1, true, None)
                     .unwrap_err()
                     .status(),
                 400
@@ -572,18 +712,34 @@ mod tests {
         assert_eq!(filled.key, create.key);
         let mut delete = put_at(&permanent, RecordVersion::new(1, 4), 1, true);
         delete.policy = filled.policy.clone();
-        assert!(check_record_put(&delete, Some(&filled), 1, true, None).is_ok());
+        assert!(
+            check_record_put(&delete, &[], Some((&filled, applied(1, 4))), 1, true, None).is_ok()
+        );
         let deleted = RecordState::after(&delete, 2, 9);
         assert!(deleted.deleted);
-        let refused = check_record_put(&create, Some(&deleted), 1, true, None).unwrap_err();
+        let refused =
+            check_record_put(&create, &[], Some((&deleted, applied(2, 9))), 1, true, None)
+                .unwrap_err();
         assert_eq!(refused.status(), 400);
         // Over the live record too, before the compare-and-swap.
-        let refused = check_record_put(&create, Some(&filled), 1, true, None).unwrap_err();
+        let refused = check_record_put(&create, &[], Some((&filled, applied(1, 4))), 1, true, None)
+            .unwrap_err();
         assert_eq!(refused.status(), 400);
-        // A create over a deleted record of its own policy is taken, as before.
+        // A create of the held policy passes the policy check and meets the compare-and-swap:
+        // `{0, 0}` doesn't hold over a kept delete, only once the service forgets the key.
         let mut ordinary_create = create.clone();
         ordinary_create.policy = filled.policy.clone();
-        assert!(check_record_put(&ordinary_create, Some(&deleted), 1, true, None).is_ok());
+        let refused = check_record_put(
+            &ordinary_create,
+            &[],
+            Some((&deleted, applied(2, 9))),
+            1,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused.status(), 409);
+        assert!(check_record_put(&ordinary_create, &[], None, 1, true, None).is_ok());
     }
 
     /// A record write, chained at (`generation`, `seq`), and the proof of it signed by

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pubky_switch_core::enc::b64;
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ops::{OpKind, sign_batch};
+use pubky_switch_core::ops::{Condition, OpKind, sign_batch};
 use pubky_switch_core::recovery::UploadChanges;
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Value, json};
@@ -284,11 +284,13 @@ async fn test_upload_divergent_record_stays_through_the_write_it_conflicts_with(
     };
     // A second device of the app writes the record at the next switch; the app reads it.
     let target = RecordTarget::new(items(), b"key");
-    let (_, write) = app
+    let (conditions, write) = app
         .record_op(&target, Some(&value(&["c"])), vec![])
         .await
         .unwrap();
-    lost.next.app_op(&app_keys("wallet"), write).unwrap();
+    lost.next
+        .app_op_if(&app_keys("wallet"), conditions, write)
+        .unwrap();
     let read = app.read_record_fresh(&target).await.unwrap();
     assert!(matches!(read, crate::app::RecordRead::Fresh(_)), "{read:?}");
     // The lost generation's next write, built on the version uploaded: newer than it.
@@ -336,8 +338,14 @@ async fn test_upload_divergent_record_is_cleared_by_a_newer_write_in_the_feed() 
         .record_op(&target, Some(&value(&["c"])), vec![])
         .await
         .unwrap();
-    assert!(conditions.is_empty());
-    lost.next.app_op(&app_keys("wallet"), kind).unwrap();
+    // Over a record taken from an upload the write names it exactly (Switch spec 10.3).
+    assert!(
+        matches!(conditions.as_slice(), [Condition::RecordCurrent { key: k, .. }] if *k == key),
+        "{conditions:?}"
+    );
+    lost.next
+        .app_op_if(&app_keys("wallet"), conditions, kind)
+        .unwrap();
     assert!(!lost.next.lock().shared.divergent.contains_key(&key));
     let report = app.receive(None).await.unwrap();
     assert!(changed(&report.events, key), "{:?}", report.events);

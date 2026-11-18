@@ -62,18 +62,16 @@ impl App {
         }
         // Another device may have taken it first: its record is built on, not over.
         let later = match self.state.device.multi_device {
-            true => self.later_under(&renewal).await?,
+            true => Box::pin(self.later_under(&renewal)).await?,
             false => None,
         };
         let took = match later {
-            Some(later) => self.take_later(renewal, later, at).await?,
+            Some(later) => Box::pin(self.take_later(renewal, later, at)).await?,
             None => {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-                let judged = self
-                    .judge_for_cert(&renewal, old.updated_at(), None)
-                    .await?;
-                self.take_cert(renewal, Taken::Judged(judged), None, at)
-                    .await?
+                let judged =
+                    Box::pin(self.judge_for_cert(&renewal, old.updated_at(), None)).await?;
+                Box::pin(self.take_cert(renewal, Taken::Judged(judged), None, at)).await?
             }
         };
         if took {
@@ -330,9 +328,9 @@ impl App {
                 tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
                 self.state.pending_record = Some(judged.pending);
                 dropped = judged.dropped;
-                self.tell_changed(&mut tx, judged.changed, None).await?;
+                Box::pin(self.tell_changed(&mut tx, judged.changed, None)).await?;
             }
-            None => self.took_elsewhere(&mut tx, &record).await?,
+            None => Box::pin(self.took_elsewhere(&mut tx, &record)).await?,
         }
         self.state.record = record;
         if !keep_renewal {
@@ -487,13 +485,12 @@ impl App {
                 let accepted = accepted.as_ref().map(AppRecord::body);
                 (body, changed) = body.over(accepted, &held, &self.protocols);
             }
-            let members = body.body().clone();
-            let record = self
-                .sign_next_record(body, held.updated_at().max(mine.updated_at()))
-                .await?;
+            let members = Box::new(body.body().clone());
+            let previous = held.updated_at().max(mine.updated_at());
+            let record = Box::pin(self.sign_next_record(body, previous)).await?;
             batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
-            self.tell_changed(&mut tx, changed, Some(&members)).await?;
+            Box::pin(self.tell_changed(&mut tx, changed, Some(&members))).await?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
                 body: batch.body().to_vec(),
@@ -717,7 +714,7 @@ impl App {
             // refused for its certificate, and read as the app not current.
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            self.take_later(cert, entry.record, None).await?;
+            Box::pin(self.take_later(cert, entry.record, None)).await?;
         }
         Ok(Listed::Key(key))
     }

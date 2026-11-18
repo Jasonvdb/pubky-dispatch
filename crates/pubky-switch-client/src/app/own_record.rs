@@ -683,7 +683,7 @@ impl App {
             Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => {
                 if let Ok(copy) = serde_json::from_slice::<SignedDoc>(&held) {
-                    self.take_own_later(&copy).await?;
+                    Box::pin(self.take_own_later(&copy)).await?;
                 }
                 Publication::Superseded
             }

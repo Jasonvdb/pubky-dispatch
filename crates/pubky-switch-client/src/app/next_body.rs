@@ -17,13 +17,13 @@ use super::protocols::ProtocolSet;
 
 /// The body of the app's next record under the certificate of the record it holds, and
 /// the certificate its members were given for.
-pub(super) struct NextBody(AppRecordBody, AppCert);
+pub(super) struct NextBody(AppRecordBody, Box<AppCert>);
 
 impl NextBody {
     /// The body of the record the app holds.
     pub(super) fn held(state: &AppState) -> pubky_switch_core::Result<Self> {
         let record = AppRecord::verify(&state.record, &state.meta.identity)?;
-        Ok(Self(record.body().clone(), record.cert().clone()))
+        Ok(Self(record.body().clone(), Box::new(record.cert().clone())))
     }
 
     pub(super) fn body(&self) -> &AppRecordBody {
@@ -41,7 +41,7 @@ impl NextBody {
         later: &AppRecord,
         protocols: &ProtocolSet,
     ) -> (Self, Vec<String>) {
-        let later_cert = later.cert().clone();
+        let later_cert = Box::new(later.cert().clone());
         let later = later.body();
         let mut members = later.protocols.clone();
         let mut changed = Vec::new();

@@ -3083,7 +3083,7 @@ impl App {
                 .map(|()| false),
             OpKind::AppPut { record } => {
                 self.feed_app_record(record, tx)?;
-                self.take_own_later(record).await?;
+                Box::pin(self.take_own_later(record)).await?;
                 Ok(false)
             }
             _ => self.feed_list_change(item, tx).map(|()| false),

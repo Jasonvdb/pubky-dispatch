@@ -2,9 +2,11 @@
 //! recovery a generation begins with, the App IDs held for the next generation, and the
 //! account starting afresh.
 
+use futures_util::TryStreamExt;
 use sqlx::Row;
 
-use super::{AccountTxn, StoreError, from_db, identity::time_to_db, to_db};
+use super::{AccountTxn, KeptAppId, StoreError, from_db, identity::time_to_db, to_db};
+use crate::marks::coverage::{HeldId, RecoverySource};
 
 /// The recovery the generation the account serves began with (Switch wire 7.4.12
 /// `recovery`).
@@ -158,6 +160,54 @@ impl AccountTxn {
                     .map_err(|_| StoreError::Corrupt("held revoked app_id"))
             })
             .collect()
+    }
+
+    /// The complete ordered exclusions that can be candidates for one inline mark
+    /// (account binding 3). An extra row or excess encoded bytes selects SQL instead.
+    pub(crate) async fn recovery_exclusions(
+        &mut self,
+    ) -> Result<Option<(Vec<KeptAppId>, Vec<HeldId>)>, StoreError> {
+        let id = self.head().id.clone();
+        let mut kept = Vec::new();
+        let mut bytes = 0;
+        let mut rows = sqlx::query(
+            "SELECT app_id, reason, at_ms, data_epoch, rotated FROM kept_app_ids \
+             WHERE account_id = $1 ORDER BY app_id LIMIT $2",
+        )
+        .bind(&id)
+        .bind(RecoverySource::MAX_ROWS as i64 + 1)
+        .fetch(self.conn());
+        while let Some(row) = rows.try_next().await? {
+            let app = KeptAppId::from_row(&row)?;
+            bytes += app.encoded_len()? + 1;
+            if bytes > crate::marks::MAX_MARK_FILE as usize
+                || kept.len() == RecoverySource::MAX_ROWS
+            {
+                return Ok(None);
+            }
+            kept.push(app);
+        }
+        drop(rows);
+        let room = RecoverySource::MAX_ROWS - kept.len();
+        let mut rows = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT app_id FROM held_revoked_apps WHERE account_id = $1 ORDER BY app_id LIMIT $2",
+        )
+        .bind(id)
+        .bind(room as i64 + 1)
+        .fetch(self.conn());
+        let mut held = Vec::new();
+        while let Some(row) = rows.try_next().await? {
+            // Two quotes, 32 hex digits and the separator.
+            bytes += 35;
+            if bytes > crate::marks::MAX_MARK_FILE as usize || held.len() == room {
+                return Ok(None);
+            }
+            held.push(HeldId(
+                row.try_into()
+                    .map_err(|_| StoreError::Corrupt("held revoked app_id"))?,
+            ));
+        }
+        Ok(Some((kept, held)))
     }
 
     /// Hold `apps`, an enrollment's `revoked_apps` answered at the serving account, until a

@@ -358,7 +358,7 @@ impl Service {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
         let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
         // Read reachability before the reset deletes the app records and receive keys.
-        let apps = super::batch::load_apps(txn, held, time_ms)
+        let had_reachable = super::batch::had_reachable_apps(txn, held)
             .await
             .map_err(|e| store_error(&e))?;
         let (directory, old_version) = txn
@@ -366,8 +366,7 @@ impl Service {
             .await
             .map_err(|e| store_error(&e))?;
         let version =
-            recovery_apps_version(directory, old_version, !apps.reachable_app_ids().is_empty())
-                .ok_or_else(temporary)?;
+            recovery_apps_version(directory, old_version, had_reachable).ok_or_else(temporary)?;
         if version != old_version {
             txn.set_directory_versions(directory, version)
                 .await

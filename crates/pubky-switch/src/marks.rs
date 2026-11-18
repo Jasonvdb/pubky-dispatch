@@ -37,7 +37,7 @@
 
 pub(crate) mod coverage;
 mod erasure;
-use coverage::{Observed, RecoverySource};
+use coverage::{Observed, RecoveryPosition, RecoverySource, RecoveryUpdate};
 pub(crate) use erasure::ErasureAttempt;
 use erasure::{attempt_from_bytes, read_attempts};
 
@@ -552,6 +552,47 @@ impl MarkStore {
         blocking(move || inner.read_sync(&identity)).await
     }
 
+    /// Read the complete independent predecessor selected for the locked transaction.
+    /// Stamping the request may already have raised its time floor.
+    pub(crate) async fn recovery_position(
+        &self,
+        identity: &str,
+        judged: AccountMark,
+    ) -> Result<Option<RecoveryPosition>, MarkStoreError> {
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            inner.reading(RecordScope::Identity(&identity), |id| {
+                let MarkRead::Mark(current) = inner.load_mark(&identity, id)? else {
+                    return Ok(None);
+                };
+                if current.time_floor_ms < judged.time_floor_ms
+                    || current
+                        != (AccountMark {
+                            time_floor_ms: current.time_floor_ms,
+                            ..judged
+                        })
+                    || inner.erased_after(&identity, current.created_at_ms)
+                {
+                    return Ok(None);
+                }
+                let store_id = hex::decode(id)
+                    .ok()
+                    .and_then(|raw| raw.try_into().ok())
+                    .ok_or_else(|| {
+                        MarkStoreError::StoreUnreadable("invalid store identity".into())
+                    })?;
+                Ok(inner
+                    .marks
+                    .lock()
+                    .get(&identity)
+                    .cloned()
+                    .map(|before| RecoveryPosition { store_id, before }))
+            })
+        })
+        .await
+    }
+
     /// Write (0, 0) with `key` and `created_at_ms` where the identity has no mark, or a file
     /// that doesn't read as one (Switch wire 7.3, Table 3: an enrollment that creates an
     /// account at an identity without a mark). A mark it holds stays.
@@ -832,6 +873,18 @@ impl MarkStore {
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Result<Advance, MarkStoreError> {
+        self.advance_with_source(identity, target, key, created_at_ms, None)
+            .await
+    }
+
+    pub(crate) async fn advance_with_source(
+        &self,
+        identity: &str,
+        target: MarkTarget,
+        key: [u8; 32],
+        created_at_ms: u64,
+        source: Option<Arc<RecoveryUpdate>>,
+    ) -> Result<Advance, MarkStoreError> {
         self.check_gate()?;
         let gate = self.gate.clone();
         let inner = self.inner.clone();
@@ -839,8 +892,17 @@ impl MarkStore {
         if !target.is_valid() {
             return Err(MarkStoreError::InvalidHead);
         }
-        blocking(move || inner.advance_sync(gate.as_ref(), &identity, target, key, created_at_ms))
-            .await
+        blocking(move || {
+            inner.advance_sync(
+                gate.as_ref(),
+                &identity,
+                target,
+                key,
+                created_at_ms,
+                source.as_deref(),
+            )
+        })
+        .await
     }
 
     /// Write the mark anew at `target`, with `key` and `created_at_ms`, its time floor the
@@ -1631,8 +1693,14 @@ impl Inner {
         target: MarkTarget,
         key: [u8; 32],
         created_at_ms: u64,
+        source: Option<&RecoveryUpdate>,
     ) -> Result<Advance, MarkStoreError> {
         self.writing(gate, RecordScope::Identity(identity), |id| {
+            if source.is_some_and(|update| !update.source.belongs_to(identity, id)) {
+                return Err(MarkStoreError::StoreUnreadable(
+                    "the recovery source belongs to another store or identity".into(),
+                ));
+            }
             let mark = match self.load_mark(identity, id)? {
                 MarkRead::Mark(mark) => mark,
                 held => return Ok(Advance::NoMark(held)),
@@ -1640,13 +1708,35 @@ impl Inner {
             if mark.created_at_ms != created_at_ms {
                 return Ok(Advance::OtherAccount(mark));
             }
-            match order(&mark, &target, key) {
-                Advance::Moved(moved) => {
+            match (order(&mark, &target, key), source) {
+                (Advance::Moved(moved), source) => {
                     self.retirement(identity, moved.generation)?;
-                    self.put_mark(identity, MarkRead::Mark(mark), moved, None)?;
+                    let matched = source.filter(|update| {
+                        self.marks.lock().get(identity) == Some(&update.before)
+                            && !self.erased_after(identity, created_at_ms)
+                    });
+                    self.put_mark(identity, MarkRead::Mark(mark), moved, matched.map(|u| u.source.as_ref()))?;
                     Ok(Advance::Moved(moved))
                 }
-                held => Ok(held),
+                (Advance::Unchanged(current), Some(update)) => {
+                    // A different reader may already have acknowledged this exact
+                    // position through SQL. It can now acquire its complete source.
+                    let expected = match update.before.position {
+                        MarkRead::Mark(prior) => matches!(order(&prior, &target, key),
+                            Advance::Moved(result) | Advance::Unchanged(result) if result == current && result.key == key),
+                        _ => false,
+                    };
+                    if expected && !self.erased_after(identity, created_at_ms) && self
+                        .marks
+                        .lock()
+                        .get(identity)
+                        .is_some_and(|held| held.recovery.is_none())
+                    {
+                        self.put_mark(identity, MarkRead::Mark(current), current, Some(&update.source))?;
+                    }
+                    Ok(Advance::Unchanged(current))
+                }
+                (held, _) => Ok(held),
             }
         })
     }

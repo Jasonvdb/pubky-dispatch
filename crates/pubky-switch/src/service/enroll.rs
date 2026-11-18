@@ -25,7 +25,7 @@ use crate::{
         error::{ApiError, ErrorCode},
     },
     limits::{Limits, fixed},
-    marks::MarkWrite,
+    marks::{AccountMark, MarkWrite},
     store::NewAccount,
 };
 
@@ -77,6 +77,8 @@ struct Enrolled {
     /// "Moving it"). Never the enrollment's own signing key: the mark keeps its key until a
     /// generation start names another (Table 3).
     mark_key: Option<[u8; 32]>,
+    /// The prior mark whose facts may be carried by a healthy commit.
+    prior: Option<Box<AccountMark>>,
 }
 
 impl Service {
@@ -476,6 +478,7 @@ impl Service {
             limits,
             created: created_at_ms,
             mark_key: None,
+            prior: None,
         }))
     }
 
@@ -572,7 +575,7 @@ impl Service {
             .ok_or_else(|| (unavailable(), None))?;
         let committed_ms = txn.head().committed_ms(self.run, mark_floor_ms);
         let refused = |error: ApiError| (error, Some(committed_ms));
-        let enrolled = self
+        let mut enrolled = self
             .enroll_under_lock(
                 &mut txn,
                 enrollment,
@@ -591,10 +594,17 @@ impl Service {
         } else {
             crate::store::MarkCoverage::None
         };
-        let committed = txn
-            .commit_with_mark(coverage)
-            .await
-            .map_err(|e| refused(store_error(&e)))?;
+        let refresh = !enrollment.revoked_apps().is_empty()
+            && matches!(enrollment.body().intent, EnrollmentIntent::Existing { .. });
+        let (committed, update) = Self::commit_marked(
+            &self.marks,
+            txn,
+            coverage,
+            enrolled.prior.take().map(|mark| *mark),
+            refresh,
+        )
+        .await
+        .map_err(refused)?;
         // At a healthy account the mark covers the committed position before any answer,
         // a retry's included: the first answer may have failed after the commit, before its
         // mark moved (Switch wire 7.3, "Moving it").
@@ -603,7 +613,7 @@ impl Service {
         {
             let created_at_ms = committed.head().created_at_ms;
             if self
-                .move_mark(identity_text, target, key, created_at_ms, false)
+                .move_mark_with_source(identity_text, target, key, created_at_ms, false, update)
                 .await
                 != super::marking::MarkMove::Done
             {
@@ -687,7 +697,7 @@ impl Service {
         let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
         // Read-only receipt recovery precedes freshness and never applies the intent again
         // (Switch account binding 3). Missing or evicted receipts prove no non-application.
-        if let Some(receipt) = txn
+        let time_ms = if let Some(receipt) = txn
             .enrollment_answer(&enrollment_hash)
             .await
             .map_err(|e| store_error(&e))?
@@ -719,52 +729,51 @@ impl Service {
                     return Err(unavailable());
                 }
             }
-            return Ok(Enrolled {
-                time_ms: txn.head().committed_ms(self.run, judged.time_floor_ms()),
-                limits,
-                created,
-                mark_key: healthy.then_some(judged.judgement.key),
-            });
-        }
-        match enrollment.body().intent {
-            EnrollmentIntent::Existing { created: expected } if expected == created => {}
-            EnrollmentIntent::Existing { .. } => return Err(creation_conflict(created)),
-            _ => return Err(binding_changed()),
-        }
-        if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
-            return Err(unavailable());
-        }
-        // Step 3, under the mark's time floor, which rises first where the stamp passes it
-        // (Switch wire 7.3, "Trusted time").
-        let time_ms = self.stamp_under_lock(txn, base_ms, judged.mark()).await?;
-        let key = self.current_key();
-        let serving = txn.head().activation == AccountActivation::Recovery
-            || held.as_ref().is_some_and(|doc| {
-                doc.inbox().url == self.origin
-                    && self.keys.signer_for(&doc.inbox().service_key).is_some()
-            });
-        if serving {
-            txn.hold_revoked_apps(enrollment.revoked_apps())
-                .await
-                .map_err(|e| store_error(&e))?;
-        }
-        txn.keep_enrollment_answer(
-            &enrollment_hash,
-            time_ms,
-            self.limits.max_enrollments,
-            store_id,
-        )
-        .await
-        .map_err(|e| store_error(&e))?;
-        if !serving && let Err(failure) = self.marks.set_key(identity_text, key, created).await {
-            tracing::error!(%failure, "a staged account's mark taking the current key");
-            return Err(unavailable());
-        }
+            txn.head().committed_ms(self.run, judged.time_floor_ms())
+        } else {
+            match enrollment.body().intent {
+                EnrollmentIntent::Existing { created: expected } if expected == created => {}
+                EnrollmentIntent::Existing { .. } => return Err(creation_conflict(created)),
+                _ => return Err(binding_changed()),
+            }
+            if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
+                return Err(unavailable());
+            }
+            let serving = txn.head().activation == AccountActivation::Recovery
+                || held.as_ref().is_some_and(|doc| {
+                    doc.inbox().url == self.origin
+                        && self.keys.signer_for(&doc.inbox().service_key).is_some()
+                });
+            // Step 3, under the mark's time floor, which rises first where the stamp passes it
+            // (Switch wire 7.3, "Trusted time").
+            let time_ms = self.stamp_under_lock(txn, base_ms, judged.mark()).await?;
+            let key = self.current_key();
+            if serving {
+                txn.hold_revoked_apps(enrollment.revoked_apps())
+                    .await
+                    .map_err(|e| store_error(&e))?;
+            }
+            txn.keep_enrollment_answer(
+                &enrollment_hash,
+                time_ms,
+                self.limits.max_enrollments,
+                store_id,
+            )
+            .await
+            .map_err(|e| store_error(&e))?;
+            if !serving && let Err(failure) = self.marks.set_key(identity_text, key, created).await
+            {
+                tracing::error!(%failure, "a staged account's mark taking the current key");
+                return Err(unavailable());
+            }
+            time_ms
+        };
         Ok(Enrolled {
             time_ms,
             limits,
             created,
             mark_key: healthy.then_some(judged.judgement.key),
+            prior: judged.mark().filter(|_| healthy).copied().map(Box::new),
         })
     }
 }

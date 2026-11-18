@@ -9,6 +9,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 - Serialize writers to the same app namespace across threads, extensions and processes. `App` uses ordinary store commits. The store also has an ownership API for callers that acquire a namespace. A memory store cannot preserve keys or unanswered writes across a restart.
 - Have the signer approve the request for this app's keys. Verify the enclosing companion claim's signature before passing the approval bytes, original request, identity and keys in `JoinRequest`. `App::join` checks the approval against them, the certificate against the registered protocols, and saves the first app record and receive-key registration before sending. Keep the App ID. If a call failed after that save, use `App::load` and `receive` to resume. A second join on that store is refused.
 - On startup, load the same App ID and protocols. Loading reads local state. Use `app_id`, `identity`, `own_identity`, `cert` and `record` for the app's current details. The app signs its own requests. The identity signing key stays with the signer.
+- A protocol SDK taking ownership of a built `App` can check its registered protocol with `protocols()` and use the app's `clock()`, `homeserver_reader()` and `publishes_record()` so its reads and publication decisions use the same settings.
 
 | Case | What happened and what to do |
 |---|---|

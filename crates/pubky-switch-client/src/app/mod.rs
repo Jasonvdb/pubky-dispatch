@@ -3770,6 +3770,16 @@ impl App {
         Arc::clone(&self.env.clock)
     }
 
+    /// The reader this app uses for Homeserver files.
+    pub fn homeserver_reader(&self) -> Arc<dyn HomeserverReader> {
+        Arc::clone(&self.env.homeserver)
+    }
+
+    /// Whether this app is configured to publish its record on its Homeserver.
+    pub fn publishes_record(&self) -> bool {
+        self.config.publishes_record
+    }
+
     pub(crate) fn now(&self) -> u64 {
         self.env.clock.now_ms()
     }

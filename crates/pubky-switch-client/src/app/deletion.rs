@@ -445,15 +445,6 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn forget_deletion_receipts(&mut self, key: [u8; 32]) -> Result<(), AppError> {
-        let mut tx = self.tx()?;
-        self.retire_deletion_receipts(key, None, &mut tx)?;
-        if !tx.is_empty() {
-            self.commit(tx).await?;
-        }
-        Ok(())
-    }
-
     pub(super) fn observe_deletion(
         &mut self,
         observed: Observation,

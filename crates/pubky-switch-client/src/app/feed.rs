@@ -3198,7 +3198,7 @@ impl App {
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
     /// minutes old, read again from the Homeserver otherwise (`force` reads it again
     /// whatever its age), with whether it was read in this call. `None` when it can't be
-    /// read now, or the identity equivocated.
+    /// read now, the read gave no copy under 10 minutes old, or the identity equivocated.
     async fn sender_doc(
         &mut self,
         sender: &[u8; 32],
@@ -3224,9 +3224,8 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let held = held.map(|(doc, _)| doc);
-        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now).await?;
-        let doc = match taken {
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now, now).await?;
+        let (doc, read_ms) = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
                     identity: *sender,
@@ -3235,9 +3234,15 @@ impl App {
                 self.commit(tx).await?;
                 return Ok(None);
             }
-            Ok(doc) => doc,
+            Ok(taken) => taken,
         };
         self.commit(tx).await?;
+        // A read that served an older copy doesn't confirm the one held: past its 10
+        // minutes when the read ends, it verifies no sender until a read gives it again, or
+        // a newer one.
+        if self.now().saturating_sub(read_ms) >= DOC_CACHE_MS {
+            return Ok(None);
+        }
         Ok(Some((doc, true)))
     }
 

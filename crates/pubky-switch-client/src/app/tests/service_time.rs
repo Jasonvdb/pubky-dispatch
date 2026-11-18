@@ -964,7 +964,9 @@ async fn assert_alarm_survives_reload(
     let error = Box::pin(app.receive(None)).await.unwrap_err();
     assert_eq!(error, AppError::Refused(Refusal::Stopped));
     assert_eq!(transport.requests().len(), 2);
-    Box::pin(app.pending_duty_events()).await.unwrap();
+    Box::pin(crate::app::tests::pending_events(&mut app))
+        .await
+        .unwrap();
     assert_eq!(app.alarm(), Some(&expected));
     assert_eq!(
         app.reader().get::<Alarm>(key::ALARM).await.unwrap(),

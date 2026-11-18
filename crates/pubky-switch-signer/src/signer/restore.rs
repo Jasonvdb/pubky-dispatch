@@ -45,7 +45,7 @@ use super::clients::{RequestClient, Target};
 use super::key_recovery::{Found, KeyRecoveryConfirmed, RestoreConfirmed};
 use super::{Signer, gate};
 use crate::alert::Alert;
-use crate::error::{RecordsFault, Refusal, Result, SignerError};
+use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
@@ -108,7 +108,7 @@ pub(super) struct RestoreLocal {
 }
 
 impl RestoreLocal {
-    fn from_state(state: Option<SignerState>, identity: &[u8; 32]) -> Self {
+    pub(super) fn from_state(state: Option<SignerState>, identity: &[u8; 32]) -> Self {
         let copies = match &state {
             Some(state) => [
                 KeptCopy::read(state.newest.as_ref().map(|newest| &newest.doc), identity),
@@ -224,7 +224,7 @@ fn local_damage(error: SignerError) -> Result<()> {
     }
 }
 
-fn restored_alerts(state: &SignerState) -> Vec<Alert> {
+pub(super) fn restored_alerts(state: &SignerState) -> Vec<Alert> {
     state
         .alerts
         .iter()
@@ -290,6 +290,13 @@ impl Signer {
             .acquire(&state::signer_namespace(&identity))
             .await?;
         let key = confirmed.into().0;
+        // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
+        if key
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         if state::set_up(&store, &identity).await? {
             return match key {
                 Some(key) => Box::pin(Self::continue_fresh(env, keyring, store, key)).await,
@@ -331,6 +338,13 @@ impl Signer {
             .store
             .acquire(&state::signer_namespace(&identity))
             .await?;
+        if confirmed
+            .0
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         let local = match (
             RestoreLocal::unusable(state::read(&store, &identity).await?, &identity),
             confirmed.0.clone(),
@@ -405,6 +419,13 @@ impl Signer {
     pub async fn restore(&mut self, confirmed: impl Into<RestoreConfirmed>) -> Result<IdentityDoc> {
         self.refresh().await?;
         let key = confirmed.into().0;
+        // A provider loss's confirmation is no confirmation of a restore (Switch spec 12.8).
+        if key
+            .as_ref()
+            .is_some_and(KeyRecoveryConfirmed::is_provider_loss)
+        {
+            return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
+        }
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
             return Box::pin(self.continue_key_recovery(key.clone())).await;
         }
@@ -502,7 +523,8 @@ impl Signer {
         let first = self
             .check_restore(&view, answer.identity.as_ref(), local.as_ref())
             .await?;
-        let mut state = self.rebuilt_records(&view, &answer, service.clone(), local.as_ref())?;
+        let mut state =
+            self.rebuilt_records(&view, &answer, service.clone(), local.as_ref(), true)?;
         let kept = local.as_ref().and_then(|local| local.state.as_ref());
         // A backup written mid-recovery holds the recovery's version, which the service it
         // names doesn't hold yet: the recovery is in progress again, delivered first, and
@@ -611,13 +633,16 @@ impl Signer {
     /// The records a restore takes from `view`, the backup's or those a recovery with the
     /// key alone found, the switch's `GET /apps` answer `answer`, and, in place or over
     /// unusable records, what `local` keeps binding (Switch wire 3.13 "Restoring"). The
-    /// caller sets `newest`; the version naming this install is owed.
+    /// caller sets `newest`; the version naming this install is owed. With `epochs_bound`,
+    /// local epochs past the one after `view`'s refuse it as stale; a provider loss, which
+    /// builds on the highest copy there is, keeps them as its floor instead.
     pub(super) fn rebuilt_records(
         &self,
         view: &BackupView,
         answer: &AppsAnswer,
         service: Service,
         local: Option<&RestoreLocal>,
+        epochs_bound: bool,
     ) -> Result<SignerState> {
         let doc = &view.identity_doc;
         // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
@@ -637,7 +662,7 @@ impl Signer {
         let mut state = self.taken_records(view, answer, service, tombstones, cleanup);
         if let Some(local) = local {
             if let Some(epoch) = local.epoch_through {
-                if epoch > doc.data_epoch().saturating_add(1) {
+                if epochs_bound && epoch > doc.data_epoch().saturating_add(1) {
                     return Err(Refusal::StaleBackup.into());
                 }
                 state.epoch_through = state.epoch_through.max(epoch);
@@ -1056,7 +1081,7 @@ pub(super) fn removed_at_switch<'a>(
 
 /// A `GET /apps` answer that shows no copy, nothing revoked and no epoch: a recovery's
 /// service before it takes the version (Switch wire 3.13).
-fn no_copy() -> AppsAnswer {
+pub(super) fn no_copy() -> AppsAnswer {
     AppsAnswer {
         apps: Vec::new(),
         recovery: None,

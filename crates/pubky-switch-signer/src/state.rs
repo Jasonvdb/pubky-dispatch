@@ -369,6 +369,14 @@ pub(crate) struct SignerState {
     /// are revoked at the new service before the version is published, which is how apps
     /// find the service (Switch spec 12.6 step 1).
     pub(crate) revoke_at_service: bool,
+    /// For apps the newest version removes, earlier times to distrust them from than its
+    /// `removed` entries, which a recovery with the key alone found picked: every version
+    /// built from then on takes them (Switch spec 12.8).
+    pub(crate) earlier_distrust: Vec<pubky_switch_core::records::RemovedApp>,
+    /// The highest generation of a version of this install's own it saw ahead of its
+    /// records, with `records_behind`: a recovery with the key alone starts above it, whatever
+    /// copies it finds then (Switch spec 12.8).
+    pub(crate) generation_seen: u64,
     /// The renewals the user asked for, each as its app and the new certificate's hash, whose
     /// flow is in progress: one delivered ends that app's [`Alert::RenewalRefused`] for a
     /// renewal that reduced nothing, as the user's newest choice, and one refused is the
@@ -612,6 +620,8 @@ impl SignerState {
             lost_generation: None,
             homeserver_copy_waived: false,
             revoke_at_service: false,
+            earlier_distrust: Vec::new(),
+            generation_seen: 0,
             user_renewals: Vec::new(),
             asked_renewals: Vec::new(),
             ever_published: false,
@@ -732,18 +742,24 @@ pub(crate) enum RecoveryEnrollment {
 
 impl RecoveryEnrollment {
     /// Permanent exclusions are the retained tombstones outside the verified recovery base
-    /// (Switch spec 12.6 step 1). Later revocations of listed apps remain deferred work.
+    /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
+    /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
     pub(crate) fn check_exclusions(&self, state: &SignerState, origin: &str) -> Result<()> {
-        let base = state
-            .recovery_base
-            .as_ref()
-            .ok_or(RecordsFault::Invariant("a recovery enrollment has no base"))?;
-        let base = stored_identity(base, &state.identity)?;
+        let base = match &state.recovery_base {
+            Some(base) => Some(stored_identity(base, &state.identity)?),
+            None if state.newest.is_none() => None,
+            None => {
+                return Err(RecordsFault::Invariant("a recovery enrollment has no base").into());
+            }
+        };
         let mut expected: Vec<_> = state
             .tombstones
             .iter()
             .copied()
-            .filter(|app| base.listed_cert(app).is_none())
+            .filter(|app| {
+                base.as_ref()
+                    .is_none_or(|base| base.listed_cert(app).is_none())
+            })
             .collect();
         expected.sort_unstable();
         expected.dedup();

@@ -412,6 +412,32 @@ impl World {
         }
     }
 
+    /// The switch at `origin` loses `identity`'s record at `key`, as a faulty switch would:
+    /// its reads answer `404` and its listings leave the key out (Switch spec 10.3.1
+    /// "Absence"). The service is stopped for the change and started again.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such record, or the service can't be started again.
+    pub async fn drop_record(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        key: &[u8; 32],
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| switch.drop_record(&id, key).await)
+                    .await
+            }
+            Backend::Scripted => self
+                .scripted_switch(origin, identity)?
+                .drop_record(key)
+                .map_err(|error| HarnessError::Setup(error.to_string())),
+        }
+    }
+
     /// The operator of `origin` retires `generation` for `identity` (Switch spec 6.5): the
     /// notice says `permanent: true` from then on. The service is stopped for the
     /// operator's step, which refuses unless the account fails stop or is lost, and

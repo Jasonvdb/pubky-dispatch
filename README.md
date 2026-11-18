@@ -8,7 +8,7 @@ One Switch serves many identities, each with its own account, in the way one Hom
 
 The Switch reads no message and no shared data, and knows nothing of what a protocol does with them. Protocols are built on top of it: each brings its own scopes, message kinds and collections, which the Switch treats as opaque. Paykit, for payments between Pubky identities, is the first; it lives in [`pubky/paykit-rs`](https://github.com/pubky/paykit-rs).
 
-> **Status:** under construction. This repository holds the workspace and its rules; the crates are filled in by the following pull requests.
+> **Status:** in development, and not yet safe for real keys or funds. [`docs/known-issues.md`](docs/known-issues.md) lists the known issues and what will still change.
 
 ## What the Switch does
 

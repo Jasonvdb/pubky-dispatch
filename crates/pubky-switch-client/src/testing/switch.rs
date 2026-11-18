@@ -295,6 +295,18 @@ pub enum Fault {
         /// The error code answered.
         code: ErrorCode,
     },
+    /// Apply an own app's request, then sign its answer with the chain's head at `at`, its
+    /// newest tip at or before that `seq`, as an answer overtaken on its way would carry
+    /// it, or with another chain hash there when `forked`, as a forked chain's; or, with
+    /// `at` `None`, with no head, as a faulty service would.
+    Head {
+        /// A part of the request's path and query.
+        path: String,
+        /// The `seq` the head is at; `None` for no head.
+        at: Option<u64>,
+        /// Whether the head's chain hash is another than the chain's at its `seq`.
+        forked: bool,
+    },
 }
 
 pub(crate) struct Inner {
@@ -321,6 +333,8 @@ pub(crate) struct Inner {
     /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
     pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
+    /// The next batch skips the operations' shape check, as a faulty switch would.
+    pub(crate) skip_shape_once: bool,
     next_erasure_outcome: Option<ErasureOutcome>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
@@ -470,6 +484,7 @@ impl Inner {
             dropped_through: 0,
             retention: Some(Retention::default()),
             faults: VecDeque::new(),
+            skip_shape_once: false,
             next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
@@ -1262,6 +1277,7 @@ impl ScriptedSwitch {
         let mut leave_out = None;
         let mut replace = None;
         let mut sign_with = None;
+        let mut head_at = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
@@ -1272,7 +1288,8 @@ impl ScriptedSwitch {
             | Fault::Replace { path: p, .. }
             | Fault::SignWith { path: p, .. }
             | Fault::ErrorSignedWith { path: p, .. }
-            | Fault::BeforeTheBody { path: p, .. } => path.contains(p.as_str()),
+            | Fault::BeforeTheBody { path: p, .. }
+            | Fault::Head { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(
@@ -1306,6 +1323,7 @@ impl ScriptedSwitch {
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
                 Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
+                Some(Fault::Head { at, forked, .. }) => head_at = Some((at, forked)),
                 Some(Fault::ErrorSignedWith { code, secret, .. }) => {
                     let (status, body) = bad(code, "scripted", Value::Null);
                     // As for `Fault::Error`: past authentication, the app was seen.
@@ -1409,6 +1427,29 @@ impl ScriptedSwitch {
             if let Some(secret) = sign_with {
                 let key = SigningKey::from_bytes(&secret);
                 return Ok(inner.respond_with(&key, request, status, &body));
+            }
+            if let Some((at, forked)) = head_at {
+                let head = at.map(|seq| {
+                    let mut tip = inner
+                        .tips
+                        .iter()
+                        .rev()
+                        .find(|tip| tip.seq <= seq)
+                        .copied()
+                        .unwrap_or(inner.tip);
+                    if forked {
+                        tip.chain_hash = [0x55; 32];
+                    }
+                    SignedHead::sign(&inner.service, &inner.identity.public(), &tip).to_header()
+                });
+                return Ok(inner.respond_signed(
+                    &inner.service,
+                    request,
+                    status,
+                    &body,
+                    inner.now(),
+                    head.as_deref(),
+                ));
             }
             Ok(inner.respond(request, status, &body))
         };
@@ -1640,6 +1681,29 @@ impl ScriptedSwitch {
     /// takes from each app in an hour of its clock.
     pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
         self.lock().uploads_per_app_per_hour = uploads;
+    }
+
+    /// Apply the next batch without the operations' shape check (Switch wire 6.4 step 9), as a
+    /// faulty switch would: it signs its proofs of what it should have refused, such as a
+    /// delete at a permanent policy (Switch spec 10.3.1). For tests of what apps make of it.
+    pub fn skip_next_shape_check(&self) {
+        self.lock().skip_shape_once = true;
+    }
+
+    /// Drop the record at `key` from the switch's state, its divergent uploads with it, as a
+    /// faulty switch that lost it would: reads answer `404` and listings leave it out. For
+    /// tests of what an app makes of a record gone (Switch spec 10.3.1 "Absence").
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Missing`] for a key the switch holds no record at.
+    pub fn drop_record(&self, key: &[u8; 32]) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        inner.shared.divergent.remove(key);
+        match inner.shared.records.remove(key) {
+            Some(_) => Ok(()),
+            None => Err(ScriptError::Missing("no record at the key".into())),
+        }
     }
 
     /// Make record `key`, one the switch holds, divergent, as a recovery upload with a

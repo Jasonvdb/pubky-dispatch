@@ -110,7 +110,8 @@ async fn test_sender_document_unlisted_certificate_is_read_again_once_then_dropp
 }
 
 /// Bob's Homeserver serves an older `identity.json` than the one the app holds: that read
-/// doesn't make the copy held fresh, so the next entry from bob reads the document again.
+/// doesn't make the copy held fresh, so past its 10 minutes it verifies no entry from bob,
+/// which is held and read again, until a read gives the copy held again.
 #[tokio::test]
 async fn test_sender_document_older_copy_leaves_the_held_copy_stale() {
     let w = World::new();
@@ -119,9 +120,8 @@ async fn test_sender_document_older_copy_leaves_the_held_copy_stale() {
     let older = w.homeserver.identity_doc(&bob).unwrap();
     let mut body = older.body().clone();
     body.version += 1;
-    w.homeserver
-        .publish(&IdentityDoc::sign(&w.bob, body).unwrap())
-        .unwrap();
+    let newer = IdentityDoc::sign(&w.bob, body).unwrap();
+    w.homeserver.publish(&newer).unwrap();
     // The copy held ages, and the next entry reads the newer one.
     w.clock.advance_ms(crate::app::DOC_CACHE_MS);
     let reads = w.homeserver.identity_reads(&bob);
@@ -129,19 +129,70 @@ async fn test_sender_document_older_copy_leaves_the_held_copy_stale() {
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
-    // Ten minutes on, the Homeserver serves the older copy again.
+    // Ten minutes on, the Homeserver serves the older copy again: the entry is held.
     w.homeserver.publish(&older).unwrap();
     w.clock.advance_ms(crate::app::DOC_CACHE_MS);
     let (seq, _) = w.note(app.app_id(), "after the older copy");
     let report = app.receive(None).await.unwrap();
-    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert!(held(&report.events, seq), "{:?}", report.events);
+    assert!(!received(&report.events, seq));
+    assert!(app.cursor().seq < seq);
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 2);
-    // A minute later the copy held is still past its 10 minutes: read again.
+    // A minute later the copy held is still past its 10 minutes: read again, held again.
     w.clock.advance_ms(60_000);
-    let (seq, _) = w.note(app.app_id(), "a minute later");
+    let report = app.receive(None).await.unwrap();
+    assert!(held(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 3);
+    // A read that gives the copy held again confirms it, and the entry is kept.
+    w.homeserver.publish(&newer).unwrap();
+    w.clock.advance_ms(60_000);
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(w.homeserver.identity_reads(&bob), reads + 3);
+    assert!(app.cursor().seq >= seq);
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 4);
+}
+
+/// The copy held doesn't list an entry's renewed certificate at 9m59s of age, and the read
+/// again takes two seconds and gives an older copy: the copy is judged when the read ends,
+/// past its 10 minutes, so the entry is held, not dropped, and kept once a read gives the
+/// renewal.
+#[tokio::test]
+async fn test_sender_document_read_again_past_the_ten_minutes_holds_the_entry() {
+    let w = World::new();
+    let mut app = app_holding_bobs_document(&w).await;
+    let bob = w.bob.public();
+    let older = w.homeserver.identity_doc(&bob).unwrap();
+    let mut body = older.body().clone();
+    body.version += 1;
+    let newer = IdentityDoc::sign(&w.bob, body).unwrap();
+    w.homeserver.publish(&newer).unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS);
+    let (seq, _) = w.note(app.app_id(), "read the newer copy");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    w.homeserver.publish(&older).unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS - 1_000);
+    let renewed = cert_for(&w.bob, &w.bob_keys, w.clock.now_ms(), &["sample-a"]);
+    let seq = note_under(&w, &renewed, app.app_id(), "under the renewal");
+    w.homeserver.slow_reads(bob, Arc::clone(&w.clock), 2_000);
+    let reads = w.homeserver.identity_reads(&bob);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
+    assert!(held(&report.events, seq), "{:?}", report.events);
+    assert!(!dropped_at_check_7(&report.events, seq));
+    assert!(app.cursor().seq < seq);
+    let mut body = newer.body().clone();
+    body.version += 1;
+    body.apps = vec![ListedApp {
+        app_id: renewed.app_id(),
+        cert: renewed.hash(),
+    }];
+    w.homeserver
+        .publish(&IdentityDoc::sign(&w.bob, body).unwrap())
+        .unwrap();
+    w.clock.advance_ms(SENDER_REREAD_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
 }
 
 fn held(events: &[AppEvent], seq: u64) -> bool {

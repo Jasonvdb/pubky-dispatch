@@ -645,6 +645,57 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
 }
 
 #[test]
+fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
+    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::shared::RecordState;
+    // An upload that drops the member of a permanent record the service holds, or names
+    // another generation in it, can't build on that record (Switch spec 10.3.1): it is
+    // divergent, never the record's replacement, which a later write at its policy could
+    // then delete.
+    let held = HeldRecord::FromUpload {
+        op_hash: [1; 32],
+        built_on: RecordVersion::new(3, 4),
+        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        divergent: &[],
+    };
+    let ordinary = Policy::new(SCOPE, &[SCOPE]);
+    let mut named = put(RecordVersion::new(3, 10));
+    named.policy = ordinary.clone().permanent(Some(1));
+    let named = op_at(LOST, OpKind::RecordPut(named));
+    for (op, policy) in [
+        (record_op(LOST), ordinary.clone().permanent(None)),
+        (record_op(LOST), ordinary.clone().permanent(Some(1))),
+        (named.clone(), ordinary.clone().permanent(Some(2))),
+        (named, ordinary.clone()),
+    ] {
+        let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
+        let upload = &checked.records[0];
+        let state = RecordState {
+            key: [30; 32],
+            collection: [31; 32],
+            policy: policy.clone(),
+            version: RecordVersion::new(3, 5),
+            deleted: false,
+        };
+        assert_eq!(
+            merge_checked_record(&held, Some(&state), upload, 8),
+            RecordMerge::Divergent { kept: true },
+            "{:?} over {policy:?}",
+            upload.put.policy
+        );
+        // At the record's own policy, the same upload replaces the older one.
+        let same = RecordState {
+            policy: upload.put.policy.clone(),
+            ..state
+        };
+        assert_eq!(
+            merge_checked_record(&held, Some(&same), upload, 8),
+            RecordMerge::Replace
+        );
+    }
+}
+
+#[test]
 fn test_upload_settled_proof_at_the_highest_step_is_taken() {
     // Of two SETTLED proofs for one claim, the one at the higher step is the one taken,
     // whatever their order in `proofs`.

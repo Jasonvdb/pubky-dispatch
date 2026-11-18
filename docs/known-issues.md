@@ -8,7 +8,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
-- **Client.** What a kept record job remembers about the delete it follows, and what the app keeps about feed entries it holds or processes ahead of a held one.
+- **Client.** What a kept record job remembers about the delete it follows.
 - **Service.** The rollback mark, kept separately from the account database, will cover every acknowledged write and a lower bound on the time the service can report. This changes the database schema and the mark files.
 
 **Additions still to come**

@@ -1,8 +1,9 @@
 //! Reading the feed (Switch spec 8.2, 8.3, 11; Switch wire 5.1, 7.4.4, 7.5).
 //!
 //! Each read follows the feed from the cursor to its end, page by page, the first page a
-//! long-poll when asked. Every page is checked against the chain view before anything on it
-//! is used. Then, in order:
+//! long-poll when asked. Every page is checked against the chain view, and against the first
+//! observations the app keeps of entries earlier pages showed, before anything on it is used:
+//! a page that contradicts either is a rollback (Switch spec 10.1). Then, in order:
 //!
 //! - **Entries** are opened with the held receive key their kid names and checked with the
 //!   core's recipient checks 1 to 9; the protocol does check 10 and returns the effect. A
@@ -97,8 +98,8 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
-    Processed, RetryEntry, Tx, encode, key,
+    HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -939,6 +940,20 @@ impl App {
         if restore_at_read == Some(super::state::RestorePending::Read) {
             chain.restore = None;
         }
+        // Two signed pages that contradict each other at a `seq` tell two histories: a
+        // rollback or fork. Nothing of the page is kept but its service time, as of every
+        // verified answer: the cursor and the observation stay as they were, the chain view
+        // is read again from the store at the next call, and the alarm stops the app until
+        // the user resolves it (Switch spec 10.1, wire 7.4.4).
+        if let Some(seq) = self.contradicted_observation(&page) {
+            return Err(self
+                .raise(Alarm::Rollback {
+                    reason: format!(
+                        "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at seq {seq}"
+                    ),
+                })
+                .await);
+        }
         let history_gap = checked.gap.map(|(verified_seq, _)| verified_seq);
         if let Some((verified_seq, checkpoint_seq)) = checked.gap {
             self.events.push(AppEvent::ContinuityUnverified {
@@ -1290,6 +1305,40 @@ impl App {
         Ok(())
     }
 
+    /// The first `seq` at which `page` contradicts the first observation the app keeps of an
+    /// entry an earlier page showed there: the observation of a held entry, and that of an
+    /// entry stored locally from the sequence the cursor follows, which a cooperative move
+    /// continues, at a `seq` the cursor hasn't passed, which later reads meet again. Every
+    /// item the page carries of a type this version reads is compared (Switch wire 7.5):
+    /// only that entry, accepted by the observation's time, may stand there. Another entry,
+    /// an `unreadable` or `missed` item, which take new `seq`s, or a chain item or stub at
+    /// that `seq` means the service signed two histories (Switch spec 10.1, wire 7.4.4).
+    fn contradicted_observation(&self, page: &FeedPage) -> Option<u64> {
+        let cursor = self.state.cursor;
+        let stored: HashMap<u64, EntryReceipt> = self
+            .state
+            .parked
+            .values()
+            .filter(|stored| {
+                self.same_sequence(stored.generation, cursor.generation) && stored.seq > cursor.seq
+            })
+            .map(|stored| (stored.seq, stored.receipt))
+            .collect();
+        page.items.iter().find_map(|item| {
+            let seq = item.seq();
+            let observed = self
+                .state
+                .held
+                .get(&seq)
+                .map(|held| held.receipt)
+                .or_else(|| stored.get(&seq).copied())?;
+            let same = matches!(item, FeedItem::Entry(entry)
+                if entry.entry_id == observed.entry_id
+                    && entry.accepted_at <= observed.read_at_ms);
+            (!same).then_some(seq)
+        })
+    }
+
     // ---------------------------------------------------------------------------------
     // Entries
 
@@ -1309,10 +1358,11 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        // The first observation of an entry held at this `seq` is kept: a page that shows
-        // another entry there, or this one accepted after that observation, contradicts what
-        // the service showed before, and is refused before anything of the entry is kept, so
-        // no kept observation ever precedes its entry's acceptance (Switch wire 7.4.4).
+        // The first observation of an entry held at this `seq` is kept, and only for that
+        // entry, accepted by then. A page that contradicts what an earlier page showed raised
+        // the alarm before any of its items was handled (`contradicted_observation`), and a page
+        // shows one item per `seq` (`FeedPage`), so no other entry takes the held receipt
+        // and no kept observation precedes its entry's acceptance (Switch wire 7.4.4).
         let receipt = match self.state.held.get(&item.seq) {
             Some(held)
                 if held.receipt.entry_id == item.entry_id
@@ -3120,8 +3170,8 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let held_doc = held.as_ref().map(|(doc, _)| doc);
-        let taken = identity::take_copy(&reader, &mut tx, &fetched, held_doc, now).await?;
+        let held = held.map(|(doc, _)| doc);
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now).await?;
         let doc = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
@@ -3131,18 +3181,7 @@ impl App {
                 self.commit(tx).await?;
                 return Ok(None);
             }
-            Ok(Taken::Newer) => fetched,
-            Ok(Taken::Same | Taken::Older) => {
-                let doc = held_doc.cloned().unwrap_or(fetched);
-                tx.put(
-                    &key::ident_doc(sender),
-                    &CachedDoc {
-                        doc: doc.signed().clone(),
-                        fetched_ms: now,
-                    },
-                )?;
-                doc
-            }
+            Ok(doc) => doc,
         };
         self.commit(tx).await?;
         Ok(Some((doc, true)))

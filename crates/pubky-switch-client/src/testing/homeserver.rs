@@ -15,6 +15,9 @@ use crate::transport::BoxFuture;
 /// Public files by identity and path.
 type Files = HashMap<([u8; 32], String), Vec<u8>>;
 
+/// An identity whose reads each move a clock on by some milliseconds before answering.
+type SlowReads = Option<([u8; 32], Arc<TestClock>, u64)>;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -32,8 +35,7 @@ pub struct TestHomeserver {
     /// How many of the next writes fail, and whether each failure is a lost answer: the
     /// file written, the writer told it failed.
     failing_writes: Mutex<(u32, bool)>,
-    /// An identity whose reads each move a clock on by some milliseconds before answering.
-    slow_reads: Mutex<Option<([u8; 32], Arc<TestClock>, u64)>>,
+    slow_reads: Mutex<SlowReads>,
 }
 
 impl TestHomeserver {

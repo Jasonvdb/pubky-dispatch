@@ -729,7 +729,9 @@ impl App {
                 let mut signed_time = None;
                 match next.public_identity_with_time(&mut signed_time).await {
                     Ok(public) => {
-                        let observed = next_started.min(public.server_time_ms()).min(clock.now_ms());
+                        let observed = next_started
+                            .min(public.server_time_ms())
+                            .min(clock.now_ms());
                         answer.version = answer.version.max(public.identity.version());
                         answer.copies.push((public.identity, observed));
                         if public.freeze.is_some() {

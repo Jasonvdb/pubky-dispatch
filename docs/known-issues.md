@@ -30,7 +30,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 ### Client
 
-- [data] **A deleted record can be forgotten before its repair applies.** A protocol can observe a deletion without holding the service cursor until its replacement write succeeds, including across a restart or restore from an older backup. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
+- [data] **A deleted record can be forgotten before its repair applies.** The client can durably deliver a deletion to its collection owner. The service cursor can still advance past the delete before a replacement write succeeds, including across restart or restore. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
 - [wrong result] **A write conflict can hide a rollback.** The client does not judge the view and head in a `409` answer for an older write, so a service showing an older version there raises no alarm. Treat a conflict that repeats against a version older than the one you hold as a possible rollback.
 - [wrong result] **A refused write the app follows is not compared with later ones.** After a protocol refuses a record's first write, a later answer showing an older write is not checked against it. Keep the protocol's own evidence of the refused version.
 - [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.

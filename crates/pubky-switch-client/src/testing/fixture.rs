@@ -344,6 +344,7 @@ impl TestSigner {
 /// beyond the cursor move, but for one built with [`TestProtocol::keeping`].
 #[derive(Debug, Default)]
 pub struct TestProtocol {
+    observes_deletes: bool,
     spec: ProtocolSpec,
     /// It keeps each message it receives in its local state.
     keeps: bool,
@@ -353,6 +354,12 @@ pub struct TestProtocol {
 }
 
 impl TestProtocol {
+    /// Retain each observed deletion's authenticated predecessor under its signed hash.
+    pub fn observing_deletions(mut self) -> Self {
+        self.observes_deletes = true;
+        self
+    }
+
     /// The protocol `spec` describes.
     pub fn new(spec: ProtocolSpec) -> Self {
         Self {
@@ -457,6 +464,22 @@ impl Protocol for TestProtocol {
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         lock(&self.missed).push(missed.clone());
         Ok(Vec::new())
+    }
+
+    fn record_put_back(
+        &self,
+        deletion: &crate::app::RecordDeletion<'_>,
+        _: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
+        Ok(deletion
+            .exact_value
+            .filter(|_| self.observes_deletes)
+            .map(|value| crate::app::PutBack::Observe {
+                observed: vec![LocalWrite::Put {
+                    key: deletion.item_hash.to_vec(),
+                    value: value.to_vec(),
+                }],
+            }))
     }
 
     fn collections(&self) -> Vec<Collection> {

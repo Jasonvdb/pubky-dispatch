@@ -201,6 +201,12 @@ impl App {
         {
             return false;
         }
+        if self.state.deletions.values().any(|d| {
+            let order = self.feed_order(d.generation, d.seq);
+            d.owner == name && (order < at || (order == at && handover == Handover::Through))
+        }) {
+            return false;
+        }
         !self.pending_calls.iter().any(|kept| {
             let order = self.feed_order(kept.generation, kept.seq);
             kept.names.iter().any(|owner| owner == name)

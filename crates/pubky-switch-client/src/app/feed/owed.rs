@@ -309,6 +309,7 @@ impl App {
             .collect::<Result<Vec<_>, AppError>>()?;
         queue.sort_by_key(|(order, ..)| *order);
         let mut kept = due.kept();
+        kept.extend(self.deletion_positions());
         kept.extend(queue.iter().map(|(_, (generation, seq), _, owed)| Kept {
             generation: *generation,
             seq: *seq,

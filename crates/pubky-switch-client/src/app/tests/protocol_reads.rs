@@ -1021,7 +1021,10 @@ async fn test_peer_lookup_reports_successor_service_observation_after_a_move() {
         }
         let first = wallet.finish_identity_lookup(switch).await.unwrap();
         assert_eq!(first.doc.version(), moved.version());
-        assert_eq!(first.homeserver_read_ms, homeserver_before_finish.then(|| p.clock.now_ms()));
+        assert_eq!(
+            first.homeserver_read_ms,
+            homeserver_before_finish.then(|| p.clock.now_ms())
+        );
         assert_eq!(first.switch_lookup_ms, service_time);
         assert_eq!(first.switch_read_ms, Some(service_time));
         assert_eq!(first.fresh_until_ms(), service_time + DOC_CACHE_MS);

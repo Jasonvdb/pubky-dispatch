@@ -13,11 +13,13 @@
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
-use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, is_renewal};
+use pubky_switch_core::records::{AppCert, AppRecord, AppRecordBody, IdentityDoc, is_renewal};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::{AppEvent, Duty};
+use super::next_body::{CertBody, NextBody};
+use super::own_record::RecordExpiries;
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
@@ -53,23 +55,193 @@ impl App {
         if self.state.own_doc.listed_cert(&me) != Some(renewal.hash()) {
             return Ok(false);
         }
-        let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-        let mut body = old.body().clone();
-        body.cert = renewal.signed().clone();
-        body.accepts = self.protocols.accepts(&renewal);
-        let record = self.sign_next_record(body, old.updated_at()).await?;
-        if !self
-            .take_cert(renewal, record.signed().clone(), true, None, at)
+        // One the protocols can't run with is refused before anything is built for it.
+        if let Some(refusal) = self.protocols.certificate_refusal(&renewal) {
+            self.refuse_cert(&renewal, refusal).await?;
+            return Ok(false);
+        }
+        // Another device may have taken it first: its record is built on, not over.
+        let later = match self.state.device.multi_device {
+            true => Box::pin(self.later_under(&renewal)).await?,
+            false => None,
+        };
+        let took = match later {
+            Some(later) => Box::pin(self.take_later(renewal, later, at)).await?,
+            None => {
+                let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+                let judged =
+                    Box::pin(self.judge_for_cert(&renewal, old.updated_at(), None)).await?;
+                Box::pin(self.take_cert(renewal, Taken::Judged(judged), None, at)).await?
+            }
+        };
+        if took {
+            self.deliver_record().await?;
+        }
+        Ok(took)
+    }
+
+    /// The own record the switch's directory holds when it carries `cert`.
+    async fn later_under(&mut self, cert: &AppCert) -> Result<Option<AppRecord>, AppError> {
+        let result = self.client.directory(None).await;
+        let me = self.state.meta.app_id;
+        Ok(self
+            .take(result)
             .await?
+            .apps
+            .into_iter()
+            .find(|app| app.app_id == me)
+            .map(|entry| entry.record)
+            .filter(|record| record.cert().hash() == cert.hash()))
+    }
+
+    /// Take `cert` with `later`, the record of the app the switch holds under it, another
+    /// device's: as it is ([`App::took_elsewhere`]), or, with a record change kept here,
+    /// signed anew over it, later than both ([`NextBody::over`]).
+    async fn take_later(
+        &mut self,
+        cert: AppCert,
+        later: AppRecord,
+        at: Option<(u64, u64)>,
+    ) -> Result<bool, AppError> {
+        if let Some(refusal) = self.protocols.certificate_refusal(&cert) {
+            self.refuse_cert(&cert, refusal).await?;
+            return Ok(false);
+        }
+        let taken = later.signed().clone();
+        let record = if self.state.pending_record.is_some() {
+            let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+            let previous = old.updated_at().max(later.updated_at());
+            Taken::Judged(self.judge_for_cert(&cert, previous, Some(&later)).await?)
+        } else {
+            Taken::AsIs(taken.clone())
+        };
+        self.take_cert(cert, record, Some(taken), at).await
+    }
+
+    /// The record held, signed once under `cert`, a renewal about to be taken, later than
+    /// `previous`, from the protocols' answers for it ([`CertBody::judged`]), with its
+    /// `app.put`; nothing is kept here. A record whose `app.put` is over the operation size
+    /// is an error, before anything changes.
+    /// Built `over` a later record under `cert` when given, whose other members were given
+    /// for `cert` already.
+    async fn judge_for_cert(
+        &mut self,
+        cert: &AppCert,
+        previous: u64,
+        over: Option<&AppRecord>,
+    ) -> Result<Judged, AppError> {
+        let asks = self.record_expiries().await?;
+        let updated_at = self.next_record_time(previous).await?;
+        let max_age = self.state.own_doc.record_max_age_ms();
+        let held = NextBody::held(&self.state)?;
+        let accepted = match &self.state.accepted {
+            Some(accepted) => Some(AppRecord::verify(accepted, &self.state.meta.identity)?),
+            None => None,
+        };
+        let mut asks = asks;
+        let (held, changed) = match over {
+            Some(later) => {
+                let accepted = accepted.as_ref().map(AppRecord::body);
+                let before = held.body().clone();
+                let (built, changed) = held.over(accepted, later, &self.protocols);
+                keep_asks(&mut asks, &before, built.body());
+                (built, changed)
+            }
+            None => (held, Vec::new()),
+        };
+        let judging = CertBody::judged(held, cert, &self.protocols, &asks, |ask| {
+            ask.at(updated_at, max_age).is_some()
+        });
+        let expires_at = self.resolve_record_expiries(&judging.asks, updated_at)?;
+        let record = judging
+            .body
+            .sign(&self.state.keys, updated_at, expires_at)?;
+        let record = self.read_back(&record)?;
+        let batch = self.record_batch(record.signed())?;
+        Ok(Judged {
+            record: record.signed().clone(),
+            pending: PendingRecord {
+                body: batch.body().to_vec(),
+            },
+            asks: judging.asks,
+            dropped: judging.dropped,
+            changed,
+        })
+    }
+
+    /// `taken`, a record of the app another device signed, replaces the one held, in `tx`:
+    /// each registered protocol whose member changed, is gone or is new is told
+    /// ([`AppEvent::MemberChanged`]); an ask goes with its member, and one whose member was
+    /// absent already stays ([`keep_asks`]).
+    async fn took_elsewhere(&mut self, tx: &mut Tx, taken: &SignedDoc) -> Result<(), AppError> {
+        let identity = self.state.meta.identity;
+        let held = AppRecord::verify(&self.state.record, &identity)?;
+        let taken = AppRecord::verify(taken, &identity)?;
+        let mut asks = self.record_expiries().await?;
+        if keep_asks(&mut asks, held.body(), taken.body()) {
+            tx.put(key::RECORD_EXPIRIES, &asks)?;
+        }
+        let changed = self.changed_from(held.body(), taken.body());
+        self.tell_changed(tx, changed)
+    }
+
+    /// The registered protocols whose member is new, changed or gone from `held` to `taken`.
+    fn changed_from(&self, held: &AppRecordBody, taken: &AppRecordBody) -> Vec<String> {
+        self.protocols
+            .names()
+            .into_iter()
+            .filter(|name| held.protocols.get(name) != taken.protocols.get(name))
+            .collect()
+    }
+
+    /// Take `later`, a record of the app another device signed under the certificate the
+    /// app presents and later than the one it holds, as it is ([`App::took_elsewhere`]),
+    /// in `tx`, as the feed or the published copy shows it. Not while a change is kept
+    /// here: its delivery meets `later` and goes over it. Returns whether it waits for a
+    /// protocol it changes that the read can't tell yet (`order` module).
+    pub(crate) async fn take_own_later(
+        &mut self,
+        later: &SignedDoc,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        let identity = self.state.meta.identity;
+        let held = AppRecord::verify(&self.state.record, &identity)?;
+        let Ok(record) = AppRecord::verify(later, &identity) else {
+            return Ok(false);
+        };
+        if self.state.pending_record.is_some()
+            || record.cert().hash() != self.state.cert.hash()
+            || record.updated_at() <= held.updated_at()
         {
             return Ok(false);
         }
-        self.deliver_record().await?;
-        Ok(true)
+        let changed = self.changed_from(held.body(), record.body());
+        if !changed.iter().all(|name| self.may_tell(name)) {
+            return Ok(true);
+        }
+        self.took_elsewhere(tx, later).await?;
+        tx.put(key::RECORD, later)?;
+        tx.put(key::ACCEPTED_RECORD, later)?;
+        self.state.record = later.clone();
+        self.state.accepted = Some(later.clone());
+        self.published_checked_ms = None;
+        Ok(false)
     }
 
-    /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
-    /// before it is sent. A certificate that reads a member of a collection of the protocol
+    /// Tell each protocol of `changed` its member is new, changed or gone, in `tx`
+    /// ([`AppEvent::MemberChanged`]).
+    fn tell_changed(&mut self, tx: &mut Tx, changed: Vec<String>) -> Result<(), AppError> {
+        for name in changed {
+            let duty = Duty::MemberChanged {
+                protocol: name.clone(),
+            };
+            self.keep_duty_for(tx, vec![name], duty)?;
+        }
+        Ok(())
+    }
+
+    /// Present `cert` from now on, with the record `taken`: one signed here is kept with its
+    /// `app.put` and asks, each member it dropped told ([`AppEvent::MemberDropped`]). A certificate that reads a member of a collection of the protocol
     /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
     /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
     ///
@@ -84,8 +256,7 @@ impl App {
     async fn take_cert(
         &mut self,
         cert: AppCert,
-        record: SignedDoc,
-        deliver: bool,
+        taken: Taken,
         accepted: Option<SignedDoc>,
         at: Option<(u64, u64)>,
     ) -> Result<bool, AppError> {
@@ -143,6 +314,10 @@ impl App {
             tx.delete(super::admission::LISTS_AT)?;
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
+        let (record, judged) = match taken {
+            Taken::Judged(judged) => (judged.record.clone(), Some(judged)),
+            Taken::AsIs(record) => (record, None),
+        };
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
@@ -152,12 +327,16 @@ impl App {
         if let Some(accepted) = &accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
         }
-        if deliver {
-            let pending = PendingRecord {
-                body: self.record_batch(&record)?.body().to_vec(),
-            };
-            tx.put(key::PENDING_RECORD, &pending)?;
-            self.state.pending_record = Some(pending);
+        let mut dropped = Vec::new();
+        match judged {
+            Some(judged) => {
+                tx.put(key::PENDING_RECORD, &judged.pending)?;
+                tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
+                self.state.pending_record = Some(judged.pending);
+                dropped = judged.dropped;
+                self.tell_changed(&mut tx, judged.changed)?;
+            }
+            None => Box::pin(self.took_elsewhere(&mut tx, &record)).await?,
         }
         self.state.record = record;
         if !keep_renewal {
@@ -169,6 +348,12 @@ impl App {
             self.published_checked_ms = None;
         }
         self.events.push(AppEvent::CertificateTaken { issued_at });
+        for protocol in dropped {
+            self.events.push(AppEvent::MemberDropped {
+                issued_at,
+                protocol,
+            });
+        }
         Ok(true)
     }
 
@@ -295,12 +480,29 @@ impl App {
                     "Switch wire 6.2: an app.put conflict naming another app's record".into(),
                 ));
             }
-            let body = mine.body().clone();
-            let record = self
-                .sign_next_record(body, held.updated_at().max(mine.updated_at()))
-                .await?;
+            // Another device's record under this certificate: its members are built on.
+            let mut body = NextBody::held(&self.state)?;
+            let mut changed = Vec::new();
+            if held.cert().hash() == self.state.cert.hash() {
+                let accepted = match &self.state.accepted {
+                    Some(accepted) => Some(AppRecord::verify(accepted, &self.state.meta.identity)?),
+                    None => None,
+                };
+                let accepted = accepted.as_ref().map(AppRecord::body);
+                (body, changed) = body.over(accepted, &held, &self.protocols);
+            }
+            // The asks of members gone from it go before it is signed.
+            let mut asks = Box::pin(self.record_expiries()).await?;
+            let cleared = keep_asks(&mut asks, mine.body(), body.body());
+            let previous = held.updated_at().max(mine.updated_at());
+            let updated_at = Box::pin(self.next_record_time(previous)).await?;
+            let record = self.sign_record_at(body, &asks, updated_at)?;
             batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
+            if cleared {
+                tx.put(key::RECORD_EXPIRIES, &asks)?;
+            }
+            self.tell_changed(&mut tx, changed)?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
                 body: batch.body().to_vec(),
@@ -361,8 +563,13 @@ impl App {
             // into the dropped body; and before the drop, so a crash between the two leaves
             // the kept record, whose re-send then finds the later record under the
             // certificate presented.
-            self.take_cert(cert.clone(), later.signed().clone(), false, None, None)
-                .await?;
+            self.take_cert(
+                cert.clone(),
+                Taken::AsIs(later.signed().clone()),
+                None,
+                None,
+            )
+            .await?;
         }
         if newer {
             self.take_own_copy(identity).await?;
@@ -372,6 +579,7 @@ impl App {
         let mut tx = self.tx()?;
         tx.delete(key::PENDING_RECORD)?;
         if taken {
+            self.took_elsewhere(&mut tx, &signed).await?;
             tx.put(key::ACCEPTED_RECORD, &signed)?;
             tx.put(key::RECORD, &signed)?;
         }
@@ -516,24 +724,9 @@ impl App {
             // is signed anew under this one, later than both records, and delivered by the
             // read, as `adopt_renewal` builds on a kept one: sent as it is, it would be
             // refused for its certificate, and read as the app not current.
-            let taken = entry.record.signed().clone();
-            let kept = self.state.pending_record.is_some();
-            let record = if kept {
-                let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-                let mut body = old.body().clone();
-                body.cert = cert.signed().clone();
-                body.accepts = self.protocols.accepts(&cert);
-                self.sign_next_record(body, old.updated_at().max(entry.record.updated_at()))
-                    .await?
-                    .signed()
-                    .clone()
-            } else {
-                taken.clone()
-            };
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            self.take_cert(cert, record, kept, Some(taken), None)
-                .await?;
+            Box::pin(self.take_later(cert, entry.record, None)).await?;
         }
         Ok(Listed::Key(key))
     }
@@ -569,4 +762,32 @@ pub(crate) fn delivered_record(batch: &Batch) -> Result<SignedDoc, AppError> {
             _ => None,
         })
         .ok_or_else(|| AppError::InvalidData("a kept app.put batch carries no record".into()))
+}
+
+/// The record [`App::take_cert`] presents with the certificate it takes.
+enum Taken {
+    /// The record held, signed here under that certificate ([`App::judge_for_cert`]).
+    Judged(Judged),
+    /// One another device signed, presented as it is: that device's protocols gave its
+    /// members ([`App::took_elsewhere`]).
+    AsIs(SignedDoc),
+}
+
+/// [`App::judge_for_cert`]: the record, its `app.put`, the asks it was signed with, and the
+/// protocols whose member it dropped.
+struct Judged {
+    record: SignedDoc,
+    pending: PendingRecord,
+    asks: RecordExpiries,
+    dropped: Vec<String>,
+    /// The registered protocols whose member held is another, gone or new in it.
+    changed: Vec<String>,
+}
+
+/// Keep in `asks` only those of members `built` carries, and those whose member `held`
+/// lacked already; returns whether any went.
+fn keep_asks(asks: &mut RecordExpiries, held: &AppRecordBody, built: &AppRecordBody) -> bool {
+    let before = asks.len();
+    asks.retain(|name, _| built.protocols.contains_key(name) || !held.protocols.contains_key(name));
+    asks.len() != before
 }

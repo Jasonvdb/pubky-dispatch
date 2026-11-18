@@ -44,6 +44,7 @@ mod held_cursor;
 mod identity;
 mod kept;
 mod keys;
+mod next_body;
 mod order;
 mod own_record;
 mod parked;
@@ -82,7 +83,7 @@ pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
-pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
+pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication, RecordExpiry};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
@@ -140,8 +141,8 @@ use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::keys::{AppKeys, ReceiveKey, ScopeKey, ScopeKeys};
 use pubky_switch_core::ops::{Condition, OpKind, Position};
 use pubky_switch_core::records::{
-    AppCert, AppRecord, AppRecordBody, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS,
-    IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord,
+    AppCert, AppRecord, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc,
+    ReceiveKeyBody, ReceiveKeyRecord,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -963,9 +964,9 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let mut body = AppRecordBody::new(&cert, protocols.accepts(&cert), now);
-            body.label = config.label.clone();
-            let record = AppRecord::sign(&keys, body)?;
+            let record =
+                next_body::CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
+                    .sign(&keys, now, None)?;
             let client = Self::client_for(&env, &meta, &keys, &cert)?;
             let batch = client.sign_batch(
                 meta.generation,

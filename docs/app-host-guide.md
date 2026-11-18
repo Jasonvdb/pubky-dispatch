@@ -23,6 +23,8 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `AppEvent::IdentityUpdated` | The client took a newer own identity document. Refresh the displayed membership and provider from it. |
 | `AppEvent::RenewalSeen` | The feed supplied a candidate renewal of this app's certificate. Keep using the held certificate while waiting for the identity to list the new one. |
 | `AppEvent::CertificateTaken` | The client committed a new certificate and its app record. Use the new permissions. A record delivery can still be pending. |
+| `AppEvent::MemberDropped` | The record signed for a renewal the app took has no member of the named protocol: the member it gave for the renewal broke the JSON rules or came with an expiry that can't be signed, or its expiry ask without a member can no longer be signed, or the protocol isn't registered on this device and the renewal removed a scope or permission. That protocol writes its member again on a device that runs it. |
+| `AppEvent::MemberChanged` | A duty event for the named protocol. The app took a record another device signed, and that protocol's member in it is new, changed or gone; a gone member takes its expiry ask. Write the member again if it is still wanted, then acknowledge. |
 | `AppEvent::CertificateRefused` | A proposed certificate could not run with the registered protocols. Tell every owner, show the reason and retain the current certificate. Ask the signer for a compatible renewal. |
 | `CertificateRefusal::UnownedRoot` | No registered protocol owns a scope root in the renewal. Correct the renewal or register the missing protocol at restore. |
 | `CertificateRefusal::Protocol` | The named protocol rejected this certificate. Use its reason to request a corrected one. |
@@ -229,7 +231,7 @@ Keep the local batch ID returned in `AppError::Kept`. Look it up with `kept_batc
 
 ## Publishing the app's own record and rotating keys
 
-Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
+Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member and expiry ask under that certificate; the default keeps both, so a protocol whose member depends on its scopes overrides it, and must not panic. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
 
 | Case | What happened and what to do |
 |---|---|
@@ -249,6 +251,14 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 | `AppEvent::KeysThrough` | The contiguous range for which the app holds its granted scope keys changed. Use the reported epoch to update readiness. |
 | `AppEvent::BundlePartSkipped` | A part failed a check, or the entire parts list could not be read. Show the reason and the range if available (a whole-list error carries `(0, 0)`). If `alert` is set, warn that the naming key differs and contact the signer. |
 | `AppEvent::FullBundleRequested` | The service accepted the request for a full key bundle. Wait for the signer to supply it and read again. |
+
+`member_for` takes and gives a protocol's expiry ask. `RecordExpiry` is non-exhaustive, so match it with a wildcard arm:
+
+| Ask | Meaning |
+|---|---|
+| `RecordExpiry::Never` | No expiry asked. |
+| `RecordExpiry::At` | An absolute expiry time. It must be later than the new record's time, or the member is dropped. |
+| `RecordExpiry::Lifetime` | A lifetime from each new record's time, capped by the identity's maximum record age. |
 
 `rotate` handles receive-key registration. `receive_key_numbers` shows the keys held. Use `fetch_key_bundle`, `keys_through`, `data_epoch` and `scope_key` for scope-key availability. Use `blind` for names derived under the app's `naming_key`. Treat keys and decrypted values as secrets. For devices sharing the same App ID, use authenticated private sync for `device_keys` and `take_device_keys`. Set `set_multi_device` on the giving device too. Sharing a cursor means missing history behind a checkpoint can require reconciliation with the other devices.
 

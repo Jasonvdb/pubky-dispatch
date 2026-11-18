@@ -530,6 +530,31 @@ pub enum AppEvent {
         /// The new certificate's `issued_at`.
         issued_at: u64,
     },
+    /// The record the app signed with a renewed certificate it took has no member of
+    /// `protocol` (Switch spec 3.2 step 3): the member its protocol gave for the certificate
+    /// broke the JSON rules or came with an ask that can't be signed, its ask without a
+    /// member can't be signed any more, or the protocol isn't
+    /// registered here and the certificate lacks a scope or permission of the one before.
+    /// Its protocol, where it runs, writes it again ([`super::App::set_protocol_member`]).
+    #[non_exhaustive]
+    MemberDropped {
+        /// The renewed certificate's `issued_at`.
+        issued_at: u64,
+        /// The protocol's name.
+        protocol: String,
+    },
+    /// The app took a record of its own that another device signed, and `protocol`'s
+    /// member in it is new, changed or gone from the record it held (Switch spec 3.2 step 3,
+    /// 4.2): the protocol writes it again if it still wants it
+    /// ([`super::App::set_protocol_member`]). The ask of a member gone goes with it. A
+    /// duty event, for that protocol.
+    #[non_exhaustive]
+    MemberChanged {
+        /// The duty event's ID.
+        id: EventId,
+        /// The protocol's name.
+        protocol: String,
+    },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
     /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
@@ -988,6 +1013,7 @@ impl AppEvent {
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
+            | Self::MemberChanged { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -1236,6 +1262,9 @@ pub(crate) enum Duty {
         issued_at: u64,
         refusal: CertificateRefusal,
     },
+    MemberChanged {
+        protocol: String,
+    },
 }
 
 impl Duty {
@@ -1402,6 +1431,7 @@ impl Duty {
                 issued_at,
                 refusal,
             },
+            Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
         }
     }
 }

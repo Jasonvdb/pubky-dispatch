@@ -227,6 +227,10 @@ async fn uncertain(w: &World, app: &mut App) -> (ParkedSummary, Message) {
     let id = app.stored_id_at(seq).unwrap();
     let entry = listed(app, id).await.unwrap();
     assert_eq!(entry.reason, ParkReason::Uncertain);
+    assert!(
+        !app.state.held.contains_key(&seq),
+        "stored, its feed observation goes"
+    );
     (entry, message)
 }
 

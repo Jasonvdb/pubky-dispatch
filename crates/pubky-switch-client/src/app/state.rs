@@ -465,6 +465,8 @@ pub(crate) struct HeldEntry {
     /// runs from it.
     pub(crate) since_ms: u64,
     pub(crate) receipt: EntryReceipt,
+    /// The acceptance time the page of the receipt showed: a later page shows the same.
+    pub(crate) accepted_at_ms: u64,
 }
 
 /// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry
@@ -1268,6 +1270,7 @@ mod tests {
                 &HeldEntry {
                     receipt: receipt(),
                     since_ms: seq,
+                    accepted_at_ms: seq,
                 },
             )
             .unwrap();
@@ -1288,7 +1291,8 @@ mod tests {
             held.get(&599),
             Some(&HeldEntry {
                 receipt: receipt(),
-                since_ms: 599
+                since_ms: 599,
+                accepted_at_ms: 599,
             })
         );
         assert_eq!(reader.get_raw(b"p/x").await.unwrap(), Some(b"1".to_vec()));

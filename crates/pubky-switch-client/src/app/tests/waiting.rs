@@ -1221,7 +1221,7 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
                 let mut held = observed;
                 match shown {
                     Shown::OtherEntry => held.receipt.entry_id[0] ^= 1,
-                    _ => held.receipt.read_at_ms = message.created_at_ms - 1,
+                    _ => held.accepted_at_ms -= 1,
                 }
                 tx.put(&key::held(held_seq), &held).unwrap();
                 held_seq

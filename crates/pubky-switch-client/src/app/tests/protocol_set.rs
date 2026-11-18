@@ -733,9 +733,10 @@ async fn test_protocol_set_owed_call_holds_only_its_own_protocol() {
 }
 
 /// Whatever an entry of the feed waits for while the cursor stays before it, the first
-/// observation of it is kept, through later reads that hold it again and a reload, so a later
-/// page that shows anything else at its `seq` raises the alarm; it goes once the entry is
-/// processed (Switch spec 8.2, 10.1; wire 7.4.4).
+/// observation of it is kept, through later reads that hold it again, a read that fails
+/// after its kept effect was dropped, and a reload, so a later page that shows anything else
+/// at its `seq` raises the alarm; it goes once the entry is processed, a kept effect sent
+/// again included (Switch spec 8.2, 10.1; wire 7.4.4).
 #[tokio::test]
 async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold() {
     #[derive(Clone, Copy, Debug)]
@@ -748,25 +749,33 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
         Conflict,
         /// Its effect is sealed under a data epoch the switch has moved past: a key wait.
         StaleEpoch,
-        /// The protocol's store fails.
-        Retry,
+        /// As `StaleEpoch`, the first key fetch failing the read after the effect is dropped.
+        KeyFetchFails,
+        /// A claim read, then its effect's answer is lost: the kept effect sent again
+        /// processes it.
+        LostAnswer,
+        /// The protocol's store fails, which kept an observation before through a write of
+        /// its own.
+        RetryAsBefore,
     }
     for hold in [
         Hold::OwedCall,
         Hold::ClaimRead,
         Hold::Conflict,
         Hold::StaleEpoch,
-        Hold::Retry,
+        Hold::KeyFetchFails,
+        Hold::LostAnswer,
+        Hold::RetryAsBefore,
     ] {
         let tasks = Named {
-            with_ops: matches!(hold, Hold::Conflict | Hold::StaleEpoch),
-            needs_claim: matches!(hold, Hold::ClaimRead),
+            with_ops: !matches!(hold, Hold::OwedCall | Hold::ClaimRead | Hold::RetryAsBefore),
+            needs_claim: matches!(hold, Hold::ClaimRead | Hold::LostAnswer),
             ..named("tasks")
         };
         let p = Pair::with(tasks, named("chat"));
         match hold {
             Hold::OwedCall => *p.tasks.failing_missed.lock().unwrap() = 3,
-            Hold::Retry => *p.tasks.retrying.lock().unwrap() = 2,
+            Hold::RetryAsBefore => *p.tasks.retrying.lock().unwrap() = 2,
             _ => {}
         }
         let mut app = p.join().await;
@@ -778,27 +787,42 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
             app.receive(None).await.unwrap();
         }
         let seq = p.send(me, "tasks.item");
-        // Twice the hold's cause, for two reads.
-        let (path, code, times) = match hold {
-            Hold::ClaimRead => ("claims/", ErrorCode::Unavailable, 2),
-            Hold::Conflict => ("ops", ErrorCode::Conflict, 4),
-            Hold::StaleEpoch => ("ops", ErrorCode::StaleEpoch, 2),
-            Hold::OwedCall | Hold::Retry => ("", ErrorCode::Unavailable, 0),
+        // The hold's cause, for two reads.
+        let error = |path: &str, code| Fault::Error {
+            path: path.into(),
+            code,
+            current: json!(null),
         };
-        for _ in 0..times {
-            p.w.switch.fail_next(Fault::Error {
-                path: path.into(),
-                code,
-                current: json!(null),
-            });
+        let faults = match hold {
+            Hold::ClaimRead => vec![
+                error("claims/", ErrorCode::Unavailable),
+                error("claims/", ErrorCode::Unavailable),
+            ],
+            Hold::Conflict => vec![error("ops", ErrorCode::Conflict); 4],
+            Hold::StaleEpoch => vec![error("ops", ErrorCode::StaleEpoch); 2],
+            Hold::KeyFetchFails => vec![
+                error("ops", ErrorCode::StaleEpoch),
+                error("/keys", ErrorCode::Unavailable),
+                error("ops", ErrorCode::StaleEpoch),
+            ],
+            Hold::LostAnswer => vec![
+                error("claims/", ErrorCode::Unavailable),
+                Fault::LoseAnswer { path: "ops".into() },
+            ],
+            Hold::OwedCall | Hold::RetryAsBefore => Vec::new(),
+        };
+        for fault in faults {
+            p.w.switch.fail_next(fault);
         }
-        app.receive(None).await.unwrap();
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::KeyFetchFails), "{hold:?}");
         assert!(app.cursor().seq < seq, "{hold:?}: held");
         let Some(first) = app.state.held.get(&seq).copied() else {
             panic!("{hold:?}: no observation kept")
         };
         p.w.clock.advance_ms(1);
-        app.receive(None).await.unwrap();
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::LostAnswer), "{hold:?}");
         assert!(app.cursor().seq < seq, "{hold:?}: held again");
         drop(app);
         let mut app = p.load(me).await.unwrap();
@@ -810,8 +834,9 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
         read(&mut app, 2).await;
         assert!(app.cursor().seq >= seq, "{hold:?}: processed");
         assert!(p.tasks.taken.lock().unwrap().contains(&seq), "{hold:?}");
+        assert!(app.state.parked.is_empty(), "{hold:?}: not stored");
         assert!(
-            !app.state.held.contains_key(&seq),
+            app.state.held.is_empty(),
             "{hold:?}: the observation goes with it"
         );
     }

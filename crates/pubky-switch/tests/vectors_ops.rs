@@ -172,7 +172,8 @@ async fn test_vectors_ops_operations() {
         let (status, answer) = post_body(&replay, "wallet", body, &at).await;
         expect_refused(case, status, &answer);
     }
-    // Unknown members at any depth of a signed operation, and integers out of the rule.
+    // Unknown members at any depth of a signed operation, integers out of the rule, and a
+    // permanent policy's member of another form.
     for case in operations["unknown_members"]["cases"]
         .as_array()
         .expect("cases")
@@ -183,6 +184,12 @@ async fn test_vectors_ops_operations() {
                 .expect("cases")
                 .iter()
                 .filter(|case| case["expect"]["status"].is_number()),
+        )
+        .chain(
+            operations["permanent_policies"]["rejections"]
+                .as_array()
+                .expect("rejections")
+                .iter(),
         )
     {
         let writer = case["writer"].as_str().expect("writer");
@@ -220,5 +227,14 @@ async fn test_vectors_ops_operations() {
     let (status, answer) = post_body(&replay, "wallet", body_of(&[largest, update]), &at).await;
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["proofs"].as_array().map(Vec::len), Some(2));
+    // Creates at a permanent policy, each a batch of its own: taken.
+    for case in operations["permanent_policies"]["cases"]
+        .as_array()
+        .expect("cases")
+    {
+        let (status, answer) = post_body(&replay, "wallet", body_of(&[case]), &at).await;
+        assert_eq!(status, 200, "{}: {answer}", case["name"]);
+        assert_eq!(answer["proofs"].as_array().map(Vec::len), Some(1));
+    }
     replay.db.drop_database().await.expect("drop");
 }

@@ -825,7 +825,7 @@ async fn test_feed_long_poll_behind_the_mark_answers_the_notice() {
             .marks
             .advance(
                 &alice_id(),
-                ahead,
+                keeping_count(&replay.marks, &alice_id(), ahead).await,
                 service_public(&replay),
                 mark_created_at(&replay, &alice_id()).await,
             )

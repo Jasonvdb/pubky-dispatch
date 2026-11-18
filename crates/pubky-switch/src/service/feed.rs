@@ -30,6 +30,7 @@ use crate::{
         error::{ApiError, ErrorCode},
     },
     keys::{ServiceSigner, sign_head},
+    marks::MarkTarget,
     store::{AccountHead, AccountTxn, CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
@@ -174,10 +175,24 @@ pub(super) struct PageRefusal {
 #[derive(Debug)]
 pub(super) struct SnapshotHead {
     tip: ChainTip,
+    /// The account's count of changed commits in the snapshot and its tag, which the mark
+    /// moves to with the head (Switch wire 7.3, "Moving it").
+    state_version: u64,
+    state_tag: [u8; 16],
+    /// Whether the snapshot's verdict is healthy: a serving account before its first chain
+    /// item moves its mark to its count.
+    healthy: bool,
     /// The creation time of the account the snapshot shows, whose mark the head moves.
     created_at_ms: u64,
     identity_key: [u8; 32],
     signer: ServiceSigner,
+}
+
+impl SnapshotHead {
+    /// Where its mark moves before its head goes out (Switch wire 7.3, "Moving it").
+    fn mark_target(&self) -> Option<MarkTarget> {
+        MarkTarget::of(self.tip, self.state_version, self.state_tag, self.healthy)
+    }
 }
 
 impl FeedStop {
@@ -788,17 +803,17 @@ impl Service {
                 if let Some(snapshot) = &refusal.snapshot {
                     let moved = if !self.lock_is_fresh() {
                         MarkMove::Failed
-                    } else if snapshot.tip.seq == 0 {
-                        MarkMove::Done
-                    } else {
+                    } else if let Some(target) = snapshot.mark_target() {
                         self.move_mark(
                             &read.account.id,
-                            snapshot.tip,
+                            target,
                             super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
                             snapshot.created_at_ms,
                             false,
                         )
                         .await
+                    } else {
+                        MarkMove::Done
                     };
                     match moved {
                         MarkMove::Done => {}
@@ -823,11 +838,11 @@ impl Service {
         // own request hasn't moved it yet (Switch wire 7.3 step 10).
         // Where the account was erased meanwhile, the request's own head is the erased
         // account's too: the refusal carries none.
-        if answered.head.tip.seq > 0 {
+        if let Some(target) = answered.head.mark_target() {
             match self
                 .move_mark(
                     &read.account.id,
-                    answered.head.tip,
+                    target,
                     super::PublicKeyBytes::public_key_bytes(&answered.head.signer),
                     answered.head.created_at_ms,
                     false,
@@ -924,11 +939,12 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
+            head.count(),
             head.created_at_ms,
             body.as_ref(),
             head.activation,
         );
-        let judged = self.judge(&read.account.id, Some(account)).await;
+        let judged = self.judge(&mut txn, &read.account.id, Some(account)).await;
         if judged.judgement.decision.erase_account_again {
             let committed_ms = txn.head().stamped_time_ms;
             drop(txn);
@@ -1066,12 +1082,18 @@ impl Service {
             self.account_input(
                 snapshot.generation,
                 snapshot.chain,
+                crate::account::Count {
+                    version: snapshot.state_version,
+                    tag: snapshot.state_tag,
+                },
                 snapshot.created_at_ms,
                 body.as_ref(),
                 snapshot.activation,
             )
         });
-        let judged = self.judge_with(&read.account.id, account, inputs).await;
+        let judged = self
+            .judge_with(self.store.pool(), &read.account.id, account, inputs)
+            .await;
         let routed = verdict::answer(
             &judged.judgement,
             &RequestClass::Ordinary,
@@ -1114,7 +1136,8 @@ impl Service {
                 });
             }
         };
-        // Judged healthy: the account is there.
+        let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
+        // Judged healthy or staged: the account is there.
         let Some(snapshot) = snapshot else {
             return Err(fallback(temporary(), read.time_ms));
         };
@@ -1132,6 +1155,9 @@ impl Service {
                     head: true,
                     snapshot: Some(SnapshotHead {
                         tip,
+                        state_version: snapshot.state_version,
+                        state_tag: snapshot.state_tag,
+                        healthy,
                         created_at_ms: snapshot.created_at_ms,
                         identity_key: read.account.identity_key,
                         signer: signer.clone(),
@@ -1162,6 +1188,9 @@ impl Service {
                 .map_or(0, |cursor| cursor.seq),
             head: SnapshotHead {
                 tip,
+                state_version: snapshot.state_version,
+                state_tag: snapshot.state_tag,
+                healthy,
                 created_at_ms: snapshot.created_at_ms,
                 identity_key: read.account.identity_key,
                 signer,
@@ -1759,6 +1788,8 @@ mod tests {
             generation: 1,
             last_seq,
             chain: None,
+            state_version: 0,
+            state_tag: [0; 16],
             start,
             window_end,
             current: current_at_nine(),

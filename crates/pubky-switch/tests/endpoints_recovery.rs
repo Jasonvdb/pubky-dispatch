@@ -323,6 +323,20 @@ async fn deliver(
     (replay.service.handle(request).await, signature)
 }
 
+/// Run the minute's maintenance before comparing the marks of two requests at this time.
+async fn sweep_before_delivery(replay: &Replay, at: u64) {
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(answer.status, 200);
+}
+
 /// alice serving at generation 1 with the vectors' chain through the phone's revocation,
 /// then an enrollment at the serving account naming [`HELD_REVOKED`]: the key the answer
 /// names, the service key, and the time after.
@@ -578,9 +592,11 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     assert_eq!(
         mark_of(&replay).await,
         AccountMark {
+            state_tag: state_tag_of(&replay, &alice_id()).await,
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
+            state_version: state_version_of(&replay, &alice_id()).await,
             key,
             created_at_ms: mark_before.created_at_ms,
         }
@@ -604,6 +620,52 @@ async fn held_and_kept(replay: &Replay) -> (i64, i64) {
         )
         .await,
     )
+}
+
+#[tokio::test]
+async fn test_recovery_held_revoked_apps_lost_to_a_restore_are_behind_the_mark() {
+    // An enrollment at a serving account holds its `revoked_apps` for the next generation:
+    // a counted write, which the mark covers before the answer goes out (Switch wire 7.3,
+    // "Moving it", Table 3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    assert_eq!(mark_of(&replay).await.state_version, count);
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let answer = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(held_and_kept(&replay).await, (1, 0));
+    assert_eq!(state_version_of(&replay, &alice_id()).await, count + 1);
+    assert_eq!(mark_of(&replay).await.state_version, count + 1);
+    // A restore that loses only that enrollment: the account is behind its mark, and no
+    // start of a later generation can then miss the held App ID unnoticed.
+    sql_on(
+        &replay,
+        &alice_id(),
+        &format!(
+            "WITH gone AS (DELETE FROM held_revoked_apps WHERE account_id = $1) \
+             UPDATE accounts SET state_version = {count} WHERE id = $1"
+        ),
+    )
+    .await;
+    let read = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(code(&read), (503, "recovery_required".to_string()));
+    assert_eq!(json_of(&read)["current"]["reason"], "behind");
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
@@ -792,6 +854,7 @@ async fn test_recovery_key_change_naming_the_same_key_is_400() {
     let Some(replay) = replay().await else { return };
     let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
+    sweep_before_delivery(&replay, at).await;
     let mark_before = mark_of(&replay).await;
     let change = key_change(&before, key);
     let (answer, _) = deliver(&replay, change, Some(before.hash()), at).await;
@@ -1049,6 +1112,7 @@ async fn test_recovery_in_place_refuses_an_app_an_enrollment_held() {
     assert_eq!(answer.status, 200);
     let key = answered_key(&answer);
     let before = held(&replay).await;
+    sweep_before_delivery(&replay, at).await;
     let mark_before = mark_of(&replay).await;
     assert!(before.body().apps.iter().any(|a| a.app_id == wallet_id));
     let recovery = next_generation(&before, key, Some(1));
@@ -1154,7 +1218,7 @@ async fn restored(replay: &Replay, fork: bool) -> u64 {
         };
         replay
             .marks
-            .write_anew(&alice_id(), beside, mark.key, mark.created_at_ms)
+            .write_anew(&alice_id(), at_head(beside), mark.key, mark.created_at_ms)
             .await
             .expect("a mark beside the state");
     } else {
@@ -1165,7 +1229,12 @@ async fn restored(replay: &Replay, fork: bool) -> u64 {
         };
         replay
             .marks
-            .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
+            .advance(
+                &alice_id(),
+                keeping_count(&replay.marks, &alice_id(), ahead).await,
+                mark.key,
+                mark.created_at_ms,
+            )
             .await
             .expect("a mark ahead of the state");
     }
@@ -1307,7 +1376,7 @@ async fn test_recovery_failing_start_is_above_the_marks_generation() {
         .marks
         .advance(
             &alice_id(),
-            ahead,
+            keeping_count(&replay.marks, &alice_id(), ahead).await,
             key,
             mark_created_at(&replay, &alice_id()).await,
         )
@@ -1395,9 +1464,11 @@ async fn test_recovery_failing_mark_lost_start_writes_the_mark_anew() {
     assert_eq!(
         mark_of(&replay).await,
         AccountMark {
+            state_tag: state_tag_of(&replay, &alice_id()).await,
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
+            state_version: state_version_of(&replay, &alice_id()).await,
             key,
             created_at_ms: created,
         }
@@ -3513,5 +3584,182 @@ async fn test_record_current_uploaded_reference_survives_restart_and_refused_gen
         .await;
     assert_eq!(read.status, 200);
     assert_eq!(json_of(&read), before);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's account's count and its tag, and her mark's.
+async fn count_and_mark(replay: &Replay) -> ((u64, [u8; 16]), (u64, [u8; 16])) {
+    let mark = mark_of(replay).await;
+    (
+        (
+            state_version_of(replay, &alice_id()).await,
+            state_tag_of(replay, &alice_id()).await,
+        ),
+        (mark.state_version, mark.state_tag),
+    )
+}
+
+#[tokio::test]
+async fn test_recovery_enrollment_retry_after_a_failed_mark_move_moves_the_mark() {
+    // A re-enrollment at a healthy account holds its `revoked_apps`, a counted write. Its
+    // mark can't move after the commit: `503`. The exact retry finds the receipt, and its
+    // `200` goes out only once the mark covers the account's count, so a restore that
+    // loses the held App ID is behind, never healthy (Switch wire 7.3, "Moving it").
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    assert_eq!(mark_of(&replay).await.state_version, count);
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let body = alice_enrollment_body(&replay, 3, Some(vec![HELD_REVOKED]), None, at).await;
+    let marks_dir = replay.key_dir().join("accounts").join("marks");
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only");
+    let failed = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body.clone(), at))
+        .await;
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(code(&failed), (503, "unavailable".into()));
+    assert_eq!(held_and_kept(&replay).await, (1, 0), "the commit held");
+    let ((state, _), (marked, _)) = count_and_mark(&replay).await;
+    assert_eq!((state, marked), (count + 1, count));
+    let retry = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, at))
+        .await;
+    assert_eq!(
+        retry.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    let (state, mark) = count_and_mark(&replay).await;
+    assert_eq!(mark, state, "the mark at the account's count and tag");
+    assert_eq!(state.0, count + 1, "the retry applied nothing again");
+    // A restore to the count before the enrollment loses the held App ID: behind.
+    sql_on(
+        &replay,
+        &alice_id(),
+        &format!(
+            "WITH gone AS (DELETE FROM held_revoked_apps WHERE account_id = $1) \
+             UPDATE accounts SET state_version = {count} WHERE id = $1"
+        ),
+    )
+    .await;
+    let read = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(code(&read), (503, "recovery_required".to_string()));
+    assert_eq!(json_of(&read)["current"]["reason"], "behind");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The key store of a service whose key changed (Switch spec 12.5): it signs every new
+/// answer with `new`, and still holds the old key, which the accounts no generation start
+/// has moved yet are answered with.
+struct ChangedKey {
+    old: std::sync::Arc<pubky_switch::keys::FileKeyStore>,
+    new: pubky_switch::keys::ServiceSigner,
+}
+
+impl pubky_switch::keys::KeyStore for ChangedKey {
+    fn current(&self) -> pubky_switch::keys::ServiceSigner {
+        self.new.clone()
+    }
+
+    fn signer_for(&self, public: &[u8; 32]) -> Option<pubky_switch::keys::ServiceSigner> {
+        use pubky_switch_core::signing::Signs;
+        if *public == self.new.public_key() {
+            Some(self.new.clone())
+        } else {
+            self.old.signer_for(public)
+        }
+    }
+
+    fn generate_as<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceKey> {
+        self.old.generate_as(id)
+    }
+
+    fn public_key<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
+        self.old.public_key(id)
+    }
+
+    fn signer<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
+        self.old.signer(id)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        id: &'a pubky_switch::keys::KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.old.delete(id)
+    }
+}
+
+#[tokio::test]
+async fn test_recovery_enrollment_after_a_service_key_change_keeps_the_marks_key() {
+    // After a service key change, an enrollment's answer names the new key, but the
+    // account is still answered with the key its document names: its mark moves to the
+    // enrollment's count and keeps that key until a generation start names the new one
+    // (Switch wire 7.3, Table 3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let old_key = service_public(&replay);
+    assert_eq!(mark_of(&replay).await.key, old_key);
+    let new = pubky_switch::keys::ServiceSigner::new(std::sync::Arc::new(
+        IdentityKey::from_secret([0x42; 32]),
+    ));
+    let new_key = {
+        use pubky_switch_core::signing::Signs;
+        new.public_key()
+    };
+    let service = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        std::sync::Arc::new(ChangedKey {
+            old: replay.keys.clone(),
+            new,
+        }),
+        replay.marks.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let body = alice_enrollment_body(&replay, 3, Some(vec![HELD_REVOKED]), None, at).await;
+    let answer = service
+        .handle(signer_request("POST", "/v1/enroll", body, at))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        answered_key(&answer),
+        new_key,
+        "the answer names the new key"
+    );
+    let (state, marked) = count_and_mark(&replay).await;
+    assert_eq!(marked, state, "the mark moved to the enrollment's count");
+    assert_eq!(mark_of(&replay).await.key, old_key, "and kept its key");
     replay.db.drop_database().await.expect("drop");
 }

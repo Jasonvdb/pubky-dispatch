@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use pubky_switch_client::clock::{Clock, TestClock};
 use pubky_switch_client::testing::{
-    ProtocolSpec, START_MS, SWITCH_ORIGIN, ScriptedSwitch, Seeds, TestHomeserver, TestIdentity,
-    TestSigner,
+    AppSpec, ProtocolSpec, START_MS, SWITCH_ORIGIN, ScriptedSwitch, Seeds, TestHomeserver,
+    TestIdentity, TestSigner, issue_cert,
 };
 use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
 use pubky_switch_client::{ClientError, Credentials, SwitchClient, TransportError};
@@ -183,6 +183,39 @@ async fn test_marks_restore_behind_the_mark_gets_the_notice() {
 }
 
 #[tokio::test]
+async fn test_marks_restore_dropping_a_counted_write_gets_the_notice() {
+    let alice = alice();
+    let switch = alice.switch();
+    let client = client(&alice);
+    client.apps().await.unwrap();
+    let marked = switch.mark().unwrap();
+    // bob's shop appends: a `seq` past the head, with no chain item, which counts and which
+    // the mark covers once it is acknowledged (Switch wire 7.3, "Moving it").
+    let bob = TestIdentity::new(&Seeds::default(), "bob");
+    let keys = bob.app_keys("shop");
+    let cert = issue_cert(bob.key(), &keys, &AppSpec::new(&["tasks"]), START_MS).unwrap();
+    let before = switch.seq();
+    let count = switch.state_version();
+    assert_eq!(switch.mark_state_version(), Some(count));
+    let seq = switch.send_envelope(bob.public(), &cert, vec![1; 32], &[]);
+    assert_eq!(seq, before + 1);
+    assert_eq!(switch.mark(), Some(marked), "the head stays");
+    assert_eq!(switch.mark_state_version(), Some(count + 1));
+    client.apps().await.unwrap();
+    // A restore of the state to before the append, its head as it was: behind, though the
+    // head is the mark's, as the service's one rule judges it (Switch wire 7.3, Table 1).
+    switch.restore_to(before);
+    assert_eq!(switch.state_version(), count);
+    let error = client.apps().await.unwrap_err();
+    assert_eq!(notice(&error), behind(1, false));
+    assert_eq!(
+        switch.mark_state_version(),
+        Some(count + 1),
+        "the mark stays"
+    );
+}
+
+#[tokio::test]
 async fn test_marks_notice_replaces_a_stale_timestamp() {
     // The notice goes also to a request the switch would refuse before authentication
     // (Switch wire 7.3, below Table 2).
@@ -342,6 +375,7 @@ async fn test_marks_lost_account_is_taken_over_by_an_enrollment() {
     let client = client(&alice);
     client.apps().await.unwrap();
     let marked = switch.mark().unwrap();
+    assert!(switch.mark_state_version() > Some(0));
     switch.lose_account();
     // No account, and a mark that records a head: the notice, at the mark's generation.
     assert_eq!(notice(&client.apps().await.unwrap_err()), behind(1, false));
@@ -364,6 +398,11 @@ async fn test_marks_lost_account_is_taken_over_by_an_enrollment() {
     let client = bound_client(&alice, answer.created);
     assert_eq!(answer.service_key, switch.service_key(), "the one key");
     assert_eq!(switch.mark(), Some(marked));
+    assert_eq!(
+        switch.mark_state_version(),
+        Some(0),
+        "the new account's count"
+    );
     assert_eq!(notice(&client.apps().await.unwrap_err()), behind(1, false));
     // A first document at generation 1 doesn't start above the mark: the notice. The
     // start above it goes through.

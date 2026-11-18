@@ -267,7 +267,7 @@ pub async fn run(options: &RetireOptions) -> Result<Retired, RetireError> {
             &options.identity,
             read.head.as_ref(),
             &read.mark,
-            read.stub_at_mark,
+            read.evidence,
             &view,
             retired,
             &options.origin,
@@ -316,10 +316,12 @@ mod tests {
 
     fn mark(generation: u64, seq: u64) -> MarkInput {
         MarkInput::Mark(AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: [1; 32],
             key: KEY,
+            state_version: 0,
             created_at_ms: 10,
         })
     }
@@ -329,6 +331,10 @@ mod tests {
             model: crate::account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 10,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -351,6 +357,7 @@ mod tests {
                 account: account.as_ref(),
                 mark,
                 stub_at_mark: None,
+                tag_at_mark: None,
                 erasure_at_ms: None,
                 retired: &[],
                 current_key: KEY,
@@ -406,6 +413,7 @@ mod tests {
             account: Some(&newer),
             mark: &older,
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[generation],
             current_key: KEY,
@@ -428,10 +436,12 @@ mod tests {
             Ok(3)
         );
         let newer = MarkInput::Mark(AccountMark {
+            state_tag: [0; 16],
             generation: 3,
             seq: 1,
             chain_hash: [1; 32],
             key: KEY,
+            state_version: 0,
             created_at_ms: 20,
         });
         let older = account(AccountState::Serving(tip(3)));

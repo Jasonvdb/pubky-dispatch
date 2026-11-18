@@ -423,6 +423,7 @@ impl Inner {
         fresh.enrolled = None;
         fresh.staged = true;
         fresh.marks = std::mem::take(&mut self.marks);
+        fresh.tags_made = self.tags_made;
         fresh.stamped_ms = self.stamped_ms;
         fresh.origin = self.origin.clone();
         fresh.enroll_limits = self.enroll_limits;
@@ -1101,6 +1102,8 @@ mod tests {
                         if generation == 0 {
                             mark.seq = 0;
                             mark.chain_hash = pubky_switch_core::chain::ZERO_HASH;
+                            mark.state_version = 0;
+                            mark.state_tag = 0;
                         }
                         inner.marks.slot = MarkSlot::At(mark);
                     } else {

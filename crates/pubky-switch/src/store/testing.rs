@@ -157,6 +157,10 @@ impl TestDatabase {
         let options = admin.clone().database(&name);
         let store = Store::connect_with(options.clone(), config).await?;
         store.migrate().await?;
+        // A test's own connections write an account's state directly, as a restore or a
+        // fault would: they carry the identity lock's mark for their whole session, which
+        // the schema's count trigger requires of every such write. The store's don't.
+        let options = options.options([("switch.locked", "on")]);
         Ok(Self {
             admin,
             name,
@@ -171,7 +175,8 @@ impl TestDatabase {
         &self.store
     }
 
-    /// Options to open more connections to the test database.
+    /// Options to open more connections to the test database, which may write an account's
+    /// state directly: outside the service's lock, and counted toward nothing.
     pub fn options(&self) -> &PgConnectOptions {
         &self.options
     }
@@ -181,20 +186,28 @@ impl TestDatabase {
         &self.name
     }
 
+    /// Options to open a connection to the test database as the service's store does, which
+    /// may write an account's state only under an identity's lock.
+    pub fn store_options(&self) -> PgConnectOptions {
+        self.admin.clone().database(&self.name)
+    }
+
     /// Open a connection to the server that may manage the test database.
     pub async fn admin(&self) -> Result<PgConnection, StoreError> {
         Ok(PgConnection::connect_with(&self.admin).await?)
     }
 
     /// Delete account `id`'s shared record at `key`, as a faulty service that lost it would:
-    /// reads answer `404` and listings leave it out (Switch spec 10.3.1 "Absence"). Whether
-    /// there was one.
+    /// reads answer `404` and listings leave it out (Switch spec 10.3.1 "Absence"). Written
+    /// directly, outside the service's lock, so it moves no count. Whether there was one.
     pub async fn drop_record(&self, id: &str, key: &[u8; 32]) -> Result<bool, StoreError> {
+        let mut conn = PgConnection::connect_with(&self.options).await?;
         let dropped = sqlx::query("DELETE FROM shared_records WHERE account_id = $1 AND key = $2")
             .bind(id)
             .bind(key.as_slice())
-            .execute(self.store.pool())
+            .execute(&mut conn)
             .await?;
+        let _ = conn.close().await;
         Ok(dropped.rows_affected() == 1)
     }
 

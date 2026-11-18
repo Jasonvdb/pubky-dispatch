@@ -42,6 +42,10 @@ pub struct FeedSnapshot {
     pub last_seq: u64,
     /// The newest chain item's `seq` and chain hash; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
+    /// The account's count of changed commits (Switch wire 7.3, "The state").
+    pub state_version: u64,
+    /// The tag written with the count's last move (Switch wire 7.3, "The state").
+    pub state_tag: [u8; 16],
     /// The latest checkpoint, which every page carries (Switch wire 7.4.4); `None` before the
     /// first.
     pub checkpoint: Option<SignedHead>,
@@ -225,8 +229,8 @@ pub(super) async fn read_feed(
         .await
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
-        "SELECT generation, last_seq, chain_seq, chain_hash, created_at_ms, stamped_time_ms, activation_requirement, \
-         identity_doc, r.checkpoint FROM accounts \
+        "SELECT generation, last_seq, chain_seq, chain_hash, state_version, state_tag, created_at_ms, \
+         stamped_time_ms, activation_requirement, identity_doc, r.checkpoint FROM accounts \
          LEFT JOIN chain_retention r ON r.account_id = accounts.id WHERE id = $1",
     )
     .bind(id)
@@ -281,6 +285,8 @@ pub(super) async fn read_feed(
         reader_kept,
         last_seq,
         chain,
+        state_version: from_db(row.try_get("state_version")?, "state_version")?,
+        state_tag: super::state_tag(row.try_get("state_tag")?)?,
         checkpoint,
         start,
         window_end,

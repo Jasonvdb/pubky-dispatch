@@ -71,6 +71,12 @@ struct Enrolled {
     limits: AnnouncedLimits,
     /// The account's creation time (Switch wire 3.7).
     created: u64,
+    /// The key the account is answered with, where it was judged healthy: its mark then
+    /// moves to the account's committed position before the answer goes out, whether this
+    /// enrollment or an earlier one with the same receipt moved its count (Switch wire 7.3,
+    /// "Moving it"). Never the enrollment's own signing key: the mark keeps its key until a
+    /// generation start names another (Table 3).
+    mark_key: Option<[u8; 32]>,
 }
 
 impl Service {
@@ -101,6 +107,7 @@ impl Service {
                 time_ms,
                 limits,
                 created,
+                ..
             }) => {
                 // The one place the answer is built (Switch wire 3.7).
                 let answer = EnrollmentAnswer::new(
@@ -286,6 +293,7 @@ impl Service {
                     Some(self.account_input(
                         head.generation,
                         head.chain,
+                        head.count(),
                         head.created_at_ms,
                         baseline.as_ref().map(IdentityDoc::body),
                         head.activation,
@@ -296,7 +304,13 @@ impl Service {
         };
         let store_id = self.marks.identity().await.map_err(|_| unavailable())?;
         let inputs = self.mark_inputs(identity_text).await;
-        let judged = self.judge_with(identity_text, account_input, inputs).await;
+        let reader = match &mut source {
+            Source::Empty(lock) => lock.conn(),
+            Source::Account(txn) => txn.conn(),
+        };
+        let judged = self
+            .judge_with(reader, identity_text, account_input, inputs)
+            .await;
         if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
             return Err(unavailable());
         }
@@ -429,6 +443,7 @@ impl Service {
             time_ms: created_at_ms,
             limits,
             created: created_at_ms,
+            mark_key: None,
         }))
     }
 
@@ -503,8 +518,10 @@ impl Service {
     /// identity's lock and the account's: it changes nothing by itself, but at a serving
     /// account its `revoked_apps` are held for the next generation, and at a staged account
     /// that no document names yet the mark's key becomes the key the answer names, durably
-    /// before the commit. A refusal comes with the time the account last committed, read
-    /// under its lock, or `None` where it came before the lock.
+    /// before the commit. At a healthy account the mark moves to the count it commits before
+    /// the answer is released (Switch wire 7.3, "Moving it"). A refusal comes with the time
+    /// the account last committed, read under its lock, or `None` where it came before the
+    /// lock.
     async fn enroll_at_account(
         &self,
         enrollment: &Enrollment,
@@ -531,7 +548,34 @@ impl Service {
             )
             .await
             .map_err(refused)?;
-        txn.commit().await.map_err(|e| refused(store_error(&e)))?;
+        // A commit that may move a mark waits for no stale instance lock (Switch spec 6.5).
+        if enrolled.mark_key.is_some() && !self.lock_is_fresh() {
+            return Err(refused(unavailable()));
+        }
+        let coverage = if enrolled.mark_key.is_some() {
+            crate::store::MarkCoverage::ServingPosition
+        } else {
+            crate::store::MarkCoverage::None
+        };
+        let committed = txn
+            .commit_with_mark(coverage)
+            .await
+            .map_err(|e| refused(store_error(&e)))?;
+        // At a healthy account the mark covers the committed position before any answer,
+        // a retry's included: the first answer may have failed after the commit, before its
+        // mark moved (Switch wire 7.3, "Moving it").
+        if let Some(key) = enrolled.mark_key
+            && let Some(target) = committed.mark_target
+        {
+            let created_at_ms = committed.head().created_at_ms;
+            if self
+                .move_mark(identity_text, target, key, created_at_ms, false)
+                .await
+                != super::marking::MarkMove::Done
+            {
+                return Err((unavailable(), Some(enrolled.time_ms)));
+            }
+        }
         Ok(enrolled)
     }
 
@@ -561,11 +605,13 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
+            head.count(),
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
             head.activation,
         );
-        let judged = self.judge(identity_text, Some(account)).await;
+        let judged = self.judge(txn, identity_text, Some(account)).await;
+        txn.retain_from_mark(judged.mark());
         let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
         if judged.judgement.decision.erase_account_again {
             return Err(unavailable());
@@ -604,6 +650,7 @@ impl Service {
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The selected SQL creation, read under the lock (Switch account binding 1.1).
         let created = binding.created().ok_or_else(unavailable)?;
+        let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
         // Read-only receipt recovery precedes freshness and never applies the intent again
         // (Switch account binding 3). Missing or evicted receipts prove no non-application.
         if let Some(receipt) = txn
@@ -624,6 +671,7 @@ impl Service {
                 time_ms: txn.head().stamped_time_ms,
                 limits,
                 created,
+                mark_key: healthy.then_some(judged.judgement.key),
             });
         }
         match enrollment.body().intent {
@@ -662,6 +710,7 @@ impl Service {
             time_ms,
             limits,
             created,
+            mark_key: healthy.then_some(judged.judgement.key),
         })
     }
 }

@@ -107,7 +107,7 @@ async fn append(db: &TestDatabase, replay: Option<&Replay>, id: &str, hashes: &[
                 .marks
                 .advance(
                     id,
-                    head,
+                    keeping_count(&replay.marks, id, head).await,
                     service_public(replay),
                     mark_created_at(replay, id).await,
                 )
@@ -130,7 +130,7 @@ async fn mark_at(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u8)
         .marks
         .advance(
             id,
-            head,
+            keeping_count(&replay.marks, id, head).await,
             service_public(replay),
             mark_created_at(replay, id).await,
         )
@@ -159,7 +159,7 @@ async fn mark_anew(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u
     };
     replay
         .marks
-        .write_anew(id, head, service_public(replay), created)
+        .write_anew(id, at_head(head), service_public(replay), created)
         .await
         .expect("write anew");
 }
@@ -264,6 +264,152 @@ async fn test_check_marks_reports_behind_fork_and_mark_lost() {
     );
     assert_eq!(report.summary.states[&MarkState::MarkLost], 1);
     assert_eq!(report.summary.needs_attention, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_check_marks_reports_counts_and_tags_for_behind_and_fork() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    let held = mark_of(&replay, &alice).await;
+    let line = find(&check(&replay, true).await.accounts, &alice).clone();
+    assert_eq!(line.state, MarkState::Healthy);
+    assert_eq!(line.head_count, Some(held.state_version));
+    assert_eq!(line.mark_count, Some(held.state_version));
+    assert_eq!(line.head_tag, Some(hex::encode(held.state_tag)));
+    assert_eq!(line.mark_tag, line.head_tag);
+    // The mark at the state's head with a higher count, then at its count with another
+    // tag: every chain position is there, and the counts tell what is missing.
+    let rewrite = async |state_version: u64, state_tag: [u8; 16]| {
+        replay.marks.delete(&alice).await.expect("delete");
+        replay
+            .marks
+            .write_anew(
+                &alice,
+                pubky_switch::marks::MarkTarget {
+                    head: held.head(),
+                    state_version,
+                    state_tag,
+                },
+                held.key,
+                held.created_at_ms,
+            )
+            .await
+            .expect("write anew");
+        find(&check(&replay, false).await.accounts, &alice).clone()
+    };
+    let line = rewrite(held.state_version + 1, held.state_tag).await;
+    assert_eq!(
+        (line.state, line.head_seq, line.mark_seq),
+        (MarkState::Behind, Some(held.seq), Some(held.seq))
+    );
+    assert_eq!(
+        (line.head_count, line.mark_count),
+        (Some(held.state_version), Some(held.state_version + 1))
+    );
+    let line = rewrite(held.state_version, [0x5a; 16]).await;
+    assert_eq!(line.state, MarkState::Fork);
+    assert_eq!(line.head_count, line.mark_count);
+    assert_eq!(line.mark_tag, Some(hex::encode([0x5a; 16])));
+    assert_ne!(line.head_tag, line.mark_tag);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_check_marks_reads_the_tag_at_the_acknowledged_count() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let id = alice_id();
+    let held = mark_of(&replay, &id).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&id)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.next_seq().expect("next seq");
+    let committed = txn.commit().await.expect("commit");
+    assert_eq!(committed.head().state_version, held.state_version + 1);
+    let report = check(&replay, true).await;
+    assert_eq!(find(&report.accounts, &id).state, MarkState::Healthy);
+
+    // The current count and its tag stay the same. Without the marked ancestor this
+    // database cannot account for the acknowledged commit.
+    write(
+        &replay.db,
+        &format!(
+            "DELETE FROM state_history WHERE account_id = '{id}' AND state_version = {}",
+            held.state_version
+        ),
+    )
+    .await;
+    let report = check(&replay, false).await;
+    assert_eq!(find(&report.accounts, &id).state, MarkState::Fork);
+    let answer = replay
+        .service
+        .handle(request("GET", &format!("/v1/{id}/identity"), &[], vec![]))
+        .await;
+    assert_eq!(answer.status, 503);
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("notice");
+    assert_eq!(body["current"]["reason"], "fork");
+    assert_eq!(mark_of(&replay, &id).await, held);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_check_marks_full_history_catches_up_after_a_read() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let id = alice_id();
+    let held = mark_of(&replay, &id).await;
+    // A database 1,024 commits ahead, with the acknowledged tag still retained.
+    let full = held.state_version + 1024;
+    write(
+        &replay.db,
+        &format!(
+            "INSERT INTO state_history (account_id, state_version, state_tag)
+         SELECT '{id}', n, uuid_send(gen_random_uuid()) FROM generate_series({}, {full}) n;
+         UPDATE accounts SET state_version = {full}, state_tag = h.state_tag
+         FROM state_history h WHERE accounts.id = '{id}' AND h.account_id = accounts.id
+         AND h.state_version = {full}",
+            held.state_version + 1
+        ),
+    )
+    .await;
+    let at = ms(&item_time(&vectors("chain.json")["items"][1])) + 120_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(at));
+    let apps = || signer_request("GET", &format!("/v1/{id}/apps"), Vec::new(), at);
+    assert_eq!(
+        replay.service.handle(apps()).await.status,
+        503,
+        "a sweep is due"
+    );
+    assert_eq!(state_version_of(&replay, &id).await, full);
+    assert_eq!(mark_of(&replay, &id).await, held);
+    assert!(!check(&replay, false).await.needs_attention());
+
+    // The public read commits no sweep. It can cover the durable position before the
+    // next counted write, even when the backlog is full.
+    let read = request("GET", &format!("/v1/{id}/identity"), &[], Vec::new());
+    assert_eq!(replay.service.handle(read).await.status, 200);
+    assert_eq!(mark_of(&replay, &id).await.state_version, full);
+    assert_eq!(replay.service.handle(apps()).await.status, 200);
+    assert_eq!(mark_of(&replay, &id).await.state_version, full + 1);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT state_version FROM state_history WHERE account_id = $1 ORDER BY state_version",
+    )
+    .bind(&id)
+    .fetch_all(&mut conn)
+    .await
+    .expect("retained positions");
+    let full = i64::try_from(full).expect("version");
+    assert_eq!(versions, [full, full + 1]);
+    conn.close().await.expect("close");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -498,11 +644,15 @@ async fn test_check_marks_summary_and_exit_status() {
         .map(|line| serde_json::from_str(line).expect("json"))
         .collect();
     assert_eq!(lines.len(), 4);
+    let head_tag = lines[0]["head_tag"].clone();
+    assert_eq!(head_tag.as_str().map(str::len), Some(32), "{head_tag}");
     assert_eq!(
         lines[0],
         serde_json::json!({
             "account": "behind", "hosted": true, "serving": true, "state": "behind",
-            "generation": 1, "permanent": false, "retired": [], "head_seq": 1, "mark_seq": 3
+            "generation": 1, "permanent": false, "retired": [], "head_seq": 1, "mark_seq": 3,
+            "head_count": 1, "mark_count": 0, "head_tag": head_tag,
+            "mark_tag": "00000000000000000000000000000000"
         })
     );
     assert_eq!(lines[3]["summary"]["needs_attention"], 3);

@@ -62,6 +62,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
+pub(crate) use account::MarkCoverage;
 pub use account::{
     AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
 };
@@ -430,7 +431,10 @@ impl Store {
     /// Take `id`'s identity lock (the module's "One identity at a time"): a transaction
     /// holding a transaction-level advisory lock on the identity until it ends. Waits at most
     /// `lock_timeout_ms` for a request, an enrollment or an erasure of the identity that
-    /// holds it ([`StoreError::LockTimeout`]).
+    /// holds it ([`StoreError::LockTimeout`]). The transaction is marked as one holding an
+    /// identity's lock, the only kind the schema's count trigger lets write an account's
+    /// state, so every such write is counted with its account's commit (Switch wire 7.3,
+    /// "The state").
     pub async fn lock_identity(&self, id: &str) -> Result<IdentityLock, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
         // READ COMMITTED whatever the pool's default, so what is read under the lock includes
@@ -440,7 +444,8 @@ impl Store {
             format!(
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
                  SET LOCAL lock_timeout = {}; \
-                 SELECT pg_advisory_xact_lock({})",
+                 SELECT pg_advisory_xact_lock({}); \
+                 SELECT set_config('switch.locked', 'on', true)",
                 self.lock_timeout_ms,
                 identity_lock_key(id)
             )
@@ -495,12 +500,19 @@ impl Store {
     /// mark reads (Switch wire 7.3 step 2) and the service time it last committed, for the
     /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
+        Self::lookup_with(&self.pool, id).await
+    }
+
+    pub(crate) async fn lookup_with<'a>(
+        reader: impl sqlx::PgExecutor<'a>,
+        id: &str,
+    ) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT generation, chain_seq, chain_hash, stamped_time_ms, created_at_ms, \
-             identity_doc, activation_requirement FROM accounts WHERE id = $1",
+            "SELECT generation, chain_seq, chain_hash, state_version, state_tag, stamped_time_ms, \
+             created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(reader)
         .await
         .map_err(StoreError::from_db)?;
         let Some(row) = row else {
@@ -525,6 +537,8 @@ impl Store {
             .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
             generation: from_db(row.try_get("generation")?, "generation")?,
             chain,
+            state_version: from_db(row.try_get("state_version")?, "state_version")?,
+            state_tag: state_tag(row.try_get("state_tag")?)?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
             identity_doc: doc
@@ -758,6 +772,10 @@ pub struct FoundAccount {
     pub generation: u64,
     /// Its newest chain item's `seq` and the chain hash there; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
+    /// Its count of changed commits (Switch wire 7.3, "The state").
+    pub state_version: u64,
+    /// The tag written with the count's last move (Switch wire 7.3, "The state").
+    pub state_tag: [u8; 16],
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// When it was created, in service time.
@@ -797,6 +815,10 @@ impl std::fmt::Debug for IdentityLock {
 }
 
 impl IdentityLock {
+    pub(crate) fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+
     /// Lock the identity's account's row too, the lock held on in the account's
     /// transaction; `None`, letting the identity's lock go, when there is no account.
     pub async fn account(self) -> Result<Option<AccountTxn>, StoreError> {
@@ -860,6 +882,11 @@ impl ReadinessCheck for StoreReadiness {
 /// Convert a `u64` to the `BIGINT` the database stores.
 pub(crate) fn to_db(value: u64, what: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange(what))
+}
+
+/// Read a stored count's tag (Switch wire 7.3, "The state").
+pub(crate) fn state_tag(value: Vec<u8>) -> Result<[u8; 16], StoreError> {
+    <[u8; 16]>::try_from(value.as_slice()).map_err(|_| StoreError::Corrupt("state_tag"))
 }
 
 /// Convert a stored `BIGINT` back to a `u64`.

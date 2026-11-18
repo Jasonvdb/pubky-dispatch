@@ -74,18 +74,20 @@ pub(super) async fn keep(
     max: u64,
     creating: bool,
 ) -> Result<(), StoreError> {
-    sqlx::query(
+    if creating || max > 1 {
+        sqlx::query(
         "INSERT INTO enrollment_answers (account_id, enrollment_hash, created_at_ms, store_id, answered_at_ms, creating) \
          VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
     )
     .bind(id).bind(hash.as_slice()).bind(time_to_db(receipt.created_at_ms)?).bind(receipt.store_id.as_slice())
     .bind(time_to_db(receipt.answered_at_ms)?).bind(creating)
     .execute(&mut *conn).await.map_err(StoreError::from_db)?;
-    let held = read(conn, id, hash)
-        .await?
-        .ok_or(StoreError::Corrupt("missing enrollment receipt"))?;
-    if held.created_at_ms != receipt.created_at_ms || held.store_id != receipt.store_id {
-        return Err(StoreError::Corrupt("enrollment receipt association"));
+        let held = read(conn, id, hash)
+            .await?
+            .ok_or(StoreError::Corrupt("missing enrollment receipt"))?;
+        if held.created_at_ms != receipt.created_at_ms || held.store_id != receipt.store_id {
+            return Err(StoreError::Corrupt("enrollment receipt association"));
+        }
     }
     sqlx::query(
         "DELETE FROM enrollment_answers WHERE account_id = $1 AND enrollment_hash IN ( \

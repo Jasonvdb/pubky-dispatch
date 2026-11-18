@@ -2558,3 +2558,89 @@ async fn test_ops_replaced_renewed_certificate_loses_its_document() {
     assert_eq!(shown_as(&items, seqs[1]), "chain");
     replay.db.drop_database().await.expect("drop");
 }
+
+/// alice's account's count, and the count her mark covers.
+async fn count_and_mark(replay: &Replay) -> (u64, u64) {
+    let mark = match replay.marks.read(&alice_id()).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.state_version,
+        other => panic!("no mark: {other:?}"),
+    };
+    (state_version_of(replay, &alice_id()).await, mark)
+}
+
+#[tokio::test]
+async fn test_claims_swept_tombstone_restored_is_behind_the_mark() {
+    // Step 4 deletes a due tombstone, and the read answers `404`: the deletion counts, and
+    // the mark covers it before the answer goes out. A restore to before it brings the
+    // tombstone back, which a read without trusted time would answer `200`: the account is
+    // behind its mark, and answers the notice instead (Switch wire 7.3, "The state").
+    let Some(replay) = registered(Limits::default(), true).await else {
+        return;
+    };
+    let sample = |replay: &Replay| {
+        use pubky_switch::time::Clock;
+        replay.time.note(
+            pubky_switch::time::TimeSample {
+                utc_ms: replay.clock.now_ms(),
+                uncertainty_ms: 0,
+            },
+            replay.clock.monotonic_ms(),
+        );
+    };
+    sample(&replay);
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(30, 1, vec![claim(ClaimType::Attempt, 0, Some(deadline))]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let ops = wallet_batch(31, 1, vec![claim(ClaimType::Done, 1, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    replay.clock.advance_ms(31 * DAY_MS);
+    sample(&replay);
+    save_image(&replay, &alice_id(), "before_sweep").await;
+    let (count, _) = count_and_mark(&replay).await;
+    let later = pubky_switch_core::time::rfc3339(ms(AT) + 31 * DAY_MS);
+    let (status, body) = read_claim(&replay, &later).await;
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    assert_eq!(count_and_mark(&replay).await, (count + 1, count + 1));
+    restore_image(&replay, &alice_id(), "before_sweep").await;
+    // A day on, the sample is too old: no trusted time.
+    replay.clock.advance_ms(DAY_MS);
+    let after = pubky_switch_core::time::rfc3339(ms(AT) + 32 * DAY_MS);
+    let (status, body) = read_claim(&replay, &after).await;
+    assert_eq!(
+        (
+            status,
+            body["code"].as_str(),
+            body["current"]["reason"].as_str()
+        ),
+        (503, Some("recovery_required"), Some("behind")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_sweeps_mark_the_minute_before_answering() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    wallet_request_at(&replay, &after(60_000)).await;
+    let counts = count_and_mark(&replay).await;
+    assert_eq!(counts.0, counts.1);
+    save_image(&replay, &alice_id(), "before_read").await;
+    wallet_request_at(&replay, &after(3 * 60_000)).await;
+    assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
+    save_image(&replay, &alice_id(), "after_sweep").await;
+    restore_image(&replay, &alice_id(), "before_read").await;
+    let at = after(3 * 60_000);
+    let (status, body) = read_claim(&replay, &at).await;
+    assert_eq!(
+        (status, body["current"]["reason"].as_str()),
+        (503, Some("behind"))
+    );
+    restore_image(&replay, &alice_id(), "after_sweep").await;
+    wallet_request_at(&replay, &at).await;
+    assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
+    replay.db.drop_database().await.expect("drop");
+}

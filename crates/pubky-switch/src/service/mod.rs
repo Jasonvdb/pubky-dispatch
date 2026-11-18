@@ -88,7 +88,7 @@ use crate::{
     limits::Limits,
     marks::MarkStore,
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
-    store::{AccountTxn, LockFreshness, Store, StoreError},
+    store::{AccountTxn, LockFreshness, MarkCoverage, Store, StoreError},
     time::TrustedTime,
 };
 
@@ -168,6 +168,9 @@ pub struct Service {
     /// its move.
     #[cfg(any(test, feature = "test-util"))]
     mark_move_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after a request's commit and mark move, before its answer is released.
+    #[cfg(any(test, feature = "test-util"))]
+    release_pause: parking_lot::Mutex<Option<RequestPause>>,
     /// A pause after a feed's mark move and before its final signing turn.
     #[cfg(any(test, feature = "test-util"))]
     feed_sign_pause: parking_lot::Mutex<Option<RequestPause>>,
@@ -441,6 +444,8 @@ impl Service {
             #[cfg(any(test, feature = "test-util"))]
             mark_move_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
+            release_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
             feed_sign_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
             feed_locked_pause: parking_lot::Mutex::default(),
@@ -508,6 +513,16 @@ impl Service {
     pub fn pause_next_mark_move(&self) -> RequestPause {
         let pause = RequestPause::default();
         *self.mark_move_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause the next answer of a request under an account's lock once its commit and mark
+    /// move are done, before it is released, until [`RequestPause::release`]: for tests of
+    /// a crash in between (Switch wire 7.3, "Moving it").
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_release(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.release_pause.lock() = Some(pause.clone());
         pause
     }
 
@@ -1145,11 +1160,13 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
+            head.count(),
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
             head.activation,
         );
-        let judged = self.judge(&identity, Some(account)).await;
+        let judged = self.judge(&mut txn, &identity, Some(account)).await;
+        txn.retain_from_mark(judged.mark());
         if let Some(store_id) = store_id
             && self.marks.identity().await.ok() != Some(store_id)
         {
@@ -1210,15 +1227,24 @@ impl Service {
         // sweeps of 9.1 run (`sweeps.rs`). It comes before the endpoint, so a refusal doesn't
         // undo it; an unauthenticated request, or the public read, pays for none of it. A
         // claim a request reads or writes goes when it is due, whatever the batch reached.
-        // Chain stub retention comes last (`retention.rs`).
+        // Chain stub retention comes last (`retention.rs`). What they delete counts toward
+        // the account's count like any other write (Switch wire 7.3, "The state").
+        // A failing or bounded account cannot cover maintenance in the state it is
+        // recovering from. Its authorized recovery or erasure makes its own changes.
         if let (Some(base), Some(_)) = (due, caller)
-            && let Err(error) = match self.step_four(&mut txn, base).await {
-                Ok(()) => self.retain_chain(&mut txn, &signer, healthy, base).await,
-                failed => failed,
-            }
+            && !matches!(
+                judged.judgement.decision.verdict,
+                verdict::Verdict::Failing { .. } | verdict::Verdict::Bounded { .. }
+            )
         {
-            let _ = store_error(&error);
-            return failed(txn);
+            let swept = match self.step_four(&mut txn, base).await {
+                Ok(()) => self.retain_chain(&mut txn, &signer, healthy, base).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = swept {
+                let _ = store_error(&error);
+                return failed(txn);
+            }
         }
         // A read after the lock takes this transaction's snapshot now, outside the endpoint's
         // savepoint, which can't export one.
@@ -1300,39 +1326,41 @@ impl Service {
                 None => return failed(txn),
             }
         };
-        let tip = txn.head().head_tip();
-        let moves_mark = (carries_head || answer.starts_generation) && tip.is_some();
-        // A commit that gives out a `seq`, signs a head or moves a mark waits for no stale
+        // A serving account before its first chain item has a position to move the mark to
+        // too (Switch wire 7.3, "The mark").
+        let has_position = txn.head().head_tip().is_some() || healthy;
+        // A commit that gives out a `seq`, signs a head or may move a mark waits for no stale
         // instance lock: another process may hold the database by now (Switch spec 6.5).
         let gives = txn.head().last_seq != txn.loaded().last_seq
             || txn.head().chain != txn.loaded().chain
             || answer.head.is_some()
             || fallback_head.is_some()
-            || moves_mark;
+            || ((healthy || carries_head || answer.starts_generation) && has_position);
         if gives && !self.lock_is_fresh() {
             tracing::error!("the instance lock isn't confirmed: a commit refused");
             return failed(txn);
         }
         let created_at_ms = txn.head().created_at_ms;
-        // The push keys the request let go (Switch wire 8.1), deleted once it commits.
+        // The push keys the request let go (Switch wire 8.1), deleted once the mark covers
+        // its commit: a restore to the state the mark covers may still name one.
         let owed = txn.owed_keys().to_vec();
-        let (store, keys) = (self.store.clone(), self.keys.clone());
         // Durable, then answered (step 10). An answer is sent even when the request only
-        // stamped the time, which must be durable before it is shown.
-        let commit = async move {
-            let committed = txn.commit().await.map(|_| ()).map_err(|failure| {
-                tracing::error!(%failure, "commit");
-            });
-            if committed.is_ok() && !owed.is_empty() {
-                erase::delete_owed(store, keys, owed).await;
-            }
-            committed
+        // stamped the time, which must be durable before it is shown. The commit runs to its
+        // end in a task of its own, also when the request is dropped meanwhile (a client that
+        // hangs up).
+        let coverage = if healthy {
+            MarkCoverage::ServingPosition
+        } else if carries_head || answer.starts_generation {
+            MarkCoverage::ChainHead
+        } else {
+            MarkCoverage::None
         };
-        // A commit that owes deleting keys runs to its end, deletions included, in a task of
-        // its own: a request dropped meanwhile (a client that hangs up) leaves no key to a
-        // sweep.
-        let committed = erase::to_the_end(commit).await.unwrap_or(Err(()));
-        if committed.is_err() {
+        let commit = async move {
+            txn.commit_with_mark(coverage).await.map_err(|failure| {
+                tracing::error!(%failure, "commit");
+            })
+        };
+        let Ok(committed) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
             // Nothing committed, the stamp included: the mark doesn't move.
             return Self::signed_error(
                 &signer,
@@ -1340,11 +1368,16 @@ impl Service {
                 AnswerTime::Account(committed_ms),
                 &unavailable(),
             );
-        }
-        // The mark moves to the committed head, durably, before the answer is released; a
-        // commit that held whose mark didn't move answers `503`, and its retry is answered as
-        // a retry (Switch wire 7.3, "Moving it").
-        if moves_mark && let Some(tip) = tip {
+        };
+        // The mark moves to the committed position, its head or the position before the
+        // first, with its count and tag, durably, before the answer is released: after a
+        // commit at a healthy account, one whose answer carries a head, or a generation
+        // start. This includes a refused erasure that committed the sweep before its
+        // savepoint (Switch wire 7.3). No answer carries a head where the verdict is behind or a fork,
+        // so no mark moves there but by a start. A commit that held whose mark didn't move
+        // answers `503`, and its retry is answered as a retry (Switch wire 7.3, "Moving it").
+        let target = committed.mark_target;
+        if let Some(target) = target {
             let moved = if answer.starts_generation
                 && matches!(routed.route, Route::StartAfresh)
                 && let Some(old) = judged
@@ -1355,7 +1388,7 @@ impl Service {
                     Some(store_id) => {
                         self.recover_older_mark(
                             &identity,
-                            tip,
+                            target,
                             answer_key,
                             created_at_ms,
                             *old,
@@ -1368,7 +1401,7 @@ impl Service {
             } else {
                 self.move_mark(
                     &identity,
-                    tip,
+                    target,
                     answer_key,
                     created_at_ms,
                     answer.starts_generation,
@@ -1376,12 +1409,26 @@ impl Service {
                 .await
             };
             if moved != marking::MarkMove::Done {
+                // The keys stay owed, for the deletion at the next start.
                 return Self::signed_error(
                     &answer_signer,
                     asked,
                     AnswerTime::Account(time_ms),
                     &unavailable(),
                 );
+            }
+        }
+        if target.is_some() && !owed.is_empty() {
+            // In a task of its own, so a request dropped meanwhile leaves no key to the next
+            // start's deletion.
+            let (store, keys) = (self.store.clone(), self.keys.clone());
+            let _ = erase::to_the_end(erase::delete_owed(store, keys, owed)).await;
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self.release_pause.lock().take();
+            if let Some(pause) = pause {
+                pause.wait().await;
             }
         }
         let mut answer = answer;

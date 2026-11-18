@@ -33,12 +33,16 @@ impl Account {
     /// `holds` says; else staged, judged by its chain where it holds one (an activated
     /// import), else holding none. `generation` is its row's: that of the `identity.json` it
     /// was enrolled with, or 1 for one enrolled without a document, until a generation
-    /// starts there, which makes it serve.
+    /// starts there, which makes it serve. `count` is its row's count of changed
+    /// commits with its tag, which its state compares with the mark's (Switch wire 7.3, "The
+    /// state").
+    #[allow(clippy::too_many_arguments)]
     pub fn judged(
         origin: &str,
         holds: impl Fn(&[u8; 32]) -> bool,
         generation: u64,
         chain: Option<(u64, [u8; 32])>,
+        count: account::Count,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
         activation: AccountActivation,
@@ -65,6 +69,7 @@ impl Account {
             model: account::Account {
                 activation,
                 state,
+                count,
                 created_at_ms,
                 document_generation: doc.map(|body| body.generation),
                 enrolled_generation: generation,
@@ -150,6 +155,8 @@ pub struct Inputs<'a> {
     /// The chain hash of the stub the service still holds at the mark's generation and
     /// `seq`, if it holds one.
     pub stub_at_mark: Option<[u8; 32]>,
+    /// The tag retained at the mark's positive count (Switch wire 7.3).
+    pub tag_at_mark: Option<[u8; 16]>,
     /// The time of the erasure's record for the identity, in Unix milliseconds, if there is
     /// one (Switch wire 7.4.16).
     pub erasure_at_ms: Option<u64>,
@@ -174,6 +181,7 @@ pub fn judge(inputs: &Inputs<'_>) -> Judgement {
         account: inputs.account.map(|account| &account.model),
         mark: &inputs.mark.model(),
         stub_at_mark: inputs.stub_at_mark,
+        tag_at_mark: inputs.tag_at_mark,
         erasure_at_ms: inputs.erasure_at_ms,
         retired: inputs.retired,
     });
@@ -281,10 +289,12 @@ mod tests {
 
     fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> AccountMark {
         AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
             key: MARK_KEY,
+            state_version: 0,
             created_at_ms,
         }
     }
@@ -305,6 +315,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 2,
@@ -315,6 +329,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -349,6 +367,7 @@ mod tests {
             account: account.as_ref(),
             mark: &mark,
             stub_at_mark: stub,
+            tag_at_mark: None,
             erasure_at_ms,
             retired,
             current_key: CURRENT,
@@ -422,10 +441,12 @@ mod tests {
     #[test]
     fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
         let marked = AccountMark {
+            state_tag: [0; 16],
             generation: 1,
             seq: 5,
             chain_hash: [1; 32],
             key: CURRENT,
+            state_version: 0,
             created_at_ms: 0,
         };
         // Past the mark in its generation, and at a later generation: the stub at the
@@ -449,6 +470,10 @@ mod tests {
                     seq: 3,
                     chain_hash: [2; 32],
                 }),
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 0,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -459,6 +484,7 @@ mod tests {
             account: Some(&serving),
             mark: &MarkInput::Mark(marked),
             stub_at_mark: Some([9; 32]),
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,
@@ -908,6 +934,7 @@ mod tests {
                 account: Some(&serving),
                 mark: &mark,
                 stub_at_mark: None,
+                tag_at_mark: None,
                 erasure_at_ms: Some(erasure_at_ms),
                 retired: &[],
                 current_key: CURRENT,
@@ -988,6 +1015,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::StagedImport(tip(3, 7, 1)),
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 3,
@@ -1000,6 +1031,7 @@ mod tests {
                 account: Some(account),
                 mark: &mark,
                 stub_at_mark: None,
+                tag_at_mark: None,
                 erasure_at_ms: None,
                 retired,
                 current_key: CURRENT,
@@ -1144,6 +1176,7 @@ mod tests {
             account: Some(&named),
             mark: &MarkInput::Missing,
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[0],
             current_key: CURRENT,
@@ -1176,6 +1209,7 @@ mod tests {
             account: Some(&serving),
             mark: &MarkInput::Missing,
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,
@@ -1199,6 +1233,7 @@ mod tests {
                 account: Some(staged),
                 mark: &mark,
                 stub_at_mark: None,
+                tag_at_mark: None,
                 erasure_at_ms: None,
                 retired: &[],
                 current_key: CURRENT,
@@ -1374,6 +1409,7 @@ mod tests {
                 holds,
                 2,
                 chain,
+                account::Count::default(),
                 5,
                 doc,
                 AccountActivation::Ordinary,
@@ -1785,6 +1821,7 @@ mod tests {
             account: Some(&named),
             mark: &mark(0, 0, 0),
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,
@@ -1895,6 +1932,7 @@ mod tests {
                 account: Some(&account),
                 mark: &MarkInput::Missing,
                 stub_at_mark: None,
+                tag_at_mark: None,
                 erasure_at_ms: None,
                 retired: &[],
                 current_key: CURRENT,
@@ -1925,6 +1963,7 @@ mod tests {
             account: Some(&account),
             mark: &MarkInput::Missing,
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,
@@ -1945,6 +1984,7 @@ mod tests {
             account: Some(&held),
             mark: &MarkInput::Mark(mark_created(2, 10, 1, 50)),
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,
@@ -1963,6 +2003,7 @@ mod tests {
             account: Some(&held),
             mark: &MarkInput::Mark(mark_created(2, 10, 1, 200)),
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: None,
             retired: &[],
             current_key: CURRENT,

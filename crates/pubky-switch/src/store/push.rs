@@ -67,6 +67,38 @@ impl std::fmt::Debug for OwedKey {
 }
 
 impl OwedKey {
+    pub(crate) async fn covered_by(
+        &mut self,
+        account: &str,
+        mark: Option<&crate::marks::AccountMark>,
+        erased: bool,
+    ) -> Result<bool, StoreError> {
+        let matches = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM push_registrations WHERE account_id = $1 AND push_key_id = $2) AND \
+             coalesce((SELECT created_at_ms = $3 AND state_version = $4 AND state_tag = $5 \
+                       AND coalesce(chain_seq, 0) = $6 AND (chain_seq IS NULL OR chain_hash = $7) \
+                       AND ($8 = generation OR ($8 = 0 AND state_version = 0)) \
+                       AND (state_version = 0 OR EXISTS (SELECT 1 FROM state_history h \
+                             WHERE h.account_id = a.id AND h.state_version = a.state_version \
+                             AND h.state_tag = a.state_tag)) \
+                       FROM accounts a WHERE id = $1), \
+                      $9 AND NOT EXISTS (SELECT 1 FROM accounts WHERE id = $1))",
+        )
+        .bind(account)
+        .bind(self.key.as_str())
+        .bind(mark.map(|m| to_db(m.created_at_ms, "created_at_ms")).transpose()?)
+        .bind(mark.map(|m| to_db(m.state_version, "state_version")).transpose()?)
+        .bind(mark.map(|m| m.state_tag.as_slice()))
+        .bind(mark.map(|m| to_db(m.seq, "seq")).transpose()?)
+        .bind(mark.map(|m| m.chain_hash.as_slice()))
+        .bind(mark.map(|m| to_db(m.generation, "generation")).transpose()?)
+        .bind(erased)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(matches)
+    }
+
     /// The key is deleted: the row goes, and the lock with it.
     pub async fn forget(mut self) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM erased_keys WHERE key_id = $1")

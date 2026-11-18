@@ -1373,7 +1373,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
         .marks
         .advance(
             &alice.id,
-            head,
+            keeping_count(&replay.marks, &alice.id, head).await,
             key,
             mark_created_at(&replay, &alice.id).await,
         )
@@ -1423,9 +1423,11 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
     assert_eq!(
         mark_of(&replay, &alice.id).await,
         AccountMark {
+            state_tag: [0; 16],
             generation: 1,
             seq: 5,
             chain_hash: [9; 32],
+            state_version: 0,
             key,
             created_at_ms: ms(T),
         },
@@ -1802,7 +1804,7 @@ async fn test_erase_lost_identity_under_a_stale_instance_lock_writes_nothing() {
         .marks
         .advance(
             &alice.id,
-            head,
+            keeping_count(&replay.marks, &alice.id, head).await,
             key,
             mark_created_at(&replay, &alice.id).await,
         )

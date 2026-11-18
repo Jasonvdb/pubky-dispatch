@@ -7,8 +7,8 @@
 
 -- One account per identity the service hosts (Switch spec 6.2).
 --
--- The row holds the account's position: the last seq given out, the chain head and the
--- stamped service time. Every request to the account locks this row, so one account's
+-- The row holds the account's position: the last seq given out, the chain head, the count
+-- of changed commits and the stamped service time. Every request to the account locks this row, so one account's
 -- operations are serialized (Switch spec 6.5).
 CREATE TABLE accounts (
     -- The identity's Pubky ID.
@@ -23,6 +23,17 @@ CREATE TABLE accounts (
     -- The newest chain item's seq and the chain hash there; both null before the first.
     chain_seq       BIGINT   CHECK (chain_seq > 0 AND chain_seq <= last_seq),
     chain_hash      BYTEA    CHECK (octet_length(chain_hash) = 32),
+    -- The count of changed commits (Switch wire 7.3, "The state"): one more for each commit
+    -- that changed any of the account's counted state, which `count_state_change` below
+    -- sees. Never reset while the row lasts; the mark keeps the value as of the last
+    -- acknowledged commit, and a restore that lost one leaves it behind the mark's.
+    state_version   BIGINT   NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+    -- A fresh random tag written with each move of the count, the zero tag before the
+    -- first: two states with the same count but different histories have different tags,
+    -- so a restore that lost one write and took another at the same count isn't taken for
+    -- the state the mark covers (Switch wire 7.3, "The state").
+    state_tag       BYTEA    NOT NULL DEFAULT '\x00000000000000000000000000000000'
+                             CHECK (octet_length(state_tag) = 16),
     -- The last service time the account stamped; it never goes back (Switch spec 10.1).
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
     -- When the account was created, in service time.
@@ -66,6 +77,13 @@ CREATE TABLE accounts (
     CHECK ((recovery_from IS NULL) = (recovery_declared_at_ms IS NULL))
 );
 
+CREATE TABLE state_history (
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    state_version BIGINT NOT NULL CHECK (state_version > 0),
+    state_tag BYTEA NOT NULL CHECK (octet_length(state_tag) = 16),
+    PRIMARY KEY (account_id, state_version)
+);
+
 -- App IDs the account keeps for good: revoked, departed, or named by an enrollment's
 -- revoked_apps, or removed in a verified document (Switch wire 3.3, 3.7, 9.1).
 CREATE TABLE kept_app_ids (
@@ -86,8 +104,8 @@ CREATE TABLE kept_app_ids (
     PRIMARY KEY (account_id, app_id)
 );
 
--- The chain: one row per chain item of a generation (Switch wire 6.6). Inbox entries and
--- cursor moves take seqs too, so seqs have gaps.
+-- The chain: one row per chain item of a generation (Switch wire 6.6). Inbox entries take
+-- seqs too, so seqs have gaps.
 CREATE TABLE chain_items (
     account_id   TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     generation   BIGINT  NOT NULL CHECK (generation >= 0),
@@ -536,8 +554,14 @@ CREATE TABLE handovers (
 -- committed registration names it, and one a replacement, a removal, a recovery in place or
 -- an erasure let go, owed until the key store deletes it. Written in the transaction that
 -- lets the key go, so its deletion is owed durably the moment nothing names it; the service
--- deletes each key, then drops the row: at once, and again at start for any a failure or a
--- crash left. No foreign key: the account may be gone by then.
+-- deletes each key, then drops the row: once the mark covers the commit that let it go, and
+-- again at start for any a failure or a crash left. No foreign key: the account may be gone
+-- by then.
+--
+-- `owe_push_key` writes a row from the request path outside the account's lock, before the
+-- key it owes is minted: no count moves for it. Losing that write to a restore changes no
+-- decision: the restored state has no registration naming the key, which nothing else ever
+-- names, so the key signs nothing and is at worst left unused in the key store.
 CREATE TABLE erased_keys (
     key_id          TEXT    PRIMARY KEY,
     account_id      TEXT    NOT NULL,
@@ -644,3 +668,127 @@ CREATE TABLE erasure_outcomes (
     attempt BYTEA NOT NULL CHECK (octet_length(attempt) BETWEEN 1 AND 4096),
     committed BOOLEAN NOT NULL
 );
+
+-- What an account's count of changed commits leaves out (Switch wire 7.3, "The state"),
+-- each with the reason losing it to a restore changes no later decision. Everything not
+-- listed is counted. This is the one list: `count_state_change` reads it, and a test
+-- checks it against the schema. Its kinds:
+-- - `column`: changes to the column `col` of table `tab` count nothing; `*` for the whole
+--   table.
+-- - `background`: table `tab` is also written outside an identity's lock, by the service's
+--   background work. Under the lock it is counted like any other table; outside it, its
+--   writes commit with no account's commit and count nothing.
+CREATE FUNCTION state_uncounted() RETURNS TABLE (kind TEXT, tab TEXT, col TEXT, reason TEXT)
+LANGUAGE sql IMMUTABLE AS $$ VALUES
+    ('column', 'accounts', 'state_version',
+     'the count itself'),
+    ('column', 'accounts', 'state_tag',
+     'the count''s tag, written with the count'),
+    ('column', 'state_history', '*',
+     'the count''s own record, retained until the mark covers it'),
+    ('column', 'accounts', 'stamped_time_ms',
+     'service time, stamped at nearly every request; that it never goes back is a rule of '
+     'its own (Switch spec 10.1)'),
+    ('column', 'apps', 'last_seen_ms',
+     'shown by GET /apps only; no decision reads it'),
+    ('column', 'sender_flags', '*',
+     'read only by GET /allow, which offers the signer a block; it admits or refuses '
+     'nothing, and a lost hit is like a flag that decayed'),
+    ('background', 'erased_keys', NULL,
+     'the row of a key the key store deleted goes once it is deleted, and a key is owed '
+     'before it is minted: a restored row has the deletion run again, a lost one leaves a '
+     'key nothing names, and a key owed deleting signs nothing'),
+    ('background', 'push_deliveries', NULL,
+     'the webhook worker commits attempts separately; after a restore its retry count '
+     'and registration require reconciliation before dispatch (Switch wire 8.2)')
+$$;
+
+-- Remember the first and last values of a touched row until commit. Replacing a row with
+-- its original value, or removing a row this request inserted, leaves no change to count.
+CREATE FUNCTION count_state_change() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    left_out TEXT[];
+    old_value JSONB;
+    new_value JSONB;
+    old_key JSONB;
+    new_key JSONB;
+BEGIN
+    IF coalesce(current_setting('switch.locked', true), '') <> 'on' THEN
+        IF EXISTS (SELECT 1 FROM state_uncounted() u
+                   WHERE u.kind = 'background' AND u.tab = TG_TABLE_NAME) THEN
+            RETURN NULL;
+        END IF;
+        RAISE EXCEPTION 'a write to %, an account''s state, outside an identity''s lock',
+            TG_TABLE_NAME;
+    END IF;
+    SELECT coalesce(array_agg(u.col), '{}') INTO left_out FROM state_uncounted() u
+        WHERE u.kind = 'column' AND u.tab = TG_TABLE_NAME;
+    IF '*' = ANY (left_out) THEN
+        RETURN NULL;
+    END IF;
+    IF TG_NARGS = 0 THEN
+        RAISE EXCEPTION 'no primary key columns for count_state_change on %', TG_TABLE_NAME;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN old_value := to_jsonb(OLD) - left_out; END IF;
+    IF TG_OP <> 'DELETE' THEN new_value := to_jsonb(NEW) - left_out; END IF;
+    IF old_value IS NOT DISTINCT FROM new_value THEN
+        RETURN NULL;
+    END IF;
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        IF to_regclass('pg_temp.switch_state_rows') IS NULL THEN
+            CREATE TEMP TABLE switch_state_rows (
+                relation OID, row_key JSONB, initial JSONB, final_value JSONB,
+                PRIMARY KEY (relation, row_key)
+            ) ON COMMIT DELETE ROWS;
+        END IF;
+        PERFORM set_config('switch.changed', 'on', true);
+    END IF;
+    IF old_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, old_value -> k) INTO old_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF new_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, new_value -> k) INTO new_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF old_key IS NOT NULL AND old_key IS DISTINCT FROM new_key THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, old_key, old_value, NULL)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = NULL;
+    END IF;
+    IF new_key IS NOT NULL THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, new_key,
+            CASE WHEN old_key = new_key THEN old_value END, new_value)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = excluded.final_value;
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION retained_state_change() RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        RETURN false;
+    END IF;
+    RETURN EXISTS (SELECT FROM pg_temp.switch_state_rows WHERE initial IS DISTINCT FROM final_value);
+END
+$$;
+
+-- Every table with an account column, and `accounts`, carries the trigger: a table is
+-- counted unless the list above leaves it out.
+DO $$
+DECLARE
+    t TEXT;
+    key_columns TEXT;
+BEGIN
+    FOR t IN
+        SELECT table_name FROM information_schema.columns
+        WHERE table_schema = current_schema() AND column_name = 'account_id'
+        UNION SELECT 'accounts'
+    LOOP
+        SELECT string_agg(quote_literal(a.attname), ', ' ORDER BY a.attnum) INTO STRICT key_columns
+        FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = t::regclass AND i.indisprimary;
+        IF key_columns IS NULL THEN RAISE EXCEPTION '% has no primary key', t; END IF;
+        EXECUTE format('CREATE TRIGGER count_state_change AFTER INSERT OR UPDATE OR DELETE '
+                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change(%s)', t, key_columns);
+    END LOOP;
+END
+$$;

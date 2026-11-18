@@ -225,6 +225,15 @@ impl Inner {
             }
         }
         let version = doc.version();
+        // A new copy changes what admits the sender: counted, as at the service (Switch
+        // wire 7.3, "The state").
+        if self
+            .peers
+            .get(sender)
+            .is_none_or(|held| held.body_hash() != doc.body_hash())
+        {
+            self.count_change();
+        }
         self.peers.insert(*sender, doc);
         (200, json!({ "version": version, "known_version": version }))
     }
@@ -962,6 +971,64 @@ mod tests {
             }
         }
         assert!(differences.is_empty(), "{}", differences.join("\n"));
+    }
+
+    #[test]
+    fn test_scripted_peers_copy_lost_to_a_restore_is_behind() {
+        // `PUT /peers` counts at the scripted switch as at the service: a stranger's copy,
+        // acknowledged at a serving account, moves the count and the mark; a restore that
+        // loses it is behind, though the head is the mark's (Switch wire 7.3, "The state").
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let own = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let mut policy = IdentityPolicy::default();
+        policy.connect_requests.enabled = true;
+        let key = inner.service.verifying_key().to_bytes();
+        let body = IdentityBody::first(
+            own.public(),
+            [0; 16],
+            Inbox::new(crate::testing::SWITCH_ORIGIN, key),
+            policy,
+        );
+        inner.doc = Some(IdentityDoc::sign(&own, body).unwrap());
+        assert_eq!(inner.judge(), super::super::marks::Verdict::Healthy);
+        let (seq, count) = (inner.seq, inner.state_version);
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let copy = IdentityDoc::sign(
+            &other,
+            IdentityBody::first(
+                other.public(),
+                [0; 16],
+                Inbox::new(crate::testing::SWITCH_ORIGIN, [5; 32]),
+                IdentityPolicy::default(),
+            ),
+        )
+        .unwrap();
+        let sender = Sender {
+            identity: other.public(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let mut request = foreign("PUT", "/peers", &cert);
+        request.body = serde_json::to_vec(copy.signed()).unwrap();
+        let (status, _) = inner.route_foreign(&request, &sender, "peers").unwrap();
+        assert_eq!(status, 200);
+        inner.settle_mark();
+        assert_eq!((inner.seq, inner.state_version), (seq, count + 1));
+        // The same copy again changes nothing, and counts nothing.
+        let (status, _) = inner.route_foreign(&request, &sender, "peers").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(inner.state_version, count + 1);
+        drop(inner);
+        assert_eq!(switch.mark_state_version(), Some(count + 1));
+        switch.restore_to(seq);
+        assert_eq!(switch.state_version(), count);
+        assert!(matches!(
+            switch.lock().judge(),
+            super::super::marks::Verdict::Failing(notice)
+                if notice.reason == pubky_switch_core::http::NoticeReason::Behind
+        ));
     }
 
     #[test]

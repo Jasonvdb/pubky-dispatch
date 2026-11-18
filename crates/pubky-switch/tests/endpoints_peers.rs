@@ -319,6 +319,93 @@ fn stranger_doc(seed: u8) -> ([u8; 32], SignedDoc) {
     )
 }
 
+/// alice's account's count of changed commits and her mark's.
+async fn counts(replay: &Replay) -> (u64, u64) {
+    let id = identity("alice")["pubky_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let mark = match replay.marks.read(&id).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.state_version,
+        other => panic!("no mark: {other:?}"),
+    };
+    (state_version_of(replay, &id).await, mark)
+}
+
+#[tokio::test]
+async fn test_peers_removal_lost_to_a_restore_is_behind_the_mark() {
+    use pubky_switch_core::records::RemovedApp;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let bob_v1 = doc("bob identity.json");
+    add_contact(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
+    // bob's shop is admitted, and delivers bob's version 1.
+    assert_eq!(
+        body(&from_shop(&replay, &bob_v1, &at).await),
+        json!({ "known_version": 1, "version": 1 })
+    );
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let held: String = sqlx::query_scalar("SELECT to_jsonb(p)::text FROM peer_copies p")
+        .fetch_one(&mut conn)
+        .await
+        .expect("copy");
+    let (count, marked) = counts(&replay).await;
+    assert_eq!(marked, count, "the mark covers the shop's delivery");
+    // alice's wallet delivers bob's version 2, which removes the shop: acknowledged with
+    // the head, and covered by the mark before the answer goes out (Switch wire 7.3).
+    let removed = changed("bob", &bob_v1, |body| {
+        let app = body.apps.remove(0);
+        body.removed.push(RemovedApp {
+            app_id: app.app_id,
+            distrust_from: ms(&at),
+        });
+        body.version = 2;
+    });
+    assert_eq!(
+        body(&from_wallet(&replay, &removed, &at).await),
+        json!({ "version": 2 })
+    );
+    assert_eq!(counts(&replay).await, (count + 1, count + 1));
+    assert_eq!(
+        status_and_code(&from_shop(&replay, &bob_v1, &at).await),
+        (403, json!("not_admitted"))
+    );
+    // A restore that loses only that write: bob's copy back at version 1, the count back,
+    // the mark as it was left.
+    sqlx::query(
+        "UPDATE peer_copies p SET doc = r.doc, version = r.version, generation = r.generation, \
+         body_hash = r.body_hash, removed = r.removed, delivered = r.delivered \
+         FROM jsonb_populate_record(NULL::peer_copies, $1::jsonb) r \
+         WHERE p.account_id = r.account_id AND p.identity = r.identity",
+    )
+    .bind(&held)
+    .execute(&mut conn)
+    .await
+    .expect("restore the copy");
+    sqlx::query("UPDATE accounts SET state_version = $1")
+        .bind(i64::try_from(count).expect("count"))
+        .execute(&mut conn)
+        .await
+        .expect("restore the count");
+    conn.close().await.expect("close");
+    // The removed shop isn't admitted on the older list: the account answers the notice,
+    // `behind` (Switch wire 7.3, Table 1).
+    let answer = from_shop(&replay, &bob_v1, &at).await;
+    assert_eq!(
+        (
+            answer.status,
+            body(&answer)["code"].clone(),
+            body(&answer)["current"]["reason"].clone()
+        ),
+        (503, json!("recovery_required"), json!("behind"))
+    );
+    assert_eq!(counts(&replay).await, (count, count + 1), "nothing counted");
+    replay.db.drop_database().await.expect("drop");
+}
+
 async fn held_copies(replay: &Replay) -> Vec<Vec<u8>> {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -708,5 +795,157 @@ async fn test_peers_document_that_doesnt_verify_is_400_for_every_caller() {
     // before admission and reads nothing held.
     assert_eq!(from_shop(&replay, &tampered, &at).await.status, 400);
     assert_eq!(from_wallet(&replay, &tampered, &at).await.status, 400);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's own `identity.json`, version 1 naming this service with connect requests on.
+fn alice_doc_here(replay: &Replay) -> IdentityDoc {
+    let key = IdentityKey::from_secret(hex32(&identity("alice")["secret_hex"]));
+    let mut policy = IdentityPolicy::default();
+    policy.connect_requests.enabled = true;
+    let body = IdentityBody::first(
+        key.public(),
+        [4; 16],
+        Inbox::new(ORIGIN, service_public(replay)),
+        policy,
+    );
+    IdentityDoc::sign(&key, body).expect("sign")
+}
+
+/// alice enrolled with an `identity.json` that names this service: serving before her
+/// first chain item. Her ID, her document and the time.
+async fn serving_without_a_chain(replay: &Replay) -> (String, IdentityDoc, String) {
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    set_time(&replay.clock, &at);
+    let id = identity("alice")["pubky_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let doc = alice_doc_here(replay);
+    let body = alice_enrollment_body(replay, 5, None, Some(doc.signed().clone()), ms(&at)).await;
+    let answer = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(&at)))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mark = mark_now(replay, &id).await;
+    assert_eq!((mark.generation, mark.seq, mark.state_version), (0, 0, 0));
+    (id, doc, at)
+}
+
+async fn mark_now(replay: &Replay, id: &str) -> pubky_switch::marks::AccountMark {
+    match replay.marks.read(id).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark,
+        other => panic!("no mark: {other:?}"),
+    }
+}
+
+/// alice's last given-out `seq`.
+async fn last_seq(replay: &Replay, id: &str) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let seq = sqlx::query_scalar("SELECT last_seq FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("seq");
+    conn.close().await.expect("close");
+    seq
+}
+
+fn notice_reason(answer: &SwitchResponse) -> (u16, Value, Value) {
+    (
+        answer.status,
+        body(answer)["code"].clone(),
+        body(answer)["current"]["reason"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn test_peers_copy_at_a_serving_account_without_a_chain_lost_to_a_restore_is_behind() {
+    // Serving before its first chain item, the account acknowledges a stranger's copy: a
+    // counted write, which moves the mark to the account's generation, `seq` 0 and its count
+    // (Switch wire 7.3, "The mark"). A restore that loses it is behind, so no `seq` the
+    // account gives out from then on can repeat one given out after the backup.
+    let Some(replay) = replay().await else { return };
+    let (id, own, at) = serving_without_a_chain(&replay).await;
+    save_image(&replay, &id, "before_copy").await;
+    let answer = from_shop(&replay, &doc("bob identity.json"), &at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mark = mark_now(&replay, &id).await;
+    let count = state_version_of(&replay, &id).await;
+    assert!(count > 0);
+    assert_eq!(
+        (mark.generation, mark.seq, mark.chain_hash),
+        (1, 0, pubky_switch_core::chain::ZERO_HASH),
+        "a mark before the first head"
+    );
+    assert_eq!(
+        (mark.state_version, mark.state_tag),
+        (count, state_tag_of(&replay, &id).await)
+    );
+    assert_eq!(last_seq(&replay, &id).await, 0);
+    restore_image(&replay, &id, "before_copy").await;
+    assert_eq!(
+        notice_reason(&from_shop(&replay, &doc("bob identity.json"), &at).await),
+        (503, json!("recovery_required"), json!("behind"))
+    );
+    // The signer's next version would take `seq` 1: it gets the notice, and no `seq` goes.
+    let mut next = own.body().clone();
+    next.version += 1;
+    let next = IdentityDoc::sign(
+        &IdentityKey::from_secret(hex32(&identity("alice")["secret_hex"])),
+        next,
+    )
+    .expect("sign");
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: next.signed().clone(),
+        prev: Some(own.hash()),
+    };
+    let put = signer_request_at_creation(
+        "PUT",
+        &format!("/v1/{id}/identity"),
+        delivery.to_json(),
+        ms(&at),
+        Some(mark.created_at_ms),
+    );
+    assert_eq!(
+        notice_reason(&replay.service.handle(put).await),
+        (503, json!("recovery_required"), json!("behind"))
+    );
+    assert_eq!(last_seq(&replay, &id).await, 0, "seq 1 not given out again");
+    assert_eq!(mark_now(&replay, &id).await, mark, "the mark stays");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_peers_account_without_a_chain_lost_entirely_is_lost() {
+    // The account took a counted write before its first chain item, then is lost entirely:
+    // its mark records a count, so the identity is lost, not unknown here (Switch wire 7.3,
+    // Table 1, row "None").
+    let Some(replay) = replay().await else { return };
+    let (id, _, at) = serving_without_a_chain(&replay).await;
+    let answer = from_shop(&replay, &doc("bob identity.json"), &at).await;
+    assert_eq!(answer.status, 200);
+    assert!(mark_now(&replay, &id).await.state_version > 0);
+    assert_eq!(
+        sql_on(&replay, &id, "DELETE FROM accounts WHERE id = $1").await,
+        1
+    );
+    assert_eq!(
+        notice_reason(&from_shop(&replay, &doc("bob identity.json"), &at).await),
+        (503, json!("recovery_required"), json!("behind"))
+    );
     replay.db.drop_database().await.expect("drop");
 }

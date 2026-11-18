@@ -3511,8 +3511,8 @@ async fn test_record_current_uploaded_reference_survives_restart_and_refused_gen
     let answer = upload(&replay, &upload_body, at).await;
     assert_eq!(answer.status, 200, "{}", json_of(&answer));
     let (key, _) = record_and_claim_keys();
-    let path = format!("/v1/{}/records/{key}?revision=1", alice_id());
-    let before = wallet_get(&replay, &format!("records/{key}?revision=1"), at).await;
+    let path = format!("/v1/{}/records/{key}", alice_id());
+    let before = wallet_get(&replay, &format!("records/{key}"), at).await;
     let op =
         SignedOp::peek(&serde_json::from_value(before["op"].clone()).expect("op")).expect("op");
     assert_eq!(

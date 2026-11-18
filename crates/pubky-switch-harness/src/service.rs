@@ -439,6 +439,28 @@ impl RealSwitch {
         .await
     }
 
+    /// `identity`'s record at `key` is dropped from the database, while the service is
+    /// stopped, as a faulty service that lost it would: reads answer `404` and listings
+    /// leave it out (Switch spec 10.3.1 "Absence").
+    ///
+    /// # Errors
+    ///
+    /// When the database holds no such record, or the service can't be started again.
+    pub async fn drop_record(
+        &mut self,
+        identity: &str,
+        key: &[u8; 32],
+    ) -> Result<(), HarnessError> {
+        self.while_stopped(async |database, _| {
+            if database.drop_record(identity, key).await.map_err(setup)? {
+                Ok(())
+            } else {
+                Err(setup(format!("{identity} holds no record at the key")))
+            }
+        })
+        .await
+    }
+
     /// The operator retires `generation` for `identity` with the service's own step
     /// ([`pubky_switch::retire`]), the service stopped as the step requires (Switch spec
     /// 6.5; Switch wire 7.3, Table 3).

@@ -170,7 +170,12 @@ pub fn version_holds<'a>(
 ///
 /// - the sealed value's data epoch is the current one (`data_epoch`), else `409 stale_epoch`
 ///   with `current.data_epoch`;
-/// - a later write repeats the record's collection and policy, else `400`;
+/// - a write over a record the service holds, live or deleted, a create included, repeats
+///   the record's collection and policy, its `permanent` member included, else `400`, before
+///   the versions are compared: a create's key derives from its policy (Switch wire 1.5), so
+///   a record held at that key under another policy came in without a derivation, from a
+///   recovery upload or an import, and a permanent key is never created again over it
+///   (Switch spec 10.3.1);
 /// - `expected_version` holds by [`version_holds`] against the held write (`current`, with
 ///   its application) and the operation's `conditions`; else `409 conflict`, whose `current`
 ///   carries `record` and the current write's `record_view` to a writer with the read scope
@@ -196,11 +201,10 @@ pub fn check_record_put<'a>(
         .with_current(json!({ "data_epoch": data_epoch })));
     }
     if let Some((held, _)) = current
-        && !put.expected_version.is_none()
         && (held.collection != put.collection || held.policy != put.policy)
     {
         return Err(Refusal::bad_request(
-            "Switch spec 10.3: a later write repeats the record's collection and policy",
+            "Switch spec 10.3: a write repeats the record's collection and policy",
         ));
     }
     let held = current.map(|(held, revision)| (held.version, revision));
@@ -641,6 +645,101 @@ mod tests {
                 .status(),
             400
         );
+    }
+
+    /// `put` with its policy `policy`, its key derived again for it.
+    fn put_at(policy: &Policy, expected: RecordVersion, epoch: u64, delete: bool) -> RecordPut {
+        let mut put = put(expected, epoch, delete);
+        let id = IdentityKey::from_secret([1; 32]);
+        let blinded = NamingKey::from_root(&id.switch_root()).blind(b"natural");
+        put.key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
+        put.policy = policy.clone();
+        put
+    }
+
+    #[test]
+    fn test_record_put_later_write_repeats_the_permanent_member() {
+        // A permanent record: a later write repeats its policy whole, the member included
+        // (Switch spec 10.3.1). One that drops it, or names another generation, could
+        // then delete the record as an ordinary one.
+        let ordinary = Policy::new("scope-a", &["scope-a"]);
+        for named in [None, Some(2)] {
+            let policy = ordinary.clone().permanent(named);
+            let held = RecordState::after(&put_at(&policy, RecordVersion::NONE, 1, false), 1, 6);
+            let at = RecordVersion::new(1, 6);
+            let mut same = put_at(&policy, at, 1, false);
+            assert!(
+                check_record_put(&same, &[], Some((&held, applied(1, 6))), 1, true, None).is_ok()
+            );
+            for other in [
+                ordinary.clone(),
+                ordinary.clone().permanent(Some(3)),
+                ordinary
+                    .clone()
+                    .permanent(if named.is_some() { None } else { Some(2) }),
+            ] {
+                same.policy = other.clone();
+                let refused =
+                    check_record_put(&same, &[], Some((&held, applied(1, 6))), 1, true, None)
+                        .unwrap_err();
+                assert_eq!(refused.status(), 400, "{policy:?} then {other:?}");
+                assert_eq!(refused.code, ErrorCode::BadRequest);
+            }
+            // A delete without the member: refused here too, whatever its own shape allows.
+            let mut dropped = put_at(&policy, at, 1, true);
+            dropped.policy = ordinary.clone();
+            assert_eq!(
+                check_record_put(&dropped, &[], Some((&held, applied(1, 6))), 1, true, None)
+                    .unwrap_err()
+                    .status(),
+                400
+            );
+        }
+    }
+
+    #[test]
+    fn test_record_put_create_over_a_held_record_repeats_its_policy() {
+        // After a provider loss, an upload that isn't a create fills a key the service
+        // lacks with the policy it names: nothing ties that key to a policy. An ordinary
+        // policy at a permanent key, deleted, isn't created again at `{0, 0}` with the
+        // permanent policy: a create over a held record repeats its policy, as a later
+        // write does, and so the key never reads as never written (Switch spec 10.3.1).
+        let permanent = Policy::new("scope-a", &["scope-a"]).permanent(None);
+        let create = put_at(&permanent, RecordVersion::NONE, 1, false);
+        let mut uploaded = put_at(&permanent, RecordVersion::new(1, 3), 1, false);
+        uploaded.policy = Policy::new("scope-a", &["scope-a"]);
+        let filled = RecordState::after(&uploaded, 1, 4);
+        assert_eq!(filled.key, create.key);
+        let mut delete = put_at(&permanent, RecordVersion::new(1, 4), 1, true);
+        delete.policy = filled.policy.clone();
+        assert!(
+            check_record_put(&delete, &[], Some((&filled, applied(1, 4))), 1, true, None).is_ok()
+        );
+        let deleted = RecordState::after(&delete, 2, 9);
+        assert!(deleted.deleted);
+        let refused =
+            check_record_put(&create, &[], Some((&deleted, applied(2, 9))), 1, true, None)
+                .unwrap_err();
+        assert_eq!(refused.status(), 400);
+        // Over the live record too, before the compare-and-swap.
+        let refused = check_record_put(&create, &[], Some((&filled, applied(1, 4))), 1, true, None)
+            .unwrap_err();
+        assert_eq!(refused.status(), 400);
+        // A create of the held policy passes the policy check and meets the compare-and-swap:
+        // `{0, 0}` doesn't hold over a kept delete, only once the service forgets the key.
+        let mut ordinary_create = create.clone();
+        ordinary_create.policy = filled.policy.clone();
+        let refused = check_record_put(
+            &ordinary_create,
+            &[],
+            Some((&deleted, applied(2, 9))),
+            1,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused.status(), 409);
+        assert!(check_record_put(&ordinary_create, &[], None, 1, true, None).is_ok());
     }
 
     /// A record write, chained at (`generation`, `seq`), and the proof of it signed by

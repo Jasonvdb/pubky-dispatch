@@ -227,6 +227,10 @@ CREATE TABLE shared_records (
     collection    BYTEA    NOT NULL CHECK (octet_length(collection) = 32),
     read_scope    TEXT     NOT NULL,
     write_scopes  TEXT[]   NOT NULL,
+    -- A permanent policy, and the generation it names, null for none (Switch wire 6.2): part
+    -- of the policy every later write repeats.
+    permanent     BOOLEAN  NOT NULL,
+    permanent_generation BIGINT CHECK (permanent_generation BETWEEN 1 AND 9007199254740991),
     -- The record's version: the write's generation and seq.
     generation    BIGINT   NOT NULL CHECK (generation >= 0),
     version       BIGINT   NOT NULL CHECK (version > 0),
@@ -270,6 +274,7 @@ CREATE TABLE shared_records (
     upload_base_op_hash BYTEA CHECK (octet_length(upload_base_op_hash) = 32),
     PRIMARY KEY (account_id, key),
     CHECK (NOT deleted OR value_bytes = 0),
+    CHECK (permanent OR permanent_generation IS NULL),
     CHECK (
         (from_upload AND proof IS NULL AND upload_seq IS NOT NULL
             AND upload_base_generation IS NULL AND upload_base_version IS NULL

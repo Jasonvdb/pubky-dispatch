@@ -332,6 +332,8 @@ pub(crate) struct Inner {
     /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
     pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
+    /// The next batch skips the operations' shape check, as a faulty switch would.
+    pub(crate) skip_shape_once: bool,
     next_erasure_outcome: Option<ErasureOutcome>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
@@ -485,6 +487,7 @@ impl Inner {
             dropped_through: 0,
             retention: Some(Retention::default()),
             faults: VecDeque::new(),
+            skip_shape_once: false,
             next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
@@ -1657,6 +1660,29 @@ impl ScriptedSwitch {
     /// takes from each app in an hour of its clock.
     pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
         self.lock().uploads_per_app_per_hour = uploads;
+    }
+
+    /// Apply the next batch without the operations' shape check (Switch wire 6.4 step 9), as a
+    /// faulty switch would: it signs its proofs of what it should have refused, such as a
+    /// delete at a permanent policy (Switch spec 10.3.1). For tests of what apps make of it.
+    pub fn skip_next_shape_check(&self) {
+        self.lock().skip_shape_once = true;
+    }
+
+    /// Drop the record at `key` from the switch's state, its divergent uploads with it, as a
+    /// faulty switch that lost it would: reads answer `404` and listings leave it out. For
+    /// tests of what an app makes of a record gone (Switch spec 10.3.1 "Absence").
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Missing`] for a key the switch holds no record at.
+    pub fn drop_record(&self, key: &[u8; 32]) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        inner.shared.divergent.remove(key);
+        match inner.shared.records.remove(key) {
+            Some(_) => Ok(()),
+            None => Err(ScriptError::Missing("no record at the key".into())),
+        }
     }
 
     /// Make record `key`, one the switch holds, divergent, as a recovery upload with a

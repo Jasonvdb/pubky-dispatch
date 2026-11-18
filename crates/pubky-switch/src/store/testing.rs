@@ -197,6 +197,18 @@ impl TestDatabase {
         Ok(PgConnection::connect_with(&self.admin).await?)
     }
 
+    /// Delete account `id`'s shared record at `key`, as a faulty service that lost it would:
+    /// reads answer `404` and listings leave it out (Switch spec 10.3.1 "Absence"). Whether
+    /// there was one.
+    pub async fn drop_record(&self, id: &str, key: &[u8; 32]) -> Result<bool, StoreError> {
+        let dropped = sqlx::query("DELETE FROM shared_records WHERE account_id = $1 AND key = $2")
+            .bind(id)
+            .bind(key.as_slice())
+            .execute(self.store.pool())
+            .await?;
+        Ok(dropped.rows_affected() == 1)
+    }
+
     /// Give out account `id`'s next `seq` without a chain item, as an inbox entry takes
     /// one (Switch spec 6.3), and commit.
     pub async fn give_out_seq(&self, id: &str) -> Result<u64, StoreError> {

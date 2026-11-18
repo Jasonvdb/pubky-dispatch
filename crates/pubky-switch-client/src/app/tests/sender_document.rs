@@ -109,6 +109,41 @@ async fn test_sender_document_unlisted_certificate_is_read_again_once_then_dropp
     assert_eq!(w.homeserver.identity_reads(&w.bob.public()), reads + 2);
 }
 
+/// Bob's Homeserver serves an older `identity.json` than the one the app holds: that read
+/// doesn't make the copy held fresh, so the next entry from bob reads the document again.
+#[tokio::test]
+async fn test_sender_document_older_copy_leaves_the_held_copy_stale() {
+    let w = World::new();
+    let mut app = app_holding_bobs_document(&w).await;
+    let bob = w.bob.public();
+    let older = w.homeserver.identity_doc(&bob).unwrap();
+    let mut body = older.body().clone();
+    body.version += 1;
+    w.homeserver
+        .publish(&IdentityDoc::sign(&w.bob, body).unwrap())
+        .unwrap();
+    // The copy held ages, and the next entry reads the newer one.
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS);
+    let reads = w.homeserver.identity_reads(&bob);
+    let (seq, _) = w.note(app.app_id(), "after the newer copy");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
+    // Ten minutes on, the Homeserver serves the older copy again.
+    w.homeserver.publish(&older).unwrap();
+    w.clock.advance_ms(crate::app::DOC_CACHE_MS);
+    let (seq, _) = w.note(app.app_id(), "after the older copy");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 2);
+    // A minute later the copy held is still past its 10 minutes: read again.
+    w.clock.advance_ms(60_000);
+    let (seq, _) = w.note(app.app_id(), "a minute later");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.homeserver.identity_reads(&bob), reads + 3);
+}
+
 fn held(events: &[AppEvent], seq: u64) -> bool {
     has(
         events,

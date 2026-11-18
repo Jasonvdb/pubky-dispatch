@@ -13509,6 +13509,111 @@ async fn test_record_publication_checks_a_second_delete_while_the_first_waits() 
 }
 
 #[tokio::test]
+async fn test_record_publication_keeps_the_cursor_until_a_read_covers_an_upload() {
+    for retry_first in [false, true] {
+        Box::pin(async {
+            let s = Setup::new();
+            let (mut writer, mut reader, target, deleted) = delete_for_put_back(&s).await;
+            let key = reader.record_key(&target).unwrap();
+            let id = reader.app_id();
+            read_on(&mut reader).await;
+            *s.protocol.pending_publication.lock().unwrap() = Some(
+                replacement_at(&reader, &key)
+                    .unwrap()
+                    .observation
+                    .delete
+                    .version,
+            );
+            let following = writer
+                .put_record(&target, &value(&["trusted", "next"]), vec![])
+                .await
+                .unwrap();
+            read_on(&mut reader).await;
+            s.w.switch
+                .make_divergent(writer.app_id(), key, [2; 32])
+                .unwrap();
+            let uploaded = s.w.switch.seq();
+            assert!(following.version.version < uploaded);
+            // Neither the publication retry nor the scheduled key read can reach the service yet.
+            for _ in 0..8 {
+                s.w.switch.fail_next(Fault::Unreachable {
+                    path: "/records/".into(),
+                    after: 0,
+                });
+            }
+            read_on(&mut reader).await;
+            assert_eq!(
+                reader.record_upload(&key).await.unwrap().unwrap().seq,
+                uploaded
+            );
+            assert!(s.w.switch.app(&id).cursor < deleted);
+            drop(reader);
+            let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+                .await
+                .unwrap();
+            *s.protocol.pending_publication.lock().unwrap() = None;
+            s.w.switch.lock().faults.clear();
+            let divergent = s.w.switch.lock().shared.divergent.remove(&key).unwrap();
+            let earlier = || {
+                s.w.switch.fail_next(Fault::Head {
+                    path: "/records/".into(),
+                    at: Some(following.version.version),
+                    forked: false,
+                })
+            };
+            // Both paths read the same signed application as it stood just before the upload.
+            earlier();
+            let hold = replacement_at(&reader, &key).unwrap().clone();
+            reader.try_put_back(hold).await.unwrap();
+            assert!(replacement_at(&reader, &key).is_some());
+            earlier();
+            assert!(matches!(
+                reader.read_record_fresh(&target).await.unwrap(),
+                RecordRead::Kept { record: Some(held), reason: KeptReason::Refused }
+                    if held.version == following.version && held.content == following.content
+            ));
+            assert!(replacement_at(&reader, &key).is_some());
+            let now = std::mem::replace(&mut s.w.switch.lock().seq, following.version.version);
+            s.w.switch.fail_next(Fault::Head {
+                path: "records?collection".into(),
+                at: Some(following.version.version),
+                forked: false,
+            });
+            assert_eq!(
+                reader
+                    .list_collection(&target.collection)
+                    .await
+                    .unwrap()
+                    .records,
+                1
+            );
+            s.w.switch.lock().seq = now;
+            assert!(replacement_at(&reader, &key).is_some());
+            assert_eq!(
+                reader.record_upload(&key).await.unwrap().unwrap().seq,
+                uploaded
+            );
+            reader.flush_cursor().await.unwrap();
+            assert!(s.w.switch.app(&id).cursor < deleted);
+
+            s.w.switch.lock().shared.divergent.insert(key, divergent);
+            if retry_first {
+                let hold = replacement_at(&reader, &key).unwrap().clone();
+                reader.try_put_back(hold).await.unwrap();
+                assert!(replacement_at(&reader, &key).is_none());
+            }
+            assert!(matches!(reader.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Fresh(record) if record.version == following.version && record.divergent));
+            assert!(replacement_at(&reader, &key).is_none());
+            read_on(&mut reader).await;
+            assert!(reader.record_upload(&key).await.unwrap().is_none());
+            assert!(s.w.switch.app(&id).cursor >= uploaded);
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn test_record_publication_protection_covers_the_interval_before_a_later_read() {
     Box::pin(async {
         let s = Setup::new();

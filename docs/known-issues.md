@@ -20,6 +20,8 @@ The client's public API for protocols and hosts is in place: record answers that
 
 If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
 
+While a protected deletion awaits publication, the service cursor stays before it until an observation of the following write covers any pending recovery upload and the collection accepts the value, or the duty is released.
+
 **Additions still to come**
 
 - **Client.** Automatic conditional publication over a deleted record or a competing live write still needs durable signed retry state.

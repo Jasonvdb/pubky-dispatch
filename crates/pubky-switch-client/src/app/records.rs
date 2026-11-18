@@ -766,6 +766,9 @@ pub(crate) struct Evidence<'a> {
     pub(crate) view_revision: Option<ApplicationRef>,
     /// What the answer showing the write is current at.
     pub(crate) current_at: CurrentAt,
+    /// Whether the service read covers the uploads for this key and collection.
+    /// A feed stub or own application proof has its own position instead.
+    view_covers_uploads: Option<bool>,
 }
 
 /// What an answer showing a write is current at (Switch spec 10.3): what an older write
@@ -908,6 +911,8 @@ pub(super) struct Accepted {
     writer: [u8; 16],
     /// The verified head or listing position at which a view showed this write.
     current_at: CurrentAt,
+    /// The observation reaches every upload due for this key and collection.
+    covers_uploads: bool,
     content: RecordContent,
     doubtful: bool,
 }
@@ -953,7 +958,8 @@ impl Accepted {
             return Ok(super::PutBackSuccessor::Wait);
         };
         let version = self.write.version.version;
-        if self.doubtful
+        if !self.covers_uploads
+            || self.doubtful
             || !self.write.version.authenticated
             || self.write.applied.generation != deletion.generation
             || version != RecordVersion::new(self.write.applied.generation, self.write.applied.seq)
@@ -1540,6 +1546,7 @@ impl App {
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
             current_at: at,
+            view_covers_uploads: Some(true),
         };
         let tx = self.tx()?;
         match self
@@ -2215,6 +2222,7 @@ impl App {
                 view_version: Some(record.version),
                 view_revision: Some(record.applied),
                 current_at: CurrentAt::Local,
+                view_covers_uploads: None,
             };
             self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
                 .await?;
@@ -2291,6 +2299,7 @@ impl App {
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
             current_at: at,
+            view_covers_uploads: Some(covers_uploads),
         };
         let read = self.read_write(&evidence, expect, key, tx).await?;
         // An earlier view can supply the signed write, while the latest upload's
@@ -2326,6 +2335,7 @@ impl App {
             view_version: None,
             view_revision: None,
             current_at: CurrentAt::Itself,
+            view_covers_uploads: None,
         };
         let key = put.key;
         let mut viewed = WriterView::NotRead;
@@ -2448,6 +2458,7 @@ impl App {
                 )),
                 view_revision: Some(current_view.revision),
                 current_at: at,
+                view_covers_uploads: Some(observed.covers_uploads),
             };
             outcome =
                 Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
@@ -2966,6 +2977,24 @@ impl App {
                 )));
             }
         };
+        // A signed successor can be learned at an earlier position, but only an
+        // observation covering the upload can release its deletion's service cursor
+        // (Switch spec 10.3, Switch wire 7.4.14).
+        let covers_uploads = match evidence.view_covers_uploads {
+            Some(covers) => covers,
+            None if evidence.current_at == CurrentAt::Itself
+                && super::put_back::at_key(&self.state.put_backs, &put.key)
+                    .next()
+                    .is_some() =>
+            {
+                let uploads = self.record_uploads(&put.key, &collection).await?;
+                self.covers_uploads(
+                    position(write.applied.generation, write.applied.seq),
+                    uploads,
+                )
+            }
+            None => false,
+        };
         Ok(Ok(Accepted {
             key: put.key,
             collection,
@@ -2976,6 +3005,7 @@ impl App {
             time,
             writer,
             current_at: evidence.current_at,
+            covers_uploads,
             content,
             doubtful,
         }))
@@ -3909,6 +3939,7 @@ impl App {
             view_version: None,
             view_revision: None,
             current_at: CurrentAt::Itself,
+            view_covers_uploads: None,
         };
         let key = put.key;
         match self

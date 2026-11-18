@@ -95,6 +95,7 @@ const COVERED: &[&str] = &[
     "KeyRecoveryStop",
     "AppFate",
     "BackupFound",
+    "KeyRecoveryKind",
 ];
 
 /// Public enums a host never receives or returns, so the guide needn't name their variants.

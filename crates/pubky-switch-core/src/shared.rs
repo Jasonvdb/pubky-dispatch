@@ -246,9 +246,12 @@ pub struct Dated {
 /// Date a `record.put` by the transition proof kept with the record (Switch wire 6.2
 /// "Accepting a write" step 2), with the newest own `identity.json` the app holds.
 ///
-/// A proof that verifies with the current service key must have a stub whose `item_hash` is
-/// the operation's, an `object` that is the record key, and a `state` whose generation and
-/// version are the stub's; it dates the write and gives its version. A proof of an earlier
+/// A proof of the document's own generation that verifies with the current service key must
+/// have a stub whose `item_hash` is the operation's, an `object` that is the record key, and
+/// a `state` whose generation and version are the stub's; it dates the write and gives its
+/// version. A proof is checked only with the key listed for the generation its stub names,
+/// so a lost generation's proof dates nothing even when it verifies with the current key,
+/// as after a provider loss at the same service (Switch wire 3.3). A proof of an earlier
 /// generation dates the write, without a version, when it verifies with the key `identity`
 /// lists for its stub's generation in `service_keys`, and its stub's `item_hash` is the
 /// operation's. Whether the stub contradicts a chain hash the app verified is the caller's
@@ -274,8 +277,11 @@ pub fn date_write(
     // proof whose stub names another generation than the operation is no proof of it.
     let of_its_generation =
         |env: &crate::chain::ChainEnvelope| env.generation == op.body().generation;
-    if let Ok(checked) = TransitionProof::verify(proof, &identity.inbox().service_key, &id) {
+    if let Ok(checked) = TransitionProof::verify(proof, &identity.inbox().service_key, &id)
+        && checked.envelope().generation == identity.generation()
+    {
         let env = checked.envelope();
+
         if env.item_type != ItemType::Op || env.item_hash != item {
             return bad("the proof's stub isn't the operation's");
         }
@@ -855,6 +861,10 @@ mod tests {
         let dated = date_write(&proof, &op, &doc).unwrap();
         assert_eq!(dated.version, None);
         // A generation service_keys doesn't name dates nothing.
+        assert!(date_write(&proof, &op, &identity_doc(2, new_key, &[])).is_err());
+        // Nor does a lost generation's proof that the current key signed, as after a provider
+        // loss at the same service: it gives no version.
+        let (op, proof) = written(1, 6, &new);
         assert!(date_write(&proof, &op, &identity_doc(2, new_key, &[])).is_err());
         // A proof of another operation dates nothing.
         let (other, _) = written(2, 7, &new);

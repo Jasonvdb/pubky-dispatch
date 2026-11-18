@@ -1,18 +1,22 @@
 //! A Homeserver of public files, in memory, failing on demand.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 
 use super::ScriptError;
 use crate::app::{HomeserverReader, HomeserverWriter};
+use crate::clock::TestClock;
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
 
 /// Public files by identity and path.
 type Files = HashMap<([u8; 32], String), Vec<u8>>;
+
+/// An identity whose reads each move a clock on by some milliseconds before answering.
+type SlowReads = Option<([u8; 32], Arc<TestClock>, u64)>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -31,6 +35,7 @@ pub struct TestHomeserver {
     /// How many of the next writes fail, and whether each failure is a lost answer: the
     /// file written, the writer told it failed.
     failing_writes: Mutex<(u32, bool)>,
+    slow_reads: Mutex<SlowReads>,
 }
 
 impl TestHomeserver {
@@ -96,6 +101,12 @@ impl TestHomeserver {
         *lock(&self.failing_writes) = (count, lose_answer);
     }
 
+    /// Make each read from `identity`'s Homeserver take `ms` on `clock`, which it moves on
+    /// before answering.
+    pub fn slow_reads(&self, identity: [u8; 32], clock: Arc<TestClock>, ms: u64) {
+        *lock(&self.slow_reads) = Some((identity, clock, ms));
+    }
+
     /// Take every Homeserver down, or bring them back.
     pub fn set_down(&self, down: bool) {
         *lock(&self.down) = down;
@@ -112,6 +123,11 @@ impl HomeserverReader for TestHomeserver {
             let mut reads = lock(&self.reads);
             let count = reads.entry((identity, path.clone())).or_insert(0);
             *count = count.saturating_add(1);
+        }
+        if let Some((slow, clock, ms)) = &*lock(&self.slow_reads)
+            && *slow == identity
+        {
+            clock.advance_ms(*ms);
         }
         let answer = if *lock(&self.down) {
             Err(TransportError::Connect("down".into()))

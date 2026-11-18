@@ -489,7 +489,7 @@ async fn test_callback_batches_only_the_over_limit_response_is_refused() {
             c.app.receive(None).await.unwrap();
         }
         c.reload().await;
-        let duties = c.app.pending_duty_events().await.unwrap();
+        let duties = crate::app::tests::pending_events(&mut c.app).await.unwrap();
         assert_eq!(
             duties
                 .iter()

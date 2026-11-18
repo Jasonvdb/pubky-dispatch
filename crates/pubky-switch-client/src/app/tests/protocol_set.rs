@@ -6,6 +6,7 @@ mod callback_batches;
 mod current_inputs;
 mod gap_completion;
 mod ownership;
+mod renewal_member;
 mod retained_authority;
 
 use std::sync::{Arc, Mutex};
@@ -79,7 +80,21 @@ struct Named {
     taken: Mutex<Vec<u64>>,
     /// Its collections.
     collections: Vec<crate::app::Collection>,
+    /// Its member of the record for a renewed certificate; the default's while `None`.
+    member_for: Mutex<Option<MemberFor>>,
+    /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
+    assign_kind: Mutex<bool>,
 }
+
+/// A [`Protocol::member_for`] of a test protocol.
+type MemberFor = fn(
+    Option<&serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+    &AppCert,
+) -> (
+    Option<serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+);
 
 fn named(name: &str) -> Named {
     Named {
@@ -266,11 +281,14 @@ impl Protocol for Named {
         }
     }
 
-    fn accepts(&self, _cert: &AppCert) -> Vec<String> {
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
         let mut kinds = vec![
             format!("{}.item", self.name),
             format!("{}.clear", self.name),
         ];
+        if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.push(format!("{}.assign", self.name));
+        }
         kinds.extend(self.foreign.clone());
         kinds
     }
@@ -415,6 +433,21 @@ impl Protocol for Named {
             );
         }
         Ok(!*self.holding.lock().unwrap())
+    }
+
+    fn member_for(
+        &self,
+        member: Option<&serde_json::Map<String, serde_json::Value>>,
+        ask: crate::app::RecordExpiry,
+        cert: &AppCert,
+    ) -> (
+        Option<serde_json::Map<String, serde_json::Value>>,
+        crate::app::RecordExpiry,
+    ) {
+        match *self.member_for.lock().unwrap() {
+            Some(member_for) => member_for(member, ask, cert),
+            None => (member.cloned(), ask),
+        }
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {
@@ -1063,6 +1096,58 @@ async fn test_protocol_set_join_refuses_a_certificate_a_protocol_refuses() {
     );
     let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
     assert!(p.store.is_empty(&ns));
+}
+
+/// Inspecting the kept duties names each one's owners, so a host gating `chat` on a pending
+/// duty sees that it is `tasks`'s alone, without taking it from the reports.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_names_its_owners() {
+    let p = Pair::with(
+        Named {
+            huge_missed: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(1, now, now);
+    read(&mut app, 2).await;
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert!(matches!(duty.event, AppEvent::LocalWritesRefused { .. }));
+    assert_eq!(duty.owners, ["tasks"]);
+}
+
+/// A duty for both protocols names both until one acknowledges it, then the other alone.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_owners_shrink_as_each_acknowledges() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(
+        &mut tx,
+        vec!["tasks".into(), "chat".into()],
+        crate::app::events::Duty::KeptBatchDropped { batch_id: [9; 16] },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert_eq!(duty.owners, ["tasks", "chat"]);
+    let id = duty.event.id().unwrap();
+    app.unacknowledged_events().await.unwrap();
+    app.ack_events_for("chat", id).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].owners, ["tasks"]);
 }
 
 #[tokio::test]

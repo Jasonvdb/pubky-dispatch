@@ -1210,41 +1210,41 @@ impl App {
     ///
     /// A store failure.
     pub async fn shared_evidence(&self) -> Result<SharedEvidence, AppError> {
-        Ok(self.shared_evidence_with_omissions().await?.0)
+        self.shared_evidence_with_details(None).await
     }
 
-    pub(super) async fn shared_evidence_with_omissions(
+    pub(super) async fn shared_evidence_with_details(
         &self,
-    ) -> Result<(SharedEvidence, super::LossInventoryDetails), AppError> {
+        mut details: Option<&mut super::LossInventoryDetails>,
+    ) -> Result<SharedEvidence, AppError> {
         let mut ops = Vec::new();
-        let mut records = Vec::new();
         for (key, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
-            let (version, followed, deleted) = held.base_write();
-            records.push(LossRecordApplication {
-                key: unb64_array(&key)
-                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
-                held: held.applied,
-                followed,
-                version,
-                deleted,
-                gone: held.gone,
-            });
+            if let Some(details) = details.as_deref_mut() {
+                let (version, followed, deleted) = held.base_write();
+                details.records.push(LossRecordApplication {
+                    key: unb64_array(&key)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                    held: held.applied,
+                    followed,
+                    version,
+                    deleted,
+                    gone: held.gone,
+                });
+            }
             ops.push(KeptOp {
                 op: held.op,
                 cert: held.cert,
                 proof: held.proof,
             });
         }
-        let (claim_ops, proofs, omitted) = self.claim_evidence_items().await?;
+        let (claim_ops, proofs, claim_entries_left_out) =
+            self.claim_evidence_items(details).await?;
         ops.extend(claim_ops);
-        Ok((
-            SharedEvidence {
-                ops,
-                proofs,
-                claim_entries_left_out: u64::try_from(omitted.len()).unwrap_or(u64::MAX),
-            },
-            super::LossInventoryDetails { records, omitted },
-        ))
+        Ok(SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out,
+        })
     }
 
     /// The protocol's mark of what the app has seen in record `key`, its high water.

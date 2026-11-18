@@ -1069,19 +1069,26 @@ impl App {
     /// which an upload can't carry (Switch wire 7.4.14).
     pub(crate) async fn claim_evidence_items(
         &self,
-    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>, Vec<super::OmittedClaimEntry>), AppError> {
+        mut details: Option<&mut super::LossInventoryDetails>,
+    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>, u64), AppError> {
         let identity = self.state.meta.identity;
         let mut ops = Vec::new();
-        let mut left_out = Vec::new();
+        let mut left_out = 0u64;
+        let mut omit = |entry: KeptEntry| {
+            left_out = left_out.saturating_add(1);
+            if let Some(details) = details.as_deref_mut() {
+                details.omitted.push(super::OmittedClaimEntry {
+                    op: entry.op,
+                    proof: entry.proof,
+                });
+            }
+        };
         for (_, entry) in self.reader().scan::<KeptEntry>(ENTRY_PREFIX).await? {
             let Some(writer) = SignedOp::peek(&entry.op)
                 .ok()
                 .and_then(|op| op.body().app_id)
             else {
-                left_out.push(super::OmittedClaimEntry {
-                    op: entry.op,
-                    proof: entry.proof,
-                });
+                omit(entry);
                 continue;
             };
             // Only a certificate whose key verifies the entry: a switch that forged an
@@ -1100,10 +1107,7 @@ impl App {
                     cert: cert.signed().clone(),
                     proof: Some(entry.proof),
                 }),
-                None => left_out.push(super::OmittedClaimEntry {
-                    op: entry.op,
-                    proof: entry.proof,
-                }),
+                None => omit(entry),
             }
         }
         let proofs = self

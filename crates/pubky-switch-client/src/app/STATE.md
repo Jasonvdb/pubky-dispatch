@@ -320,6 +320,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `loss/opening` | the verified first identity document chained immediately after the recovery transition, replaced on a new loss and retained on a move | |
 | `loss/removed/<app>`, `loss/removal/<version>` | each original app explicitly removed and the signed successor at that version, shared by the apps it removed | |
 | `retain-loss-uploads` | the host opted in to keeping the exact inputs of its ordinary loss evidence step | |
+| `loss-checkpoint/<protocol>` | the protocol-local cutoff key registered by the host; its before/after digests are kept with each inventory | |
 | `loss-upload/<generation>/<body hash>/<details hash>` | an indexed inventory, the account, app, service key, signed loss generation and opening hash when known, with the checked result for that inventory | |
 | `loss-data/<generation>/<hash>/<part>` | exact bytes of the ordinary upload or the record applications and omitted signed entries, indexed while pending and committed before sending; retained across later losses until the host releases this generation | sealed protocol data and signed entries |
 | `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |

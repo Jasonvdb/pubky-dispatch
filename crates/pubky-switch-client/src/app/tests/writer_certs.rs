@@ -230,6 +230,7 @@ async fn test_writer_cert_left_out_entries_are_in_the_recovery_report() {
     // and the recovery report says how many.
     let store = Arc::new(MemoryStore::new());
     let (w, router, mut app) = joined_after_the_writer_on(&store).await;
+    app.retain_loss_uploads().await.unwrap();
     hide_the_phone(&w);
     app.receive(None).await.unwrap();
     drop(app);
@@ -261,6 +262,18 @@ async fn test_writer_cert_left_out_entries_are_in_the_recovery_report() {
     let info = app.recovery_info().await.unwrap().unwrap();
     assert_eq!(info.loss.generation, 2);
     assert_eq!(info.claim_entries_left_out, 1);
+    let seen = app.loss_uploads(2).await.unwrap();
+    assert_eq!(seen.len(), 1);
+    let (input, details) = app.loss_upload_inputs(&seen[0]).await.unwrap();
+    assert!(input.claims.is_empty());
+    assert_eq!(details.omitted.len(), 1);
+    assert_eq!(
+        pubky_switch_core::ops::SignedOp::peek(&details.omitted[0].op)
+            .unwrap()
+            .body()
+            .app_id,
+        Some(phone())
+    );
 }
 
 #[tokio::test]

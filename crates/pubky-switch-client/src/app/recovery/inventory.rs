@@ -28,9 +28,25 @@ impl std::fmt::Debug for OmittedClaimEntry {
     }
 }
 
-/// Record applications and omissions from the pass that collected the signed upload.
+/// A protocol-local continuity checkpoint read on either side of an inventory scan.
+/// The protocol maintains its checkpoint atomically with the protective work it covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossCheckpoint {
+    /// The registered protocol.
+    pub protocol: String,
+    /// The checkpoint key in that protocol's local store.
+    pub key: Vec<u8>,
+    /// Hash of the checkpoint before enumeration, if held.
+    pub before: Option<[u8; 32]>,
+    /// Hash of the checkpoint after enumeration, if held.
+    pub after: Option<[u8; 32]>,
+}
+
+/// Record applications and omissions from the pass that collected the signed upload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LossInventoryDetails {
+    /// The checkpoints the host registered for this scan. A missing or changed checkpoint cannot establish a stable cutoff.
+    pub checkpoints: Vec<LossCheckpoint>,
     /// The retained and followed applications, including deletes whose content was refused.
     pub records: Vec<crate::app::LossRecordApplication>,
     /// Entries that lacked a verifying writer certificate.
@@ -205,6 +221,52 @@ impl App {
         self.commit(tx).await
     }
 
+    /// Capture a protocol-local checkpoint with future loss uploads. The protocol commits
+    /// a unique new checkpoint with each material change to its duties, including restore.
+    /// The app hashes its value before and after enumeration. The protocol verifies the
+    /// checkpoint's continuity, accounts for later work and supplies its own declaration.
+    ///
+    /// # Errors
+    ///
+    /// An unregistered protocol, or a store failure.
+    pub async fn retain_loss_uploads_for(
+        &mut self,
+        protocol: &str,
+        key: &[u8],
+    ) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.check_registered(protocol)?;
+        let mut tx = self.tx()?;
+        tx.put(&format!("loss-checkpoint/{protocol}"), &key)?;
+        tx.put("retain-loss-uploads", &true)?;
+        self.commit(tx).await
+    }
+
+    pub(super) async fn loss_checkpoints(&self) -> Result<Vec<LossCheckpoint>, AppError> {
+        let mut checkpoints = Vec::new();
+        for (protocol, key) in self.reader().scan::<Vec<u8>>("loss-checkpoint/").await? {
+            let before = self.checkpoint_hash(&protocol, &key).await?;
+            checkpoints.push(LossCheckpoint {
+                protocol,
+                key,
+                before,
+                after: None,
+            });
+        }
+        Ok(checkpoints)
+    }
+
+    pub(super) async fn checkpoint_hash(
+        &self,
+        protocol: &str,
+        key: &[u8],
+    ) -> Result<Option<[u8; 32]>, AppError> {
+        if !self.protocols.contains(protocol) {
+            return Ok(None);
+        }
+        Ok(self.protocol_get(protocol, key).await?.as_deref().map(hash))
+    }
+
     /// Discard this installation's observations for one generation once its protocols
     /// have durably accounted for all their duties. This also discards the exact inputs.
     /// Other generations and future capture are independent (Switch spec 12.6).
@@ -289,7 +351,27 @@ impl App {
         };
         let key = entry.key();
         if let Some(prior) = self.reader().get::<Attempt>(&key).await? {
+            if prior.identity != entry.identity
+                || prior.app_id != entry.app_id
+                || prior.recovery_from != entry.recovery_from
+                || prior.service_key != entry.service_key
+                || prior.key() != key
+            {
+                return Err(corrupt());
+            }
             entry = prior;
+            // A retry can land even when the service refused an earlier send of the same body.
+            if send
+                && matches!(
+                    entry.outcome,
+                    StoredOutcome::Refused(_) | StoredOutcome::TooLarge
+                )
+            {
+                entry.outcome = StoredOutcome::Pending;
+                let mut tx = self.tx()?;
+                tx.put(&key, &entry)?;
+                self.commit(tx).await?;
+            }
         } else {
             // An interrupted capture remains visible even if the next pass sees fewer items.
             let mut tx = self.tx()?;

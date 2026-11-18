@@ -330,9 +330,10 @@ impl App {
     /// shared-state scan (Switch spec 12.5 step 3, 12.6 step 3).
     async fn retained_evidence(
         &self,
-    ) -> Result<(SharedEvidence, inventory::LossInventoryDetails), AppError> {
+        details: Option<&mut inventory::LossInventoryDetails>,
+    ) -> Result<SharedEvidence, AppError> {
         let reader = self.reader();
-        let (shared, omitted) = self.shared_evidence_with_omissions().await?;
+        let shared = self.shared_evidence_with_details(details).await?;
         let mut ops: Vec<_> = reader
             .scan::<KeptOp>("ev/op/")
             .await?
@@ -360,14 +361,11 @@ impl App {
                 ops.push(item);
             }
         }
-        Ok((
-            SharedEvidence {
-                ops,
-                proofs,
-                claim_entries_left_out: shared.claim_entries_left_out,
-            },
-            omitted,
-        ))
+        Ok(SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out: shared.claim_entries_left_out,
+        })
     }
 
     /// The retained proofs that verify with the selected service key, or all of them.
@@ -375,7 +373,7 @@ impl App {
         &self,
         service_key: Option<&[u8; 32]>,
     ) -> Result<Vec<SignedDoc>, AppError> {
-        let mut proofs = self.retained_evidence().await?.0.proofs;
+        let mut proofs = self.retained_evidence(None).await?.proofs;
         if let Some(key) = service_key {
             let identity = self.state.meta.identity;
             proofs.retain(|proof| TransitionProof::verify(proof, key, &identity).is_ok());
@@ -859,7 +857,20 @@ impl App {
     /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on. Returns how
     /// many kept claim entries it left out, without a certificate of their writer.
     async fn loss_upload(&mut self, loss: &LossRecord) -> Result<u64, AppError> {
-        let (evidence, omitted) = self.retained_evidence().await?;
+        let retain = self.reader().get::<bool>("retain-loss-uploads").await? == Some(true);
+        let mut checkpoints = if retain {
+            self.loss_checkpoints().await?
+        } else {
+            Vec::new()
+        };
+        let mut details = inventory::LossInventoryDetails::default();
+        let evidence = self
+            .retained_evidence(retain.then_some(&mut details))
+            .await?;
+        for item in &mut checkpoints {
+            item.after = self.checkpoint_hash(&item.protocol, &item.key).await?;
+        }
+        details.checkpoints = checkpoints;
         let SharedEvidence {
             ops,
             proofs,
@@ -899,8 +910,8 @@ impl App {
             lists: None,
         };
         let body = upload.to_json();
-        let entry = if self.reader().get::<bool>("retain-loss-uploads").await? == Some(true) {
-            Some(Box::pin(self.keep_loss_inputs(loss, &body, &omitted, send)).await?)
+        let entry = if retain {
+            Some(Box::pin(self.keep_loss_inputs(loss, &body, &details, send)).await?)
         } else {
             None
         };

@@ -99,7 +99,7 @@ pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::inventory::{
-    LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
+    LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};

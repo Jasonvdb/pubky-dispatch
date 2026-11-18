@@ -4046,7 +4046,18 @@ impl App {
     /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
     /// step 3). A kept batch signed for an earlier generation has its proofs checked with
     /// that generation's key (Switch wire 6.4 step 6).
-    pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
+    pub(crate) fn submit<'a>(
+        &'a mut self,
+        batch: &'a Batch,
+    ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
+        self.submit_before(batch, None)
+    }
+
+    async fn submit_before(
+        &mut self,
+        batch: &Batch,
+        first: Option<&crate::transport::FirstSend>,
+    ) -> Result<Submitted, AppError> {
         self.refuse_before_upload_of(Some(batch)).await?;
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
@@ -4055,7 +4066,7 @@ impl App {
             None => None,
         };
         let result = match earlier_key.or_else(|| self.client.pinned_key()) {
-            Some(key) => self.client.submit_proved_by(batch, &key).await,
+            Some(key) => self.client.submit_before(batch, &key, first).await,
             None => Err(ClientError::Unpinned.into()),
         };
         let (result, error_head) = match result {

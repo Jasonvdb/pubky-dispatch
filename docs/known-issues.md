@@ -10,6 +10,8 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 **Caller changes already on main**
 
+- Custom transports used with `OpBatch::first_send_before` must implement `Transport::send_before`. Forward the supplied `FirstSend` through queues and wrappers. Check it with `FirstSend::check` after waiting for readiness, immediately before releasing the first request bytes. If bytes may already have been sent, report an uncertain transport failure. The default implementation returns `FirstSendUnavailable` without sending. The native HTTPS transport implements the check.
+
 - `PeerIdentity::read_at_ms` changed from `u64` to `Option<u64>`. `Some(at)` is the time a Homeserver or Switch read supplied the selected identity version. `None` means that version has no qualifying read time, as can happen when it came only from the directory. Before acting on the peer's public records, call `PeerIdentity::may_act` and follow its wait or refresh result. Substituting the current time would make a directory-only version appear fresh.
 - `PublicIdentity` now carries the verified service time. Callers that constructed this response with a struct literal must obtain it from `SwitchClient::public_identity`. Callers that destructure it can use `PublicIdentity { identity, freeze, .. }`. The signed time is available through `server_time_ms()`.
 

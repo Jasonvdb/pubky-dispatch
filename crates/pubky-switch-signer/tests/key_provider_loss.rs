@@ -1549,3 +1549,94 @@ async fn test_key_provider_loss_with_more_revoked_ids_than_an_enrollment_carries
     assert_eq!(service.kept_app_ids().len(), shown.revoked.len());
     signs_at(&world, &service, &mut signer, 1).await;
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_refuses_a_copy_that_appears_after_a_survey_of_none() {
+    // The survey found no copy anywhere; at the declaration the Homeserver shows one: it is
+    // new to the user, refused, and nothing is written.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    remove_file(&world, IDENTITY_PATH);
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let (_, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert_eq!(shown.kind, KeyRecoveryKind::ProviderLoss { lost: None });
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(doc.signed()).unwrap());
+    let refusal = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
+    assert_eq!(stored(&world, &store), (None, None));
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_signs_above_a_version_seen_only_at_the_declaration() {
+    // A higher version at a lower generation than the copy built on shows only at the
+    // declaration: the base stands, and the version signed is above it.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let base = signed_at(&world, &doc, 5, 2, 8);
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_holding(&world, &base));
+    remove_file(&world, IDENTITY_PATH);
+    let (service, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store, &router).await.unwrap();
+    let seen = signed_at(&world, &doc, 9, 1, 7);
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(seen.signed()).unwrap());
+    let mut signer = Signer::declare_provider_loss_with_key(
+        env_on(&world, &store, &router),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(signer.identity_doc().unwrap().unwrap().version(), 10);
+    signs_at(&world, &service, &mut signer, 2).await;
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_keeps_a_declared_enrollments_revocations() {
+    // An App ID revoked and purged lives only in the records; they stop reading while a
+    // declaration's enrollment, naming it, is still in flight: the next declaration names
+    // it too.
+    let world = World::new();
+    let (mut old, store) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 74).await;
+    let id = app.keys.app_id_bytes();
+    old.revoke(id, None, confirmed()).await.unwrap();
+    old.purge_removed(id).await.unwrap();
+    drop(old);
+    let (service, router) = picked_service(&world);
+    let mut env = world.env(store.clone());
+    env.transport = router.clone();
+    let mut declaring = Signer::open(env, world.keyring()).await.unwrap();
+    declaring
+        .declare_provider_loss("https://unreached.example", confirmed())
+        .await
+        .unwrap_err();
+    drop(declaring);
+    let ns = signer_namespace(&world.key.public());
+    let mut batch = WriteBatch::new();
+    batch.put(&ns, b"state".to_vec(), b"{".to_vec()).unwrap();
+    store.commit(batch).unwrap();
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert!(shown.revoked.contains(&id));
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    assert!(service.kept_app_ids().contains(&id));
+    signs_at(&world, &service, &mut signer, 1).await;
+}

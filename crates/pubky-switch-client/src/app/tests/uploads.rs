@@ -121,6 +121,65 @@ async fn test_upload_record_taken_is_read_from_the_transition() {
     assert!(!changed(&report.events, key), "{:?}", report.events);
 }
 
+/// The first GET shows the account before the upload, when this key really was absent.
+/// A later receive can still discover the uploaded value after the app closes and opens.
+#[tokio::test]
+async fn test_upload_record_reread_before_its_transition_survives_reload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let target = RecordTarget::new(items(), b"uploaded");
+        let before = lost.next.seq();
+        assert!(matches!(
+            app.read_record_fresh(&target).await.unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::NotFound
+            }
+        ));
+
+        let key = upload_unheld_record(&lost, &mut app).await;
+        // Read the upload transition, then its key at that earlier service snapshot.
+        let uploaded = lost.next.lock().shared.records.remove(&key).unwrap();
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        let earlier = app.receive(None).await.unwrap();
+        assert!(!changed(&earlier.events, key));
+        assert!(app.shared_record(&key).await.unwrap().is_none());
+        assert_eq!(marks(&store, "rcread/"), 1);
+        lost.next.lock().shared.records.insert(key, uploaded);
+
+        let id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store.clone()),
+            lost.protocol.clone(),
+            World::config(),
+            id,
+        )
+        .await
+        .unwrap();
+        let report = app.receive(None).await.unwrap();
+        assert!(changed(&report.events, key));
+        assert_eq!(
+            ids(app
+                .shared_record(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value()),
+            ["u"]
+        );
+        assert_eq!(marks(&store, "rcread/"), 0);
+        assert!(!changed(&app.receive(None).await.unwrap().events, key));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_upload_record_reread_the_switch_may_answer_later_keeps_its_mark() {
     // A read again that fails for now keeps the mark, and the feed's read still succeeds;
@@ -604,7 +663,7 @@ async fn test_upload_changed_claim_listed_is_read_again() {
 #[tokio::test]
 async fn test_upload_record_view_of_another_key_isnt_taken() {
     // A switch that answers `GET /records/{key}` with a view of another key: nothing is
-    // taken or flagged under either key, and the mark goes.
+    // taken or flagged under either key. The matching current read completes the duty.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, false).await;
     let key = upload_unheld_record(&lost, &mut app).await;
@@ -621,6 +680,8 @@ async fn test_upload_record_view_of_another_key_isnt_taken() {
     assert!(!changed(&report.events, key) && !changed(&report.events, other));
     assert_eq!(divergent(&report.events, other), 0, "{:?}", report.events);
     assert_eq!(marks(&store, "rcdiv/"), 0);
+    assert_eq!(marks(&store, "rcread/"), 1);
+    assert!(changed(&app.receive(None).await.unwrap().events, key));
     assert_eq!(marks(&store, "rcread/"), 0);
 }
 

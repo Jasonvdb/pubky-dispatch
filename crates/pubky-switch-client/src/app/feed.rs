@@ -4046,6 +4046,10 @@ impl App {
                             let claims = changes.claims.iter().chain(&changes.divergent_claims);
                             let lists = self
                                 .mark_uploaded(
+                                    FeedPosition {
+                                        generation: envelope.generation,
+                                        seq: item.seq,
+                                    },
                                     records.copied().collect(),
                                     claims.copied().collect(),
                                     &mut read.tx,

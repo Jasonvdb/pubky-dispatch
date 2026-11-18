@@ -261,11 +261,13 @@ impl ListProgress {
 }
 
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
-enum RecordAnswer {
+pub(super) enum RecordAnswer {
     /// The record's view, with what it is current at.
     View(Box<(SharedRecordView, CurrentAt)>),
-    /// A hosted `404`, and whether its head covers what the app already saw at the key.
-    Absent { current: bool },
+    /// A hosted `404` covering the observations at this key.
+    Absent,
+    /// The answer does not cover the applicable record or upload observation.
+    Inconclusive,
     /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
     /// (Switch wire 7.3 step 2). That says nothing of the record: the service reads as
     /// unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
@@ -971,7 +973,7 @@ pub(crate) enum WriteRead {
     /// Older than the write held, by an answer current before it: overtaken
     /// ([`KeptReason::Overtaken`]).
     Overtaken(ShownWrite, RecordVersion),
-    /// The application and the selected one fall in sequences the app cannot order.
+    /// The observation cannot be placed in this key's history.
     Unordered,
     /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
     /// take.
@@ -1111,7 +1113,7 @@ impl App {
     /// value. Every judging of a write reads through the transaction it writes in, so two
     /// writes of one record in one commit, such as two views of one key on a list page, are
     /// each judged against what the other left.
-    async fn read_in<T: serde::de::DeserializeOwned>(
+    pub(super) async fn read_in<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
         tx: &Tx,
@@ -1251,14 +1253,14 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Fetched, AppError> {
-        let (view, at) = match Box::pin(self.record_answer(key)).await? {
+        let (view, at) = match Box::pin(self.record_answer(key, None)).await? {
             RecordAnswer::View(view) => *view,
-            RecordAnswer::Absent { current: true }
-                if self.state.cert.holds_scope(&collection.policy.read_scope) =>
-            {
+            RecordAnswer::Absent if self.state.cert.holds_scope(&collection.policy.read_scope) => {
                 return Ok(Fetched::Absent);
             }
-            RecordAnswer::Absent { .. } => return Ok(Fetched::Read(WriteRead::Unordered)),
+            RecordAnswer::Absent | RecordAnswer::Inconclusive => {
+                return Ok(Fetched::Read(WriteRead::Unordered));
+            }
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
             RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
@@ -1353,27 +1355,28 @@ impl App {
         &mut self,
         key: &[u8; 32],
     ) -> Result<Option<(SharedRecordView, CurrentAt)>, AppError> {
-        match Box::pin(self.record_answer(key)).await? {
+        match Box::pin(self.record_answer(key, None)).await? {
             RecordAnswer::View(view) => Ok(Some(*view)),
-            RecordAnswer::Absent { .. } => Ok(None),
+            RecordAnswer::Absent | RecordAnswer::Inconclusive => Ok(None),
             RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
         }
     }
 
     /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
     /// doesn't hold from an identity it doesn't host.
-    async fn record_answer(&mut self, key: &[u8; 32]) -> Result<RecordAnswer, AppError> {
+    pub(super) async fn record_answer(
+        &mut self,
+        key: &[u8; 32],
+        upload: Option<FeedPosition>,
+    ) -> Result<RecordAnswer, AppError> {
         let (result, head) = match self.client.record_with_head(key).await {
             Ok(answer) => (Ok(answer), None),
             Err(failure) => (Err(failure.error), failure.head),
         };
-        match self.take(result).await {
-            Ok(answer) => {
-                let at = self.current_at(answer.head, None).await?;
-                Ok(RecordAnswer::View(Box::new((answer.view, at))))
-            }
+        let (view, head) = match self.take(result).await {
+            Ok(answer) => (Some(answer.view), answer.head),
             Err(AppError::Switch(error)) if error.is_not_hosted() => {
-                Ok(RecordAnswer::NotHosted(Box::new(error)))
+                return Ok(RecordAnswer::NotHosted(Box::new(error)));
             }
             Err(error) if error.code() == Some(ErrorCode::NotFound) => {
                 let head = head.ok_or_else(|| {
@@ -1381,16 +1384,32 @@ impl App {
                         "Switch wire 7.1: a hosted record absence carries a head".into(),
                     )
                 })?;
-                let at = self.current_at(*head, None).await?;
-                let mut tx = self.tx()?;
-                let current = self.note_absent(key, at, &mut tx).await?;
-                if !tx.is_empty() {
-                    self.commit(tx).await?;
-                }
-                Ok(RecordAnswer::Absent { current })
+                (None, *head)
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+        let at = self.current_at(head, None).await?;
+        // An upload has no record.put of its own. Only an observation covering that
+        // transition can judge what the upload changed, even at a previously unknown key.
+        if upload.is_some_and(|upload| {
+            head.generation != self.state.meta.generation
+                || !self.covers(position(head.generation, head.seq), upload)
+        }) {
+            return Ok(RecordAnswer::Inconclusive);
         }
+        if let Some(view) = view {
+            return Ok(RecordAnswer::View(Box::new((view, at))));
+        }
+        let mut tx = self.tx()?;
+        let current = self.note_absent(key, at, &mut tx).await?;
+        if !tx.is_empty() {
+            self.commit(tx).await?;
+        }
+        Ok(if current {
+            RecordAnswer::Absent
+        } else {
+            RecordAnswer::Inconclusive
+        })
     }
 
     /// Compare a refused batch's record evidence at the head of that reply (Switch wire
@@ -2035,7 +2054,7 @@ impl App {
         if !SignedOp::peek(&view.op)
             .is_ok_and(|op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == key))
         {
-            return Ok(WriteRead::Refused);
+            return Ok(WriteRead::Unordered);
         }
         let evidence = Evidence {
             op: &view.op,

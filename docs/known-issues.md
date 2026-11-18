@@ -4,7 +4,7 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
-The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. The changes still planned add to it; they do not rename or remove what is there.
+The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, `App::receive` keeps a record read outstanding across restart until the current service answers at or after the upload that listed the key, or refuses its read scope. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. The changes still planned add to it; they do not rename or remove what is there.
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 

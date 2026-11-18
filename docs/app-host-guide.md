@@ -333,7 +333,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::Alarm` | The app detected a security failure. Show the specific alarm below and keep its evidence. Read `alarm()` when reopening the store. |
 | `AppError::Alarm` | The call detected an alarm and stopped normal work. Show the details even on the error path. |
 | `Refusal::Stopped` | An alarm already blocks this operation. Consult the recorded alarm. Repeated service calls cannot clear it. |
-| `Alarm::Rollback` | Signed service evidence contradicts the chain or a fact already verified. Stop actions, preserve the evidence and bring it to the signer for provider resolution. |
+| `Alarm::Rollback` | Signed service evidence contradicts the chain or a fact already verified. A later feed page can show a different readable item or change the acceptance time at a position where the app still holds the entry's observation. A page can still [omit that position entirely](known-issues.md#client). Stop actions, preserve the evidence and bring it to the signer for provider resolution. |
 | `Alarm::ProtocolRollback` | A registered protocol supplied a rule broken by signed service data via `raise_rollback`. Display the protocol and rule. Resolve it with the signer as a service rollback. |
 | `Alarm::Equivocation` | Two signed bodies for the own identity have the same version. Stop using the conflicting authority and ask the signer to resolve it. |
 | `Alarm::IdentityRollback` | An own identity update violated its history, for example by reinstating a removed app. Keep the held history and involve the signer. |
@@ -388,7 +388,7 @@ A failed multi-step call may already have saved work. Read its outer error befor
 | `AppError::Transport` | The network, homeserver or relay operation failed. Check whether the request could have left and resume any saved work. |
 | `AppError::Store` | Reading or writing the host's store failed. Show the storage problem and follow its certainty about that commit. |
 | `AppError::Protocol` | A protocol callback failed in its own store, for example during loss recovery. Repair that store and resume the saved step. |
-| `AppError::InvalidData` | A document, proof, saved value or host input failed its checks. A later feed page can also contradict a held entry by changing its ID at the same position or placing acceptance after the first observation. Show the rule and inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
+| `AppError::InvalidData` | A document, proof, saved value or host input failed its checks. Show the rule and inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
 | `AppError::Refused` | An app rule blocked a step. Use its detailed refusal. Earlier steps of the call may already be durable. |
 | `Refusal::NotNow` | A prerequisite is missing, such as completed reconciliation, a usable lookup or a required upload. Show the reason and retry after the prerequisite changes. |
 | `Refusal::Usage` | A host argument, permission, protocol registration or requested operation violates this API's rules. Correct the cause before calling again. |

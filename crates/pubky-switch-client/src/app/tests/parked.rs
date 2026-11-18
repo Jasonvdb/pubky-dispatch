@@ -227,6 +227,10 @@ async fn uncertain(w: &World, app: &mut App) -> (ParkedSummary, Message) {
     let id = app.stored_id_at(seq).unwrap();
     let entry = listed(app, id).await.unwrap();
     assert_eq!(entry.reason, ParkReason::Uncertain);
+    assert!(
+        !app.state.held.contains_key(&seq),
+        "stored, its feed observation goes"
+    );
     (entry, message)
 }
 
@@ -2414,4 +2418,40 @@ async fn test_provider_loss_completion_retires_prior_copies() {
         "ordinary loss settlement retires eligible prior copies"
     );
     assert_eq!(pending.world.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_effect_replay_retires_its_observation_before_another_page() {
+    // Stop after each successive commit until the cursor first passes the entry.
+    for uncertain in [false, true] {
+        let mut reached = false;
+        for cut in 1..30 {
+            let w = World::new();
+            let protocol = ParkingProtocol::new(Mode::Plain);
+            let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+            let (seq, _) = w.note(app.app_id(), "effect with a lost answer");
+            w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+            assert!(app.receive(None).await.is_err());
+            assert!(app.state.held.contains_key(&seq));
+            if uncertain {
+                w.clock.advance_ms(31 * DAY_MS);
+                w.switch.lock().batches.clear();
+            }
+            drop(app);
+            let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::StopAfter(cut)));
+            let mut app = load_on(&w, &protocol, store).await;
+            let _ = app.receive(None).await;
+            drop(app);
+            let app = load_on(&w, &protocol, w.store.clone()).await;
+            if app.state.pending_effect.is_none() && app.cursor().seq >= seq {
+                assert!(
+                    !app.state.held.contains_key(&seq),
+                    "retained after cursor passed in commit {cut}, uncertain={uncertain}"
+                );
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "no cursor commit observed, uncertain={uncertain}");
+    }
 }

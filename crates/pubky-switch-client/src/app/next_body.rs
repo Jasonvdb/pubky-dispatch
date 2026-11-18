@@ -28,8 +28,8 @@ pub(super) struct NextBody(AppRecordBody);
 /// A registered protocol that refused to give a member for a certificate, or whose member
 /// the record check refused ([`super::Protocol::member_for`]).
 pub(super) struct MemberRefusal {
-    /// The protocol's name.
-    pub(super) protocol: String,
+    /// The protocol's name; `None` when the record check refused the certificate alone.
+    pub(super) protocol: Option<String>,
     /// Its reason, or the check's, without content.
     pub(super) reason: String,
 }
@@ -119,7 +119,7 @@ impl CertBody {
             let member = protocol
                 .member_for(carried.get(&name), cert)
                 .map_err(|reason| MemberRefusal {
-                    protocol: name.clone(),
+                    protocol: Some(name.clone()),
                     reason,
                 })?;
             match member {
@@ -151,13 +151,19 @@ impl CertBody {
         &self.dropped
     }
 
-    /// The body with `protocol`'s member alone, if it has one: it holds nothing the
-    /// protocols didn't give for its certificate, so it may be signed to check that member
-    /// apart from the others.
-    pub(super) fn only(&self, protocol: &str) -> Option<Self> {
-        let member = self.body.protocols.get(protocol)?;
+    /// The body with `protocol`'s member alone, if it has one, or with no member for
+    /// `None`: it holds nothing the protocols didn't give for its certificate, so it may be
+    /// signed to check that member, or the certificate and kinds alone, apart from the
+    /// others.
+    pub(super) fn only(&self, protocol: Option<&str>) -> Option<Self> {
         let mut body = self.body.clone();
-        body.protocols = [(protocol.to_owned(), member.clone())].into();
+        body.protocols = match protocol {
+            Some(protocol) => {
+                let member = self.body.protocols.get(protocol)?;
+                [(protocol.to_owned(), member.clone())].into()
+            }
+            None => Default::default(),
+        };
         Some(Self {
             body,
             removed: Vec::new(),

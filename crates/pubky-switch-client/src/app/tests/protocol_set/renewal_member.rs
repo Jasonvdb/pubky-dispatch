@@ -176,7 +176,7 @@ enum Path {
 }
 
 /// The `RenewalWaits` events of `events`: the certificate's `issued_at` and the protocol.
-fn waits(events: Vec<AppEvent>) -> Vec<(u64, String)> {
+fn waits(events: Vec<AppEvent>) -> Vec<(u64, Option<String>)> {
     events
         .into_iter()
         .filter_map(|event| match event {
@@ -346,7 +346,7 @@ async fn test_renewal_member_refused_keeps_the_held_certificate_until_a_later_re
         }
         assert_eq!(p.tasks.received.lock().unwrap().len(), 1);
         // Told once, however many reads it waits.
-        assert_eq!(told, [(renewed.issued_at(), "tasks".into())]);
+        assert_eq!(told, [(renewed.issued_at(), Some("tasks".into()))]);
         // Nothing signed: the certificate and record held stay, and the renewal is owed.
         assert_eq!(app.cert().hash(), old.hash());
         assert_eq!(app.record(), &record);
@@ -464,11 +464,11 @@ async fn test_renewal_member_refused_renewal_kept_across_a_backup() {
     assert_eq!(restored.cert().hash(), renewed.hash());
 }
 
-/// A renewal another device took, while this one keeps a change and a protocol refuses
-/// it: the change waits unsent, the reads go on and take what is sent meanwhile, and the
-/// next look after the protocol gives a member takes the renewal with the change.
+/// A renewal another device took, while this one keeps a change a protocol refuses under
+/// it: the app takes that device's record as it is, its protocols having given its members,
+/// and gives the change up, telling the protocols once; the reads go on.
 #[tokio::test]
-async fn test_renewal_member_refused_renewal_taken_elsewhere_lets_reads_go_on() {
+async fn test_renewal_member_taken_elsewhere_over_a_refused_change_gives_it_up() {
     let p = Pair::new();
     let (mut app, _) = join(&p).await;
     let me = app.app_id();
@@ -498,23 +498,158 @@ async fn test_renewal_member_refused_renewal_taken_elsewhere_lets_reads_go_on() 
     p.w.clock.advance_ms(1000);
     app.receive(None).await.unwrap_err();
     let puts = p.w.switch.applied().len();
-    let mut told = Vec::new();
+    let mut dropped = Vec::new();
     for _ in 0..3 {
         p.send(me, "tasks.item");
         p.w.clock.advance_ms(1000);
         let report = app.receive(None).await.unwrap();
-        told.extend(waits(report.events));
+        for event in report.events {
+            if let AppEvent::RecordChangeDropped {
+                id,
+                issued_at,
+                protocol,
+                ..
+            } = event
+            {
+                dropped.push((issued_at, protocol));
+                app.ack_events(id).await.unwrap();
+            }
+        }
     }
-    assert_eq!(told, [(renewed.issued_at(), "tasks".into())]);
+    assert_eq!(dropped, [(renewed.issued_at(), Some("tasks".into()))]);
     assert_eq!(p.tasks.received.lock().unwrap().len(), 3);
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(app.record(), other.signed());
+    assert!(app.state.pending_record.is_none());
     assert!(puts_from(&p, puts).is_empty());
-    assert_ne!(app.cert().hash(), renewed.hash());
-    *p.tasks.member_for.lock().unwrap() = Some(drop_assign);
-    p.w.clock.advance_ms(crate::app::DOC_CACHE_MS + 1);
+}
+
+/// Two devices of the app hold one renewal from its `cert.put`. A protocol refuses it on
+/// this one, the other takes it and delivers its record, and the signer closes the earlier
+/// certificate. This one takes that record as it is at its next look, also after a restore
+/// from a backup holding the renewal.
+#[tokio::test]
+async fn test_renewal_member_refused_renewal_another_device_took_is_taken_as_it_is() {
+    for restored in [false, true] {
+        let p = Pair::new();
+        *p.tasks.member_for.lock().unwrap() = Some(|_, _| Err("tasks: not yet".into()));
+        let (mut x, _) = join(&p).await;
+        let me = x.app_id();
+        x.set_multi_device(true).await.unwrap();
+        // The other device, from the same state, running protocols that give their members.
+        let set = ProtocolSet::new(vec![
+            Arc::new(named("tasks")) as Arc<dyn Protocol>,
+            Arc::new(named("chat")) as Arc<dyn Protocol>,
+        ])
+        .unwrap();
+        let backup = x.backup().await.unwrap();
+        let mut y = App::restore(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            set,
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        y.end_reconcile(UserConfirmed::new()).await.ok();
+        p.w.clock.advance_ms(1000);
+        let old = x.cert().clone();
+        let renewed = renew(&p, &x);
+        p.w.clock.advance_ms(1000);
+        let report = x.receive(None).await.unwrap();
+        assert_eq!(
+            waits(report.events),
+            [(renewed.issued_at(), Some("tasks".into()))]
+        );
+        if restored {
+            x.flush_cursor().await.unwrap();
+            let backup = x.backup().await.unwrap();
+            x = App::restore(
+                p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+                p.set(),
+                World::config(),
+                &backup,
+            )
+            .await
+            .unwrap();
+        }
+        for _ in 0..2 {
+            p.w.clock.advance_ms(1000);
+            y.receive(None).await.unwrap();
+        }
+        assert_eq!(y.cert().hash(), renewed.hash());
+        // The signer closes the earlier certificate (Switch spec 3.2 step 4).
+        let until = p.w.clock.now_ms() + 5 * 60_000;
+        p.w.next_doc(|body| {
+            for entry in &mut body.renewed {
+                if entry.app_id == me && entry.cert == old.hash() {
+                    entry.until = Some(until);
+                }
+            }
+        });
+        p.w.clock.advance_ms(crate::app::DOC_CACHE_MS + 1);
+        p.send(me, "tasks.item");
+        x.receive(None).await.unwrap();
+        assert_eq!(x.cert().hash(), renewed.hash(), "restored: {restored}");
+        assert_eq!(
+            Some(x.record()),
+            p.w.switch.app(&me).record.as_ref(),
+            "restored: {restored}"
+        );
+        assert_eq!(p.tasks.received.lock().unwrap().len(), 1);
+    }
+}
+
+/// The host is told once per certificate and protocol, however the refusals alternate.
+#[tokio::test]
+async fn test_renewal_member_waits_told_once_per_protocol() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    p.w.clock.advance_ms(1000);
+    let renewed = renew(&p, &app);
+    let refuse: MemberFor = |_, _| Err("not yet".into());
+    let mut told = Vec::new();
+    for (tasks, chat) in [(true, false), (false, true), (true, false), (false, true)] {
+        *p.tasks.member_for.lock().unwrap() = tasks.then_some(refuse);
+        *p.chat.member_for.lock().unwrap() = chat.then_some(refuse);
+        p.w.clock.advance_ms(1000);
+        told.extend(waits(app.receive(None).await.unwrap().events));
+    }
+    let at = renewed.issued_at();
+    assert_eq!(
+        told,
+        [(at, Some("tasks".into())), (at, Some("chat".into()))]
+    );
+    *p.chat.member_for.lock().unwrap() = None;
     app.receive(None).await.unwrap();
     assert_eq!(app.cert().hash(), renewed.hash());
-    assert_eq!(members(&app)["tasks"], json!({ "list": "work" }));
-    assert_eq!(p.w.switch.app(&me).record.as_ref(), Some(app.record()));
+}
+
+/// A record the check refuses for the certificate and kinds alone waits, naming no
+/// protocol, and the reads go on.
+#[tokio::test]
+async fn test_renewal_member_record_refused_for_the_certificate_alone() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    // Under the renewal, which lacks `tasks_assign`, `tasks` accepts more kinds than a
+    // record can carry.
+    *p.tasks.unassigned_kinds.lock().unwrap() = (0..600)
+        .map(|n| format!("tasks.{}{n}", "k".repeat(1000)))
+        .collect();
+    p.w.clock.advance_ms(1000);
+    let renewed = renew(&p, &app);
+    let mut told = Vec::new();
+    for _ in 0..3 {
+        p.send(me, "tasks.item");
+        p.w.clock.advance_ms(1000);
+        told.extend(waits(app.receive(None).await.unwrap().events));
+    }
+    assert_eq!(told, [(renewed.issued_at(), None)]);
+    assert_eq!(p.tasks.received.lock().unwrap().len(), 3);
+    p.tasks.unassigned_kinds.lock().unwrap().clear();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cert().hash(), renewed.hash());
 }
 
 /// The same app on two devices with different protocol sets: `notes` runs on one only. A

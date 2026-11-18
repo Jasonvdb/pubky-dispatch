@@ -84,6 +84,8 @@ struct Named {
     member_for: Mutex<Option<MemberFor>>,
     /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
     assign_kind: Mutex<bool>,
+    /// More kinds it accepts under a certificate without `<name>_assign`.
+    unassigned_kinds: Mutex<Vec<String>>,
 }
 
 /// A [`Protocol::member_for`] of a test protocol.
@@ -284,6 +286,9 @@ impl Protocol for Named {
         ];
         if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
             kinds.push(format!("{}.assign", self.name));
+        }
+        if !cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.extend(self.unassigned_kinds.lock().unwrap().clone());
         }
         kinds.extend(self.foreign.clone());
         kinds

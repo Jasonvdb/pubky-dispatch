@@ -527,27 +527,35 @@ pub enum AppEvent {
     RenewalSeen,
     /// A renewed certificate the own `identity.json` lists wasn't taken: the registered
     /// protocol `protocol` refused to give its member for it, or gave one the record check
-    /// refused ([`super::Protocol::member_for`]; a member removed is a valid answer). Told
-    /// once per certificate and protocol (`cert/waits`). One refusal holds the certificate
-    /// back from every protocol of the app: the record and certificate are one.
+    /// refused ([`super::Protocol::member_for`]; a member removed is a valid answer), or,
+    /// with no protocol, the check refused the record for the certificate alone. Told once
+    /// per certificate and protocol (`cert/waits`). One refusal holds the certificate back
+    /// from every protocol of the app: the record and certificate are one.
     ///
     /// Nothing of it is signed or taken: the app keeps presenting the certificate and record
     /// it holds, the read goes on, and the renewal is tried again at each later read, at most
-    /// every [`super::DOC_CACHE_MS`] for one another device took. A record change waits
+    /// every [`super::DOC_CACHE_MS`] for one found in the directory. A record change waits
     /// unsent meanwhile ([`super::Publication::RenewalWaits`]), one at a time: the switch
-    /// refuses a record under the earlier certificate. A renewal that reduces the
-    /// certificate closes the earlier one at its cutoff whatever the app does (Switch spec
-    /// 3.2 "Reductions close at once"): from then on the switch refuses the app's writes.
+    /// refuses a record under the earlier certificate. Once another device of the app
+    /// delivers its record under the renewal, the app takes that record as it is, and a
+    /// change it kept is given up if a protocol still refuses
+    /// ([`AppEvent::RecordChangeDropped`]).
     ///
-    /// It ends when the protocol gives a member, after an update or once its own member
-    /// changes ([`super::App::set_protocol_member`]); when the signer renews again with a
-    /// certificate the protocol runs with; or when the certificate lapses and the app is
-    /// approved again (Switch spec 3.2 step 3).
+    /// The earlier certificate closes at its cutoff whatever the app does: at once for a
+    /// renewal that reduces it (Switch spec 3.2 "Reductions close at once"), otherwise once
+    /// the service holds a record under the renewal. Its own switch still serves the app,
+    /// which it checks against the renewal, but from then on recipients reject the app's
+    /// messages and other switches refuse its appends. With the protocol still refusing, the
+    /// move is the app's or the host's: the protocol removes or changes its member
+    /// ([`super::App::set_protocol_member`]) or is updated to give one; the signer renews
+    /// again with a certificate the protocol runs with; or the app is approved again (Switch
+    /// spec 3.2 step 3).
+    #[non_exhaustive]
     RenewalWaits {
         /// The renewed certificate's `issued_at`.
         issued_at: u64,
-        /// The protocol's name.
-        protocol: String,
+        /// The protocol's name; `None` when the record check refused the certificate alone.
+        protocol: Option<String>,
         /// Its reason, without content.
         reason: String,
     },
@@ -561,11 +569,28 @@ pub enum AppEvent {
     /// another device: no protocol here could give that member for the certificate (Switch
     /// spec 3.2 step 3). Told once, when the certificate is taken. Its protocol, where it
     /// runs, writes it again when it next runs ([`super::App::set_protocol_member`]).
+    #[non_exhaustive]
     MemberDropped {
         /// The renewed certificate's `issued_at`.
         issued_at: u64,
         /// The name of the protocol whose member was dropped.
         protocol: String,
+    },
+    /// A record change the app kept under its earlier certificate, unsent while a protocol
+    /// refused the renewal ([`AppEvent::RenewalWaits`]), was given up when the app took the
+    /// record another device of the app delivered under that renewal, as that device signed
+    /// it: `protocol` still refused to give its member for the renewal, or, with no
+    /// protocol, the record check refused it (Switch spec 3.2 step 3). Each protocol whose
+    /// member the change set sets it again ([`super::App::set_protocol_member`]). A duty
+    /// event, for every protocol.
+    #[non_exhaustive]
+    RecordChangeDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The renewed certificate's `issued_at`.
+        issued_at: u64,
+        /// The protocol that refused; `None` when the record check refused the record.
+        protocol: Option<String>,
     },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
@@ -999,6 +1024,7 @@ impl AppEvent {
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
+            | Self::RecordChangeDropped { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -1238,6 +1264,10 @@ pub(crate) enum Duty {
         issued_at: u64,
         refusal: CertificateRefusal,
     },
+    RecordChangeDropped {
+        issued_at: u64,
+        protocol: Option<String>,
+    },
 }
 
 impl Duty {
@@ -1388,6 +1418,14 @@ impl Duty {
                 id,
                 issued_at,
                 refusal,
+            },
+            Self::RecordChangeDropped {
+                issued_at,
+                protocol,
+            } => AppEvent::RecordChangeDropped {
+                id,
+                issued_at,
+                protocol,
             },
         }
     }

@@ -533,3 +533,32 @@ async fn test_callback_batches_failed_gap_reloads_all_owners_from_the_new_answer
     c.reload().await;
     c.gap_is(&[[84; 32]]).await;
 }
+
+#[tokio::test]
+async fn test_resend_callback_crash_keeps_the_first_feed_observation() {
+    let mut c = Box::pin(Many::with_last_size(3, false, false, 1)).await;
+    c.app.receive(None).await.unwrap();
+    let store = c.fault(StoreFault::None).await;
+    *c.protocols[2].retrying.lock().unwrap() = 2;
+    let held = c.pair.send(c.app.app_id(), "alpha.item");
+    let seq = c.unopenable();
+    let observed_at = c.pair.w.clock.now_ms();
+    store.fail_put_once(format!("p/{}/resend", NAMES[1]).as_bytes());
+    assert!(c.app.receive(None).await.is_err());
+    c.reload().await;
+    assert!(c.app.cursor().seq < held && held < seq);
+    assert!(c.app.state.held.contains_key(&held));
+    assert!(c.app.state.asked.contains(&seq));
+    assert_eq!(
+        c.app.protocol_get(NAMES[0], b"resend").await.unwrap(),
+        Some(vec![1])
+    );
+    let kept = c
+        .app
+        .state
+        .held
+        .get(&seq)
+        .expect("first resend callback committed ahead of cursor without its feed observation");
+    assert_eq!(kept.receipt.read_at_ms, observed_at);
+    assert_eq!(kept.accepted_at_ms, observed_at);
+}

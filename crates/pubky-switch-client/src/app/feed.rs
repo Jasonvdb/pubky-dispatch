@@ -1039,12 +1039,6 @@ impl App {
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
         let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
-        // What this page shows of an entry, its first observation unless one is held.
-        let observed = |entry: &EntryItem| EntryReceipt {
-            entry_id: entry.entry_id,
-            service_key: page.service_key,
-            read_at_ms: page.server_time_ms,
-        };
         for item in &page.items {
             if stopped.is_some() {
                 break;
@@ -1110,12 +1104,15 @@ impl App {
             // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
             self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
             let step = match item {
-                _ if kept_call => Step::Pass,
-                // Processed past a held entry in an earlier read.
-                FeedItem::Entry(_) if self.state.seen.contains(&seq) => Step::Pass,
                 FeedItem::Entry(entry) => {
-                    self.handle_entry(entry, observed(entry), &mut read).await?
+                    let receipt = self.observe_entry(entry, &page, &mut read.tx)?;
+                    if kept_call || self.state.seen.contains(&seq) {
+                        Step::Pass
+                    } else {
+                        self.handle_entry(entry, receipt, &mut read).await?
+                    }
                 }
+                _ if kept_call => Step::Pass,
                 FeedItem::Unreadable {
                     seq,
                     sender,
@@ -1165,32 +1162,13 @@ impl App {
                     self.clear_retry(seq, &mut read)?;
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
-                    } else if let FeedItem::Entry(entry) = item
-                        && !self.state.seen.contains(&seq)
+                    } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
                     {
                         read.tx.put(&key::seen(seq), &())?;
                         self.state.seen.insert(seq);
-                        // Local custody can end before the cursor reaches this entry.
-                        self.keep_observation(
-                            seq,
-                            observed(entry),
-                            entry.accepted_at,
-                            &mut read.tx,
-                        )?;
                     }
                 }
-                Step::Hold => {
-                    // Whatever an entry waits for, the cursor stays before it.
-                    if let FeedItem::Entry(entry) = item {
-                        self.keep_observation(
-                            seq,
-                            observed(entry),
-                            entry.accepted_at,
-                            &mut read.tx,
-                        )?;
-                    }
-                    read.block(seq);
-                }
+                Step::Hold => read.block(seq),
                 Step::Stop => {
                     stopped = Some(seq);
                     break;
@@ -1316,29 +1294,30 @@ impl App {
         self.advance_feed_cursor(seq, accepted, &mut read.tx)
     }
 
-    /// Keeps the first observation of an entry of the feed the cursor stays before, at
-    /// `held/<seq>`: from the read that holds it, whatever it waits for, or processes it
-    /// past an earlier one, or the commit that keeps its effect, so no later step can lose
-    /// it. A later page must agree until the cursor passes it (Switch spec 8.2, 10.1;
-    /// wire 7.4.4).
-    fn keep_observation(
+    /// Stage the entry's first observation before handling it. A saved effect or callback
+    /// can commit the read before the cursor passes the entry (Switch spec 8.2, wire 7.4.4).
+    fn observe_entry(
         &mut self,
-        seq: u64,
-        receipt: EntryReceipt,
-        accepted_at_ms: u64,
+        entry: &EntryItem,
+        page: &FeedPage,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        if self.state.held.contains_key(&seq) {
-            return Ok(());
+    ) -> Result<EntryReceipt, AppError> {
+        if let Some(held) = self.state.held.get(&entry.seq) {
+            return Ok(held.receipt);
         }
+        let receipt = EntryReceipt {
+            entry_id: entry.entry_id,
+            service_key: page.service_key,
+            read_at_ms: page.server_time_ms,
+        };
         let held = HeldEntry {
             since_ms: self.now(),
             receipt,
-            accepted_at_ms,
+            accepted_at_ms: entry.accepted_at,
         };
-        tx.put(&key::held(seq), &held)?;
-        self.state.held.insert(seq, held);
-        Ok(())
+        tx.put(&key::held(entry.seq), &held)?;
+        self.state.held.insert(entry.seq, held);
+        Ok(receipt)
     }
 
     /// Keep observations only for feed positions the local cursor can still read.
@@ -1419,12 +1398,6 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        // The page has already been compared with every kept observation (Switch wire 7.4.4).
-        let receipt = self
-            .state
-            .held
-            .get(&item.seq)
-            .map_or(receipt, |held| held.receipt);
         let entry = Entry {
             receipt,
             seq: item.seq,
@@ -2052,12 +2025,6 @@ impl App {
     ) -> Result<Option<Step>, AppError> {
         if self.key_may_come_by_fetch(data_epoch) {
             if entry.stored.is_none() {
-                self.keep_observation(
-                    entry.seq,
-                    entry.receipt,
-                    entry.accepted_at_ms,
-                    &mut read.tx,
-                )?;
                 self.commit_read(read).await?;
             }
             self.fetch_key_parts().await?;
@@ -2209,11 +2176,7 @@ impl App {
         {
             return Ok(Sent::TooLarge);
         }
-        // Everything read so far, with the kept batch, before it is sent; an entry of the
-        // feed keeps its observation past a refusal that drops the batch.
-        if entry.stored.is_none() {
-            self.keep_observation(entry.seq, entry.receipt, entry.accepted_at_ms, &mut read.tx)?;
-        }
+        // Commit the read so far with the saved batch before sending it.
         read.tx.put(key::PENDING_EFFECT, &pending)?;
         read.tx.put(key::CURSOR, &self.state.cursor)?;
         let tx = std::mem::replace(&mut read.tx, self.tx()?);

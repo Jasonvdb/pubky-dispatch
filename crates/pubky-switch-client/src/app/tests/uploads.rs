@@ -75,7 +75,11 @@ async fn followed(store: &Arc<MemoryStore>, record: bool) -> (Lost, App) {
 /// A record of the lost generation the app doesn't hold, uploaded to the next switch with
 /// no proof, as another device's app would (Switch wire 7.4.14): taken there. Its key.
 async fn upload_unheld_record(lost: &Lost, app: &mut App) -> [u8; 32] {
-    let target = RecordTarget::new(items(), b"uploaded");
+    upload_named_record(lost, app, b"uploaded", [98; 16]).await
+}
+
+async fn upload_named_record(lost: &Lost, app: &mut App, name: &[u8], batch: [u8; 16]) -> [u8; 32] {
+    let target = RecordTarget::new(items(), name);
     let (_, kind) = app
         .record_op(&target, Some(&value(&["u"])), vec![])
         .await
@@ -89,7 +93,7 @@ async fn upload_unheld_record(lost: &Lost, app: &mut App) -> [u8; 32] {
         &lost.w.alice.public(),
         Some(app_keys("wallet").app_id_bytes()),
         1,
-        [98; 16],
+        batch,
         vec![(Vec::new(), kind)],
     )
     .unwrap();
@@ -119,6 +123,77 @@ async fn test_upload_record_taken_is_read_from_the_transition() {
     assert_eq!(marks(&store, "rcread/"), 0);
     let report = app.receive(None).await.unwrap();
     assert!(!changed(&report.events, key), "{:?}", report.events);
+}
+
+/// The first GET shows the account before the upload, when this key really was absent.
+/// A later receive can still discover the uploaded value after the app closes and opens.
+#[tokio::test]
+async fn test_upload_record_reread_before_its_transition_survives_reload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let target = RecordTarget::new(items(), b"uploaded");
+        let before = lost.next.seq();
+        assert!(matches!(
+            app.read_record_fresh(&target).await.unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::NotFound
+            }
+        ));
+
+        let key = upload_unheld_record(&lost, &mut app).await;
+        // Read the upload transition, then its key at that earlier service snapshot.
+        let uploaded = lost.next.lock().shared.records.remove(&key).unwrap();
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        let earlier = app.receive(None).await.unwrap();
+        assert!(!changed(&earlier.events, key));
+        assert!(app.shared_record(&key).await.unwrap().is_none());
+        assert_eq!(marks(&store, "rcread/"), 1);
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(matches!(
+            app.read_record_fresh(&target).await.unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::Refused
+            }
+        ));
+        lost.next.lock().shared.records.insert(key, uploaded);
+
+        let id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store.clone()),
+            lost.protocol.clone(),
+            World::config(),
+            id,
+        )
+        .await
+        .unwrap();
+        let report = app.receive(None).await.unwrap();
+        assert!(changed(&report.events, key));
+        assert_eq!(
+            ids(app
+                .shared_record(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value()),
+            ["u"]
+        );
+        assert_eq!(marks(&store, "rcread/"), 0);
+        assert!(!changed(&app.receive(None).await.unwrap().events, key));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -248,6 +323,87 @@ async fn test_upload_divergent_record_is_held_divergent_until_a_newer_write() {
     let report = app.receive(None).await.unwrap();
     assert_eq!(divergent(&report.events, key), 0, "{:?}", report.events);
     assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+}
+
+#[tokio::test]
+async fn test_upload_direct_read_keeps_divergence_until_its_observation_covers() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, true).await;
+        let target = RecordTarget::new(items(), b"key");
+        let before = lost.next.seq();
+        let key = upload_fork(&lost, [99; 16]);
+        app.receive(None).await.unwrap();
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+        upload_fork(&lost, [97; 16]);
+        lost.next.fail_next(Fault::Unreachable {
+            path: "/records/".into(),
+            after: 0,
+        });
+        app.receive(None).await.unwrap();
+        let divergent = lost.next.lock().shared.divergent.remove(&key).unwrap();
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        let old = app.read_record_fresh(&target).await.unwrap();
+        assert!(matches!(
+            old,
+            crate::app::RecordRead::Kept { record: Some(held), .. } if held.divergent
+        ));
+        lost.next.lock().shared.divergent.insert(key, divergent);
+        let current = app.read_record_fresh(&target).await.unwrap();
+        assert!(matches!(current, crate::app::RecordRead::Fresh(record) if record.divergent));
+        app.receive(None).await.unwrap();
+        assert_eq!(marks(&store, "rcread/"), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_upload_covering_reread_of_another_application_keeps_its_mark() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, true).await;
+        let key = upload_fork(&lost, [95; 16]);
+        let upload = lost.next.seq();
+        lost.next.fail_next(Fault::Unreachable {
+            path: "/records/".into(),
+            after: 0,
+        });
+        app.receive(None).await.unwrap();
+        assert_eq!(marks(&store, "rcread/"), 1);
+        let previous = lost.next.lock().shared.records[&key].clone();
+        let divergence = lost.next.lock().shared.divergent[&key].clone();
+        let target = RecordTarget::new(items(), b"key");
+        app.put_record(&target, &value(&["later"]), vec![])
+            .await
+            .unwrap();
+        let later = lost
+            .next
+            .lock()
+            .shared
+            .records
+            .insert(key, previous)
+            .unwrap();
+        lost.next.lock().shared.divergent.insert(key, divergence);
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(upload),
+            forked: false,
+        });
+        app.receive(None).await.unwrap();
+        let held = app.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), ["later"]);
+        assert!(!held.divergent);
+        assert_eq!(marks(&store, "rcread/"), 1);
+        lost.next.lock().shared.records.insert(key, later);
+        lost.next.lock().shared.divergent.remove(&key);
+        app.receive(None).await.unwrap();
+        assert_eq!(marks(&store, "rcread/"), 0);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -604,7 +760,7 @@ async fn test_upload_changed_claim_listed_is_read_again() {
 #[tokio::test]
 async fn test_upload_record_view_of_another_key_isnt_taken() {
     // A switch that answers `GET /records/{key}` with a view of another key: nothing is
-    // taken or flagged under either key, and the mark goes.
+    // taken or flagged under either key. The matching current read completes the duty.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, false).await;
     let key = upload_unheld_record(&lost, &mut app).await;
@@ -621,6 +777,8 @@ async fn test_upload_record_view_of_another_key_isnt_taken() {
     assert!(!changed(&report.events, key) && !changed(&report.events, other));
     assert_eq!(divergent(&report.events, other), 0, "{:?}", report.events);
     assert_eq!(marks(&store, "rcdiv/"), 0);
+    assert_eq!(marks(&store, "rcread/"), 1);
+    assert!(changed(&app.receive(None).await.unwrap().events, key));
     assert_eq!(marks(&store, "rcread/"), 0);
 }
 
@@ -649,6 +807,181 @@ async fn test_upload_divergent_flag_follows_the_last_note_in_one_commit() {
     assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
     let report = app.receive(None).await.unwrap();
     assert_eq!(divergent(&report.events, key), 2, "{:?}", report.events);
+}
+
+fn cap_record_reads(lost: &Lost) {
+    let records = (0..MAX_RECORD_MARKS)
+        .map(|i| {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+            key
+        })
+        .collect();
+    lost.next
+        .chain_upload(
+            PHONE,
+            UploadChanges {
+                records,
+                ..UploadChanges::default()
+            }
+            .to_value(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_upload_listing_waits_for_a_covering_page_across_reload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let before = lost.next.seq();
+        let baseline = app.list_collection(&items()).await.unwrap();
+        assert_eq!((baseline.records, baseline.more), (0, false));
+        let key = upload_unheld_record(&lost, &mut app).await;
+        cap_record_reads(&lost);
+        let uploaded = lost.next.lock().shared.records.remove(&key).unwrap();
+        let earlier_page = || {
+            lost.next.fail_next(Fault::Head {
+                path: "records?collection".into(),
+                at: Some(before),
+                forked: false,
+            })
+        };
+        // The page was read before the upload, though the service signed a later head.
+        lost.next.fail_next(Fault::Replace {
+            path: "records?collection".into(),
+            member: "seq".into(),
+            value: json!(before),
+        });
+        let report = app.receive(None).await.unwrap();
+        assert!(!changed(&report.events, key));
+        assert!(app.listing_owed().await.unwrap());
+        // The host listing sees the empty collection and head from that same snapshot.
+        let current = std::mem::replace(&mut lost.next.lock().seq, before);
+        earlier_page();
+        assert!(app.list_collections().await.unwrap());
+        assert!(app.listing_owed().await.unwrap());
+        // The per-key marks have given way to the collection listing.
+        assert_eq!(marks(&store, "rcread/"), 0);
+        lost.next.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(matches!(
+            app.read_record_fresh(&RecordTarget::new(items(), b"uploaded"))
+                .await
+                .unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::Refused
+            }
+        ));
+        let app_id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store),
+            lost.protocol.clone(),
+            World::config(),
+            app_id,
+        )
+        .await
+        .unwrap();
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().seq = current;
+        lost.next.lock().shared.records.insert(key, uploaded);
+        assert!(matches!(
+            app.read_record_fresh(&RecordTarget::new(items(), b"never uploaded"))
+                .await
+                .unwrap(),
+            crate::app::RecordRead::Kept {
+                record: None,
+                reason: crate::app::KeptReason::NotFound
+            }
+        ));
+        assert!(app.listing_owed().await.unwrap());
+        assert!(changed(&app.receive(None).await.unwrap().events, key));
+        assert_eq!(
+            ids(app
+                .shared_record(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value()),
+            ["u"]
+        );
+        assert!(!app.listing_owed().await.unwrap());
+        assert!(!changed(&app.receive(None).await.unwrap().events, key));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_upload_listing_keeps_its_continuation_until_the_page_covers_the_upload() {
+    Box::pin(async {
+        let store = Arc::new(MemoryStore::new());
+        let (lost, mut app) = followed(&store, false).await;
+        let before = lost.next.seq();
+        assert_eq!(app.list_collection(&items()).await.unwrap().records, 0);
+        let mut keys = [
+            upload_named_record(&lost, &mut app, b"first", [90; 16]).await,
+            upload_named_record(&lost, &mut app, b"second", [91; 16]).await,
+        ];
+        keys.sort_by_key(|key| b64(key));
+        let [first, second] = keys;
+        cap_record_reads(&lost);
+        lost.next.fail_next(Fault::Unreachable {
+            path: "records?collection".into(),
+            after: 0,
+        });
+        assert!(app.receive(None).await.is_err());
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().max_page_bytes = 1;
+        let continuation = format!("&after={}", b64(&first));
+        lost.next.fail_next(Fault::Unreachable {
+            path: continuation.clone(),
+            after: 0,
+        });
+        assert!(app.list_collections().await.is_err());
+        assert!(app.shared_record(&first).await.unwrap().is_some());
+        assert!(app.shared_record(&second).await.unwrap().is_none());
+        let cursor = || {
+            let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+            store.get(&ns, b"list_at").unwrap()
+        };
+        let after_first = cursor().unwrap();
+        let saved = lost.next.lock().shared.records.remove(&second).unwrap();
+        let current = std::mem::replace(&mut lost.next.lock().seq, before);
+        lost.next.fail_next(Fault::Head {
+            path: continuation.clone(),
+            at: Some(before),
+            forked: false,
+        });
+        assert!(app.list_collections().await.unwrap());
+        assert_eq!(cursor().unwrap(), after_first);
+        assert!(app.listing_owed().await.unwrap());
+        lost.next.lock().seq = current;
+        lost.next.lock().shared.records.insert(second, saved);
+        let id = app.app_id();
+        drop(app);
+        let mut app = App::load(
+            lost.router.env(&lost.w, store.clone()),
+            lost.protocol.clone(),
+            World::config(),
+            id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cursor().unwrap(), after_first);
+        let listed = lost.next.lock().shared.listings;
+        assert!(!app.list_collections().await.unwrap());
+        assert_eq!(lost.next.lock().shared.listings - listed, 1);
+        assert!(app.shared_record(&second).await.unwrap().is_some());
+        assert!(!app.listing_owed().await.unwrap());
+        assert!(cursor().is_none());
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -805,23 +1138,16 @@ async fn test_record_read_answered_with_another_records_view_flags_neither() {
     assert_eq!(marks(&store, "rcdiv/"), 0);
 }
 
-#[tokio::test]
-async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() {
-    // A feed write by a writer whose certificate the app can't find (it never saw the
-    // phone's `app.put`, and the directory doesn't show it) is judged by the record's view:
-    // the view's `divergent` is the switch's latest word, so the record is held divergent
-    // although the write is newer, and the app is told once.
-    let store = Arc::new(MemoryStore::new());
-    let w = World::new();
-    let router = super::moves::Router::of(&w);
+async fn wallet_missing_phone_certificate(w: &World, store: &Arc<MemoryStore>) -> (App, AppKeys) {
+    let router = super::moves::Router::of(w);
     let phone = w.other_app("phone", &Permission::ALL);
     let protocol = Arc::new(super::moves::LossProtocol::default());
     *protocol.collections.lock().unwrap() = vec![items()];
     let mut app = super::moves::join_on(
-        &w,
+        w,
         &router,
-        Arc::clone(&store) as Arc<dyn StateStore>,
-        Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+        Arc::clone(store) as Arc<dyn StateStore>,
+        protocol,
         &Permission::ALL,
     )
     .await;
@@ -833,6 +1159,18 @@ async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() 
         .unwrap()
         .record = None;
     app.receive(None).await.unwrap();
+    (app, phone)
+}
+
+#[tokio::test]
+async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() {
+    // A feed write by a writer whose certificate the app can't find (it never saw the
+    // phone's `app.put`, and the directory doesn't show it) is judged by the record's view:
+    // the view's `divergent` is the switch's latest word, so the record is held divergent
+    // although the write is newer, and the app is told once.
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let (mut app, phone) = wallet_missing_phone_certificate(&w, &store).await;
     let listings = w.switch.lock().shared.listings;
     let target = RecordTarget::new(items(), b"the phone's");
     let (_, kind) = app
@@ -851,6 +1189,93 @@ async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() 
     assert_eq!(ids(held.content.value()), vec!["p"]);
     assert!(held.divergent, "the view said divergent");
     assert_eq!(divergent(&report.events, key), 1, "{:?}", report.events);
+}
+
+#[tokio::test]
+async fn test_upload_replayed_feed_write_keeps_divergence_from_a_later_upload() {
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let (mut app, phone) = wallet_missing_phone_certificate(&w, &store).await;
+        let target = RecordTarget::new(items(), b"observed");
+        app.put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        let key = app.record_key(&target).unwrap();
+        w.switch.make_divergent(PHONE, key, [1; 32]).unwrap();
+        app.receive(None).await.unwrap();
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+        let first = w.switch.lock().shared.records[&key].clone();
+        let observed = w.switch.seq();
+        // A temporarily unavailable sender keeps the cursor behind the phone's write.
+        w.homeserver.set_down(true);
+        let (held, _) = w.note(app.app_id(), "held");
+        let (conditions, kind) = app
+            .record_op(&target, Some(&value(&["b"])), vec![])
+            .await
+            .unwrap();
+        let updated_at = w.switch.app_op_if(&phone, conditions, kind).unwrap();
+        let second = w.switch.lock().shared.records[&key].clone();
+        w.switch.make_divergent(PHONE, key, [2; 32]).unwrap();
+        let read_at = |seq| {
+            w.switch.lock().faults.clear();
+            // Both the feed's certificate lookup and the pending upload GET see this snapshot.
+            for _ in 0..8 {
+                w.switch.fail_next(Fault::Head {
+                    path: "/records/".into(),
+                    at: Some(seq),
+                    forked: false,
+                });
+            }
+        };
+        // On the first pass the available position remains the former record.
+        w.switch.lock().shared.records.insert(key, first);
+        read_at(observed);
+        let previous = app.receive(None).await.unwrap();
+        assert!(app.cursor().seq < held, "{:?}", previous.events);
+        assert_eq!(marks(&store, "rcread/"), 1, "{:?}", previous.events);
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+        assert_eq!(
+            ids(app
+                .shared_record(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value()),
+            ["a"]
+        );
+        // On the replay, the missing certificate leads to the actual newer signed write
+        // at its own time, before the now-known divergent upload.
+        w.switch.lock().shared.records.insert(key, second);
+        let divergent = w.switch.lock().shared.divergent.remove(&key).unwrap();
+        read_at(updated_at);
+        let replayed = app.receive(None).await.unwrap();
+        let record = app.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(record.content.value()), ["b"], "{:?}", replayed.events);
+        assert_eq!(marks(&store, "rcread/"), 1, "{:?}", replayed.events);
+        assert!(
+            record.divergent,
+            "the certificate lookup predates the upload"
+        );
+        // The same record listed at the phone's write has the same historical flag.
+        let current = std::mem::replace(&mut w.switch.lock().seq, updated_at);
+        w.switch.fail_next(Fault::Head {
+            path: "records?collection".into(),
+            at: Some(updated_at),
+            forked: false,
+        });
+        assert_eq!(app.list_collection(&items()).await.unwrap().records, 1);
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+        w.switch.lock().seq = current;
+        w.switch.lock().shared.divergent.insert(key, divergent);
+        w.switch.lock().faults.clear();
+        w.homeserver.set_down(false);
+        app.receive(None).await.unwrap();
+        assert_eq!(marks(&store, "rcread/"), 0);
+        assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+    })
+    .await;
 }
 
 #[tokio::test]

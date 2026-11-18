@@ -2819,7 +2819,13 @@ impl Owing {
         p.w.switch.make_divergent(by, chat_record, [1; 32]).unwrap();
         let now = p.w.clock.now_ms();
         let first = p.w.switch.push_missed(1, now, now);
+        p.w.switch.lock().shared.record_reads.clear();
         let report = app.receive(None).await.unwrap();
+        assert_eq!(
+            p.w.switch.lock().shared.record_reads,
+            [chat_record],
+            "only the ready protocol reads its marked key"
+        );
         assert!(!report.more, "{report:?}");
         assert!(!report.stopped, "{report:?}");
         assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);

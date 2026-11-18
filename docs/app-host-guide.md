@@ -134,7 +134,7 @@ Use `identity_of` for the newest checked peer document available. For an action 
 | `MayAct::IfUserConfirms` | The user's fresh lookup lacks service confirmation after failure or expiry of the grace interval. Explain that the peer's apps could not be confirmed, obtain explicit consent and record the decision before acting. |
 | `MayAct::WaitForLookup` | A pending lookup must finish. This also applies to a stale copy after the grace interval, even for a user action. |
 | `MayAct::No` | An automatic lookup failed to obtain service confirmation. Skip the action. A fresh lookup can be tried. |
-| `MayAct::LookUpAgain` | The copy or its last switch lookup is too old. Refresh it before acting. |
+| `MayAct::LookUpAgain` | The copy or its last switch lookup is too old. Refresh it before acting. If it comes again straight after a refresh, no source confirmed the copy the app holds (each was unavailable or served an older one): treat the copy as not confirmed and do not retry in a tight loop. |
 | `AppEvent::PeerEquivocation` | Two bodies signed by this peer's identity have the same version. Show the identity and version. Suspend actions for that peer while the conflict remains. |
 
 `send` queues an `OutgoingMessage` then tries its jobs. Use `queue` to defer delivery or `sign_message` and `queue_signed` for a newly signed message. Attach a `RecordJob` with `with_record` when a record write must follow acceptance. Use `msg_id` to track the signed message. Use `queue_stored` for previously signed plaintext belonging to this app. It checks the replay deadline and give-up markers. `queue_signed` skips those checks. Keep a given message ID through retries.

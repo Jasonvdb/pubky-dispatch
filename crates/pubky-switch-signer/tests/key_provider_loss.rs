@@ -1523,3 +1523,29 @@ async fn test_key_provider_loss_reads_the_backup_a_delivery_sealed() {
     assert!(signer.identity_doc().unwrap().unwrap().listed_cert(&id).is_none());
     signs_at(&world, &service, &mut signer, 1).await;
 }
+
+#[tokio::test]
+async fn test_key_provider_loss_with_more_revoked_ids_than_an_enrollment_carries() {
+    // The records hold more App IDs revoked for good than one enrollment can name, none of
+    // them listed or removed by any version: the declaration names as many as fit and goes
+    // ahead, and the identity signs on.
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    drop(old);
+    edit_state(&world, &store, |state| {
+        let ids: Vec<serde_json::Value> = (0..20_000u64)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&(i + 1).to_be_bytes());
+                serde_json::json!(id.to_vec())
+            })
+            .collect();
+        state["tombstones"] = serde_json::Value::Array(ids);
+    });
+    let (service, router) = picked_service(&world);
+    let shown = survey(&world, &store, &router).await.unwrap();
+    assert!(!shown.revoked.is_empty() && shown.revoked.len() < 20_000);
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    assert_eq!(service.kept_app_ids().len(), shown.revoked.len());
+    signs_at(&world, &service, &mut signer, 1).await;
+}

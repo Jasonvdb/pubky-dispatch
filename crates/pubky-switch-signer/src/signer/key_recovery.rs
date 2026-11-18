@@ -1116,6 +1116,47 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
     }
 }
 
+/// Of the App IDs `revoked` (ascending), those a move's enrollment carrying `base` could
+/// carry within seven eighths of its cap, with the headroom every version keeps (Switch wire
+/// 3.7, 7.1), so the identity's later versions still fit. Revoked apps `base` lists or removes always stay. When
+/// more were found than fit, as when disjoint sources each hold many, the others, revoked
+/// apps no version lists or removes any more, go: the same loss as when no source holds
+/// them, and no recovery is ever refused for their number (Switch spec 12.8).
+fn enrollable(base: Option<&IdentityDoc>, revoked: Vec<[u8; 16]>) -> Result<Vec<[u8; 16]>> {
+    let Some(limit) = enrollment_limit() else {
+        return Ok(revoked);
+    };
+    let named = |app: &[u8; 16]| {
+        base.is_some_and(|base| {
+            base.listed_cert(app).is_some() || base.body().removed.iter().any(|r| &r.app_id == app)
+        })
+    };
+    let (kept, rest): (Vec<[u8; 16]>, Vec<[u8; 16]>) = revoked.into_iter().partition(named);
+    let policy = base.map_or_else(IdentityPolicy::default, |base| base.body().policy);
+    let fits = |taken: usize| -> Result<bool> {
+        let ids: Vec<[u8; 16]> = kept.iter().chain(&rest[..taken]).copied().collect();
+        let bytes = Enrollment::max_request_len(&policy, base.map(IdentityDoc::signed), &ids)?;
+        // An eighth of the cap stays free for the content the identity adds later.
+        Ok(bytes.saturating_add(CAP_HEADROOM) <= limit - limit / 8)
+    };
+    let (mut fitting, mut over) = (0, rest.len());
+    if !fits(over)? {
+        while over - fitting > 1 {
+            let middle = fitting + (over - fitting) / 2;
+            if fits(middle)? {
+                fitting = middle;
+            } else {
+                over = middle;
+            }
+        }
+    } else {
+        fitting = over;
+    }
+    let mut taken: Vec<[u8; 16]> = kept.into_iter().chain(rest.into_iter().take(fitting)).collect();
+    taken.sort_unstable();
+    Ok(taken)
+}
+
 /// The backup on the Homeserver, `found`, and one the store's flow sealed, `sealed`, as one:
 /// the revoked App IDs, the certificates and the picked times of both. The Homeserver's
 /// document stands, else the sealed one's.
@@ -1283,22 +1324,27 @@ impl Signer {
     /// already declared, and records that don't read. Returns the signer, once the
     /// recovery's version is delivered and published.
     ///
-    /// Before anything is written, the survey is read again, and must be the one confirmed;
-    /// the enrollment at that service is signed. Then the records it rebuilt and the
-    /// declaration are committed in one write, and the provider loss goes on as one declared
-    /// with [`Signer::declare_provider_loss`]: the enrollment, the version naming this
-    /// install at the next generation, built on the copy the survey showed, above every
-    /// version any source shows or the records spent, and its delivery. Its backup is
-    /// written once that delivery has won.
+    /// Before anything is written, everything is read again. A source that shows less now,
+    /// or nothing, changes nothing: the declaration acts on the survey confirmed. A copy above
+    /// the one confirmed, a revocation or an earlier time it didn't show, or another key or
+    /// account at the service picked is refused. The enrollment at that service is signed.
+    /// Then the records it rebuilt and the declaration are committed in one write, and the
+    /// provider loss goes on as one declared with [`Signer::declare_provider_loss`]: the
+    /// enrollment, whose answer must name the key the discovery showed, the version naming
+    /// this install at the next generation, built on the copy the survey showed, above every
+    /// version any source or the survey showed or the records spent, and its delivery. Its
+    /// backup is written once that delivery has won where the copy names another install,
+    /// names a certificate this install doesn't hold, or there is none; before it otherwise.
     ///
     /// # Errors
     ///
-    /// [`KeyRecoveryStop::SurveyChanged`] when the survey reads otherwise, or `confirmed`
-    /// isn't a provider loss's; [`Refusal::IdentityTooLarge`] for a version the cap can't
-    /// take; otherwise as [`Signer::survey_provider_loss_with_key`]. With nothing written,
-    /// the store is as found. Once the declaration is committed, as [`Signer::resume`]: the
-    /// recovery in progress is resumed, or declared again, with this entry or
-    /// [`Signer::declare_provider_loss`], at that service or another.
+    /// [`KeyRecoveryStop::SurveyChanged`] for something the survey didn't show, or when
+    /// `confirmed` isn't a provider loss's: survey again; [`Refusal::IdentityTooLarge`] for
+    /// a version the cap can't take; otherwise as [`Signer::survey_provider_loss_with_key`].
+    /// With nothing written, the store is as found. Once the declaration is committed, as
+    /// [`Signer::resume`]: the recovery in progress is resumed, or declared again with this
+    /// entry, at that service or another, or with [`Signer::declare_provider_loss`] where it
+    /// built on a copy (with no copy anywhere, this entry only).
     pub async fn declare_provider_loss_with_key(
         env: SignerEnv,
         keyring: IdentityKeyring,
@@ -1565,6 +1611,7 @@ impl Signer {
             let mut revoked = found.kept.tombstones.clone();
             revoked.sort_unstable();
             revoked.dedup();
+            let revoked = enrollable(None, revoked)?;
             let mut survey = KeyRecoverySurvey {
                 origin: to.to_owned(),
                 version: 0,
@@ -1608,6 +1655,7 @@ impl Signer {
             .fates(&base, &docs, backed_up, &found.kept, &answer)
             .await?;
         fates.removed_elsewhere(&answer);
+        fates.revoked = enrollable(Some(&base), fates.revoked)?;
         let survey = KeyRecoverySurvey::of(
             to.to_owned(),
             &base,
@@ -1695,6 +1743,15 @@ impl Signer {
             .epoch_through
             .max(found.local.epoch_through.unwrap_or(0));
         state.earlier_distrust.clone_from(&plan.survey.earlier);
+        // Only the App IDs the survey kept: the enrollment names them all (Switch wire 3.7).
+        let listed = |app: &[u8; 16]| {
+            plan.base
+                .as_ref()
+                .is_some_and(|base| base.listed_cert(app).is_some())
+        };
+        state
+            .tombstones
+            .retain(|app| listed(app) || plan.survey.revoked.contains(app));
         state.recovering = true;
         state.lost_generation = Some(plan.lost);
         state.recovery_origin = Some(to.to_owned());

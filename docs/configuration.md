@@ -279,6 +279,7 @@ Each line gets one state:
 | `behind` | the state is behind the mark: of an earlier generation, at a lower `seq` in the same generation, or at a lower count in the selected account lifetime (`head_count` below `mark_count`): a write the service acknowledged is missing, a chain item or any other, such as an inbox entry, a cursor move or a peer's `identity.json` |
 | `fork` | the chain hash disagrees at the marked position, or the account lacks the matching tag at `mark_count`. A database can report `fork` even when its `head_count` is higher. Choose a database that retains the acknowledged history. |
 | `mark_lost` | the account's mark is missing or doesn't read as a mark |
+| `unknown` | the account lifetime cannot be determined, for example when a mark is unreadable and the database has no account for it. Keep the mark in place. Check the authoritative mark store and rerun `check-marks` against a database that holds the account before promoting a replica. |
 | `lost` | a mark that records something acknowledged, a head or a count above 0, with no account and no erasure's record covering it: the database lost the account |
 | `leftover` | a mark an erasure's record covers, with no account; the service deletes it |
 | `erased_again` | an account created at or before an erasure's record; the service erases it again |

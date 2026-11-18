@@ -443,6 +443,38 @@ async fn test_awaiting_key_from_await_key_and_from_a_write_without_the_key() {
         }));
 }
 
+#[tokio::test]
+async fn test_awaiting_key_keeps_first_observation_through_a_failed_fetch() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Check);
+    let transport = w.switch.transport();
+    let mut app = wallet_on(&w, &protocol, &transport, w.store.clone()).await;
+    let me = app.app_id();
+    w.next_doc(|body| body.data_epoch = 2);
+    let (seq, note) = w.note(me, "checks first");
+    w.switch.fail_next(crate::testing::Fault::Unreachable {
+        path: "/keys".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(protocol.runs_of(&note.msg_id), 1);
+    drop(app);
+
+    let mut app = App::load(w.env(), protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    let held = app.state.held[&seq];
+    assert!(app.cursor().seq < seq);
+    w.clock.advance_ms(1);
+    app.receive(None).await.unwrap();
+    let stored = app.stored_at(seq).unwrap();
+    assert_eq!(stored.receipt, held.receipt);
+    assert_eq!(stored.accepted_at_ms, held.accepted_at_ms);
+    assert_eq!(Some(stored.reason), awaiting(2));
+    assert!(app.cursor().seq >= seq);
+    assert!(!app.state.held.contains_key(&seq));
+}
+
 /// An entry that waits for a key raises no [`AppEvent::StoreFailing`] however long it
 /// waits, and keeps no count of the store's retries: one its step retried for want of the
 /// store before it waited for the key ends that count.

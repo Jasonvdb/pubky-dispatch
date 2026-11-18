@@ -48,6 +48,8 @@ pub(crate) struct ItemsProtocol {
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
+    observe_values: std::sync::atomic::AtomicBool,
+    observation_bytes: std::sync::atomic::AtomicUsize,
     observe_deletes: std::sync::atomic::AtomicBool,
     observation_unavailable: std::sync::atomic::AtomicBool,
     /// Whether a delete fails a check of the protocol's own, seen or not.
@@ -143,6 +145,57 @@ impl Protocol for ItemsProtocol {
             .unwrap()
             .clone()
             .unwrap_or_else(|| vec![items()])
+    }
+
+    fn observe_record(
+        &self,
+        observed: &crate::app::RecordObservation<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.observe_values.load(Relaxed) || !observed.current || observed.record.divergent {
+            return Ok(Vec::new());
+        }
+        let target = RecordTarget::new(items(), b"n1");
+        if observed.record.key != cx.record_key(&target).unwrap() {
+            return Ok(Vec::new());
+        }
+        let signed = SignedOp::peek(observed.operation).unwrap();
+        assert_eq!(signed.item_hash().unwrap(), observed.application.item_hash);
+        assert_eq!(signed.body().app_id, Some(observed.record.writer));
+        assert_eq!(observed.record.policy, target.collection.policy);
+        assert!(observed.record.authenticated);
+        let mut kept = ids(cx.local_get(b"accepted-items").unwrap().as_deref());
+        let mut changed = false;
+        for id in ids(observed.record.content.value()) {
+            if !kept.contains(&id) {
+                kept.push(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(Vec::new());
+        }
+        let mut value = value(&kept.iter().map(String::as_str).collect::<Vec<_>>());
+        value.resize(value.len() + self.observation_bytes.load(Relaxed), b' ');
+        let mut transitions: Vec<Vec<String>> = cx
+            .local_get(b"previous-items")
+            .unwrap()
+            .map(|v| serde_json::from_slice(&v).unwrap())
+            .unwrap_or_default();
+        transitions.push(ids(observed
+            .previous
+            .and_then(|prior| prior.content.value())));
+        Ok(vec![
+            LocalWrite::Put {
+                key: b"accepted-items".to_vec(),
+                value,
+            },
+            LocalWrite::Put {
+                key: b"previous-items".to_vec(),
+                value: serde_json::to_vec(&transitions).unwrap(),
+            },
+        ])
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -12190,6 +12243,151 @@ async fn test_records_second_device_write_waiting_for_its_key_keeps_the_mark() {
         report.events
     );
     assert_eq!(after_b, ["a", "x"]);
+}
+
+/// A record first taken from the feed and an own replacement share the observations
+/// kept for this protocol, including when its selected backup restores on a new store.
+#[tokio::test]
+async fn test_records_protocol_observations_follow_the_record_and_its_selected_backup() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    s.protocol.observe_values.store(true, Relaxed);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    phone.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    phone
+        .put_record(&target, &value(&["first", "second"]), vec![])
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first", "second"]
+    );
+    wallet
+        .put_record(&target, &value(&["third"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["third"]
+    );
+    let before: Vec<Vec<String>> = serde_json::from_slice(
+        &wallet
+            .protocol_get("sample", b"previous-items")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before,
+        [
+            Vec::<String>::new(),
+            vec!["first".to_owned()],
+            vec!["first".to_owned(), "second".to_owned()]
+        ]
+    );
+    let backup = wallet.backup_layered().await.unwrap();
+    let restored = App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids(restored
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first", "second", "third"]
+    );
+}
+
+/// A local effect that doesn't fit cannot advance the record or its feed position.
+/// The same signed application is taken after the owner can store its restriction.
+#[tokio::test]
+async fn test_records_protocol_observation_waits_for_its_local_writes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    s.protocol.observe_values.store(true, Relaxed);
+    s.protocol
+        .observation_bytes
+        .store(crate::app::MAX_STEP_LOCAL_BYTES, Relaxed);
+    let error = wallet.receive(None).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Store(crate::error::StoreError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    assert!(
+        wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let me = wallet.app_id();
+    drop(wallet);
+    s.protocol.observation_bytes.store(0, Relaxed);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["first"]
+    );
+    assert_eq!(
+        ids(wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first"]
+    );
 }
 
 /// The wallet changes `["a"]` to `["b"]`, loses the answer, and its feed shows the write

@@ -196,6 +196,7 @@ const LIST_PAGE: u32 = 1000;
 /// What taking one listed record writes, at most: its cached write (its operation, 512 KiB,
 /// and opened value, 256 KiB, in base64, with its proof: 1.2 MiB), its mark as stored
 /// ([`MAX_SEEN_MARK_BYTES`] in base64), a flagged write's rule, and its duty events.
+/// The reserved room covers either a deletion or the readable value's local observation.
 const LISTED_RECORD_ROOM_BYTES: u64 = super::feed::CACHED_RECORD_BYTES
     + super::feed::KEPT_MARK_BYTES
     + super::deletion::ROOM
@@ -780,6 +781,7 @@ pub(crate) struct Evidence<'a> {
     pub(crate) view_revision: Option<ApplicationRef>,
     /// What the answer showing the write is current at.
     pub(crate) current_at: CurrentAt,
+    observation: ObservationSource,
 }
 
 /// What an answer showing a write is current at (Switch spec 10.3): what an older write
@@ -798,6 +800,10 @@ pub(crate) enum CurrentAt {
 }
 
 impl CurrentAt {
+    fn in_generation(self, generation: u64) -> bool {
+        matches!(self, Self::Answer(v) | Self::KeyAtKnownTip(v, _) if v.generation == generation)
+    }
+
     /// What a record view read now with `head` is current at: `seq` in the head's
     /// generation, the head's own `seq` when `seq` is `None`; never another generation's.
     fn of(head: &SignedHead, seq: Option<u64>) -> Self {
@@ -924,6 +930,7 @@ struct Accepted {
     writer: [u8; 16],
     /// The verified head or listing position at which a view showed this write.
     current_at: CurrentAt,
+    observation: ObservationSource,
     content: RecordContent,
     doubtful: bool,
 }
@@ -1017,6 +1024,14 @@ impl WriteRead {
     fn says_of_now(self) -> bool {
         !matches!(self, Self::Overtaken(..) | Self::Unordered)
     }
+}
+
+/// What the source of a readable write establishes at this application.
+#[derive(Clone, Copy)]
+enum ObservationSource {
+    View { covered: bool, divergent: bool },
+    Applied,
+    Reopened,
 }
 
 /// The view read to obtain a missing writer certificate (Switch wire 6.2).
@@ -1410,14 +1425,19 @@ impl App {
     }
 
     async fn listing_upload(&self, collection: &str) -> Result<Option<FeedPosition>, AppError> {
-        let Some(due) = self.reader().get::<ListDue>(LIST_DUE).await? else {
-            return Ok(None);
-        };
-        Ok(due.upload.filter(|_| {
+        Ok(self
+            .reader()
+            .get::<ListDue>(LIST_DUE)
+            .await?
+            .and_then(|due| self.collection_upload(collection, &due)))
+    }
+
+    fn collection_upload(&self, collection: &str, due: &ListDue) -> Option<FeedPosition> {
+        due.upload.filter(|_| {
             self.protocols
                 .of_collection(collection)
                 .is_some_and(|owner| due.at(&owner.name).is_some())
-        }))
+        })
     }
 
     async fn record_uploads(
@@ -2155,6 +2175,7 @@ impl App {
                 view_version: Some(record.version),
                 view_revision: Some(record.applied),
                 current_at: CurrentAt::Local,
+                observation: ObservationSource::Reopened,
             };
             self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
                 .await?;
@@ -2231,6 +2252,10 @@ impl App {
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
             current_at: at,
+            observation: ObservationSource::View {
+                covered: covers_uploads && at.in_generation(self.state.meta.generation),
+                divergent: view.divergent,
+            },
         };
         let read = self.read_write(&evidence, expect, key, tx).await?;
         // An earlier view can supply the signed write, while the latest upload's
@@ -2266,6 +2291,7 @@ impl App {
             view_version: None,
             view_revision: None,
             current_at: CurrentAt::Itself,
+            observation: ObservationSource::Applied,
         };
         let key = put.key;
         let mut viewed = WriterView::NotRead;
@@ -2388,6 +2414,11 @@ impl App {
                 )),
                 view_revision: Some(current_view.revision),
                 current_at: at,
+                observation: ObservationSource::View {
+                    covered: observed.covers_uploads
+                        && at.in_generation(self.state.meta.generation),
+                    divergent: current_view.divergent,
+                },
             };
             outcome =
                 Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
@@ -2915,6 +2946,7 @@ impl App {
             time,
             writer,
             current_at: evidence.current_at,
+            observation: evidence.observation,
             content,
             doubtful,
         }))
@@ -3266,6 +3298,7 @@ impl App {
                     if let Some(h) = placement.historical && !confirms {
                         return Ok(Taken::Historical(h));
                     }
+                    self.observe_readable_record(&key, &upgraded, Some(held), accepted.observation, false, tx).await?;
                     return Ok(Taken::Equal);
                 }
                 if let Some(h) = placement.historical {
@@ -3471,6 +3504,9 @@ impl App {
                 observed: held.as_ref().filter(|_| !selects_base).map_or(observed, |h| h.observed),
                 gone: !selects_base && held.as_ref().is_some_and(|h| h.gone),
             };
+            if placement.historical.is_none() {
+                self.observe_readable_record(&key, &record, held.as_ref(), accepted.observation, !reopened, tx).await?;
+            }
             put_held(tx, &key, &record)?;
             self.events.push(AppEvent::RecordChanged { key });
             Ok(if let Some(h) = placement.historical {
@@ -3482,6 +3518,85 @@ impl App {
             })
         })
         .await
+    }
+
+    /// Commit what the collection owner learned with the accepted record. A protocol
+    /// can derive its physical target through the context and carry its own qualified
+    /// observations across a selected backup (Switch spec 8.2, 12.4).
+    async fn observe_readable_record(
+        &self,
+        key: &[u8; 32],
+        record: &HeldRecord,
+        previous: Option<&HeldRecord>,
+        source: ObservationSource,
+        newer: bool,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if !record.authenticated || record.content.value().is_none() {
+            return Ok(());
+        }
+        let Some(owner) = self.protocols.of_collection(&record.collection) else {
+            return Ok(());
+        };
+        let prior_divergence = match tx.pending_state(&super::uploaded::divergent_key(key)) {
+            Some(held) => held,
+            None => self.is_divergent(key).await?,
+        };
+        let (current, divergent) = match source {
+            ObservationSource::View { covered, divergent } => {
+                (covered, if covered { divergent } else { prior_divergence })
+            }
+            ObservationSource::Applied | ObservationSource::Reopened => {
+                let listing = self.read_in::<ListDue>(LIST_DUE, tx).await?;
+                let uploads = [
+                    self.record_upload_in(key, tx).await?,
+                    listing
+                        .as_ref()
+                        .and_then(|due| self.collection_upload(&record.collection, due)),
+                ];
+                let at = if matches!(source, ObservationSource::Reopened) {
+                    record.observed
+                } else {
+                    position(record.applied.generation, record.applied.seq)
+                };
+                let covered =
+                    at.generation == self.state.meta.generation && self.covers_uploads(at, uploads);
+                (covered, prior_divergence && !(newer && covered))
+            }
+        };
+        let accepted = record.shared(key, divergent);
+        let before = previous.map(|held| held.shared(key, prior_divergence));
+        let input = super::RecordObservation {
+            record: &accepted,
+            previous: before.as_ref(),
+            operation: &record.op,
+            application: record.applied,
+            current,
+        };
+        let context = super::ReceiveContext::new(
+            &self.state,
+            &self.protocols,
+            &owner.name,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            false,
+            &[],
+            tx.pending_local(),
+            tx.pending_writes(),
+        );
+        let local = owner
+            .protocol
+            .observe_record(&input, &context)
+            .map_err(AppError::Protocol)?;
+        let bytes = super::local_writes_bytes(&local);
+        if bytes > super::MAX_STEP_LOCAL_BYTES {
+            return Err(crate::error::StoreError::TooLarge {
+                size: u64::try_from(bytes).unwrap_or(u64::MAX),
+                cap: super::MAX_STEP_LOCAL_BYTES as u64,
+            }
+            .into());
+        }
+        tx.local(&super::protocols::qualify(&owner.name, local))
     }
 
     /// The collection as held, registered, or named when building an own write.
@@ -3676,6 +3791,7 @@ impl App {
             view_version: None,
             view_revision: None,
             current_at: CurrentAt::Itself,
+            observation: ObservationSource::Applied,
         };
         let key = put.key;
         match self

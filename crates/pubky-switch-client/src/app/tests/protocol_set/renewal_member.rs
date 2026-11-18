@@ -452,6 +452,14 @@ async fn test_renewal_member_unowned_kept_when_nothing_is_removed() {
 /// takes that record, its `chat` is told, with its ask gone, and writes its member again.
 #[tokio::test]
 async fn test_renewal_member_unowned_dropped_then_written_again_by_its_owner() {
+    for kept in [false, true] {
+        unowned_dropped_then_written_again(kept).await;
+    }
+}
+
+/// [`test_renewal_member_unowned_dropped_then_written_again_by_its_owner`]; with `kept`,
+/// `b` keeps a change it signs over `a`'s record, and `chat`'s ask goes with its member.
+async fn unowned_dropped_then_written_again(kept: bool) {
     let p = Pair::new();
     let both = p.set();
     let request =
@@ -486,7 +494,8 @@ async fn test_renewal_member_unowned_dropped_then_written_again_by_its_owner() {
     .unwrap();
     a.end_reconcile(UserConfirmed::new()).await.ok();
     let room = object(json!({ "room": 1 }));
-    b.set_protocol_member("chat", Some(room.clone()), None)
+    let deadline = p.w.clock.now_ms() + HOUR;
+    b.set_protocol_member("chat", Some(room.clone()), Some(deadline))
         .await
         .unwrap();
     // `b` takes a renewal with the same rights; `a` takes its record as it is.
@@ -509,19 +518,36 @@ async fn test_renewal_member_unowned_dropped_then_written_again_by_its_owner() {
     assert_eq!(a.cert().hash(), second.hash());
     assert_eq!(dropped(&report.events), ["chat"]);
     assert!(!members(&a).contains_key("chat"));
+    if kept {
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        });
+        b.set_protocol_member("tasks", Some(object(json!({ "list": "work" }))), None)
+            .await
+            .unwrap_err();
+    }
     // `b` takes that record; `chat` is told once, its ask gone, and writes its member again.
     let mut changed = Vec::new();
-    for _ in 0..2 {
+    // With a kept change, the first read learns the listed certificate from the switch's
+    // refusal of that change under the earlier one.
+    for _ in 0..3 {
         p.w.clock.advance_ms(1000);
-        for event in b.receive(None).await.unwrap().events {
+        let Ok(report) = b.receive(None).await else {
+            assert!(kept);
+            continue;
+        };
+        for event in report.events {
             if let AppEvent::MemberChanged { protocol, .. } = event {
                 changed.push(protocol);
             }
         }
     }
     assert_eq!(b.cert().hash(), second.hash());
-    assert_eq!(changed, ["chat"]);
+    assert_eq!(changed, ["chat"], "kept: {kept}");
     assert!(!b.record_expiries().await.unwrap().contains_key("chat"));
+    let signed = AppRecord::verify(b.record(), &p.w.alice.public()).unwrap();
+    assert_eq!(signed.body().expires_at, None, "kept: {kept}");
     b.set_protocol_member("chat", Some(room.clone()), None)
         .await
         .unwrap();
@@ -788,4 +814,92 @@ async fn test_renewal_member_later_published_copy_is_taken() {
     );
     assert_eq!(app.record(), other.signed());
     assert_eq!(changed(app.receive(None).await.unwrap().events), ["chat"]);
+}
+
+/// An ask without a member that can't be signed under the renewal is dropped, the host
+/// told, and the renewal taken.
+#[tokio::test]
+async fn test_renewal_member_lapsed_ask_without_member_is_dropped() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    app.set_protocol_member("chat", None, None).await.unwrap();
+    app.renew_record("chat", Some(p.w.clock.now_ms() + 5_000))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(10_000);
+    let renewed = renew(&p, &app);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(dropped(&report.events), ["chat"]);
+    assert!(!app.record_expiries().await.unwrap().contains_key("chat"));
+}
+
+/// A change kept here signed over another device's later record that lacks `chat`
+/// leaves `chat`'s ask out of the record and of the asks kept.
+#[tokio::test]
+async fn test_renewal_member_conflict_drops_the_gone_members_ask() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    let me = app.app_id();
+    let deadline = p.w.clock.now_ms() + HOUR;
+    app.set_protocol_member("chat", Some(object(json!({ "room": 1 }))), Some(deadline))
+        .await
+        .unwrap();
+    let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
+    let mut body = held.body().clone();
+    body.updated_at = p.w.clock.now_ms() + 60_000;
+    body.expires_at = None;
+    body.protocols.remove("chat");
+    let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    p.w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: other.signed().clone(),
+            },
+        )
+        .unwrap();
+    p.w.clock.advance_ms(1000);
+    app.set_protocol_member("tasks", Some(object(json!({ "list": "x" }))), None)
+        .await
+        .unwrap();
+    let held = p.w.switch.app(&me).record.unwrap();
+    let held = AppRecord::verify(&held, &p.w.alice.public()).unwrap();
+    assert!(!held.body().protocols.contains_key("chat"));
+    assert_eq!(held.body().expires_at, None);
+    assert!(!app.record_expiries().await.unwrap().contains_key("chat"));
+}
+
+/// Asks stay with the device that asked: a member taken from another device carries no
+/// ask here, so this device's next renewal signs it without that device's deadline. Its
+/// protocol is told when the member arrives.
+#[tokio::test]
+async fn test_renewal_member_remote_deadline_is_not_carried() {
+    let p = Pair::new();
+    let (mut a, _) = join(&p).await;
+    a.set_multi_device(true).await.unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.end_reconcile(UserConfirmed::new()).await.ok();
+    p.w.clock.advance_ms(1000);
+    let deadline = p.w.clock.now_ms() + HOUR;
+    a.set_protocol_member("chat", Some(object(json!({ "room": 5 }))), Some(deadline))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1000);
+    assert_eq!(changed(b.receive(None).await.unwrap().events), ["chat"]);
+    assert!(b.record_expiries().await.unwrap().get("chat") != Some(&RecordExpiry::At(deadline)));
+    p.w.clock.advance_ms(1000);
+    renew_to(&p, &b, &SCOPES);
+    b.receive(None).await.unwrap();
+    let held = AppRecord::verify(b.record(), &p.w.alice.public()).unwrap();
+    assert_eq!(members(&b)["chat"], json!({ "room": 5 }));
+    assert_ne!(held.body().expires_at, Some(deadline));
 }

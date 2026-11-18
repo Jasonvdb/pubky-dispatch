@@ -138,10 +138,14 @@ impl App {
             Some(accepted) => Some(AppRecord::verify(accepted, &self.state.meta.identity)?),
             None => None,
         };
+        let mut asks = asks;
         let (held, changed) = match over {
             Some(later) => {
                 let accepted = accepted.as_ref().map(AppRecord::body);
-                held.over(accepted, later, &self.protocols)
+                let before = held.body().clone();
+                let (built, changed) = held.over(accepted, later, &self.protocols);
+                keep_asks(&mut asks, &before, built.body());
+                (built, changed)
             }
             None => (held, Vec::new()),
         };
@@ -167,64 +171,66 @@ impl App {
 
     /// `taken`, a record of the app another device signed, replaces the one held, in `tx`:
     /// each registered protocol whose member changed, is gone or is new is told
-    /// ([`AppEvent::MemberChanged`]), and the ask of a member gone goes with it.
+    /// ([`AppEvent::MemberChanged`]); an ask goes with its member, and one whose member was
+    /// absent already stays ([`keep_asks`]).
     async fn took_elsewhere(&mut self, tx: &mut Tx, taken: &SignedDoc) -> Result<(), AppError> {
         let identity = self.state.meta.identity;
         let held = AppRecord::verify(&self.state.record, &identity)?;
         let taken = AppRecord::verify(taken, &identity)?;
-        let changed = self
-            .protocols
+        let mut asks = self.record_expiries().await?;
+        if keep_asks(&mut asks, held.body(), taken.body()) {
+            tx.put(key::RECORD_EXPIRIES, &asks)?;
+        }
+        let changed = self.changed_from(held.body(), taken.body());
+        self.tell_changed(tx, changed)
+    }
+
+    /// The registered protocols whose member is new, changed or gone from `held` to `taken`.
+    fn changed_from(&self, held: &AppRecordBody, taken: &AppRecordBody) -> Vec<String> {
+        self.protocols
             .names()
             .into_iter()
-            .filter(|name| held.body().protocols.get(name) != taken.body().protocols.get(name))
-            .collect();
-        self.tell_changed(tx, changed, Some(taken.body())).await
+            .filter(|name| held.protocols.get(name) != taken.protocols.get(name))
+            .collect()
     }
 
     /// Take `later`, a record of the app another device signed under the certificate the
     /// app presents and later than the one it holds, as it is ([`App::took_elsewhere`]),
-    /// as the feed or the published copy shows it. Not while a change is kept here: its
-    /// delivery meets `later` and goes over it.
-    pub(crate) async fn take_own_later(&mut self, later: &SignedDoc) -> Result<(), AppError> {
+    /// in `tx`, as the feed or the published copy shows it. Not while a change is kept
+    /// here: its delivery meets `later` and goes over it. Returns whether it waits for a
+    /// protocol it changes that the read can't tell yet (`order` module).
+    pub(crate) async fn take_own_later(
+        &mut self,
+        later: &SignedDoc,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
         let identity = self.state.meta.identity;
         let held = AppRecord::verify(&self.state.record, &identity)?;
         let Ok(record) = AppRecord::verify(later, &identity) else {
-            return Ok(());
+            return Ok(false);
         };
         if self.state.pending_record.is_some()
             || record.cert().hash() != self.state.cert.hash()
             || record.updated_at() <= held.updated_at()
         {
-            return Ok(());
+            return Ok(false);
         }
-        let mut tx = self.tx()?;
-        self.took_elsewhere(&mut tx, later).await?;
+        let changed = self.changed_from(held.body(), record.body());
+        if !changed.iter().all(|name| self.may_tell(name)) {
+            return Ok(true);
+        }
+        self.took_elsewhere(tx, later).await?;
         tx.put(key::RECORD, later)?;
         tx.put(key::ACCEPTED_RECORD, later)?;
-        self.commit(tx).await?;
         self.state.record = later.clone();
         self.state.accepted = Some(later.clone());
         self.published_checked_ms = None;
-        Ok(())
+        Ok(false)
     }
 
-    /// Tell each protocol of `changed` its member changed or is gone, in `tx`
-    /// ([`AppEvent::MemberChanged`]); with `members`, the record's, drop the asks of
-    /// protocols without one.
-    async fn tell_changed(
-        &mut self,
-        tx: &mut Tx,
-        changed: Vec<String>,
-        members: Option<&AppRecordBody>,
-    ) -> Result<(), AppError> {
-        if let Some(members) = members.map(|body| &body.protocols) {
-            let mut asks = self.record_expiries().await?;
-            let before = asks.len();
-            asks.retain(|name, _| members.contains_key(name));
-            if asks.len() != before {
-                tx.put(key::RECORD_EXPIRIES, &asks)?;
-            }
-        }
+    /// Tell each protocol of `changed` its member is new, changed or gone, in `tx`
+    /// ([`AppEvent::MemberChanged`]).
+    fn tell_changed(&mut self, tx: &mut Tx, changed: Vec<String>) -> Result<(), AppError> {
         for name in changed {
             let duty = Duty::MemberChanged {
                 protocol: name.clone(),
@@ -328,7 +334,7 @@ impl App {
                 tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
                 self.state.pending_record = Some(judged.pending);
                 dropped = judged.dropped;
-                Box::pin(self.tell_changed(&mut tx, judged.changed, None)).await?;
+                self.tell_changed(&mut tx, judged.changed)?;
             }
             None => Box::pin(self.took_elsewhere(&mut tx, &record)).await?,
         }
@@ -485,12 +491,18 @@ impl App {
                 let accepted = accepted.as_ref().map(AppRecord::body);
                 (body, changed) = body.over(accepted, &held, &self.protocols);
             }
-            let members = Box::new(body.body().clone());
+            // The asks of members gone from it go before it is signed.
+            let mut asks = Box::pin(self.record_expiries()).await?;
+            let cleared = keep_asks(&mut asks, mine.body(), body.body());
             let previous = held.updated_at().max(mine.updated_at());
-            let record = Box::pin(self.sign_next_record(body, previous)).await?;
+            let updated_at = Box::pin(self.next_record_time(previous)).await?;
+            let record = self.sign_record_at(body, &asks, updated_at)?;
             batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
-            Box::pin(self.tell_changed(&mut tx, changed, Some(&members))).await?;
+            if cleared {
+                tx.put(key::RECORD_EXPIRIES, &asks)?;
+            }
+            self.tell_changed(&mut tx, changed)?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
                 body: batch.body().to_vec(),
@@ -770,4 +782,12 @@ struct Judged {
     dropped: Vec<String>,
     /// The registered protocols whose member held is another, gone or new in it.
     changed: Vec<String>,
+}
+
+/// Keep in `asks` only those of members `built` carries, and those whose member `held`
+/// lacked already; returns whether any went.
+fn keep_asks(asks: &mut RecordExpiries, held: &AppRecordBody, built: &AppRecordBody) -> bool {
+    let before = asks.len();
+    asks.retain(|name, _| built.protocols.contains_key(name) || !held.protocols.contains_key(name));
+    asks.len() != before
 }

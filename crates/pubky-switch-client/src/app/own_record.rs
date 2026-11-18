@@ -563,7 +563,7 @@ impl App {
         self.sign_record_at(body, &expiries, updated_at)
     }
 
-    fn sign_record_at(
+    pub(super) fn sign_record_at(
         &self,
         body: NextBody,
         expiries: &RecordExpiries,
@@ -683,7 +683,10 @@ impl App {
             Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => {
                 if let Ok(copy) = serde_json::from_slice::<SignedDoc>(&held) {
-                    Box::pin(self.take_own_later(&copy)).await?;
+                    let mut tx = self.tx()?;
+                    if !Box::pin(self.take_own_later(&copy, &mut tx)).await? {
+                        self.commit(tx).await?;
+                    }
                 }
                 Publication::Superseded
             }

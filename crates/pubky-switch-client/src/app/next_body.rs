@@ -145,7 +145,11 @@ impl CertBody {
             let keeps_ask = had.is_some() || ask != RecordExpiry::Never;
             let Some(member) = member else {
                 if before.is_none() && keeps_ask {
-                    judging_asks.insert(name, ask);
+                    if ask.valid() && writable(ask) {
+                        judging_asks.insert(name, ask);
+                    } else {
+                        dropped.push(name);
+                    }
                 }
                 continue;
             };

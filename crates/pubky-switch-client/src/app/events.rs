@@ -532,7 +532,8 @@ pub enum AppEvent {
     },
     /// The record the app signed with a renewed certificate it took has no member of
     /// `protocol` (Switch spec 3.2 step 3): the member its protocol gave for the certificate
-    /// broke the JSON rules or came with an ask that can't be signed, or the protocol isn't
+    /// broke the JSON rules or came with an ask that can't be signed, its ask without a
+    /// member can't be signed any more, or the protocol isn't
     /// registered here and the certificate lacks a scope or permission of the one before.
     /// Its protocol, where it runs, writes it again ([`super::App::set_protocol_member`]).
     #[non_exhaustive]

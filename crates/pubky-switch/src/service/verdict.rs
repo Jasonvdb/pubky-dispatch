@@ -33,12 +33,15 @@ impl Account {
     /// `holds` says; else staged, judged by its chain where it holds one (an activated
     /// import), else holding none. `generation` is its row's: that of the `identity.json` it
     /// was enrolled with, or 1 for one enrolled without a document, until a generation
-    /// starts there, which makes it serve.
+    /// starts there, which makes it serve. `state_version` is its row's count of changed
+    /// commits, which its state compares with the mark's (Switch wire 7.3, "The state").
+    #[allow(clippy::too_many_arguments)]
     pub fn judged(
         origin: &str,
         holds: impl Fn(&[u8; 32]) -> bool,
         generation: u64,
         chain: Option<(u64, [u8; 32])>,
+        state_version: u64,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
         activation: AccountActivation,
@@ -65,6 +68,7 @@ impl Account {
             model: account::Account {
                 activation,
                 state,
+                state_version,
                 created_at_ms,
                 document_generation: doc.map(|body| body.generation),
                 enrolled_generation: generation,
@@ -285,6 +289,7 @@ mod tests {
             seq,
             chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
             key: MARK_KEY,
+            state_version: 0,
             created_at_ms,
         }
     }
@@ -305,6 +310,7 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                state_version: 0,
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 2,
@@ -315,6 +321,7 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                state_version: 0,
                 created_at_ms: 100,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -426,6 +433,7 @@ mod tests {
             seq: 5,
             chain_hash: [1; 32],
             key: CURRENT,
+            state_version: 0,
             created_at_ms: 0,
         };
         // Past the mark in its generation, and at a later generation: the stub at the
@@ -449,6 +457,7 @@ mod tests {
                     seq: 3,
                     chain_hash: [2; 32],
                 }),
+                state_version: 0,
                 created_at_ms: 0,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -988,6 +997,7 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::StagedImport(tip(3, 7, 1)),
+                state_version: 0,
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 3,
@@ -1374,6 +1384,7 @@ mod tests {
                 holds,
                 2,
                 chain,
+                0,
                 5,
                 doc,
                 AccountActivation::Ordinary,

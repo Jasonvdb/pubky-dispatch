@@ -19,13 +19,15 @@ use serde_json::json;
 use super::{Answer, Inner, ScriptedSwitch, bad};
 use crate::transport::{Request, Response};
 
-/// A mark: the newest head the switch signed for the identity, the service key the account
-/// is answered with, and the time the account was created (Switch wire 7.3).
+/// A mark: the newest head the switch signed for the identity, the account's count of
+/// changed state as of its last acknowledged change, the service key the account is
+/// answered with, and the time the account was created (Switch wire 7.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Mark {
     pub(crate) generation: u64,
     pub(crate) seq: u64,
     pub(crate) chain_hash: [u8; 32],
+    pub(crate) state_version: u64,
     pub(crate) key: [u8; 32],
     pub(crate) created_at_ms: u64,
 }
@@ -37,6 +39,7 @@ impl Mark {
             generation: 0,
             seq: 0,
             chain_hash: ZERO_HASH,
+            state_version: 0,
             key,
             created_at_ms,
         }
@@ -295,6 +298,12 @@ impl Inner {
                 {
                     // A state past the mark with another chain hash at the mark's `seq`.
                     Some(NoticeReason::Fork)
+                } else if state.generation == mark.generation
+                    && self.state_version < mark.state_version
+                {
+                    // Fewer changes than the mark covers: an acknowledged one was lost, as
+                    // the service's one rule judges it (Switch wire 7.3, Table 1).
+                    Some(NoticeReason::Behind)
                 } else {
                     None
                 }
@@ -505,26 +514,34 @@ impl Inner {
             MarkSlot::At(mark) => Mark {
                 key,
                 created_at_ms: created,
+                state_version: self.state_version,
                 ..mark
             },
             MarkSlot::Missing | MarkSlot::Corrupt => Mark::zero(key, created),
         });
     }
 
-    /// Move the mark to the account's state after a commit that gives out a head (Switch
-    /// wire 7.3, Table 3): only while the account is healthy, and only to a higher pair.
+    /// Move the mark to the account's state and count after a request (Switch wire 7.3,
+    /// "Moving it", Table 3): only while the account is healthy, and only forward: a later
+    /// generation, or the mark's with neither the head's `seq` nor the count lower and one
+    /// higher.
     pub(super) fn settle_mark(&mut self) {
         if self.judge() != Verdict::Healthy || self.tip.seq == 0 {
             return;
         }
-        let tip = self.tip;
+        let (tip, state_version) = (self.tip, self.state_version);
         let key = self.service.verifying_key().to_bytes();
         if let MarkSlot::At(mark) = &mut self.marks.slot
-            && (tip.generation, tip.seq) > (mark.generation, mark.seq)
+            && (tip.generation > mark.generation
+                || (tip.generation == mark.generation
+                    && tip.seq >= mark.seq
+                    && state_version >= mark.state_version
+                    && (tip.seq, state_version) != (mark.seq, mark.state_version)))
         {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
+            mark.state_version = state_version;
             mark.key = key;
         }
     }
@@ -538,6 +555,7 @@ impl Inner {
             generation: self.tip.generation,
             seq: self.tip.seq,
             chain_hash: self.tip.chain_hash,
+            state_version: self.state_version,
             key: self.service.verifying_key().to_bytes(),
             created_at_ms: created,
         });
@@ -555,6 +573,7 @@ impl Inner {
                 generation: self.tip.generation,
                 seq: self.tip.seq,
                 chain_hash: self.tip.chain_hash,
+                state_version: self.state_version,
                 key,
                 created_at_ms: self.created_at_ms,
             }
@@ -590,6 +609,20 @@ impl ScriptedSwitch {
         }
     }
 
+    /// The count the mark covers (Switch wire 7.3, "The mark"), `None` where it is missing or
+    /// doesn't read as a mark.
+    pub fn mark_state_version(&self) -> Option<u64> {
+        match self.lock().marks.slot {
+            MarkSlot::At(mark) => Some(mark.state_version),
+            MarkSlot::Missing | MarkSlot::Corrupt => None,
+        }
+    }
+
+    /// The account's count of changed state (Switch wire 7.3, "The state").
+    pub fn state_version(&self) -> u64 {
+        self.lock().state_version
+    }
+
     /// The account's creation time, as its enrollment answer names it (Switch wire 3.7): the
     /// one in its mark, or the account's own where the mark is lost.
     pub fn created(&self) -> u64 {
@@ -613,9 +646,10 @@ impl ScriptedSwitch {
         self.lock().marks.erasure_at_ms
     }
 
-    /// A restore of the account's state to `seq` of its generation, the mark staying where
-    /// it is: past the mark, the account fails stop, `behind` (Switch wire 7.3, Table 3 "A
-    /// restore of the state"). The `identity.json` the account holds goes back with it: a
+    /// A restore of the account's state to `seq` of its generation, as it was when `seq` was
+    /// given out, its count with it, the mark staying where it is: below the mark's head or
+    /// count, the account fails stop, `behind` (Switch wire 7.3, Table 3 "A restore of the
+    /// state"). The `identity.json` the account holds goes back with it: a
     /// delivery past `seq` is undone, and the newest one at or below it is held again.
     pub fn restore_to(&self, seq: u64) {
         let mut inner = self.lock();
@@ -652,18 +686,25 @@ impl ScriptedSwitch {
         }
         inner.tips.retain(|tip| tip.seq <= seq);
         inner.seq = seq;
+        // The count goes back to what it was as `seq` was given out: every change after it
+        // is lost with the restore.
+        if let Some(at) = inner.versions.iter().rposition(|(given, _)| *given == seq) {
+            inner.state_version = inner.versions[at].1;
+            inner.versions.truncate(at + 1);
+        }
     }
 
     /// The mark records another chain hash at the state's pair, as after a restore that took
     /// other writes up to the mark's `seq`: the account fails stop, `fork`.
     pub fn fork_mark(&self) {
         let mut inner = self.lock();
-        let tip = inner.tip;
+        let (tip, state_version) = (inner.tip, inner.state_version);
         if let MarkSlot::At(mark) = &mut inner.marks.slot {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
             mark.chain_hash[0] ^= 0xff;
+            mark.state_version = state_version;
         }
     }
 

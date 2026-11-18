@@ -581,6 +581,7 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
+            state_version: state_version_of(&replay, &alice_id()).await,
             key,
             created_at_ms: mark_before.created_at_ms,
         }
@@ -604,6 +605,52 @@ async fn held_and_kept(replay: &Replay) -> (i64, i64) {
         )
         .await,
     )
+}
+
+#[tokio::test]
+async fn test_recovery_held_revoked_apps_lost_to_a_restore_are_behind_the_mark() {
+    // An enrollment at a serving account holds its `revoked_apps` for the next generation:
+    // a counted write, which the mark covers before the answer goes out (Switch wire 7.3,
+    // "Moving it", Table 3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    assert_eq!(mark_of(&replay).await.state_version, count);
+    let at = replay.clock.now_ms() + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let answer = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(held_and_kept(&replay).await, (1, 0));
+    assert_eq!(state_version_of(&replay, &alice_id()).await, count + 1);
+    assert_eq!(mark_of(&replay).await.state_version, count + 1);
+    // A restore that loses only that enrollment: the account is behind its mark, and no
+    // start of a later generation can then miss the held App ID unnoticed.
+    sql_on(
+        &replay,
+        &alice_id(),
+        &format!(
+            "WITH gone AS (DELETE FROM held_revoked_apps WHERE account_id = $1) \
+             UPDATE accounts SET state_version = {count} WHERE id = $1"
+        ),
+    )
+    .await;
+    let read = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(code(&read), (503, "recovery_required".to_string()));
+    assert_eq!(json_of(&read)["current"]["reason"], "behind");
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
@@ -1154,7 +1201,7 @@ async fn restored(replay: &Replay, fork: bool) -> u64 {
         };
         replay
             .marks
-            .write_anew(&alice_id(), beside, mark.key, mark.created_at_ms)
+            .write_anew(&alice_id(), at_head(beside), mark.key, mark.created_at_ms)
             .await
             .expect("a mark beside the state");
     } else {
@@ -1165,7 +1212,12 @@ async fn restored(replay: &Replay, fork: bool) -> u64 {
         };
         replay
             .marks
-            .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
+            .advance(
+                &alice_id(),
+                keeping_count(&replay.marks, &alice_id(), ahead).await,
+                mark.key,
+                mark.created_at_ms,
+            )
             .await
             .expect("a mark ahead of the state");
     }
@@ -1307,7 +1359,7 @@ async fn test_recovery_failing_start_is_above_the_marks_generation() {
         .marks
         .advance(
             &alice_id(),
-            ahead,
+            keeping_count(&replay.marks, &alice_id(), ahead).await,
             key,
             mark_created_at(&replay, &alice_id()).await,
         )
@@ -1398,6 +1450,7 @@ async fn test_recovery_failing_mark_lost_start_writes_the_mark_anew() {
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
+            state_version: state_version_of(&replay, &alice_id()).await,
             key,
             created_at_ms: created,
         }

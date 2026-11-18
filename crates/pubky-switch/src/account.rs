@@ -19,6 +19,9 @@ pub struct Mark {
     pub seq: u64,
     /// The chain hash of that head, or the zero hash before any head.
     pub chain_hash: [u8; 32],
+    /// The account's count of changed commits as of the last one acknowledged under the
+    /// mark, 0 before any head (Switch wire 7.3, "The mark").
+    pub state_version: u64,
     /// The account creation time, in Unix milliseconds.
     pub created_at_ms: u64,
 }
@@ -30,6 +33,7 @@ impl Mark {
             generation: 0,
             seq: 0,
             chain_hash: [0; 32],
+            state_version: 0,
             created_at_ms,
         }
     }
@@ -76,6 +80,9 @@ pub struct Account {
     pub activation: AccountActivation,
     /// What it holds.
     pub state: AccountState,
+    /// Its count of changed commits: with its chain head, its state (Switch wire 7.3, "The
+    /// state").
+    pub state_version: u64,
     /// When it was created, in Unix milliseconds.
     pub created_at_ms: u64,
     /// The generation of the newest `identity.json` it holds, `None` while it holds none.
@@ -228,7 +235,8 @@ enum Column {
     Head,
     /// The mark records a head; the state is at or past it.
     AtOrPast,
-    /// The mark records a head; the state is behind it.
+    /// The mark records a head; the state is behind it: of an earlier generation, or of
+    /// the mark's with a lower `seq` or a lower count.
     Behind,
     /// The mark is at the state's pair with another chain hash, or the state is past the
     /// mark with another chain hash at the mark's `seq`.
@@ -427,7 +435,7 @@ fn lost(mark: &Mark, permanent: bool) -> Verdict {
 fn judge_account(account: &Account, inputs: &Inputs<'_>, retired: Option<u64>) -> Verdict {
     let state = account.state.state();
     let mark = inputs.mark.mark();
-    let column = column(state, mark, inputs.stub_at_mark);
+    let column = column(state, account.state_version, mark, inputs.stub_at_mark);
     // A retirement is of the generation [`retirement_generation`] selects, and counts
     // only while the state isn't of a later generation than that.
     let retired =
@@ -501,9 +509,15 @@ pub fn stub_for_fork_rule(state: Option<(u64, u64)>, mark: &Mark) -> Option<(u64
     (mark.records_head() && state.is_some_and(|at| at > marked)).then_some(marked)
 }
 
-/// Which of Table 1's columns, other than the two read first, the state and the mark fall
-/// in.
-fn column(state: Option<ChainTip>, mark: Option<&Mark>, stub_at_mark: Option<[u8; 32]>) -> Column {
+/// Which of Table 1's columns, other than the two read first, the state, with its count of
+/// changed commits `state_version`, and the mark fall in (Switch wire 7.3, Table 1). The
+/// one rule the service, its offline check and the scripted switch judge by.
+fn column(
+    state: Option<ChainTip>,
+    state_version: u64,
+    mark: Option<&Mark>,
+    stub_at_mark: Option<[u8; 32]>,
+) -> Column {
     let Some(mark) = mark else {
         return Column::NoMark;
     };
@@ -515,7 +529,7 @@ fn column(state: Option<ChainTip>, mark: Option<&Mark>, stub_at_mark: Option<[u8
     };
     let at = (state.generation, state.seq);
     let marked = (mark.generation, mark.seq);
-    if at < marked {
+    let by_head = if at < marked {
         Column::Behind
     } else if at == marked {
         if state.chain_hash == mark.chain_hash {
@@ -529,6 +543,16 @@ fn column(state: Option<ChainTip>, mark: Option<&Mark>, stub_at_mark: Option<[u8
         Column::Fork
     } else {
         Column::AtOrPast
+    };
+    // Read after the heads, so a fork stays a fork: in the mark's generation, a state with
+    // fewer changed commits than the mark covers lost an acknowledged write.
+    if by_head == Column::AtOrPast
+        && state.generation == mark.generation
+        && state_version < mark.state_version
+    {
+        Column::Behind
+    } else {
+        by_head
     }
 }
 

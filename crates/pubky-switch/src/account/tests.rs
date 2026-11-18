@@ -2,6 +2,8 @@ use super::*;
 
 /// The state of every row with one: generation 2, `seq` 10.
 const STATE: ChainTip = tip(2, 10, 1);
+/// The count of every row's account (Switch wire 7.3, "The state").
+const COUNT: u64 = 10;
 /// The time of the erasure's record of the erased rows; their marks were made before.
 const ERASED_AT: u64 = 200;
 
@@ -17,12 +19,20 @@ fn mark(generation: u64, seq: u64, hash: u8) -> MarkInput {
     MarkInput::Mark(mark_created(generation, seq, hash, 100))
 }
 
+/// A mark at (`generation`, `seq`) that covers the count `state_version`.
+fn counting(generation: u64, seq: u64, hash: u8, state_version: u64) -> MarkInput {
+    MarkInput::Mark(Mark {
+        state_version,
+        ..mark_created(generation, seq, hash, 100)
+    })
+}
+
 fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> Mark {
     Mark {
         generation,
         seq,
         chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
-
+        state_version: 0,
         created_at_ms,
     }
 }
@@ -42,17 +52,17 @@ fn account(row: Row) -> Option<Account> {
     let staged = |state| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
+        state_version: COUNT,
         created_at_ms: 100,
         document_generation: None,
-
         enrolled_generation: 2,
     };
     let serving = |state| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
+        state_version: COUNT,
         created_at_ms: 100,
         document_generation: Some(2),
-
         enrolled_generation: 2,
     };
     match row {
@@ -149,6 +159,7 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
         seq: 5,
         chain_hash: [1; 32],
 
+        state_version: 0,
         created_at_ms: 0,
     };
     // Past the mark in its generation, and at a later generation: the stub at the
@@ -168,9 +179,9 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
             seq: 3,
             chain_hash: [2; 32],
         }),
+        state_version: 0,
         created_at_ms: 0,
         document_generation: Some(2),
-
         enrolled_generation: 2,
     };
     let judged = judge(&Inputs {
@@ -440,8 +451,13 @@ fn assert_at_or_past(row: Row) {
     for mark in at_or_past_marks() {
         assert_eq!(verdict(row, mark, &[]), Verdict::Healthy);
     }
-    // Past the mark in a later generation.
+    // Past the mark in a later generation, whatever count the mark's covers.
     assert_eq!(verdict(row, mark(1, 30, 7), &[]), Verdict::Healthy);
+    assert_eq!(verdict(row, counting(1, 30, 7, 90), &[]), Verdict::Healthy);
+    // In the mark's generation, at or past the count it covers.
+    for at_count in [counting(2, 10, 1, COUNT), counting(2, 5, 7, COUNT - 1)] {
+        assert_eq!(verdict(row, at_count, &[]), Verdict::Healthy);
+    }
 }
 
 fn assert_behind(row: Row) {
@@ -455,11 +471,29 @@ fn assert_behind(row: Row) {
         verdict(row, mark(3, 1, 7), &[]),
         failing(3, NoticeReason::Behind, false, false)
     );
+    // At the mark's head or past it, in its generation, with a lower count than the mark
+    // covers: an acknowledged write was lost (Switch wire 7.3, Table 1).
+    for lost_write in [counting(2, 10, 1, COUNT + 1), counting(2, 8, 7, COUNT + 2)] {
+        assert_eq!(
+            verdict(row, lost_write, &[]),
+            failing(2, NoticeReason::Behind, false, abort_at(row))
+        );
+    }
 }
 
 fn assert_fork(row: Row) {
     assert_eq!(
         verdict(row, fork_mark(), &[]),
+        failing(2, NoticeReason::Fork, false, abort_at(row))
+    );
+    // A fork stays a fork whatever the count: at the state's pair with another chain hash,
+    // and past the mark with another chain hash at its stub.
+    assert_eq!(
+        verdict(row, counting(2, 10, 9, COUNT + 4), &[]),
+        failing(2, NoticeReason::Fork, false, abort_at(row))
+    );
+    assert_eq!(
+        judged_with(row, counting(2, 8, 7, COUNT + 4), Some([9; 32]), &[]).verdict,
         failing(2, NoticeReason::Fork, false, abort_at(row))
     );
 }
@@ -700,9 +734,9 @@ fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generatio
     let import = Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedImport(tip(3, 7, 1)),
+        state_version: 0,
         created_at_ms: 100,
         document_generation: None,
-
         enrolled_generation: 3,
     };
     assert_eq!(import.generation(), 3);
@@ -1484,6 +1518,7 @@ fn test_retirement_generation_is_the_one_the_verdict_reads() {
     let serving_at = |state: ChainTip, created_at_ms| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::Serving(state),
+        state_version: COUNT,
         created_at_ms,
         document_generation: Some(state.generation),
         enrolled_generation: state.generation,
@@ -1491,6 +1526,7 @@ fn test_retirement_generation_is_the_one_the_verdict_reads() {
     let staged = Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedNoChain,
+        state_version: COUNT,
         created_at_ms: 100,
         document_generation: None,
         enrolled_generation: 2,

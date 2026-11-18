@@ -16,7 +16,7 @@ use pubky_switch::changes::{ChangeHub, ChangeListener};
 use pubky_switch::http::source::ProxyConfig;
 use pubky_switch::keys::FileKeyStore;
 use pubky_switch::limits::Limits;
-use pubky_switch::marks::{AccountMark, Advance, MarkRead, MarkStore};
+use pubky_switch::marks::{AccountMark, Advance, MarkRead, MarkStore, MarkTarget};
 use pubky_switch::retire::{self, RetireOptions};
 use pubky_switch::service::Service;
 use pubky_switch::store::Store;
@@ -354,10 +354,13 @@ impl RealSwitch {
         self.while_stopped(async |_, key_dir| {
             let marks = MarkStore::open(key_dir).map_err(setup)?;
             let mark = Self::mark_of(&marks, identity).await?;
-            let past = ChainTip {
-                generation: mark.generation,
-                seq: mark.seq + 1,
-                chain_hash: [0x5a; 32],
+            let past = MarkTarget {
+                head: ChainTip {
+                    generation: mark.generation,
+                    seq: mark.seq + 1,
+                    chain_hash: [0x5a; 32],
+                },
+                state_version: mark.state_version + 1,
             };
             match marks
                 .advance(identity, past, mark.key, mark.created_at_ms)
@@ -382,8 +385,11 @@ impl RealSwitch {
         self.while_stopped(async |_, key_dir| {
             let marks = MarkStore::open(key_dir).map_err(setup)?;
             let mark = Self::mark_of(&marks, identity).await?;
-            let mut other = mark.head();
-            other.chain_hash[0] ^= 0xff;
+            let mut other = MarkTarget {
+                head: mark.head(),
+                state_version: mark.state_version,
+            };
+            other.head.chain_hash[0] ^= 0xff;
             marks.delete(identity).await.map_err(setup)?;
             marks
                 .write_anew(identity, other, mark.key, mark.created_at_ms)

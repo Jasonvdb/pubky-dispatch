@@ -303,6 +303,12 @@ pub(crate) struct Inner {
     pub(crate) clock: Arc<TestClock>,
     pub(crate) tip: ChainTip,
     pub(crate) seq: u64,
+    /// The account's count of changed state, as the service's (Switch wire 7.3, "The
+    /// state"): one more at each `seq` given out and at each other state change modelled
+    /// here (FAKES.md).
+    pub(crate) state_version: u64,
+    /// The count as each `seq` was given out, for a restore to that `seq`.
+    pub(crate) versions: Vec<(u64, u64)>,
     pub(crate) items: Vec<Item>,
     pub(crate) tips: Vec<ChainTip>,
     pub(crate) doc: Option<IdentityDoc>,
@@ -459,6 +465,8 @@ impl Inner {
             clock,
             tip,
             seq: tip.seq,
+            state_version: 0,
+            versions: Vec::new(),
             items: Vec::new(),
             tips: vec![tip],
             doc: None,
@@ -1573,7 +1581,8 @@ impl ScriptedSwitch {
         Ok(self.send_envelope(sender, cert, envelope, to))
     }
 
-    /// An entry carrying `envelope` as it is, for the `to` apps. Returns its `seq`.
+    /// An entry carrying `envelope` as it is, for the `to` apps, acknowledged to its sender at
+    /// once: the mark covers it (Switch wire 7.3, "Moving it"). Returns its `seq`.
     pub fn send_envelope(
         &self,
         sender: [u8; 32],
@@ -1597,6 +1606,7 @@ impl ScriptedSwitch {
             context: None,
         });
         inner.judge_lagging();
+        inner.settle_mark();
         seq
     }
 
@@ -1961,11 +1971,12 @@ impl ScriptedSwitch {
     pub(crate) fn roll_back_to(&self, seq: u64) {
         self.restore_to(seq);
         let mut inner = self.lock();
-        let tip = inner.tip;
+        let (tip, state_version) = (inner.tip, inner.state_version);
         if let marks::MarkSlot::At(mark) = &mut inner.marks.slot {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
+            mark.state_version = state_version;
         }
     }
 
@@ -2151,9 +2162,16 @@ impl Inner {
 
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
+        self.count_change();
+        self.versions.push((self.seq, self.state_version));
         // The account changes: the held reads look again.
         self.wake_held();
         self.seq
+    }
+
+    /// Count a change of the account's state (Switch wire 7.3, "The state").
+    pub(super) fn count_change(&mut self) {
+        self.state_version = self.state_version.saturating_add(1);
     }
 
     /// Wake every held feed read, to look again.
@@ -3148,6 +3166,7 @@ impl Inner {
         };
         let out = answer(&reg);
         self.push.insert(app, reg);
+        self.count_change();
         out
     }
 

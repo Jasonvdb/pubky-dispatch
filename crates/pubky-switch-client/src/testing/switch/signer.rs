@@ -1101,6 +1101,7 @@ mod tests {
                         if generation == 0 {
                             mark.seq = 0;
                             mark.chain_hash = pubky_switch_core::chain::ZERO_HASH;
+                            mark.state_version = 0;
                         }
                         inner.marks.slot = MarkSlot::At(mark);
                     } else {

@@ -320,6 +320,7 @@ fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Accou
         |key| key == service_key,
         head.generation,
         head.chain,
+        head.state_version,
         head.created_at_ms,
         body.as_ref(),
         head.activation,
@@ -570,6 +571,7 @@ mod tests {
             seq,
             chain_hash: [hash; 32],
             key: KEY,
+            state_version: 0,
             created_at_ms: 10,
         })
     }
@@ -583,6 +585,7 @@ mod tests {
                     seq,
                     chain_hash: [hash; 32],
                 }),
+                state_version: 0,
                 created_at_ms: 10,
                 document_generation: Some(1),
                 enrolled_generation: 1,

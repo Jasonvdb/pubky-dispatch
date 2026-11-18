@@ -40,8 +40,8 @@ pub struct NewAccount {
     pub enrollment_store_id: [u8; 16],
 }
 
-/// An account's position: its generation and key, the last `seq` given out, the chain head
-/// and the stamped service time.
+/// An account's position: its generation and key, the last `seq` given out, the chain head,
+/// its count of changed commits and the stamped service time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountHead {
     /// The persisted activation requirement of this lifetime.
@@ -56,6 +56,9 @@ pub struct AccountHead {
     pub last_seq: u64,
     /// The newest chain item's `seq` and the chain hash there; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
+    /// The account's count of changed commits: one more for each commit that changed any of
+    /// its counted state, never reset while the account lasts (Switch wire 7.3, "The state").
+    pub state_version: u64,
     /// The last service time the account stamped.
     pub stamped_time_ms: u64,
     /// When the account was created.
@@ -88,18 +91,25 @@ impl AccountHead {
     }
 }
 
-/// A committed request: what it committed is durable, so an answer carrying a `seq`, a
-/// proof or a head may go out once the mark has moved to its head (Switch wire 7.3 step 10).
-/// Only [`AccountTxn::commit`] makes one.
+/// A committed request: what it committed is durable, so its answer may go out once the
+/// mark has moved to its head and count (Switch wire 7.3 step 10, "Moving it"). Only
+/// [`AccountTxn::commit`] makes one.
 #[derive(Debug)]
 pub struct Committed {
     head: AccountHead,
+    counted: bool,
 }
 
 impl Committed {
     /// The account's position as committed.
     pub fn head(&self) -> &AccountHead {
         &self.head
+    }
+
+    /// Whether the commit changed counted state, and so moved the account's count (Switch
+    /// wire 7.3, "The state").
+    pub fn counted(&self) -> bool {
+        self.counted
     }
 }
 
@@ -344,8 +354,9 @@ impl AccountTxn {
         id: &str,
     ) -> Result<Option<Self>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, \
-             stamped_time_ms, created_at_ms, activation_requirement FROM accounts WHERE id = $1 FOR UPDATE",
+            "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, state_version, \
+             stamped_time_ms, created_at_ms, activation_requirement FROM accounts WHERE id = $1 \
+             FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -375,6 +386,7 @@ impl AccountTxn {
             generation: from_db(row.try_get("generation")?, "generation")?,
             last_seq: from_db(row.try_get("last_seq")?, "last_seq")?,
             chain,
+            state_version: from_db(row.try_get("state_version")?, "state_version")?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         };
@@ -491,45 +503,105 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// Run `work` on this transaction as `reason`, a write whose loss to a restore changes
+    /// no later decision: what it changes counts nothing toward the account's count (Switch
+    /// wire 7.3, "The state"). The step 4 sweeps, chain stub retention and a due claim's
+    /// deletion run so; each is named in the schema's list of what the count leaves out.
+    ///
+    /// # Errors
+    ///
+    /// `work`'s error, or the database's.
+    pub async fn uncounted<T>(
+        &mut self,
+        reason: &'static str,
+        work: impl AsyncFnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.set_uncounted(reason).await?;
+        let done = work(self).await?;
+        self.set_uncounted("").await?;
+        Ok(done)
+    }
+
+    /// Mark what this transaction writes from now on as uncounted for `reason`, or counted
+    /// again with `""`: a transaction-local setting the schema's count trigger reads.
+    async fn set_uncounted(&mut self, reason: &str) -> Result<(), StoreError> {
+        sqlx::query("SELECT set_config('switch.uncounted', $1, true)")
+            .bind(reason)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
     /// The transaction's connection, for the queries of the account's other state. Every
     /// query on it is part of this request, and commits or rolls back with it.
     pub fn conn(&mut self) -> &mut PgConnection {
         &mut self.tx
     }
 
-    /// Commit the request. Once this returns, what it committed is durable; an answer that
-    /// carries a head goes out once the mark has moved to it (Switch wire 7.3 step 10).
+    /// Commit the request. Once this returns, what it committed is durable; its answer goes
+    /// out once the mark has moved to its head and count (Switch wire 7.3 step 10, "Moving
+    /// it").
+    ///
+    /// The account's count moves by one where the request changed counted state: a row the
+    /// schema's count trigger saw change, or the account's position other than its stamp.
+    /// It is read after the superseded documents go and before the request's last-seen time
+    /// and flags are written, which count nothing (Switch wire 7.3, "The state").
     pub async fn commit(mut self) -> Result<Committed, StoreError> {
         // The documents this request superseded go with it (Switch wire 7.5).
         self.drop_stale_documents().await?;
-        if self.head != self.loaded {
-            let chain_seq = self
-                .head
-                .chain
-                .map(|(seq, _)| to_db(seq, "chain_seq"))
-                .transpose()?;
-            let chain_hash = self.head.chain.map(|(_, hash)| hash.to_vec());
-            let updated = sqlx::query(
+        let moved = self.head.generation != self.loaded.generation
+            || self.head.last_seq != self.loaded.last_seq
+            || self.head.chain != self.loaded.chain;
+        // With the position unchanged, the row is written only where the count moves.
+        let flagged = self.head == self.loaded && {
+            let flagged: Option<bool> = sqlx::query_scalar(
+                "SELECT coalesce(current_setting('switch.changed', true), '') = 'on'",
+            )
+            .fetch_one(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+            flagged.unwrap_or(false)
+        };
+        let chain_seq = self
+            .head
+            .chain
+            .map(|(seq, _)| to_db(seq, "chain_seq"))
+            .transpose()?;
+        let chain_hash = self.head.chain.map(|(_, hash)| hash.to_vec());
+        // An overflow of the count is the database's error: the commit fails.
+        let state_version: Option<i64> = if self.head == self.loaded && !flagged {
+            Some(to_db(self.loaded.state_version, "state_version")?)
+        } else {
+            sqlx::query_scalar(
                 "UPDATE accounts SET last_seq = $2, chain_seq = $3, chain_hash = $4, \
-                 stamped_time_ms = $5 WHERE id = $1",
+             stamped_time_ms = $5, state_version = CASE \
+             WHEN $6 OR coalesce(current_setting('switch.changed', true), '') = 'on' \
+             THEN state_version + 1 ELSE state_version END \
+             WHERE id = $1 RETURNING state_version",
             )
             .bind(&self.head.id)
             .bind(to_db(self.head.last_seq, "last_seq")?)
             .bind(chain_seq)
             .bind(chain_hash)
             .bind(to_db(self.head.stamped_time_ms, "stamped_time_ms")?)
-            .execute(&mut *self.tx)
+            .bind(moved)
+            .fetch_optional(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?
-            .rows_affected();
-            if updated != 1 {
-                return Err(StoreError::Corrupt("account row vanished under its lock"));
-            }
-            // A new seq or chain head is a change waiting readers care about; a stamped
-            // time alone, which every request may move, isn't.
-            if self.head.last_seq != self.loaded.last_seq || self.head.chain != self.loaded.chain {
-                self.changed = true;
-            }
+        };
+        let state_version = match state_version {
+            Some(state_version) => state_version,
+            // The row this transaction deleted, its position unchanged, has no count to move.
+            None if self.head == self.loaded => to_db(self.loaded.state_version, "state_version")?,
+            None => return Err(StoreError::Corrupt("account row vanished under its lock")),
+        };
+        self.head.state_version = from_db(state_version, "state_version")?;
+        let counted = self.head.state_version != self.loaded.state_version;
+        // A new seq or chain head is a change waiting readers care about; a stamped time
+        // alone, which every request may move, isn't.
+        if moved {
+            self.changed = true;
         }
         if let Some((app_id, at_ms)) = self.last_seen {
             sqlx::query("UPDATE apps SET last_seen_ms = $3 WHERE account_id = $1 AND app_id = $2")
@@ -578,7 +650,10 @@ impl AccountTxn {
                 .map_err(StoreError::from_db)?;
         }
         self.tx.commit().await.map_err(StoreError::from_db)?;
-        Ok(Committed { head: self.head })
+        Ok(Committed {
+            head: self.head,
+            counted,
+        })
     }
 
     /// Erase the account (Switch wire 7.4.16): delete its row, and with it every row of its

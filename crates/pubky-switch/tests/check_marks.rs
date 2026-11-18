@@ -107,7 +107,7 @@ async fn append(db: &TestDatabase, replay: Option<&Replay>, id: &str, hashes: &[
                 .marks
                 .advance(
                     id,
-                    head,
+                    keeping_count(&replay.marks, id, head).await,
                     service_public(replay),
                     mark_created_at(replay, id).await,
                 )
@@ -130,7 +130,7 @@ async fn mark_at(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u8)
         .marks
         .advance(
             id,
-            head,
+            keeping_count(&replay.marks, id, head).await,
             service_public(replay),
             mark_created_at(replay, id).await,
         )
@@ -159,7 +159,7 @@ async fn mark_anew(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u
     };
     replay
         .marks
-        .write_anew(id, head, service_public(replay), created)
+        .write_anew(id, at_head(head), service_public(replay), created)
         .await
         .expect("write anew");
 }

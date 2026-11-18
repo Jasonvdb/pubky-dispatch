@@ -235,7 +235,7 @@ async fn mark_ahead(replay: &Replay) {
         .marks
         .advance(
             &alice_id(),
-            ahead,
+            keeping_count(&replay.marks, &alice_id(), ahead).await,
             service_public(replay),
             mark_created_at(replay, &alice_id()).await,
         )

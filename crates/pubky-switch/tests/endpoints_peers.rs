@@ -319,6 +319,93 @@ fn stranger_doc(seed: u8) -> ([u8; 32], SignedDoc) {
     )
 }
 
+/// alice's account's count of changed commits and her mark's.
+async fn counts(replay: &Replay) -> (u64, u64) {
+    let id = identity("alice")["pubky_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let mark = match replay.marks.read(&id).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.state_version,
+        other => panic!("no mark: {other:?}"),
+    };
+    (state_version_of(replay, &id).await, mark)
+}
+
+#[tokio::test]
+async fn test_peers_removal_lost_to_a_restore_is_behind_the_mark() {
+    use pubky_switch_core::records::RemovedApp;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let bob_v1 = doc("bob identity.json");
+    add_contact(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
+    // bob's shop is admitted, and delivers bob's version 1.
+    assert_eq!(
+        body(&from_shop(&replay, &bob_v1, &at).await),
+        json!({ "known_version": 1, "version": 1 })
+    );
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let held: String = sqlx::query_scalar("SELECT to_jsonb(p)::text FROM peer_copies p")
+        .fetch_one(&mut conn)
+        .await
+        .expect("copy");
+    let (count, marked) = counts(&replay).await;
+    assert_eq!(marked, count, "the mark covers the shop's delivery");
+    // alice's wallet delivers bob's version 2, which removes the shop: acknowledged with
+    // the head, and covered by the mark before the answer goes out (Switch wire 7.3).
+    let removed = changed("bob", &bob_v1, |body| {
+        let app = body.apps.remove(0);
+        body.removed.push(RemovedApp {
+            app_id: app.app_id,
+            distrust_from: ms(&at),
+        });
+        body.version = 2;
+    });
+    assert_eq!(
+        body(&from_wallet(&replay, &removed, &at).await),
+        json!({ "version": 2 })
+    );
+    assert_eq!(counts(&replay).await, (count + 1, count + 1));
+    assert_eq!(
+        status_and_code(&from_shop(&replay, &bob_v1, &at).await),
+        (403, json!("not_admitted"))
+    );
+    // A restore that loses only that write: bob's copy back at version 1, the count back,
+    // the mark as it was left.
+    sqlx::query(
+        "UPDATE peer_copies p SET doc = r.doc, version = r.version, generation = r.generation, \
+         body_hash = r.body_hash, removed = r.removed, delivered = r.delivered \
+         FROM jsonb_populate_record(NULL::peer_copies, $1::jsonb) r \
+         WHERE p.account_id = r.account_id AND p.identity = r.identity",
+    )
+    .bind(&held)
+    .execute(&mut conn)
+    .await
+    .expect("restore the copy");
+    sqlx::query("UPDATE accounts SET state_version = $1")
+        .bind(i64::try_from(count).expect("count"))
+        .execute(&mut conn)
+        .await
+        .expect("restore the count");
+    conn.close().await.expect("close");
+    // The removed shop isn't admitted on the older list: the account answers the notice,
+    // `behind` (Switch wire 7.3, Table 1).
+    let answer = from_shop(&replay, &bob_v1, &at).await;
+    assert_eq!(
+        (
+            answer.status,
+            body(&answer)["code"].clone(),
+            body(&answer)["current"]["reason"].clone()
+        ),
+        (503, json!("recovery_required"), json!("behind"))
+    );
+    assert_eq!(counts(&replay).await, (count, count + 1), "nothing counted");
+    replay.db.drop_database().await.expect("drop");
+}
+
 async fn held_copies(replay: &Replay) -> Vec<Vec<u8>> {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await

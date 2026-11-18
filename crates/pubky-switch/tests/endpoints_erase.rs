@@ -1110,7 +1110,7 @@ async fn test_erase_conflict_at_a_failing_account_carries_the_held_copy() {
                 .marks
                 .advance(
                     &alice_id(),
-                    head_at(50),
+                    keeping_count(&replay.marks, &alice_id(), head_at(50)).await,
                     service_public(&replay),
                     mark_created_at(&replay, &alice_id()).await,
                 )
@@ -1183,7 +1183,12 @@ async fn test_erase_conflict_at_a_failing_account_carries_the_held_copy() {
 async fn lost_identity(replay: &Replay, created: &str) {
     let written = replay
         .marks
-        .write_anew(&alice_id(), head_at(2), service_public(replay), ms(created))
+        .write_anew(
+            &alice_id(),
+            at_head(head_at(2)),
+            service_public(replay),
+            ms(created),
+        )
         .await
         .expect("mark");
     assert!(matches!(
@@ -2040,7 +2045,12 @@ async fn test_erase_leftover_mark_is_deleted_at_a_request_and_at_start() {
             };
             replay
                 .marks
-                .write_anew(&alice_id(), head_at(2), service_public(&replay), created)
+                .write_anew(
+                    &alice_id(),
+                    at_head(head_at(2)),
+                    service_public(&replay),
+                    created,
+                )
                 .await
                 .expect("mark");
             set_time(&replay.clock, now);
@@ -2381,7 +2391,7 @@ async fn test_erase_wrong_created_conflict() {
                     .marks
                     .advance(
                         &alice_id(),
-                        head_at(2),
+                        keeping_count(&replay.marks, &alice_id(), head_at(2)).await,
                         service_public(&replay),
                         mark_created_at(&replay, &alice_id()).await,
                     )
@@ -2393,7 +2403,7 @@ async fn test_erase_wrong_created_conflict() {
                     .marks
                     .advance(
                         &alice_id(),
-                        head_at(50),
+                        keeping_count(&replay.marks, &alice_id(), head_at(50)).await,
                         service_public(&replay),
                         mark_created_at(&replay, &alice_id()).await,
                     )

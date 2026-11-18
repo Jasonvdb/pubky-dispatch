@@ -131,6 +131,7 @@ impl Inner {
     /// with no current target waits: only a departure converts it (Switch wire 7.4.4
     /// "Unreadable items").
     pub(super) fn after_cursor_move(&mut self) {
+        self.count_change();
         let current = self.current_app_ids();
         self.release_passed(&current, true);
         self.forget_deleted_keys();

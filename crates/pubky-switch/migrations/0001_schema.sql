@@ -7,8 +7,8 @@
 
 -- One account per identity the service hosts (Switch spec 6.2).
 --
--- The row holds the account's position: the last seq given out, the chain head and the
--- stamped service time. Every request to the account locks this row, so one account's
+-- The row holds the account's position: the last seq given out, the chain head, the count
+-- of changed commits and the stamped service time. Every request to the account locks this row, so one account's
 -- operations are serialized (Switch spec 6.5).
 CREATE TABLE accounts (
     -- The identity's Pubky ID.
@@ -23,6 +23,11 @@ CREATE TABLE accounts (
     -- The newest chain item's seq and the chain hash there; both null before the first.
     chain_seq       BIGINT   CHECK (chain_seq > 0 AND chain_seq <= last_seq),
     chain_hash      BYTEA    CHECK (octet_length(chain_hash) = 32),
+    -- The count of changed commits (Switch wire 7.3, "The state"): one more for each commit
+    -- that changed any of the account's counted state, which `count_state_change` below
+    -- sees. Never reset while the row lasts; the mark keeps the value as of the last
+    -- acknowledged commit, and a restore that lost one leaves it behind the mark's.
+    state_version   BIGINT   NOT NULL DEFAULT 0 CHECK (state_version >= 0),
     -- The last service time the account stamped; it never goes back (Switch spec 10.1).
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
     -- When the account was created, in service time.
@@ -86,8 +91,8 @@ CREATE TABLE kept_app_ids (
     PRIMARY KEY (account_id, app_id)
 );
 
--- The chain: one row per chain item of a generation (Switch wire 6.6). Inbox entries and
--- cursor moves take seqs too, so seqs have gaps.
+-- The chain: one row per chain item of a generation (Switch wire 6.6). Inbox entries take
+-- seqs too, so seqs have gaps.
 CREATE TABLE chain_items (
     account_id   TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     generation   BIGINT  NOT NULL CHECK (generation >= 0),
@@ -639,3 +644,102 @@ CREATE TABLE erasure_outcomes (
     attempt BYTEA NOT NULL CHECK (octet_length(attempt) BETWEEN 1 AND 4096),
     committed BOOLEAN NOT NULL
 );
+
+-- What an account's count of changed commits leaves out (Switch wire 7.3, "The state"),
+-- each with the reason losing it to a restore changes no later decision. Everything not
+-- listed is counted. This is the one list: `count_state_change` reads it, and a test
+-- checks it against the schema. Its kinds:
+-- - `column`: changes to the column `col` of table `tab` count nothing; `*` for the whole
+--   table.
+-- - `scope`: a write the service makes under the reason `col` counts nothing
+--   (`AccountTxn::uncounted`).
+-- - `background`: table `tab` is also written outside an identity's lock, by the service's
+--   background work. Under the lock it is counted like any other table; outside it, its
+--   writes commit with no account's commit and count nothing.
+CREATE FUNCTION state_uncounted() RETURNS TABLE (kind TEXT, tab TEXT, col TEXT, reason TEXT)
+LANGUAGE sql IMMUTABLE AS $$ VALUES
+    ('column', 'accounts', 'state_version',
+     'the count itself'),
+    ('column', 'accounts', 'stamped_time_ms',
+     'service time, stamped at nearly every request; that it never goes back is a rule of '
+     'its own (Switch spec 10.1)'),
+    ('column', 'apps', 'last_seen_ms',
+     'shown by GET /apps only; no decision reads it'),
+    ('column', 'sender_flags', '*',
+     'read only by GET /allow, which offers the signer a block; it admits or refuses '
+     'nothing, and a lost hit is like a flag that decayed'),
+    ('scope', NULL, 'step 4',
+     'the sweeps and chain stub retention of Switch wire 7.3 step 4: due claims, forgotten '
+     'deleted keys, spent invite codes and expired batch proofs come back due, spent or past '
+     'their time, which every reader treats as gone; dropped chain stubs and spent batches '
+     'come back kept, which is always safe; the next run takes them again, and the sweep '
+     'minute only sets when that run is'),
+    ('scope', NULL, 'due claim',
+     'a due claim GET /claims deletes comes back due, which every reader treats as gone'),
+    ('background', 'erased_keys', NULL,
+     'the row of a key the key store deleted goes once it is deleted: a restored row has '
+     'the deletion run again, and a key owed deleting signs nothing'),
+    ('background', 'push_deliveries', NULL,
+     'the webhook worker claims, retries and deletes rows: a restored row is sent at most '
+     'again within its entry''s minute, as a retry is (Switch wire 8.2)')
+$$;
+
+-- The row trigger on every account's table: it marks the transaction as one that changed
+-- counted state, `switch.changed`, which `AccountTxn::commit` reads to move the count. A
+-- rollback to a savepoint undoes the mark with the writes, so a refused request counts
+-- nothing; an update that changes no counted column counts nothing either. A write outside
+-- an identity's lock (`switch.locked`, set where the lock is taken) raises, unless its table
+-- is listed as background-written: a writer outside the request path fails loudly instead
+-- of going uncounted.
+CREATE FUNCTION count_state_change() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    scope TEXT := coalesce(current_setting('switch.uncounted', true), '');
+    left_out TEXT[];
+BEGIN
+    IF coalesce(current_setting('switch.locked', true), '') <> 'on' THEN
+        IF EXISTS (SELECT 1 FROM state_uncounted() u
+                   WHERE u.kind = 'background' AND u.tab = TG_TABLE_NAME) THEN
+            RETURN NULL;
+        END IF;
+        RAISE EXCEPTION 'a write to %, an account''s state, outside an identity''s lock',
+            TG_TABLE_NAME;
+    END IF;
+    IF scope <> '' THEN
+        IF NOT EXISTS (SELECT 1 FROM state_uncounted() u
+                       WHERE u.kind = 'scope' AND u.col = scope) THEN
+            RAISE EXCEPTION 'an uncounted write for an unlisted reason: %', scope;
+        END IF;
+        RETURN NULL;
+    END IF;
+    IF coalesce(current_setting('switch.changed', true), '') = 'on' THEN
+        RETURN NULL;
+    END IF;
+    SELECT coalesce(array_agg(u.col), '{}') INTO left_out FROM state_uncounted() u
+        WHERE u.kind = 'column' AND u.tab = TG_TABLE_NAME;
+    IF '*' = ANY (left_out) THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - left_out) = (to_jsonb(NEW) - left_out) THEN
+        RETURN NULL;
+    END IF;
+    PERFORM set_config('switch.changed', 'on', true);
+    RETURN NULL;
+END
+$$;
+
+-- Every table with an account column, and `accounts`, carries the trigger: a table is
+-- counted unless the list above leaves it out.
+DO $$
+DECLARE
+    t TEXT;
+BEGIN
+    FOR t IN
+        SELECT table_name FROM information_schema.columns
+        WHERE table_schema = current_schema() AND column_name = 'account_id'
+        UNION SELECT 'accounts'
+    LOOP
+        EXECUTE format('CREATE TRIGGER count_state_change AFTER INSERT OR UPDATE OR DELETE '
+                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change()', t);
+    END LOOP;
+END
+$$;

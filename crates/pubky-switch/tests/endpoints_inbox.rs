@@ -933,6 +933,68 @@ async fn test_inbox_removed_app_and_closed_renewal() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// alice's mark.
+async fn alice_mark(replay: &Replay) -> pubky_switch::marks::AccountMark {
+    match replay.marks.read(&alice_id()).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark,
+        other => panic!("no mark: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_inbox_append_lost_to_a_restore_is_behind_the_mark() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let last_seq = sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let count = sql_value(&replay, "SELECT state_version FROM accounts WHERE id = $1").await;
+    let before = alice_mark(&replay).await;
+    // bob's shop appends: an inbox entry at the next `seq`, with no chain item.
+    let answer = from_shop(&replay, to_wallet(1, false), Some(version), None).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let appended = sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    assert_eq!(appended, last_seq + 1);
+    // The mark covers the append's count before the answer goes out, its head unchanged
+    // (Switch wire 7.3, "Moving it").
+    let counted = sql_value(&replay, "SELECT state_version FROM accounts WHERE id = $1").await;
+    assert_eq!(counted, count + 1);
+    let mark = alice_mark(&replay).await;
+    assert_eq!(mark.head(), before.head());
+    assert_eq!(i64::try_from(mark.state_version).expect("count"), counted);
+    // A restore of a backup taken before the append: the entry, its `seq` and the count go
+    // back; the mark, apart from the state, stays.
+    let restored = sql_on(
+        &replay,
+        &alice_id(),
+        &format!(
+            "WITH gone AS (DELETE FROM inbox_entries WHERE account_id = $1 AND seq = {appended}) \
+             UPDATE accounts SET last_seq = {last_seq}, state_version = {count} WHERE id = $1"
+        ),
+    )
+    .await;
+    assert_eq!(restored, 1);
+    // The next append gets the notice, `behind`: the lost `seq` is never given out again
+    // (Switch wire 7.3, Table 1).
+    let again = from_shop(&replay, to_wallet(3, false), Some(version), None).await;
+    assert_eq!(code_of(&again), (503, json!("recovery_required")));
+    assert_eq!(
+        body(&again)["current"],
+        json!({ "generation": before.generation, "reason": "behind", "permanent": false })
+    );
+    assert_eq!(
+        sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await,
+        last_seq,
+        "no seq given out"
+    );
+    assert_eq!(alice_mark(&replay).await, mark);
+    replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_inbox_retry_gets_the_original_answer() {
     let Some(replay) = replay().await else { return };

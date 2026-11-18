@@ -157,6 +157,10 @@ impl TestDatabase {
         let options = admin.clone().database(&name);
         let store = Store::connect_with(options.clone(), config).await?;
         store.migrate().await?;
+        // A test's own connections write an account's state directly, as a restore or a
+        // fault would: they carry the identity lock's mark for their whole session, which
+        // the schema's count trigger requires of every such write. The store's don't.
+        let options = options.options([("switch.locked", "on")]);
         Ok(Self {
             admin,
             name,
@@ -171,7 +175,8 @@ impl TestDatabase {
         &self.store
     }
 
-    /// Options to open more connections to the test database.
+    /// Options to open more connections to the test database, which may write an account's
+    /// state directly: outside the service's lock, and counted toward nothing.
     pub fn options(&self) -> &PgConnectOptions {
         &self.options
     }
@@ -179,6 +184,12 @@ impl TestDatabase {
     /// The test database's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Options to open a connection to the test database as the service's store does, which
+    /// may write an account's state only under an identity's lock.
+    pub fn store_options(&self) -> PgConnectOptions {
+        self.admin.clone().database(&self.name)
     }
 
     /// Open a connection to the server that may manage the test database.

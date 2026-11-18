@@ -30,6 +30,7 @@ use crate::{
         error::{ApiError, ErrorCode},
     },
     keys::{ServiceSigner, sign_head},
+    marks::MarkTarget,
     store::{AccountHead, AccountTxn, CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
@@ -174,6 +175,9 @@ pub(super) struct PageRefusal {
 #[derive(Debug)]
 pub(super) struct SnapshotHead {
     tip: ChainTip,
+    /// The account's count of changed commits in the snapshot, which the mark moves to with
+    /// the head (Switch wire 7.3, "Moving it").
+    state_version: u64,
     /// The creation time of the account the snapshot shows, whose mark the head moves.
     created_at_ms: u64,
     identity_key: [u8; 32],
@@ -793,7 +797,10 @@ impl Service {
                     } else {
                         self.move_mark(
                             &read.account.id,
-                            snapshot.tip,
+                            MarkTarget {
+                                head: snapshot.tip,
+                                state_version: snapshot.state_version,
+                            },
                             super::PublicKeyBytes::public_key_bytes(&snapshot.signer),
                             snapshot.created_at_ms,
                             false,
@@ -827,7 +834,10 @@ impl Service {
             match self
                 .move_mark(
                     &read.account.id,
-                    answered.head.tip,
+                    MarkTarget {
+                        head: answered.head.tip,
+                        state_version: answered.head.state_version,
+                    },
                     super::PublicKeyBytes::public_key_bytes(&answered.head.signer),
                     answered.head.created_at_ms,
                     false,
@@ -924,6 +934,7 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
+            head.state_version,
             head.created_at_ms,
             body.as_ref(),
             head.activation,
@@ -1066,6 +1077,7 @@ impl Service {
             self.account_input(
                 snapshot.generation,
                 snapshot.chain,
+                snapshot.state_version,
                 snapshot.created_at_ms,
                 body.as_ref(),
                 snapshot.activation,
@@ -1132,6 +1144,7 @@ impl Service {
                     head: true,
                     snapshot: Some(SnapshotHead {
                         tip,
+                        state_version: snapshot.state_version,
                         created_at_ms: snapshot.created_at_ms,
                         identity_key: read.account.identity_key,
                         signer: signer.clone(),
@@ -1162,6 +1175,7 @@ impl Service {
                 .map_or(0, |cursor| cursor.seq),
             head: SnapshotHead {
                 tip,
+                state_version: snapshot.state_version,
                 created_at_ms: snapshot.created_at_ms,
                 identity_key: read.account.identity_key,
                 signer,
@@ -1759,6 +1773,7 @@ mod tests {
             generation: 1,
             last_seq,
             chain: None,
+            state_version: 0,
             start,
             window_end,
             current: current_at_nine(),

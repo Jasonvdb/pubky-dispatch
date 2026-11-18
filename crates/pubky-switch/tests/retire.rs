@@ -90,7 +90,7 @@ async fn mark_at(replay: &Replay, id: &str, generation: u64, seq: u64, hash: u8)
         .marks
         .advance(
             id,
-            head,
+            keeping_count(&replay.marks, id, head).await,
             service_public(replay),
             mark_created_at(replay, id).await,
         )

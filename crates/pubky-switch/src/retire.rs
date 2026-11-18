@@ -320,6 +320,7 @@ mod tests {
             seq,
             chain_hash: [1; 32],
             key: KEY,
+            state_version: 0,
             created_at_ms: 10,
         })
     }
@@ -329,6 +330,7 @@ mod tests {
             model: crate::account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
+                state_version: 0,
                 created_at_ms: 10,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -432,6 +434,7 @@ mod tests {
             seq: 1,
             chain_hash: [1; 32],
             key: KEY,
+            state_version: 0,
             created_at_ms: 20,
         });
         let older = account(AccountState::Serving(tip(3)));

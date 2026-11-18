@@ -86,7 +86,7 @@ use crate::{
     },
     keys::{KeyStore, ServiceSigner},
     limits::Limits,
-    marks::MarkStore,
+    marks::{MarkStore, MarkTarget},
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
     store::{AccountTxn, LockFreshness, Store, StoreError},
     time::TrustedTime,
@@ -168,6 +168,9 @@ pub struct Service {
     /// its move.
     #[cfg(any(test, feature = "test-util"))]
     mark_move_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after a request's commit and mark move, before its answer is released.
+    #[cfg(any(test, feature = "test-util"))]
+    release_pause: parking_lot::Mutex<Option<RequestPause>>,
     /// A pause after a feed's mark move and before its final signing turn.
     #[cfg(any(test, feature = "test-util"))]
     feed_sign_pause: parking_lot::Mutex<Option<RequestPause>>,
@@ -441,6 +444,8 @@ impl Service {
             #[cfg(any(test, feature = "test-util"))]
             mark_move_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
+            release_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
             feed_sign_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
             feed_locked_pause: parking_lot::Mutex::default(),
@@ -508,6 +513,16 @@ impl Service {
     pub fn pause_next_mark_move(&self) -> RequestPause {
         let pause = RequestPause::default();
         *self.mark_move_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause the next answer of a request under an account's lock once its commit and mark
+    /// move are done, before it is released, until [`RequestPause::release`]: for tests of
+    /// a crash in between (Switch wire 7.3, "Moving it").
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_release(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.release_pause.lock() = Some(pause.clone());
         pause
     }
 
@@ -1145,6 +1160,7 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
+            head.state_version,
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
             head.activation,
@@ -1211,11 +1227,14 @@ impl Service {
         // undo it; an unauthenticated request, or the public read, pays for none of it. A
         // claim a request reads or writes goes when it is due, whatever the batch reached.
         // Chain stub retention comes last (`retention.rs`).
+        // Neither counts toward the account's count (Switch wire 7.3, "The state").
         if let (Some(base), Some(_)) = (due, caller)
-            && let Err(error) = match self.step_four(&mut txn, base).await {
-                Ok(()) => self.retain_chain(&mut txn, &signer, healthy, base).await,
-                failed => failed,
-            }
+            && let Err(error) = txn
+                .uncounted("step 4", async |txn| {
+                    self.step_four(txn, base).await?;
+                    self.retain_chain(txn, &signer, healthy, base).await
+                })
+                .await
         {
             let _ = store_error(&error);
             return failed(txn);
@@ -1300,15 +1319,14 @@ impl Service {
                 None => return failed(txn),
             }
         };
-        let tip = txn.head().head_tip();
-        let moves_mark = (carries_head || answer.starts_generation) && tip.is_some();
-        // A commit that gives out a `seq`, signs a head or moves a mark waits for no stale
+        let has_tip = txn.head().head_tip().is_some();
+        // A commit that gives out a `seq`, signs a head or may move a mark waits for no stale
         // instance lock: another process may hold the database by now (Switch spec 6.5).
         let gives = txn.head().last_seq != txn.loaded().last_seq
             || txn.head().chain != txn.loaded().chain
             || answer.head.is_some()
             || fallback_head.is_some()
-            || moves_mark;
+            || ((carries_head || answer.starts_generation) && has_tip);
         if gives && !self.lock_is_fresh() {
             tracing::error!("the instance lock isn't confirmed: a commit refused");
             return failed(txn);
@@ -1320,7 +1338,7 @@ impl Service {
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown.
         let commit = async move {
-            let committed = txn.commit().await.map(|_| ()).map_err(|failure| {
+            let committed = txn.commit().await.map_err(|failure| {
                 tracing::error!(%failure, "commit");
             });
             if committed.is_ok() && !owed.is_empty() {
@@ -1331,8 +1349,7 @@ impl Service {
         // A commit that owes deleting keys runs to its end, deletions included, in a task of
         // its own: a request dropped meanwhile (a client that hangs up) leaves no key to a
         // sweep.
-        let committed = erase::to_the_end(commit).await.unwrap_or(Err(()));
-        if committed.is_err() {
+        let Ok(committed) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
             // Nothing committed, the stamp included: the mark doesn't move.
             return Self::signed_error(
                 &signer,
@@ -1340,11 +1357,21 @@ impl Service {
                 AnswerTime::Account(committed_ms),
                 &unavailable(),
             );
-        }
-        // The mark moves to the committed head, durably, before the answer is released; a
-        // commit that held whose mark didn't move answers `503`, and its retry is answered as
-        // a retry (Switch wire 7.3, "Moving it").
-        if moves_mark && let Some(tip) = tip {
+        };
+        // The mark moves to the committed head and count, durably, before the answer is
+        // released: after a commit whose answer carries a head or starts a generation. At a
+        // healthy account every answer here carries a head (Switch wire 7.3, Table 2; an
+        // enrollment moves it in `enroll_at_account`), so every commit there that changed
+        // counted state moves the mark to its count. A commit that held whose mark didn't
+        // move answers `503`, and its retry is answered as a retry (Switch wire 7.3, "Moving
+        // it").
+        let target = committed.head().head_tip().map(|head| MarkTarget {
+            head,
+            state_version: committed.head().state_version,
+        });
+        if (carries_head || answer.starts_generation)
+            && let Some(target) = target
+        {
             let moved = if answer.starts_generation
                 && matches!(routed.route, Route::StartAfresh)
                 && let Some(old) = judged
@@ -1355,7 +1382,7 @@ impl Service {
                     Some(store_id) => {
                         self.recover_older_mark(
                             &identity,
-                            tip,
+                            target,
                             answer_key,
                             created_at_ms,
                             *old,
@@ -1368,7 +1395,7 @@ impl Service {
             } else {
                 self.move_mark(
                     &identity,
-                    tip,
+                    target,
                     answer_key,
                     created_at_ms,
                     answer.starts_generation,
@@ -1382,6 +1409,13 @@ impl Service {
                     AnswerTime::Account(time_ms),
                     &unavailable(),
                 );
+            }
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self.release_pause.lock().take();
+            if let Some(pause) = pause {
+                pause.wait().await;
             }
         }
         let mut answer = answer;

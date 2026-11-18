@@ -430,7 +430,10 @@ impl Store {
     /// Take `id`'s identity lock (the module's "One identity at a time"): a transaction
     /// holding a transaction-level advisory lock on the identity until it ends. Waits at most
     /// `lock_timeout_ms` for a request, an enrollment or an erasure of the identity that
-    /// holds it ([`StoreError::LockTimeout`]).
+    /// holds it ([`StoreError::LockTimeout`]). The transaction is marked as one holding an
+    /// identity's lock, the only kind the schema's count trigger lets write an account's
+    /// state, so every such write is counted with its account's commit (Switch wire 7.3,
+    /// "The state").
     pub async fn lock_identity(&self, id: &str) -> Result<IdentityLock, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
         // READ COMMITTED whatever the pool's default, so what is read under the lock includes
@@ -440,7 +443,8 @@ impl Store {
             format!(
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
                  SET LOCAL lock_timeout = {}; \
-                 SELECT pg_advisory_xact_lock({})",
+                 SELECT pg_advisory_xact_lock({}); \
+                 SELECT set_config('switch.locked', 'on', true)",
                 self.lock_timeout_ms,
                 identity_lock_key(id)
             )
@@ -496,8 +500,8 @@ impl Store {
     /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT generation, chain_seq, chain_hash, stamped_time_ms, created_at_ms, \
-             identity_doc, activation_requirement FROM accounts WHERE id = $1",
+            "SELECT generation, chain_seq, chain_hash, state_version, stamped_time_ms, \
+             created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -525,6 +529,7 @@ impl Store {
             .map_err(|_| StoreError::Corrupt("activation_requirement"))?,
             generation: from_db(row.try_get("generation")?, "generation")?,
             chain,
+            state_version: from_db(row.try_get("state_version")?, "state_version")?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
             identity_doc: doc
@@ -758,6 +763,8 @@ pub struct FoundAccount {
     pub generation: u64,
     /// Its newest chain item's `seq` and the chain hash there; `None` before the first.
     pub chain: Option<(u64, [u8; 32])>,
+    /// Its count of changed commits (Switch wire 7.3, "The state").
+    pub state_version: u64,
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// When it was created, in service time.

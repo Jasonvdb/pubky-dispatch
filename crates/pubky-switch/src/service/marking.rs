@@ -10,7 +10,6 @@
 //! compares a state with its mark.
 
 use pubky_switch_core::{
-    chain::ChainTip,
     http::{IdentityDelivery, NoticeReason, RecoveryNotice, Uncompared, not_hosted_current},
     records::{AccountActivation, AccountBinding, IdentityBody},
     sig::SignedDoc,
@@ -27,7 +26,7 @@ use crate::{
         error::{ApiError, ErrorCode},
         route::Call,
     },
-    marks::{AccountMark, Advance, MarkRead, MarkStoreError, MarkWrite},
+    marks::{AccountMark, Advance, MarkRead, MarkStoreError, MarkTarget, MarkWrite},
 };
 
 /// How many accounts' notices one process logs, each once.
@@ -152,6 +151,7 @@ impl Service {
         &self,
         generation: u64,
         chain: Option<(u64, [u8; 32])>,
+        state_version: u64,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
         activation: AccountActivation,
@@ -161,6 +161,7 @@ impl Service {
             |key| self.keys.signer_for(key).is_some(),
             generation,
             chain,
+            state_version,
             created_at_ms,
             doc,
             activation,
@@ -177,6 +178,7 @@ impl Service {
         self.account_input(
             found.generation,
             found.chain,
+            found.state_version,
             found.created_at_ms,
             body.as_ref(),
             found.activation,
@@ -525,8 +527,9 @@ impl Service {
         );
     }
 
-    /// Move the mark of `identity`'s account created at `created_at_ms` to `tip`, answered
-    /// with `key`, once the commit that holds it is durable (Switch wire 7.3, "Moving it").
+    /// Move the mark of `identity`'s account created at `created_at_ms` to `target`, its
+    /// head and count, answered with `key`, once the commit that holds it is durable (Switch
+    /// wire 7.3, "Moving it").
     /// A mark a later move overtook stays. Where the mark is lost, a delivery that starts a
     /// generation (`starts_generation`) writes it anew with the account's creation time
     /// (Table 3); any other move finds no mark and fails.
@@ -539,7 +542,7 @@ impl Service {
     pub(super) async fn move_mark(
         &self,
         identity: &str,
-        tip: ChainTip,
+        target: MarkTarget,
         key: [u8; 32],
         created_at_ms: u64,
         starts_generation: bool,
@@ -547,12 +550,16 @@ impl Service {
         #[cfg(any(test, feature = "test-util"))]
         self.wait_before_mark_move().await;
         for _ in 0..2 {
-            match self.marks.advance(identity, tip, key, created_at_ms).await {
+            match self
+                .marks
+                .advance(identity, target, key, created_at_ms)
+                .await
+            {
                 Ok(Advance::Moved(_) | Advance::Unchanged(_) | Advance::Overtaken(_)) => {
                     return MarkMove::Done;
                 }
                 Ok(Advance::Fork(_)) => {
-                    tracing::error!("a mark at the head's pair with another chain hash");
+                    tracing::error!("a mark the committed head and count don't follow on from");
                     return MarkMove::Failed;
                 }
                 Ok(Advance::OtherAccount(_)) => return account_gone(),
@@ -570,7 +577,7 @@ impl Service {
                             Ok(true) | Err(_) => MarkMove::Failed,
                         };
                     }
-                    match self.write_anew(identity, tip, key, created_at_ms).await {
+                    match self.write_anew(identity, target, key, created_at_ms).await {
                         Some(MarkWrite::Written(_)) => return MarkMove::Done,
                         // Written meanwhile: moved, or told another account's, by the next
                         // turn.
@@ -593,7 +600,7 @@ impl Service {
     pub(super) async fn recover_older_mark(
         &self,
         identity: &str,
-        tip: ChainTip,
+        target: MarkTarget,
         key: [u8; 32],
         created_at_ms: u64,
         old: AccountMark,
@@ -611,7 +618,7 @@ impl Service {
         }
         match self
             .marks
-            .recover_older(identity, old, store_id, tip, key, created_at_ms)
+            .recover_older(identity, old, store_id, target, key, created_at_ms)
             .await
         {
             Ok(MarkWrite::Written(_)) => MarkMove::Done,
@@ -627,7 +634,7 @@ impl Service {
         }
     }
 
-    /// Write `identity`'s lost mark anew at `tip` under the identity's lock, only while its
+    /// Write `identity`'s lost mark anew at `target` under the identity's lock, only while its
     /// account is the one created at `created_at_ms`: an account erased meanwhile gets no
     /// mark, which would be a leftover, nor does a later one get this account's
     /// (Switch wire 7.3, Table 3). `Unchanged(Missing)` for an account gone; `None` when the
@@ -635,7 +642,7 @@ impl Service {
     async fn write_anew(
         &self,
         identity: &str,
-        tip: ChainTip,
+        target: MarkTarget,
         key: [u8; 32],
         created_at_ms: u64,
     ) -> Option<MarkWrite> {
@@ -656,7 +663,7 @@ impl Service {
         }
         let written = self
             .marks
-            .write_anew(identity, tip, key, created_at_ms)
+            .write_anew(identity, target, key, created_at_ms)
             .await;
         drop(lock);
         match written {

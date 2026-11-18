@@ -189,7 +189,15 @@ fn wallet_batch(replay: &Replay, seqs: &[u64]) -> SwitchRequest {
     )
 }
 
-/// The mark a healthy answer at the head `seq` leaves.
+/// The mark a healthy answer at the head `seq` leaves, at the count the account holds.
+async fn moved_to(replay: &Replay, old: &AccountMark, seq: u64) -> AccountMark {
+    AccountMark {
+        state_version: state_version_of(replay, &alice_id()).await,
+        ..mark_at(old, seq)
+    }
+}
+
+/// The mark a healthy answer at the head `seq` leaves, its count as `old`'s.
 fn mark_at(old: &AccountMark, seq: u64) -> AccountMark {
     AccountMark {
         seq,
@@ -379,13 +387,22 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
         "{}",
         String::from_utf8_lossy(&batch.body)
     );
-    assert_eq!(mark_in(&replay.marks).await, mark_at(&mark, 4), "moved");
+    assert_eq!(
+        mark_in(&replay.marks).await,
+        moved_to(&replay, &mark, 4).await,
+        "moved"
+    );
     // The mark back at seq 2, as a move that failed after its commit leaves it.
     replay.marks.delete(&alice_id()).await.expect("delete");
     let at_two = mark_at(&mark, 2);
     replay
         .marks
-        .write_anew(&alice_id(), at_two.head(), at_two.key, at_two.created_at_ms)
+        .write_anew(
+            &alice_id(),
+            at_head(at_two.head()),
+            at_two.key,
+            at_two.created_at_ms,
+        )
         .await
         .expect("write");
     let at = time_of(3) + 60_000;
@@ -405,7 +422,11 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
         &Sent::of(&apps_read(at))
     ));
     // The answer carried a head: the mark moved to it (Table 3).
-    assert_eq!(mark_in(&replay.marks).await, mark_at(&mark, 4), "moved");
+    assert_eq!(
+        mark_in(&replay.marks).await,
+        moved_to(&replay, &mark, 4).await,
+        "moved"
+    );
     assert_eq!(replay.service.mark_refusals(), 0);
     replay.db.drop_database().await.expect("drop");
 }
@@ -431,7 +452,7 @@ async fn test_marks_state_ahead_with_another_hash_at_the_mark_is_a_fork() {
     };
     replay
         .marks
-        .write_anew(&alice_id(), other, mark.key, mark.created_at_ms)
+        .write_anew(&alice_id(), at_head(other), mark.key, mark.created_at_ms)
         .await
         .expect("write");
     let at = time_of(3) + 60_000;
@@ -459,7 +480,12 @@ async fn test_marks_database_older_than_the_mark_answers_behind() {
     };
     replay
         .marks
-        .advance(&alice_id(), ahead, mark.key, mark.created_at_ms)
+        .advance(
+            &alice_id(),
+            keeping_count(&replay.marks, &alice_id(), ahead).await,
+            mark.key,
+            mark.created_at_ms,
+        )
         .await
         .expect("advance");
     let request = apps_read(base);
@@ -487,7 +513,7 @@ async fn test_marks_mark_at_the_state_with_another_hash_answers_fork() {
     };
     replay
         .marks
-        .write_anew(&alice_id(), other, mark.key, mark.created_at_ms)
+        .write_anew(&alice_id(), at_head(other), mark.key, mark.created_at_ms)
         .await
         .expect("write");
     let request = apps_read(base);
@@ -724,7 +750,197 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
     assert_eq!(retried["head"]["seq"], 4);
     assert!(header_text(&retry, header::HEAD).is_some(), "the head");
     assert_eq!(account_row(&replay).await.0, 4, "no seq given out again");
-    assert_eq!(mark_in(&marks).await, mark_at(&mark, 4), "moved");
+    assert_eq!(
+        mark_in(&marks).await,
+        moved_to(&replay, &mark, 4).await,
+        "moved"
+    );
+    assert_eq!(service.mark_refusals(), 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's wallet's batch of no operation that moves its cursor to `seq` of generation 1,
+/// at `at_ms`: a cursor sync, which takes no `seq` (Switch wire 6.2, spec 8.3).
+fn cursor_sync(seq: u64, at_ms: u64) -> SwitchRequest {
+    let keys = vectors("keys.json");
+    let position = pubky_switch_core::ops::Position { generation: 1, seq };
+    app_request(
+        app(&keys, "wallet"),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(&[], Some(position)).to_json(),
+        at_ms,
+    )
+}
+
+/// alice served, and her wallet's first call made: the batch of `chain.json` seqs 3 and 4,
+/// which moves no cursor. Her mark, and the time to sign the next calls at.
+async fn wallet_in(replay: &Replay) -> (AccountMark, u64) {
+    served(replay).await;
+    let answer = Box::pin(replay.service.handle(wallet_batch(replay, &[3, 4]))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    (mark_in(&replay.marks).await, time_of(3))
+}
+
+/// alice's wallet's cursor, as SQL values.
+async fn wallet_cursor(replay: &Replay) -> (String, String) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let (generation, seq): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT cursor_generation, cursor_seq FROM apps WHERE account_id = $1 AND app_id = $2",
+    )
+    .bind(alice_id())
+    .bind(app_id_of("wallet").as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("cursor");
+    conn.close().await.expect("close");
+    let text = |value: Option<i64>| value.map_or("NULL".to_string(), |value| value.to_string());
+    (text(generation), text(seq))
+}
+
+/// alice's account's count and her mark's.
+async fn counts(replay: &Replay, marks: &MarkStore) -> (u64, u64) {
+    (
+        state_version_of(replay, &alice_id()).await,
+        mark_in(marks).await.state_version,
+    )
+}
+
+#[tokio::test]
+async fn test_marks_cursor_sync_lost_to_a_restore_is_behind_the_mark() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, base) = wallet_in(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    assert_eq!(
+        mark.state_version, count,
+        "the mark covers every commit so far"
+    );
+    let (generation, seq) = wallet_cursor(&replay).await;
+    let answer = Box::pin(replay.service.handle(cursor_sync(4, base))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    // The cursor moved, which counts, and the mark covers it, its head unchanged.
+    assert_ne!(
+        wallet_cursor(&replay).await,
+        (generation.clone(), seq.clone())
+    );
+    assert_eq!(counts(&replay, &replay.marks).await, (count + 1, count + 1));
+    assert_eq!(mark_in(&replay.marks).await.head(), mark.head());
+    // A restore that loses only the cursor sync: the account is behind its mark.
+    sql(
+        &replay,
+        &[
+            &format!("UPDATE apps SET cursor_generation = {generation}, cursor_seq = {seq}"),
+            &format!("UPDATE accounts SET state_version = {count}"),
+        ],
+    )
+    .await;
+    let request = apps_read(base);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    assert_notice(&replay, &answer, &sent, "behind", mark.generation);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_refused_request_counts_nothing() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, _) = served(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    // A batch that skips a `seq`: refused, and what its endpoint wrote is undone.
+    let refused = Box::pin(replay.service.handle(wallet_batch(&replay, &[4]))).await;
+    assert!(refused.status >= 400, "{}", refused.status);
+    assert_eq!(counts(&replay, &replay.marks).await, (count, count));
+    assert_eq!(mark_in(&replay.marks).await, mark, "the mark unchanged");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_crash_between_a_counted_commit_and_its_mark_move_fails_closed() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, base) = wallet_in(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    // The commit of a cursor sync holds and the mark can't move: the answer isn't released
+    // (Switch wire 7.3, "Moving it").
+    let marks_dir = accounts_dir(&replay).join("marks");
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only");
+    let request = cursor_sync(3, base);
+    let sent = Sent::of(&request);
+    let answer = Box::pin(replay.service.handle(request)).await;
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    assert_eq!(counts(&replay, &replay.marks).await, (count + 1, count));
+    // A restart: the state ahead of the mark is healthy, no false alarm, and the next
+    // counted commit moves the mark to the count.
+    let (service, marks) = restarted(&replay, Limits::default());
+    let read = Box::pin(service.handle(apps_read(base))).await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
+    // The read carries the head, so the mark catches up with the state, the count the
+    // failed move left behind included.
+    assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
+    let next = Box::pin(service.handle(cursor_sync(4, base))).await;
+    assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));
+    assert_eq!(counts(&replay, &marks).await, (count + 2, count + 2));
+    assert_eq!(mark_in(&marks).await.head(), mark.head());
+    assert_eq!(service.mark_refusals(), 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_crash_after_the_mark_move_before_the_answer_is_healthy() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (_, base) = wallet_in(&replay).await;
+    let count = state_version_of(&replay, &alice_id()).await;
+    // The cursor sync commits and its mark moves; the process dies before the answer is
+    // released: the mark is at the committed count by then (Switch wire 7.3, "Moving it").
+    let pause = replay.service.pause_next_release();
+    let mut handling = Box::pin(replay.service.handle(cursor_sync(4, base)));
+    tokio::select! {
+        answer = &mut handling => panic!("released before the pause: {}", answer.status),
+        () = pause.reached() => {}
+    }
+    assert_eq!(
+        counts(&replay, &replay.marks).await,
+        (count + 1, count + 1),
+        "the mark at the state before the answer goes out"
+    );
+    drop(handling);
+    // A restart: healthy, and the app's retry is answered, changing nothing.
+    let (service, marks) = restarted(&replay, Limits::default());
+    let retry = Box::pin(service.handle(cursor_sync(4, base))).await;
+    assert_eq!(
+        retry.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
+    let read = Box::pin(service.handle(apps_read(base))).await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
     assert_eq!(service.mark_refusals(), 0);
     replay.db.drop_database().await.expect("drop");
 }
@@ -768,7 +984,11 @@ async fn test_marks_failed_commit_leaves_the_mark() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert_eq!(mark_in(&replay.marks).await, mark_at(&mark, 4), "moved");
+    assert_eq!(
+        mark_in(&replay.marks).await,
+        moved_to(&replay, &mark, 4).await,
+        "moved"
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -811,7 +1031,11 @@ async fn test_marks_stale_instance_lock_refuses_a_write() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(account_row(&replay).await.0, 4);
-    assert_eq!(mark_in(&replay.marks).await, mark_at(&mark, 4), "moved");
+    assert_eq!(
+        mark_in(&replay.marks).await,
+        moved_to(&replay, &mark, 4).await,
+        "moved"
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -980,7 +1204,7 @@ async fn test_marks_later_generation_over_a_forked_earlier_chain_is_a_fork() {
     };
     replay
         .marks
-        .write_anew(&alice_id(), other, mark.key, mark.created_at_ms)
+        .write_anew(&alice_id(), at_head(other), mark.key, mark.created_at_ms)
         .await
         .expect("write");
     let at = time_of(3) + 60_000;
@@ -1141,7 +1365,12 @@ async fn test_marks_lost_identity_over_its_source_limit_gets_the_notice() {
     };
     replay
         .marks
-        .write_anew(&alice_id(), head, service_public(&replay), time_of(1))
+        .write_anew(
+            &alice_id(),
+            at_head(head),
+            service_public(&replay),
+            time_of(1),
+        )
         .await
         .expect("mark");
     let base = time_of(2) + 60_000;

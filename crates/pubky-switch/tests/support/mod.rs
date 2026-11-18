@@ -997,6 +997,48 @@ pub fn service_public(replay: &Replay) -> [u8; 32] {
     replay.keys.current().public_key()
 }
 
+/// The count of changed commits of `id`'s account, as the database holds it (Switch wire
+/// 7.3, "The state").
+pub async fn state_version_of(replay: &Replay, id: &str) -> u64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let count: i64 = sqlx::query_scalar("SELECT state_version FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    u64::try_from(count).expect("count")
+}
+
+/// The move of `id`'s mark in `marks` to `head`, the count it holds kept: a head moved
+/// ahead of the state, or to it, by the head alone (Switch wire 7.3, "The mark").
+pub async fn keeping_count(
+    marks: &pubky_switch::marks::MarkStore,
+    id: &str,
+    head: pubky_switch_core::chain::ChainTip,
+) -> pubky_switch::marks::MarkTarget {
+    let state_version = match marks.read(id).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => mark.state_version,
+        _ => 0,
+    };
+    pubky_switch::marks::MarkTarget {
+        head,
+        state_version,
+    }
+}
+
+/// The move of a mark to `head` with count 0, at or below every state's (Switch wire 7.3,
+/// "The mark").
+pub fn at_head(head: pubky_switch_core::chain::ChainTip) -> pubky_switch::marks::MarkTarget {
+    pubky_switch::marks::MarkTarget {
+        head,
+        state_version: 0,
+    }
+}
+
 /// The creation time of the mark `replay` holds for `id`, which a test's own move of the
 /// mark names (`MarkStore::advance`).
 pub async fn mark_created_at(replay: &Replay, id: &str) -> u64 {

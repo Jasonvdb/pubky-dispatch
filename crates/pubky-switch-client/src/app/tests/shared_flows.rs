@@ -13551,6 +13551,9 @@ async fn test_record_publication_keeps_the_cursor_until_a_read_covers_an_upload(
             let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
                 .await
                 .unwrap();
+            // Enter through the public app to load its saved protocol positions before a retry.
+            reader.flush_cursor().await.unwrap();
+            assert!(s.w.switch.app(&id).cursor < deleted);
             *s.protocol.pending_publication.lock().unwrap() = None;
             s.w.switch.lock().faults.clear();
             let divergent = s.w.switch.lock().shared.divergent.remove(&key).unwrap();
@@ -13564,7 +13567,9 @@ async fn test_record_publication_keeps_the_cursor_until_a_read_covers_an_upload(
             // Both paths read the same signed application as it stood just before the upload.
             earlier();
             let hold = replacement_at(&reader, &key).unwrap().clone();
+            let reads = s.w.switch.lock().shared.record_reads.len();
             reader.try_put_back(hold).await.unwrap();
+            assert_eq!(&s.w.switch.lock().shared.record_reads[reads..], &[key]);
             assert!(replacement_at(&reader, &key).is_some());
             earlier();
             assert!(matches!(
@@ -13589,6 +13594,7 @@ async fn test_record_publication_keeps_the_cursor_until_a_read_covers_an_upload(
             );
             s.w.switch.lock().seq = now;
             assert!(replacement_at(&reader, &key).is_some());
+            assert!(s.w.switch.lock().faults.is_empty());
             assert_eq!(
                 reader.record_upload(&key).await.unwrap().unwrap().seq,
                 uploaded
@@ -13602,8 +13608,12 @@ async fn test_record_publication_keeps_the_cursor_until_a_read_covers_an_upload(
                 reader.try_put_back(hold).await.unwrap();
                 assert!(replacement_at(&reader, &key).is_none());
             }
-            assert!(matches!(reader.read_record_fresh(&target).await.unwrap(),
-            RecordRead::Fresh(record) if record.version == following.version && record.divergent));
+            let current = reader.read_record_fresh(&target).await.unwrap();
+            let RecordRead::Fresh(record) = current else {
+                panic!("covering read after retry {retry_first}: {current:?}");
+            };
+            assert_eq!(record.version, following.version);
+            assert!(record.divergent, "covering read after retry {retry_first}");
             assert!(replacement_at(&reader, &key).is_none());
             read_on(&mut reader).await;
             assert!(reader.record_upload(&key).await.unwrap().is_none());

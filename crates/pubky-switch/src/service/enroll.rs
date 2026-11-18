@@ -443,13 +443,20 @@ impl Service {
                 .map_err(|e| store_error(&e))?,
         };
         if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. }) {
-            let (tx, anchor) = creation
+            let (tx, opening) = creation
                 .prepare_fresh()
                 .await
                 .map_err(|e| store_error(&e))?;
             let bound = self
                 .marks
-                .create_anchored(identity_text, store_id, key, created_at_ms, anchor)
+                .create_anchored(
+                    identity_text,
+                    store_id,
+                    key,
+                    created_at_ms,
+                    opening.anchor,
+                    opening.recovery,
+                )
                 .await
                 .map_err(|failure| mark_failure(failure, "binding fresh enrollment contents"))?;
             if !matches!(bound, MarkWrite::Written(_)) {

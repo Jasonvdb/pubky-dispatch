@@ -350,13 +350,20 @@ impl Creation {
     /// Materialize the fresh account and its immutable witness, still under the identity lock.
     pub(crate) async fn prepare_fresh(
         mut self,
-    ) -> Result<(Transaction<'static, Postgres>, [u8; 32]), StoreError> {
+    ) -> Result<
+        (
+            Transaction<'static, Postgres>,
+            super::creation_anchor::OpeningContents,
+        ),
+        StoreError,
+    > {
         self.populate().await?;
         let opening = super::creation_anchor::contents(
             &mut self.tx,
             &self.account.id,
             self.account.enrollment_store_id,
             self.account.enrollment_hash,
+            true,
         )
         .await?;
         sqlx::query(
@@ -368,7 +375,7 @@ impl Creation {
         .execute(&mut *self.tx)
         .await
         .map_err(StoreError::from_db)?;
-        Ok((self.tx, opening.anchor))
+        Ok((self.tx, opening))
     }
 
     async fn populate(&mut self) -> Result<(), StoreError> {

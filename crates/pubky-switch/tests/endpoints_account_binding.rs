@@ -326,6 +326,11 @@ async fn test_fresh_enrollment_receipt_verifies_the_initial_exclusions_after_res
     let path = replay.key_dir().join("accounts/marks").join(key().id());
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.len() <= 4096);
+    let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        record.get("recovery").is_none(),
+        "the mark requires verified SQL for this set"
+    );
     let reopened = service_with_restored_mark(&replay, &bytes);
     let MarkRead::Mark(mark) = MarkStore::open(replay.key_dir())
         .unwrap()
@@ -438,15 +443,12 @@ async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
     let (opening, _) = create(&replay, NOW, 43).await;
     let path = replay.key_dir().join("accounts/marks").join(key().id());
     let completed = std::fs::read(&path).unwrap();
-    let mut reserved: pubky_switch::marks::AccountMark =
-        serde_json::from_slice(&completed).unwrap();
-    let pubky_switch::marks::CreationAnchor::Bound { confirmed, .. } =
-        &mut reserved.creation_anchor
-    else {
-        panic!("missing opening commitment");
-    };
-    assert!(*confirmed);
-    *confirmed = false;
+    let mut reserved: serde_json::Value = serde_json::from_slice(&completed).unwrap();
+    let confirmed = reserved
+        .pointer_mut("/position/creation_anchor/bound/confirmed")
+        .unwrap();
+    assert_eq!(*confirmed, true);
+    *confirmed = false.into();
     // SQL committed before the process could sync the confirmation into its mark.
     let reopened = service_with_restored_mark(&replay, &serde_json::to_vec(&reserved).unwrap());
     let request = enrollment_request(&opening, NOW);
@@ -459,6 +461,58 @@ async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
         &sent
     ));
     assert_eq!(std::fs::read(path).unwrap(), completed);
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_opening_mark_keeps_the_confirmed_limits_and_exclusions() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let mut body = make_enrollment(EnrollmentIntent::Create { observation }, 48)
+        .body()
+        .clone();
+    let app = [7; 16];
+    body.revoked_apps = Some(vec![app]);
+    let enrollment = Enrollment::sign(&key(), body).unwrap();
+    let answer = replay
+        .service
+        .handle(enrollment_request(&enrollment, NOW))
+        .await;
+    status(&answer, 200);
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let read =
+        || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+    let record = read();
+    let source = &record["recovery"];
+    assert_eq!(source["identity"], hex::encode(key().public()));
+    assert_eq!(
+        source["store_id"],
+        hex::encode(replay.marks.identity().await.unwrap())
+    );
+    assert_eq!(source["limits"], value(&answer)["limits"]);
+    assert_eq!(source["prior"], serde_json::Value::Null);
+    assert_eq!(source["generation_floor"], 1);
+    assert_eq!(source["directory_version"], 0);
+    assert_eq!(source["apps_version"], 0);
+    assert_eq!(source["had_reachable_apps"], false);
+    assert_eq!(
+        source["kept"],
+        json!([{"app_id": hex::encode(app), "reason":"enrolled",
+        "at_ms": NOW, "data_epoch": null, "rotated": false}])
+    );
+    assert_eq!(source["held"], json!([]));
+    assert_eq!(
+        record["position"]["creation_anchor"]["bound"]["confirmed"],
+        true
+    );
+    let reopened = MarkStore::open(replay.key_dir()).unwrap();
+    reopened
+        .raise_floor(&key().id(), NOW, NOW + 200_000)
+        .await
+        .unwrap();
+    assert_eq!(&read()["recovery"], source);
     replay.db.drop_database().await.unwrap();
 }
 

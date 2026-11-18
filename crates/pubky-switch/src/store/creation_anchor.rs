@@ -8,14 +8,16 @@ use pubky_switch_core::sig::SignedDoc;
 use sqlx::{PgConnection, Row};
 
 use super::{AccountTxn, StoreError, from_db};
+use crate::marks::coverage::{PriorDocument, RecoverySource};
 
 // Each distinct exclusion in the creating enrollment needs at least its 16 raw ID bytes.
 // The complete signed enrollment, including its optional signed identity, fits 256 KiB.
 const MAX_ROWS: i64 = MAX_ENROLLMENT_BYTES as i64 / 16;
 
-pub(super) struct OpeningContents {
-    pub(super) anchor: [u8; 32],
+pub(crate) struct OpeningContents {
+    pub(crate) anchor: [u8; 32],
     pub(super) material: [u8; 32],
+    pub(crate) recovery: Option<RecoverySource>,
 }
 
 // The signed enrollment hash binds its origin, nonce and identity. The current service
@@ -51,10 +53,11 @@ pub(super) async fn contents(
     id: &str,
     store_id: [u8; 16],
     enrollment: [u8; 32],
+    capture_recovery: bool,
 ) -> Result<OpeningContents, StoreError> {
     let corrupt = StoreError::Corrupt("fresh enrollment contents");
     let row = sqlx::query(
-        "SELECT identity_key, created_at_ms, generation, announced_limits, identity_doc, \
+        "SELECT identity_key, created_at_ms, stamped_time_ms, generation, announced_limits, identity_doc, \
          directory_version, apps_version, activation_requirement, \
          EXISTS (SELECT 1 FROM apps WHERE account_id = $1) AS has_apps, \
          EXISTS (SELECT 1 FROM held_revoked_apps WHERE account_id = $1) AS has_held \
@@ -93,6 +96,24 @@ pub(super) async fn contents(
     }
     let created = from_db(row.try_get("created_at_ms")?, "created_at_ms")?;
     let generation = from_db(row.try_get("generation")?, "generation")?;
+    let stamped_ms = from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?;
+    let mut recovery = capture_recovery.then(|| RecoverySource {
+        identity,
+        store_id,
+        generation_floor: generation.max(doc.as_ref().map_or(0, IdentityDoc::generation)),
+        prior: doc.as_ref().map(|doc| PriorDocument {
+            hash: doc.hash(),
+            version: doc.version(),
+        }),
+        recovery_only: false,
+        stamped_ms,
+        directory_version: 0,
+        apps_version: 0,
+        had_reachable_apps: false,
+        limits,
+        kept: Vec::new(),
+        held: Vec::new(),
+    });
     let doc_hash = doc.as_ref().map(IdentityDoc::hash);
     let mut hash = blake3::Hasher::new();
     hash.update(&lp(&[
@@ -111,10 +132,25 @@ pub(super) async fn contents(
     .bind(MAX_ROWS + 1)
     .fetch(&mut *conn);
     let mut count = 0;
+    let mut kept_bytes = 0;
     while let Some(row) = rows.try_next().await? {
         count += 1;
         if count > MAX_ROWS {
             return Err(StoreError::Corrupt("fresh enrollment exclusion bound"));
+        }
+        if let Some(source) = &mut recovery {
+            let kept = super::KeptAppId::from_row(&row)?;
+            kept_bytes += serde_json::to_vec(&kept)
+                .map_err(|_| StoreError::Corrupt("a kept ID does not encode"))?
+                .len()
+                + 1;
+            if source.kept.len() == RecoverySource::MAX_ROWS
+                || kept_bytes > crate::marks::MAX_MARK_FILE as usize
+            {
+                recovery = None;
+            } else {
+                source.kept.push(kept);
+            }
         }
         let app: Vec<u8> = row.try_get("app_id")?;
         let reason: String = row.try_get("reason")?;
@@ -143,7 +179,11 @@ pub(super) async fn contents(
     if anchor == [0; 32] {
         return Err(StoreError::Corrupt("zero creation anchor"));
     }
-    Ok(OpeningContents { anchor, material })
+    Ok(OpeningContents {
+        anchor,
+        material,
+        recovery,
+    })
 }
 
 /// Recover the SQL witness before this transaction can change the opening contents.
@@ -168,7 +208,7 @@ pub(super) async fn opening_origin(
     let (Ok(store), Ok(enrollment)) = (store.try_into(), enrollment.try_into()) else {
         return Ok(None);
     };
-    match contents(conn, &head.id, store, enrollment).await {
+    match contents(conn, &head.id, store, enrollment, false).await {
         Ok(opening) => Ok((opening.anchor.as_slice() == stored).then_some(opening.anchor)),
         Err(
             StoreError::Corrupt(_)

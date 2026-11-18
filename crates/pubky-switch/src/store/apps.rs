@@ -10,7 +10,8 @@ use sqlx::Row;
 use super::{AccountTxn, StoreError, StoredApp, from_db, to_db};
 
 /// Why an App ID is kept for good (Switch wire 9.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KeptReason {
     /// The signer revoked it.
     Revoked,
@@ -23,9 +24,11 @@ pub enum KeptReason {
 }
 
 /// An App ID the account keeps for good.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeptAppId {
     /// The App ID.
+    #[serde(with = "crate::keys::hex_bytes")]
     pub app_id: [u8; 16],
     /// Why.
     pub reason: KeptReason,
@@ -101,6 +104,29 @@ fn reason(text: &str) -> Result<KeptReason, StoreError> {
         "enrolled" => Ok(KeptReason::Enrolled),
         "document" => Ok(KeptReason::Document),
         _ => Err(StoreError::Corrupt("a kept App ID's reason")),
+    }
+}
+
+impl KeptAppId {
+    pub(super) fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, StoreError> {
+        let reason = reason(row.try_get("reason")?)?;
+        let at: Option<i64> = row.try_get("at_ms")?;
+        let epoch: Option<i64> = row.try_get("data_epoch")?;
+        let rotated: bool = row.try_get("rotated")?;
+        if (reason == KeptReason::Document) != at.is_none()
+            || (reason == KeptReason::Document && (epoch.is_some() || rotated))
+        {
+            return Err(StoreError::Corrupt("a kept App ID's event provenance"));
+        }
+        Ok(Self {
+            app_id: app_id(row.try_get("app_id")?)?,
+            reason,
+            at_ms: at.map(|at| from_db(at, "at_ms")).transpose()?,
+            data_epoch: epoch
+                .map(|value| from_db(value, "data_epoch"))
+                .transpose()?,
+            rotated,
+        })
     }
 }
 
@@ -242,24 +268,7 @@ impl AccountTxn {
         .await
         .map_err(StoreError::from_db)?
         {
-            let app: Vec<u8> = row.try_get("app_id")?;
-            let reason_text: String = row.try_get("reason")?;
-            let data_epoch: Option<i64> = row.try_get("data_epoch")?;
-            let reason = reason(&reason_text)?;
-            let at: Option<i64> = row.try_get("at_ms")?;
-            let rotated: bool = row.try_get("rotated")?;
-            if (reason == KeptReason::Document) != at.is_none()
-                || (reason == KeptReason::Document && (data_epoch.is_some() || rotated))
-            {
-                return Err(StoreError::Corrupt("a kept App ID's event provenance"));
-            }
-            kept.push(KeptAppId {
-                app_id: app_id(&app)?,
-                reason,
-                at_ms: at.map(|at| from_db(at, "at_ms")).transpose()?,
-                data_epoch: data_epoch.map(|e| from_db(e, "data_epoch")).transpose()?,
-                rotated,
-            });
+            kept.push(KeptAppId::from_row(&row)?);
         }
         Ok(kept)
     }

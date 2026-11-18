@@ -13,7 +13,7 @@ use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
     AccountActivation, AccountAssociation, AccountView, Delivery, DeliveryRefusal, Enrollment,
     EnrollmentAnswer, GenerationChange, IdentityDoc, KeptProofs, Limits, check_delivery,
-    needed_generations,
+    needed_generations, recovery_apps_version,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
@@ -519,7 +519,24 @@ impl Inner {
     /// a failing or bounded account takes: its creation time, its mark store, its service
     /// time, its enrollments and the App IDs to refuse stay, those held for this generation
     /// among them, and everything else goes (Switch spec 12.6 step 1, wire 3.3, 3.7).
-    fn start_afresh(&mut self, generation: u64) {
+    fn start_afresh(&mut self, generation: u64) -> Result<(), Answer> {
+        let had_reachable_apps = self.current_app_ids().iter().any(|id| {
+            self.apps
+                .get(id)
+                .is_some_and(|app| app.receive_key.is_some())
+        });
+        let apps_version = recovery_apps_version(
+            self.directory_version,
+            self.apps_version,
+            had_reachable_apps,
+        )
+        .ok_or_else(|| {
+            bad(
+                ErrorCode::Unavailable,
+                "7.6: a temporary failure",
+                Value::Null,
+            )
+        })?;
         // The held reads look again, and find the generation changed (Switch wire 7.4.4);
         // their numbers go on, so none is taken for another's.
         self.wake_held();
@@ -550,7 +567,7 @@ impl Inner {
         // counting, as at the service, so a sender's copy from before the loss never
         // carries a version the new generation gives another set of apps (Switch wire
         // 7.4.3 step 5, 7.4.10).
-        fresh.apps_version = self.apps_version;
+        fresh.apps_version = apps_version;
         fresh.directory_version = self.directory_version;
         // What a test set of the switch's configuration stays set, as a service's does.
         fresh.retention = self.retention;
@@ -567,6 +584,7 @@ impl Inner {
         fresh.apps = self.exclusions();
         fresh.kept_app_ids = fresh.apps.keys().copied().collect();
         *self = fresh;
+        Ok(())
     }
 
     /// Chain a delivered `identity.json` and hold it; returns the delivery's transition
@@ -731,7 +749,9 @@ impl Inner {
                     json!(null),
                 ));
             }
-            self.start_afresh(doc.generation());
+            if let Err(answer) = self.start_afresh(doc.generation()) {
+                return Ok(answer);
+            }
             kept = self.kept_app_ids.clone();
             started_afresh = true;
         }
@@ -781,7 +801,9 @@ impl Inner {
                                 json!(null),
                             ));
                         }
-                        self.start_afresh(doc.generation());
+                        if let Err(answer) = self.start_afresh(doc.generation()) {
+                            return Ok(answer);
+                        }
                     }
                     Some(GenerationChange::Staged) | None => {}
                 }

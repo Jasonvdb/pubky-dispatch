@@ -755,6 +755,39 @@ async fn wallet_cursor(replay: &Replay, after: &str, at: u64) -> Value {
 }
 
 #[tokio::test]
+async fn test_recovery_in_place_counts_the_loss_of_reachable_apps_once() {
+    async fn versions(replay: &Replay) -> (u64, u64) {
+        let mut txn = replay
+            .db
+            .store()
+            .begin(&alice_id())
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.directory_versions().await.expect("directory versions")
+    }
+
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    replay_batch(&replay, &vectors("chain.json"), &[3, 4]).await;
+    let key = service_public(&replay);
+    let at = replay.clock.now_ms();
+    let (directory, apps) = versions(&replay).await;
+    assert!(apps > 0, "the wallet has a receive key");
+    // The wallet becomes unreachable on the first recovery. Nothing registered again
+    // before the second recovery (Switch wire 7.4.10).
+    for step in 1..=2 {
+        let previous = held(&replay).await;
+        let recovery = next_generation(&previous, key, Some(previous.generation()));
+        let (answer, sent) = deliver(&replay, recovery, Some(previous.hash()), at).await;
+        assert_eq!(answer.status, 200, "{}", json_of(&answer));
+        assert!(signed_by(&answer, &key, &sent));
+        assert_eq!(versions(&replay).await, (directory + step, apps + 1));
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_recovery_in_place_holds_no_cursor_of_the_lost_sequence() {
     // A provider loss starts the account's apps afresh: the new sequence holds no cursor
     // from the lost one, so the wallet's first page there reports 0, before any move of its

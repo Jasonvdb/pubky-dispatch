@@ -70,6 +70,14 @@ pub enum GenerationChange {
     ProviderLoss,
 }
 
+/// The apps version after a recovery clears the directory (Switch wire 7.4.10).
+/// The document delivery also advances the directory version. Neither result may
+/// exceed the wire integer range (Switch wire 1.1).
+pub fn recovery_apps_version(directory: u64, apps: u64, had_reachable_apps: bool) -> Option<u64> {
+    let apps = apps.checked_add(u64::from(had_reachable_apps))?;
+    (directory < crate::json::MAX_INT && apps <= crate::json::MAX_INT).then_some(apps)
+}
+
 /// A delivery the service takes (Switch wire 3.3, 7.4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
@@ -320,6 +328,22 @@ mod tests {
     use crate::records::{IdentityBody, IdentityPolicy, Inbox, ListedApp, RemovedApp};
 
     const ORIGIN: &str = "https://inbox.example";
+
+    #[test]
+    fn test_recovery_directory_versions_at_the_wire_limit() {
+        use crate::json::MAX_INT;
+
+        assert_eq!(
+            recovery_apps_version(MAX_INT - 1, MAX_INT - 1, true),
+            Some(MAX_INT)
+        );
+        assert_eq!(
+            recovery_apps_version(MAX_INT - 1, MAX_INT, false),
+            Some(MAX_INT)
+        );
+        assert_eq!(recovery_apps_version(MAX_INT, 0, false), None);
+        assert_eq!(recovery_apps_version(0, MAX_INT, true), None);
+    }
 
     fn body(version: u64) -> IdentityBody {
         let mut b = IdentityBody::first(

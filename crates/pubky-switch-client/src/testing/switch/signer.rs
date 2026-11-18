@@ -29,7 +29,22 @@ type GenerationKey = (u64, [u8; 32]);
 struct OpeningEnrollment {
     enrollment_hash: [u8; 32],
     store_id: [u8; 16],
+    material: [u8; 32],
     digest: [u8; 32],
+}
+
+impl OpeningEnrollment {
+    fn commitment(
+        material: [u8; 32],
+        store_id: [u8; 16],
+        enrollment: [u8; 32],
+        identity: [u8; 32],
+        created: u64,
+        limits: Limits,
+    ) -> Result<[u8; 32], ScriptError> {
+        let fields = (material, store_id, enrollment, identity, created, limits);
+        Ok(pubky_switch_core::enc::hash(&serde_json::to_vec(&fields)?))
+    }
 }
 
 /// What an enrolled account holds of its enrollments (Switch wire 3.7).
@@ -49,7 +64,7 @@ pub(crate) struct Enrolled {
 pub(crate) struct EnrollmentReceipt {
     created: u64,
     store_id: [u8; 16],
-    answer: Value,
+    answer: EnrollmentAnswer,
 }
 
 impl ScriptedSwitch {
@@ -213,7 +228,7 @@ impl Inner {
         &self,
         enrollment_hash: [u8; 32],
         store_id: [u8; 16],
-    ) -> Result<Option<[u8; 32]>, ScriptError> {
+    ) -> Result<Option<OpeningEnrollment>, ScriptError> {
         let max_rows = pubky_switch_core::records::MAX_ENROLLMENT_BYTES / 16;
         if self.apps.len() > max_rows
             || self.kept_app_ids.len() > max_rows
@@ -238,20 +253,30 @@ impl Inner {
             })
             .collect();
         let facts = (
-            store_id,
-            self.identity.public(),
-            self.created_at_ms,
-            enrollment_hash,
             self.tip.generation,
             self.doc.as_ref().map(IdentityDoc::hash),
-            self.enrolled.as_ref().map(|e| e.limits),
             &self.kept_app_ids,
             self.kept_at,
             permanent,
         );
-        Ok(Some(pubky_switch_core::enc::hash(&serde_json::to_vec(
-            &facts,
-        )?)))
+        let Some(enrolled) = &self.enrolled else {
+            return Ok(None);
+        };
+        let material = pubky_switch_core::enc::hash(&serde_json::to_vec(&facts)?);
+        let digest = OpeningEnrollment::commitment(
+            material,
+            store_id,
+            enrollment_hash,
+            self.identity.public(),
+            self.created_at_ms,
+            enrolled.limits,
+        )?;
+        Ok(Some(OpeningEnrollment {
+            enrollment_hash,
+            store_id,
+            material,
+            digest,
+        }))
     }
 
     /// Read the SQL-side origin before any changes to the simulated transaction.
@@ -260,6 +285,7 @@ impl Inner {
         let found = if self.state_version == 0 && self.seq == 0 {
             self.opening_anchor(opening.enrollment_hash, opening.store_id)
                 .ok()?
+                .map(|actual| actual.digest)
         } else {
             let (tag, stored) = self.state_history.get(&self.state_version)?;
             (*tag == self.state_tag).then_some(*stored).flatten()
@@ -267,14 +293,30 @@ impl Inner {
         found.filter(|found| *found == opening.digest)
     }
 
-    fn covers_opening_receipt(&self, hash: [u8; 32], receipt: &EnrollmentReceipt) -> bool {
-        let Some(opening) = self.enrolled.as_ref().and_then(|enrolled| enrolled.opening) else {
+    fn covers_opening_receipt(&self, enrollment: &Enrollment, receipt: &EnrollmentReceipt) -> bool {
+        let Some(enrolled) = self.enrolled.as_ref() else {
+            return false;
+        };
+        let Some(opening) = enrolled.opening else {
             return false;
         };
         let super::marks::MarkSlot::At(mark) = self.marks.slot else {
             return false;
         };
-        if opening.enrollment_hash != hash
+        let answer = &receipt.answer;
+        let digest = OpeningEnrollment::commitment(
+            opening.material,
+            receipt.store_id,
+            enrollment.hash(),
+            self.identity.public(),
+            receipt.created,
+            answer.limits,
+        );
+        if answer.check(enrollment).is_err()
+            || answer.limits != enrolled.limits
+            || answer.created != receipt.created
+            || digest.ok() != Some(opening.digest)
+            || opening.enrollment_hash != enrollment.hash()
             || opening.store_id != receipt.store_id
             || self.creation_origin != Some(opening.digest)
             || mark.created_at_ms != receipt.created
@@ -305,7 +347,7 @@ impl Inner {
         };
         // The same enrollment again gets its kept answer, with no other effect (Switch wire
         // 3.7, 7.4.1).
-        if let Some(answer) = self
+        if let Some(mut answer) = self
             .enrolled
             .as_ref()
             .filter(|_| {
@@ -320,15 +362,18 @@ impl Inner {
             if matches!(
                 enrollment.body().intent,
                 pubky_switch_core::records::EnrollmentIntent::Create { .. }
-            ) && !self.covers_opening_receipt(enrollment.hash(), &answer)
-            {
-                return Ok(bad(
-                    ErrorCode::Unavailable,
-                    "account binding: fresh enrollment contents unavailable",
-                    Value::Null,
-                ));
+            ) {
+                if !self.covers_opening_receipt(enrollment, &answer) {
+                    return Ok(bad(
+                        ErrorCode::Unavailable,
+                        "account binding: fresh enrollment contents unavailable",
+                        Value::Null,
+                    ));
+                }
+                // The result key follows the current signing key (Switch wire 7.4.1).
+                answer.answer.service_key = self.service.verifying_key().to_bytes();
             }
-            return Ok((200, answer.answer));
+            return Ok((200, serde_json::to_value(answer.answer)?));
         }
         if let Err(answer) = self.authorize_enrollment(enrollment, store_id) {
             return Ok(answer);
@@ -427,7 +472,7 @@ impl Inner {
             EnrollmentReceipt {
                 created,
                 store_id,
-                answer: value.clone(),
+                answer,
             },
         );
         // The enrollment that makes the account names the App IDs it keeps for good; another
@@ -449,14 +494,11 @@ impl Inner {
             enrollment.body().intent,
             pubky_switch_core::records::EnrollmentIntent::Create { .. }
         ) {
-            let anchor = self.opening_anchor(enrollment.hash(), store_id)?;
+            let opening = self.opening_anchor(enrollment.hash(), store_id)?;
             if let Some(held) = &mut self.enrolled {
-                held.opening = anchor.map(|digest| OpeningEnrollment {
-                    enrollment_hash: enrollment.hash(),
-                    store_id,
-                    digest,
-                });
+                held.opening = opening;
             }
+            let anchor = opening.map(|opening| opening.digest);
             self.creation_origin = anchor;
             if let super::marks::MarkSlot::At(mark) = &mut self.marks.slot {
                 mark.creation_anchor = anchor.map(|digest| (created, digest));

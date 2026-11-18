@@ -511,6 +511,31 @@ async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
     assert!(support::header_text(&unavailable, header::HEAD).is_none());
     sql(&replay,"UPDATE state_history h SET creation_anchor = s.creation_anchor FROM saved_origins s WHERE h.account_id = s.account_id AND h.state_version = s.state_version").await;
     assert_eq!(restored.handle(retry()).await.body, original.body);
+
+    // A counted position also needs the proof for the receipt fields returned today.
+    sql(
+        &replay,
+        "CREATE TABLE saved_material AS SELECT id, opening_material FROM accounts;
+                  UPDATE accounts SET opening_material = NULL",
+    )
+    .await;
+    let request = retry();
+    let sent = support::Sent::of(&request);
+    let unavailable = restored.handle(request).await;
+    status(&unavailable, 503);
+    assert!(support::signed_with(
+        &unavailable,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert!(support::header_text(&unavailable, header::HEAD).is_none());
+    sql(
+        &replay,
+        "UPDATE accounts a SET opening_material = m.opening_material
+                  FROM saved_material m WHERE a.id = m.id",
+    )
+    .await;
+    assert_eq!(restored.handle(retry()).await.body, original.body);
     replay.db.drop_database().await.unwrap();
 }
 

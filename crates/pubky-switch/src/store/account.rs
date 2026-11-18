@@ -352,20 +352,23 @@ impl Creation {
         mut self,
     ) -> Result<(Transaction<'static, Postgres>, [u8; 32]), StoreError> {
         self.populate().await?;
-        let anchor = super::creation_anchor::contents(
+        let opening = super::creation_anchor::contents(
             &mut self.tx,
             &self.account.id,
             self.account.enrollment_store_id,
             self.account.enrollment_hash,
         )
         .await?;
-        sqlx::query("UPDATE accounts SET creation_anchor = $2 WHERE id = $1")
-            .bind(&self.account.id)
-            .bind(anchor.as_slice())
-            .execute(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-        Ok((self.tx, anchor))
+        sqlx::query(
+            "UPDATE accounts SET creation_anchor = $2, opening_material = $3 WHERE id = $1",
+        )
+        .bind(&self.account.id)
+        .bind(opening.anchor.as_slice())
+        .bind(opening.material.as_slice())
+        .execute(&mut *self.tx)
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok((self.tx, opening.anchor))
     }
 
     async fn populate(&mut self) -> Result<(), StoreError> {

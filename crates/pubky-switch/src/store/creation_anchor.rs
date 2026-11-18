@@ -13,12 +13,45 @@ use super::{AccountTxn, StoreError, from_db};
 // The complete signed enrollment, including its optional signed identity, fits 256 KiB.
 const MAX_ROWS: i64 = MAX_ENROLLMENT_BYTES as i64 / 16;
 
+pub(super) struct OpeningContents {
+    pub(super) anchor: [u8; 32],
+    pub(super) material: [u8; 32],
+}
+
+// The signed enrollment hash binds its origin, nonce and identity. The current service
+// signs the answer with its own key under wire 7.4.1. All remaining result fields are
+// fixed for this opening, including each of the seven announced limits.
+fn receipt_anchor(
+    material: &[u8; 32],
+    store_id: &[u8; 16],
+    identity: &[u8; 32],
+    enrollment: &[u8; 32],
+    created: u64,
+    limits: &Limits,
+) -> [u8; 32] {
+    pubky_switch_core::enc::hash(&lp(&[
+        b"pubky-switch/v1/creation-anchor",
+        material,
+        store_id,
+        identity,
+        enrollment,
+        &created.to_be_bytes(),
+        &limits.app_limit.to_be_bytes(),
+        &limits.max_envelope.to_be_bytes(),
+        &limits.max_sealed_value.to_be_bytes(),
+        &limits.quota_bytes.to_be_bytes(),
+        &limits.max_batch.to_be_bytes(),
+        &limits.record_quota_bytes.to_be_bytes(),
+        &limits.max_import_bytes.to_be_bytes(),
+    ]))
+}
+
 pub(super) async fn contents(
     conn: &mut PgConnection,
     id: &str,
     store_id: [u8; 16],
     enrollment: [u8; 32],
-) -> Result<[u8; 32], StoreError> {
+) -> Result<OpeningContents, StoreError> {
     let corrupt = StoreError::Corrupt("fresh enrollment contents");
     let row = sqlx::query(
         "SELECT identity_key, created_at_ms, generation, announced_limits, identity_doc, \
@@ -63,20 +96,9 @@ pub(super) async fn contents(
     let doc_hash = doc.as_ref().map(IdentityDoc::hash);
     let mut hash = blake3::Hasher::new();
     hash.update(&lp(&[
-        b"pubky-switch/v1/creation-anchor",
-        &store_id,
-        &identity,
-        &enrollment,
-        &created.to_be_bytes(),
+        b"pubky-switch/v1/creation-material",
         &generation.to_be_bytes(),
         doc_hash.as_ref().map_or(&[][..], |bytes| bytes.as_slice()),
-        &limits.app_limit.to_be_bytes(),
-        &limits.max_envelope.to_be_bytes(),
-        &limits.max_sealed_value.to_be_bytes(),
-        &limits.quota_bytes.to_be_bytes(),
-        &limits.max_batch.to_be_bytes(),
-        &limits.record_quota_bytes.to_be_bytes(),
-        &limits.max_import_bytes.to_be_bytes(),
         &directory.to_be_bytes(),
         &apps.to_be_bytes(),
         &[0],
@@ -109,11 +131,19 @@ pub(super) async fn contents(
             &[u8::from(rotated)],
         ]));
     }
-    let anchor = *hash.finalize().as_bytes();
+    let material = *hash.finalize().as_bytes();
+    let anchor = receipt_anchor(
+        &material,
+        &store_id,
+        &identity,
+        &enrollment,
+        created,
+        &limits,
+    );
     if anchor == [0; 32] {
         return Err(StoreError::Corrupt("zero creation anchor"));
     }
-    Ok(anchor)
+    Ok(OpeningContents { anchor, material })
 }
 
 /// Recover the SQL witness before this transaction can change the opening contents.
@@ -139,7 +169,7 @@ pub(super) async fn opening_origin(
         return Ok(None);
     };
     match contents(conn, &head.id, store, enrollment).await {
-        Ok(origin) => Ok((origin.as_slice() == stored).then_some(origin)),
+        Ok(opening) => Ok((opening.anchor.as_slice() == stored).then_some(opening.anchor)),
         Err(
             StoreError::Corrupt(_)
             | StoreError::OutOfRange(_)
@@ -156,6 +186,7 @@ impl AccountTxn {
         &mut self,
         store_id: [u8; 16],
         enrollment: [u8; 32],
+        limits: &Limits,
         mark: &crate::marks::AccountMark,
     ) -> Result<bool, StoreError> {
         let head = self.head();
@@ -171,13 +202,16 @@ impl AccountTxn {
         if head.state_version == 0 && (mark.generation != 0 || head.last_seq != 0) {
             return Ok(false);
         }
+        let identity = head.identity_key;
+        let created = head.created_at_ms;
         let id = head.id.clone();
         // A positive marked position must carry this same origin at its tagged history
         // row. A zero mark can attest to the immutable opening receipt only; it never
         // establishes coverage of later exclusion changes.
-        let covered: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM enrollment_answers WHERE account_id = $1 AND \
-             enrollment_hash = $2 AND store_id = $3 AND creating) AND ($4::bigint = 0 OR EXISTS( \
+        let material: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT a.opening_material FROM accounts a JOIN enrollment_answers e ON e.account_id = a.id \
+             WHERE a.id = $1 AND a.opening_material IS NOT NULL AND e.enrollment_hash = $2 AND \
+             e.store_id = $3 AND e.creating AND e.created_at_ms = a.created_at_ms AND ($4::bigint = 0 OR EXISTS( \
              SELECT 1 FROM state_history WHERE account_id = $1 AND state_version = $4 \
              AND state_tag = $5 AND creation_anchor = $6))",
         )
@@ -187,8 +221,67 @@ impl AccountTxn {
         .bind(super::to_db(mark.state_version, "state_version")?)
         .bind(mark.state_tag.as_slice())
         .bind(anchor.as_slice())
-        .fetch_one(self.conn())
+        .fetch_optional(self.conn())
         .await?;
-        Ok(covered)
+        let Some(material) = material.and_then(|bytes| bytes.try_into().ok()) else {
+            return Ok(false);
+        };
+        Ok(receipt_anchor(
+            &material,
+            &store_id,
+            &identity,
+            &enrollment,
+            created,
+            limits,
+        ) == anchor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_opening_receipt_binds_the_request_and_returned_limits() {
+        let first = [1; 32];
+        let second = [2; 32];
+        let limits = Limits::default();
+        let anchor = |enrollment: &[u8; 32], actual: Limits| {
+            receipt_anchor(&[3; 32], &[4; 16], &[5; 32], enrollment, 17, &actual)
+        };
+        let original = anchor(&first, limits);
+        assert_ne!(anchor(&second, limits), original);
+        for other in [
+            Limits {
+                app_limit: limits.app_limit + 1,
+                ..limits
+            },
+            Limits {
+                max_envelope: limits.max_envelope + 1,
+                ..limits
+            },
+            Limits {
+                max_sealed_value: limits.max_sealed_value + 1,
+                ..limits
+            },
+            Limits {
+                quota_bytes: limits.quota_bytes + 1,
+                ..limits
+            },
+            Limits {
+                max_batch: limits.max_batch + 1,
+                ..limits
+            },
+            Limits {
+                record_quota_bytes: limits.record_quota_bytes + 1,
+                ..limits
+            },
+            Limits {
+                max_import_bytes: limits.max_import_bytes + 1,
+                ..limits
+            },
+        ] {
+            assert_ne!(anchor(&first, other), original);
+        }
     }
 }

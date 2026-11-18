@@ -698,7 +698,7 @@ impl Service {
                     judged.judgement.decision.verdict,
                     verdict::Verdict::Healthy | verdict::Verdict::Staged
                 ) || !txn
-                    .covers_opening_receipt(store_id, enrollment_hash, mark)
+                    .covers_opening_receipt(store_id, enrollment_hash, &limits, mark)
                     .await
                     .map_err(|e| store_error(&e))?
                 {

@@ -1423,6 +1423,7 @@ async fn test_enroll_takes_over_a_lost_accounts_mark() {
     assert_eq!(
         mark_of(&replay, &alice.id).await,
         AccountMark {
+            state_tag: [0; 16],
             generation: 1,
             seq: 5,
             chain_hash: [9; 32],

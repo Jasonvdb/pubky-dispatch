@@ -407,7 +407,7 @@ impl Service {
             let account = self.account_input(
                 head.generation,
                 head.chain,
-                head.state_version,
+                head.count(),
                 head.created_at_ms,
                 held.as_ref().map(IdentityDoc::body),
                 head.activation,

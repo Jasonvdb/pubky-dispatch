@@ -28,6 +28,12 @@ CREATE TABLE accounts (
     -- sees. Never reset while the row lasts; the mark keeps the value as of the last
     -- acknowledged commit, and a restore that lost one leaves it behind the mark's.
     state_version   BIGINT   NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+    -- A fresh random tag written with each move of the count, the zero tag before the
+    -- first: two states with the same count but different histories have different tags,
+    -- so a restore that lost one write and took another at the same count isn't taken for
+    -- the state the mark covers (Switch wire 7.3, "The state").
+    state_tag       BYTEA    NOT NULL DEFAULT '\x00000000000000000000000000000000'
+                             CHECK (octet_length(state_tag) = 16),
     -- The last service time the account stamped; it never goes back (Switch spec 10.1).
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
     -- When the account was created, in service time.
@@ -536,8 +542,14 @@ CREATE TABLE handovers (
 -- committed registration names it, and one a replacement, a removal, a recovery in place or
 -- an erasure let go, owed until the key store deletes it. Written in the transaction that
 -- lets the key go, so its deletion is owed durably the moment nothing names it; the service
--- deletes each key, then drops the row: at once, and again at start for any a failure or a
--- crash left. No foreign key: the account may be gone by then.
+-- deletes each key, then drops the row: once the mark covers the commit that let it go, and
+-- again at start for any a failure or a crash left. No foreign key: the account may be gone
+-- by then.
+--
+-- `owe_push_key` writes a row from the request path outside the account's lock, before the
+-- key it owes is minted: no count moves for it. Losing that write to a restore changes no
+-- decision: the restored state has no registration naming the key, which nothing else ever
+-- names, so the key signs nothing and is at worst left unused in the key store.
 CREATE TABLE erased_keys (
     key_id          TEXT    PRIMARY KEY,
     account_id      TEXT    NOT NULL,
@@ -651,8 +663,6 @@ CREATE TABLE erasure_outcomes (
 -- checks it against the schema. Its kinds:
 -- - `column`: changes to the column `col` of table `tab` count nothing; `*` for the whole
 --   table.
--- - `scope`: a write the service makes under the reason `col` counts nothing
---   (`AccountTxn::uncounted`).
 -- - `background`: table `tab` is also written outside an identity's lock, by the service's
 --   background work. Under the lock it is counted like any other table; outside it, its
 --   writes commit with no account's commit and count nothing.
@@ -660,25 +670,23 @@ CREATE FUNCTION state_uncounted() RETURNS TABLE (kind TEXT, tab TEXT, col TEXT, 
 LANGUAGE sql IMMUTABLE AS $$ VALUES
     ('column', 'accounts', 'state_version',
      'the count itself'),
+    ('column', 'accounts', 'state_tag',
+     'the count''s tag, written with the count'),
     ('column', 'accounts', 'stamped_time_ms',
      'service time, stamped at nearly every request; that it never goes back is a rule of '
      'its own (Switch spec 10.1)'),
+    ('column', 'accounts', 'swept_at_ms',
+     'sets only when the next sweep runs: a restored earlier minute runs it sooner, and what '
+     'the sweep deletes is counted'),
     ('column', 'apps', 'last_seen_ms',
      'shown by GET /apps only; no decision reads it'),
     ('column', 'sender_flags', '*',
      'read only by GET /allow, which offers the signer a block; it admits or refuses '
      'nothing, and a lost hit is like a flag that decayed'),
-    ('scope', NULL, 'step 4',
-     'the sweeps and chain stub retention of Switch wire 7.3 step 4: due claims, forgotten '
-     'deleted keys, spent invite codes and expired batch proofs come back due, spent or past '
-     'their time, which every reader treats as gone; dropped chain stubs and spent batches '
-     'come back kept, which is always safe; the next run takes them again, and the sweep '
-     'minute only sets when that run is'),
-    ('scope', NULL, 'due claim',
-     'a due claim GET /claims deletes comes back due, which every reader treats as gone'),
     ('background', 'erased_keys', NULL,
-     'the row of a key the key store deleted goes once it is deleted: a restored row has '
-     'the deletion run again, and a key owed deleting signs nothing'),
+     'the row of a key the key store deleted goes once it is deleted, and a key is owed '
+     'before it is minted: a restored row has the deletion run again, a lost one leaves a '
+     'key nothing names, and a key owed deleting signs nothing'),
     ('background', 'push_deliveries', NULL,
      'the webhook worker claims, retries and deletes rows: a restored row is sent at most '
      'again within its entry''s minute, as a retry is (Switch wire 8.2)')
@@ -693,7 +701,6 @@ $$;
 -- of going uncounted.
 CREATE FUNCTION count_state_change() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    scope TEXT := coalesce(current_setting('switch.uncounted', true), '');
     left_out TEXT[];
 BEGIN
     IF coalesce(current_setting('switch.locked', true), '') <> 'on' THEN
@@ -703,13 +710,6 @@ BEGIN
         END IF;
         RAISE EXCEPTION 'a write to %, an account''s state, outside an identity''s lock',
             TG_TABLE_NAME;
-    END IF;
-    IF scope <> '' THEN
-        IF NOT EXISTS (SELECT 1 FROM state_uncounted() u
-                       WHERE u.kind = 'scope' AND u.col = scope) THEN
-            RAISE EXCEPTION 'an uncounted write for an unlisted reason: %', scope;
-        END IF;
-        RETURN NULL;
     END IF;
     IF coalesce(current_setting('switch.changed', true), '') = 'on' THEN
         RETURN NULL;

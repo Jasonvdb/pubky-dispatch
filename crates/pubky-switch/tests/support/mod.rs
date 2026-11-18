@@ -770,6 +770,38 @@ pub async fn fresh_alice_enrollment(replay: &Replay, at_ms: u64) -> SwitchReques
     )
 }
 
+/// The body of alice's enrollment at `at_ms`: the vectors' enrollment with `nonce`,
+/// `revoked_apps` and `identity_doc`, under the intent this service's account observation
+/// gives now (account binding). The same body sent again is the exact retry.
+pub async fn alice_enrollment_body(
+    replay: &Replay,
+    nonce: u8,
+    revoked_apps: Option<Vec<[u8; 16]>>,
+    identity_doc: Option<SignedDoc>,
+    at_ms: u64,
+) -> Vec<u8> {
+    use pubky_switch_core::records::Enrollment;
+    let keys = vectors("keys.json");
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let http = vectors("http.json");
+    let template = vector_request(named(&http["requests"], "signer: enrollment"));
+    let wrapper: Value = serde_json::from_slice(&template.body).expect("enrollment request");
+    let signed: SignedDoc =
+        serde_json::from_value(wrapper["enrollment"].clone()).expect("signed enrollment");
+    let mut body = Enrollment::verify(&signed, &key.public(), ORIGIN)
+        .expect("enrollment template")
+        .body()
+        .clone();
+    body.nonce = [nonce; 16];
+    body.revoked_apps = revoked_apps;
+    body.identity_doc = identity_doc;
+    body.intent = new_alice_enrollment_intent(replay, at_ms).await;
+    Enrollment::sign(&key, body)
+        .expect("enrollment")
+        .to_request_json()
+        .expect("request")
+}
+
 /// alice's account as `chain.json` starts it: enrolled, then given `identity.json` version
 /// 1 at seq 1 and version 3 at seq 2, at the items' times.
 pub async fn serve_alice(replay: &Replay) {
@@ -1013,6 +1045,82 @@ pub async fn state_version_of(replay: &Replay, id: &str) -> u64 {
     u64::try_from(count).expect("count")
 }
 
+/// The tag of `id`'s account's count, as the database holds it (Switch wire 7.3, "The
+/// state").
+pub async fn state_tag_of(replay: &Replay, id: &str) -> [u8; 16] {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let tag: Vec<u8> = sqlx::query_scalar("SELECT state_tag FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("tag");
+    conn.close().await.expect("close");
+    tag.try_into().expect("16 bytes")
+}
+
+/// Run the statements of `sql` on one connection that may write an account's state
+/// directly, as a restore does: its triggers and foreign keys off for the session.
+async fn restore_sql(replay: &Replay, sql: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::raw_sql(&format!(
+        "SET session_replication_role = replica; {sql}; SET session_replication_role = origin"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("restore");
+    conn.close().await.expect("close");
+}
+
+/// The tables of the test database that hold an account's rows, `accounts` first.
+const IMAGE_TABLES: &str = "SELECT 'accounts' UNION ALL (SELECT table_name::text \
+     FROM information_schema.columns WHERE table_schema = current_schema() \
+     AND column_name = 'account_id' ORDER BY 1)";
+
+/// A backup of `id`'s account taken now, under `name`: every row of every table that holds
+/// the account's state, as a database backup holds it.
+pub async fn save_image(replay: &Replay, id: &str, name: &str) {
+    restore_sql(
+        replay,
+        &format!(
+            "CREATE SCHEMA image_{name}; \
+             DO $$ DECLARE t TEXT; s TEXT := current_schema(); BEGIN \
+             FOR t IN {IMAGE_TABLES} LOOP \
+             EXECUTE format('CREATE TABLE image_{name}.%I AS SELECT * FROM %I.%I WHERE %I = %L', \
+             t, s, t, CASE WHEN t = 'accounts' THEN 'id' ELSE 'account_id' END, '{id}'); \
+             END LOOP; END $$"
+        ),
+    )
+    .await;
+}
+
+/// Restore the backup `name` of `id`'s account ([`save_image`]): every row of the account
+/// goes back to what it held then, as a database restore leaves it, with the service's own
+/// rules off; the mark store, apart from the state, stays.
+pub async fn restore_image(replay: &Replay, id: &str, name: &str) {
+    restore_sql(
+        replay,
+        &format!(
+            "DO $$ DECLARE t TEXT; s TEXT := current_schema(); k TEXT; c TEXT; BEGIN \
+             FOR t IN {IMAGE_TABLES} LOOP \
+             k := CASE WHEN t = 'accounts' THEN 'id' ELSE 'account_id' END; \
+             SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position) \
+             INTO c FROM information_schema.columns WHERE table_schema = s \
+             AND table_name = t AND is_generated = 'NEVER'; \
+             EXECUTE format('DELETE FROM %I.%I WHERE %I = %L', s, t, k, '{id}'); \
+             EXECUTE format('INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE \
+             SELECT %s FROM image_{name}.%I', s, t, c, c, t); \
+             END LOOP; END $$"
+        ),
+    )
+    .await;
+}
+
 /// The move of `id`'s mark in `marks` to `head`, the count it holds kept: a head moved
 /// ahead of the state, or to it, by the head alone (Switch wire 7.3, "The mark").
 pub async fn keeping_count(
@@ -1020,13 +1128,14 @@ pub async fn keeping_count(
     id: &str,
     head: pubky_switch_core::chain::ChainTip,
 ) -> pubky_switch::marks::MarkTarget {
-    let state_version = match marks.read(id).await.expect("read") {
-        pubky_switch::marks::MarkRead::Mark(mark) => mark.state_version,
-        _ => 0,
+    let (state_version, state_tag) = match marks.read(id).await.expect("read") {
+        pubky_switch::marks::MarkRead::Mark(mark) => (mark.state_version, mark.state_tag),
+        _ => (0, [0; 16]),
     };
     pubky_switch::marks::MarkTarget {
         head,
         state_version,
+        state_tag,
     }
 }
 
@@ -1036,6 +1145,7 @@ pub fn at_head(head: pubky_switch_core::chain::ChainTip) -> pubky_switch::marks:
     pubky_switch::marks::MarkTarget {
         head,
         state_version: 0,
+        state_tag: [0; 16],
     }
 }
 

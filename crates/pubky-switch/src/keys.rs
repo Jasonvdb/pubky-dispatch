@@ -686,17 +686,22 @@ pub(crate) mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     /// Write `bytes` as lowercase hex.
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer, const N: usize>(
+        bytes: &[u8; N],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&hex::encode(bytes))
     }
 
-    /// Read 32 bytes of lowercase hex.
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+    /// Read `N` bytes of lowercase hex.
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[u8; N], D::Error> {
         let text = String::deserialize(deserializer)?;
         if text.bytes().any(|b| b.is_ascii_uppercase()) {
             return Err(D::Error::custom("uppercase hex"));
         }
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; N];
         hex::decode_to_slice(text, &mut bytes).map_err(D::Error::custom)?;
         Ok(bytes)
     }

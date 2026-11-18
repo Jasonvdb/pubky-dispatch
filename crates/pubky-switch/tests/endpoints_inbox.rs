@@ -1352,3 +1352,104 @@ async fn test_inbox_entry_hidden_from_other_apps_and_counted_for_its_target() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The reason of the notice `answer` is, or `null` for another answer.
+fn notice_reason(answer: &SwitchResponse) -> Value {
+    if code_of(answer) == (503, json!("recovery_required")) {
+        body(answer)["current"]["reason"].clone()
+    } else {
+        Value::Null
+    }
+}
+
+#[tokio::test]
+async fn test_inbox_enrollment_at_a_restored_account_behind_its_mark_stays_failing() {
+    // A restore to the count before an acknowledged append is behind the mark. An
+    // enrollment there commits a write of its own and brings the count back to the mark's,
+    // with a fresh tag: the same count, another history, so the account still fails stop,
+    // now as a fork, and the append's `seq` is never given out again (Switch wire 7.3,
+    // Table 1).
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let id = alice_id();
+    let version = apps_version(&replay).await;
+    let last_seq = sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    save_image(&replay, &id, "before_append").await;
+    let answer = from_shop(&replay, to_wallet(1, false), Some(version), None).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let marked = alice_mark(&replay).await;
+    restore_image(&replay, &id, "before_append").await;
+    let again = from_shop(&replay, to_wallet(2, false), Some(version), None).await;
+    assert_eq!(notice_reason(&again), json!("behind"));
+    // The signer enrolls again at the restored account: the enrollment commits its
+    // receipt, which counts.
+    let at = ms(&at());
+    let enrollment = alice_enrollment_body(&replay, 9, None, None, at).await;
+    let enrolled = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", enrollment, at))
+        .await;
+    assert_eq!(
+        enrolled.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&enrolled.body)
+    );
+    assert_eq!(state_version_of(&replay, &id).await, marked.state_version);
+    assert_ne!(state_tag_of(&replay, &id).await, marked.state_tag);
+    assert_eq!(
+        alice_mark(&replay).await,
+        marked,
+        "no mark moves while failing"
+    );
+    let again = from_shop(&replay, to_wallet(3, false), Some(version), None).await;
+    assert_eq!(notice_reason(&again), json!("fork"));
+    assert_eq!(
+        sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await,
+        last_seq,
+        "the lost seq not given out again"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_restored_image_at_the_marks_count_with_another_history_is_a_fork() {
+    // An append commits and the process stops before its mark moves: no answer went out.
+    // Keep that image. A restore of the marked image serves on, healthy, and acknowledges
+    // another append at the same count and `seq`. A restore of the kept image is then at
+    // the mark's head and count, but without the acknowledged append: its tag tells it, a
+    // fork (Switch wire 7.3, Table 1).
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let id = alice_id();
+    let version = apps_version(&replay).await;
+    save_image(&replay, &id, "marked").await;
+    let marks_dir = replay.key_dir().join("accounts").join("marks");
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only");
+    let unanswered = from_shop(&replay, to_wallet(1, false), Some(version), None).await;
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(code_of(&unanswered), (503, json!("unavailable")));
+    save_image(&replay, &id, "unanswered").await;
+    restore_image(&replay, &id, "marked").await;
+    let answer = from_shop(&replay, to_wallet(2, false), Some(version), None).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mark = alice_mark(&replay).await;
+    restore_image(&replay, &id, "unanswered").await;
+    assert_eq!(state_version_of(&replay, &id).await, mark.state_version);
+    let next = from_shop(&replay, to_wallet(3, false), Some(version), None).await;
+    assert_eq!(notice_reason(&next), json!("fork"));
+    assert_eq!(alice_mark(&replay).await, mark);
+    replay.db.drop_database().await.expect("drop");
+}

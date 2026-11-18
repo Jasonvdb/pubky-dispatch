@@ -191,6 +191,15 @@ pub struct AccountReport {
     pub head_seq: Option<u64>,
     /// The mark's `seq`; `None` without a mark.
     pub mark_seq: Option<u64>,
+    /// The account's count of changed commits; `None` without an account (Switch wire 7.3,
+    /// "The state").
+    pub head_count: Option<u64>,
+    /// The tag of that count, in hex; `None` without an account.
+    pub head_tag: Option<String>,
+    /// The count the mark covers; `None` without a mark.
+    pub mark_count: Option<u64>,
+    /// The tag of that count, in hex; `None` without a mark.
+    pub mark_tag: Option<String>,
 }
 
 impl AccountReport {
@@ -320,7 +329,7 @@ fn account_of(head: &StoredHead, origin: &str, service_key: &[u8; 32]) -> (Accou
         |key| key == service_key,
         head.generation,
         head.chain,
-        head.state_version,
+        head.count(),
         head.created_at_ms,
         body.as_ref(),
         head.activation,
@@ -409,8 +418,8 @@ fn judge_line(
         return Ok(None);
     };
     let notice = notice_of(&judged.judgement.decision.verdict);
-    let mark_seq = match mark {
-        MarkInput::Mark(mark) => Some(mark.seq),
+    let marked = match mark {
+        MarkInput::Mark(mark) => Some(mark),
         _ => None,
     };
     Ok(Some(AccountReport {
@@ -422,7 +431,11 @@ fn judge_line(
         permanent: notice.is_some_and(|notice| notice.permanent),
         retired,
         head_seq: head.and_then(|head| head.chain.map(|(seq, _)| seq)),
-        mark_seq,
+        mark_seq: marked.map(|mark| mark.seq),
+        head_count: head.map(|head| head.state_version),
+        head_tag: head.map(|head| hex::encode(head.state_tag)),
+        mark_count: marked.map(|mark| mark.state_version),
+        mark_tag: marked.map(|mark| hex::encode(mark.state_tag)),
     }))
 }
 
@@ -567,6 +580,7 @@ mod tests {
 
     fn mark(generation: u64, seq: u64, hash: u8) -> MarkInput {
         MarkInput::Mark(AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: [hash; 32],
@@ -585,7 +599,10 @@ mod tests {
                     seq,
                     chain_hash: [hash; 32],
                 }),
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 10,
                 document_generation: Some(1),
                 enrolled_generation: 1,

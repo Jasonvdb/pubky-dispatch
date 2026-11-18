@@ -307,8 +307,13 @@ pub(crate) struct Inner {
     /// state"): one more at each `seq` given out and at each other state change modelled
     /// here (FAKES.md).
     pub(crate) state_version: u64,
-    /// The count as each `seq` was given out, for a restore to that `seq`.
-    pub(crate) versions: Vec<(u64, u64)>,
+    /// The tag of the count's last move, 0 for the zero tag: a number no other move here
+    /// took, as the service's random one (Switch wire 7.3, "The state").
+    pub(crate) state_tag: u64,
+    /// The tags given out, which no restore takes back.
+    pub(crate) tags_made: u64,
+    /// The count and its tag as each `seq` was given out, for a restore to that `seq`.
+    pub(crate) versions: Vec<(u64, u64, u64)>,
     pub(crate) items: Vec<Item>,
     pub(crate) tips: Vec<ChainTip>,
     pub(crate) doc: Option<IdentityDoc>,
@@ -466,6 +471,8 @@ impl Inner {
             tip,
             seq: tip.seq,
             state_version: 0,
+            state_tag: 0,
+            tags_made: 0,
             versions: Vec::new(),
             items: Vec::new(),
             tips: vec![tip],
@@ -1971,12 +1978,13 @@ impl ScriptedSwitch {
     pub(crate) fn roll_back_to(&self, seq: u64) {
         self.restore_to(seq);
         let mut inner = self.lock();
-        let (tip, state_version) = (inner.tip, inner.state_version);
+        let (tip, state_version, state_tag) = (inner.tip, inner.state_version, inner.state_tag);
         if let marks::MarkSlot::At(mark) = &mut inner.marks.slot {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
             mark.state_version = state_version;
+            mark.state_tag = state_tag;
         }
     }
 
@@ -2163,15 +2171,19 @@ impl Inner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.count_change();
-        self.versions.push((self.seq, self.state_version));
+        self.versions
+            .push((self.seq, self.state_version, self.state_tag));
         // The account changes: the held reads look again.
         self.wake_held();
         self.seq
     }
 
-    /// Count a change of the account's state (Switch wire 7.3, "The state").
+    /// Count a change of the account's state, with a fresh tag (Switch wire 7.3, "The
+    /// state").
     pub(super) fn count_change(&mut self) {
         self.state_version = self.state_version.saturating_add(1);
+        self.tags_made = self.tags_made.saturating_add(1);
+        self.state_tag = self.tags_made;
     }
 
     /// Wake every held feed read, to look again.

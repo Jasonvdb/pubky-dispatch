@@ -268,6 +268,55 @@ async fn test_check_marks_reports_behind_fork_and_mark_lost() {
 }
 
 #[tokio::test]
+async fn test_check_marks_reports_counts_and_tags_for_behind_and_fork() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let alice = alice_id();
+    let held = mark_of(&replay, &alice).await;
+    let line = find(&check(&replay, true).await.accounts, &alice).clone();
+    assert_eq!(line.state, MarkState::Healthy);
+    assert_eq!(line.head_count, Some(held.state_version));
+    assert_eq!(line.mark_count, Some(held.state_version));
+    assert_eq!(line.head_tag, Some(hex::encode(held.state_tag)));
+    assert_eq!(line.mark_tag, line.head_tag);
+    // The mark at the state's head with a higher count, then at its count with another
+    // tag: every chain position is there, and the counts tell what is missing.
+    let rewrite = async |state_version: u64, state_tag: [u8; 16]| {
+        replay.marks.delete(&alice).await.expect("delete");
+        replay
+            .marks
+            .write_anew(
+                &alice,
+                pubky_switch::marks::MarkTarget {
+                    head: held.head(),
+                    state_version,
+                    state_tag,
+                },
+                held.key,
+                held.created_at_ms,
+            )
+            .await
+            .expect("write anew");
+        find(&check(&replay, false).await.accounts, &alice).clone()
+    };
+    let line = rewrite(held.state_version + 1, held.state_tag).await;
+    assert_eq!(
+        (line.state, line.head_seq, line.mark_seq),
+        (MarkState::Behind, Some(held.seq), Some(held.seq))
+    );
+    assert_eq!(
+        (line.head_count, line.mark_count),
+        (Some(held.state_version), Some(held.state_version + 1))
+    );
+    let line = rewrite(held.state_version, [0x5a; 16]).await;
+    assert_eq!(line.state, MarkState::Fork);
+    assert_eq!(line.head_count, line.mark_count);
+    assert_eq!(line.mark_tag, Some(hex::encode([0x5a; 16])));
+    assert_ne!(line.head_tag, line.mark_tag);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_check_marks_reports_retired_generations() {
     // alice's state went behind her mark and the operator retired generation 1: her line
     // lists it, and the notice is permanent (Switch spec 6.5, Switch wire 7.3, Table 1).
@@ -479,11 +528,15 @@ async fn test_check_marks_summary_and_exit_status() {
         .map(|line| serde_json::from_str(line).expect("json"))
         .collect();
     assert_eq!(lines.len(), 4);
+    let head_tag = lines[0]["head_tag"].clone();
+    assert_eq!(head_tag.as_str().map(str::len), Some(32), "{head_tag}");
     assert_eq!(
         lines[0],
         serde_json::json!({
             "account": "behind", "hosted": true, "serving": true, "state": "behind",
-            "generation": 1, "permanent": false, "retired": [], "head_seq": 1, "mark_seq": 3
+            "generation": 1, "permanent": false, "retired": [], "head_seq": 1, "mark_seq": 3,
+            "head_count": 1, "mark_count": 0, "head_tag": head_tag,
+            "mark_tag": "00000000000000000000000000000000"
         })
     );
     assert_eq!(lines[3]["summary"]["needs_attention"], 3);

@@ -500,7 +500,7 @@ impl Store {
     /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT generation, chain_seq, chain_hash, state_version, stamped_time_ms, \
+            "SELECT generation, chain_seq, chain_hash, state_version, state_tag, stamped_time_ms, \
              created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
@@ -530,6 +530,7 @@ impl Store {
             generation: from_db(row.try_get("generation")?, "generation")?,
             chain,
             state_version: from_db(row.try_get("state_version")?, "state_version")?,
+            state_tag: state_tag(row.try_get("state_tag")?)?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
             identity_doc: doc
@@ -765,6 +766,8 @@ pub struct FoundAccount {
     pub chain: Option<(u64, [u8; 32])>,
     /// Its count of changed commits (Switch wire 7.3, "The state").
     pub state_version: u64,
+    /// The tag written with the count's last move (Switch wire 7.3, "The state").
+    pub state_tag: [u8; 16],
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// When it was created, in service time.
@@ -867,6 +870,11 @@ impl ReadinessCheck for StoreReadiness {
 /// Convert a `u64` to the `BIGINT` the database stores.
 pub(crate) fn to_db(value: u64, what: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange(what))
+}
+
+/// Read a stored count's tag (Switch wire 7.3, "The state").
+pub(crate) fn state_tag(value: Vec<u8>) -> Result<[u8; 16], StoreError> {
+    <[u8; 16]>::try_from(value.as_slice()).map_err(|_| StoreError::Corrupt("state_tag"))
 }
 
 /// Convert a stored `BIGINT` back to a `u64`.

@@ -72,7 +72,7 @@ impl Service {
         };
         // A claim that is due is gone, whatever step 4's batch reached (Switch wire 7.3).
         if due.is_some_and(|base| claim.deletable(Some(base), self.limits.max_claim_age_ms)) {
-            txn.uncounted("due claim", async |txn| txn.delete_claim(&claim_key).await)
+            txn.delete_claim(&claim_key)
                 .await
                 .map_err(|e| store_error(&e))?;
             return Err(not_found());

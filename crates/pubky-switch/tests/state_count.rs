@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use pubky_switch::store::{
-    NewAccount, StoreError,
+    NewAccount,
     testing::{TestDatabase, test_database},
 };
 use sqlx::{Connection, PgConnection};
@@ -50,9 +50,10 @@ async fn commit_with(db: &TestDatabase, sql: &str) -> bool {
 }
 
 /// What is wrong with the schema's count trigger, read from the live schema: a table with
-/// an account column, or `accounts`, without the trigger; a trigger anywhere else, or of
-/// another name; a listed column or table that doesn't exist, or a listing without a
-/// reason or of an unknown kind.
+/// an account column, or `accounts`, without the trigger; one whose trigger doesn't fire
+/// after every insert, update and delete of each row, or fires only `WHEN` a condition holds;
+/// a trigger anywhere else, or of another name; a listed column or table that doesn't exist,
+/// or a listing without a reason or of an unknown kind.
 async fn trigger_problems(conn: &mut PgConnection) -> Vec<String> {
     let mut problems = Vec::new();
     let account_tables: Vec<String> = sqlx::query_scalar(
@@ -82,6 +83,39 @@ async fn trigger_problems(conn: &mut PgConnection) -> Vec<String> {
     for (on, name, function) in &triggers {
         if !account_tables.contains(on) || name != "count_state_change" {
             problems.push(format!("an extra trigger {name} ({function}) on {on}"));
+        }
+    }
+    // How each count trigger fires: its events, one row each, its timing and orientation,
+    // and any `WHEN` condition.
+    let firing: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event_object_table::text, event_manipulation::text, action_timing::text, \
+         action_orientation::text, action_condition::text FROM information_schema.triggers \
+         WHERE trigger_schema = current_schema() AND trigger_name = 'count_state_change' \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .expect("trigger events");
+    for table in &account_tables {
+        let rows: Vec<_> = firing.iter().filter(|row| &row.0 == table).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let events: Vec<&str> = rows.iter().map(|row| row.1.as_str()).collect();
+        if events != ["DELETE", "INSERT", "UPDATE"] {
+            problems.push(format!("{table}'s count trigger fires on {events:?}"));
+        }
+        for (_, event, timing, orientation, condition) in rows {
+            if timing != "AFTER" || orientation != "ROW" {
+                problems.push(format!(
+                    "{table}'s count trigger fires {timing} each {orientation}"
+                ));
+            }
+            if let Some(condition) = condition {
+                problems.push(format!(
+                    "{table}'s count trigger on {event} has WHEN {condition}"
+                ));
+            }
         }
     }
     let listed: Vec<Listing> =
@@ -121,7 +155,6 @@ async fn trigger_problems(conn: &mut PgConnection) -> Vec<String> {
                     problems.push(format!("{tab} isn't an account table"));
                 }
             }
-            ("scope", None, Some(_)) => {}
             (kind, tab, col) => problems.push(format!("a listing {kind} {tab:?} {col:?}")),
         }
     }
@@ -154,6 +187,44 @@ async fn test_state_count_every_account_table_has_the_trigger() {
     .execute(&mut conn)
     .await
     .expect("trigger");
+    assert_eq!(trigger_problems(&mut conn).await, Vec::<String>::new());
+    // A trigger without its update event, or one that fires only when a condition holds,
+    // fails it too.
+    for (trigger, problem) in [
+        (
+            "AFTER INSERT OR DELETE ON added_state FOR EACH ROW",
+            "added_state's count trigger fires on [\"DELETE\", \"INSERT\"]",
+        ),
+        (
+            "AFTER INSERT OR UPDATE OR DELETE ON added_state FOR EACH ROW \
+             WHEN (pg_trigger_depth() < 1)",
+            "added_state's count trigger on DELETE has WHEN (pg_trigger_depth() < 1)",
+        ),
+    ] {
+        sqlx::query("DROP TRIGGER count_state_change ON added_state")
+            .execute(&mut conn)
+            .await
+            .expect("drop trigger");
+        sqlx::query(&format!(
+            "CREATE TRIGGER count_state_change {trigger} EXECUTE FUNCTION count_state_change()"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("changed trigger");
+        let problems = trigger_problems(&mut conn).await;
+        assert!(problems.contains(&problem.to_string()), "{problems:?}");
+    }
+    sqlx::query("DROP TRIGGER count_state_change ON added_state")
+        .execute(&mut conn)
+        .await
+        .expect("drop trigger");
+    sqlx::query(
+        "CREATE TRIGGER count_state_change AFTER INSERT OR UPDATE OR DELETE ON added_state \
+         FOR EACH ROW EXECUTE FUNCTION count_state_change()",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("trigger again");
     assert_eq!(trigger_problems(&mut conn).await, Vec::<String>::new());
     sqlx::query(
         "CREATE TRIGGER other AFTER INSERT ON erasure_outcomes \
@@ -258,35 +329,72 @@ async fn test_state_count_refused_write_rolled_back_counts_nothing() {
 }
 
 #[tokio::test]
-async fn test_state_count_uncounted_writes_need_a_listed_reason() {
+async fn test_state_count_sweep_minute_alone_counts_nothing() {
     let Some(db) = with_account().await else {
         return;
     };
+    // The sweep minute alone counts nothing; what a sweep deletes counts like any other
+    // write, so a restore that brings a swept row back is behind the mark.
+    assert!(!commit_with(&db, "UPDATE accounts SET swept_at_ms = 5 WHERE id = $1").await);
+    assert!(
+        commit_with(
+            &db,
+            "INSERT INTO connect_requests (account_id, pubky, at_ms) \
+             VALUES ($1, '\\x0303030303030303030303030303030303030303030303030303030303030303', 1)",
+        )
+        .await
+    );
     let mut txn = db.store().begin(ID).await.expect("begin").expect("account");
-    txn.uncounted("step 4", async |txn| {
-        sqlx::query("UPDATE accounts SET swept_at_ms = 5 WHERE id = $1")
+    for sql in [
+        "UPDATE accounts SET swept_at_ms = 6 WHERE id = $1",
+        "DELETE FROM connect_requests WHERE account_id = $1",
+    ] {
+        sqlx::query(sql)
             .bind(ID)
             .execute(txn.conn())
             .await
-            .map_err(StoreError::Database)?;
-        Ok(())
-    })
-    .await
-    .expect("swept");
-    assert!(!txn.commit().await.expect("commit").counted());
-    // A reason the list doesn't name raises.
-    let mut txn = db.store().begin(ID).await.expect("begin").expect("account");
-    let unlisted = txn
-        .uncounted("a reason nobody listed", async |txn| {
-            sqlx::query("UPDATE accounts SET swept_at_ms = 6 WHERE id = $1")
-                .bind(ID)
-                .execute(txn.conn())
-                .await
-                .map_err(StoreError::Database)?;
-            Ok(())
-        })
-        .await;
-    assert!(unlisted.is_err(), "{unlisted:?}");
+            .expect("sweep");
+    }
+    assert!(txn.commit().await.expect("commit").counted());
+    db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_state_count_each_move_writes_a_fresh_tag() {
+    let Some(db) = with_account().await else {
+        return;
+    };
+    let tag = |db: &TestDatabase| {
+        let store = db.store().clone();
+        async move {
+            let found = store.lookup(ID).await.expect("lookup").expect("account");
+            (found.state_version, found.state_tag)
+        }
+    };
+    assert_eq!(tag(&db).await, (0, [0; 16]));
+    assert!(
+        commit_with(
+            &db,
+            "UPDATE accounts SET admission_staged = true WHERE id = $1"
+        )
+        .await
+    );
+    let (one, first) = tag(&db).await;
+    assert_eq!(one, 1);
+    assert_ne!(first, [0; 16]);
+    // A commit that counts nothing keeps the tag; the next move writes another.
+    assert!(!commit_with(&db, "UPDATE accounts SET swept_at_ms = 5 WHERE id = $1").await);
+    assert_eq!(tag(&db).await, (1, first));
+    assert!(
+        commit_with(
+            &db,
+            "UPDATE accounts SET admission_staged = false WHERE id = $1"
+        )
+        .await
+    );
+    let (two, second) = tag(&db).await;
+    assert_eq!(two, 2);
+    assert_ne!(second, first);
     db.drop_database().await.expect("drop");
 }
 

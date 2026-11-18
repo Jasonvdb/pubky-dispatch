@@ -72,7 +72,10 @@ struct Enrolled {
     /// The account's creation time (Switch wire 3.7).
     created: u64,
     /// The key the account is answered with, where it was judged healthy: its mark then
-    /// moves to the count the enrollment commits (Switch wire 7.3, "Moving it").
+    /// moves to the account's committed position before the answer goes out, whether this
+    /// enrollment or an earlier one with the same receipt moved its count (Switch wire 7.3,
+    /// "Moving it"). Never the enrollment's own signing key: the mark keeps its key until a
+    /// generation start names another (Table 3).
     mark_key: Option<[u8; 32]>,
 }
 
@@ -290,7 +293,7 @@ impl Service {
                     Some(self.account_input(
                         head.generation,
                         head.chain,
-                        head.state_version,
+                        head.count(),
                         head.created_at_ms,
                         baseline.as_ref().map(IdentityDoc::body),
                         head.activation,
@@ -539,20 +542,17 @@ impl Service {
             )
             .await
             .map_err(refused)?;
-        let moves_mark = enrolled.mark_key.is_some() && txn.head().head_tip().is_some();
         // A commit that may move a mark waits for no stale instance lock (Switch spec 6.5).
-        if moves_mark && !self.lock_is_fresh() {
+        if enrolled.mark_key.is_some() && !self.lock_is_fresh() {
             return Err(refused(unavailable()));
         }
         let committed = txn.commit().await.map_err(|e| refused(store_error(&e)))?;
+        // At a healthy account the mark covers the committed position before any answer,
+        // a retry's included: the first answer may have failed after the commit, before its
+        // mark moved (Switch wire 7.3, "Moving it").
         if let Some(key) = enrolled.mark_key
-            && committed.counted()
-            && let Some(head) = committed.head().head_tip()
+            && let Some(target) = committed.head().mark_target(true)
         {
-            let target = crate::marks::MarkTarget {
-                head,
-                state_version: committed.head().state_version,
-            };
             let created_at_ms = committed.head().created_at_ms;
             if self
                 .move_mark(identity_text, target, key, created_at_ms, false)
@@ -591,7 +591,7 @@ impl Service {
         let account = self.account_input(
             head.generation,
             head.chain,
-            head.state_version,
+            head.count(),
             head.created_at_ms,
             held.as_ref().map(IdentityDoc::body),
             head.activation,
@@ -635,6 +635,7 @@ impl Service {
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The selected SQL creation, read under the lock (Switch account binding 1.1).
         let created = binding.created().ok_or_else(unavailable)?;
+        let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
         // Read-only receipt recovery precedes freshness and never applies the intent again
         // (Switch account binding 3). Missing or evicted receipts prove no non-application.
         if let Some(receipt) = txn
@@ -655,7 +656,7 @@ impl Service {
                 time_ms: txn.head().stamped_time_ms,
                 limits,
                 created,
-                mark_key: None,
+                mark_key: healthy.then_some(judged.judgement.key),
             });
         }
         match enrollment.body().intent {
@@ -690,12 +691,11 @@ impl Service {
             tracing::error!(%failure, "a staged account's mark taking the current key");
             return Err(unavailable());
         }
-        let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
         Ok(Enrolled {
             time_ms,
             limits,
             created,
-            mark_key: healthy.then_some(routed.key),
+            mark_key: healthy.then_some(judged.judgement.key),
         })
     }
 }

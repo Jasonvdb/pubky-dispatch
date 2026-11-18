@@ -189,10 +189,12 @@ fn wallet_batch(replay: &Replay, seqs: &[u64]) -> SwitchRequest {
     )
 }
 
-/// The mark a healthy answer at the head `seq` leaves, at the count the account holds.
+/// The mark a healthy answer at the head `seq` leaves, at the count and tag the account
+/// holds.
 async fn moved_to(replay: &Replay, old: &AccountMark, seq: u64) -> AccountMark {
     AccountMark {
         state_version: state_version_of(replay, &alice_id()).await,
+        state_tag: state_tag_of(replay, &alice_id()).await,
         ..mark_at(old, seq)
     }
 }
@@ -891,14 +893,31 @@ async fn test_marks_crash_between_a_counted_commit_and_its_mark_move_fails_close
         (503, "unavailable")
     );
     assert!(signed_with(&answer, &service_public(&replay), &sent));
+    assert!(
+        header_text(&answer, header::HEAD).is_none(),
+        "nothing acknowledged"
+    );
     assert_eq!(counts(&replay, &replay.marks).await, (count + 1, count));
-    // A restart: the state ahead of the mark is healthy, no false alarm, and the next
-    // counted commit moves the mark to the count.
+    // A restart in that state: the state is ahead of the mark, a higher count with a tag of
+    // its own, which Table 1 judges healthy, neither behind nor a fork. The app's retry is
+    // answered as a retry, once the mark has moved to the committed count; nothing is
+    // acknowledged before the mark catches up.
     let (service, marks) = restarted(&replay, Limits::default());
+    let retry = Box::pin(service.handle(cursor_sync(3, base))).await;
+    assert_eq!(
+        retry.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    assert!(header_text(&retry, header::HEAD).is_some(), "the head");
+    assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
+    assert_eq!(
+        mark_in(&marks).await.state_tag,
+        state_tag_of(&replay, &alice_id()).await
+    );
     let read = Box::pin(service.handle(apps_read(base))).await;
     assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
-    // The read carries the head, so the mark catches up with the state, the count the
-    // failed move left behind included.
     assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
     let next = Box::pin(service.handle(cursor_sync(4, base))).await;
     assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));

@@ -66,18 +66,24 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   signed with the switch's one key, the key made from `service_secret`. A key change in place (`change_key_into`) is a switch of its own under the
   new key, where the service keeps each mark's key until a start names the new one.
 - **Accounts and marks** (Switch wire 7.3, Tables 1 to 3), in `switch/marks.rs`: the
-  account's mark (generation, `seq`, chain hash, count, key, creation time), its retired
+  account's mark (generation, `seq`, chain hash, count, tag, key, creation time), its retired
   generations and its erasure's record lie apart from its state and survive an erasure, a
   lost account and a start afresh. An enrollment that creates the account writes (0, 0)
-  first, or takes over a (0, 0) mark or a lost account's mark; a switch made with `new`,
-  `with_generation`, `recovering` or `import_into` starts with its mark at its state. The
-  switch keeps its own count of changed state, as the service's (wire 7.3, "The state"):
-  one more at each `seq` it gives out, at each cursor move and at each push registration,
-  the changes it models; it counts no other write. Table 1 compares it as the service's one
-  rule does: in the mark's generation, a lower count is `behind`, a fork staying a fork.
-  The mark moves to the state and count after each request whose account is healthy, only
-  forward (a later generation, or neither the head's `seq` nor the count lower), and to an
-  injected batch's, and a delivery that starts a generation writes it at the new first
+  first, or takes over a (0, 0) mark or a lost account's mark, its count 0 and its tag the
+  zero tag; a switch made with `new`, `with_generation`, `recovering` or `import_into`
+  starts with its mark at its state. The switch keeps its own count of changed state, as the
+  service's (wire 7.3, "The state"): one more at each `seq` it gives out, at each cursor
+  move, at each push registration and at each new peer copy (`PUT /peers`), the changes it
+  models; it counts no other write. Each move takes a tag no other move took, a number
+  where the service's is random. Table 1 compares them as the service's one rule does: in
+  the mark's generation, a lower count is `behind` and the mark's count with another tag
+  a `fork`, a fork of the heads staying a fork. A mark that records no head, only a count,
+  is compared by its count alone, and an identity without an account whose mark records
+  either is lost. The mark moves to the state, count and tag after each request whose
+  account is healthy, never while it is behind or a fork, only forward (a later
+  generation, or neither the head's `seq` nor the count lower), at a serving account
+  before its first chain item to its generation with `seq` 0 once the count has moved, and
+  to an injected batch's; a delivery that starts a generation writes it at the new first
   head. Step 2
   judges the two before anything else, a stale timestamp and an own app's first-call `403`
   included: the notice, `503 recovery_required` with `current { generation, reason,
@@ -85,8 +91,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   unavailable` while the store can't be read; each with no head. The notice and the
   not-hosted answer carry the clock's time; the unavailable answer carries the last
   stamped time where the account is held, otherwise the clock's time (wire 7.1). The
-  test controls: `restore_to` (the state, and its count, as they were when a `seq` was
-  given out, behind the mark), `fork_mark`, `lose_mark`,
+  test controls: `restore_to` (the state, and its count and tag, as they were when a `seq`
+  was given out, behind the mark), `fork_mark`, `lose_mark`,
   `corrupt_mark`, `set_mark_store_unreadable`, `lose_account` (the mark without the account)
   and `retire`; `mark` and `erasure_record` read them. `roll_back_to` moves the mark back
   with the chain, a faulty service that signs behind its heads. Left out:

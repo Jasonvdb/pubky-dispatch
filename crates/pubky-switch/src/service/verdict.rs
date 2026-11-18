@@ -33,15 +33,16 @@ impl Account {
     /// `holds` says; else staged, judged by its chain where it holds one (an activated
     /// import), else holding none. `generation` is its row's: that of the `identity.json` it
     /// was enrolled with, or 1 for one enrolled without a document, until a generation
-    /// starts there, which makes it serve. `state_version` is its row's count of changed
-    /// commits, which its state compares with the mark's (Switch wire 7.3, "The state").
+    /// starts there, which makes it serve. `count` is its row's count of changed
+    /// commits with its tag, which its state compares with the mark's (Switch wire 7.3, "The
+    /// state").
     #[allow(clippy::too_many_arguments)]
     pub fn judged(
         origin: &str,
         holds: impl Fn(&[u8; 32]) -> bool,
         generation: u64,
         chain: Option<(u64, [u8; 32])>,
-        state_version: u64,
+        count: account::Count,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
         activation: AccountActivation,
@@ -68,7 +69,7 @@ impl Account {
             model: account::Account {
                 activation,
                 state,
-                state_version,
+                count,
                 created_at_ms,
                 document_generation: doc.map(|body| body.generation),
                 enrolled_generation: generation,
@@ -285,6 +286,7 @@ mod tests {
 
     fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> AccountMark {
         AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
@@ -310,7 +312,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 2,
@@ -321,7 +326,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -429,6 +437,7 @@ mod tests {
     #[test]
     fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
         let marked = AccountMark {
+            state_tag: [0; 16],
             generation: 1,
             seq: 5,
             chain_hash: [1; 32],
@@ -457,7 +466,10 @@ mod tests {
                     seq: 3,
                     chain_hash: [2; 32],
                 }),
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 0,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -997,7 +1009,10 @@ mod tests {
             model: account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state: AccountState::StagedImport(tip(3, 7, 1)),
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 100,
                 document_generation: None,
                 enrolled_generation: 3,
@@ -1384,7 +1399,7 @@ mod tests {
                 holds,
                 2,
                 chain,
-                0,
+                account::Count::default(),
                 5,
                 doc,
                 AccountActivation::Ordinary,

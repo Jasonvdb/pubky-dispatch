@@ -884,9 +884,11 @@ async fn test_push_minted_key_of_a_cancelled_start_is_deleted() {
 }
 
 #[tokio::test]
-async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_is_deleted() {
+async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_stays_owed() {
     // The request is dropped while its commit, which owes the replaced key's deletion, is
-    // under way: the commit lands and the replaced key goes all the same, with no sweep.
+    // under way: the commit lands, but no mark moved for it and nothing was answered, so
+    // the replaced key stays, owed, until the sweep at the next start (Switch wire 7.3,
+    // "Moving it"; 8.1).
     let Some((replay, keys)) = pushing().await else {
         return;
     };
@@ -917,16 +919,42 @@ async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_is_deleted(
     .await;
     assert!(answered.is_err(), "dropped during the commit");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    while (exists(&keys, &old_id).await || !owed(&replay).await.is_empty())
-        && std::time::Instant::now() < deadline
-    {
+    while stored(&replay).await.expect("held").1 == old_id && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let new_id = stored(&replay).await.expect("held").1;
     assert_ne!(new_id, old_id, "the replacement committed");
-    assert!(!exists(&keys, &old_id).await, "no key left to a sweep");
+    assert!(exists(&keys, &old_id).await, "the replaced key stays");
+    assert_eq!(owed(&replay).await, vec![old_id.as_str().to_string()]);
+    // The sweep at the next start deletes it.
+    let _ = replay.service.sweep_erased_keys().await;
+    assert!(!exists(&keys, &old_id).await);
     assert!(owed(&replay).await.is_empty());
     assert!(exists(&keys, &new_id).await);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_push_replaced_key_stays_while_the_mark_doesnt_cover_the_replacement() {
+    // A replacement commits and its mark can't move: `503`, and the replaced key stays, so
+    // a restore to the state the mark covers, which names it, still signs with it (Switch
+    // wire 7.3, "Moving it"; 8.1).
+    use std::os::unix::fs::PermissionsExt;
+    let Some((replay, keys)) = pushing().await else {
+        return;
+    };
+    let old = started(&replay, RELAY, None).await;
+    let old_id = stored(&replay).await.expect("held").1;
+    let marks_dir = replay.key_dir().join("accounts").join("marks");
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("read-only");
+    let answer = put(&replay, "wallet", &start(OTHER_RELAY, Some(old))).await;
+    std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(code(&answer), (503, json!("unavailable")));
+    let new_id = stored(&replay).await.expect("held").1;
+    assert_ne!(new_id, old_id, "the replacement committed");
+    assert!(exists(&keys, &old_id).await, "the replaced key stays");
+    assert_eq!(owed(&replay).await, vec![old_id.as_str().to_string()]);
     replay.db.drop_database().await.expect("drop");
 }
 

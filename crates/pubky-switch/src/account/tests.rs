@@ -22,7 +22,10 @@ fn mark(generation: u64, seq: u64, hash: u8) -> MarkInput {
 /// A mark at (`generation`, `seq`) that covers the count `state_version`.
 fn counting(generation: u64, seq: u64, hash: u8, state_version: u64) -> MarkInput {
     MarkInput::Mark(Mark {
-        state_version,
+        count: Count {
+            version: state_version,
+            tag: [0; 16],
+        },
         ..mark_created(generation, seq, hash, 100)
     })
 }
@@ -32,7 +35,10 @@ fn mark_created(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> Mark
         generation,
         seq,
         chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
-        state_version: 0,
+        count: Count {
+            version: 0,
+            tag: [0; 16],
+        },
         created_at_ms,
     }
 }
@@ -52,7 +58,10 @@ fn account(row: Row) -> Option<Account> {
     let staged = |state| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
-        state_version: COUNT,
+        count: Count {
+            version: COUNT,
+            tag: [0; 16],
+        },
         created_at_ms: 100,
         document_generation: None,
         enrolled_generation: 2,
@@ -60,7 +69,10 @@ fn account(row: Row) -> Option<Account> {
     let serving = |state| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state,
-        state_version: COUNT,
+        count: Count {
+            version: COUNT,
+            tag: [0; 16],
+        },
         created_at_ms: 100,
         document_generation: Some(2),
         enrolled_generation: 2,
@@ -159,7 +171,10 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
         seq: 5,
         chain_hash: [1; 32],
 
-        state_version: 0,
+        count: Count {
+            version: 0,
+            tag: [0; 16],
+        },
         created_at_ms: 0,
     };
     // Past the mark in its generation, and at a later generation: the stub at the
@@ -179,7 +194,10 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
             seq: 3,
             chain_hash: [2; 32],
         }),
-        state_version: 0,
+        count: Count {
+            version: 0,
+            tag: [0; 16],
+        },
         created_at_ms: 0,
         document_generation: Some(2),
         enrolled_generation: 2,
@@ -734,7 +752,10 @@ fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generatio
     let import = Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedImport(tip(3, 7, 1)),
-        state_version: 0,
+        count: Count {
+            version: 0,
+            tag: [0; 16],
+        },
         created_at_ms: 100,
         document_generation: None,
         enrolled_generation: 3,
@@ -1518,7 +1539,10 @@ fn test_retirement_generation_is_the_one_the_verdict_reads() {
     let serving_at = |state: ChainTip, created_at_ms| Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::Serving(state),
-        state_version: COUNT,
+        count: Count {
+            version: COUNT,
+            tag: [0; 16],
+        },
         created_at_ms,
         document_generation: Some(state.generation),
         enrolled_generation: state.generation,
@@ -1526,7 +1550,10 @@ fn test_retirement_generation_is_the_one_the_verdict_reads() {
     let staged = Account {
         activation: pubky_switch_core::records::AccountActivation::Ordinary,
         state: AccountState::StagedNoChain,
-        state_version: COUNT,
+        count: Count {
+            version: COUNT,
+            tag: [0; 16],
+        },
         created_at_ms: 100,
         document_generation: None,
         enrolled_generation: 2,
@@ -1627,4 +1654,110 @@ fn test_retirement_generation_unreadable_store_has_none() {
         judged(Row::Serving, MarkInput::StoreUnreadable, &[2]).retirement_generation,
         None
     );
+}
+
+/// A mark that records no head, only a count: `generation`, `seq` 0, the zero hash, and
+/// `count` with `tag` (Switch wire 7.3, "The mark").
+fn no_head(generation: u64, count: u64, tag: u8) -> MarkInput {
+    MarkInput::Mark(Mark {
+        generation,
+        seq: 0,
+        chain_hash: [0; 32],
+        count: Count {
+            version: count,
+            tag: [tag; 16],
+        },
+        created_at_ms: 100,
+    })
+}
+
+/// A mark at (`generation`, `seq`) that covers `count` with `tag`.
+fn tagged(generation: u64, seq: u64, hash: u8, count: u64, tag: u8) -> MarkInput {
+    MarkInput::Mark(Mark {
+        count: Count {
+            version: count,
+            tag: [tag; 16],
+        },
+        ..mark_created(generation, seq, hash, 100)
+    })
+}
+
+#[test]
+fn test_verdict_no_head_count_column_rows() {
+    // Table 1 for a mark that records no head but a count: like (0, 0), but a state of its
+    // generation with a lower count is behind and one at its count with another tag a fork;
+    // with no account, it records something acknowledged, so the identity is lost.
+    let at_count = no_head(2, COUNT, 0);
+    let above = no_head(2, COUNT + 1, 0);
+    let other_tag = no_head(2, COUNT, 5);
+    // Rows without an account.
+    assert_erased_again(above, &[], LEFTOVER);
+    assert_eq!(verdict(Row::None, above, &[]), lost(2, false));
+    assert_eq!(verdict(Row::None, above, &[2]), lost(2, true));
+    assert_eq!(verdict(Row::NoneErased, above, &[]), LEFTOVER);
+    // A no-head mark with count 0 records nothing: not hosted, as (0, 0).
+    assert_eq!(verdict(Row::None, no_head(2, 0, 0), &[]), NOT_HOSTED);
+    // A staged account holding no chain has no state to compare: as at (0, 0).
+    assert_eq!(verdict(Row::StagedNoChain, above, &[]), Verdict::Staged);
+    // The rows of a state.
+    for row in STATE_ROWS {
+        assert_eq!(verdict(row, at_count, &[]), Verdict::Healthy);
+        assert_eq!(
+            verdict(row, no_head(2, COUNT - 1, 9), &[]),
+            Verdict::Healthy
+        );
+        assert_eq!(
+            verdict(row, above, &[]),
+            failing(2, NoticeReason::Behind, false, abort_at(row))
+        );
+        assert_eq!(
+            verdict(row, other_tag, &[]),
+            failing(2, NoticeReason::Fork, false, abort_at(row))
+        );
+        // Of an earlier generation than the state's: its count doesn't compare.
+        assert_eq!(
+            verdict(row, no_head(1, COUNT + 9, 5), &[]),
+            Verdict::Healthy
+        );
+        // The fork rule of the heads doesn't look at a mark without a head.
+        assert_eq!(
+            judged_with(row, at_count, Some([9; 32]), &[]).verdict,
+            Verdict::Healthy
+        );
+        assert_eq!(
+            verdict(row, above, &[2]),
+            failing(2, NoticeReason::Behind, true, abort_at(row))
+        );
+    }
+}
+
+#[test]
+fn test_verdict_tag_at_the_marks_count_is_a_fork() {
+    // At the mark's head and count, the mark's tag is the state's own history; another tag
+    // is another history reaching the same count (Switch wire 7.3, Table 1).
+    for row in STATE_ROWS {
+        assert_eq!(
+            verdict(row, tagged(2, 10, 1, COUNT, 0), &[]),
+            Verdict::Healthy
+        );
+        assert_eq!(
+            verdict(row, tagged(2, 10, 1, COUNT, 5), &[]),
+            failing(2, NoticeReason::Fork, false, abort_at(row))
+        );
+        // Below the mark's head, too.
+        assert_eq!(
+            verdict(row, tagged(2, 8, 7, COUNT, 5), &[]),
+            failing(2, NoticeReason::Fork, false, abort_at(row))
+        );
+        // Past the mark's count, another tag is the state's later history.
+        assert_eq!(
+            verdict(row, tagged(2, 8, 7, COUNT - 1, 5), &[]),
+            Verdict::Healthy
+        );
+        // A lower count stays behind, whatever the tag.
+        assert_eq!(
+            verdict(row, tagged(2, 10, 1, COUNT + 1, 5), &[]),
+            failing(2, NoticeReason::Behind, false, abort_at(row))
+        );
+    }
 }

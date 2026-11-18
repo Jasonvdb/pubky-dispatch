@@ -316,6 +316,7 @@ mod tests {
 
     fn mark(generation: u64, seq: u64) -> MarkInput {
         MarkInput::Mark(AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: [1; 32],
@@ -330,7 +331,10 @@ mod tests {
             model: crate::account::Account {
                 activation: pubky_switch_core::records::AccountActivation::Ordinary,
                 state,
-                state_version: 0,
+                count: crate::account::Count {
+                    version: 0,
+                    tag: [0; 16],
+                },
                 created_at_ms: 10,
                 document_generation: Some(2),
                 enrolled_generation: 2,
@@ -430,6 +434,7 @@ mod tests {
             Ok(3)
         );
         let newer = MarkInput::Mark(AccountMark {
+            state_tag: [0; 16],
             generation: 3,
             seq: 1,
             chain_hash: [1; 32],

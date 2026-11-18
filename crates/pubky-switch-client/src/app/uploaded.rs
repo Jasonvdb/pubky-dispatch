@@ -297,12 +297,22 @@ impl App {
             let mut tx = self.tx()?;
             if let Some((view, at)) = view {
                 let read = self
-                    .take_view(&view, at, collection.as_ref().map(|c| (&key, c)), &mut tx)
+                    .take_view(
+                        &view,
+                        at,
+                        collection.as_ref().map(|c| (&key, c)),
+                        true,
+                        &mut tx,
+                    )
                     .await?;
-                if matches!(
-                    read,
-                    WriteRead::Overtaken(..) | WriteRead::Unordered | WriteRead::Waits
-                ) {
+                let waiting = match read {
+                    WriteRead::Overtaken(..) => {
+                        !self.upload_view_already_held(&view, upload, &tx).await?
+                    }
+                    WriteRead::Unordered | WriteRead::Waits => true,
+                    _ => false,
+                };
+                if waiting {
                     self.commit(tx).await?;
                     return Ok(false);
                 }

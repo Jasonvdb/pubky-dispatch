@@ -2108,6 +2108,7 @@ async fn test_records_followed_write_survives_an_overtaken_read_and_reload() {
             &earlier.view,
             at,
             Some((&held.key, &target.collection)),
+            true,
             &mut tx,
         )
         .await
@@ -2219,7 +2220,13 @@ async fn test_records_followed_upload_keeps_its_application_across_an_earlier_vi
         first.head.seq,
     ));
     let read = phone
-        .take_view(&first.view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(
+            &first.view,
+            at,
+            Some((&key, &target.collection)),
+            true,
+            &mut tx,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -10531,7 +10538,7 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
     view.divergent = true;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
         .await;
     assert!(
         matches!(
@@ -10550,7 +10557,7 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
     view.revision.item_hash = signed;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), &mut tx)
+        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
         .await
         .unwrap();
     assert_eq!(read, crate::app::records::WriteRead::Taken);

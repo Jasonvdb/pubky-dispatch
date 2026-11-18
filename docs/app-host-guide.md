@@ -169,6 +169,8 @@ For admission or current-certificate refusals, the client gives up after five qu
 
 ## Writing records and claims
 
+When a decision needs every current record of a registered collection, pass the report from `app.receive` to `app.current_collection(&collection, &report)`. A complete result contains the live values and any keys whose current value the client could not verify. A count needs an empty `uncertain_keys`. If the result is `None`, continue the bounded receive and use its new report. You can query again with the same report after a local write to include that write. Another app can write after the read.
+
 A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings. After recovery uploads, an older page leaves the listing at the same continuation. A fresh lookup for an outstanding upload returns `KeptReason::Refused` if the service observation cannot establish its current state.
 
 | Case | What happened and what to do |

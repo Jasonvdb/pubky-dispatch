@@ -67,7 +67,7 @@ pub(crate) use owed::{Owed, OwedCall, owed_place};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, Verifier};
+use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, SignedHead, Verifier};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::message::{Message, MessagePlaintext};
@@ -140,6 +140,7 @@ pub(crate) struct OwedGap {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReceiveReport {
+    pub(crate) coverage: Option<Arc<ReadCoverage>>,
     /// Everything that happened, in order.
     pub events: Vec<AppEvent>,
     /// The position processed to.
@@ -165,6 +166,15 @@ pub struct ReceiveReport {
     /// committed or sent, the worst of the read's pages (Switch spec 8.3); `None` when the
     /// read read no page.
     pub held_cursor: Option<super::HeldCursor>,
+}
+
+/// The authenticated final page of one completed receive on this app instance.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReadCoverage {
+    pub(crate) identity: [u8; 32],
+    pub(crate) cert: [u8; 32],
+    pub(crate) through: Position,
+    pub(crate) head: SignedHead,
 }
 
 /// How far an item lets the cursor go.
@@ -416,6 +426,7 @@ impl App {
     /// and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
+            self.last_collection_read = None;
             self.ready_local().await?;
             // Local age selection runs even when an alarm forbids intake or callbacks.
             self.bound_unverified().await?;
@@ -640,6 +651,7 @@ impl App {
         };
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]).
         let mut reached = None;
+        let mut end_head = None;
         // The read's listing waits for a scope key: no wait on the feed shows the key
         // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
         let mut key_wait = waits_for_key;
@@ -744,6 +756,7 @@ impl App {
                 let result = self.client.feed(query).await;
                 let page = self.take(result).await?;
                 let scanned = page.scanned_through;
+                let head = page.head;
                 let ended = self
                     .process_page(page, after, &mut blocked, Some(budget), admission_declined)
                     .await;
@@ -758,6 +771,9 @@ impl App {
                         // cursor again, and meets them.
                         let seq = after.max(scanned);
                         reached = Some(Position { generation, seq });
+                        if scanned >= after {
+                            end_head = Some(head);
+                        }
                         self.feed_read_to_end().await?;
                         break;
                     }
@@ -879,6 +895,23 @@ impl App {
         };
         report.cursor = self.cursor();
         report.held_cursor = self.held_cursor_read.take();
+        if !report.stopped
+            && !report.more
+            && let Some((through, head)) = reached.zip(end_head)
+            && through.generation == self.state.meta.generation
+            && head.generation == through.generation
+            && through.seq >= head.seq
+            && matches!(report.held_cursor, Some(super::HeldCursor::Clean))
+        {
+            let coverage = Arc::new(ReadCoverage {
+                identity: self.identity(),
+                cert: self.state.cert.hash(),
+                through,
+                head,
+            });
+            self.last_collection_read = Some(coverage.clone());
+            report.coverage = Some(coverage);
+        }
         Ok(report)
     }
 

@@ -770,11 +770,10 @@ pub enum AppEvent {
     /// The app gave up delivery of a message, or of a re-send of it, knowing the outcome
     /// (Switch spec 11). With `resend: false` no request carrying it can have reached the
     /// recipient's switch, from this app or from a copy of its store. It was given up after
-    /// `403 not_admitted` or
-    /// `403 not_current` refusals ([`super::UNDELIVERABLE_MS`]), for writes over the
-    /// store's sizes ([`crate::error::StoreError::TooLarge`]), past a replay deadline while
-    /// held, or withdrawn ([`super::App::withdraw_message`]). A message never accepted is
-    /// deleted from the outbox, plaintext and all. With `resend: true` only a re-send of a
+    /// `403 not_admitted` or `403 not_current` refusals ([`super::UNDELIVERABLE_MS`]), for
+    /// writes over the store's sizes ([`crate::error::StoreError::TooLarge`]), or withdrawn
+    /// ([`super::App::withdraw_message`]); a re-send also past its replay deadline. A
+    /// message never accepted is deleted from the outbox, plaintext and all. With `resend: true` only a re-send of a
     /// message accepted before was given up, and that acceptance stands. With
     /// `resend: false` the recipient never had it: a protocol may send a replacement. A
     /// give-up the app can't tell from a delivery is [`AppEvent::DeliveryUnknown`] instead.

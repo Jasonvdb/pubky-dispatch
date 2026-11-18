@@ -790,6 +790,9 @@ struct Carried {
     lost_owed: u64,
     /// One past every local ID of an entry stored locally that a carried duty event names.
     stored_past: u64,
+    /// The messages whose give-up a kept duty event that reads tells, carried or left
+    /// behind for a protocol no longer registered: the store ended their delivery.
+    given_up: BTreeSet<String>,
 }
 
 /// An owed call both a backup and the store restored in place hold under one key: the
@@ -1472,9 +1475,9 @@ impl App {
     /// device time without one, less the clock tolerance. The deadline is checked at every
     /// try, not here. The messages the backup left out, and those whose
     /// [`AppEvent::DeliveryUnknown`] it carries, are told to the protocol, in the same
-    /// commit. A message in `told`, whose give-up a duty event this commit keeps already
-    /// tells, as one the store restored in place gave up, is neither put back nor told
-    /// again.
+    /// commit. A message in `told`, whose give-up the store restored in place told already,
+    /// isn't delivered or told again: its record stays only for what else it owes
+    /// ([`send::OutboxItem::without_delivery`]).
     fn reinstall_outbox(
         &mut self,
         backup: &AppBackup,
@@ -1485,13 +1488,19 @@ impl App {
             .taken_service_ms
             .unwrap_or(backup.taken_ms)
             .saturating_sub(CLOCK_TOLERANCE_MS);
-        for item in backup
-            .outbox
-            .iter()
-            .filter(|item| !told.contains(item.msg_id()))
-        {
+        // The store's marks went with it: each give-up it told stays one, so neither
+        // `queue_stored` nor a re-send after a loss delivers the message again.
+        for msg_id in told {
+            send::note_given_up(tx, msg_id, self.now())?;
+        }
+        for item in &backup.outbox {
             let mut item = item.clone();
-            if item.delivery_owed() {
+            if told.contains(item.msg_id()) {
+                match item.without_delivery() {
+                    Some(kept) => item = kept,
+                    None => continue,
+                }
+            } else if item.delivery_owed() {
                 item.replay_until(baseline);
             }
             send::put_outbox_item(tx, &item)?;
@@ -2329,19 +2338,9 @@ impl App {
                 for msg_id in &old_message_holds {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }
-                // The give-ups the store restored in place told already: its duty events go
-                // on, and the backup's copy of such a message is neither delivered nor told
-                // again.
-                let mut told = BTreeSet::new();
-                for (key, value) in &carried.values {
-                    if key.starts_with(key::DUTY_PREFIX)
-                        && let Ok(kept) = serde_json::from_value::<events::KeptDuty>(value.clone())
-                        && let Some(msg_id) = kept.duty.given_up()
-                    {
-                        told.insert(msg_id.to_owned());
-                    }
-                }
-                app.reinstall_outbox(backup, &told, &mut tx)?;
+                // The give-ups the store restored in place told already: the backup's copy of
+                // such a message isn't delivered or told again.
+                app.reinstall_outbox(backup, &carried.given_up, &mut tx)?;
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
                         send::put_hold(&mut tx, &pubky)?;
@@ -3225,6 +3224,9 @@ impl App {
                         unverified::notice_id(&kept.duty)?;
                     }
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
+                    if let Some(msg_id) = kept.duty.given_up() {
+                        carried.given_up.insert(msg_id.to_owned());
+                    }
                     if let Some(id) = kept.duty.stored_id() {
                         carried.stored_past = carried.stored_past.max(id.saturating_add(1));
                     }

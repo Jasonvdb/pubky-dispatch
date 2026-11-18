@@ -171,9 +171,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   marks a copy another store may have delivered; else `DeliveryUnknown`, as does a refusal
   for good of a message with it. A message a backup left out past its budget is
   `DeliveryUnknown` too, unless it was accepted before. A backup names the messages whose
-  `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each; a
-  restore in place neither puts back nor tells again a message whose give-up the store's
-  carried duty events tell.
+  `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each. A
+  restore in place doesn't deliver or tell again a message whose give-up a duty event of the
+  store tells, carried or left behind for a protocol no longer registered: it marks the
+  give-up again and puts the backup's record back only for what else it owes, a refusal for
+  good as it stands or an accepted message's owed record job.
 - **A restored delivery has a replay deadline** (`replay_until_ms` on its record): the
   backup's verified service time, or its device time without one, less the clock tolerance,
   plus `SENT_RETENTION_MS` (30 days), or a message's first acceptance plus 30 days when it

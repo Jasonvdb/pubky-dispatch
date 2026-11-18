@@ -639,8 +639,8 @@ pub struct OutboxReport {
     /// The messages whose delivery was given up although known not delivered, or only a
     /// re-send of them, each told with [`AppEvent::MessageUndelivered`]: after
     /// [`UNDELIVERABLE_MS`] of `403 not_admitted` or `403 not_current` (Switch spec 11),
-    /// past a replay deadline, or because a try's writes were too large for the store
-    /// ([`StoreError::TooLarge`]).
+    /// a re-send past its replay deadline, or because a try's writes were too large for the
+    /// store ([`StoreError::TooLarge`]).
     pub undelivered: Vec<String>,
     /// The messages whose delivery was given up, or refused for good, while they may have
     /// been delivered, each told with [`AppEvent::DeliveryUnknown`]: a host must not take
@@ -858,6 +858,17 @@ impl OutboxItem {
         self.clear_undeliverable();
         let kept = (self.accepted_at_ms.is_some() && !self.complete()).then_some(self);
         (kept, duty)
+    }
+
+    /// The item as it stays once its delivery was given up elsewhere, with its duty event
+    /// told there: one refused for good stays as it is, reported failed; one accepted before
+    /// stays while its record job is owed, as [`OutboxItem::give_up_delivery`] keeps it.
+    /// `None` for nothing left.
+    pub(crate) fn without_delivery(self) -> Option<Self> {
+        if self.failed.is_some() {
+            return Some(self);
+        }
+        self.give_up_delivery().0
     }
 
     /// The duty event that tells the protocol this delivery is given up (Switch spec 11).

@@ -198,14 +198,16 @@ impl TestDatabase {
     }
 
     /// Delete account `id`'s shared record at `key`, as a faulty service that lost it would:
-    /// reads answer `404` and listings leave it out (Switch spec 10.3.1 "Absence"). Whether
-    /// there was one.
+    /// reads answer `404` and listings leave it out (Switch spec 10.3.1 "Absence"). Written
+    /// directly, outside the service's lock, so it moves no count. Whether there was one.
     pub async fn drop_record(&self, id: &str, key: &[u8; 32]) -> Result<bool, StoreError> {
+        let mut conn = PgConnection::connect_with(&self.options).await?;
         let dropped = sqlx::query("DELETE FROM shared_records WHERE account_id = $1 AND key = $2")
             .bind(id)
             .bind(key.as_slice())
-            .execute(self.store.pool())
+            .execute(&mut conn)
             .await?;
+        let _ = conn.close().await;
         Ok(dropped.rows_affected() == 1)
     }
 

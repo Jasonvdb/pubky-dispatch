@@ -75,7 +75,8 @@ pub enum IdentityRefresh {
 }
 
 impl IdentityRefresh {
-    /// When the read confirmed the copy held, for the outcomes that confirm it.
+    /// When this read confirmed the copy it found. Before acting, check the current
+    /// [`App::identity_confirmation_age_ms`], which also observes later clock changes.
     pub fn confirmed_at(&self) -> Option<u64> {
         match self {
             IdentityRefresh::Newer { confirmed_at, .. }
@@ -97,11 +98,10 @@ impl App {
     /// waking, and before an attempt that needs a fresh copy.
     ///
     /// An app makes no attempt without an `identity.json` revalidated in the last
-    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Before an attempt, compare
-    /// the time from [`IdentityRefresh::confirmed_at`] or [`App::identity_confirmed_at`]
-    /// with the device clock after the read completes. The time must be at or before now
-    /// and less than [`REVALIDATION_MS`] old. A missing, older or unavailable copy and a
-    /// failed read leave the current version without a new confirmation.
+    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Immediately before an attempt,
+    /// [`App::identity_confirmation_age_ms`] must give an age below that limit. A backwards
+    /// sample during or after the read invalidates it. A missing, older or unavailable
+    /// copy and a failed read leave the current version without a new confirmation.
     ///
     /// # Errors
     ///

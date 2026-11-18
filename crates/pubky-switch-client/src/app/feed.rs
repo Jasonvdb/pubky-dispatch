@@ -98,8 +98,8 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
-    Processed, RetryEntry, Tx, encode, key,
+    HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -3174,8 +3174,8 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let held_doc = held.as_ref().map(|(doc, _)| doc);
-        let taken = identity::take_copy(&reader, &mut tx, &fetched, held_doc, now).await?;
+        let held = held.map(|(doc, _)| doc);
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now).await?;
         let doc = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
@@ -3185,18 +3185,7 @@ impl App {
                 self.commit(tx).await?;
                 return Ok(None);
             }
-            Ok(Taken::Newer) => fetched,
-            Ok(Taken::Same | Taken::Older) => {
-                let doc = held_doc.cloned().unwrap_or(fetched);
-                tx.put(
-                    &key::ident_doc(sender),
-                    &CachedDoc {
-                        doc: doc.signed().clone(),
-                        fetched_ms: now,
-                    },
-                )?;
-                doc
-            }
+            Ok(doc) => doc,
         };
         self.commit(tx).await?;
         Ok(Some((doc, true)))

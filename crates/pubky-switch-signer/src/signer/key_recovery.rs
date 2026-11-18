@@ -582,6 +582,7 @@ impl Signer {
                 confirmed.digest,
                 &confirmed.dropped,
                 held,
+                &marks,
             ))
             .await?;
         } else {
@@ -608,10 +609,10 @@ impl Signer {
             .ok_or_else(|| RecordsFault::Invariant("the recovery's version is gone").into())
     }
 
-    /// The step of a recovery with the key alone (the module's doc): send the `existing`
-    /// enrollment, the same bytes, read the survey again, and, when it is the one the user
-    /// confirmed, commit the records with the version naming this install, built on the
-    /// service's copy. A definite refusal before that commit ends the recovery as
+    /// Send the same signed `existing` enrollment and read the survey again using the
+    /// verified local copies in `marks` (Switch spec 12.8). If the survey still matches
+    /// the confirmation, commit the version naming this install, built on the service's
+    /// copy. A definite refusal before that commit ends the recovery as
     /// [`Signer::end_key_recovery`] says.
     pub(super) async fn key_recover(
         &mut self,
@@ -620,6 +621,7 @@ impl Signer {
         digest: [u8; 32],
         dropped: &[[u8; 16]],
         held: Held,
+        marks: &[IdentityDoc],
     ) -> Result<()> {
         let identity = self.state.identity;
         let RecoveryEnrollment::Ready {
@@ -652,8 +654,7 @@ impl Signer {
                     .await);
             }
         };
-        let marks = marks_of(&self.state)?;
-        let planned = self.key_plan(&self.state, &marks, Some(origin)).await;
+        let planned = self.key_plan(&self.state, marks, Some(origin)).await;
         let built = match planned {
             Ok(plan) if plan.survey.digest == digest => {
                 self.recovered_records(origin, plan, &answer, dropped)
@@ -1960,7 +1961,7 @@ fn account_key(origin: &str, copy: [u8; 32], answered: [u8; 32]) -> ([u8; 32], O
 }
 
 /// The copies the records `state` hold: the newest version and a declared recovery's base.
-fn marks_of(state: &SignerState) -> Result<Vec<IdentityDoc>> {
+pub(super) fn marks_of(state: &SignerState) -> Result<Vec<IdentityDoc>> {
     let mut marks: Vec<IdentityDoc> = state.newest_doc()?.into_iter().collect();
     if let Some(base) = &state.recovery_base {
         marks.push(state::stored_identity(base, &state.identity)?);

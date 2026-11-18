@@ -142,8 +142,8 @@ impl RecordState {
 /// - a write over a record the service holds, a later write or a create over a deleted
 ///   one, repeats the record's collection and policy, its `permanent` member included, else
 ///   `400`: a create's key derives from its policy (Switch wire 1.5), so a record held at
-///   that key under another policy came in without a derivation, from a recovery upload,
-///   and a permanent key is never created again over it (Switch spec 10.3.1);
+///   that key under another policy came in without a derivation, from a recovery upload
+///   or an import, and a permanent key is never created again over it (Switch spec 10.3.1);
 /// - `expected_version` is the record's current version, and `{0, 0}` matches a record that
 ///   is absent, forgotten (`current` `None`) or deleted; else `409 conflict`, whose `current`
 ///   carries `record` and the current write's `record_view` to a writer with the read scope

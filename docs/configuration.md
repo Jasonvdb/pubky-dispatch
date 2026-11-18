@@ -279,6 +279,7 @@ Each line gets one state:
 | `behind` | the state is behind the mark: acknowledged chain positions are missing |
 | `fork` | the state is at the mark's pair, or past it, with another chain hash |
 | `mark_lost` | the account's mark is missing or doesn't read as a mark |
+| `unknown` | the account lifetime cannot be determined, for example when a mark is unreadable and the database has no account for it. Keep the mark in place. Check the authoritative mark store and rerun `check-marks` against a database that holds the account before promoting a replica. |
 | `lost` | a mark that records a head, with no account and no erasure's record covering it: the database lost the account |
 | `leftover` | a mark an erasure's record covers, with no account; the service deletes it |
 | `erased_again` | an account created at or before an erasure's record; the service erases it again |

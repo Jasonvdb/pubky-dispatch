@@ -321,6 +321,24 @@ async fn test_check_marks_reports_a_fork_past_the_mark() {
 }
 
 #[tokio::test]
+async fn test_check_marks_reports_unreadable_mark_without_an_account() {
+    let Some(replay) = replay().await else { return };
+    let id = alice_id();
+    let path = replay.key_dir().join("accounts/marks").join(&id);
+    fs::write(&path, b"unreadable").expect("write mark");
+
+    let report = check(&replay, false).await;
+    assert!(report.needs_attention());
+    let line = find(&report.accounts, &id);
+    assert!(!line.hosted);
+    assert_eq!(serde_json::to_value(line.state).expect("state"), "unknown");
+    assert_eq!(report.summary.needs_attention, 1);
+    assert_eq!(report.summary.states[&line.state], 1);
+    assert_eq!(fs::read(path).expect("preserved mark"), b"unreadable");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_check_marks_reports_marks_without_an_account() {
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
@@ -455,6 +473,7 @@ async fn test_check_marks_summary_and_exit_status() {
         (MarkState::Lost, 1),
         (MarkState::Fork, 0),
         (MarkState::MarkLost, 0),
+        (MarkState::Unknown, 0),
         (MarkState::Leftover, 0),
         (MarkState::ErasedAgain, 0),
     ] {

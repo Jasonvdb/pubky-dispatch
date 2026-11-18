@@ -57,6 +57,8 @@ pub enum MarkState {
     Fork,
     /// The account's mark is missing or doesn't read as a mark.
     MarkLost,
+    /// The available account and mark do not identify the account lifetime.
+    Unknown,
     /// A mark that records a head, with no account and no erasure's record covering it.
     Lost,
     /// A mark an erasure's record covers, with no account: deleted at the next request or
@@ -69,13 +71,14 @@ pub enum MarkState {
 
 impl MarkState {
     /// Every state, in the order the summary lists them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Healthy,
         Self::Staged,
         Self::Bounded,
         Self::Behind,
         Self::Fork,
         Self::MarkLost,
+        Self::Unknown,
         Self::Lost,
         Self::Leftover,
         Self::ErasedAgain,
@@ -297,7 +300,8 @@ pub fn state_of(verdict: &Verdict, erased_again: bool) -> Option<MarkState> {
     };
     match verdict {
         Verdict::NotHosted { delete_mark: true } => Some(MarkState::Leftover),
-        Verdict::NotHosted { delete_mark: false } | Verdict::Unknown => None,
+        Verdict::NotHosted { delete_mark: false } => None,
+        Verdict::Unknown => Some(MarkState::Unknown),
         Verdict::Staged => Some(MarkState::Staged),
         Verdict::Healthy => Some(MarkState::Healthy),
         Verdict::Bounded { .. } => Some(MarkState::Bounded),

@@ -9211,6 +9211,78 @@ async fn test_records_read_finding_a_delete_forgotten_lets_the_next_write_create
     assert!(created.is_ok(), "{created:?}");
 }
 
+/// The key was absent both before the create and after the service forgot its delete.
+/// Only the latter head covers the application's intervening observations.
+#[tokio::test]
+async fn test_records_hosted_absence_covers_the_write_the_wallet_follows() {
+    Box::pin(async {
+        let s = Setup::new();
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = s.target("shared");
+        let before = s.w.switch.seq();
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                record: None,
+                reason: KeptReason::NotFound
+            }
+        ));
+        let first = wallet
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        phone.read_record(&target).await.unwrap();
+        phone.delete_record(&target, vec![]).await.unwrap();
+        s.protocol
+            .refuses_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        read_on(&mut wallet).await;
+        read_on(&mut phone).await;
+        assert!(!held_at_switch(&s, &first.key));
+        let held = wallet.shared_record(&first.key).await.unwrap().unwrap();
+        assert_eq!(held.content, first.content);
+        assert!(held.flagged);
+
+        // The hosted absence at the earlier genuine chain head predates this key's
+        // creation. It cannot describe the currently followed write or clear it.
+        s.w.switch.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert_eq!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                record: Some(held.clone()),
+                reason: KeptReason::Refused
+            }
+        );
+        let id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        assert_eq!(wallet.shared_record(&first.key).await.unwrap(), Some(held));
+
+        // Both readers passed the actual delete. The current hosted answer now covers
+        // it, and an ordinary new write uses the absent base.
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                reason: KeptReason::NotFound,
+                ..
+            }
+        ));
+        let written = wallet
+            .put_record(&target, &value(&["a", "b"]), vec![])
+            .await
+            .unwrap();
+        assert_eq!(ids(written.content.value()), ["a", "b"]);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_records_not_hosted_read_over_a_held_delete_marks_nothing_gone() {
     // The `404` saying the switch doesn't host the identity says nothing of the record

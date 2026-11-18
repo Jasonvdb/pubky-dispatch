@@ -181,8 +181,8 @@ A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, an
 | `PolicyFamily::SubScopes` | The collection admits the declared family of policies with sub-scopes. Derive and check the member with the collection's methods before reading or writing. |
 | `RecordRead::Fresh` | A read verified the service's current write as the one held. Use its content and flags. |
 | `RecordRead::Kept` | The lookup did not replace or confirm the held copy as current. Show the reason and the optional local record. |
-| `KeptReason::NotFound` | The service reports no record here. Preserve any earlier trusted value and show its age. |
-| `KeptReason::Refused` | The client did not accept the write as trustworthy. Inspect the flags and trusted content before acting. |
+| `KeptReason::NotFound` | The current service reports no record here at a signed head covering the app's observations of this key. Preserve any earlier trusted value and show its age. |
+| `KeptReason::Refused` | The client could not establish the current value or absence. An earlier hosted absence can leave a newer write held. Inspect the flags and trusted content before acting. |
 | `KeptReason::Older` | The service showed an older write than the held one, or one not shown newer, as the record's current write. With both versions authenticated it would be a rollback alarm instead. The held copy remains available. When `SharedRecord::different_write_at_held_version` is true, the next write would build on a different signed operation at that version. A protocol that needs the contents of the current write can wait for an accepted successor. An unauthenticated `write.version` is the service's claim of the record now, as after a recovery upload. |
 | `KeptReason::Overtaken` | The answer was current at `current_at`, before the held write, so it says nothing of the record now. Continue with the held copy. |
 | `KeptReason::SwitchRefused` | The service gave the indicated lasting refusal to the read. Address its cause before another lookup. |

@@ -512,7 +512,7 @@ impl<'a> ReceiveContext<'a> {
         Ok(self.state.naming.record_key(
             &target.collection.name,
             &target.natural_key,
-            &target.collection.policy.hash()?,
+            &target.concrete_policy()?.hash()?,
         ))
     }
 

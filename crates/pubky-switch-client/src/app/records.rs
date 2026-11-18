@@ -1055,9 +1055,10 @@ pub(crate) enum WriteRead {
 
 impl WriteRead {
     /// Whether the answer that showed the write says anything of the record now: one
-    /// overtaken by the write held doesn't (Switch spec 10.3).
+    /// overtaken by the write held or waiting for its owner cannot establish the current
+    /// view (Switch spec 10.3).
     fn says_of_now(self) -> bool {
-        !matches!(self, Self::Overtaken(..) | Self::Unordered)
+        !matches!(self, Self::Overtaken(..) | Self::Unordered | Self::Waits)
     }
 }
 
@@ -3600,7 +3601,7 @@ impl App {
     /// # Errors
     ///
     /// The alarm; a store failure.
-    async fn note_absent(
+    pub(super) async fn note_absent(
         &mut self,
         key: &[u8; 32],
         current: CurrentAt,
@@ -3611,7 +3612,11 @@ impl App {
         };
         let at = position(v.generation, v.version);
         let held = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?;
-        let current = v.generation == self.state.meta.generation
+        // A protected delete must still exist throughout its protected interval,
+        // including before a later observation of the same key (Switch spec 10.3).
+        let can_report_absence = v.generation == self.state.meta.generation
+            && self.put_back_absence_is_current(key, at).await?;
+        let current = can_report_absence
             && held.as_ref().is_none_or(|held| {
                 let (_, applied, _) = held.base_write();
                 self.state.cert.holds_scope(&held.policy.read_scope)
@@ -3619,7 +3624,6 @@ impl App {
                     && self.covers(at, position(held.applied.generation, held.applied.seq))
                     && self.covers(at, position(applied.generation, applied.seq))
             });
-        let current = current && self.put_back_absence_is_current(key, at).await?;
         if let Some(mut held) = held.filter(|_| current) {
             self.check_absent(&held, at.generation).await?;
             if held.delete_base().is_some() && (!held.gone || held.observed != at) {

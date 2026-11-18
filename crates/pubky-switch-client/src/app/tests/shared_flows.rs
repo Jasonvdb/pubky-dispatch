@@ -13496,6 +13496,91 @@ async fn test_record_publication_checks_a_second_delete_while_the_first_waits() 
 }
 
 #[tokio::test]
+async fn test_record_publication_protection_covers_the_interval_before_a_later_read() {
+    Box::pin(async {
+        let s = Setup::new();
+        let (mut writer, mut reader, target, deleted) = delete_for_put_back(&s).await;
+        let key = reader.record_key(&target).unwrap();
+        read_on(&mut reader).await;
+        let generation = replacement_at(&reader, &key)
+            .unwrap()
+            .observation
+            .generation;
+        writer
+            .put_record(&s.target("other"), &value(&["new"]), vec![])
+            .await
+            .unwrap();
+        reader.read_record(&target).await.unwrap();
+        let (_, latest) = reader.record_view(&key).await.unwrap().unwrap();
+        assert!(matches!(latest, crate::app::records::CurrentAt::Answer(v) if v.version > deleted));
+
+        let at = |seq| crate::app::records::CurrentAt::Answer(RecordVersion::new(generation, seq));
+        let mut tx = reader.tx().unwrap();
+        assert!(
+            !reader
+                .note_absent(&key, at(deleted - 1), &mut tx)
+                .await
+                .unwrap()
+        );
+        assert!(replacement_at(&reader, &key).is_some());
+        let outcome = reader.note_absent(&key, at(deleted), &mut tx).await;
+        assert!(matches!(
+            outcome,
+            Err(AppError::Alarm(Alarm::Rollback { .. }))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_publication_waits_for_the_owner_before_changing_divergence() {
+    Box::pin(async {
+        let s = Setup::new();
+        let (mut writer, mut reader, target, _, _) = unread_deletion(&s, &value(&["first"])).await;
+        let key = reader.record_key(&target).unwrap();
+        s.protocol
+            .observation_unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        read_on(&mut reader).await;
+        let mut tx = reader.tx().unwrap();
+        reader
+            .note_view_divergence(&key, true, &mut tx)
+            .await
+            .unwrap();
+        reader.commit(tx).await.unwrap();
+        writer
+            .put_record(&target, &value(&["first", "next"]), vec![])
+            .await
+            .unwrap();
+
+        let id = reader.app_id();
+        drop(reader);
+        let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        let waiting = reader.read_record_fresh(&target).await.unwrap();
+        assert!(matches!(
+            waiting,
+            RecordRead::Kept {
+                reason: KeptReason::Refused,
+                ..
+            }
+        ));
+        assert!(reader.is_divergent(&key).await.unwrap());
+        s.protocol
+            .observation_unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        read_on(&mut reader).await;
+        assert!(matches!(
+            reader.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Fresh(_)
+        ));
+        assert!(!reader.is_divergent(&key).await.unwrap());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_record_publication_shared_store_handoff_keeps_the_real_service_cursor() {
     let s = Setup::new();
     let (mut writer, reader, target, _) = delete_for_put_back(&s).await;

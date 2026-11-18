@@ -295,6 +295,18 @@ pub enum Fault {
         /// The error code answered.
         code: ErrorCode,
     },
+    /// Apply an own app's request, then sign its answer with the chain's head at `at`, its
+    /// newest tip at or before that `seq`, as an answer overtaken on its way would carry
+    /// it, or with another chain hash there when `forked`, as a forked chain's; or, with
+    /// `at` `None`, with no head, as a faulty service would.
+    Head {
+        /// A part of the request's path and query.
+        path: String,
+        /// The `seq` the head is at; `None` for no head.
+        at: Option<u64>,
+        /// Whether the head's chain hash is another than the chain's at its `seq`.
+        forked: bool,
+    },
 }
 
 pub(crate) struct Inner {
@@ -1262,6 +1274,7 @@ impl ScriptedSwitch {
         let mut leave_out = None;
         let mut replace = None;
         let mut sign_with = None;
+        let mut head_at = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
@@ -1272,7 +1285,8 @@ impl ScriptedSwitch {
             | Fault::Replace { path: p, .. }
             | Fault::SignWith { path: p, .. }
             | Fault::ErrorSignedWith { path: p, .. }
-            | Fault::BeforeTheBody { path: p, .. } => path.contains(p.as_str()),
+            | Fault::BeforeTheBody { path: p, .. }
+            | Fault::Head { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(
@@ -1306,6 +1320,7 @@ impl ScriptedSwitch {
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
                 Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
+                Some(Fault::Head { at, forked, .. }) => head_at = Some((at, forked)),
                 Some(Fault::ErrorSignedWith { code, secret, .. }) => {
                     let (status, body) = bad(code, "scripted", Value::Null);
                     // As for `Fault::Error`: past authentication, the app was seen.
@@ -1409,6 +1424,29 @@ impl ScriptedSwitch {
             if let Some(secret) = sign_with {
                 let key = SigningKey::from_bytes(&secret);
                 return Ok(inner.respond_with(&key, request, status, &body));
+            }
+            if let Some((at, forked)) = head_at {
+                let head = at.map(|seq| {
+                    let mut tip = inner
+                        .tips
+                        .iter()
+                        .rev()
+                        .find(|tip| tip.seq <= seq)
+                        .copied()
+                        .unwrap_or(inner.tip);
+                    if forked {
+                        tip.chain_hash = [0x55; 32];
+                    }
+                    SignedHead::sign(&inner.service, &inner.identity.public(), &tip).to_header()
+                });
+                return Ok(inner.respond_signed(
+                    &inner.service,
+                    request,
+                    status,
+                    &body,
+                    inner.now(),
+                    head.as_deref(),
+                ));
             }
             Ok(inner.respond(request, status, &body))
         };

@@ -31,7 +31,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 
 Call `receive(None)` on startup and after a wake. Act on the report's events. Inspect `take_events()` after other calls, including failures. A report with `more` has bounded work left to do now, so read again. If `stopped` is set, act on the reason. Use `cursor` for the committed local position, `service_cursor` for the position last confirmed at the service, and `flush_cursor` to send a deferred move. A local cursor can advance before that send. `received_order` lets a protocol order inputs the client has handed it.
 
-An event with an `id()` is a duty (`is_duty`). Save what it requires before acknowledging it. Delivery is at least once. Recover outstanding duties with `unacknowledged_events`. Use `pending_duty_events` for inspection without handing them over; each `PendingDuty` names its `owners`, which `event_owners` learns only once an event is handed over. Events without IDs are information from this run. They can be lost across a crash. An event ID can be stored with `to_bytes` and read with `from_bytes`. `EventIdError` means the encoded ID is invalid. Compare `counter()` values only within the same store epoch (`same_store`, `cmp_same_store`).
+An event with an `id()` is a duty (`is_duty`). Save what it requires before acknowledging it. Delivery is at least once. Recover outstanding duties with `unacknowledged_events`. Use `pending_duty_events` for inspection without handing them over; each `PendingDuty` names the protocols that still owe its acknowledgement, in `owners`. Events without IDs are information from this run. They can be lost across a crash. An event ID can be stored with `to_bytes` and read with `from_bytes`. `EventIdError` means the encoded ID is invalid. Compare `counter()` values only within the same store epoch (`same_store`, `cmp_same_store`).
 
 | Case | What happened and what to do |
 |---|---|
@@ -174,7 +174,7 @@ A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, an
 | `RecordRead::Kept` | The lookup did not replace or confirm the held copy as current. Show the reason and the optional local record. |
 | `KeptReason::NotFound` | The service reports no record here. Preserve any earlier trusted value and show its age. |
 | `KeptReason::Refused` | The client did not accept the write as trustworthy. Inspect the flags and trusted content before acting. |
-| `KeptReason::Older` | The service showed an older write than the held one, or one not shown newer, as the record's current write; with both versions authenticated it would be a rollback alarm instead. Continue with the held copy. An unauthenticated `write.version` is the service's claim of the record now, as after a recovery upload. |
+| `KeptReason::Older` | The service showed an older write than the held one, or one not shown newer, as the record's current write. With both versions authenticated it would be a rollback alarm instead. Continue with the held copy. An unauthenticated `write.version` is the service's claim of the record now, as after a recovery upload. |
 | `KeptReason::Overtaken` | The answer was current at `current_at`, before the held write, so it says nothing of the record now. Continue with the held copy. |
 | `KeptReason::SwitchRefused` | The service gave the indicated lasting refusal to the read. Address its cause before another lookup. |
 | `KeptReason::Unreachable` | No usable fresh answer was available. Show any held record as cached and retry the read later. |
@@ -183,8 +183,10 @@ A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, an
 | `RecordContent::Unreadable` | A write exists but its value is unavailable. Show the reason and keep the version distinct from deletion. |
 | `Unopened::KeyNotHeld` | The client lacks the key for this epoch. It can reopen the value if a bundle brings the key. The certificate might never grant it. |
 | `Unopened::DoesNotOpen` | Opening failed with the key available. Inspect the flagged write. This value is not scheduled to open again. |
+| `Unopened::Refused` | The protocol's check refused the first write the client read of this record, so nothing of it is trusted. The record reads as flagged; the next write builds on that write's version. |
 | `AppEvent::RecordChanged` | A record the client tracks changed. Read its current local version before updating the screen. |
 | `AppEvent::WriteNotTaken` | A service-supplied date or writer certificate did not establish a trustworthy change. The client follows the shown version for its next write while preserving trusted content. Show the record's `not_taken` state without blaming a writer. |
+| `AppEvent::RecordShownOlder` | The service showed an older write than the held one as the record's current write, and the client kept the held copy. Treat an unauthenticated `write.version` as the service's claim of the record now, as after a recovery upload. |
 | `AppEvent::WriteFlagged` | A write failed a check, including possible regression against previously seen data. Inspect the rule and named writer in `flagged_writes`. Do not act on the rejected content. |
 | `AppEvent::RecordUncheckable` | The protocol's `record_seen` mark exceeded 64 KiB. Future writes cannot be checked against this mark. An earlier mark is kept for another writer's change and cleared for an own write. Show the affected record/version and reduce the mark size. |
 | `AppEvent::RecordDivergent` | Uploaded copies conflicted with a record after provider loss. Re-read its current `divergent` flag before asking the user to resolve it. A later write may already have cleared it and a restore may report the same conflict under another ID. |
@@ -474,6 +476,7 @@ The optional `test-support` feature exposes a scripted service and store. The fo
 | `testing::Fault::LeaveOut` | Return a signed answer missing a member. Check that invalid data cannot authorize work. |
 | `testing::Fault::Replace` | Replace an answer member before signing. Check validation of the returned contents. |
 | `testing::Fault::SignWith` | Use a different service key on the targeted answer. Verify the host keeps its pin and discards the answer. |
+| `testing::Fault::Head` | Give the targeted answer an earlier head, or none. Verify the host reports an overtaken answer apart and refuses one without a head. |
 | `testing::Fault::ErrorSignedWith` | Sign a refusal under the wrong key. Verify the status cannot settle a write. |
 | `testing::Fault::BeforeTheBody` | Return a signed refusal before reading the body. Check the unresolved batch is retained. |
 | `ErasureOutcome::Unresolved` | Leave the account present with no known erasure outcome. Keep the attempt unresolved. |

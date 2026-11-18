@@ -1091,6 +1091,32 @@ async fn test_protocol_set_pending_duty_names_its_owners() {
     assert_eq!(duty.owners, ["tasks"]);
 }
 
+/// A duty for both protocols names both until one acknowledges it, then the other alone.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_owners_shrink_as_each_acknowledges() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(
+        &mut tx,
+        vec!["tasks".into(), "chat".into()],
+        crate::app::events::Duty::KeptBatchDropped { batch_id: [9; 16] },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert_eq!(duty.owners, ["tasks", "chat"]);
+    let id = duty.event.id().unwrap();
+    app.unacknowledged_events().await.unwrap();
+    app.ack_events_for("chat", id).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].owners, ["tasks"]);
+}
+
 #[tokio::test]
 async fn test_protocol_set_duty_event_stays_for_its_owner_until_it_acknowledges() {
     let p = Pair::with(

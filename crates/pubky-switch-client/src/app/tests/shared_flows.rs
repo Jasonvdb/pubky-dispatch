@@ -1910,13 +1910,152 @@ async fn test_records_older_authenticated_write_shown_current_raises_the_alarm()
     assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
 }
 
+/// An answer whose head is before the held write was overtaken by it: the read keeps the
+/// held write and hands the shown one over apart from an older one, with what the answer is
+/// current at, and nothing about the record's divergence changes (Switch spec 10.3).
+#[tokio::test]
+async fn test_records_overtaken_answer_is_handed_apart_from_an_older_one() {
+    let (s, _wallet, mut phone, target, held, older) = older_write_held().await;
+    let at = older.seq;
+    let shown = older.state.version;
+    show_older(&s, &phone, &target, older, true);
+    // The overtaken view says the record is divergent: that says nothing of it now.
+    let key = phone.record_key(&target).unwrap();
+    s.w.switch
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32]]);
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: Some(at),
+        forked: false,
+    });
+    phone.take_events();
+    let read = phone.read_record_fresh(&target).await.unwrap();
+    let RecordRead::Kept {
+        record,
+        reason: KeptReason::Overtaken { write, current_at },
+    } = read
+    else {
+        panic!("{read:?}");
+    };
+    assert_eq!(record, Some(held));
+    assert_eq!(write.version, shown);
+    assert!(write.authenticated);
+    assert_eq!(current_at.version, at);
+    assert!(phone.alarm().is_none());
+    let events = phone.take_events();
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AppEvent::RecordShownOlder { .. } | AppEvent::RecordDivergent { .. }
+    )));
+    assert!(!phone.shared_record(&key).await.unwrap().unwrap().divergent);
+}
+
+/// A read whose head contradicts the verified chain at its `seq` is the switch's fork: the
+/// app raises the rollback alarm before it judges the view (Switch spec 10.1).
+#[tokio::test]
+async fn test_records_read_with_a_forked_head_raises_the_alarm() {
+    let (s, _wallet, mut phone, target, _, older) = older_write_held().await;
+    let at = older.seq;
+    show_older(&s, &phone, &target, older, true);
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: Some(at),
+        forked: true,
+    });
+    let read = phone.read_record_fresh(&target).await;
+    assert!(
+        matches!(read, Err(AppError::Alarm(Alarm::Rollback { .. }))),
+        "{read:?}"
+    );
+}
+
+/// A record read without a head isn't the service's answer (Switch wire 7.1): it is refused,
+/// never read as an older write.
+#[tokio::test]
+async fn test_records_read_without_a_head_is_refused() {
+    let (s, _wallet, mut phone, target, held, older) = older_write_held().await;
+    show_older(&s, &phone, &target, older, true);
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: None,
+        forked: false,
+    });
+    let read = phone.read_record_fresh(&target).await.unwrap();
+    assert!(
+        matches!(
+            &read,
+            RecordRead::Kept {
+                record: Some(kept),
+                reason: KeptReason::Unreachable(_),
+            } if *kept == held
+        ),
+        "{read:?}"
+    );
+    assert!(phone.alarm().is_none());
+}
+
+/// The switch's view of `key`, as `GET /records/{key}` answers `app` (Switch wire 7.4.9).
+async fn raw_view(app: &App, key: &[u8; 32]) -> serde_json::Value {
+    use pubky_switch_core::enc::{b64, pubky_id};
+    let path = format!(
+        "/v1/{}/records/{}",
+        pubky_id(&app.own_identity().identity()),
+        b64(key)
+    );
+    let request = app
+        .client
+        .sign_request("GET", &path, Vec::new(), None)
+        .unwrap();
+    serde_json::from_slice(&app.client.send(request).await.unwrap().body).unwrap()
+}
+
+/// Two views of one key on one list page are each judged against what the other left: a
+/// page that shows the newer write and then an older one, both authenticated, is the
+/// switch's rollback, never the older write taken over the newer (Switch spec 10.1, 10.3).
+#[tokio::test]
+async fn test_records_two_views_of_one_key_on_a_page_are_judged_together() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let first = raw_view(&wallet, &key).await;
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let second = raw_view(&wallet, &key).await;
+    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    s.w.switch.fail_next(Fault::Replace {
+        path: "records?collection".into(),
+        member: "records".into(),
+        value: json!([second, first]),
+    });
+    let listed = phone.list_collection(&items()).await;
+    assert!(
+        matches!(listed, Err(AppError::Alarm(Alarm::Rollback { .. }))),
+        "{listed:?}"
+    );
+    let held = phone.shared_record(&key).await.unwrap();
+    assert!(held.is_none_or(|held| ids(held.content.value()) == ["a", "b"]));
+}
+
 /// An older write whose version is only the switch's word is kept apart from the held one:
+
 /// the read keeps the held write and hands the older one over with its version, item hash
 /// and writer, and that the version isn't authenticated (Switch spec 10.3).
 #[tokio::test]
 async fn test_records_older_unauthenticated_write_is_handed_as_older() {
     let (s, wallet, mut phone, target, held, older) = older_write_held().await;
     show_older(&s, &phone, &target, older.clone(), false);
+    let key = phone.record_key(&target).unwrap();
     let RecordRead::Kept {
         record,
         reason: KeptReason::Older(write),
@@ -1933,6 +2072,12 @@ async fn test_records_older_unauthenticated_write_is_handed_as_older() {
     );
     assert_eq!(write.writer, wallet.app_id());
     assert!(phone.alarm().is_none());
+    // A listing that shows it tells it too.
+    phone.take_events();
+    phone.list_collection(&items()).await.unwrap();
+    assert!(phone.take_events().iter().any(
+        |e| matches!(e, AppEvent::RecordShownOlder { key: k, write: w } if *k == key && *w == write)
+    ));
 }
 
 /// After a provider loss declared at the same service, under its same key, the lost
@@ -1999,8 +2144,9 @@ async fn test_records_regression_base_carries_the_write_time() {
 }
 
 /// The protocol's check runs on the first write the app reads of a record too, against
-/// nothing seen: a write that fails it is flagged with the app that signed it and not taken
-/// (Switch spec 8.2); a first write that passes is taken.
+/// nothing seen: a write that fails it is flagged with the app that signed it, its value not
+/// trusted, and the app's repair builds on its version and lands (Switch spec 8.2); a first
+/// write that passes is taken.
 #[tokio::test]
 async fn test_records_regression_check_runs_on_a_first_read() {
     let s = Setup::new();
@@ -2013,15 +2159,30 @@ async fn test_records_regression_check_runs_on_a_first_read() {
         .put_record(&target, &value(&["x"]), vec![])
         .await
         .unwrap();
+    let refused = s.w.switch.record(&key).unwrap().state.version;
     phone.take_events();
-    assert!(matches!(
-        phone.read_record_fresh(&target).await.unwrap(),
-        RecordRead::Kept {
-            record: None,
-            reason: KeptReason::Refused,
-        }
-    ));
+    let RecordRead::Kept {
+        record: Some(held),
+        reason: KeptReason::Refused,
+    } = phone.read_record_fresh(&target).await.unwrap()
+    else {
+        panic!("not kept as refused");
+    };
+    assert!(held.flagged);
+    assert_eq!(held.content, RecordContent::Unreadable(Unopened::Refused));
     assert!(flagged_by(&phone.take_events(), &key, wallet.app_id()));
+    // The repair builds on the refused write's version, and lands.
+    let repaired = phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(!repaired.flagged);
+    assert!(repaired.version > refused);
+    let op = SignedOp::peek(&s.w.switch.record(&key).unwrap().op).unwrap();
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("a record write");
+    };
+    assert_eq!(put.expected_version, refused);
     let other = s.target("n2");
     wallet
         .put_record(&other, &value(&["a"]), vec![])

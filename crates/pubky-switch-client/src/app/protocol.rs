@@ -1118,7 +1118,6 @@ pub trait Protocol: Send + Sync {
         &self,
         collection: &str,
         seen: Option<&[u8]>,
-
         value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {

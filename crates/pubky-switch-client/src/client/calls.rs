@@ -1,6 +1,6 @@
 //! The typed calls of every endpoint (Switch wire 7.4, 8.1, 10).
 
-use pubky_switch_core::chain::{ChainError, ItemType, TransitionProof, item_hash};
+use pubky_switch_core::chain::{ChainError, ItemType, SignedHead, TransitionProof, item_hash};
 use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::export::{
     ActivateAnswer, ActivateRequest, ChunkAnswer, ImportStart, ImportStatus, Manifest,
@@ -560,7 +560,7 @@ impl SwitchClient {
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
         Ok(RecordAnswer {
             view: SharedRecordView::read(Obj::of(&value, what)?)?,
-            head: checked.head,
+            head: own_head(&checked, "a record view")?,
         })
     }
 
@@ -585,9 +585,7 @@ impl SwitchClient {
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
-        let mut page = RecordPage::read(Obj::of(&value, what)?)?;
-        page.head = checked.head;
-        Ok(page)
+        RecordPage::read(Obj::of(&value, what)?, own_head(&checked, "a record page")?)
     }
 
     /// `GET /v1/{id}/directory` (own app, or an admitted app of another identity, Switch wire
@@ -1048,4 +1046,14 @@ impl SwitchClient {
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.17: a hand-over")?;
         StoredHandover::read(Obj::of(&value, what)?)
     }
+}
+
+/// The head of an own app's answer, which every one carries (Switch wire 7.1): an answer
+/// without it isn't the service's, whatever it says.
+fn own_head(checked: &CheckedResponse, what: &str) -> Result<SignedHead, ClientError> {
+    checked.head.ok_or_else(|| {
+        ClientError::InvalidResponse(format!(
+            "Switch wire 7.1: {what} for an own app carries no Switch-Head"
+        ))
+    })
 }

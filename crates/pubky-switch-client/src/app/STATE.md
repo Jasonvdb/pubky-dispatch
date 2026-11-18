@@ -142,7 +142,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   within the app's read scope retires it. Only a layered backup carries this
   acknowledgement, inside the layer whose writes it identifies. An older layer can
   receive the deletion again. During an in-place restore its owner can read its
-  own earlier installation's local state and return verified evidence to retain.
+  own earlier installation's local state and return verified evidence to retain. The
+  owner can stream its collection's held records from the old namespace. One record
+  is read at a time, under both certificates' read scopes. The write, writer and
+  opened bytes are checked before returning its existing version and flags. A fresh
+  installation and the backup's standalone check supply no previous records.
   Each feed item reserves 6 MiB for the observation or the owner's writes of up to
   4 MiB and their acknowledgement. Restoring still has to fit one 32 MiB store commit.
 - **A restore is one commit:** the namespace cleared, the app's restored state and each

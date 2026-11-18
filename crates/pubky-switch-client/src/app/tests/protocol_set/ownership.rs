@@ -9,6 +9,53 @@ fn collection(name: &str) -> Collection {
 }
 
 #[tokio::test]
+async fn test_record_deletion_restore_gives_each_owner_only_its_registered_collection() {
+    let family = Collection::with_sub_scopes("task_lists", Policy::new("tasks", &["tasks"]));
+    let tasks = Named {
+        collections: vec![family.clone()],
+        ..named("tasks")
+    };
+    let chat = Named {
+        collections: vec![collection("chat")],
+        ..named("chat")
+    };
+    let pair = Pair::with(tasks, chat);
+    let mut app = pair.join().await;
+    let backup = app.backup_layered().await.unwrap();
+    let target = RecordTarget::new(family.sub_scope("team").unwrap(), b"key");
+    let written = app
+        .put_record(&target, br#"{"issued":true}"#, vec![])
+        .await
+        .unwrap();
+    for owner in [&pair.tasks, &pair.chat] {
+        *owner.previous_collection.lock().unwrap() = Some("task_lists".into());
+    }
+    let restored = Box::pin(App::restore(
+        pair.env(),
+        pair.set(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        restored
+            .protocol_get("tasks", &written.key)
+            .await
+            .unwrap()
+            .as_deref(),
+        written.content.value()
+    );
+    assert!(
+        restored
+            .protocol_get("chat", &written.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_collection_members_survive_join_reload_and_restore() {
     let family = Collection::with_sub_scopes("task_lists", Policy::new("tasks", &["tasks"]));
     let members: Vec<_> = ["alpha", "beta"]

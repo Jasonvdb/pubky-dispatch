@@ -34,6 +34,7 @@
 //!   taken that reads a collection the one before didn't (Switch spec 8.2, 8.3).
 
 mod collection;
+pub(super) mod previous;
 
 pub use collection::{Collection, PolicyFamily, RecordTarget};
 

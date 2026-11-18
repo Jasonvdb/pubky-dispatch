@@ -73,6 +73,7 @@ struct Named {
     refuse_cert: Mutex<bool>,
     /// Whether each restore step was handed a layer.
     restored: Mutex<Vec<bool>>,
+    previous_collection: Mutex<Option<String>>,
     /// It holds its outbox messages back.
     holding: Mutex<bool>,
     /// Its deliveries need their exact hash under the protocol's own local key.
@@ -467,17 +468,29 @@ impl Protocol for Named {
     fn restore_layer(
         &self,
         layer: Option<&ProtocolLayer>,
-        _: &RestoreContext<'_>,
+        cx: &RestoreContext<'_>,
     ) -> Result<Vec<LocalWrite>, String> {
         self.restored.lock().unwrap().push(layer.is_some());
         let Some(layer) = layer else {
             return Ok(Vec::new());
         };
         let state = crate::app::decode_local_state(&layer.data).ok_or("named: unreadable")?;
-        Ok(state
+        let mut writes: Vec<_> = state
             .into_iter()
             .map(|(key, value)| LocalWrite::Put { key, value })
-            .collect())
+            .collect();
+        if let Some(collection) = self.previous_collection.lock().unwrap().as_ref() {
+            for record in cx.previous_records_of(collection) {
+                let record = record.map_err(|e| e.to_string())?;
+                if let Some(bytes) = record.content.value() {
+                    writes.push(LocalWrite::Put {
+                        key: record.key.to_vec(),
+                        value: bytes.to_vec(),
+                    });
+                }
+            }
+        }
+        Ok(writes)
     }
 }
 

@@ -2098,13 +2098,16 @@ impl App {
                 let mut restoring =
                     RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
                 if same_installation && layer_check == LayerCheck::Install {
-                    restoring.previous = Some(LocalView::new(
-                        meta.identity,
-                        meta.app_id,
-                        env.store.store().as_ref(),
-                        &ns,
-                        &registered.name,
-                    ));
+                    restoring.previous = Some(context::PreviousInstallation {
+                        local: LocalView::new(
+                            meta.identity,
+                            meta.app_id,
+                            env.store.store().as_ref(),
+                            &ns,
+                            &registered.name,
+                        ),
+                        protocols: &protocols,
+                    });
                 }
                 let layer = layers.iter().find(|l| l.protocol == registered.name);
                 match registered.protocol.restore_layer(layer, &restoring) {

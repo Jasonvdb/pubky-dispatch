@@ -160,7 +160,7 @@ pub enum WontDeliver {
         until_ms: u64,
     },
     /// This app gave the message's delivery up already, and told the protocol so then
-    /// ([`super::AppEvent::MessageUndelivered`]).
+    /// ([`super::AppEvent::MessageUndelivered`] or [`super::AppEvent::DeliveryUnknown`]).
     GivenUp,
     /// Its outbox record is over the store's sizes.
     TooLarge,

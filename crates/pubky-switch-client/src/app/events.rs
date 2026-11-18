@@ -792,18 +792,17 @@ pub enum AppEvent {
         /// The acceptance time, the recipient's service time.
         accepted_at_ms: u64,
     },
-    /// The app gave up delivery after `403 not_admitted` or `403 not_current` refusals
-    /// ([`super::UNDELIVERABLE_MS`], Switch spec 11). If its store had no record of
-    /// acceptance, the app deleted the outbox entry and its plaintext. The recipient may
-    /// have accepted a try whose answer was lost. For a re-send, only the re-send was
-    /// given up. Also a message whose try needed writes over
-    /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
-    /// make: it was deleted from the outbox at once. Also a message a restore didn't
-    /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the
-    /// device the backup came from may have delivered it since ([`super::App::backup`]).
-    /// Also a delivery with a replay deadline not made by it: one a restore put back, a copy
-    /// [`super::App::queue_stored`] queued, or a re-send of either (Switch spec 11). Once a
-    /// delivery is given up, `queue_stored` refuses the message
+    /// The app gave up delivery of a message, or of a re-send of it, knowing the outcome
+    /// (Switch spec 11). With `resend: false` no request carrying it can have reached the
+    /// recipient's switch, from this app or from a copy of its store. It was given up after
+    /// `403 not_admitted` or `403 not_current` refusals ([`super::UNDELIVERABLE_MS`]), for
+    /// writes over the store's sizes ([`crate::error::StoreError::TooLarge`]), or withdrawn
+    /// ([`super::App::withdraw_message`]); a re-send also past its replay deadline. A
+    /// message never accepted is deleted from the outbox, plaintext and all. With `resend: true` only a re-send of a
+    /// message accepted before was given up, and that acceptance stands. With
+    /// `resend: false` the recipient never had it: a protocol may send a replacement. A
+    /// give-up the app can't tell from a delivery is [`AppEvent::DeliveryUnknown`] instead.
+    /// Once a delivery is given up, `queue_stored` refuses the message
     /// ([`super::WontDeliver::GivenUp`]), so a protocol hears of it once. A duty event.
     #[non_exhaustive]
     MessageUndelivered {
@@ -812,10 +811,35 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
         /// Whether this app had the message accepted before, and only a re-send of it was
-        /// given up. `false` says that this app's store never saw it accepted: a message a
-        /// restore put back, or one queued again with `queue_stored`, may still have been
-        /// delivered by the device the backup came from.
+        /// given up.
         resend: bool,
+    },
+    /// The app gave up delivery of a message that may have been delivered, or it was refused
+    /// for good after a try that may have been accepted (Switch spec 11): it no longer
+    /// tries it, and can't know the recipient doesn't have it. Either a
+    /// request carrying it may have reached the recipient's switch, its answer lost, or a
+    /// copy of this app's store may have delivered it: a message a restore put back or a
+    /// backup left out, one [`super::App::queue_stored`] queued, or one whose acceptance a
+    /// restore in place dropped ([`super::App::backup`]). It comes in place of
+    /// [`AppEvent::MessageUndelivered`] whenever the app knows of no acceptance yet can't
+    /// rule one out. A protocol must not read it as "not delivered": a replacement may be
+    /// a second delivery that the recipient acts on too. It settles the outcome another
+    /// way, if it can: a reply or a receipt the counterparty sends, the shared records and
+    /// claims the message would change, or asking the counterparty. The app tells nothing
+    /// more of this message.
+    /// The app keeps no record of each try's answer: once it committed an envelope of the
+    /// message to be sent, a give-up says this, even when every try was answered with a
+    /// refusal and the recipient never took it.
+    /// The message left the outbox, plaintext and all, unless it is kept as refused for
+    /// good, and `queue_stored` refuses it ([`super::WontDeliver::GivenUp`]). A flush lists
+    /// it in [`super::OutboxReport::unknown`], never in `undelivered`. A backup carries the
+    /// event until it is acknowledged, so a restore tells it again. A duty event.
+    #[non_exhaustive]
+    DeliveryUnknown {
+        /// The duty event's ID.
+        id: EventId,
+        /// The message ID.
+        msg_id: String,
     },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
     /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
@@ -879,7 +903,8 @@ pub enum AppEvent {
     },
     /// After a provider loss of a counterparty, the messages its old switch accepted since
     /// the previous check were queued again for its new one (Switch spec 8.1), but none
-    /// whose delivery the app gave up ([`AppEvent::MessageUndelivered`]).
+    /// whose delivery the app gave up ([`AppEvent::MessageUndelivered`],
+    /// [`AppEvent::DeliveryUnknown`]).
     ResendAfterLoss {
         /// The counterparty.
         identity: [u8; 32],
@@ -1007,6 +1032,7 @@ impl AppEvent {
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
+            | Self::DeliveryUnknown { id, .. }
             | Self::RecordJobDropped { id, .. }
             | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
@@ -1223,6 +1249,9 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    DeliveryUnknown {
+        msg_id: String,
+    },
     RecordJobDropped {
         msg_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1268,6 +1297,16 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
+    /// The message whose delivery the event gives up, if it gives one up.
+    pub(crate) fn given_up(&self) -> Option<&str> {
+        match self {
+            Self::MessageUndelivered { msg_id, .. } | Self::DeliveryUnknown { msg_id } => {
+                Some(msg_id)
+            }
+            _ => None,
+        }
+    }
+
     /// The local ID of the entry stored locally the event names, if it names one.
     pub(crate) fn stored_id(&self) -> Option<u64> {
         match self {
@@ -1378,6 +1417,7 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::DeliveryUnknown { msg_id } => AppEvent::DeliveryUnknown { id, msg_id },
             Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
                 id,
                 msg_id,

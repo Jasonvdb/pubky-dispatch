@@ -947,15 +947,13 @@ impl SwitchClient {
 
     /// `GET /v1/{id}/identity`, the unauthenticated public read (Switch wire 7.4.15): sent
     /// without any `Switch-*` header, and the document and the freeze verified with the
-    /// account's identity key. The answer is checked with the pinned key, or, without one,
-    /// with the key the verified document names for this origin, which is then pinned
-    /// (Switch wire 7.1 "An unpinned public read").
+    /// account's identity key. The service signature and the signed time are checked
+    /// before the document or freeze is used (Switch wire 7.1).
     ///
     /// # Errors
     ///
-    /// As every call; [`ClientError::Core`] for a document that doesn't verify. Without a
-    /// pinned key, [`ClientError::BadServiceSignature`] for any answer that can't be checked
-    /// so, an error answer included: a failed lookup.
+    /// [`ClientError::Unpinned`] before sending without a service key, [`ClientError::StaleAnswer`]
+    /// for a response outside the time window, or [`ClientError::Core`] for an invalid document.
     pub async fn public_identity(&self) -> Result<PublicIdentity, ClientError> {
         let checked = self
             .call(
@@ -971,7 +969,11 @@ impl SwitchClient {
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.15: a public read")?;
-        PublicIdentity::read(Obj::of(&value, what)?, &self.account())
+        PublicIdentity::read(
+            Obj::of(&value, what)?,
+            &self.account(),
+            checked.server_time_ms,
+        )
     }
 
     /// `POST /v1/{id}/erase` (signer, Switch wire 7.4.16), naming `created`, the account's

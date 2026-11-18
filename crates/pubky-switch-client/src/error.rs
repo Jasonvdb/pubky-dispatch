@@ -162,6 +162,12 @@ pub enum ClientError {
         /// The response's HTTP status, unauthenticated.
         status: u16,
     },
+    /// The signed public-read time is outside the reader's window (Switch wire 7.1).
+    #[error("the public identity response is stale (signed time {server_time_ms})")]
+    StaleAnswer {
+        /// The signed service time, in Unix milliseconds.
+        server_time_ms: u64,
+    },
     /// An error answer the service gave before it read the request's body: a `413
     /// too_large`, a `429 rate_limited` or a `404 not_found`, its signature verified with the
     /// pinned key and the empty body field. It binds the request without its body, so it may

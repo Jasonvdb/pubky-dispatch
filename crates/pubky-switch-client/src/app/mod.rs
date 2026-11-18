@@ -1111,7 +1111,7 @@ impl App {
                 )?;
             }
             tx.put(key::BUNDLE, &app.state.bundle)?;
-            let taken = identity::take_copy(&app.reader(), &mut tx, &doc, None, now).await?;
+            let taken = identity::take_copy(&app.reader(), &mut tx, &doc, None, Default::default()).await?;
             if taken.is_err() {
                 return Err(AppError::InvalidData(
                     "Switch spec 4.3: the approval's identity.json equivocates".into(),
@@ -2459,7 +2459,7 @@ impl App {
             &key::ident_doc(&s.meta.identity),
             &CachedDoc {
                 doc: doc.signed().clone(),
-                fetched_ms: 0,
+                reads: Default::default(),
             },
         )?;
         tx.put(

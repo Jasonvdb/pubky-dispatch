@@ -77,6 +77,12 @@ async fn test_sender_document_renewed_certificate_before_the_copy_ages_is_kept()
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert!(app.cursor().seq >= seq);
+    let at = w.clock.now_ms();
+    w.homeserver.set_down(true);
+    let found = app.begin_identity_lookup(&w.bob.public(), true).await.unwrap();
+    assert_eq!(found.identity.homeserver_read_ms, Some(at));
+    assert_eq!(found.identity.read_at_ms, Some(at));
+
 }
 
 /// A certificate bob's newest document doesn't list either: read again once, then dropped

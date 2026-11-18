@@ -2592,6 +2592,25 @@ async fn test_erasure_wait_goes_on_past_a_replayed_public_read() {
 }
 
 #[tokio::test]
+async fn test_erasure_wait_survives_an_unanswered_signed_read() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    w.switch.lock().not_hosted_unpinned = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    let waiting = app.state.erasing;
+    assert!(waiting.is_some());
+    w.switch.lock().not_hosted_unpinned = false;
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(app.check_for_move().await.is_err());
+    assert_eq!(app.state.erasing, waiting);
+}
+
+#[tokio::test]
 async fn test_erasure_wait_ends_on_a_signed_read_a_public_refusal_prompts() {
     // A refusal the pinned key signed for the public read may be an earlier one sent again,
     // so it only prompts the signed read, whose answer ends the wait (Switch spec 12.7).

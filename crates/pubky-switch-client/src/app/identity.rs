@@ -25,7 +25,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::App;
 use super::error::{Alarm, AppError};
-use super::state::{CachedDoc, Floor, Reader, Tx, key};
+use super::state::{CachedDoc, Floor, Reader, SourceReads, Tx, key};
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
 
@@ -48,12 +48,12 @@ pub enum IdentityRefresh {
     Newer {
         /// The version taken.
         version: u64,
-        /// When the read was answered, before the copy was taken.
+        /// When the request began, capped at the clock when it answered.
         confirmed_at: u64,
     },
     /// The Homeserver serves the version the app holds: it is confirmed.
     Current {
-        /// When the read was answered.
+        /// When the request began, capped at the clock when it answered.
         confirmed_at: u64,
     },
     /// The Homeserver serves a version the app doesn't take, older than the one it took from
@@ -107,6 +107,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let identity = self.state.meta.identity;
+            let started = self.now();
             let doc = match read_homeserver(self.env.homeserver.as_ref(), &identity).await {
                 Ok(Some(doc)) => doc,
                 Ok(None) => return Ok(IdentityRefresh::Missing),
@@ -115,11 +116,11 @@ impl App {
             };
             // The read's own time: taking the copy may commit and fetch keys first, and the
             // confirmation is only as fresh as the read (Switch spec 12.6).
-            let confirmed_at = self.now();
+            let confirmed_at = started.min(self.now());
             let served = doc.version();
             let newer = self.take_own_copy(doc).await?;
             let held = self.state.own_doc.version();
-            if !newer && served != held {
+            if served != held {
                 return Ok(IdentityRefresh::Older { served });
             }
             self.identity_confirmed = Some(Confirmed {
@@ -185,7 +186,7 @@ pub(crate) struct Equivocation {
 
 /// Take a verified copy of `doc`'s identity against what the store holds for it, and add
 /// the records it changes to `tx`. `held` is the newest copy held, if any; a newer copy is
-/// kept as read at `read_ms`, app clock.
+/// kept with its source observations, if any.
 ///
 /// # Errors
 ///
@@ -196,7 +197,7 @@ pub(crate) async fn take_copy(
     tx: &mut Tx,
     doc: &IdentityDoc,
     held: Option<&IdentityDoc>,
-    read_ms: u64,
+    reads: SourceReads,
 ) -> Result<Result<Taken, Equivocation>, AppError> {
     let identity = doc.identity();
     let version = doc.version();
@@ -241,71 +242,52 @@ pub(crate) async fn take_copy(
         &key::ident_doc(&identity),
         &CachedDoc {
             doc: doc.signed().clone(),
-            fetched_ms: read_ms,
+            reads,
         },
     )?;
     Ok(Ok(Taken::Newer))
 }
 
-/// Take a counterparty's copy `doc`, given by a source at `read_ms`, app clock, against
-/// `held`, the newest copy held and when it was last read ([`take_copy`]), and return the
-/// newest copy held after it, with when it was last read. The copy held counts as read at
-/// `read_ms` only when the source gave it: a newer copy, or the one held again, and then
-/// at the later of the two reads, never after `now_ms` ([`later_read`]). An older copy
-/// leaves its read time as it was, so a source serving a copy rolled back doesn't make the
-/// one held count as fresh (Switch spec 4.3).
-///
-/// # Errors
-///
-/// As [`take_copy`].
+/// Keep source times with the version that supplied them (Switch spec 4.3). Directory
+/// answers carry empty observations. An older version only caps the held times if the
+/// device clock moved back.
 pub(crate) async fn take_peer_read(
-    reader: &Reader,
-    tx: &mut Tx,
-    doc: IdentityDoc,
-    held: Option<(IdentityDoc, u64)>,
-    read_ms: u64,
-    now_ms: u64,
-) -> Result<Result<(IdentityDoc, u64), Equivocation>, AppError> {
+    reader: &Reader, tx: &mut Tx, doc: IdentityDoc, held: Option<(IdentityDoc, SourceReads)>,
+    observed: SourceReads, now: u64,
+) -> Result<Result<(IdentityDoc, SourceReads), Equivocation>, AppError> {
     let held_doc = held.as_ref().map(|(held, _)| held);
-    let taken = match take_copy(reader, tx, &doc, held_doc, read_ms).await? {
+    let taken = match take_copy(reader, tx, &doc, held_doc, observed).await? {
         Ok(taken) => taken,
         Err(equivocation) => return Ok(Err(equivocation)),
     };
-    Ok(Ok(match (taken, held) {
-        (Taken::Newer, _) | (_, None) => (doc, read_ms),
-        (Taken::Same, Some((held, held_ms))) => {
-            let read_ms = later_read(held_ms, read_ms, now_ms);
-            tx.put(
-                &key::ident_doc(&held.identity()),
-                &CachedDoc {
-                    doc: held.signed().clone(),
-                    fetched_ms: read_ms,
-                },
-            )?;
-            (held, read_ms)
-        }
-        (Taken::Older, Some(held)) => held,
-    }))
-}
-
-/// When a copy given by two reads counts as read: at the later of `held_ms` and `read_ms`,
-/// so a read that finishes after a later one doesn't take its time back, but never after
-/// `now_ms`, so a time kept from before the clock was set back doesn't stay ahead of it.
-pub(crate) fn later_read(held_ms: u64, read_ms: u64, now_ms: u64) -> u64 {
-    held_ms.max(read_ms).min(now_ms)
+    let (Some((held, previous)), Taken::Same | Taken::Older) = (held, &taken) else {
+        return Ok(Ok((doc, observed)));
+    };
+    let update = |prior: Option<u64>, read: Option<u64>| {
+        let latest = if taken == Taken::Same { prior.max(read) } else { prior };
+        latest.map(|at| at.min(now))
+    };
+    let reads = SourceReads {
+        homeserver_ms: update(previous.homeserver_ms, observed.homeserver_ms),
+        switch_ms: update(previous.switch_ms, observed.switch_ms),
+    };
+    if previous != reads {
+        tx.put(&key::ident_doc(&held.identity()), &CachedDoc { doc: held.signed().clone(), reads })?;
+    }
+    Ok(Ok((held, reads)))
 }
 
 /// The newest copy held for `identity`, verified, with when it was read.
 pub(crate) async fn held_copy(
     reader: &Reader,
     identity: &[u8; 32],
-) -> Result<Option<(IdentityDoc, u64)>, AppError> {
+) -> Result<Option<(IdentityDoc, SourceReads)>, AppError> {
     let Some(cached) = reader.get::<CachedDoc>(&key::ident_doc(identity)).await? else {
         return Ok(None);
     };
     let doc = IdentityDoc::verify(&cached.doc, identity)
         .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
-    Ok(Some((doc, cached.fetched_ms)))
+    Ok(Some((doc, cached.reads)))
 }
 
 /// Read `identity`'s `identity.json` from its Homeserver: `Ok(None)` when it publishes
@@ -372,7 +354,7 @@ mod tests {
             .unwrap()
             .map(|(d, _)| d);
         let mut tx = Tx::new("client/a");
-        let taken = take_copy(reader, &mut tx, d, held.as_ref(), 1)
+        let taken = take_copy(reader, &mut tx, d, held.as_ref(), SourceReads::default())
             .await
             .unwrap();
         tx.commit(store).await.unwrap();

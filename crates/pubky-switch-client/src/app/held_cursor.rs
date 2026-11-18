@@ -186,8 +186,8 @@ impl App {
         let mut settles = false;
         if let Some(mut check) = self.state.restore_cursor {
             let confirmed = self
-                .identity_confirmed
-                .is_some_and(|c| c.at_ms >= check.restored_at_ms);
+                .identity_confirmed_at()
+                .is_some_and(|at| at >= check.restored_at_ms);
             match check.verdict {
                 None if confirmed => {
                     let key_current = self

@@ -714,7 +714,9 @@ impl App {
         // owed write-back failed to commit would leave nothing owed in the store and skip
         // the next read's repair for the interval; the branches that owe a publication
         // need no mark, since what is owed goes at every call.
-        self.published_checked_ms = Some(now);
+        self.published_checked_ms = (outcome == Publication::Published
+            && self.state.accepted.as_ref() == Some(&record))
+        .then_some(now);
         Ok(outcome)
     }
 

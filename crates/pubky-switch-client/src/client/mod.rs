@@ -4,7 +4,7 @@
 //! A [`SwitchClient`] acts with one set of [`Credentials`] on one account at one switch
 //! origin. It signs every request (Switch wire 7.1, 7.2) and checks every answer with the
 //! service key it pinned before it uses anything in it. Without a pinned key it sends only
-//! an enrollment, authenticated account discovery, and the public read. Their first-use
+//! an enrollment and authenticated account discovery. Their first-use
 //! rules establish which key checks the answer; every other call fails closed before it
 //! is sent (Switch wire 7.1, Switch spec 6.1, account-binding Section 2).
 //!
@@ -28,7 +28,7 @@ use pubky_switch_core::http::{
 };
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::labels;
-use pubky_switch_core::records::{AppCert, Enrollment, ExportTransfer, IdentityDoc};
+use pubky_switch_core::records::{AppCert, Enrollment, ExportTransfer};
 use pubky_switch_core::signing::{Signs, SignsRequests};
 use pubky_switch_core::time::{MAX_TIME_MS, parse_rfc3339, rfc3339, rfc3339_seconds};
 use serde_json::Value;
@@ -556,7 +556,7 @@ impl SwitchClient {
     /// `pinned_key` is the account's service key the caller pinned: from the `identity.json`
     /// naming the service or, for the signer, from its enrollment answer or the freeze naming
     /// the next service (Switch wire 7.1). Without one, the client sends only an enrollment
-    /// and authenticated account discovery, and the public read. Existing-account signer
+    /// and authenticated account discovery. Existing-account signer
     /// calls also need [`Self::with_account_created`].
     ///
     /// # Errors
@@ -976,8 +976,8 @@ impl SwitchClient {
         })
     }
 
-    /// Sign, send and check a call with the pinned key. Without a pinned key nothing is
-    /// sent but the public read (Switch wire 7.1). A verified `401 stale_timestamp` that
+    /// Sign, send and check a call with the pinned key. A missing pin refuses the call before
+    /// it is sent (Switch wire 7.1). A verified `401 stale_timestamp` that
     /// carries `current.server_time` is retried once, the same call signed at that time; the
     /// time is used for nothing else, and a second `stale_timestamp` is the answer.
     pub(crate) async fn call(
@@ -1002,16 +1002,7 @@ impl SwitchClient {
         content: Body,
         auth: Auth<'_>,
     ) -> Result<CallStep, ClientError> {
-        let key = match self.pinned_key() {
-            Some(key) => key,
-            None if auth.public => {
-                return self
-                    .unpinned_public_read(method, path_and_query)
-                    .await
-                    .map(CallStep::Answer);
-            }
-            None => return Err(ClientError::Unpinned),
-        };
+        let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
@@ -1177,50 +1168,37 @@ impl SwitchClient {
             _ => key,
         };
         let checked = check_response(&key, &self.account, &sent, &response);
+        let checked = if http::is_public_read(&sent.method, &sent.path_and_query) {
+            // Only an authenticated answer supplies the time for this check (Switch wire 7.1).
+            let signed_ms = match &checked {
+                Ok(answer) => Some(answer.server_time_ms),
+                Err(ClientError::Switch { .. } | ClientError::BodyUnread { .. }) => Some(
+                    response
+                        .header(header::SERVER_TIME)
+                        .and_then(|time| parse_rfc3339(time).ok())
+                        .ok_or_else(|| {
+                            ClientError::InvalidResponse(
+                                "Switch wire 7.1: Switch-Server-Time doesn't parse".into(),
+                            )
+                        })?,
+                ),
+                Err(_) => None,
+            };
+            match signed_ms {
+                Some(server_time_ms)
+                    if self.clock.now_ms().abs_diff(server_time_ms)
+                        > http::PUBLIC_READ_CACHE_MS
+                            + 2 * pubky_switch_core::records::CLOCK_TOLERANCE_MS =>
+                {
+                    Err(ClientError::StaleAnswer { server_time_ms })
+                }
+                _ => checked,
+            }
+        } else {
+            checked
+        };
         self.note_server_time(&sent, &checked, &response);
         Ok(checked)
-    }
-
-    /// The public read without a pinned key (Switch wire 7.1 "An unpinned public read",
-    /// 7.4.15). The `identity.json` in the answer is verified with the account's identity key
-    /// and nothing else is used before the response signature verifies with the service key
-    /// that document names, which it does only when the document names this origin. That key
-    /// is then pinned. Any answer that can't be checked so, an error included, is
-    /// [`ClientError::BadServiceSignature`]: a failed lookup, never a sign that the service
-    /// holds no document.
-    async fn unpinned_public_read(
-        &self,
-        method: &str,
-        path_and_query: &str,
-    ) -> Result<CheckedResponse, ClientError> {
-        self.forget_latest();
-        let auth = Auth {
-            public: true,
-            ..Auth::default()
-        };
-        let signed = self.build(method, path_and_query, Vec::new(), Body::Empty, auth)?;
-        let sent = SentRequest::of(&signed.request);
-        let response = self.send_response(signed.request).await?;
-        let key =
-            self.named_service_key(&response.body)
-                .ok_or(ClientError::BadServiceSignature {
-                    status: response.status,
-                })?;
-        let checked = check_response(&key, &self.account, &sent, &response);
-        self.note_server_time(&sent, &checked, &response);
-        if checked.is_ok() {
-            self.pin(key);
-        }
-        checked
-    }
-
-    /// The service key an unchecked public-read body names for this origin: that of its
-    /// `identity`, once it verifies with the account's identity key; `None` otherwise.
-    fn named_service_key(&self, body: &[u8]) -> Option<[u8; 32]> {
-        let value: Value = pubky_switch_core::json::parse_json(body).ok()?;
-        let signed = read::doc(value.get("identity")?)?;
-        let doc = IdentityDoc::verify(&signed, &self.account).ok()?;
-        (doc.inbox().url == self.origin).then_some(doc.inbox().service_key)
     }
 
     /// Send a request this client signed, as built by [`SwitchClient::sign_request`], and

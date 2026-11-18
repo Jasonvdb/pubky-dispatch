@@ -1054,6 +1054,8 @@ impl AppsAnswer {
 /// requests"): it shows what the identity key signed, and nothing about the account now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicIdentity {
+    /// The time the service signed for this answer, in Unix milliseconds.
+    pub(crate) server_time_ms: u64,
     /// The newest `identity.json` the service holds, verified with the account's identity.
     pub identity: IdentityDoc,
     /// The freeze while the account is frozen, verified with the account's identity.
@@ -1061,7 +1063,11 @@ pub struct PublicIdentity {
 }
 
 impl PublicIdentity {
-    pub(crate) fn read(o: Obj<'_>, account: &[u8; 32]) -> Result<Self, ClientError> {
+    pub(crate) fn read(
+        o: Obj<'_>,
+        account: &[u8; 32],
+        server_time_ms: u64,
+    ) -> Result<Self, ClientError> {
         let freeze = match o.opt_doc("freeze")? {
             None => None,
             Some(signed) => Some(Freeze::verify(&signed, account)?),
@@ -1069,6 +1075,7 @@ impl PublicIdentity {
         Ok(Self {
             identity: IdentityDoc::verify(&o.doc("identity")?, account)?,
             freeze,
+            server_time_ms,
         })
     }
 }

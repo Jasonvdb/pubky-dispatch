@@ -545,7 +545,8 @@ impl SourceReads {
     }
 
     pub(crate) fn is_fresh(self, now: u64) -> bool {
-        self.latest().and_then(|at| now.checked_sub(at))
+        self.latest()
+            .and_then(|at| now.checked_sub(at))
             .is_some_and(|age| age < super::DOC_CACHE_MS)
     }
 }

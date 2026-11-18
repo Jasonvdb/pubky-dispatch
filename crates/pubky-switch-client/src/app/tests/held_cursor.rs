@@ -145,7 +145,8 @@ async fn test_held_cursor_restore_waits_for_the_current_document() {
     let mut app = restored(&w, &backup).await;
     let newer = w.next_doc(|_| {});
     app.take_own_copy(newer.clone()).await.unwrap();
-    w.homeserver.remove(w.alice.public(), pubky_switch_core::records::IDENTITY_PATH);
+    w.homeserver
+        .remove(w.alice.public(), pubky_switch_core::records::IDENTITY_PATH);
     assert!(app.identity_confirmed_at().is_none());
     app.receive(None).await.unwrap();
     assert_eq!(app.restore_held_cursor(), None);

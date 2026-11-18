@@ -224,7 +224,7 @@ impl App {
         tx.put(key::ACCEPTED_RECORD, later)?;
         self.state.record = later.clone();
         self.state.accepted = Some(later.clone());
-        self.published_checked_ms = None;
+        self.published_check = None;
         Ok(false)
     }
 
@@ -345,7 +345,7 @@ impl App {
         self.commit(tx).await?;
         if let Some(accepted) = accepted {
             self.state.accepted = Some(accepted);
-            self.published_checked_ms = None;
+            self.published_check = None;
         }
         self.events.push(AppEvent::CertificateTaken { issued_at });
         for protocol in dropped {
@@ -588,7 +588,7 @@ impl App {
         if taken {
             self.state.record = signed.clone();
             self.state.accepted = Some(signed);
-            self.published_checked_ms = None;
+            self.published_check = None;
         }
         Ok(())
     }

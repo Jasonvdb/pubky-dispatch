@@ -937,10 +937,11 @@ async fn test_identity_lookup_directory_version_needs_its_own_read() {
             Arc::new(MemoryStore::new()),
         )
         .await;
-    let _shop = p
+    let mut shop = p
         .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
         .await;
     let bob = p.bob.identity().public();
+    shop.invite(&p.alice.identity().public()).await.unwrap();
     let before = wallet.identity_of(&bob, true).await.unwrap();
     let mut body = p.bob.body();
     body.version += 1;

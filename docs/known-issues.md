@@ -12,7 +12,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Additions still to come**
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events). Public reads used to establish freshness will gain an age check on the signed answer.
+- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events).
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 

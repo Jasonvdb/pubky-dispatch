@@ -252,8 +252,12 @@ pub(crate) async fn take_copy(
 /// answers carry empty observations. An older version only caps the held times if the
 /// device clock moved back.
 pub(crate) async fn take_peer_read(
-    reader: &Reader, tx: &mut Tx, doc: IdentityDoc, held: Option<(IdentityDoc, SourceReads)>,
-    observed: SourceReads, now: u64,
+    reader: &Reader,
+    tx: &mut Tx,
+    doc: IdentityDoc,
+    held: Option<(IdentityDoc, SourceReads)>,
+    observed: SourceReads,
+    now: u64,
 ) -> Result<Result<(IdentityDoc, SourceReads), Equivocation>, AppError> {
     let held_doc = held.as_ref().map(|(held, _)| held);
     let taken = match take_copy(reader, tx, &doc, held_doc, observed).await? {
@@ -264,7 +268,11 @@ pub(crate) async fn take_peer_read(
         return Ok(Ok((doc, observed)));
     };
     let update = |prior: Option<u64>, read: Option<u64>| {
-        let latest = if taken == Taken::Same { prior.max(read) } else { prior };
+        let latest = if taken == Taken::Same {
+            prior.max(read)
+        } else {
+            prior
+        };
         latest.map(|at| at.min(now))
     };
     let reads = SourceReads {
@@ -272,7 +280,13 @@ pub(crate) async fn take_peer_read(
         switch_ms: update(previous.switch_ms, observed.switch_ms),
     };
     if previous != reads {
-        tx.put(&key::ident_doc(&held.identity()), &CachedDoc { doc: held.signed().clone(), reads })?;
+        tx.put(
+            &key::ident_doc(&held.identity()),
+            &CachedDoc {
+                doc: held.signed().clone(),
+                reads,
+            },
+        )?;
     }
     Ok(Ok((held, reads)))
 }

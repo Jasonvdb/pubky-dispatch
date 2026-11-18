@@ -197,7 +197,6 @@ pub enum HomeserverCopy {
 /// Whether a counterparty's switch confirmed its `identity.json` (Switch spec 4.3, "The
 /// switch's copy"). A lookup's answer counts until the next lookup, once the copy is more
 /// than 10 minutes old.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SwitchCopy {
@@ -260,7 +259,7 @@ pub struct PeerIdentity {
     /// version floor the app keeps.
     pub doc: IdentityDoc,
     /// When the copy held was last read from the Homeserver or the switch, app clock: not
-    /// the lookup's time when neither could be read at it. Absent for a directory-only version.
+    /// the lookup's time when neither could be read at it. A directory-only version has no time.
     pub read_at_ms: Option<u64>,
     /// Whether the Homeserver's copy was read at this lookup.
     pub homeserver: HomeserverCopy,
@@ -270,7 +269,7 @@ pub struct PeerIdentity {
     /// [`HomeserverCopy::Held`], at the one before.
     pub switch_copy: SwitchCopy,
     /// When the switch was looked up, app clock: when the lookup began while it is
-    /// [`SwitchCopy::Pending`], otherwise when its answer, or its failure, came.
+    /// [`SwitchCopy::Pending`], otherwise bounded by the request and signed response time.
     pub switch_lookup_ms: u64,
     /// When a public switch read last supplied this version, on the app clock.
     pub switch_read_ms: Option<u64>,
@@ -507,7 +506,7 @@ impl App {
     /// The second half of [`App::identity_of`]: take the copies the switch's half read,
     /// under the version floor and the equivocation check, and keep when the switch was
     /// looked up and whether it answered, which counts until the next lookup. The answer
-    /// counts from when its read completed ([`SwitchAnswer::read_ms`]), not from this call:
+    /// counts from the request and signed response time ([`SwitchAnswer::read_ms`]):
     /// one held more than 10 minutes gives a copy to look up again. An answer of a lookup
     /// begun before the one whose outcome is kept leaves that outcome standing, whatever
     /// the clock read at either.
@@ -671,10 +670,9 @@ impl App {
     }
 
     /// The switch's half of a lookup of `pubky`, at the switch `doc` names, and, when it is
-    /// frozen, at the next service its freeze names, once (Switch wire 7.4.15). Its copies
-    /// are `None` when the lookup failed: a switch that can't be read, or a next service
-    /// frozen too. A next service still staged hasn't been named yet, so the frozen one's
-    /// copy stands.
+    /// frozen, at the next service its freeze names, once (Switch wire 7.4.15). Each
+    /// verified answer keeps its copy even when the complete lookup fails. A fresh staged
+    /// answer leaves the first service's copy in use.
     fn switch_lookup(
         &self,
         pubky: &[u8; 32],
@@ -797,7 +795,10 @@ impl App {
         match taken {
             Ok((doc, reads)) => Ok(Some((doc, reads.latest()))),
             Err(equivocation) => {
-                self.events.push(AppEvent::PeerEquivocation { identity: *pubky, version: equivocation.version });
+                self.events.push(AppEvent::PeerEquivocation {
+                    identity: *pubky,
+                    version: equivocation.version,
+                });
                 Ok(None)
             }
         }

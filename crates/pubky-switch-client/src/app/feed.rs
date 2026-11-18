@@ -4055,7 +4055,9 @@ impl App {
             return Err(self.raise(alarm).await);
         }
         let reader = self.reader();
-        let taken = identity::take_copy(&reader, &mut read.tx, &doc, Some(&held), Default::default()).await?;
+        let taken =
+            identity::take_copy(&reader, &mut read.tx, &doc, Some(&held), Default::default())
+                .await?;
         let doc = match taken {
             Err(equivocation) => {
                 return Err(self

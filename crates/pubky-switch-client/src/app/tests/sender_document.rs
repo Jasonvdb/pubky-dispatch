@@ -79,10 +79,12 @@ async fn test_sender_document_renewed_certificate_before_the_copy_ages_is_kept()
     assert!(app.cursor().seq >= seq);
     let at = w.clock.now_ms();
     w.homeserver.set_down(true);
-    let found = app.begin_identity_lookup(&w.bob.public(), true).await.unwrap();
+    let found = app
+        .begin_identity_lookup(&w.bob.public(), true)
+        .await
+        .unwrap();
     assert_eq!(found.identity.homeserver_read_ms, Some(at));
     assert_eq!(found.identity.read_at_ms, Some(at));
-
 }
 
 /// A certificate bob's newest document doesn't list either: read again once, then dropped
@@ -366,4 +368,12 @@ async fn test_sender_document_older_copy_served_again_lists_nothing_back() {
         report.events
     );
     assert_eq!(w.homeserver.identity_reads(&bob), reads + 1);
+    let before = w.clock.now_ms();
+    w.clock.set_ms(before - SENDER_REREAD_MS - 1);
+    let lookup = app.begin_identity_lookup(&bob, true).await.unwrap();
+    assert_eq!(lookup.identity.read_at_ms, Some(w.clock.now_ms()));
+    assert_eq!(
+        lookup.identity.homeserver_read_ms,
+        lookup.identity.read_at_ms
+    );
 }

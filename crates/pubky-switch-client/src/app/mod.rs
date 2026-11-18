@@ -745,9 +745,8 @@ pub struct App {
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
     reopen_failures: u32,
-    /// When the Homeserver copy of the app's record was last read to compare it with the
-    /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
-    published_checked_ms: Option<u64>,
+    /// The device-clock time and signature of the accepted record last confirmed published.
+    published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
     /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
     bundle_asked_ms: Option<u64>,
@@ -1081,7 +1080,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
-                published_checked_ms: None,
+                published_check: None,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
@@ -1111,7 +1110,8 @@ impl App {
                 )?;
             }
             tx.put(key::BUNDLE, &app.state.bundle)?;
-            let taken = identity::take_copy(&app.reader(), &mut tx, &doc, None, Default::default()).await?;
+            let taken =
+                identity::take_copy(&app.reader(), &mut tx, &doc, None, Default::default()).await?;
             if taken.is_err() {
                 return Err(AppError::InvalidData(
                     "Switch spec 4.3: the approval's identity.json equivocates".into(),
@@ -1249,7 +1249,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
-                published_checked_ms: None,
+                published_check: None,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
@@ -2290,7 +2290,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
-                published_checked_ms: None,
+                published_check: None,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,

@@ -1,6 +1,6 @@
 //! A collection owner's observation of a signed record deletion (Switch spec 8.2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use pubky_switch_core::enc::{b64, serde_b64};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
@@ -388,7 +388,7 @@ impl App {
     pub(super) fn retire_deletion_receipts(
         &mut self,
         key: [u8; 32],
-        successor: Option<(&pubky_switch_core::shared::ApplicationRef, bool)>,
+        successor: Option<([u8; 32], RecordVersion)>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let first = (key, RecordVersion::NONE, [0; 32]);
@@ -398,11 +398,10 @@ impl App {
             .range(first..)
             .take_while(|(id, _)| id.0 == key)
             .filter(|(_, r)| match successor {
-                Some((next, current)) => {
-                    next.item_hash != r.delete.item_hash
-                        && (current
-                            || self.feed_order(next.generation, next.seq)
-                                > self.feed_order(r.generation, r.seq))
+                Some((hash, at)) => {
+                    hash != r.delete.item_hash
+                        && self.feed_order(at.generation, at.version)
+                            >= self.feed_order(r.generation, r.seq)
                 }
                 None => self.state.cert.holds_scope(&r.read_scope),
             })
@@ -454,9 +453,9 @@ impl App {
                 }
             }
             Ok(Some(_)) | Err(AppError::Protocol(_)) => {
-                if !self.state.deletions.contains_key(&observed.id()) {
+                if let Entry::Vacant(entry) = self.state.deletions.entry(observed.id()) {
                     tx.put(&observed.store_key(), &observed)?;
-                    self.state.deletions.insert(observed.id(), observed);
+                    entry.insert(observed);
                 }
                 return Ok(());
             }
@@ -489,6 +488,9 @@ impl App {
             if self.ready_at(&observation.owner, order, Handover::Call) {
                 let mut tx = self.tx()?;
                 self.observe_deletion(observation, &mut tx)?;
+                if self.state.deletion_receipts.contains_key(&id) {
+                    self.retire_completed_deletion(id.0, &mut tx).await?;
+                }
                 if !tx.is_empty() {
                     self.commit(tx).await?;
                 }

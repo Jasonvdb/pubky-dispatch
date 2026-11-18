@@ -940,8 +940,8 @@ struct Accepted {
     item_hash: [u8; 32],
     /// The write's application ([`Evidence::view_revision`], else at its version).
     revision: ApplicationRef,
-    /// Whether a record view showed it: the switch's current write.
-    viewed: bool,
+    /// The verified head or listing position at which a view showed this write.
+    current_at: CurrentAt,
     content: RecordContent,
     doubtful: bool,
     /// How it compares with the write held ([`compare_with_held`]).
@@ -2678,7 +2678,7 @@ impl App {
             revision: evidence
                 .view_revision
                 .unwrap_or(applied_at(version.version, item_hash)),
-            viewed: evidence.current_at.viewed(),
+            current_at: evidence.current_at,
             content,
             doubtful,
             order,
@@ -2945,14 +2945,20 @@ impl App {
     async fn take_write(
         &mut self,
         mut accepted: Accepted,
-        own: bool,
+        settling_own: bool,
         page_time_ms: Option<u64>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         Box::pin(async move {
             let key = accepted.key;
-            if self.state.deletions.values().any(|d| (d.key == key || self.protocols.of_collection(&accepted.collection.name).is_some_and(|owner| owner.name == d.owner)) && self.feed_order(d.generation, d.seq)
-                < self.feed_order(accepted.revision.generation, accepted.revision.seq)) {
+            // The application proof settles an own submission even while a foreign
+            // observation is owed. Foreign handovers still follow the owner's feed order.
+            let owner = self.protocols.of_collection(&accepted.collection.name);
+            let at = self.feed_order(accepted.revision.generation, accepted.revision.seq);
+            if !settling_own && self.state.deletions.values().any(|d| {
+                (d.key == key || owner.is_some_and(|owner| owner.name == d.owner))
+                    && self.feed_order(d.generation, d.seq) < at
+            }) {
                 return Ok(Taken::Waits);
             }
             self.keep_cert(&accepted.cert, tx)?;
@@ -2970,6 +2976,14 @@ impl App {
                 accepted.proof = accepted.proof.take().or(held.proof.clone());
                 accepted.time = held.written_at_ms.or(accepted.time);
             }
+            let current_at = match accepted.current_at {
+                CurrentAt::Answer(at) => Some(at),
+                CurrentAt::Itself if accepted.version.authenticated => Some(accepted.version.version),
+                CurrentAt::Itself => None,
+            };
+            if !matches!(accepted.order, Order::Overtaken(..)) && let Some(at) = current_at {
+                self.retire_deletion_receipts(key, Some((accepted.item_hash, at)), tx)?;
+            }
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
                 if accepted.order == Order::Equal {
                     let mut upgraded = held.clone();
@@ -2983,7 +2997,7 @@ impl App {
                     // A view shows the held write as the switch's current one: at the
                     // application it shows, such as a recovery upload's, which the next write
                     // names; and neither forgotten nor behind another write at its version.
-                    if accepted.viewed {
+                    if accepted.current_at.viewed() {
                         upgraded.applied = accepted.revision;
                         upgraded.gone = false;
                         // A write held refused is followed as itself for good: its value
@@ -3006,7 +3020,7 @@ impl App {
                     // Another write at the held version, which a view shows as the switch's
                     // current one: after recovery uploads two writes can share a version
                     // (Switch spec 12.6 step 3). It isn't taken, but the next write builds on it.
-                    if accepted.viewed && accepted.version.version == held.version {
+                    if accepted.current_at.viewed() && accepted.version.version == held.version {
                         let deleted = accepted.content == RecordContent::Deleted;
                         let shown = (accepted.version.version, accepted.revision);
                         self.follow_write(&key, shown, deleted, false, tx).await?;
@@ -3033,9 +3047,6 @@ impl App {
                         "Switch spec 10.3.1: a create over a permanent record seen live".into();
                     return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
                 }
-            }
-            if accepted.version.authenticated || accepted.viewed {
-                self.retire_deletion_receipts(key, Some((&accepted.revision, accepted.viewed)), tx)?;
             }
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
             let new_value = accepted.content.value();
@@ -3066,7 +3077,7 @@ impl App {
             // spec 3.1), so it is never checked against what this device saw, and it is marked
             // from the value written, as at its answer, once this device can read that value. A
             // flag would name the app itself.
-            let own = own || accepted.writer == self.state.meta.app_id;
+            let own = settling_own || accepted.writer == self.state.meta.app_id;
             // Every write of another app the app would take is checked, the first of a
             // record included, against nothing seen yet (Switch spec 8.2).
             let mark = seen.as_ref().map(|mark| mark.mark.as_slice());
@@ -3297,6 +3308,23 @@ impl App {
             let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
             if !listed.contains(&key) {
                 Box::pin(self.note_absent(&key)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A pending observation may finish after the app settled an own write or read
+    /// the deletion as gone. Keep the owner's evidence while retiring the acknowledgement.
+    pub(super) async fn retire_completed_deletion(
+        &mut self,
+        key: [u8; 32],
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some(held) = self.held_record(&key).await? {
+            if held.gone {
+                self.retire_deletion_receipts(key, None, tx)?;
+            } else if held.authenticated {
+                self.retire_deletion_receipts(key, Some((held.item_hash, held.version)), tx)?;
             }
         }
         Ok(())

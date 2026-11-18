@@ -9479,6 +9479,116 @@ async fn test_record_deletion_restore_an_older_signed_source_is_not_the_exact_pr
 }
 
 #[tokio::test]
+async fn test_record_deletion_an_earlier_view_preserves_the_restored_acknowledgement() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let target = s.target("issued item");
+    let key = writer
+        .put_record(&target, &value(&["issued"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    read_on(&mut reader).await;
+    let prior = s.w.switch.record(&key).unwrap();
+    let before = prior.seq;
+    s.protocol.observe_deletes.store(true, SeqCst);
+    writer.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut reader).await;
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    let backup = reader.backup_layered().await.unwrap();
+    let mut restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    let current = s.w.switch.record(&key).unwrap();
+    show_older(&s, &restored, &target, prior, true);
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: Some(before),
+        forked: false,
+    });
+    restored.read_record(&target).await.unwrap();
+    assert_eq!(restored.state.deletion_receipts.len(), 1);
+    show_older(&s, &restored, &target, current, true);
+    restored.read_record(&target).await.unwrap();
+    assert_eq!(deletion_receipts(&restored).await, receipts);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnTarget {
+    New,
+    Existing,
+    Deleted,
+}
+
+async fn own_write_while_deletion_is_owed(which: OwnTarget) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let original = value(&["issued"]);
+    let (mut writer, mut reader, deleted, hash, _) = unread_deletion(&s, &original).await;
+    let target = if which == OwnTarget::Deleted {
+        deleted
+    } else {
+        s.target("another record")
+    };
+    if which == OwnTarget::Existing {
+        reader
+            .put_record(&target, &value(&["older"]), vec![])
+            .await
+            .unwrap();
+    }
+    s.protocol.observation_unavailable.store(true, SeqCst);
+    read_on(&mut reader).await;
+    assert_eq!(reader.state.deletions.len(), 1);
+
+    let new = value(&["issued", "older", "updated"]);
+    let result = reader.put_record(&target, &new, vec![]).await;
+    let service = writer.read_record(&target).await.unwrap().unwrap();
+    assert_eq!(service.content.value(), Some(new.as_slice()));
+    let reported = result.unwrap();
+    assert_eq!(reported.version, service.version);
+    assert_eq!(reported.content, service.content);
+    assert!(deletion_receipts(&reader).await.is_empty());
+    assert_eq!(reader.state.deletions.len(), 1);
+
+    s.protocol.observation_unavailable.store(false, SeqCst);
+    read_on(&mut reader).await;
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["hash"], json!(hash));
+    assert_eq!(receipts[0]["value"].as_str().unwrap().as_bytes(), original);
+    assert!(reader.state.deletions.is_empty());
+    let current = reader.read_record(&target).await.unwrap().unwrap();
+    assert_eq!(current.content, service.content);
+    if which == OwnTarget::Deleted {
+        assert!(reader.state.deletion_receipts.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_record_deletion_own_creation_while_observation_is_owed() {
+    Box::pin(own_write_while_deletion_is_owed(OwnTarget::New)).await;
+}
+
+#[tokio::test]
+async fn test_record_deletion_own_update_while_observation_is_owed() {
+    Box::pin(own_write_while_deletion_is_owed(OwnTarget::Existing)).await;
+}
+
+#[tokio::test]
+async fn test_record_deletion_own_successor_while_observation_is_owed() {
+    Box::pin(own_write_while_deletion_is_owed(OwnTarget::Deleted)).await;
+}
+
+#[tokio::test]
 async fn test_record_deletion_unavailable_owner_resumes_before_the_successor() {
     Box::pin(resume_deletion(DeletionInstall::Original)).await;
 }
@@ -9648,8 +9758,16 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     let original_delete = s.w.switch.record(&key).unwrap();
     assert!(original_delete.state.deleted);
     if let Some(reader) = &mut reader {
+        s.protocol
+            .observe_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let held = reader.read_record(&target).await.unwrap().unwrap();
         assert_eq!(held.content, RecordContent::Deleted);
+        assert_eq!(reader.state.deletion_receipts.len(), 1);
+        assert_eq!(
+            deletion_receipts(reader).await[0]["hash"],
+            json!(original_delete.revision.item_hash)
+        );
     }
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
@@ -9740,6 +9858,16 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
             held.different_write_at_held_version,
             uploaded == UploadedDelete::Other,
             "only a different signed delete at the held version changes the write base"
+        );
+        assert_eq!(
+            reader.state.deletion_receipts.is_empty(),
+            uploaded == UploadedDelete::Other
+        );
+        let receipts = deletion_receipts(reader).await;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0]["hash"],
+            json!(original_delete.revision.item_hash)
         );
     }
     wallet.receive(None).await.unwrap();

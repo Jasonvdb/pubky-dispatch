@@ -131,7 +131,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   `delobs/<key>/<generation>/<version>/<item hash>`. Its original signed delete,
   preceding signed readable write when available, certificates, proof, prior mark
   and verified feed-page time travel together. The owner waits there while another
-  owner can continue. Both backup forms carry unanswered observations. A restore
+  owner can continue. Proof of an app's own submission settles its record write while
+  an earlier foreign observation remains owed. Both backup forms carry unanswered observations. A restore
   verifies the deletion, checks the predecessor's identity against the signed base or
   dated proof, and keeps outstanding observations from the same install.
 - The owner's bounded observation writes and their acknowledgement commit together.

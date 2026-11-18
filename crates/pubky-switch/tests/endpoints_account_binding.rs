@@ -326,6 +326,11 @@ async fn test_fresh_enrollment_receipt_verifies_the_initial_exclusions_after_res
     let path = replay.key_dir().join("accounts/marks").join(key().id());
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.len() <= 4096);
+    let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        record.get("recovery").is_none(),
+        "the mark requires verified SQL for this set"
+    );
     let reopened = service_with_restored_mark(&replay, &bytes);
     let MarkRead::Mark(mark) = MarkStore::open(replay.key_dir())
         .unwrap()
@@ -427,6 +432,150 @@ async fn test_first_counted_change_checks_the_actual_opening_contents() {
         &sent
     ));
     assert!(support::header_text(&refused, header::HEAD).is_none());
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
+    check_opening_confirmation(false).await;
+}
+
+#[tokio::test]
+async fn test_opening_receipt_confirms_a_sql_required_mark_after_restart() {
+    check_opening_confirmation(true).await;
+}
+
+async fn check_opening_confirmation(overflow: bool) {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let mut body = make_enrollment(EnrollmentIntent::Create { observation }, 43)
+        .body()
+        .clone();
+    if overflow {
+        let mut apps: Vec<_> = (0..=255).map(|n| [n; 16]).collect();
+        apps.sort_by_key(|id| pubky_switch_core::enc::zbase32_encode(id));
+        body.revoked_apps = Some(apps);
+    }
+    let opening = Enrollment::sign(&key(), body).unwrap();
+
+    // Hold the creating transaction at COMMIT so the saved bytes come from the
+    // service's reservation writer (Switch account binding 3).
+    sql(
+        &replay,
+        "CREATE FUNCTION wait_for_opening() RETURNS trigger LANGUAGE plpgsql AS \
+        $$ BEGIN PERFORM pg_advisory_xact_lock(792043); RETURN NEW; END $$; \
+        CREATE CONSTRAINT TRIGGER wait_for_opening AFTER INSERT ON accounts \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION wait_for_opening()",
+    )
+    .await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .unwrap();
+    let mut gate = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(792043)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let (original, reserved) = tokio::join!(
+        replay.service.handle(enrollment_request(&opening, NOW)),
+        async {
+            let reserved = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                std::fs::read(&path).unwrap()
+            })
+            .await
+            .expect("opening reservation");
+            gate.commit().await.unwrap();
+            reserved
+        }
+    );
+    conn.close().await.unwrap();
+    status(&original, 200);
+    let completed = std::fs::read(&path).unwrap();
+    let mut expected: Value = serde_json::from_slice(&reserved).unwrap();
+    assert_eq!(expected.get("recovery").is_none(), overflow);
+    let position = if overflow {
+        &mut expected
+    } else {
+        &mut expected["position"]
+    };
+    let flag = &mut position["creation_anchor"]["bound"]["confirmed"];
+    assert_eq!(*flag, false);
+    *flag = true.into();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&completed).unwrap(),
+        expected
+    );
+
+    let reopened = service_with_restored_mark(&replay, &reserved);
+    let request = enrollment_request(&opening, NOW);
+    let sent = support::Sent::of(&request);
+    let answer = reopened.handle(request).await;
+    status(&answer, 200);
+    assert_eq!(answer.body, original.body);
+    assert!(support::signed_with(
+        &answer,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), completed);
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_opening_mark_keeps_the_confirmed_limits_and_exclusions() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let mut body = make_enrollment(EnrollmentIntent::Create { observation }, 48)
+        .body()
+        .clone();
+    let app = [7; 16];
+    body.revoked_apps = Some(vec![app]);
+    let enrollment = Enrollment::sign(&key(), body).unwrap();
+    let answer = replay
+        .service
+        .handle(enrollment_request(&enrollment, NOW))
+        .await;
+    status(&answer, 200);
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let read =
+        || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+    let record = read();
+    let source = &record["recovery"];
+    assert_eq!(source["identity"], hex::encode(key().public()));
+    assert_eq!(
+        source["store_id"],
+        hex::encode(replay.marks.identity().await.unwrap())
+    );
+    assert_eq!(source["limits"], value(&answer)["limits"]);
+    assert_eq!(source["prior"], serde_json::Value::Null);
+    assert_eq!(source["generation_floor"], 1);
+    assert_eq!(source["directory_version"], 0);
+    assert_eq!(source["apps_version"], 0);
+    assert_eq!(source["had_reachable_apps"], false);
+    assert_eq!(
+        source["kept"],
+        json!([{"app_id": hex::encode(app), "reason":"enrolled",
+        "at_ms": NOW, "data_epoch": null, "rotated": false}])
+    );
+    assert_eq!(source["held"], json!([]));
+    assert_eq!(
+        record["position"]["creation_anchor"]["bound"]["confirmed"],
+        true
+    );
+    let reopened = MarkStore::open(replay.key_dir()).unwrap();
+    reopened
+        .raise_floor(&key().id(), NOW, NOW + 200_000)
+        .await
+        .unwrap();
+    assert_eq!(&read()["recovery"], source);
     replay.db.drop_database().await.unwrap();
 }
 

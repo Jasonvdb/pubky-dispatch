@@ -35,7 +35,9 @@
 //! or deleted, and no erasure's record written, while another process may hold the database
 //! (Switch spec 6.5).
 
+pub(crate) mod coverage;
 mod erasure;
+use coverage::{Observed, RecoverySource};
 pub(crate) use erasure::ErasureAttempt;
 use erasure::{attempt_from_bytes, read_attempts};
 
@@ -60,7 +62,7 @@ use crate::keys::{
 use crate::store::LockFreshness;
 
 /// The largest mark file the store reads, in bytes; a larger one doesn't read as a mark.
-const MAX_MARK_FILE: u64 = 4096;
+pub(crate) const MAX_MARK_FILE: u64 = 4096;
 
 /// The largest erasure's record the store reads, in bytes: a `u64` in decimal.
 const MAX_ERASURE_FILE: u64 = 20;
@@ -87,6 +89,8 @@ pub enum CreationAnchor {
         /// The nonzero content commitment.
         #[serde(with = "hex_bytes")]
         digest: [u8; 32],
+        /// Whether the service observed the matching creation in committed SQL.
+        confirmed: bool,
     },
 }
 
@@ -97,6 +101,7 @@ impl CreationAnchor {
             Self::Bound {
                 created_at_ms,
                 digest,
+                ..
             } if created == created_at_ms => Some(digest),
             _ => None,
         }
@@ -188,6 +193,7 @@ impl AccountMark {
         if let CreationAnchor::Bound {
             created_at_ms,
             digest,
+            ..
         } = self.creation_anchor
             && (created_at_ms > self.created_at_ms || digest == [0; 32])
         {
@@ -428,7 +434,7 @@ struct Inner {
     store_id: Mutex<Option<String>>,
     /// What the store last held durably for each identity read. Reads compare the live
     /// file, and only a successful directory sync publishes a changed mark.
-    marks: Mutex<HashMap<String, MarkRead>>,
+    marks: Mutex<HashMap<String, Observed>>,
     /// Retirements last read or written durably, checked against their live files.
     retired: Mutex<HashMap<String, BTreeSet<u64>>>,
     /// Erasure records last read or written durably, checked against their live files.
@@ -582,6 +588,7 @@ impl MarkStore {
         key: [u8; 32],
         created_at_ms: u64,
         anchor: [u8; 32],
+        recovery: Option<RecoverySource>,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
         if anchor == [0; 32] {
@@ -591,15 +598,66 @@ impl MarkStore {
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
+            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), recovery, |held| {
                 (held == MarkRead::Missing).then_some(AccountMark {
                     creation_anchor: CreationAnchor::Bound {
                         created_at_ms,
                         digest: anchor,
+                        confirmed: false,
                     },
                     ..AccountMark::zero(key, created_at_ms)
                 })
             })
+        })
+        .await
+    }
+
+    /// Seal an observed SQL creation in its independent mark. The caller verified the
+    /// committed opening receipt while holding the identity lock (account binding 3).
+    pub(crate) async fn confirm_creation(
+        &self,
+        identity: &str,
+        store_id: [u8; 16],
+        read: AccountMark,
+    ) -> Result<bool, MarkStoreError> {
+        let CreationAnchor::Bound {
+            created_at_ms,
+            digest,
+            confirmed,
+        } = read.creation_anchor
+        else {
+            return Ok(false);
+        };
+        if created_at_ms != read.created_at_ms {
+            return Ok(false);
+        }
+        if confirmed {
+            return Ok(true);
+        }
+        self.check_gate()?;
+        let gate = self.gate.clone();
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            let sealed = AccountMark {
+                creation_anchor: CreationAnchor::Bound {
+                    created_at_ms,
+                    digest,
+                    confirmed: true,
+                },
+                ..read
+            };
+            let result = inner.write_sync_in_store(
+                gate.as_ref(),
+                &identity,
+                Some(store_id),
+                None,
+                |held| {
+                    (held == MarkRead::Mark(read) && !inner.erased_after(&identity, created_at_ms))
+                        .then_some(sealed)
+                },
+            )?;
+            Ok(result == MarkWrite::Written(sealed))
         })
         .await
     }
@@ -671,7 +729,7 @@ impl MarkStore {
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         blocking(move || {
-            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
+            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), None, |held| {
                 (held == MarkRead::Mark(read)).then_some(AccountMark {
                     creation_anchor: read.creation_anchor,
                     ..target.mark(key, created_at_ms, read.time_floor_ms)
@@ -1113,7 +1171,7 @@ impl Inner {
             if dir == self.marks_dir() {
                 self.marks
                     .lock()
-                    .insert(name.to_string(), mark_from_bytes(bytes.as_deref()));
+                    .insert(name.to_string(), Observed::read(bytes.as_deref()));
             } else if dir == self.retired_dir() {
                 let (identity, generation) = retirement_name(name)?;
                 self.retired
@@ -1450,7 +1508,7 @@ impl Inner {
         }
         let path = self.mark_path(identity);
         let bytes = read_record_file(&path, MAX_MARK_FILE)?;
-        let observed = mark_from_bytes(bytes.as_deref());
+        let observed = Observed::read(bytes.as_deref()).checked(identity, store_id);
         let mut marks = self.marks.lock();
         let read = if let Some(held) = marks.get(identity) {
             if self
@@ -1459,19 +1517,19 @@ impl Inner {
                 .get(&path)
                 .is_some_and(|pending| *pending == bytes)
             {
-                *held
+                held.position
+            } else if matches!(observed.position, MarkRead::Mark(_)) && observed != *held {
+                MarkRead::NotAMark
             } else {
-                match observed {
-                    MarkRead::Mark(_) if observed != *held => MarkRead::NotAMark,
-                    other => other,
-                }
+                observed.position
             }
         } else {
             // An absent file for an arbitrary identity is no durable authority to retain.
-            if observed != MarkRead::Missing {
+            let position = observed.position;
+            if position != MarkRead::Missing {
                 marks.insert(identity.to_string(), observed);
             }
-            observed
+            position
         };
         if let MarkRead::Mark(mark) = read {
             self.retirement(identity, mark.generation)?;
@@ -1502,7 +1560,7 @@ impl Inner {
         identity: &str,
         next: impl FnOnce(MarkRead) -> Option<AccountMark>,
     ) -> Result<MarkWrite, MarkStoreError> {
-        self.write_sync_in_store(gate, identity, None, next)
+        self.write_sync_in_store(gate, identity, None, None, next)
     }
 
     fn write_sync_in_store(
@@ -1510,6 +1568,7 @@ impl Inner {
         gate: Option<&LockFreshness>,
         identity: &str,
         expected_store: Option<[u8; 16]>,
+        recovery: Option<RecoverySource>,
         next: impl FnOnce(MarkRead) -> Option<AccountMark>,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.writing(gate, RecordScope::Identity(identity), |id| {
@@ -1526,8 +1585,8 @@ impl Inner {
                     self.marks
                         .lock()
                         .entry(identity.to_string())
-                        .or_insert(held);
-                    self.put_mark(identity, mark)?;
+                        .or_insert_with(|| held.into());
+                    self.put_mark(identity, held, mark, recovery.as_ref())?;
                     Ok(MarkWrite::Written(mark))
                 }
                 None => Ok(MarkWrite::Unchanged(held)),
@@ -1537,9 +1596,31 @@ impl Inner {
 
     /// Write `mark` durably, then hold it in memory. The caller holds `writes` and loaded
     /// the identity's mark first.
-    fn put_mark(&self, identity: &str, mark: AccountMark) -> Result<(), MarkStoreError> {
-        let bytes = serde_json::to_vec(&mark)
-            .map_err(|error| MarkStoreError::Io(std::io::Error::other(error.to_string())))?;
+    fn put_mark(
+        &self,
+        identity: &str,
+        read: MarkRead,
+        mark: AccountMark,
+        recovery: Option<&RecoverySource>,
+    ) -> Result<(), MarkStoreError> {
+        // Confirmation and a time-only write preserve the material at the same position.
+        // Across a change of lifetime or count, only newly established evidence applies.
+        let previous = self.marks.lock().get(identity).and_then(|held| {
+            let MarkRead::Mark(before) = read else {
+                return None;
+            };
+            if before.head() == mark.head()
+                && before.state_version == mark.state_version
+                && before.state_tag == mark.state_tag
+                && before.created_at_ms == mark.created_at_ms
+                && before.key == mark.key
+            {
+                held.recovery.clone()
+            } else {
+                None
+            }
+        });
+        let bytes = Observed::encode(mark, recovery.or(previous.as_deref()))?;
         self.write_atomic(&self.mark_path(identity), &bytes)
     }
 
@@ -1562,7 +1643,7 @@ impl Inner {
             match order(&mark, &target, key) {
                 Advance::Moved(moved) => {
                     self.retirement(identity, moved.generation)?;
-                    self.put_mark(identity, moved)?;
+                    self.put_mark(identity, MarkRead::Mark(mark), moved, None)?;
                     Ok(Advance::Moved(moved))
                 }
                 held => Ok(held),
@@ -1777,7 +1858,10 @@ impl MarkView {
                 "an erasure outcome is unresolved".into(),
             ));
         }
-        read_mark_file(&self.accounts.join("marks").join(identity))
+        let bytes = read_record_file(&self.accounts.join("marks").join(&identity), MAX_MARK_FILE)?;
+        Ok(Observed::read(bytes.as_deref())
+            .checked(&identity, &self.store_id)
+            .position)
     }
 
     /// The identity's current retired generations, ascending.
@@ -1968,26 +2052,6 @@ fn list_marks(dir: &Path) -> Result<Vec<String>, MarkStoreError> {
     }
     identities.sort();
     Ok(identities)
-}
-
-/// Read the mark file at `path`.
-fn read_mark_file(path: &Path) -> Result<MarkRead, MarkStoreError> {
-    Ok(mark_from_bytes(
-        read_record_file(path, MAX_MARK_FILE)?.as_deref(),
-    ))
-}
-
-fn mark_from_bytes(bytes: Option<&[u8]>) -> MarkRead {
-    let Some(bytes) = bytes else {
-        return MarkRead::Missing;
-    };
-    if bytes.len() as u64 > MAX_MARK_FILE {
-        return MarkRead::NotAMark;
-    }
-    match serde_json::from_slice::<AccountMark>(bytes) {
-        Ok(mark) if mark.is_valid() => MarkRead::Mark(mark),
-        Ok(_) | Err(_) => MarkRead::NotAMark,
-    }
 }
 
 fn read_record_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, MarkStoreError> {
@@ -4334,8 +4398,13 @@ mod tests {
         fs::remove_file(marks_dir(&dir).join(ALICE)).expect("lose known mark");
         assert_eq!(store.read(ALICE).await.expect("lost"), MarkRead::Missing);
         assert_eq!(
-            store.inner.marks.lock().get(ALICE),
-            Some(&MarkRead::Mark(held))
+            store
+                .inner
+                .marks
+                .lock()
+                .get(ALICE)
+                .map(|held| held.position),
+            Some(MarkRead::Mark(held))
         );
         fs::write(
             marks_dir(&dir).join(ALICE),

@@ -48,6 +48,8 @@ pub(crate) struct ItemsProtocol {
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
+    /// Whether a delete fails a check of the protocol's own, seen or not.
+    pub(crate) refuses_deletes: std::sync::atomic::AtomicBool,
     /// An item no write may hold, seen or not: a check of the protocol's own that a first
     /// write fails too.
     pub(crate) forbidden: std::sync::Mutex<Option<String>>,
@@ -160,9 +162,12 @@ impl Protocol for ItemsProtocol {
     ) -> Option<String> {
         self.bases.lock().unwrap().push(base);
         let Some(value) = value else {
-            return (seen.is_some()
+            return ((seen.is_some()
                 && self
                     .deletes_regress
+                    .load(std::sync::atomic::Ordering::SeqCst))
+                || self
+                    .refuses_deletes
                     .load(std::sync::atomic::Ordering::SeqCst))
             .then(|| "sample: a record seen was deleted".to_owned());
         };
@@ -6883,6 +6888,35 @@ async fn created_and_deleted(app: &mut App, target: &RecordTarget) -> [u8; 32] {
         .unwrap();
     app.delete_record(target, vec![]).await.unwrap();
     app.record_key(target).unwrap()
+}
+
+/// A refused first write that is a delete is followed as a delete: once the service forgets
+/// it, the app's write creates the record instead of naming it for good (Switch spec 8.2,
+/// 10.3).
+#[tokio::test]
+async fn test_records_refused_first_delete_is_written_over_after_a_forget() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    s.protocol
+        .refuses_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut phone = s.join("phone").await;
+    let read = phone.read_record_fresh(&target).await.unwrap();
+    assert!(
+        matches!(&read, RecordRead::Kept { record: Some(held), reason: KeptReason::Refused }
+            if held.flagged && held.content == RecordContent::Unreadable(Unopened::Refused)),
+        "{read:?}"
+    );
+    s.protocol
+        .refuses_deletes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    let written = put_over_a_forgotten_delete(&mut phone, &target, &value(&["b"])).await;
+    assert_eq!(ids(written.content.value()), ["b"]);
 }
 
 /// `app` reads its feed and moves its cursor at the switch past what it read.

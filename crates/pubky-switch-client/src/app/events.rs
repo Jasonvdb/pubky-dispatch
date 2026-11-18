@@ -943,8 +943,9 @@ pub enum AppEvent {
     /// holds, or one not shown newer, by an answer current past the held write (Switch spec
     /// 10.3): the app keeps the write it holds. `write.authenticated` `false`, or a held
     /// version that is the service's word only, says this is the service's claim of the
-    /// record now; two authenticated versions are a rollback instead. Told at each read or
-    /// listing that shows it, so the host may hear it again.
+    /// record now; two authenticated versions are a rollback instead. Told at each read,
+    /// listing or feed write that shows it, so the host may hear it again.
+    #[non_exhaustive]
     RecordShownOlder {
         /// The record key.
         key: [u8; 32],

@@ -442,9 +442,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
-  copy that doesn't verify; **`Fault::Head`** one that applies the request and signs its answer with an earlier head or none; **`Fault::SignWith`** one that applies the request and signs
+  copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
   its answer with another key, such as a third key; **`Fault::ErrorSignedWith`** an
-  error answer under another key, applying nothing.
+  error answer under another key, applying nothing; **`Fault::Head`** one that applies the
+  request and signs its answer with an earlier head, a forked one, or none.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` is `401
   stale_timestamp` for a timestamp more than five minutes from the switch's time base;
   then it checks the body's `created` names the account's creation time and

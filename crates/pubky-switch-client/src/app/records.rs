@@ -2931,7 +2931,11 @@ impl App {
                     if accepted.viewed {
                         upgraded.applied = accepted.revision;
                         upgraded.gone = false;
-                        if upgraded.follow == Some(upgraded.version) {
+                        // A write held refused is followed as itself for good: its value
+                        // isn't trusted, so the follow keeps whether it is a delete.
+                        if upgraded.content == RecordContent::Unreadable(Unopened::Refused) {
+                            upgraded.follow_applied = Some(accepted.revision);
+                        } else if upgraded.follow == Some(upgraded.version) {
                             upgraded.follow = None;
                             upgraded.follow_applied = None;
                             upgraded.follow_deleted = false;
@@ -3024,8 +3028,9 @@ impl App {
                 let deleted = accepted.content == RecordContent::Deleted;
                 // With nothing held, there is no version to follow the refused write from:
                 // it is held for its version only, its value not trusted
-                // ([`Unopened::Refused`]), so the record reads as flagged and the next write
-                // builds on it instead of creating the record (Switch spec 8.2).
+                // ([`Unopened::Refused`]), and followed as itself, a delete included, so the
+                // record reads as flagged and the next write builds on it, or creates the
+                // record once the service forgot that delete (Switch spec 8.2, 10.3).
                 if held.is_none() {
                     let refused = HeldRecord {
                         collection: accepted.collection.name.clone(),
@@ -3042,9 +3047,9 @@ impl App {
                         content: RecordContent::Unreadable(Unopened::Refused),
                         doubtful: accepted.doubtful,
                         applied: accepted.revision,
-                        follow: None,
-                        follow_applied: None,
-                        follow_deleted: false,
+                        follow: Some(accepted.version.version),
+                        follow_applied: Some(accepted.revision),
+                        follow_deleted: deleted,
                         gone: false,
                         follow_named: true,
                         live_in: None,

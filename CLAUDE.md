@@ -44,6 +44,7 @@ These are the conditions of a consistent Switch (Switch spec 6.5). Breaking one 
 - `cargo fmt --all`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`, then `cargo test --workspace --all-features`, then `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`. CI runs all four, plus a check on the minimum supported Rust version (1.91.1).
 - **No panics on network input:** no `unwrap`, `expect`, `panic!`, unchecked indexing or unchecked arithmetic on anything a caller, a peer or storage supplies. Workspace lints deny `unwrap_used`, `expect_used` and `panic` outside tests.
 - **Errors:** map every failure to the error answer the wire format fixes (Switch wire 7.6); never leak internal detail in a response body.
+- Prefer an additive public API when it expresses the required behavior. If existing callers must edit their code, document the affected API and the required caller change under "What will still change" in `docs/known-issues.md` in the same pull request.
 - Public items carry `///` docs; `missing_docs` is denied.
 - No `unsafe` code.
 - Keep files ASCII. Follow Rust defaults: snake_case functions and modules, UpperCamelCase types, SCREAMING_SNAKE_CASE constants.

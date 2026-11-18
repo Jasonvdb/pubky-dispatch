@@ -35,7 +35,9 @@ use super::claims::ObligationDeadline;
 use super::error::{KeptAhead, Refusal, RefusalPlace, never_left, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::kept::{Ended, KeptBatchDrop, index_kept};
-use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
+use super::protocol::{
+    LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
+};
 use super::recovery::LossStep;
 use super::send::{OutboxItem, SignedMessage};
 use super::state::{Tx, key};
@@ -143,12 +145,23 @@ pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
 /// a carried cursor move counting toward them.
 #[derive(Clone, Debug, Default)]
 pub struct OpBatch {
+    first_send_before_ms: Option<u64>,
     ops: Vec<(Vec<Condition>, OpKind)>,
     invites: Vec<InviteNote>,
     deadlines: Vec<([u8; 32], ObligationDeadline)>,
     local: Vec<LocalWrite>,
     queued: Vec<SignedMessage>,
     protocol: Option<String>,
+    kept_id_key: Option<KeptIdKey>,
+}
+
+#[derive(Clone)]
+struct KeptIdKey(Vec<u8>);
+
+impl std::fmt::Debug for KeptIdKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeptIdKey({} bytes)", self.0.len())
+    }
 }
 
 /// An invite code registered in a batch, kept by the app once the switch takes it.
@@ -207,6 +220,14 @@ impl OpBatch {
         self
     }
 
+    /// Set an exclusive service-time deadline for the first transport handoff of
+    /// each signed body. Queued or newly signed bytes keep the deadline. To restrict
+    /// application as well, add a [`server_time_in`] condition (Switch wire 6.3).
+    pub fn first_send_before(mut self, deadline_ms: u64) -> Self {
+        self.first_send_before_ms = Some(deadline_ms);
+        self
+    }
+
     /// The deadline the app computes itself for the obligation of `claim_key`, kept with
     /// the claim's evidence once the switch takes the batch (Switch wire 6.8).
     pub fn obligation_deadline(
@@ -229,6 +250,18 @@ impl OpBatch {
     /// Writes of the protocol's own local state, as [`OpBatch::local`].
     pub fn locals(mut self, writes: impl IntoIterator<Item = LocalWrite>) -> Self {
         self.local.extend(writes);
+        self
+    }
+
+    /// Save the original 16-byte [`App::kept_batch`] ID at this protocol-local key in
+    /// the same commit that first keeps the batch, before sending it. The key must be
+    /// vacant and the batch must belong to a registered protocol. An automatic reseal
+    /// after a definitive stale-epoch refusal replaces only that original ID.
+    ///
+    /// The protocol owns the marker. It can remove it with an applied-only
+    /// [`Self::local`] write and inspect it after an interrupted submission.
+    pub fn keep_id_at(mut self, key: Vec<u8>) -> Self {
+        self.kept_id_key = Some(KeptIdKey(key));
         self
     }
 
@@ -276,6 +309,8 @@ impl OpBatch {
 /// settles. Its `Debug` shows no content.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PendingBatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_send: Option<BatchFirstSend>,
     #[serde(with = "serde_b64_vec")]
     pub(crate) body: Vec<u8>,
     pub(crate) invites: Vec<InviteNote>,
@@ -303,6 +338,13 @@ pub(crate) struct PendingBatch {
     /// Its creation number among the app's kept batches, in the commit that keeps it: the
     /// order kept batches go in (`kept_order`).
     pub(crate) queued_n: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BatchFirstSend {
+    before_ms: u64,
+    /// Only a request-body-bound service answer proves a timely handoff after reload.
+    confirmed_body: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for PendingBatch {
@@ -442,6 +484,9 @@ impl App {
                     None => error,
                 });
             }
+            Err(AppError::ExpiredUnsent) => {
+                return Err(crate::error::TransportError::FirstSendExpired.into());
+            }
             Err(error) => return Err(error),
         };
         let attempts: Vec<(usize, ClaimEntry)> = batch
@@ -465,7 +510,7 @@ impl App {
             .iter()
             .any(|(_, kind)| matches!(kind, OpKind::RecordPut(_)))
             .then(|| batch.clone());
-        let submitted = match (self.submit_new_behind(batch, behind).await, unsigned) {
+        let submitted = match (self.submit_new_behind(batch, behind, None).await, unsigned) {
             (Ok(submitted), _) => submitted,
             (Err(stale), Some(unsigned)) if stale.code() == Some(ErrorCode::StaleEpoch) => {
                 self.submit_resealed(unsigned, stale).await?
@@ -561,7 +606,7 @@ impl App {
     /// Sign `batch` once, keep it, send it and commit its outcome, without sending the
     /// batches kept from earlier calls first.
     pub(crate) async fn submit_new(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
-        self.submit_new_behind(batch, None).await
+        self.submit_new_behind(batch, None, None).await
     }
 
     /// [`App::submit_new`], keeping the batch unsent when batches kept from earlier calls
@@ -571,6 +616,7 @@ impl App {
         &mut self,
         batch: OpBatch,
         behind: Option<AppError>,
+        replace: Option<[u8; 16]>,
     ) -> Result<Submitted, AppError> {
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
@@ -579,7 +625,26 @@ impl App {
         }
         // Local writes over the bound are refused at hand-over, before anything is signed
         // or kept (`Protocol`, "Limits a receive step plans for").
-        if local_writes_bytes(&batch.local) > MAX_STEP_LOCAL_BYTES {
+        let marker = match &batch.kept_id_key {
+            Some(key) => {
+                let owner = batch.protocol.as_deref().ok_or_else(|| {
+                    Refusal::Usage("a kept batch ID key needs a registered protocol".into())
+                })?;
+                let previous = self.protocol_get(owner, &key.0).await?;
+                if previous.as_deref() != replace.as_ref().map(<[_; 16]>::as_slice) {
+                    return Err(Refusal::NotNow(
+                        "the protocol's kept batch ID key is in use".into(),
+                    )
+                    .into());
+                }
+                Some(super::protocols::qualified_key(owner, &key.0))
+            }
+            None => None,
+        };
+        let marker_bytes = marker.as_ref().map_or(0, |k| {
+            k.len().saturating_add(16 + LOCAL_WRITE_OVERHEAD_BYTES)
+        });
+        if local_writes_bytes(&batch.local).saturating_add(marker_bytes) > MAX_STEP_LOCAL_BYTES {
             return Err(Refusal::Usage(format!(
                 "a batch's local writes are at most {MAX_STEP_LOCAL_BYTES} bytes"
             ))
@@ -635,6 +700,10 @@ impl App {
         // The creation number, given out in the commit that keeps it, below.
         let queued_n: u64 = self.reader().get(KEPT_NEXT).await?.unwrap_or(0);
         let pending = PendingBatch {
+            first_send: batch.first_send_before_ms.map(|before_ms| BatchFirstSend {
+                before_ms,
+                confirmed_body: None,
+            }),
             body: signed.body().to_vec(),
             invites: batch.invites,
             deadlines: batch
@@ -670,6 +739,12 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
         tx.put(&pending_key(&id), &pending)?;
+        if let Some(key) = marker {
+            tx.local(&[LocalWrite::Put {
+                key,
+                value: id.to_vec(),
+            }])?;
+        }
         index_kept(&mut tx, &id, &pending, &signed)?;
         if let Some(error) = behind {
             // Kept behind the batches from earlier calls: it goes after them, by the reads
@@ -724,6 +799,24 @@ impl App {
         batch: OpBatch,
         stale: AppError,
     ) -> Result<Submitted, AppError> {
+        let replace = if let (Some(name), Some(key)) = (&batch.protocol, &batch.kept_id_key) {
+            let Some(id) = self
+                .protocol_get(name, &key.0)
+                .await?
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            else {
+                return Err(stale);
+            };
+            if !matches!(self.kept_batch(id).await?, Some(super::KeptBatchStatus::Dropped {
+                reason: KeptBatchDrop::Refused { code }, ..
+            }) if code == ErrorCode::StaleEpoch.as_str())
+            {
+                return Err(stale);
+            }
+            Some(id)
+        } else {
+            None
+        };
         let refreshed = match self.refresh_identity().await {
             Ok(_) => self.fetch_key_bundle().await,
             Err(error) => Err(error),
@@ -734,7 +827,10 @@ impl App {
             Err(_) => return Err(stale),
         }
         match self.reseal(batch)? {
-            Some(resealed) => self.submit_new(resealed).await,
+            Some(resealed) => match self.submit_new_behind(resealed, None, replace).await {
+                Err(AppError::ExpiredUnsent) => Err(stale),
+                result => result,
+            },
             None => Err(stale),
         }
     }
@@ -879,7 +975,10 @@ impl App {
                     self.commit(tx).await?;
                     continue;
                 }
-                self.send_unsent(&id, &pending, &batch).await?;
+                match self.send_unsent(&id, &pending, &batch).await {
+                    Ok(()) | Err(AppError::ExpiredUnsent) => {}
+                    Err(error) => return Err(error),
+                }
                 continue;
             }
             // Past the window no answer tells whether it was applied, at any generation: it
@@ -893,26 +992,48 @@ impl App {
                 past = !self.answer_decides(pending.kept_ms);
             }
             if past {
+                if pending.first_send.is_some()
+                    && Box::pin(self.settle_from_shared_evidence(&id, &pending, &batch)).await?
+                {
+                    continue;
+                }
                 let mut tx = self.tx()?;
                 self.kept_batch_dropped(&id, &pending, &batch, &mut tx)
                     .await?;
                 self.commit(tx).await?;
                 continue;
             }
-            if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
-                self.resend_earlier(&id, &pending, &batch).await?;
-                continue;
-            }
-            match self.run_pending(&id, &pending, &batch, true).await {
-                Ok(submitted) => self.check_attempts_of(&batch, &submitted).await?,
-                Err(error) if refused_before_lookup(&error) => {
-                    self.kept_refused_before_lookup(&id, &pending, &batch, error)
-                        .await?;
+            let result = if super::batch_generation(&batch)
+                .is_some_and(|g| g < self.state.meta.generation)
+            {
+                self.resend_earlier(&id, &pending, &batch).await
+            } else {
+                match self.run_pending(&id, &pending, &batch, true).await {
+                    Ok(submitted) => self.check_attempts_of(&batch, &submitted).await,
+                    Err(error) if refused_before_lookup(&error) => {
+                        self.kept_refused_before_lookup(&id, &pending, &batch, error)
+                            .await
+                    }
+                    Err(error) => match refused_for_good(&error) {
+                        Some(code) => self.kept_batch_refused(&id, &pending, code).await,
+                        None => Err(error),
+                    },
                 }
-                Err(error) => match refused_for_good(&error) {
-                    Some(code) => self.kept_batch_refused(&id, &pending, code).await?,
-                    None => return Err(error),
-                },
+            };
+            if let Err(error) = result {
+                if pending.first_send.is_some()
+                    && matches!(
+                        &error,
+                        AppError::Transport(
+                            crate::error::TransportError::FirstSendExpired
+                                | crate::error::TransportError::FirstSendUnavailable
+                        )
+                    )
+                    && Box::pin(self.settle_from_shared_evidence(&id, &pending, &batch)).await?
+                {
+                    continue;
+                }
+                return Err(error);
             }
         }
         Ok(left)
@@ -1136,6 +1257,70 @@ impl App {
         }
     }
 
+    fn submit_pending<'a>(
+        &'a mut self,
+        id: &'a [u8; 16],
+        pending: &'a PendingBatch,
+        batch: &'a Batch,
+    ) -> crate::transport::BoxFuture<'a, Result<Submitted, AppError>> {
+        // A provider change can resume this write from inside a read. Keep the
+        // guarded submission and its service-time read off that caller's stack.
+        match &pending.first_send {
+            None => Box::pin(self.submit(batch)),
+            Some(first) => Box::pin(self.submit_guarded(id, pending, batch, first)),
+        }
+    }
+
+    async fn submit_guarded(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+        first: &BatchFirstSend,
+    ) -> Result<Submitted, AppError> {
+        let hash = pubky_switch_core::enc::hash(batch.body());
+        if first.confirmed_body == Some(hash) {
+            return self.submit(batch).await;
+        }
+        // Only a verified earlier handoff permits submitting old-generation bytes to
+        // another provider. Newly signed bytes need their own current time check.
+        if super::batch_generation(batch) != Some(self.state.meta.generation) {
+            return Err(crate::error::TransportError::FirstSendUnavailable.into());
+        }
+        self.fresh_service_time().await?;
+        let (highest, offset) = self
+            .state
+            .service_time
+            .filter(|time| time.key == self.state.meta.service_key)
+            .and_then(|time| Some((time.highest_ms, time.offset_ms?)))
+            .ok_or(crate::error::TransportError::FirstSendUnavailable)?;
+        let gate = crate::transport::FirstSend::new(
+            self.env.clock.clone(),
+            highest,
+            offset,
+            first.before_ms,
+        );
+        let result = self.submit_before(batch, Some(&gate)).await;
+        if gate.confirmed() && result.is_err() {
+            let mut held = pending.clone();
+            if let Some(first) = &mut held.first_send {
+                first.confirmed_body = Some(hash);
+            }
+            let mut tx = self.tx()?;
+            tx.put(&pending_key(id), &held)?;
+            self.commit(tx).await?;
+        }
+        // A failed timestamp retry can itself have sent nothing, after these bytes
+        // already reached the service. Never roll that first handoff back to unsent.
+        if gate.confirmed() && result.as_ref().is_err_and(never_left) {
+            return Err(crate::error::TransportError::Other(
+                "the switch received the body but its timestamp retry was unanswered".into(),
+            )
+            .into());
+        }
+        result
+    }
+
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
     /// `resent` for a batch that may have been sent before: one refused before the batch ID
@@ -1177,10 +1362,21 @@ impl App {
         } else {
             pending
         };
-        let submitted = match self.submit(batch).await {
+        let submitted = match self.submit_pending(id, pending, batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
                 self.note_kept_rate_limited(&error);
+                if first_send
+                    && matches!(
+                        error,
+                        AppError::Transport(crate::error::TransportError::FirstSendExpired)
+                    )
+                {
+                    let mut tx = self.tx()?;
+                    self.kept_batch_dropped(id, unsent, batch, &mut tx).await?;
+                    self.commit(tx).await?;
+                    return Err(AppError::ExpiredUnsent);
+                }
                 // A first send the transport never carried leaves a batch never sent: its
                 // stamp is taken back, so it has no window and is never ambiguous. A crash
                 // before this commit leaves it stamped, as one that may have been sent.
@@ -1445,7 +1641,7 @@ impl App {
         pending: &PendingBatch,
         batch: &Batch,
     ) -> Result<(), AppError> {
-        let sent = self.submit(batch).await;
+        let sent = self.submit_pending(id, pending, batch).await;
         if let Err(error) = &sent {
             self.note_kept_rate_limited(error);
         }
@@ -1521,6 +1717,17 @@ impl App {
         };
         // Applied: an attempt learned of this way isn't carried out on this answer; the
         // protocol reads its claim (Switch spec 12.5 "Kept batches").
+        self.commit_kept_application(id, pending, batch, &proofs)
+            .await
+    }
+
+    async fn commit_kept_application(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+        proofs: &[TransitionProof],
+    ) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         for (index, op) in batch.ops().iter().enumerate() {
             self.settle_op(op, proofs.get(index), pending, &mut tx)
@@ -1535,6 +1742,89 @@ impl App {
         self.events
             .push(AppEvent::KeptBatchApplied { batch_id: *id });
         Ok(())
+    }
+
+    /// A lost answer can be recovered from the signed operations held after reading
+    /// the affected records and claims. Match the complete original batch before
+    /// committing its effects. The proofs say nothing about an unsigned cursor move.
+    async fn settle_from_shared_evidence(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+    ) -> Result<bool, AppError> {
+        let Some(generation) = super::batch_generation(batch) else {
+            return Ok(false);
+        };
+        let identity = self.identity();
+        let writer = self.app_id();
+        if batch.ops().iter().any(|op| {
+            let body = op.body();
+            body.identity != identity
+                || body.app_id != Some(writer)
+                || body.generation != generation
+                || !matches!(body.kind, OpKind::RecordPut(_) | OpKind::Claim(_))
+        }) {
+            return Ok(false);
+        }
+        let Some(service) = self.service_key_of(generation).await? else {
+            return Ok(false);
+        };
+        let evidence = self.shared_evidence().await?;
+        let signed: Option<Vec<_>> = batch
+            .ops()
+            .iter()
+            .map(|op| {
+                evidence
+                    .ops
+                    .iter()
+                    .find(|held| held.op == *op.signed())?
+                    .proof
+                    .clone()
+            })
+            .collect();
+        let Some(signed) = signed else {
+            return Ok(false);
+        };
+        let Ok(proofs) =
+            pubky_switch_core::chain::bind_answer(batch.ops(), &signed, &service, &identity)
+        else {
+            return Ok(false);
+        };
+        let mut previous: Option<&TransitionProof> = None;
+        for (op, proof) in batch.ops().iter().zip(&proofs) {
+            let stub = proof.envelope();
+            if previous.is_some_and(|prev| {
+                prev.envelope().seq.checked_add(1) != Some(stub.seq)
+                    || prev.body().chain.chain_hash != stub.prev_chain_hash
+                    || prev.envelope().server_time > stub.server_time
+            }) {
+                return Ok(false);
+            }
+            previous = Some(proof);
+            if op.body().conditions.iter().any(|condition| matches!(
+                condition, Condition::ServerTimeIn { start, end }
+                    if start.is_some_and(|at| stub.server_time < at) || end.is_some_and(|at| stub.server_time >= at)
+            )) {
+                return Ok(false);
+            }
+            if let OpKind::Claim(fields) = &op.body().kind {
+                let Ok(entry) = fields.check() else {
+                    return Ok(false);
+                };
+                if matches!(entry.kind, EntryKind::Attempt { .. })
+                    && pubky_switch_core::chain::check_attempt_proof(
+                        proof, &entry, &writer, generation,
+                    )
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        self.commit_kept_application(id, pending, batch, &proofs)
+            .await?;
+        Ok(true)
     }
 
     /// A kept batch the old service applied, though its answer was lost: what it settles

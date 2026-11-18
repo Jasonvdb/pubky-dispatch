@@ -93,7 +93,9 @@ impl App {
         let item = write.applied.item_hash;
         let version = write.version;
         let at = match current_at {
-            CurrentAt::Answer(v) => Some(position(v.generation, v.version)),
+            CurrentAt::Answer(v) | CurrentAt::KeyAtKnownTip(v, _) => {
+                Some(position(v.generation, v.version))
+            }
             CurrentAt::Itself => Some(position(
                 version.version.generation,
                 version.version.version,

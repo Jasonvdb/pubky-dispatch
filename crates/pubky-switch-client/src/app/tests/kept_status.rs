@@ -866,3 +866,165 @@ async fn test_kept_batch_status_ends_go_with_a_leave() {
     .unwrap();
     assert_eq!(end_keys(&app).await, 0);
 }
+
+#[tokio::test]
+async fn test_first_send_possible_stamp_after_reload_does_not_permit_late_transport() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_app(&w, &router).await;
+    let app_id = app.app_id();
+    let before = w.clock.now_ms() + 600_000;
+    w.switch.fail_next(Fault::Unanswered {
+        path: "ops".into(),
+        after: 0,
+    });
+    let id = app
+        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept {
+            sent_at_ms: Some(_),
+            ..
+        })
+    ));
+    drop(app);
+    w.clock.set_ms(before);
+    let mut app = load_on(&w, &router, w.store.clone(), app_id).await.unwrap();
+    let n = router.log().len();
+    assert!(app.resume_batches().await.is_err());
+    assert!(
+        !router.log()[n..]
+            .iter()
+            .any(|r| r.starts_with("POST ") && r.ends_with("/ops"))
+    );
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_first_send_verified_handoff_allows_the_same_body_after_reload() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_app(&w, &router).await;
+    let app_id = app.app_id();
+    let before = w.clock.now_ms() + 600_000;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    let id = app
+        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    drop(app);
+    w.clock.set_ms(before);
+    let mut app = load_on(&w, &router, w.store.clone(), app_id).await.unwrap();
+    let n = router.log().len();
+    app.resume_batches().await.unwrap();
+    assert_eq!(
+        router.log()[n..]
+            .iter()
+            .filter(|r| r.starts_with("POST ") && r.ends_with("/ops"))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Applied { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_first_send_new_body_has_no_handoff_even_with_same_kept_id() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_app(&w, &router).await;
+    let before = w.clock.now_ms() + 600_000;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    let id = app
+        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    let (_, mut pending) = app.kept_batches().await.unwrap().pop().unwrap();
+    let old = crate::client::Batch::from_body(pending.body.clone()).unwrap();
+    let signed = app
+        .sign_ops(crate::app::provider::ops_of(&old), None)
+        .unwrap();
+    assert_ne!(signed.body(), pending.body);
+    pending.body = signed.body().to_vec();
+    pending.kept_ms = None;
+    let mut tx = app.tx().unwrap();
+    App::keep_signed_again(&id, &pending, &mut tx).unwrap();
+    app.commit(tx).await.unwrap();
+    w.clock.set_ms(before);
+    let n = router.log().len();
+    app.resume_batches().await.unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Dropped {
+            reason: KeptBatchDrop::Unsent,
+            ..
+        })
+    ));
+    assert!(
+        !router.log()[n..]
+            .iter()
+            .any(|r| r.starts_with("POST ") && r.ends_with("/ops"))
+    );
+}
+
+#[tokio::test]
+async fn test_first_send_lost_answer_needs_every_original_operation_proof() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_app(&w, &router).await;
+    let cutoff = w.clock.now_ms() + 600_000;
+    let second = [23; 32];
+    let batch = OpBatch::new()
+        .op(ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, Some(cutoff)).kind())
+        .op(ClaimOp::attempt(second, 0, [21; 16], 3600, Some(cutoff)).kind())
+        .first_send_before(cutoff);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let id = app
+        .submit_batch(batch)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+
+    w.clock.set_ms(cutoff);
+    let before = router.log().len();
+    assert!(app.read_claim(&CLAIM).await.unwrap().is_some());
+    assert!(app.resume_batches().await.is_err());
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept { .. })
+    ));
+
+    assert!(app.read_claim(&second).await.unwrap().is_some());
+    app.resume_batches().await.unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Applied { .. })
+    ));
+    assert!(
+        !router.log()[before..]
+            .iter()
+            .any(|r| r.starts_with("POST ") && r.ends_with("/ops"))
+    );
+}

@@ -1679,9 +1679,13 @@ name = "pubky-switch-client"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "ed25519-dalek",
  "getrandom 0.3.4",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "pubky-switch-client",
  "pubky-switch-core",
  "reqwest",
@@ -1689,7 +1693,9 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "url",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]

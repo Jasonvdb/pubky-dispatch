@@ -31,15 +31,17 @@
 //!
 //! [`SharedRecord::divergent`]: super::records::SharedRecord::divergent
 
+use std::collections::BTreeMap;
+
 use pubky_switch_core::enc::{b64, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::scopes::Permission;
 
 use super::claims::{claim_key_of, reread_key};
 use super::events::Duty;
-use super::records::record_key_of;
+use super::records::{RecordAnswer, WriteRead, record_key_of};
 use super::state::Tx;
-use super::{App, AppError};
+use super::{App, AppError, FeedPosition};
 use crate::error::{ClientError, StoreError};
 
 /// A record the app reads again after an upload listed it (`rcread/<key>`), with when it
@@ -69,7 +71,7 @@ pub const MAX_RECORD_MARKS: usize = 1_000;
 const MAX_MARKED_KEYS: usize = 14_742;
 
 /// What one mark takes in a commit, at most: its namespace, key and value.
-const MARK_BYTES: u64 = 128;
+const MARK_BYTES: u64 = 256;
 
 // The marks of one upload fit the room a feed item has in its read's commit.
 const _: () = assert!(2 * (MAX_MARKED_KEYS as u64) * MARK_BYTES <= super::feed::ITEM_ROOM_BYTES);
@@ -82,7 +84,43 @@ pub(super) fn divergent_key(key: &[u8; 32]) -> String {
     format!("{DIVERGENT_PREFIX}{}", b64(key))
 }
 
+/// The device time orders work. The verified feed position determines which answers
+/// can fulfill the upload's read (Switch wire 7.4.14).
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct RecordReread {
+    marked_ms: u64,
+    upload: FeedPosition,
+}
+
 impl App {
+    pub(super) async fn record_upload(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Option<FeedPosition>, AppError> {
+        Ok(self
+            .reader()
+            .get::<RecordReread>(&record_reread_key(key))
+            .await?
+            .map(|mark| mark.upload))
+    }
+
+    /// A replay before the cursor can revisit an earlier upload. Retain the higher
+    /// verified position when individual obligations or listings are combined.
+    pub(super) fn latest_upload(
+        &self,
+        a: FeedPosition,
+        b: FeedPosition,
+    ) -> Result<FeedPosition, AppError> {
+        match self.received_order(a, b) {
+            Some(std::cmp::Ordering::Less) => Ok(b),
+            Some(_) => Ok(a),
+            None => Err(super::Refusal::NotNow(
+                "the outstanding upload positions cannot be ordered".into(),
+            )
+            .into()),
+        }
+    }
+
     /// Mark for reading again the records an upload changed or made divergent, and the
     /// claims among those it lists that the app holds, from its `upload` transition in the
     /// feed (Switch wire 7.4.14), in `tx`. A key already marked is marked again, at the
@@ -90,62 +128,82 @@ impl App {
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
     /// listing instead, but for records the app holds outside the protocol's collections:
-    /// returns whether it does, and the caller owes the listing at the transition's item.
+    /// returns the newest upload the listing must cover.
     pub(crate) async fn mark_uploaded(
         &self,
+        upload: FeedPosition,
         mut records: Vec<[u8; 32]>,
         mut claims: Vec<[u8; 32]>,
         tx: &mut Tx,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Option<FeedPosition>, AppError> {
         let at = self.now();
-        let mut lists = false;
+        let mark = RecordReread {
+            marked_ms: at,
+            upload,
+        };
+        let mut listing = None;
         records.truncate(MAX_MARKED_KEYS);
         claims.truncate(MAX_MARKED_KEYS);
         if !records.is_empty() {
             // The marks held, at most: those committed, unless `tx` dropped them (a key no
             // mark has shows the drop), and those `tx` puts.
             let dropped = tx.pending_state(&format!("{RECORD_REREAD_PREFIX}~")) == Some(false);
-            let committed = if dropped {
-                0
+            let mut held: BTreeMap<String, RecordReread> = if dropped {
+                BTreeMap::new()
             } else {
-                self.reader().scan_raw(RECORD_REREAD_PREFIX).await?.len()
+                self.reader()
+                    .scan(RECORD_REREAD_PREFIX)
+                    .await?
+                    .into_iter()
+                    .collect()
             };
-            let marked = committed.saturating_add(tx.pending_puts(RECORD_REREAD_PREFIX));
-            if marked.saturating_add(records.len()) > MAX_RECORD_MARKS {
-                // The listing reads only the protocol's collections: the marks of records
-                // the app holds outside them stay, bounded by the records it holds.
-                let mut keys: Vec<[u8; 32]> = records.clone();
-                let committed = if dropped {
-                    Vec::new()
+            let staged = tx.pending_put_keys(RECORD_REREAD_PREFIX);
+            let capped = held
+                .len()
+                .saturating_add(staged.len())
+                .saturating_add(records.len())
+                > MAX_RECORD_MARKS;
+            for rest in staged {
+                let entry = format!("{RECORD_REREAD_PREFIX}{rest}");
+                let prior = tx
+                    .pending_get::<RecordReread>(&entry)?
+                    .flatten()
+                    .ok_or(StoreError::Corrupt)?;
+                held.insert(rest, prior);
+            }
+            for key in records {
+                let rest = b64(&key);
+                let mut next = mark;
+                if let Some(prior) = held.get(&rest) {
+                    next.upload = self.latest_upload(upload, prior.upload)?;
+                }
+                if capped {
+                    held.insert(rest, next);
                 } else {
-                    self.reader().scan_raw(RECORD_REREAD_PREFIX).await?
-                };
-                let rests = committed
-                    .into_iter()
-                    .map(|(rest, _)| rest)
-                    .chain(tx.pending_put_keys(RECORD_REREAD_PREFIX));
-                keys.extend(rests.filter_map(|rest| unb64_array::<32>(&rest).ok()));
-                keys.sort_unstable();
-                keys.dedup();
-                let listed: Vec<String> = self
-                    .protocols
-                    .collections()
-                    .into_iter()
-                    .map(|collection| collection.name)
-                    .collect();
-                tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                lists = true;
-                for key in keys {
-                    if let Some(held) = self.held_collection(&key).await?
-                        && !listed.contains(&held.name)
+                    tx.put(&record_reread_key(&key), &next)?;
+                }
+            }
+            if capped {
+                let collections = self.protocols.collections();
+                let mut minimum = upload;
+                let mut keep = Vec::new();
+                for (rest, mark) in held {
+                    let key = unb64_array::<32>(&rest).map_err(|_| StoreError::Corrupt)?;
+                    if let Some(collection) = self.held_collection(&key).await?
+                        && !collections
+                            .iter()
+                            .any(|listed| listed.name == collection.name)
                     {
-                        tx.put(&record_reread_key(&key), &at)?;
+                        keep.push((key, mark));
+                    } else {
+                        minimum = self.latest_upload(minimum, mark.upload)?;
                     }
                 }
-            } else {
-                for key in &records {
-                    tx.put(&record_reread_key(key), &at)?;
+                tx.delete_prefix(RECORD_REREAD_PREFIX)?;
+                for (key, mark) in keep {
+                    tx.put(&record_reread_key(&key), &mark)?;
                 }
+                listing = Some(minimum);
             }
         }
         if self.state.cert.has_permission(Permission::ClaimsRead) {
@@ -160,7 +218,7 @@ impl App {
                 }
             }
         }
-        Ok(lists)
+        Ok(listing)
     }
 
     /// At the end of a read: read again the records an upload listed (Switch wire 7.4.14),
@@ -169,8 +227,9 @@ impl App {
     /// commit of what it read, and so is one the switch doesn't know (`404` at an account it
     /// hosts, which is absence: the rollback alarm for a permanent record the app holds live,
     /// Switch spec 10.3.1 "Absence"), one whose read scope the app lacks (`403
-    /// permission_missing`), and one whose view names another key, which isn't taken. Any
-    /// other failure, on the network or an answer the switch may change, such as `403
+    /// permission_missing`). An earlier or unordered observation, or a view naming another
+    /// key, leaves the read owed. Any other failure on the network or an answer the switch
+    /// may change, such as `403
     /// cert_expired` before a renewal or the signed `404` saying it doesn't host the identity
     /// (Switch spec 12.7 step 5), stops the reads here, its record and the rest still marked,
     /// and the feed's read still succeeds; an alarm or a store failure fails it.
@@ -190,11 +249,14 @@ impl App {
         &mut self,
         budget: Option<&super::CallBudget>,
     ) -> Result<bool, AppError> {
-        let mut marks = self.reader().scan::<u64>(RECORD_REREAD_PREFIX).await?;
-        marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
+        let mut marks = self
+            .reader()
+            .scan::<RecordReread>(RECORD_REREAD_PREFIX)
+            .await?;
+        marks.sort_by(|(a, x), (b, y)| x.marked_ms.cmp(&y.marked_ms).then(a.cmp(b)));
         let mut due = Vec::new();
         let mut left = false;
-        for (rest, _) in marks {
+        for (rest, mark) in marks {
             let key = unb64_array::<32>(&rest).map_err(|_| AppError::Store(StoreError::Corrupt))?;
             let protocol = self.record_protocol(&key).await?;
             if !self.may_tell_of(protocol.as_deref()) {
@@ -204,14 +266,24 @@ impl App {
                 left = true;
                 break;
             }
-            due.push(key);
+            due.push((key, mark.upload));
         }
-        for (index, key) in due.into_iter().enumerate() {
+        for (index, (key, upload)) in due.into_iter().enumerate() {
             if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
                 return Ok(true);
             }
-            let view = match self.record_view(&key).await {
-                Ok(view) => view.filter(|(view, _)| view.key == key),
+            let view = match self.record_answer(&key, [Some(upload), None]).await {
+                Ok(RecordAnswer::View(record))
+                    if record.view.key == key && record.covers_uploads =>
+                {
+                    Some((record.view, record.at))
+                }
+                Ok(RecordAnswer::Absent) => None,
+                Ok(
+                    RecordAnswer::Inconclusive | RecordAnswer::NotHosted(_) | RecordAnswer::View(_),
+                ) => {
+                    return Ok(false);
+                }
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::PermissionMissing,
                     ..
@@ -224,8 +296,26 @@ impl App {
             let collection = self.held_collection(&key).await?;
             let mut tx = self.tx()?;
             if let Some((view, at)) = view {
-                self.take_view(&view, at, collection.as_ref().map(|c| (&key, c)), &mut tx)
+                let read = self
+                    .take_view(
+                        &view,
+                        at,
+                        collection.as_ref().map(|c| (&key, c)),
+                        true,
+                        &mut tx,
+                    )
                     .await?;
+                let waiting = match read {
+                    WriteRead::Overtaken(..) => {
+                        !self.upload_view_already_held(&view, upload, &tx).await?
+                    }
+                    WriteRead::Unordered | WriteRead::Waits => true,
+                    _ => false,
+                };
+                if waiting {
+                    self.commit(tx).await?;
+                    return Ok(false);
+                }
             }
             tx.delete(&record_reread_key(&key))?;
             self.commit(tx).await?;

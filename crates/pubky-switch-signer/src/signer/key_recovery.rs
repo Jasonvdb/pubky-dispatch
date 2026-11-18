@@ -41,20 +41,26 @@
 //! delivery has won, as for every racing delivery; while the version names a certificate
 //! this install doesn't hold, none can be sealed, and the version after it, which removes
 //! those apps and drops those entries, comes before every other one.
+//!
+//! Where that recovery can't go ahead, or the user prefers, the key alone also declares a
+//! provider loss at a service the user picks, from whatever the store holds
+//! ([`Signer::survey_provider_loss_with_key`], [`Signer::declare_provider_loss_with_key`]):
+//! it builds on the highest copy the key signed that any source shows, and starts the next
+//! generation there (Switch spec 12.6, 12.8).
 
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::enc::{hash, lp, random_bytes, u64be};
 use pubky_switch_core::records::{
-    AccountAssociation, AccountObservation, AppCert, AppRecord, Enrollment, EnrollmentAnswer,
-    EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Limits, RemovedApp,
-    SIGNER_BACKUP_PATH, app_record_path,
+    AccountAssociation, AccountObservation, AppCert, AppRecord, CLOCK_TOLERANCE_MS, Enrollment,
+    EnrollmentAnswer, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, IdentityPolicy,
+    Limits, RemovedApp, SIGNER_BACKUP_PATH, app_record_path,
 };
 use pubky_switch_core::sig::SignedDoc;
 
 use super::clients::{RequestClient, Target};
-use super::restore::{KeptCopy, RestoreLocal, check_local_restore};
+use super::restore::{KeptCopy, RestoreLocal, check_local_restore, no_copy, restored_alerts};
 use super::revocation::UserConfirmed;
 use super::{CAP_HEADROOM, Room, Signer, SignerEnv, enrollment_limit, gate};
 use crate::alert::Alert;
@@ -84,11 +90,65 @@ pub struct KeyRecoverySurvey {
     pub revoked: Vec<[u8; 16]>,
     /// What the signer backup on the Homeserver holds.
     pub backup: BackupFound,
+    /// What the recovery does: at the service, or a provider loss.
+    pub kind: KeyRecoveryKind,
     /// Whether `origin` is the one the user gave
     /// ([`Signer::survey_key_recovery_new_at`]), not the one the newest copy names.
     pub origin_supplied: bool,
+    /// The key the service at `origin` signs with: for a provider loss, the one its account
+    /// discovery showed, which every answer there must be signed with; at the service, the
+    /// one its copy names.
+    pub service_key: [u8; 32],
+    identity: [u8; 32],
     copy: [u8; 32],
+    /// What the account discovery at `origin` showed: its association and creation.
+    discovery: Vec<u8>,
+    /// The earlier certificates in `renewed` that go, by document hash.
+    certs_dropped: Vec<[u8; 32]>,
+    /// For apps the copy removes, the earlier times picked to distrust them from, which the
+    /// version signed takes.
+    earlier: Vec<RemovedApp>,
+    /// The highest version any source showed, which the version signed is above.
+    versions: u64,
+    /// For a provider loss, what it read, which the declaration acts on.
+    carried: Option<Carried>,
     digest: [u8; 32],
+}
+
+/// What a provider loss's survey read ([`LossPlan`]), carried to the declaration with the
+/// user's confirmation of it. Surveys compare by everything they show, not by this.
+#[derive(Clone)]
+struct Carried(std::sync::Arc<LossPlan>);
+
+impl PartialEq for Carried {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Carried {}
+
+impl std::fmt::Debug for Carried {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carried")
+    }
+}
+
+/// What a recovery with the identity key alone does (Switch spec 12.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyRecoveryKind {
+    /// At the service that serves the account, on its copy: the generation stays
+    /// ([`Signer::survey_key_recovery`], [`Signer::survey_key_recovery_new`]).
+    AtService,
+    /// A provider loss at the service the user picked, built on the highest copy any source
+    /// shows (Switch spec 12.6): the generation `lost` is declared lost and the next one
+    /// starts there ([`Signer::survey_provider_loss_with_key`]).
+    ProviderLoss {
+        /// The generation declared lost. `None` when no copy was found anywhere: the first
+        /// document then takes its generation and version from the time.
+        lost: Option<u64>,
+    },
 }
 
 /// What becomes of a listed app in a recovery with the key alone (Switch spec 12.8).
@@ -122,8 +182,9 @@ pub enum BackupFound {
     Missing,
     /// One that doesn't open or verify.
     Unreadable,
-    /// One that opens and holds `version`, which the service's copy doesn't match: its
-    /// certificates, revoked App IDs and picked times still count.
+    /// One that opens and holds `version`, which the service's copy doesn't match, or, for a
+    /// provider loss, any that opens: its certificates, revoked App IDs and picked times
+    /// count.
     Stale {
         /// The version it holds.
         version: u64,
@@ -139,18 +200,33 @@ pub enum BackupFound {
 pub struct KeyRecoveryConfirmed {
     digest: [u8; 32],
     dropped: Vec<[u8; 16]>,
+    /// The service a provider loss goes to, which the user picked.
+    to: Option<String>,
+    /// What the provider loss's survey read.
+    shown: Option<Carried>,
     /// The origin the user gave for the survey, if they gave one.
     asked: Option<String>,
 }
 
 impl KeyRecoveryConfirmed {
+    /// Whether it confirms a provider loss, which only
+    /// [`Signer::declare_provider_loss_with_key`] carries out.
+    pub(super) fn is_provider_loss(&self) -> bool {
+        self.to.is_some()
+    }
+
     /// Made by the host only after showing `survey` and what it loses, with `dropped` the
     /// apps of the survey the user chose to revoke too.
     #[must_use]
     pub fn shown_and_confirmed(survey: &KeyRecoverySurvey, dropped: &[[u8; 16]]) -> Self {
         Self {
             digest: survey.digest,
+            shown: survey.carried.clone(),
             dropped: dropped.to_vec(),
+            to: match survey.kind {
+                KeyRecoveryKind::AtService => None,
+                KeyRecoveryKind::ProviderLoss { .. } => Some(survey.origin.clone()),
+            },
             asked: survey.origin_supplied.then(|| survey.origin.clone()),
         }
     }
@@ -201,6 +277,109 @@ struct KeyPlan {
     view: BackupView,
 }
 
+/// What becomes of each listed app, and what a recovery takes (the module's doc).
+struct Fates {
+    apps: Vec<([u8; 16], AppFate)>,
+    renewals_dropped: Vec<[u8; 16]>,
+    certs_dropped: Vec<[u8; 32]>,
+    revoked: Vec<[u8; 16]>,
+    picked: Vec<RemovedApp>,
+    /// For apps the copy removes, the earlier times picked than its `removed` entries'.
+    earlier: Vec<RemovedApp>,
+    certs: Vec<AppCert>,
+    not_found: Vec<[u8; 16]>,
+}
+
+impl Fates {
+    /// For a provider loss: the apps a service read shows revoked or departed are revoked
+    /// at the new service, which doesn't know, distrusted from the earliest of a picked time
+    /// and the time `answer` shows.
+    fn removed_elsewhere(&mut self, answer: &AppsAnswer) {
+        for (app_id, fate) in &mut self.apps {
+            let AppFate::RemovedAtSwitch { distrust_from } = fate else {
+                continue;
+            };
+            let at_switch = answer
+                .apps
+                .iter()
+                .filter(|status| status.app_id == *app_id)
+                .flat_map(|status| status.revoked_at.into_iter().chain(status.departed_at))
+                .min();
+            let earliest = match (*distrust_from, at_switch) {
+                (Some(picked), Some(shown)) => Some(picked.min(shown)),
+                (picked, shown) => picked.or(shown),
+            };
+            *distrust_from = earliest;
+            self.revoked.push(*app_id);
+            if let Some(time) = earliest {
+                self.picked.retain(|p| p.app_id != *app_id);
+                self.picked.push(RemovedApp {
+                    app_id: *app_id,
+                    distrust_from: time,
+                });
+            }
+        }
+        self.revoked.sort_unstable();
+        self.revoked.dedup();
+    }
+
+    /// The records a recovery takes on `copy`, as a backup would hold them, with `created`
+    /// the account creation and `limits` its limits: every App ID revoked for good, a listed
+    /// app whose certificate wasn't found among them.
+    fn view(&self, copy: &IdentityDoc, created: u64, limits: Limits) -> BackupView {
+        let mut revoked_apps = self.revoked.clone();
+        revoked_apps.extend(&self.not_found);
+        BackupView {
+            identity_doc: copy.clone(),
+            account_created: created,
+            revoked_apps,
+            certs: self.certs.clone(),
+            limits,
+            bundle_parts: Vec::new(),
+            prev: None,
+            pending_distrust: self.picked.clone(),
+        }
+    }
+}
+
+impl KeyRecoverySurvey {
+    /// The survey of a recovery `kind` at `origin` on `copy`, with its digest, with
+    /// `observation` the account discovery there and `versions` the highest version seen.
+    fn of(
+        origin: String,
+        copy: &IdentityDoc,
+        fates: &Fates,
+        backup: BackupFound,
+        kind: KeyRecoveryKind,
+        observation: &AccountObservation,
+        versions: u64,
+    ) -> Self {
+        let mut survey = Self {
+            origin,
+            version: copy.version(),
+            generation: copy.generation(),
+            signer: copy.body().signer,
+            apps: fates.apps.clone(),
+            renewals_dropped: fates.renewals_dropped.clone(),
+            revoked: fates.revoked.clone(),
+            backup,
+            kind,
+            origin_supplied: false,
+            service_key: observation.body().service_key,
+            identity: copy.body().identity,
+            copy: copy.hash(),
+            discovery: discovery_of(observation),
+            certs_dropped: fates.certs_dropped.clone(),
+            earlier: fates.earlier.clone(),
+            versions,
+            carried: None,
+            digest: [0; 32],
+        };
+        survey.digest = digest_of(&survey);
+        survey
+    }
+}
+
 fn stop(stop: KeyRecoveryStop) -> SignerError {
     Refusal::KeyRecovery(stop).into()
 }
@@ -209,7 +388,9 @@ impl Signer {
     /// Survey a recovery with the identity key alone, in place (Switch spec 12.8): when the
     /// restore from the backup refuses ([`Refusal::NoBackup`], [`Refusal::UnreadableBackup`],
     /// [`Refusal::StaleBackup`]). It reads, and writes nothing. The user confirms it
-    /// ([`KeyRecoveryConfirmed`]) and [`Signer::restore`] carries it out.
+    /// ([`KeyRecoveryConfirmed`]) and [`Signer::restore`] carries it out. Beside it, and
+    /// wherever it is refused, a provider loss with the key alone is offered
+    /// ([`Signer::survey_provider_loss_with_key`]).
     ///
     /// # Errors
     ///
@@ -516,7 +697,8 @@ impl Signer {
             }
         }
         let local = RestoreLocal::intact(self.state.clone())?;
-        let mut state = self.rebuilt_records(&view, &plan.answer, service.clone(), Some(&local))?;
+        let mut state =
+            self.rebuilt_records(&view, &plan.answer, service.clone(), Some(&local), true)?;
         if let Some(alert) = changed {
             state.alert(alert);
         }
@@ -529,6 +711,7 @@ impl Signer {
             delivered_at: None,
         });
         // No content is added, so the plain cap: the copy was measured with the headroom.
+        state.earlier_distrust.clone_from(&plan.survey.earlier);
         let body = Self::body_on(&state, &plan.copy, |_| {}, Room::Cap)?;
         let doc = {
             let key = gate::signing_key(&self.keyring, &state, &self.store)?;
@@ -578,21 +761,7 @@ impl Signer {
         if let Some(alarm) = gate::held_alarm(kept) {
             return Err(SignerError::Alarm(alarm.clone()));
         }
-        let homeserver = &self.env.homeserver;
-        let opened = match homeserver
-            .get(SIGNER_BACKUP_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?
-        {
-            None => None,
-            Some(bytes) => Some(self.open_backup(&bytes)?),
-        };
-        let published = homeserver
-            .get(IDENTITY_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?
-            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
-            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok());
+        let (opened, published) = self.read_published().await?;
         let backed_up = opened.as_ref().and_then(Option::as_ref);
         // Rule 1: the service the newest copy names, which must serve the account.
         let seen: Vec<&IdentityDoc> = published
@@ -696,10 +865,64 @@ impl Signer {
         if kept.epoch_through > copy.data_epoch().saturating_add(1) {
             return Err(behind(kept.signed_through));
         }
-        let certs = self.found_certs(&copy, backed_up, kept).await?;
-        let held = |cert: &[u8; 32]| certs.iter().any(|found| &found.hash() == cert);
         let docs: Vec<&IdentityDoc> = std::iter::once(&copy).chain(seen.iter().copied()).collect();
-        let (revoked, picked) = revoked_for_good(&copy, &docs, backed_up, kept, &answer)?;
+        let fates = self.fates(&copy, &docs, backed_up, kept, &answer).await?;
+        let survey = KeyRecoverySurvey::of(
+            origin,
+            &copy,
+            &fates,
+            backup,
+            KeyRecoveryKind::AtService,
+            &observation,
+            copy.version(),
+        );
+        let view = fates.view(&copy, created, Limits::default());
+        Ok(KeyPlan {
+            survey,
+            observation,
+            created,
+            copy,
+            answer,
+            view,
+        })
+    }
+
+    /// The signer backup on the Homeserver, `Some(None)` for one that doesn't open, and the
+    /// Homeserver's `identity.json` where the identity key signed it.
+    async fn read_published(&self) -> Result<(Option<Option<BackupView>>, Option<IdentityDoc>)> {
+        let identity = self.state.identity;
+        let homeserver = &self.env.homeserver;
+        let opened = match homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+        {
+            None => None,
+            Some(bytes) => Some(self.open_backup(&bytes)?),
+        };
+        let published = homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok());
+        Ok((opened, published))
+    }
+
+    /// What becomes of each app `copy` lists, and what the recovery takes, with `docs` every
+    /// copy seen, `backed_up` the backup that opened, `kept` the records it starts from and
+    /// `answer` the switch's `GET /apps` (the module's doc).
+    async fn fates(
+        &self,
+        copy: &IdentityDoc,
+        docs: &[&IdentityDoc],
+        backed_up: Option<&BackupView>,
+        kept: &SignerState,
+        answer: &AppsAnswer,
+    ) -> Result<Fates> {
+        let certs = self.found_certs(copy, backed_up, kept).await?;
+        let held = |cert: &[u8; 32]| certs.iter().any(|found| &found.hash() == cert);
+        let (revoked, picked) = revoked_for_good(copy, docs, backed_up, kept, answer)?;
         let mut apps = Vec::new();
         let mut not_found = Vec::new();
         for listed in &copy.body().apps {
@@ -723,6 +946,14 @@ impl Signer {
             };
             apps.push((listed.app_id, fate));
         }
+        let mut certs_dropped: Vec<[u8; 32]> = copy
+            .body()
+            .renewed
+            .iter()
+            .filter(|entry| !held(&entry.cert))
+            .map(|entry| entry.cert)
+            .collect();
+        certs_dropped.sort_unstable();
         let mut renewals_dropped: Vec<[u8; 16]> = copy
             .body()
             .renewed
@@ -731,39 +962,24 @@ impl Signer {
             .map(|entry| entry.app_id)
             .collect();
         renewals_dropped.dedup();
-        let mut survey = KeyRecoverySurvey {
-            origin,
-            version: copy.version(),
-            generation: copy.generation(),
-            signer: copy.body().signer,
+        Ok(Fates {
             apps,
             renewals_dropped,
+            certs_dropped,
             revoked,
-            backup,
-            origin_supplied: false,
-            copy: copy.hash(),
-            digest: [0; 32],
-        };
-        survey.digest = digest_of(&survey);
-        let mut revoked_apps = survey.revoked.clone();
-        revoked_apps.extend(not_found);
-        let view = BackupView {
-            identity_doc: copy.clone(),
-            account_created: created,
-            revoked_apps,
+            earlier: picked
+                .iter()
+                .filter(|p| {
+                    copy.body()
+                        .removed
+                        .iter()
+                        .any(|r| r.app_id == p.app_id && p.distrust_from < r.distrust_from)
+                })
+                .copied()
+                .collect(),
+            picked,
             certs,
-            limits: Limits::default(),
-            bundle_parts: Vec::new(),
-            prev: None,
-            pending_distrust: picked,
-        };
-        Ok(KeyPlan {
-            survey,
-            observation,
-            created,
-            copy,
-            answer,
-            view,
+            not_found,
         })
     }
 
@@ -808,6 +1024,749 @@ impl Signer {
             }
         }
         Ok(held)
+    }
+}
+
+/// What a store holds for the identity, whatever its state, for a provider loss with the key
+/// alone (Switch spec 12.8): the records it starts from, what binds them, the copies they
+/// hold, and the generation a recovery they declared sent a start for.
+pub(super) struct LossFound {
+    kept: SignerState,
+    /// A backup a delivery in flight sealed, as the store's flow holds it.
+    sealed: Option<Vec<u8>>,
+    local: RestoreLocal,
+    marks: Vec<IdentityDoc>,
+    generations: u64,
+}
+
+/// [`LossFound`] from what the store read, `records`: a state that decodes counts whatever it
+/// says, and so does a version a flow that decodes signed; nothing else is kept. A new
+/// install's records, `install`, when no state decodes.
+fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]) -> LossFound {
+    let state = records.state.ok().flatten();
+    let flow = records.flow.ok().flatten();
+    let mut local = RestoreLocal::from_state(state.clone(), &identity);
+    let mut marks = copies_of(&local);
+    // A version a flow signed may have reached a service, and spent its version and epoch.
+    let signed = match &flow {
+        Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
+        Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
+        _ => None,
+    };
+    // The backup a delivery sealed, and the App IDs a declared recovery's enrollment names
+    // revoked, count as the records' own, whether the state decodes or not.
+    let sealed = match &flow {
+        Some(Flow::Deliver {
+            backup: Some(backup),
+            ..
+        }) => serde_json::to_vec(backup).ok(),
+        _ => None,
+    };
+    let enrolled_revoked: Vec<[u8; 16]> = match &flow {
+        Some(Flow::Recover {
+            origin,
+            enrollment: RecoveryEnrollment::Ready { enrollment, .. },
+        }) => Enrollment::verify(enrollment, &identity, origin)
+            .map(|signed| signed.revoked_apps().to_vec())
+            .unwrap_or_default(),
+        Some(Flow::Recover {
+            enrollment: RecoveryEnrollment::Preparing { revoked_apps, .. },
+            ..
+        }) => revoked_apps.clone(),
+        _ => Vec::new(),
+    };
+    if let Some(doc) = signed.and_then(|signed| state::stored_identity(signed, &identity).ok()) {
+        local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
+        local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
+        marks.push(doc);
+    }
+    let mut kept = state.unwrap_or_else(|| SignerState::new(identity, install));
+    for app in enrolled_revoked {
+        if !kept.tombstones.contains(&app) {
+            kept.tombstones.push(app);
+        }
+    }
+    kept.signed_through = local
+        .signed_through
+        .unwrap_or(0)
+        .max(kept.records_behind.unwrap_or(0));
+    kept.epoch_through = local.epoch_through.unwrap_or(0);
+    // A hand-over in progress lets its target sign the next version, which nothing may show.
+    if let Some(handed) = kept
+        .handing_over
+        .as_ref()
+        .and_then(|h| state::stored_identity(&h.doc, &identity).ok())
+    {
+        kept.signed_through = kept.signed_through.max(handed.version().saturating_add(1));
+    }
+    // A recovery declared already may have sent a start for the generation after the lost
+    // one, and the records may have seen a version of their own at a higher one.
+    let generations = kept
+        .lost_generation
+        .filter(|_| kept.recovering)
+        .map_or(0, |lost| lost.saturating_add(1))
+        .max(kept.generation_seen);
+    LossFound {
+        kept,
+        sealed,
+        local,
+        marks,
+        generations,
+    }
+}
+
+/// Of the App IDs `revoked` (ascending), those a move's enrollment carrying `base` could
+/// carry within seven eighths of its cap, with the headroom every version keeps (Switch wire
+/// 3.7, 7.1), so the identity's later versions still fit. Revoked apps `base` lists or removes always stay. When
+/// more were found than fit, as when disjoint sources each hold many, the others, revoked
+/// apps no version lists or removes any more, go: the same loss as when no source holds
+/// them, and no recovery is ever refused for their number (Switch spec 12.8).
+fn enrollable(base: Option<&IdentityDoc>, revoked: Vec<[u8; 16]>) -> Result<Vec<[u8; 16]>> {
+    let Some(limit) = enrollment_limit() else {
+        return Ok(revoked);
+    };
+    let named = |app: &[u8; 16]| {
+        base.is_some_and(|base| {
+            base.listed_cert(app).is_some() || base.body().removed.iter().any(|r| &r.app_id == app)
+        })
+    };
+    let (kept, rest): (Vec<[u8; 16]>, Vec<[u8; 16]>) = revoked.into_iter().partition(named);
+    let policy = base.map_or_else(IdentityPolicy::default, |base| base.body().policy);
+    let fits = |taken: usize| -> Result<bool> {
+        let ids: Vec<[u8; 16]> = kept.iter().chain(&rest[..taken]).copied().collect();
+        let bytes = Enrollment::max_request_len(&policy, base.map(IdentityDoc::signed), &ids)?;
+        // An eighth of the cap stays free for the content the identity adds later.
+        Ok(bytes.saturating_add(CAP_HEADROOM) <= limit - limit / 8)
+    };
+    let (mut fitting, mut over) = (0, rest.len());
+    if !fits(over)? {
+        while over - fitting > 1 {
+            let middle = fitting + (over - fitting) / 2;
+            if fits(middle)? {
+                fitting = middle;
+            } else {
+                over = middle;
+            }
+        }
+    } else {
+        fitting = over;
+    }
+    let mut taken: Vec<[u8; 16]> = kept
+        .into_iter()
+        .chain(rest.into_iter().take(fitting))
+        .collect();
+    taken.sort_unstable();
+    Ok(taken)
+}
+
+/// The backup on the Homeserver, `found`, and one the store's flow sealed, `sealed`, as one:
+/// the revoked App IDs, the certificates and the picked times of both. The Homeserver's
+/// document stands, else the sealed one's.
+fn merged_views(found: Option<BackupView>, sealed: Option<BackupView>) -> Option<BackupView> {
+    match (found, sealed) {
+        (Some(mut view), Some(other)) => {
+            for app in other.revoked_apps {
+                if !view.revoked_apps.contains(&app) {
+                    view.revoked_apps.push(app);
+                }
+            }
+            for cert in other.certs {
+                if !view.certs.iter().any(|held| held.hash() == cert.hash()) {
+                    view.certs.push(cert);
+                }
+            }
+            view.pending_distrust.extend(other.pending_distrust);
+            Some(view)
+        }
+        (view, other) => view.or(other),
+    }
+}
+
+/// A provider loss's survey, with what it builds on.
+#[derive(Clone, Debug)]
+struct LossPlan {
+    survey: KeyRecoverySurvey,
+    observation: AccountObservation,
+    base: Option<IdentityDoc>,
+    lost: u64,
+    versions: u64,
+    answer: AppsAnswer,
+    view: Option<BackupView>,
+}
+
+impl LossPlan {
+    /// This plan, its survey carrying it.
+    fn carried(mut self) -> Self {
+        self.survey.carried = Some(Carried(std::sync::Arc::new(self.clone())));
+        self
+    }
+
+    /// The plan the declaration acts on: `shown`, the one the user confirmed, with what this
+    /// one, read again at the declaration, adds that doesn't change what the user saw. A
+    /// source that shows less now, or none, changes nothing. A copy above the one confirmed,
+    /// a revocation or an earlier time not shown, or another key or account at the service
+    /// picked is new to the user, and refused (Switch spec 12.8).
+    fn settle(self, shown: &Self) -> Result<Self> {
+        let changed = || stop(KeyRecoveryStop::SurveyChanged);
+        let (now, then) = (&self.survey, &shown.survey);
+        if now.identity != then.identity
+            || now.origin != then.origin
+            || now.service_key != then.service_key
+            || now.discovery != then.discovery
+        {
+            return Err(changed());
+        }
+        match (&shown.base, &self.base) {
+            (_, None) => {}
+            (None, Some(_)) => return Err(changed()),
+            (Some(confirmed), Some(read)) => {
+                if read.hash() != confirmed.hash()
+                    && (read.generation(), read.version())
+                        >= (confirmed.generation(), confirmed.version())
+                {
+                    return Err(changed());
+                }
+            }
+        }
+        if now.revoked.iter().any(|app| !then.revoked.contains(app)) {
+            return Err(changed());
+        }
+        let revoked_from = |fate: &AppFate| match fate {
+            AppFate::RemovedAtSwitch { distrust_from }
+            | AppFate::RevocationPending { distrust_from } => Some(*distrust_from),
+            _ => None,
+        };
+        for (app, fate) in &now.apps {
+            let Some(from_now) = revoked_from(fate) else {
+                continue;
+            };
+            let Some((_, confirmed)) = then.apps.iter().find(|(id, _)| id == app) else {
+                continue;
+            };
+            match revoked_from(confirmed) {
+                None => return Err(changed()),
+                Some(from_then) => {
+                    if from_now.is_some_and(|t| from_then.is_none_or(|c| t < c)) {
+                        return Err(changed());
+                    }
+                }
+            }
+        }
+        for earlier in &now.earlier {
+            let known = then
+                .earlier
+                .iter()
+                .any(|e| e.app_id == earlier.app_id && e.distrust_from <= earlier.distrust_from);
+            if !known {
+                return Err(changed());
+            }
+        }
+        let mut settled = shown.clone();
+        settled.survey.carried = None;
+        settled.observation = self.observation;
+        settled.lost = settled.lost.max(self.lost);
+        settled.versions = settled.versions.max(self.versions);
+        if let (Some(view), Some(read)) = (&mut settled.view, &self.view) {
+            for cert in &read.certs {
+                if !view.certs.iter().any(|held| held.hash() == cert.hash()) {
+                    view.certs.push(cert.clone());
+                }
+            }
+        }
+        settled.answer.apps.extend(self.answer.apps);
+        Ok(settled)
+    }
+}
+
+/// The copy of the highest generation, then version, of `docs`, the first of equals: the
+/// ones a service took come first.
+fn highest(docs: &[IdentityDoc]) -> Option<&IdentityDoc> {
+    docs.iter()
+        .fold(None, |best: Option<&IdentityDoc>, doc| match best {
+            Some(best)
+                if (best.generation(), best.version()) >= (doc.generation(), doc.version()) =>
+            {
+                Some(best)
+            }
+            _ => Some(doc),
+        })
+}
+
+impl Signer {
+    /// Survey a provider loss with the identity key alone, at the service at `origin` the
+    /// user picked (Switch spec 12.6, 12.8): from whatever the store holds for the identity,
+    /// no records, usable ones in any state, or unusable ones, with no [`Signer`] open for it.
+    /// It reads, and writes nothing; [`Signer::declare_provider_loss_with_key`] carries it out.
+    ///
+    /// It builds on the highest copy of `identity.json` the identity key signed that any
+    /// source shows: the Homeserver's, one in a backup that opens, the store's records and
+    /// the versions its flows signed, and the copy of every service those name, and of the
+    /// one picked, where they serve the account. It declares that copy's
+    /// generation lost, or a higher one a recovery the records declared sent a start for.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::KeyRecovery`] with [`KeyRecoveryStop::NotServing`] when the service at
+    /// `origin` doesn't answer the account discovery (another service is the way on), or
+    /// [`KeyRecoveryStop::UnknownMembers`]; an `origin` that isn't a switch origin; the
+    /// switch's, the Homeserver's or the store's error.
+    pub async fn survey_provider_loss_with_key(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        origin: &str,
+    ) -> Result<KeyRecoverySurvey> {
+        let (signer, found) = Self::loss_target(env, keyring).await?;
+        Ok(signer.loss_plan(&found, origin).await?.survey)
+    }
+
+    /// Declare a provider loss with the identity key alone, once the user confirmed its
+    /// survey ([`Signer::survey_provider_loss_with_key`]), and recover at the service they
+    /// picked (Switch spec 12.6, 12.8). Like the survey, it takes whatever the store holds,
+    /// with no [`Signer`] open for the identity: a hand-over, a take-over, an erasure or a
+    /// flow in progress, another install named, records behind, an alarm or a recovery
+    /// already declared, and records that don't read. Returns the signer, once the
+    /// recovery's version is delivered and published.
+    ///
+    /// Before anything is written, everything is read again. A source that shows less now,
+    /// or nothing, changes nothing: the declaration acts on the survey confirmed. A copy above
+    /// the one confirmed, a revocation or an earlier time it didn't show, or another key or
+    /// account at the service picked is refused. The enrollment at that service is signed.
+    /// Then the records it rebuilt and the declaration are committed in one write, and the
+    /// provider loss goes on as one declared with [`Signer::declare_provider_loss`]: the
+    /// enrollment, whose answer must name the key the discovery showed, the version naming
+    /// this install at the next generation, built on the copy the survey showed, above every
+    /// version any source or the survey showed or the records spent, and its delivery. Its
+    /// backup is written once that delivery has won where the copy names another install,
+    /// names a certificate this install doesn't hold, or there is none; before it otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyRecoveryStop::SurveyChanged`] for something the survey didn't show, or when
+    /// `confirmed` isn't a provider loss's: survey again; [`Refusal::IdentityTooLarge`] for
+    /// a version the cap can't take; otherwise as [`Signer::survey_provider_loss_with_key`].
+    /// With nothing written, the store is as found. Once the declaration is committed, as
+    /// [`Signer::resume`]: the recovery in progress is resumed, or declared again with this
+    /// entry, at that service or another, or with [`Signer::declare_provider_loss`] where it
+    /// built on a copy (with no copy anywhere, this entry only).
+    pub async fn declare_provider_loss_with_key(
+        env: SignerEnv,
+        keyring: IdentityKeyring,
+        confirmed: KeyRecoveryConfirmed,
+    ) -> Result<Self> {
+        let Some(to) = confirmed.to.clone() else {
+            return Err(stop(KeyRecoveryStop::SurveyChanged));
+        };
+        let Some(Carried(shown)) = confirmed.shown.clone() else {
+            return Err(stop(KeyRecoveryStop::SurveyChanged));
+        };
+        let (mut signer, found) = Self::loss_target(env, keyring).await?;
+        let plan = Box::pin(signer.loss_plan(&found, &to))
+            .await?
+            .settle(&shown)?;
+        let identity = signer.state.identity;
+        let state = signer.loss_records(&plan, &found, &to, &confirmed.dropped)?;
+        // In memory until the commit below: a refusal before it leaves the store as found.
+        signer.state = state;
+        let until = signer.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
+        let base = plan.base.as_ref();
+        signer.recovery_body(base, plan.lost, &to, [0; 32], until)?;
+        let mut revoked: Vec<[u8; 16]> = signer
+            .state
+            .tombstones
+            .iter()
+            .copied()
+            .filter(|app| base.is_none_or(|base| base.listed_cert(app).is_none()))
+            .collect();
+        revoked.sort_unstable();
+        revoked.dedup();
+        let signed = {
+            let key = gate::recovery_key(&signer.keyring, &signer.state, &signer.store)?;
+            Enrollment::sign(
+                &key,
+                EnrollmentBody {
+                    identity,
+                    origin: to.clone(),
+                    nonce: random_bytes()?,
+                    intent: plan.observation.enrollment_intent()?,
+                    policy: base.map_or_else(IdentityPolicy::default, |base| base.body().policy),
+                    identity_doc: None,
+                    revoked_apps: Some(revoked),
+                },
+            )?
+        };
+        let flow = Flow::Recover {
+            origin: to,
+            enrollment: RecoveryEnrollment::Ready {
+                observation: plan.observation.carried().clone(),
+                enrollment: signed.signed().clone(),
+            },
+        };
+        signer.commit(signer.state.clone(), Some(flow)).await?;
+        Box::pin(signer.resume()).await?;
+        Box::pin(signer.complete_listed_revocations()).await?;
+        Ok(signer)
+    }
+
+    /// The signer of a provider loss with the key alone, on the store it takes over, and
+    /// what that store holds ([`loss_found`]).
+    async fn loss_target(env: SignerEnv, keyring: IdentityKeyring) -> Result<(Self, LossFound)> {
+        let identity = keyring.public_key();
+        let store = env
+            .store
+            .acquire(&state::signer_namespace(&identity))
+            .await?;
+        let records = state::read(&store, &identity).await?;
+        let mut signer = Self::restore_target(env, keyring, store)?;
+        let found = loss_found(records, identity, signer.state.install);
+        signer.state = found.kept.clone();
+        Ok((signer, found))
+    }
+
+    /// The account the service at `origin` serves for the identity, its creation and its
+    /// `GET /apps` answer; `None` where it serves none or can't be read.
+    async fn serving(&self, origin: &str) -> Result<Option<(u64, AppsAnswer)>> {
+        if !pubky_switch_core::records::is_origin(origin) {
+            return Ok(None);
+        }
+        let identity = self.state.identity;
+        let target = Target {
+            origin,
+            pinned: None,
+            created: None,
+            identity,
+        };
+        let Ok(observation) = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+            .observe_account()
+            .await
+        else {
+            return Ok(None);
+        };
+        Ok(self.apps_of(origin, &observation).await?.ok())
+    }
+
+    /// The `GET /apps` answer of the account `observation` shows at `origin`, under the key
+    /// that signed it, with its creation; `Err` with the switch's error, `Ok(Err(()))` for an
+    /// observation of no account.
+    async fn apps_of(
+        &self,
+        origin: &str,
+        observation: &AccountObservation,
+    ) -> Result<std::result::Result<(u64, AppsAnswer), ClientError>> {
+        let body = observation.body();
+        let (AccountAssociation::Account, Some(created)) = (body.association, body.created) else {
+            return Ok(Err(ClientError::Usage("no account is served".into())));
+        };
+        let target = Target {
+            origin,
+            pinned: Some(body.service_key),
+            created: Some(created),
+            identity: self.state.identity,
+        };
+        Ok(
+            RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+                .apps()
+                .await
+                .map(|answer| (created, answer)),
+        )
+    }
+
+    /// Read each service `pending` names that isn't `visited` yet ([`Signer::serving`]),
+    /// into `reads`, and the service each copy read names in turn, up to [`MAX_SERVICES`] in
+    /// all.
+    async fn follow(
+        &self,
+        pending: &mut std::collections::BTreeSet<String>,
+        visited: &mut std::collections::BTreeSet<String>,
+        reads: &mut Vec<(u64, AppsAnswer)>,
+    ) -> Result<()> {
+        let identity = self.state.identity;
+        while let Some(origin) = pending.pop_first() {
+            if visited.len() > MAX_SERVICES || !visited.insert(origin.clone()) {
+                continue;
+            }
+            if let Some(read) = Box::pin(self.serving(&origin)).await? {
+                if let Some(copy) = read
+                    .1
+                    .identity
+                    .as_ref()
+                    .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
+                {
+                    pending.insert(copy.inbox().url.clone());
+                }
+                reads.push(read);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a provider loss's survey at `to` (the doc of
+    /// [`Signer::survey_provider_loss_with_key`]) over what the store holds, `found`.
+    async fn loss_plan(&self, found: &LossFound, to: &str) -> Result<LossPlan> {
+        let identity = self.state.identity;
+        if !pubky_switch_core::records::is_origin(to) {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 3.7: invalid recovery origin".into(),
+            )));
+        }
+        let (opened, published) = self.read_published().await?;
+        let sealed = match &found.sealed {
+            Some(bytes) => self.open_backup(bytes)?,
+            None => None,
+        };
+        let merged = merged_views(opened.clone().flatten(), sealed.clone());
+        let backed_up = merged.as_ref();
+        let mut held: Vec<IdentityDoc> = published
+            .iter()
+            .cloned()
+            .chain(
+                opened
+                    .iter()
+                    .flatten()
+                    .map(|view| view.identity_doc.clone()),
+            )
+            .chain(sealed.iter().map(|view| view.identity_doc.clone()))
+            .chain(found.marks.iter().cloned())
+            .collect();
+        let copy_of = |answer: &AppsAnswer| {
+            answer
+                .identity
+                .as_ref()
+                .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
+        };
+        // Every service a copy names, read where it serves the account, and every service
+        // the copies those hold name in turn: the Homeserver can't choose which copy counts
+        // as the newest by showing an older one naming another service, and a service's
+        // newer copy naming the next one is followed there.
+        let mut visited = std::collections::BTreeSet::from([to.to_owned()]);
+        let mut pending: std::collections::BTreeSet<String> =
+            held.iter().map(|doc| doc.inbox().url.clone()).collect();
+        let mut reads = Vec::new();
+        Box::pin(self.follow(&mut pending, &mut visited, &mut reads)).await?;
+        // The service picked, which the enrollment goes to.
+        let target = Target {
+            origin: to,
+            pinned: None,
+            created: None,
+            identity,
+        };
+        let observation = match RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+            .observe_account()
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error @ ClientError::Transport(_)) => return Err(error.into()),
+            Err(_) => return Err(stop(KeyRecoveryStop::NotServing)),
+        };
+        observation.enrollment_intent()?;
+        let picked = match self.apps_of(to, &observation).await? {
+            Ok(answer) => Some(answer),
+            Err(error @ ClientError::Transport(_)) => return Err(error.into()),
+            Err(_) => None,
+        };
+        if let Some(copy) = picked.as_ref().and_then(|(_, answer)| copy_of(answer)) {
+            pending.insert(copy.inbox().url.clone());
+            Box::pin(self.follow(&mut pending, &mut visited, &mut reads)).await?;
+        }
+        reads.extend(picked);
+        // Copies a service took come first among equals.
+        let mut seen: Vec<IdentityDoc> = reads
+            .iter()
+            .filter_map(|(_, answer)| copy_of(answer))
+            .collect();
+        seen.append(&mut held);
+        let base = highest(&seen).cloned();
+        let versions = seen
+            .iter()
+            .map(IdentityDoc::version)
+            .fold(found.kept.signed_through, u64::max);
+        // The answer of the service holding the base, else of the first that answered, with
+        // the revocations and departures every service shows: none of them is dropped.
+        let holding = reads
+            .iter()
+            .position(|(_, answer)| {
+                copy_of(answer)
+                    .is_some_and(|copy| base.as_ref().is_some_and(|b| b.hash() == copy.hash()))
+            })
+            .unwrap_or(0);
+        let (created, mut answer) = if reads.is_empty() {
+            (0, no_copy())
+        } else {
+            reads.swap_remove(holding)
+        };
+        for (_, other) in reads {
+            answer.apps.extend(
+                other
+                    .apps
+                    .into_iter()
+                    .filter(|status| status.revoked_at.is_some() || status.departed_at.is_some()),
+            );
+        }
+        let backup = match &opened {
+            None => BackupFound::Missing,
+            Some(None) => BackupFound::Unreadable,
+            Some(Some(view)) => BackupFound::Stale {
+                version: view.identity_doc.version(),
+            },
+        };
+        let Some(base) = base else {
+            // No copy anywhere: a first document in a provider loss's shape, at a generation
+            // (the seconds) and a version (the milliseconds, times a thousand, plus a random
+            // part, so two such recoveries in one millisecond don't sign one version twice)
+            // from the time, above any a lost install could have reached (Switch spec 12.8).
+            let time = no_copy_time(self.env.clock.now_ms(), observation.body().observed_at);
+            let spread = u64::from(u16::from_be_bytes(random_bytes()?) % 1_000);
+            let floor = time.saturating_mul(1_000).saturating_add(spread);
+            let mut revoked = found.kept.tombstones.clone();
+            revoked.sort_unstable();
+            revoked.dedup();
+            let revoked = enrollable(None, revoked)?;
+            let mut survey = KeyRecoverySurvey {
+                origin: to.to_owned(),
+                version: 0,
+                generation: 0,
+                signer: [0; 16],
+                apps: Vec::new(),
+                renewals_dropped: Vec::new(),
+                revoked,
+                backup,
+                kind: KeyRecoveryKind::ProviderLoss { lost: None },
+                origin_supplied: false,
+                service_key: observation.body().service_key,
+                identity,
+                copy: [0; 32],
+                discovery: discovery_of(&observation),
+                certs_dropped: Vec::new(),
+                earlier: Vec::new(),
+                versions: versions.max(floor),
+                carried: None,
+                digest: [0; 32],
+            };
+            survey.digest = digest_of(&survey);
+            return Ok(LossPlan {
+                survey,
+                observation,
+                base: None,
+                lost: (time / 1_000).max(found.generations),
+                versions: versions.max(floor),
+                answer,
+                view: None,
+            }
+            .carried());
+        };
+        // The version signs the members this signer reads, as at the service.
+        if carries_unknown_members(&base)? {
+            return Err(stop(KeyRecoveryStop::UnknownMembers));
+        }
+        let lost = base.generation().max(found.generations);
+        let docs: Vec<&IdentityDoc> = seen.iter().collect();
+        let mut fates = self
+            .fates(&base, &docs, backed_up, &found.kept, &answer)
+            .await?;
+        fates.removed_elsewhere(&answer);
+        fates.revoked = enrollable(Some(&base), fates.revoked)?;
+        let survey = KeyRecoverySurvey::of(
+            to.to_owned(),
+            &base,
+            &fates,
+            backup,
+            KeyRecoveryKind::ProviderLoss { lost: Some(lost) },
+            &observation,
+            versions,
+        );
+        let (created, limits) = backed_up.map_or((created, Limits::default()), |view| {
+            (view.account_created, view.limits)
+        });
+        let view = fates.view(&base, created, limits);
+        Ok(LossPlan {
+            survey,
+            observation,
+            base: Some(base),
+            lost,
+            versions,
+            answer,
+            view: Some(view),
+        }
+        .carried())
+    }
+
+    /// The records a provider loss with the key alone commits from `plan` over what the store
+    /// held, `found`, declared to the service at `to`, with the listed apps the user
+    /// `dropped` revoked: a recovery in progress, as [`Signer::declare_provider_loss`] leaves
+    /// it, built on the plan's copy, which the Homeserver's copy needn't name.
+    fn loss_records(
+        &self,
+        plan: &LossPlan,
+        found: &LossFound,
+        to: &str,
+        dropped: &[[u8; 16]],
+    ) -> Result<SignerState> {
+        let mut state = match (&plan.base, &plan.view) {
+            (Some(base), Some(view)) => {
+                let mut view = view.clone();
+                for app in dropped {
+                    if base.listed_cert(app).is_some() && !view.revoked_apps.contains(app) {
+                        view.revoked_apps.push(*app);
+                    }
+                }
+                let service = Service {
+                    origin: base.inbox().url.clone(),
+                    service_key: base.inbox().service_key,
+                    limits: view.limits,
+                    created: view.account_created,
+                };
+                let mut state = self.rebuilt_records(
+                    &view,
+                    &plan.answer,
+                    service.clone(),
+                    Some(&found.local),
+                    false,
+                )?;
+                state.newest = Some(Newest {
+                    account: Some(service),
+                    doc: base.signed().clone(),
+                    prev: None,
+                    published: false,
+                    delivered_at: None,
+                });
+                state.recovery_base = Some(base.signed().clone());
+                state
+            }
+            _ => {
+                let kept = &found.kept;
+                let mut state = SignerState::new(kept.identity, kept.install);
+                state.alerts = restored_alerts(kept);
+                state.tombstones.clone_from(&plan.survey.revoked);
+                state.cleanup.clone_from(&kept.cleanup);
+                state.deletion_checks = state
+                    .tombstones
+                    .iter()
+                    .copied()
+                    .filter(|app| !state.cleanup.contains(app))
+                    .collect();
+                state
+            }
+        };
+        state.signed_through = state.signed_through.max(plan.versions);
+        state.epoch_through = state
+            .epoch_through
+            .max(found.local.epoch_through.unwrap_or(0));
+        state.earlier_distrust.clone_from(&plan.survey.earlier);
+        // Only the App IDs the survey kept: the enrollment names them all (Switch wire 3.7).
+        let listed = |app: &[u8; 16]| {
+            plan.base
+                .as_ref()
+                .is_some_and(|base| base.listed_cert(app).is_some())
+        };
+        state
+            .tombstones
+            .retain(|app| listed(app) || plan.survey.revoked.contains(app));
+        state.recovering = true;
+        state.lost_generation = Some(plan.lost);
+        state.recovery_origin = Some(to.to_owned());
+        // The survey the user confirmed read the Homeserver's copy, and took it as one of the
+        // copies to build on: a missing or unreadable one is no reason to stop.
+        state.homeserver_copy_waived = true;
+        Ok(state)
     }
 }
 
@@ -907,7 +1866,13 @@ fn revoked_for_good(
         times.extend(doc.body().removed.iter().copied());
     }
     let mut picked: Vec<RemovedApp> = Vec::new();
-    for time in times.into_iter().filter(|t| listed(&t.app_id)) {
+    // For an app the copy lists, and one it removes: an earlier time than its `removed`
+    // entry's is a time the user picked, and the version signed takes it.
+    let removes = |app: &[u8; 16]| copy.body().removed.iter().any(|r| &r.app_id == app);
+    for time in times
+        .into_iter()
+        .filter(|t| listed(&t.app_id) || removes(&t.app_id))
+    {
         match picked.iter_mut().find(|p| p.app_id == time.app_id) {
             Some(earlier) => earlier.distrust_from = earlier.distrust_from.min(time.distrust_from),
             None => picked.push(time),
@@ -1044,15 +2009,61 @@ fn fresh_records(
     state
 }
 
-/// A picked time as the digest takes it: none, or its eight bytes.
+/// The time a first document with no copy anywhere takes its generation and version from:
+/// the later of the device's clock `now` and the picked service's trusted time `observed`,
+/// which counts at most a day ahead of the device's, so neither a service's clock nor the
+/// device's alone sets it below the other.
+fn no_copy_time(now: u64, observed: u64) -> u64 {
+    now.max(observed.min(now.saturating_add(DAY_MS)))
+}
+
+/// How many services a provider loss's survey reads at most, following the copies.
+const MAX_SERVICES: usize = 32;
+
+/// A day, in milliseconds.
+const DAY_MS: u64 = 86_400_000;
+
+/// What an account discovery showed, as the digest takes it: the association, the creation
+/// and the key that signed it.
+fn discovery_of(observation: &AccountObservation) -> Vec<u8> {
+    let body = observation.body();
+    let association = match body.association {
+        AccountAssociation::Account => 0,
+        AccountAssociation::Mark => 1,
+        AccountAssociation::Absent => 2,
+    };
+    [
+        &[association][..],
+        &picked_time(body.created),
+        &body.service_key,
+    ]
+    .concat()
+}
+
+/// A picked time or a generation as the digest takes it: none, or its eight bytes.
 fn picked_time(time: Option<u64>) -> Vec<u8> {
     time.map(|time| u64be(time).to_vec()).unwrap_or_default()
 }
 
 /// The digest of the whole survey, which the user's confirmation binds (Switch spec 12.8).
 fn digest_of(survey: &KeyRecoverySurvey) -> [u8; 32] {
-    // The copy's hash stands for its origin, version, generation and signer.
-    let mut parts: Vec<Vec<u8>> = vec![survey.copy.to_vec()];
+    // The copy's hash stands for its version, generation and signer.
+    let kind = match survey.kind {
+        KeyRecoveryKind::AtService => vec![0],
+        KeyRecoveryKind::ProviderLoss { lost } => [&[1][..], &picked_time(lost)].concat(),
+    };
+    let mut parts: Vec<Vec<u8>> = vec![
+        kind,
+        survey.identity.to_vec(),
+        survey.origin.as_bytes().to_vec(),
+        survey.service_key.to_vec(),
+        survey.discovery.clone(),
+        survey.copy.to_vec(),
+        survey.certs_dropped.concat(),
+    ];
+    for earlier in &survey.earlier {
+        parts.push([&earlier.app_id[..], &u64be(earlier.distrust_from)].concat());
+    }
     for (app, fate) in &survey.apps {
         let fate = match fate {
             AppFate::Stays => vec![0],
@@ -1159,8 +2170,19 @@ mod tests {
             renewals_dropped: vec![[2; 16]],
             revoked: vec![[6; 16]],
             backup: BackupFound::Stale { version: 3 },
+            kind: KeyRecoveryKind::AtService,
             origin_supplied: false,
+            service_key: [10; 32],
+            identity: [11; 32],
             copy: [7; 32],
+            discovery: vec![0],
+            certs_dropped: vec![[12; 32]],
+            earlier: vec![RemovedApp {
+                app_id: [16; 16],
+                distrust_from: 7,
+            }],
+            versions: 4,
+            carried: None,
             digest: [0; 32],
         };
         let changes: Vec<fn(&mut KeyRecoverySurvey)> = vec![
@@ -1180,6 +2202,14 @@ mod tests {
             |s| s.revoked.push([9; 16]),
             |s| s.backup = BackupFound::Stale { version: 2 },
             |s| s.backup = BackupFound::Missing,
+            |s| s.origin = "https://other.example".into(),
+            |s| s.kind = KeyRecoveryKind::ProviderLoss { lost: Some(1) },
+            |s| s.kind = KeyRecoveryKind::ProviderLoss { lost: None },
+            |s| s.service_key = [13; 32],
+            |s| s.identity = [14; 32],
+            |s| s.discovery = vec![1],
+            |s| s.certs_dropped = vec![[15; 32]],
+            |s| s.earlier[0].distrust_from = 6,
         ];
         let mut digests = vec![digest_of(&survey)];
         for change in changes {
@@ -1191,6 +2221,15 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), digests.len());
+    }
+
+    #[test]
+    fn test_key_recovery_no_copy_time_is_bound_by_the_device_clock() {
+        // A service's time below the device's counts for nothing; one ahead counts at most a
+        // day ahead.
+        assert_eq!(no_copy_time(5_000_000, 1_000), 5_000_000);
+        assert_eq!(no_copy_time(5_000_000, 6_000_000), 6_000_000);
+        assert_eq!(no_copy_time(5_000_000, u64::MAX), 5_000_000 + DAY_MS);
     }
 
     #[test]

@@ -295,6 +295,18 @@ pub enum Fault {
         /// The error code answered.
         code: ErrorCode,
     },
+    /// Apply an own app's request, then sign its answer with the chain's head at `at`, its
+    /// newest tip at or before that `seq`, as an answer overtaken on its way would carry
+    /// it, or with another chain hash there when `forked`, as a forked chain's; or, with
+    /// `at` `None`, with no head, as a faulty service would.
+    Head {
+        /// A part of the request's path and query.
+        path: String,
+        /// The `seq` the head is at; `None` for no head.
+        at: Option<u64>,
+        /// Whether the head's chain hash is another than the chain's at its `seq`.
+        forked: bool,
+    },
 }
 
 pub(crate) struct Inner {
@@ -307,8 +319,15 @@ pub(crate) struct Inner {
     /// state"): one more at each `seq` given out and at each other state change modelled
     /// here (FAKES.md).
     pub(crate) state_version: u64,
-    /// The count as each `seq` was given out, for a restore to that `seq`.
-    pub(crate) versions: Vec<(u64, u64)>,
+    /// The tag of the count's last move, 0 for the zero tag: a number no other move here
+    /// took, as the service's random one (Switch wire 7.3, "The state").
+    pub(crate) state_tag: u64,
+    /// The tags given out, which no restore takes back.
+    pub(crate) tags_made: u64,
+    /// Tags retained at and after the count covered by the mark.
+    pub(crate) state_history: BTreeMap<u64, u64>,
+    /// The count and its tag as each `seq` was given out, for a restore to that `seq`.
+    pub(crate) versions: Vec<(u64, u64, u64)>,
     pub(crate) items: Vec<Item>,
     pub(crate) tips: Vec<ChainTip>,
     pub(crate) doc: Option<IdentityDoc>,
@@ -327,6 +346,8 @@ pub(crate) struct Inner {
     /// the checkpoints a test scripts (Switch wire 7.4.4, 9.1).
     pub(crate) retention: Option<Retention>,
     pub(crate) faults: VecDeque<Fault>,
+    /// The next batch skips the operations' shape check, as a faulty switch would.
+    pub(crate) skip_shape_once: bool,
     next_erasure_outcome: Option<ErasureOutcome>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
@@ -466,6 +487,9 @@ impl Inner {
             tip,
             seq: tip.seq,
             state_version: 0,
+            state_tag: 0,
+            tags_made: 0,
+            state_history: BTreeMap::new(),
             versions: Vec::new(),
             items: Vec::new(),
             tips: vec![tip],
@@ -478,6 +502,7 @@ impl Inner {
             dropped_through: 0,
             retention: Some(Retention::default()),
             faults: VecDeque::new(),
+            skip_shape_once: false,
             next_erasure_outcome: None,
             applied: Vec::new(),
             frozen: None,
@@ -1270,6 +1295,7 @@ impl ScriptedSwitch {
         let mut leave_out = None;
         let mut replace = None;
         let mut sign_with = None;
+        let mut head_at = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
@@ -1280,7 +1306,8 @@ impl ScriptedSwitch {
             | Fault::Replace { path: p, .. }
             | Fault::SignWith { path: p, .. }
             | Fault::ErrorSignedWith { path: p, .. }
-            | Fault::BeforeTheBody { path: p, .. } => path.contains(p.as_str()),
+            | Fault::BeforeTheBody { path: p, .. }
+            | Fault::Head { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(
@@ -1314,6 +1341,7 @@ impl ScriptedSwitch {
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
                 Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
+                Some(Fault::Head { at, forked, .. }) => head_at = Some((at, forked)),
                 Some(Fault::ErrorSignedWith { code, secret, .. }) => {
                     let (status, body) = bad(code, "scripted", Value::Null);
                     // As for `Fault::Error`: past authentication, the app was seen.
@@ -1417,6 +1445,29 @@ impl ScriptedSwitch {
             if let Some(secret) = sign_with {
                 let key = SigningKey::from_bytes(&secret);
                 return Ok(inner.respond_with(&key, request, status, &body));
+            }
+            if let Some((at, forked)) = head_at {
+                let head = at.map(|seq| {
+                    let mut tip = inner
+                        .tips
+                        .iter()
+                        .rev()
+                        .find(|tip| tip.seq <= seq)
+                        .copied()
+                        .unwrap_or(inner.tip);
+                    if forked {
+                        tip.chain_hash = [0x55; 32];
+                    }
+                    SignedHead::sign(&inner.service, &inner.identity.public(), &tip).to_header()
+                });
+                return Ok(inner.respond_signed(
+                    &inner.service,
+                    request,
+                    status,
+                    &body,
+                    inner.now(),
+                    head.as_deref(),
+                ));
             }
             Ok(inner.respond(request, status, &body))
         };
@@ -1650,6 +1701,29 @@ impl ScriptedSwitch {
     /// takes from each app in an hour of its clock.
     pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
         self.lock().uploads_per_app_per_hour = uploads;
+    }
+
+    /// Apply the next batch without the operations' shape check (Switch wire 6.4 step 9), as a
+    /// faulty switch would: it signs its proofs of what it should have refused, such as a
+    /// delete at a permanent policy (Switch spec 10.3.1). For tests of what apps make of it.
+    pub fn skip_next_shape_check(&self) {
+        self.lock().skip_shape_once = true;
+    }
+
+    /// Drop the record at `key` from the switch's state, its divergent uploads with it, as a
+    /// faulty switch that lost it would: reads answer `404` and listings leave it out. For
+    /// tests of what an app makes of a record gone (Switch spec 10.3.1 "Absence").
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Missing`] for a key the switch holds no record at.
+    pub fn drop_record(&self, key: &[u8; 32]) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        inner.shared.divergent.remove(key);
+        match inner.shared.records.remove(key) {
+            Some(_) => Ok(()),
+            None => Err(ScriptError::Missing("no record at the key".into())),
+        }
     }
 
     /// Make record `key`, one the switch holds, divergent, as a recovery upload with a
@@ -1971,12 +2045,13 @@ impl ScriptedSwitch {
     pub(crate) fn roll_back_to(&self, seq: u64) {
         self.restore_to(seq);
         let mut inner = self.lock();
-        let (tip, state_version) = (inner.tip, inner.state_version);
+        let (tip, state_version, state_tag) = (inner.tip, inner.state_version, inner.state_tag);
         if let marks::MarkSlot::At(mark) = &mut inner.marks.slot {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
             mark.state_version = state_version;
+            mark.state_tag = state_tag;
         }
     }
 
@@ -2163,15 +2238,25 @@ impl Inner {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.count_change();
-        self.versions.push((self.seq, self.state_version));
+        self.versions
+            .push((self.seq, self.state_version, self.state_tag));
         // The account changes: the held reads look again.
         self.wake_held();
         self.seq
     }
 
-    /// Count a change of the account's state (Switch wire 7.3, "The state").
+    /// Count a change of the account's state, with a fresh tag (Switch wire 7.3, "The
+    /// state").
     pub(super) fn count_change(&mut self) {
         self.state_version = self.state_version.saturating_add(1);
+        self.tags_made = self.tags_made.saturating_add(1);
+        self.state_tag = self.tags_made;
+        if let marks::MarkSlot::At(mark) = &self.marks.slot {
+            self.state_history
+                .retain(|version, _| *version >= mark.state_version);
+        }
+        self.state_history
+            .insert(self.state_version, self.state_tag);
     }
 
     /// Wake every held feed read, to look again.

@@ -361,6 +361,7 @@ impl RealSwitch {
                     chain_hash: [0x5a; 32],
                 },
                 state_version: mark.state_version + 1,
+                state_tag: mark.state_tag,
                 stamped_ms: mark.time_floor_ms,
             };
             match marks
@@ -389,6 +390,7 @@ impl RealSwitch {
             let mut other = MarkTarget {
                 head: mark.head(),
                 state_version: mark.state_version,
+                state_tag: mark.state_tag,
                 stamped_ms: mark.time_floor_ms,
             };
             other.head.chain_hash[0] ^= 0xff;
@@ -435,6 +437,28 @@ impl RealSwitch {
                 .map_err(setup)?
                 .ok_or_else(|| setup(format!("no account {identity}")))?;
             account.erase(now_ms).await.map_err(setup)
+        })
+        .await
+    }
+
+    /// `identity`'s record at `key` is dropped from the database, while the service is
+    /// stopped, as a faulty service that lost it would: reads answer `404` and listings
+    /// leave it out (Switch spec 10.3.1 "Absence").
+    ///
+    /// # Errors
+    ///
+    /// When the database holds no such record, or the service can't be started again.
+    pub async fn drop_record(
+        &mut self,
+        identity: &str,
+        key: &[u8; 32],
+    ) -> Result<(), HarnessError> {
+        self.while_stopped(async |database, _| {
+            if database.drop_record(identity, key).await.map_err(setup)? {
+                Ok(())
+            } else {
+                Err(setup(format!("{identity} holds no record at the key")))
+            }
         })
         .await
     }

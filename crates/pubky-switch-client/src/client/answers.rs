@@ -657,8 +657,21 @@ impl SharedRecordView {
     }
 }
 
+/// The answer of `GET /v1/{id}/records/{key}` (Switch wire 7.4.9): the record view and the
+/// head it came with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordAnswer {
+    /// The record's view: its current write as of `head`.
+    pub view: SharedRecordView,
+    /// `Switch-Head`, verified with the service key, which every own app's answer carries
+    /// (Switch wire 7.1): what the view is current at (Switch spec 10.3).
+    pub head: SignedHead,
+}
+
 /// A page of `GET /v1/{id}/records?collection=` (Switch wire 7.4.9).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecordPage {
     /// The current records the caller may read, deleted ones left out.
     pub records: Vec<SharedRecordView>,
@@ -666,10 +679,14 @@ pub struct RecordPage {
     pub seq: u64,
     /// The key to pass as `after` for the next page; `None` on the last page.
     pub next: Option<[u8; 32]>,
+    /// `Switch-Head` of the answer the page came with, verified with the service key, which
+    /// every own app's answer carries (Switch wire 7.1): its generation is the one `seq`
+    /// counts in (Switch spec 10.3). Not in the body.
+    pub head: SignedHead,
 }
 
 impl RecordPage {
-    pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
+    pub(crate) fn read(o: Obj<'_>, head: SignedHead) -> Result<Self, ClientError> {
         Ok(Self {
             records: o
                 .required_objects("records")?
@@ -678,6 +695,7 @@ impl RecordPage {
                 .collect::<Result<_, _>>()?,
             seq: o.u64("seq")?,
             next: o.opt_b64n("next")?,
+            head,
         })
     }
 }
@@ -1560,7 +1578,12 @@ mod tests {
         let page = json!({ "records": [record_view()], "seq": 3, "next": null });
         requires(&page, "/records", |value| {
             assert_eq!(
-                RecordPage::read(Obj::of(value, "records")?)?.records.len(),
+                RecordPage::read(
+                    Obj::of(value, "records")?,
+                    SignedHead::from_value(&head_value()).unwrap()
+                )?
+                .records
+                .len(),
                 1
             );
             Ok(())

@@ -28,6 +28,12 @@ CREATE TABLE accounts (
     -- sees. Never reset while the row lasts; the mark keeps the value as of the last
     -- acknowledged commit, and a restore that lost one leaves it behind the mark's.
     state_version   BIGINT   NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+    -- A fresh random tag written with each move of the count, the zero tag before the
+    -- first: two states with the same count but different histories have different tags,
+    -- so a restore that lost one write and took another at the same count isn't taken for
+    -- the state the mark covers (Switch wire 7.3, "The state").
+    state_tag       BYTEA    NOT NULL DEFAULT '\x00000000000000000000000000000000'
+                             CHECK (octet_length(state_tag) = 16),
     -- The last service time the account stamped; it never goes back (Switch spec 10.1).
     stamped_time_ms BIGINT   NOT NULL DEFAULT 0 CHECK (stamped_time_ms >= 0),
     -- The run of the service that committed the stamped time (Switch wire 7.3, "Trusted
@@ -73,6 +79,13 @@ CREATE TABLE accounts (
     CHECK (activation_requirement != 'recovery' OR
            (last_seq = 0 AND chain_seq IS NULL AND identity_proof IS NULL AND recovery_from IS NULL)),
     CHECK ((recovery_from IS NULL) = (recovery_declared_at_ms IS NULL))
+);
+
+CREATE TABLE state_history (
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    state_version BIGINT NOT NULL CHECK (state_version > 0),
+    state_tag BYTEA NOT NULL CHECK (octet_length(state_tag) = 16),
+    PRIMARY KEY (account_id, state_version)
 );
 
 -- App IDs the account keeps for good: revoked, departed, or named by an enrollment's
@@ -225,6 +238,10 @@ CREATE TABLE shared_records (
     collection    BYTEA    NOT NULL CHECK (octet_length(collection) = 32),
     read_scope    TEXT     NOT NULL,
     write_scopes  TEXT[]   NOT NULL,
+    -- A permanent policy, and the generation it names, null for none (Switch wire 6.2): part
+    -- of the policy every later write repeats.
+    permanent     BOOLEAN  NOT NULL,
+    permanent_generation BIGINT CHECK (permanent_generation BETWEEN 1 AND 9007199254740991),
     -- The record's version: the write's generation and seq.
     generation    BIGINT   NOT NULL CHECK (generation >= 0),
     version       BIGINT   NOT NULL CHECK (version > 0),
@@ -268,6 +285,7 @@ CREATE TABLE shared_records (
     upload_base_op_hash BYTEA CHECK (octet_length(upload_base_op_hash) = 32),
     PRIMARY KEY (account_id, key),
     CHECK (NOT deleted OR value_bytes = 0),
+    CHECK (permanent OR permanent_generation IS NULL),
     CHECK (
         (from_upload AND proof IS NULL AND upload_seq IS NOT NULL
             AND upload_base_generation IS NULL AND upload_base_version IS NULL
@@ -540,8 +558,14 @@ CREATE TABLE handovers (
 -- committed registration names it, and one a replacement, a removal, a recovery in place or
 -- an erasure let go, owed until the key store deletes it. Written in the transaction that
 -- lets the key go, so its deletion is owed durably the moment nothing names it; the service
--- deletes each key, then drops the row: at once, and again at start for any a failure or a
--- crash left. No foreign key: the account may be gone by then.
+-- deletes each key, then drops the row: once the mark covers the commit that let it go, and
+-- again at start for any a failure or a crash left. No foreign key: the account may be gone
+-- by then.
+--
+-- `owe_push_key` writes a row from the request path outside the account's lock, before the
+-- key it owes is minted: no count moves for it. Losing that write to a restore changes no
+-- decision: the restored state has no registration naming the key, which nothing else ever
+-- names, so the key signs nothing and is at worst left unused in the key store.
 CREATE TABLE erased_keys (
     key_id          TEXT    PRIMARY KEY,
     account_id      TEXT    NOT NULL,
@@ -655,8 +679,6 @@ CREATE TABLE erasure_outcomes (
 -- checks it against the schema. Its kinds:
 -- - `column`: changes to the column `col` of table `tab` count nothing; `*` for the whole
 --   table.
--- - `scope`: a write the service makes under the reason `col` counts nothing
---   (`AccountTxn::uncounted`).
 -- - `background`: table `tab` is also written outside an identity's lock, by the service's
 --   background work. Under the lock it is counted like any other table; outside it, its
 --   writes commit with no account's commit and count nothing.
@@ -664,6 +686,10 @@ CREATE FUNCTION state_uncounted() RETURNS TABLE (kind TEXT, tab TEXT, col TEXT, 
 LANGUAGE sql IMMUTABLE AS $$ VALUES
     ('column', 'accounts', 'state_version',
      'the count itself'),
+    ('column', 'accounts', 'state_tag',
+     'the count''s tag, written with the count'),
+    ('column', 'state_history', '*',
+     'the count''s own record, retained until the mark covers it'),
     ('column', 'accounts', 'stamped_time_ms',
      'service time, stamped at nearly every request; that it never goes back is a rule of '
      'its own (Switch spec 10.1)'),
@@ -675,33 +701,24 @@ LANGUAGE sql IMMUTABLE AS $$ VALUES
     ('column', 'sender_flags', '*',
      'read only by GET /allow, which offers the signer a block; it admits or refuses '
      'nothing, and a lost hit is like a flag that decayed'),
-    ('scope', NULL, 'step 4',
-     'the sweeps and chain stub retention of Switch wire 7.3 step 4: due claims, forgotten '
-     'deleted keys, spent invite codes and expired batch proofs come back due, spent or past '
-     'their time, which every reader treats as gone; dropped chain stubs and spent batches '
-     'come back kept, which is always safe; the next run takes them again, and the sweep '
-     'minute only sets when that run is'),
-    ('scope', NULL, 'due claim',
-     'a due claim GET /claims deletes comes back due, which every reader treats as gone'),
     ('background', 'erased_keys', NULL,
-     'the row of a key the key store deleted goes once it is deleted: a restored row has '
-     'the deletion run again, and a key owed deleting signs nothing'),
+     'the row of a key the key store deleted goes once it is deleted, and a key is owed '
+     'before it is minted: a restored row has the deletion run again, a lost one leaves a '
+     'key nothing names, and a key owed deleting signs nothing'),
     ('background', 'push_deliveries', NULL,
-     'the webhook worker claims, retries and deletes rows: a restored row is sent at most '
-     'again within its entry''s minute, as a retry is (Switch wire 8.2)')
+     'the webhook worker commits attempts separately; after a restore its retry count '
+     'and registration require reconciliation before dispatch (Switch wire 8.2)')
 $$;
 
--- The row trigger on every account's table: it marks the transaction as one that changed
--- counted state, `switch.changed`, which `AccountTxn::commit` reads to move the count. A
--- rollback to a savepoint undoes the mark with the writes, so a refused request counts
--- nothing; an update that changes no counted column counts nothing either. A write outside
--- an identity's lock (`switch.locked`, set where the lock is taken) raises, unless its table
--- is listed as background-written: a writer outside the request path fails loudly instead
--- of going uncounted.
+-- Remember the first and last values of a touched row until commit. Replacing a row with
+-- its original value, or removing a row this request inserted, leaves no change to count.
 CREATE FUNCTION count_state_change() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    scope TEXT := coalesce(current_setting('switch.uncounted', true), '');
     left_out TEXT[];
+    old_value JSONB;
+    new_value JSONB;
+    old_key JSONB;
+    new_key JSONB;
 BEGIN
     IF coalesce(current_setting('switch.locked', true), '') <> 'on' THEN
         IF EXISTS (SELECT 1 FROM state_uncounted() u
@@ -711,26 +728,53 @@ BEGIN
         RAISE EXCEPTION 'a write to %, an account''s state, outside an identity''s lock',
             TG_TABLE_NAME;
     END IF;
-    IF scope <> '' THEN
-        IF NOT EXISTS (SELECT 1 FROM state_uncounted() u
-                       WHERE u.kind = 'scope' AND u.col = scope) THEN
-            RAISE EXCEPTION 'an uncounted write for an unlisted reason: %', scope;
-        END IF;
-        RETURN NULL;
-    END IF;
-    IF coalesce(current_setting('switch.changed', true), '') = 'on' THEN
-        RETURN NULL;
-    END IF;
     SELECT coalesce(array_agg(u.col), '{}') INTO left_out FROM state_uncounted() u
         WHERE u.kind = 'column' AND u.tab = TG_TABLE_NAME;
     IF '*' = ANY (left_out) THEN
         RETURN NULL;
     END IF;
-    IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - left_out) = (to_jsonb(NEW) - left_out) THEN
+    IF TG_NARGS = 0 THEN
+        RAISE EXCEPTION 'no primary key columns for count_state_change on %', TG_TABLE_NAME;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN old_value := to_jsonb(OLD) - left_out; END IF;
+    IF TG_OP <> 'DELETE' THEN new_value := to_jsonb(NEW) - left_out; END IF;
+    IF old_value IS NOT DISTINCT FROM new_value THEN
         RETURN NULL;
     END IF;
-    PERFORM set_config('switch.changed', 'on', true);
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        IF to_regclass('pg_temp.switch_state_rows') IS NULL THEN
+            CREATE TEMP TABLE switch_state_rows (
+                relation OID, row_key JSONB, initial JSONB, final_value JSONB,
+                PRIMARY KEY (relation, row_key)
+            ) ON COMMIT DELETE ROWS;
+        END IF;
+        PERFORM set_config('switch.changed', 'on', true);
+    END IF;
+    IF old_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, old_value -> k) INTO old_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF new_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, new_value -> k) INTO new_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF old_key IS NOT NULL AND old_key IS DISTINCT FROM new_key THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, old_key, old_value, NULL)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = NULL;
+    END IF;
+    IF new_key IS NOT NULL THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, new_key,
+            CASE WHEN old_key = new_key THEN old_value END, new_value)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = excluded.final_value;
+    END IF;
     RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION retained_state_change() RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        RETURN false;
+    END IF;
+    RETURN EXISTS (SELECT FROM pg_temp.switch_state_rows WHERE initial IS DISTINCT FROM final_value);
 END
 $$;
 
@@ -739,14 +783,19 @@ $$;
 DO $$
 DECLARE
     t TEXT;
+    key_columns TEXT;
 BEGIN
     FOR t IN
         SELECT table_name FROM information_schema.columns
         WHERE table_schema = current_schema() AND column_name = 'account_id'
         UNION SELECT 'accounts'
     LOOP
+        SELECT string_agg(quote_literal(a.attname), ', ' ORDER BY a.attnum) INTO STRICT key_columns
+        FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = t::regclass AND i.indisprimary;
+        IF key_columns IS NULL THEN RAISE EXCEPTION '% has no primary key', t; END IF;
         EXECUTE format('CREATE TRIGGER count_state_change AFTER INSERT OR UPDATE OR DELETE '
-                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change()', t);
+                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change(%s)', t, key_columns);
     END LOOP;
 END
 $$;

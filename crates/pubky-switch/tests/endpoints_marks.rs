@@ -189,10 +189,12 @@ fn wallet_batch(replay: &Replay, seqs: &[u64]) -> SwitchRequest {
     )
 }
 
-/// The mark a healthy answer at the head `seq` leaves, at the count the account holds.
+/// The mark a healthy answer at the head `seq` leaves, at the count and tag the account
+/// holds.
 async fn moved_to(replay: &Replay, old: &AccountMark, seq: u64) -> AccountMark {
     AccountMark {
         state_version: state_version_of(replay, &alice_id()).await,
+        state_tag: state_tag_of(replay, &alice_id()).await,
         ..mark_at(old, seq)
     }
 }
@@ -473,7 +475,7 @@ async fn read_raises_the_floor(replay: &Replay, read_at: u64) -> AccountMark {
     let before = mark_in(&replay.marks).await;
     assert!(read_at > before.time_floor_ms);
     replay.clock.set_wall_ms(read_at);
-    let read = replay.service.handle(apps_read(read_at)).await;
+    let read = replay.service.handle(public_read()).await;
     assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
     assert_eq!(time_shown(&read), read_at);
     let raised = mark_in(&replay.marks).await;
@@ -523,7 +525,7 @@ async fn test_marks_restore_of_time_only_commits_stays_healthy_and_time_never_go
     // so the mark's doesn't either (Switch wire 7.3, "The state", "Time base").
     let restarted = replay.restarted_with(Limits::default());
     replay.clock.set_wall_ms(read_at);
-    let read = restarted.handle(apps_read(read_at)).await;
+    let read = restarted.handle(public_read()).await;
     assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
     let floor_ms = read_at + pubky_switch::marks::TIME_FLOOR_STEP_MS;
     assert_eq!(time_shown(&read), floor_ms);
@@ -551,8 +553,19 @@ async fn test_marks_restore_of_time_only_commits_stays_healthy_and_time_never_go
     assert!(header_text(&again, header::HEAD).is_some(), "the head");
     assert_eq!(time_shown(&again), floor_ms);
     assert_eq!(again_run.mark_refusals(), 0);
-    // It committed at the floor, in the new run: the floor doesn't rise for it.
-    assert_eq!(mark_in(&replay.marks).await, raised);
+    // The authenticated read also commits the due sweep. Its count and tag advance
+    // while the reopened service stamps at the existing floor.
+    let after = mark_in(&replay.marks).await;
+    assert_eq!(after.state_version, raised.state_version + 1);
+    assert_ne!(after.state_tag, raised.state_tag);
+    assert_eq!(
+        after,
+        AccountMark {
+            state_version: after.state_version,
+            state_tag: state_tag_of(&replay, &alice_id()).await,
+            ..raised
+        }
+    );
     assert_eq!(
         account_row(&replay).await.1,
         i64::try_from(floor_ms).expect("ms")
@@ -599,7 +612,7 @@ async fn test_marks_restore_inside_one_floor_window_never_shows_an_earlier_time(
     let after_a = backup_of(&replay).await;
     let t2 = read_at + 10_000;
     replay.clock.set_wall_ms(t2);
-    let b = replay.service.handle(apps_read(t2)).await;
+    let b = replay.service.handle(public_read()).await;
     assert_eq!(b.status, 200, "{}", String::from_utf8_lossy(&b.body));
     assert_eq!(time_shown(&b), t2);
     assert_eq!(mark_in(&replay.marks).await, raised, "B raised nothing");
@@ -617,7 +630,7 @@ async fn test_marks_restore_inside_one_floor_window_never_shows_an_earlier_time(
         time_shown(&refused)
     );
     // The new run's first committed stamp is the floor.
-    let again = restarted.handle(apps_read(read_at)).await;
+    let again = restarted.handle(public_read()).await;
     assert_eq!(
         again.status,
         200,
@@ -647,7 +660,7 @@ async fn test_marks_time_within_one_run_is_not_pushed_to_the_floor() {
     let refused = replay.service.handle(bad_signature(apps_read(later))).await;
     assert_eq!(refused.status, 401);
     assert_eq!(time_shown(&refused), read_at);
-    let next = replay.service.handle(apps_read(later)).await;
+    let next = replay.service.handle(public_read()).await;
     assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));
     assert_eq!(time_shown(&next), later);
     assert_eq!(
@@ -1149,14 +1162,31 @@ async fn test_marks_crash_between_a_counted_commit_and_its_mark_move_fails_close
         (503, "unavailable")
     );
     assert!(signed_with(&answer, &service_public(&replay), &sent));
+    assert!(
+        header_text(&answer, header::HEAD).is_none(),
+        "nothing acknowledged"
+    );
     assert_eq!(counts(&replay, &replay.marks).await, (count + 1, count));
-    // A restart: the state ahead of the mark is healthy, no false alarm, and the next
-    // counted commit moves the mark to the count.
+    // A restart in that state: the state is ahead of the mark, a higher count with a tag of
+    // its own, which Table 1 judges healthy, neither behind nor a fork. The app's retry is
+    // answered as a retry, once the mark has moved to the committed count; nothing is
+    // acknowledged before the mark catches up.
     let (service, marks) = restarted(&replay, Limits::default());
+    let retry = Box::pin(service.handle(cursor_sync(3, base))).await;
+    assert_eq!(
+        retry.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    assert!(header_text(&retry, header::HEAD).is_some(), "the head");
+    assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
+    assert_eq!(
+        mark_in(&marks).await.state_tag,
+        state_tag_of(&replay, &alice_id()).await
+    );
     let read = Box::pin(service.handle(apps_read(base))).await;
     assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
-    // The read carries the head, so the mark catches up with the state, the count the
-    // failed move left behind included.
     assert_eq!(counts(&replay, &marks).await, (count + 1, count + 1));
     let next = Box::pin(service.handle(cursor_sync(4, base))).await;
     assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));

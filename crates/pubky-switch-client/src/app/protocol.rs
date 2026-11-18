@@ -46,18 +46,19 @@
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
+use super::own_record::RecordExpiry;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
 use crate::error::StoreError;
 use crate::store::KeyValue;
 
-/// What a newer write of a record builds on, as the reading app sees it
-/// ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
+/// What a newer write of a record builds on, and when it was made, as the reading app sees
+/// it ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
@@ -80,6 +81,13 @@ pub struct WriteBase {
     /// applied the write; a protocol's reader rule may require one, such as a condition on
     /// the claim of what the write drops, and flag a write without it (Switch spec 8.2).
     pub conditions: Vec<Condition>,
+    /// The service time, in Unix milliseconds, the write's verified chain stub or transition
+    /// proof dates it at (Switch spec 8.2, 10.3 check 2): an earlier generation's proof that
+    /// verifies with the key the newest own `identity.json` lists for it dates it too, a lost
+    /// generation's never. `None` when nothing dates it, as for a record taken from a
+    /// recovery upload (Switch spec 12.6). For a rule from one version to the next that
+    /// depends on when the write was made.
+    pub written_at_ms: Option<u64>,
 }
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
@@ -849,6 +857,29 @@ pub trait Protocol: Send + Sync {
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
 
+    /// The protocol's member of the app's record, and its expiry ask, under `cert`, a
+    /// renewal the app takes, from `member` and `ask`, the ones it has now (Switch spec 3.2
+    /// step 3, 4.2). The app builds the record carrying `cert` from these answers alone and
+    /// signs it once, in the commit that takes `cert`: a member whose content `cert` no
+    /// longer covers, such as one naming a scope it dropped, is changed or removed here, and
+    /// the earlier member is never signed under `cert`. `None` removes the member and its
+    /// ask. A member that breaks the JSON rules (Switch wire 1.1), or an ask that can't be
+    /// signed, removes the member and its ask ([`super::AppEvent::MemberDropped`]). A member
+    /// of a protocol not registered here stays while `cert` holds every scope and
+    /// permission of the one before, and is removed otherwise, for its protocol to write
+    /// again where it runs. Keeps both by default, so a protocol whose member depends on
+    /// the certificate's scopes overrides this. Pure and synchronous: it reads no store,
+    /// writes nothing, and must not panic, which would unwind through the read.
+    fn member_for(
+        &self,
+        member: Option<&Map<String, Value>>,
+        ask: RecordExpiry,
+        cert: &AppCert,
+    ) -> (Option<Map<String, Value>>, RecordExpiry) {
+        let _ = cert;
+        (member.cloned(), ask)
+    }
+
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
     /// the body parses as its kind's body, the members read have their types, and the
     /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive`],
@@ -1087,13 +1118,18 @@ pub trait Protocol: Send + Sync {
         None
     }
 
-    /// Whether a newer write of a record goes back on what the app has seen there (Switch
-    /// spec 8.2), such as dropping or replacing a message of a role it saw: the rule it
-    /// breaks, without content, and the write is flagged and not acted on. `value` is
-    /// `None` for a delete or an unreadable value. Never by default.
+    /// Whether a newer write of a record goes back on what the app has seen there, or fails
+    /// another of the protocol's checks (Switch spec 8.2), such as dropping or replacing a
+    /// message of a role it saw: the rule it breaks, without content, and the write is
+    /// flagged with the app that signed it and not acted on. `seen` is the protocol's mark
+    /// of what the app has seen of the record ([`Protocol::record_seen`]), `None` when it
+    /// has seen nothing yet, such as at the first read of a record: every write of another
+    /// app the app would take is checked, the first included. `value` is `None` for a
+    /// delete or an unreadable value. Never by default.
     ///
     /// `base` tells what the newer write builds on ([`WriteBase`]): its `expected_version`,
-    /// whether the app holds that version, and the conditions its operation signed. A
+    /// whether the app holds that version, the conditions its operation signed, and the
+    /// service time its stub or proof dates it at, if anything dates it. A
     /// protocol whose rules hold only for a writer that built on the value the app holds,
     /// such as one that may drop only what it held itself, applies them when `base.held`;
     /// one whose rule fences a change on a condition, such as a `claim_step` on the claim of
@@ -1105,7 +1141,7 @@ pub trait Protocol: Send + Sync {
     fn record_regression(
         &self,
         collection: &str,
-        seen: &[u8],
+        seen: Option<&[u8]>,
         value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {

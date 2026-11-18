@@ -19,34 +19,42 @@ use serde_json::json;
 use super::{Answer, Inner, ScriptedSwitch, bad};
 use crate::transport::{Request, Response};
 
-/// A mark: the newest head the switch signed for the identity, the account's count of
-/// changed state as of its last acknowledged change, the service key the account is
-/// answered with, and the time the account was created (Switch wire 7.3).
+/// A mark: the newest head the switch signed for the identity, or at a serving account
+/// before its first chain item its generation with `seq` 0; the account's count of changed
+/// state as of its last acknowledged change, with its tag; the service key the account is
+/// answered with; and the time the account was created (Switch wire 7.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Mark {
     pub(crate) generation: u64,
     pub(crate) seq: u64,
     pub(crate) chain_hash: [u8; 32],
     pub(crate) state_version: u64,
+    pub(crate) state_tag: u64,
     pub(crate) key: [u8; 32],
     pub(crate) created_at_ms: u64,
 }
 
 impl Mark {
-    /// A mark that records no head: (0, 0).
+    /// A mark that records nothing: (0, 0), count 0, the zero tag.
     fn zero(key: [u8; 32], created_at_ms: u64) -> Self {
         Self {
             generation: 0,
             seq: 0,
             chain_hash: ZERO_HASH,
             state_version: 0,
+            state_tag: 0,
             key,
             created_at_ms,
         }
     }
 
     fn records_head(&self) -> bool {
-        (self.generation, self.seq) != (0, 0)
+        self.seq != 0
+    }
+
+    /// A head, or a count above 0: what makes an identity without an account lost.
+    fn records_acknowledged(&self) -> bool {
+        self.records_head() || self.state_version != 0
     }
 }
 
@@ -242,7 +250,7 @@ impl Inner {
                 return Verdict::NotHosted { delete_mark: true };
             }
             let permanent = marks.retired.contains(&mark.generation);
-            return if mark.records_head() || permanent {
+            return if mark.records_acknowledged() || permanent {
                 Verdict::Lost(RecoveryNotice {
                     generation: mark.generation,
                     reason: NoticeReason::Behind,
@@ -281,9 +289,23 @@ impl Inner {
             };
         };
         // Rows "Staged, holding an activated import", "Serving" and "Frozen".
+        let by_count = |mark: &Mark| {
+            if state.generation < mark.generation || self.state_version < mark.state_version {
+                // Fewer changes than the mark covers: an acknowledged one was lost, as the
+                // service's one rule judges it (Switch wire 7.3, Table 1).
+                Some(NoticeReason::Behind)
+            } else if (mark.state_version > 0
+                && self.state_history.get(&mark.state_version) != Some(&mark.state_tag))
+                || (self.state_version == mark.state_version && self.state_tag != mark.state_tag)
+            {
+                Some(NoticeReason::Fork)
+            } else {
+                None
+            }
+        };
         let reason = match mark {
             None => Some(NoticeReason::MarkLost),
-            Some(mark) if !mark.records_head() => None,
+            Some(mark) if !mark.records_head() => by_count(mark),
             Some(mark) => {
                 let at = (state.generation, state.seq);
                 let marked = (mark.generation, mark.seq);
@@ -298,14 +320,8 @@ impl Inner {
                 {
                     // A state past the mark with another chain hash at the mark's `seq`.
                     Some(NoticeReason::Fork)
-                } else if state.generation == mark.generation
-                    && self.state_version < mark.state_version
-                {
-                    // Fewer changes than the mark covers: an acknowledged one was lost, as
-                    // the service's one rule judges it (Switch wire 7.3, Table 1).
-                    Some(NoticeReason::Behind)
                 } else {
-                    None
+                    by_count(mark)
                 }
             }
         };
@@ -506,30 +522,34 @@ impl Inner {
     /// without a mark, (0, 0) with the current key and the creation time, before the account;
     /// at a (0, 0) mark left with no account, or a lost account's mark, the new account
     /// takes it over with the current key and its own creation time, its generation, `seq`,
-    /// chain hash and retirements staying.
+    /// chain hash and retirements staying, its count and tag the new account's, 0 and the
+    /// zero tag; a mark that records no head becomes (0, 0).
     pub(super) fn mark_new_account(&mut self, created: u64) {
         let key = self.service.verifying_key().to_bytes();
         self.created_at_ms = created;
         self.marks.slot = MarkSlot::At(match self.marks.slot {
+            MarkSlot::At(mark) if !mark.records_head() => Mark::zero(key, created),
             MarkSlot::At(mark) => Mark {
                 key,
                 created_at_ms: created,
-                state_version: self.state_version,
+                state_version: 0,
+                state_tag: 0,
                 ..mark
             },
             MarkSlot::Missing | MarkSlot::Corrupt => Mark::zero(key, created),
         });
     }
 
-    /// Move the mark to the account's state and count after a request (Switch wire 7.3,
-    /// "Moving it", Table 3): only while the account is healthy, and only forward: a later
-    /// generation, or the mark's with neither the head's `seq` nor the count lower and one
-    /// higher.
+    /// Move the mark to the account's state, count and tag after a request (Switch wire
+    /// 7.3, "Moving it", Table 3): only while the account is healthy, so never while it is
+    /// behind or a fork; before its first chain item only once the count has moved; and
+    /// only forward: a later generation, or the mark's with neither the head's `seq` nor the
+    /// count lower and one higher.
     pub(super) fn settle_mark(&mut self) {
-        if self.judge() != Verdict::Healthy || self.tip.seq == 0 {
+        if self.judge() != Verdict::Healthy || (self.tip.seq == 0 && self.state_version == 0) {
             return;
         }
-        let (tip, state_version) = (self.tip, self.state_version);
+        let (tip, state_version, state_tag) = (self.tip, self.state_version, self.state_tag);
         let key = self.service.verifying_key().to_bytes();
         if let MarkSlot::At(mark) = &mut self.marks.slot
             && (tip.generation > mark.generation
@@ -542,6 +562,7 @@ impl Inner {
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
             mark.state_version = state_version;
+            mark.state_tag = state_tag;
             mark.key = key;
         }
     }
@@ -556,6 +577,7 @@ impl Inner {
             seq: self.tip.seq,
             chain_hash: self.tip.chain_hash,
             state_version: self.state_version,
+            state_tag: self.state_tag,
             key: self.service.verifying_key().to_bytes(),
             created_at_ms: created,
         });
@@ -574,6 +596,7 @@ impl Inner {
                 seq: self.tip.seq,
                 chain_hash: self.tip.chain_hash,
                 state_version: self.state_version,
+                state_tag: self.state_tag,
                 key,
                 created_at_ms: self.created_at_ms,
             }
@@ -688,9 +711,21 @@ impl ScriptedSwitch {
         inner.seq = seq;
         // The count goes back to what it was as `seq` was given out: every change after it
         // is lost with the restore.
-        if let Some(at) = inner.versions.iter().rposition(|(given, _)| *given == seq) {
-            inner.state_version = inner.versions[at].1;
-            inner.versions.truncate(at + 1);
+        // Before any `seq` the switch gave out, as it was made: count 0, the zero tag.
+        match inner.versions.iter().rposition(|(given, ..)| *given <= seq) {
+            Some(at) => {
+                (_, inner.state_version, inner.state_tag) = inner.versions[at];
+                inner.versions.truncate(at + 1);
+            }
+            None => {
+                (inner.state_version, inner.state_tag) = (0, 0);
+                inner.versions.clear();
+            }
+        }
+        let (version, tag) = (inner.state_version, inner.state_tag);
+        inner.state_history.retain(|count, _| *count <= version);
+        if version > 0 {
+            inner.state_history.insert(version, tag);
         }
     }
 
@@ -698,13 +733,14 @@ impl ScriptedSwitch {
     /// other writes up to the mark's `seq`: the account fails stop, `fork`.
     pub fn fork_mark(&self) {
         let mut inner = self.lock();
-        let (tip, state_version) = (inner.tip, inner.state_version);
+        let (tip, state_version, state_tag) = (inner.tip, inner.state_version, inner.state_tag);
         if let MarkSlot::At(mark) = &mut inner.marks.slot {
             mark.generation = tip.generation;
             mark.seq = tip.seq;
             mark.chain_hash = tip.chain_hash;
             mark.chain_hash[0] ^= 0xff;
             mark.state_version = state_version;
+            mark.state_tag = state_tag;
         }
     }
 

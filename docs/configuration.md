@@ -164,7 +164,7 @@ The last rule fires on any request answered with the recovery notice, `503 recov
 
 ### `[database]`
 
-PostgreSQL 14 or later.
+PostgreSQL 14 or later. The service database role needs the `TEMPORARY` database privilege. Each writing connection uses a temporary table to compare the first and last values of the rows a request touches. Space usage grows with the rows touched in that transaction. PostgreSQL clears these entries at commit.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -255,6 +255,8 @@ The service holds no per-account key in a KMS: the keys are files on that volume
 
 ### No restore and continue
 
+Stop the service before restoring its database or switching to a replica. On restart, the mark's time floor keeps the first answers for an account at or above the time shown before the restore. The first stamp can include the unused part of a one-minute reservation and stay at that value until the clock catches up. If the database switches under a running process, the instance-lock check may take up to ten seconds to detect it.
+
 Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Switch spec 6.5). The service never continues from it under the same generation:
 
 1. The marks stop the affected accounts on their own, and the readiness answer stays up for the others: their requests answer the recovery notice, `503 recovery_required`, with the generation and the reason (`behind`, `fork`, `mark_lost`; Switch wire 7.6).
@@ -276,18 +278,21 @@ Each line gets one state:
 | `healthy` | the state is at or past the mark |
 | `staged` | a staged account at its (0, 0) mark |
 | `bounded` | a staged account holding no chain, whose mark records a head |
-| `behind` | the state is behind the mark: acknowledged chain positions are missing |
-| `fork` | the state is at the mark's pair, or past it, with another chain hash |
+| `behind` | the state is behind the mark: of an earlier generation, at a lower `seq` in the same generation, or at a lower count in the selected account lifetime (`head_count` below `mark_count`): a write the service acknowledged is missing, a chain item or any other, such as an inbox entry, a cursor move or a peer's `identity.json` |
+| `fork` | the chain hash disagrees at the marked position, or the account lacks the matching tag at `mark_count`. A database can report `fork` even when its `head_count` is higher. Choose a database that retains the acknowledged history. |
 | `mark_lost` | the account's mark is missing or doesn't read as a mark |
-| `lost` | a mark that records a head, with no account and no erasure's record covering it: the database lost the account |
+| `unknown` | the account lifetime cannot be determined, for example when a mark is unreadable and the database has no account for it. Keep the mark in place. Check the authoritative mark store and rerun `check-marks` against a database that holds the account before promoting a replica. |
+| `lost` | a mark that records something acknowledged, a head or a count above 0, with no account and no erasure's record covering it: the database lost the account |
 | `leftover` | a mark an erasure's record covers, with no account; the service deletes it |
 | `erased_again` | an account created at or before an erasure's record; the service erases it again |
 
 `healthy` and `staged` need no attention; every other state does, serving or not, since a database to fail over to must hold what the service signed for every account.
 
-It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `retired` (the generations retired for the identity, ascending), `head_seq` and `mark_seq`; then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
+A healthy account can have committed writes waiting for its mark to advance. The database retains up to 1,024 newer tags. It reserves the last slot for a commit that can advance the mark. A staged account with 1,023 uncovered changes can therefore still accept its first valid identity document. At that limit a request that would record another change returns `503 unavailable` and rolls back. Once the authoritative mark store is writable, a public `GET /v1/{id}/identity` on the healthy account covers its committed position. Retry the write. The next counted commit keeps the tag at the covered position and discards older ones.
 
-**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. A database on which the check exits 0 holds every chain item and signed head the service acknowledged, since such an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
+It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `retired` (the generations retired for the identity, ascending), `head_seq` and `mark_seq`, `head_count` and `mark_count`, and `head_tag` and `mark_tag` (the counts' tags, in hex); then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
+
+**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. An exit code of 0 means the candidate passed every account's mark check, including ordinary writes acknowledged for healthy accounts (Switch spec 6.5). Check the recovery-enrollment and webhook limitations before resuming either operation after a restore. See [Known issues](known-issues.md). The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
 
 ### Retiring a generation
 
@@ -298,7 +303,7 @@ What it does: from then on the identity's requests answer the recovery notice wi
 It refuses, and records nothing, unless:
 
 - the generation is above 0;
-- the identity is lost (no account, and a mark that records a head, no erasure's record covering it: `lost` in `check-marks`), or its account fails stop and its newest `identity.json` names this service (`serving` in `check-marks`, and `behind`, `fork` or `mark_lost`). A healthy account is refused, and so is every staged one, such as a move's target, bounded or failing: its ways out stay the abort and the erasure (Switch wire 7.3, Table 2);
+- the identity is lost (no account, and a mark that records a head or a count, no erasure's record covering it: `lost` in `check-marks`), or its account fails stop and its newest `identity.json` names this service (`serving` in `check-marks`, and `behind`, `fork` or `mark_lost`). A healthy account is refused, and so is every staged one, such as a move's target, bounded or failing: its ways out stay the abort and the erasure (Switch wire 7.3, Table 2);
 - the generation given is the one the retirement is of: the mark's, or the account's where the mark is lost. It is the `generation` `check-marks` reports for the line, and a refusal for another names it.
 
 It reads the configuration file as the service does (it needs `server.origin`, `keys.path` and the database), and runs only while the service is stopped: it takes the key store's lock, `<keys.path>/lock`, and refuses while the running service holds it, since the service reads the retirements when it starts. Under the lock it judges the identity as `check-marks` does, reading only, then records the retirement durably. Start the service again afterwards. It prints one JSON line: `account`, the generation `retired`, `already_retired` (`true` when that generation was retired already: nothing changed, and the exit code is still 0), and the `notice` the identity's requests now get. A refusal or a failure exits 1, with the reason on stderr.

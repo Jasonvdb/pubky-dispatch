@@ -59,7 +59,7 @@ use crate::{
         route::Call,
     },
     keys::{KeyId, KeyStore, ServiceSigner},
-    marks::ErasureAttempt,
+    marks::{ErasureAttempt, MarkRead, MarkStore},
     store::{AccountTxn, Store},
 };
 
@@ -265,7 +265,7 @@ impl Service {
             {
                 forget_outcome(lock, freshness.as_ref()).await;
             }
-            let _ = sweep_owed(store, keys).await;
+            let _ = sweep_owed(store, keys, marks).await;
             Ok::<_, String>(())
         })
         .await;
@@ -413,12 +413,14 @@ impl Service {
             let account = self.account_input(
                 head.generation,
                 head.chain,
-                head.state_version,
+                head.count(),
                 head.created_at_ms,
                 held.as_ref().map(IdentityDoc::body),
                 head.activation,
             );
-            let judged = self.judge_with(identity, Some(account), inputs).await;
+            let judged = self
+                .judge_with(txn.conn(), identity, Some(account), inputs)
+                .await;
             let routed = verdict::answer(
                 &judged.judgement,
                 &verdict::RequestClass::Erase,
@@ -473,7 +475,7 @@ impl Service {
                 ),
             );
         }
-        let judged = self.judge_with(identity, None, inputs).await;
+        let judged = self.judge_with(lock.conn(), identity, None, inputs).await;
         if matches!(judged.judgement.decision.verdict, verdict::Verdict::Unknown) {
             return refuse(unavailable());
         }
@@ -603,7 +605,7 @@ impl Service {
             Err(error) => return refuse(store_error(&error)),
         }
         let inputs = self.mark_inputs(account).await;
-        let judged = self.judge_with(account, None, inputs).await;
+        let judged = self.judge_with(lock.conn(), account, None, inputs).await;
         let routed = verdict::answer(
             &judged.judgement,
             &verdict::RequestClass::Erase,
@@ -645,9 +647,13 @@ impl Service {
     /// Returns the accounts whose keys are still owed; `None` when the owed keys can't be
     /// read.
     pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
-        to_the_end(sweep_owed(self.store.clone(), self.keys.clone()))
-            .await
-            .flatten()
+        to_the_end(sweep_owed(
+            self.store.clone(),
+            self.keys.clone(),
+            self.marks.clone(),
+        ))
+        .await
+        .flatten()
     }
 
     /// Erase again account `account`, which a restored database brought back after its
@@ -699,7 +705,7 @@ impl Service {
             if let Err(failure) = marks.delete_created_by(&id, erased_at_ms).await {
                 tracing::warn!(%failure, "deleting an erased account's mark");
             }
-            let _ = sweep_owed(store, keys).await;
+            let _ = sweep_owed(store, keys, marks).await;
             Ok(true)
         })
         .await;
@@ -886,7 +892,11 @@ pub(super) async fn to_the_end<T: Send + 'static>(
 }
 
 /// [`Service::sweep_erased_keys`]'s work.
-pub(super) async fn sweep_owed(store: Store, keys: Arc<dyn KeyStore>) -> Option<Vec<String>> {
+pub(super) async fn sweep_owed(
+    store: Store,
+    keys: Arc<dyn KeyStore>,
+    marks: MarkStore,
+) -> Option<Vec<String>> {
     let owed = match store.erased_keys().await {
         Ok(owed) => owed,
         Err(failure) => {
@@ -896,7 +906,7 @@ pub(super) async fn sweep_owed(store: Store, keys: Arc<dyn KeyStore>) -> Option<
     };
     let mut left = Vec::new();
     for erased in owed {
-        let row = match store.lock_owed_key(&erased.key).await {
+        let mut row = match store.lock_owed_key(&erased.key).await {
             Ok(Some(row)) => row,
             // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
             Ok(None) => continue,
@@ -906,6 +916,33 @@ pub(super) async fn sweep_owed(store: Store, keys: Arc<dyn KeyStore>) -> Option<
                 continue;
             }
         };
+        let covered = match (
+            marks.erasure_attempt(&erased.account).await,
+            marks.read(&erased.account).await,
+            marks.erasure(&erased.account).await,
+        ) {
+            (Ok(None), Ok(read), Ok(at)) => {
+                let mark = match &read {
+                    MarkRead::Mark(mark) => Some(mark),
+                    MarkRead::Missing => None,
+                    MarkRead::NotAMark => {
+                        left.push(erased.account);
+                        continue;
+                    }
+                };
+                let erased_account = at.is_some_and(|at| {
+                    at >= erased.erased_at_ms && mark.is_none_or(|m| m.created_at_ms <= at)
+                });
+                row.covered_by(&erased.account, mark, erased_account)
+                    .await
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !covered {
+            left.push(erased.account);
+            continue;
+        }
         if let Err(failure) = keys.delete(&erased.key).await {
             tracing::error!(%failure, "deleting an owed key");
             left.push(erased.account);

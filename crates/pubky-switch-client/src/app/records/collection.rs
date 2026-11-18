@@ -89,7 +89,10 @@ impl Collection {
                 }
             })
             .collect();
-        Ok(Policy::new(&narrowed, &writes))
+        // A sub-scope's policy keeps the family's permanent member (Switch spec 10.3.1).
+        let mut policy = Policy::new(&narrowed, &writes);
+        policy.permanent = self.policy.permanent;
+        Ok(policy)
     }
 
     /// The collection of sub-scope `sub` alone: its records, read and written under that

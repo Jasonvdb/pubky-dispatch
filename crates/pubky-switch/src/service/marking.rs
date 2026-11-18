@@ -168,7 +168,7 @@ impl Service {
         &self,
         generation: u64,
         chain: Option<(u64, [u8; 32])>,
-        state_version: u64,
+        count: crate::account::Count,
         created_at_ms: u64,
         doc: Option<&IdentityBody>,
         activation: AccountActivation,
@@ -178,7 +178,7 @@ impl Service {
             |key| self.keys.signer_for(key).is_some(),
             generation,
             chain,
-            state_version,
+            count,
             created_at_ms,
             doc,
             activation,
@@ -195,7 +195,10 @@ impl Service {
         self.account_input(
             found.generation,
             found.chain,
-            found.state_version,
+            crate::account::Count {
+                version: found.state_version,
+                tag: found.state_tag,
+            },
             found.created_at_ms,
             body.as_ref(),
             found.activation,
@@ -242,17 +245,23 @@ impl Service {
     /// Judge `identity`'s `account` with its mark, the erasure's record and the retirements
     /// (Switch wire 7.3, Table 1), read now. Only under the account's lock, where no commit
     /// moves the state meanwhile.
-    pub(super) async fn judge(&self, identity: &str, account: Option<Account>) -> Judged {
+    pub(super) async fn judge(
+        &self,
+        txn: &mut crate::store::AccountTxn,
+        identity: &str,
+        account: Option<Account>,
+    ) -> Judged {
         let inputs = self.mark_inputs(identity).await;
-        self.judge_with(identity, account, inputs).await
+        self.judge_with(txn.conn(), identity, account, inputs).await
     }
 
     /// Judge `identity`'s `account` with `inputs`, read before the account was (Switch wire
     /// 7.3, Table 1). Read the selected retirement once its generation is known. A stub
     /// or retirement that can't be read is a store that can't be read: the verdict
     /// is unknown.
-    pub(super) async fn judge_with(
+    pub(super) async fn judge_with<'a>(
         &self,
+        reader: impl sqlx::PgExecutor<'a>,
         identity: &str,
         account: Option<Account>,
         inputs: MarkInputs,
@@ -287,20 +296,24 @@ impl Service {
                 }
             }
         }
-        // The stub at the mark's generation and `seq`, where the state is past the mark,
-        // whatever the state's generation (Switch wire 7.3 under Table 1).
-        let mut stub_at_mark = None;
-        let state = account
-            .and_then(|account| account.model.state.state())
-            .map(|state| (state.generation, state.seq));
+        let mut evidence = crate::store::heads::MarkEvidence::default();
         if let MarkInput::Mark(held) = &mark
-            && account.is_some_and(|account| account.model.created_at_ms == held.created_at_ms)
-            && let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held)
+            && let Some(account) = account.filter(|a| a.model.created_at_ms == held.created_at_ms)
         {
-            match self.store.stub_hash_at(identity, generation, seq).await {
-                Ok(hash) => stub_at_mark = hash,
+            let state = account.model.state.state().map(|s| (s.generation, s.seq));
+            let stub = verdict::stub_for_fork_rule(state, held);
+            match crate::store::heads::evidence_at(reader, identity, stub, held).await {
+                Ok(found) => {
+                    evidence = found;
+                    if held.state_version > 0
+                        && found.tag.is_none()
+                        && self.marks.read(identity).await.ok() != Some(MarkRead::Mark(*held))
+                    {
+                        mark = MarkInput::StoreUnreadable;
+                    }
+                }
                 Err(failure) => {
-                    tracing::error!(%failure, "reading the stub at the mark");
+                    tracing::error!(%failure, "reading the history at the mark");
                     mark = MarkInput::StoreUnreadable;
                 }
             }
@@ -308,7 +321,8 @@ impl Service {
         let judgement = verdict::judge(&Inputs {
             account: account.as_ref(),
             mark: &mark,
-            stub_at_mark,
+            stub_at_mark: evidence.stub,
+            tag_at_mark: evidence.tag,
             erasure_at_ms,
             retired: retired.as_slice(),
             current_key: verdict_key(self),
@@ -390,7 +404,9 @@ impl Service {
             .await
             .map_err(|error| super::store_error(&error))?;
         let account = found.as_ref().map(|found| self.found_input(found));
-        let mut judged = self.judge_with(identity, account, inputs).await;
+        let mut judged = self
+            .judge_with(self.store.pool(), identity, account, inputs)
+            .await;
         let mut found = found;
         if judged.judgement.decision.erase_account_again {
             self.erase_again(identity).await?;
@@ -402,7 +418,9 @@ impl Service {
                 .await
                 .map_err(|error| super::store_error(&error))?;
             let account = found.as_ref().map(|found| self.found_input(found));
-            judged = self.judge_with(identity, account, inputs).await;
+            judged = self
+                .judge_with(self.store.pool(), identity, account, inputs)
+                .await;
         }
         if let (verdict::Verdict::NotHosted { delete_mark: true }, Some(erased_at_ms)) =
             (judged.judgement.decision.verdict, judged.erasure_at_ms)

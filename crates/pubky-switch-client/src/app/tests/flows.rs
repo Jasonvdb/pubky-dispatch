@@ -4433,7 +4433,10 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
     let mut app = w.load(app.app_id()).await;
     let queued = app.events.clone();
     for _ in 0..2 {
-        assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+        assert_eq!(
+            crate::app::tests::pending_events(&mut app).await.unwrap(),
+            duties
+        );
         assert_eq!(app.events, queued);
         assert_eq!(app.duty_handed, 0);
     }
@@ -4444,7 +4447,10 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
         Some(std::cmp::Ordering::Less)
     );
     app.ack_events(ids[1]).await.unwrap();
-    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        duties
+    );
     let (seq, message) = w.note(app.app_id(), "after inspection");
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq));
@@ -4464,11 +4470,16 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
     );
     app.ack_events(ids[0]).await.unwrap();
     assert_eq!(
-        app.pending_duty_events().await.unwrap(),
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
         vec![duties[1].clone()]
     );
     app.ack_events(ids[1]).await.unwrap();
-    assert!(app.pending_duty_events().await.unwrap().is_empty());
+    assert!(
+        crate::app::tests::pending_events(&mut app)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(app.take_events().is_empty());
 }
 
@@ -4484,16 +4495,21 @@ async fn test_pending_duty_events_do_not_extend_prior_delivery() {
     )
     .unwrap();
     app.commit(tx).await.unwrap();
-    let pending = app.pending_duty_events().await.unwrap();
+    let pending = crate::app::tests::pending_events(&mut app).await.unwrap();
     assert_eq!(pending.len(), first.len() + 1);
     app.ack_events(last_id(&pending)).await.unwrap();
     assert_eq!(
-        app.pending_duty_events().await.unwrap(),
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
         vec![pending.last().unwrap().clone()]
     );
     assert_eq!(app.take_events(), vec![pending.last().unwrap().clone()]);
     app.ack_events(last_id(&pending)).await.unwrap();
-    assert!(app.pending_duty_events().await.unwrap().is_empty());
+    assert!(
+        crate::app::tests::pending_events(&mut app)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -4515,7 +4531,11 @@ async fn test_pending_duty_events_reload_after_each_failed_commit() {
             unreported |= !refused_events(&kept, seq).is_empty()
                 && refused_events(&app.events, seq).is_empty();
             for _ in 0..2 {
-                assert_eq!(app.pending_duty_events().await.unwrap(), kept, "{fault:?}");
+                assert_eq!(
+                    crate::app::tests::pending_events(&mut app).await.unwrap(),
+                    kept,
+                    "{fault:?}"
+                );
                 assert!(!app.reload, "{fault:?}: automatic reload completed");
                 assert_eq!(app.cursor(), durable.cursor(), "{fault:?}");
                 assert_eq!(app.duty_handed, handed, "{fault:?}");
@@ -4550,10 +4570,13 @@ async fn test_pending_duty_events_read_errors_leave_delivery_intact() {
     let (mut app, store) = load_behind(&w, app, StoreFault::None).await;
     let queued = app.events.clone();
     store.fail_scan(b"duty/", 0);
-    assert!(app.pending_duty_events().await.is_err());
+    assert!(crate::app::tests::pending_events(&mut app).await.is_err());
     assert_eq!(app.events, queued);
     assert_eq!(app.duty_handed, 0);
-    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        duties
+    );
     assert_eq!(app.duty_handed, 0);
     assert_eq!(app.take_events(), duties);
 }
@@ -4566,14 +4589,25 @@ async fn test_pending_duty_events_leave_explicit_delivery_available() {
     let mut app = w.load(app.app_id()).await;
     // Informational events have no durable ID and remain in the host's next report.
     app.events.push(AppEvent::PushRemoved);
-    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        duties
+    );
     assert_eq!(app.events.last(), Some(&AppEvent::PushRemoved));
     assert_eq!(app.duty_handed, 0);
     assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
     assert_eq!(app.take_events(), vec![AppEvent::PushRemoved]);
-    assert_eq!(app.pending_duty_events().await.unwrap(), duties);
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        duties
+    );
     app.ack_events(last_id(&duties)).await.unwrap();
-    assert!(app.pending_duty_events().await.unwrap().is_empty());
+    assert!(
+        crate::app::tests::pending_events(&mut app)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -9317,7 +9351,9 @@ async fn test_alarm_equivocation_survives_failed_commit_without_dirty_time() {
     assert_eq!(app.alarm(), Some(&expected));
     assert!(!app.service_time_dirty);
     assert_eq!(app.reader().get::<Alarm>(key::ALARM).await.unwrap(), None);
-    Box::pin(app.pending_duty_events()).await.unwrap();
+    Box::pin(crate::app::tests::pending_events(&mut app))
+        .await
+        .unwrap();
     assert_eq!(app.alarm(), Some(&expected));
     assert_eq!(
         app.reader().get::<Alarm>(key::ALARM).await.unwrap(),

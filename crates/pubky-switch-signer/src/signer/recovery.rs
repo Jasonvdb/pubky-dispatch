@@ -34,7 +34,8 @@
 //! another install signs, and during a hand-over or a take-over.
 
 use pubky_switch_core::records::{
-    CLOCK_TOLERANCE_MS, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Inbox,
+    CLOCK_TOLERANCE_MS, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc,
+    IdentityPolicy, Inbox,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -140,7 +141,7 @@ impl Signer {
                 )));
         }
         // Taken before the checks below, which may end a flow in progress.
-        let base = self.recovery_base()?;
+        let base = self.recovery_base()?.ok_or(Refusal::NotSetUp)?;
         // The copies the lost service can't be asked about: the backup and the Homeserver's
         // `identity.json` show another install that took over, or records behind (Switch
         // spec 4.3). Another body there at the mark is an alarm, which the recovery passes,
@@ -163,9 +164,9 @@ impl Signer {
         revoked.dedup();
         // A version the cap can't take is refused before anything is sent: the origin is in
         // it, and the service's key is as long whatever it is.
-        let lost = self.lost_generation(&base);
+        let lost = self.lost_generation(Some(&base))?;
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
-        self.recovery_body(&base, lost, origin, [0; 32], until)?;
+        self.recovery_body(Some(&base), lost, origin, [0; 32], until)?;
         if !pubky_switch_core::records::is_origin(origin) {
             return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
                 "Switch wire 3.7: invalid recovery origin".into(),
@@ -347,42 +348,52 @@ impl Signer {
     /// The document the recovery builds on: the one kept for a recovery declared already,
     /// else the newest this install signed, the version of a delivery or a renewal in flight
     /// to the lost service included, since that service may have taken it and apps seen it.
-    fn recovery_base(&self) -> Result<IdentityDoc> {
+    /// `None` for a recovery with the key alone that found no copy anywhere (Switch spec
+    /// 12.8), and before the first version.
+    pub(super) fn recovery_base(&self) -> Result<Option<IdentityDoc>> {
         let identity = self.state.identity;
         if self.state.recovering
             && let Some(base) = &self.state.recovery_base
         {
-            return state::stored_identity(base, &identity);
+            return state::stored_identity(base, &identity).map(Some);
         }
-        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        let Some(newest) = self.state.newest_doc()? else {
+            return Ok(None);
+        };
         let in_flight = match &self.flow {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => {
                 Some(state::stored_identity(doc, &identity)?)
             }
             _ => None,
         };
-        Ok(in_flight
-            .filter(|doc| {
-                doc.generation() == newest.generation() && doc.version() > newest.version()
-            })
-            .unwrap_or(newest))
+        Ok(Some(
+            in_flight
+                .filter(|doc| {
+                    doc.generation() == newest.generation() && doc.version() > newest.version()
+                })
+                .unwrap_or(newest),
+        ))
     }
 
     /// The generation the recovery declares lost: the one kept for a recovery declared
     /// already, else `base`'s.
-    fn lost_generation(&self, base: &IdentityDoc) -> u64 {
+    fn lost_generation(&self, base: Option<&IdentityDoc>) -> Result<u64> {
         self.state
             .lost_generation
             .filter(|_| self.state.recovering)
-            .unwrap_or_else(|| base.generation())
+            .or_else(|| base.map(IdentityDoc::generation))
+            .ok_or_else(|| RecordsFault::Invariant("a recovery declares no generation lost").into())
     }
 
     /// The body of the recovery's version on `base`, declaring generation `lost` lost and
     /// naming the service at `origin` and its key `service_key`, with owed reductions closed
     /// at `until` (the module's doc, step 2), measured against the cap. Nothing is signed.
-    fn recovery_body(
+    /// With no `base`, after a recovery with the key alone that found no copy anywhere, it is
+    /// a first document in a provider loss's shape (Switch spec 12.8, wire 3.3): no app, at
+    /// the generation after `lost` and above every version the records spent.
+    pub(super) fn recovery_body(
         &self,
-        base: &IdentityDoc,
+        base: Option<&IdentityDoc>,
         lost: u64,
         origin: &str,
         service_key: [u8; 32],
@@ -393,6 +404,24 @@ impl Signer {
                 .ok_or(SignerError::Records(RecordsFault::Invariant(
                     "the generation can't go higher",
                 )))?;
+        let Some(base) = base else {
+            let mut body = IdentityBody::first(
+                self.state.identity,
+                self.state.install,
+                Inbox::new(origin, service_key),
+                IdentityPolicy::default(),
+            );
+            body.version = self
+                .state
+                .signed_through
+                .checked_add(1)
+                .ok_or(SignerError::Records(RecordsFault::Invariant(
+                    "the version can't go higher",
+                )))?;
+            body.generation = generation;
+            body.recovery_from = Some(lost);
+            return Self::measured(&self.state, body, None, Room::Cap);
+        };
         let owed = self.owed_in(base)?;
         self.next_body_on(
             base,
@@ -429,11 +458,19 @@ impl Signer {
         let answer = self
             .enroll_for_recovery(origin, enrollment, observed.body().service_key)
             .await?;
+        // The enrollment's answer names the key the service signs with from then on: only the
+        // one its account discovery showed, which the user confirmed, is followed. Another
+        // fails the step, and the recovery is declared again (Switch spec 12.6, 12.8).
+        if answer.service_key != observed.body().service_key {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.1: the enrollment's answer names another key than the account discovery".into(),
+            )));
+        }
         let base = self.recovery_base()?;
-        let lost = self.lost_generation(&base);
+        let lost = self.lost_generation(base.as_ref())?;
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         // The enrollment names no App ID this version lists: both come from `base`.
-        let body = self.recovery_body(&base, lost, origin, answer.service_key, until)?;
+        let body = self.recovery_body(base.as_ref(), lost, origin, answer.service_key, until)?;
         let key = gate::recovery_key(&self.keyring, &self.state, &self.store)?;
         let doc = IdentityDoc::sign(&key, body)?;
         drop(key);
@@ -476,11 +513,15 @@ impl Signer {
         state.recovery_serving = match self.state.recovery_serving.clone() {
             Some(kept) => Some(kept),
             None => {
-                let earlier = if base.generation() == lost {
-                    (base.inbox().url == origin).then(|| base.inbox().service_key)
-                } else {
-                    self.lost_generations_key_on_homeserver(origin, lost, base.version())
-                        .await?
+                let earlier = match &base {
+                    None => None,
+                    Some(base) if base.generation() == lost => {
+                        (base.inbox().url == origin).then(|| base.inbox().service_key)
+                    }
+                    Some(base) => {
+                        self.lost_generations_key_on_homeserver(origin, lost, base.version())
+                            .await?
+                    }
                 };
                 earlier
                     .filter(|earlier| *earlier != answer.service_key)
@@ -497,9 +538,14 @@ impl Signer {
         // After a recovery with the key alone the version may name a certificate this install
         // doesn't hold, and no backup of it can be sealed: it is written once the delivery
         // has won, as a racing delivery's is, by the version that drops those certificates
-        // (Switch spec 12.8). That backup is owed already: the recovery's own stays owed
-        // until that version.
-        let unheld = self.names_unheld(&doc)?;
+        // (Switch spec 12.8). So is one built on a copy another install signed, or on none:
+        // it races whatever install signed that copy, and a backup that install wrote is
+        // below its version only once it has won.
+        let unheld = self.names_unheld(&doc)?
+            || base
+                .as_ref()
+                .is_none_or(|base| base.body().signer != self.state.install);
+        state.backup_owed |= unheld;
         let flow = Flow::Deliver {
             account: service,
             doc: doc.signed().clone(),
@@ -644,7 +690,7 @@ impl Signer {
     /// Complete at the new service every revocation the recovery's version still lists the
     /// app of (the module's doc, step 4). One that fails stays pending with its alert, and is
     /// completed as any pending revocation is: the recovery itself is done.
-    async fn complete_listed_revocations(&mut self) -> Result<()> {
+    pub(super) async fn complete_listed_revocations(&mut self) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let pending: Vec<[u8; 16]> = self
             .state

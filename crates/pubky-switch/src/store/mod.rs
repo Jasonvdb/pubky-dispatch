@@ -62,6 +62,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
+pub(crate) use account::MarkCoverage;
 pub use account::{
     AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
     ServiceRun, committed_time_ms,
@@ -500,13 +501,19 @@ impl Store {
     /// mark reads (Switch wire 7.3 step 2) and the service time it last committed, for the
     /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
+        Self::lookup_with(&self.pool, id).await
+    }
+
+    pub(crate) async fn lookup_with<'a>(
+        reader: impl sqlx::PgExecutor<'a>,
+        id: &str,
+    ) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
-            "SELECT generation, chain_seq, chain_hash, state_version, stamped_time_ms, \
-             stamped_by, created_at_ms, identity_doc, activation_requirement FROM accounts \
-             WHERE id = $1",
+            "SELECT generation, chain_seq, chain_hash, state_version, state_tag, stamped_time_ms, \
+             stamped_by, created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(reader)
         .await
         .map_err(StoreError::from_db)?;
         let Some(row) = row else {
@@ -532,6 +539,7 @@ impl Store {
             generation: from_db(row.try_get("generation")?, "generation")?,
             chain,
             state_version: from_db(row.try_get("state_version")?, "state_version")?,
+            state_tag: state_tag(row.try_get("state_tag")?)?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
             stamped_by: account::stamped_by(&row)?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
@@ -768,6 +776,8 @@ pub struct FoundAccount {
     pub chain: Option<(u64, [u8; 32])>,
     /// Its count of changed commits (Switch wire 7.3, "The state").
     pub state_version: u64,
+    /// The tag written with the count's last move (Switch wire 7.3, "The state").
+    pub state_tag: [u8; 16],
     /// The service time it last committed.
     pub stamped_time_ms: u64,
     /// The run of the service that stamped it (Switch wire 7.3, "Trusted time").
@@ -817,6 +827,10 @@ impl std::fmt::Debug for IdentityLock {
 }
 
 impl IdentityLock {
+    pub(crate) fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+
     /// Lock the identity's account's row too, the lock held on in the account's
     /// transaction; `None`, letting the identity's lock go, when there is no account.
     pub async fn account(self) -> Result<Option<AccountTxn>, StoreError> {
@@ -880,6 +894,11 @@ impl ReadinessCheck for StoreReadiness {
 /// Convert a `u64` to the `BIGINT` the database stores.
 pub(crate) fn to_db(value: u64, what: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange(what))
+}
+
+/// Read a stored count's tag (Switch wire 7.3, "The state").
+pub(crate) fn state_tag(value: Vec<u8>) -> Result<[u8; 16], StoreError> {
+    <[u8; 16]>::try_from(value.as_slice()).map_err(|_| StoreError::Corrupt("state_tag"))
 }
 
 /// Convert a stored `BIGINT` back to a `u64`.

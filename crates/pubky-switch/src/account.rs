@@ -10,18 +10,30 @@ use pubky_switch_core::{
     records::{AccountActivation, AccountAssociation, AccountBinding, AccountMarkInput},
 };
 
+/// An account's count of changed commits and the random tag written with its last move,
+/// the zero tag before the first (Switch wire 7.3, "The state"). Two states at the same
+/// count with different tags have different histories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Count {
+    /// The count.
+    pub version: u64,
+    /// The tag.
+    pub tag: [u8; 16],
+}
+
 /// The mark facts used by the account verdict (Switch wire 7.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mark {
-    /// The generation of the newest signed head, or zero before any head.
+    /// The generation of the newest signed head; at a serving account before its first
+    /// chain item, its generation once a count is recorded; zero before either.
     pub generation: u64,
     /// The sequence number of that head, or zero before any head.
     pub seq: u64,
     /// The chain hash of that head, or the zero hash before any head.
     pub chain_hash: [u8; 32],
-    /// The account's count of changed commits as of the last one acknowledged under the
-    /// mark, 0 before any head (Switch wire 7.3, "The mark").
-    pub state_version: u64,
+    /// The account's count and tag as of the last commit acknowledged under the mark, 0 and
+    /// the zero tag before any (Switch wire 7.3, "The mark").
+    pub count: Count,
     /// The account creation time, in Unix milliseconds.
     pub created_at_ms: u64,
 }
@@ -33,13 +45,20 @@ impl Mark {
             generation: 0,
             seq: 0,
             chain_hash: [0; 32],
-            state_version: 0,
+            count: Count::default(),
             created_at_ms,
         }
     }
 
+    /// Whether it records a head: a `seq` of 1 or more.
     fn records_head(&self) -> bool {
-        self.generation != 0
+        self.seq != 0
+    }
+
+    /// Whether it records anything acknowledged: a head, or a count above 0 (Switch wire
+    /// 7.3, Table 1, the rows without an account).
+    fn records_acknowledged(&self) -> bool {
+        self.records_head() || self.count.version != 0
     }
 }
 
@@ -80,9 +99,9 @@ pub struct Account {
     pub activation: AccountActivation,
     /// What it holds.
     pub state: AccountState,
-    /// Its count of changed commits: with its chain head, its state (Switch wire 7.3, "The
-    /// state").
-    pub state_version: u64,
+    /// Its count of changed commits and their tag: with its chain head, its state (Switch
+    /// wire 7.3, "The state").
+    pub count: Count,
     /// When it was created, in Unix milliseconds.
     pub created_at_ms: u64,
     /// The generation of the newest `identity.json` it holds, `None` while it holds none.
@@ -159,6 +178,8 @@ pub struct Inputs<'a> {
     /// The chain hash of the stub the service still holds at the mark's generation and
     /// `seq`, if it holds one.
     pub stub_at_mark: Option<[u8; 32]>,
+    /// The database's retained tag at the mark's positive count (Switch wire 7.3).
+    pub tag_at_mark: Option<[u8; 16]>,
     /// The time of the erasure's record for the identity, in Unix milliseconds, if there is
     /// one (Switch wire 7.4.16).
     pub erasure_at_ms: Option<u64>,
@@ -229,17 +250,19 @@ pub struct Judgement {
 enum Column {
     /// No mark, or one that doesn't read as a mark.
     NoMark,
-    /// Mark (0, 0).
+    /// Mark (0, 0); also a mark that records no head, only a count, where the state isn't
+    /// behind its count.
     Zero,
     /// The mark records a head; the account has no state to compare.
     Head,
     /// The mark records a head; the state is at or past it.
     AtOrPast,
-    /// The mark records a head; the state is behind it: of an earlier generation, or of
-    /// the mark's with a lower `seq` or a lower count.
+    /// The state has an earlier generation, a lower `seq` in the same generation, or a
+    /// lower count within the account lifetime.
     Behind,
     /// The mark is at the state's pair with another chain hash, or the state is past the
-    /// mark with another chain hash at the mark's `seq`.
+    /// mark with another chain hash at its `seq`, or the state lacks the matching tag at
+    /// the mark's positive count.
     Fork,
 }
 
@@ -414,7 +437,7 @@ fn judge_without_account(inputs: &Inputs<'_>, retired: bool) -> Verdict {
     if retired {
         return lost(mark, true);
     }
-    if mark.records_head() {
+    if mark.records_acknowledged() {
         lost(mark, false)
     } else {
         Verdict::NotHosted { delete_mark: false }
@@ -435,7 +458,13 @@ fn lost(mark: &Mark, permanent: bool) -> Verdict {
 fn judge_account(account: &Account, inputs: &Inputs<'_>, retired: Option<u64>) -> Verdict {
     let state = account.state.state();
     let mark = inputs.mark.mark();
-    let column = column(state, account.state_version, mark, inputs.stub_at_mark);
+    let column = column(
+        state,
+        account.count,
+        mark,
+        inputs.stub_at_mark,
+        inputs.tag_at_mark,
+    );
     // A retirement is of the generation [`retirement_generation`] selects, and counts
     // only while the state isn't of a later generation than that.
     let retired =
@@ -509,51 +538,62 @@ pub fn stub_for_fork_rule(state: Option<(u64, u64)>, mark: &Mark) -> Option<(u64
     (mark.records_head() && state.is_some_and(|at| at > marked)).then_some(marked)
 }
 
-/// Which of Table 1's columns, other than the two read first, the state, with its count of
-/// changed commits `state_version`, and the mark fall in (Switch wire 7.3, Table 1). The
-/// one rule the service, its offline check and the scripted switch judge by.
+/// Which of Table 1's columns, other than the two read first, the state, with its count
+/// `count`, and the mark fall in (Switch wire 7.3, Table 1). The one rule the service and its
+/// offline check judge by.
 fn column(
     state: Option<ChainTip>,
-    state_version: u64,
+    count: Count,
     mark: Option<&Mark>,
     stub_at_mark: Option<[u8; 32]>,
+    tag_at_mark: Option<[u8; 16]>,
 ) -> Column {
     let Some(mark) = mark else {
         return Column::NoMark;
     };
-    if !mark.records_head() {
-        return Column::Zero;
-    }
     let Some(state) = state else {
-        return Column::Head;
-    };
-    let at = (state.generation, state.seq);
-    let marked = (mark.generation, mark.seq);
-    let by_head = if at < marked {
-        Column::Behind
-    } else if at == marked {
-        if state.chain_hash == mark.chain_hash {
-            Column::AtOrPast
+        return if mark.records_head() {
+            Column::Head
         } else {
-            Column::Fork
-        }
-    } else if stub_at_mark.is_some_and(|hash| hash != mark.chain_hash) {
-        // Where the service still holds the stub at the mark's `seq`, a state past the
-        // mark with another chain hash there is a fork too.
-        Column::Fork
-    } else {
-        Column::AtOrPast
+            Column::Zero
+        };
     };
-    // Read after the heads, so a fork stays a fork: in the mark's generation, a state with
-    // fewer changed commits than the mark covers lost an acknowledged write.
-    if by_head == Column::AtOrPast
-        && state.generation == mark.generation
-        && state_version < mark.state_version
-    {
-        Column::Behind
+    let by_head = if !mark.records_head() {
+        // A mark that records no head compares by its count alone; the fork rules of the
+        // heads don't apply.
+        Column::Zero
     } else {
-        by_head
+        let at = (state.generation, state.seq);
+        let marked = (mark.generation, mark.seq);
+        if at < marked {
+            Column::Behind
+        } else if at == marked {
+            if state.chain_hash == mark.chain_hash {
+                Column::AtOrPast
+            } else {
+                Column::Fork
+            }
+        } else if stub_at_mark.is_some_and(|hash| hash != mark.chain_hash) {
+            // Where the service still holds the stub at the mark's `seq`, a state past the
+            // mark with another chain hash there is a fork too.
+            Column::Fork
+        } else {
+            Column::AtOrPast
+        }
+    };
+    // A later generation in SQL still belongs to the same account lifetime. An ordinary
+    // request can only advance a mark whose acknowledged history this database retains.
+    if matches!(by_head, Column::AtOrPast | Column::Zero) {
+        if state.generation < mark.generation || count.version < mark.count.version {
+            return Column::Behind;
+        }
+        if (mark.count.version > 0 && tag_at_mark != Some(mark.count.tag))
+            || (count.version == mark.count.version && count.tag != mark.count.tag)
+        {
+            return Column::Fork;
+        }
     }
+    by_head
 }
 
 /// A request, by the columns of Table 2 (Switch wire 7.3).

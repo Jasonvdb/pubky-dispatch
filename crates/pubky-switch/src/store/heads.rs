@@ -26,11 +26,23 @@ pub struct StoredHead {
     pub chain: Option<(u64, [u8; 32])>,
     /// The account's count of changed commits (Switch wire 7.3, "The state").
     pub state_version: u64,
+    /// The tag written with the count's last move (Switch wire 7.3, "The state").
+    pub state_tag: [u8; 16],
     /// When the account was created, in service time.
     pub created_at_ms: u64,
     /// The newest `identity.json` the account holds, in the carrying form the store keeps,
     /// not decoded: one that doesn't decode is the caller's to judge.
     pub identity_doc: Option<Vec<u8>>,
+}
+
+impl StoredHead {
+    /// Its count of changed commits with their tag (Switch wire 7.3, "The state").
+    pub fn count(&self) -> crate::account::Count {
+        crate::account::Count {
+            version: self.state_version,
+            tag: self.state_tag,
+        }
+    }
 }
 
 /// Open one connection to `url` with a read-only session: every transaction on it is read
@@ -94,11 +106,63 @@ pub async fn stub_hash_at(
     .transpose()
 }
 
+/// What the selected SQL lifetime retains at the mark's position.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MarkEvidence {
+    pub(crate) stub: Option<[u8; 32]>,
+    pub(crate) tag: Option<[u8; 16]>,
+}
+
+pub(crate) async fn evidence_at<'a>(
+    reader: impl sqlx::PgExecutor<'a>,
+    id: &str,
+    stub: Option<(u64, u64)>,
+    mark: &crate::marks::AccountMark,
+) -> Result<MarkEvidence, StoreError> {
+    if stub.is_none() && mark.state_version == 0 {
+        return Ok(MarkEvidence::default());
+    }
+    let mut query = sqlx::QueryBuilder::new("SELECT ");
+    if let Some((generation, seq)) = stub {
+        query
+            .push("(SELECT chain_hash FROM chain_items WHERE account_id = a.id AND generation = ")
+            .push_bind(to_db(generation, "generation")?)
+            .push(" AND seq = ")
+            .push_bind(to_db(seq, "seq")?)
+            .push(")");
+    } else {
+        query.push("NULL::bytea");
+    }
+    query.push(" AS stub, (SELECT state_tag FROM state_history WHERE account_id = a.id AND state_version = ")
+        .push_bind(to_db(mark.state_version, "state_version")?)
+        .push(") AS tag FROM accounts a WHERE a.id = ").push_bind(id)
+        .push(" AND a.created_at_ms = ").push_bind(to_db(mark.created_at_ms, "created_at_ms")?);
+    let row = query
+        .build()
+        .fetch_optional(reader)
+        .await
+        .map_err(StoreError::from_db)?;
+    let Some(row) = row else {
+        return Ok(MarkEvidence::default());
+    };
+    let stub: Option<Vec<u8>> = row.try_get("stub")?;
+    let tag: Option<Vec<u8>> = row.try_get("tag")?;
+    Ok(MarkEvidence {
+        stub: stub
+            .map(|hash| {
+                hash.try_into()
+                    .map_err(|_| StoreError::Corrupt("chain_hash"))
+            })
+            .transpose()?,
+        tag: tag.map(super::state_tag).transpose()?,
+    })
+}
+
 /// The heads of the accounts `ids` names that are there now, in the order of their IDs.
 pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<StoredHead>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, identity_key, generation, chain_seq, chain_hash, state_version, created_at_ms, \
-         activation_requirement, identity_doc FROM accounts WHERE id = ANY($1) ORDER BY id",
+        "SELECT id, identity_key, generation, chain_seq, chain_hash, state_version, state_tag, \
+         created_at_ms, activation_requirement, identity_doc FROM accounts WHERE id = ANY($1) ORDER BY id",
     )
     .bind(ids)
     .fetch_all(conn)
@@ -125,6 +189,7 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
                 generation: from_db(row.try_get("generation")?, "generation")?,
                 chain,
                 state_version: from_db(row.try_get("state_version")?, "state_version")?,
+                state_tag: super::state_tag(row.try_get("state_tag")?)?,
                 created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
                 activation: pubky_switch_core::records::AccountActivation::parse(
                     row.try_get("activation_requirement")?,

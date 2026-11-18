@@ -6,10 +6,12 @@ mod callback_batches;
 mod current_inputs;
 mod gap_completion;
 mod ownership;
+mod renewal_member;
 mod retained_authority;
 
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::message::Message;
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
 use pubky_switch_core::records::{AppCert, AppRecord};
@@ -18,8 +20,8 @@ use serde_json::json;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, OpBatch,
-    OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
+    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, Need,
+    OpBatch, OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
     UserConfirmed,
 };
 use crate::error::StoreError;
@@ -61,6 +63,8 @@ struct Named {
     failing_gap: Mutex<u32>,
     /// How many of the next receive steps end in a retry.
     retrying: Mutex<u32>,
+    /// Its receive step reads a claim from the switch first.
+    needs_claim: bool,
     /// Its effects carry a conversation entry for the sender.
     with_ops: bool,
     /// Raw operations returned by each receive step.
@@ -79,7 +83,21 @@ struct Named {
     taken: Mutex<Vec<u64>>,
     /// Its collections.
     collections: Vec<crate::app::Collection>,
+    /// Its member of the record for a renewed certificate; the default's while `None`.
+    member_for: Mutex<Option<MemberFor>>,
+    /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
+    assign_kind: Mutex<bool>,
 }
+
+/// A [`Protocol::member_for`] of a test protocol.
+type MemberFor = fn(
+    Option<&serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+    &AppCert,
+) -> (
+    Option<serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+);
 
 fn named(name: &str) -> Named {
     Named {
@@ -266,11 +284,14 @@ impl Protocol for Named {
         }
     }
 
-    fn accepts(&self, _cert: &AppCert) -> Vec<String> {
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
         let mut kinds = vec![
             format!("{}.item", self.name),
             format!("{}.clear", self.name),
         ];
+        if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.push(format!("{}.assign", self.name));
+        }
         kinds.extend(self.foreign.clone());
         kinds
     }
@@ -282,10 +303,13 @@ impl Protocol for Named {
     fn receive(
         &self,
         message: &ReceivedMessage,
-        _: &mut crate::app::ReceiveContext<'_>,
+        cx: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
         if count_down(&self.retrying) {
             return Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable));
+        }
+        if self.needs_claim && cx.switch_claim(&[7; 32]).is_none() {
+            return Outcome::Need(vec![Need::Claim([7; 32])]);
         }
         self.received
             .lock()
@@ -415,6 +439,21 @@ impl Protocol for Named {
             );
         }
         Ok(!*self.holding.lock().unwrap())
+    }
+
+    fn member_for(
+        &self,
+        member: Option<&serde_json::Map<String, serde_json::Value>>,
+        ask: crate::app::RecordExpiry,
+        cert: &AppCert,
+    ) -> (
+        Option<serde_json::Map<String, serde_json::Value>>,
+        crate::app::RecordExpiry,
+    ) {
+        match *self.member_for.lock().unwrap() {
+            Some(member_for) => member_for(member, ask, cert),
+            None => (member.cloned(), ask),
+        }
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {
@@ -724,6 +763,115 @@ async fn test_protocol_set_owed_call_holds_only_its_own_protocol() {
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert_eq!(*p.chat.missed.lock().unwrap(), [gap]);
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+}
+
+/// Whatever an entry of the feed waits for while the cursor stays before it, the first
+/// observation of it is kept, through later reads that hold it again, a read that fails
+/// after its kept effect was dropped, and a reload, so a later page that shows anything else
+/// at its `seq` raises the alarm; it goes once the entry is processed, a kept effect sent
+/// again included (Switch spec 8.2, 10.1; wire 7.4.4).
+#[tokio::test]
+async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold() {
+    #[derive(Clone, Copy, Debug)]
+    enum Hold {
+        /// Its protocol owes a call made before it.
+        OwedCall,
+        /// A claim its step reads can't be read for now.
+        ClaimRead,
+        /// Its effect conflicts at every try.
+        Conflict,
+        /// Its effect is sealed under a data epoch the switch has moved past: a key wait.
+        StaleEpoch,
+        /// As `StaleEpoch`, the first key fetch failing the read after the effect is dropped.
+        KeyFetchFails,
+        /// A claim read, then its effect's answer is lost: the kept effect sent again
+        /// processes it.
+        LostAnswer,
+        /// The protocol's store asks the app to retry.
+        StoreRetry,
+    }
+    for hold in [
+        Hold::OwedCall,
+        Hold::ClaimRead,
+        Hold::Conflict,
+        Hold::StaleEpoch,
+        Hold::KeyFetchFails,
+        Hold::LostAnswer,
+        Hold::StoreRetry,
+    ] {
+        let mut p = Pair::new();
+        p.tasks = Arc::new(Named {
+            with_ops: !matches!(hold, Hold::OwedCall | Hold::ClaimRead | Hold::StoreRetry),
+            needs_claim: matches!(hold, Hold::ClaimRead | Hold::LostAnswer),
+            ..named("tasks")
+        });
+        match hold {
+            Hold::OwedCall => *p.tasks.failing_missed.lock().unwrap() = 3,
+            Hold::StoreRetry => *p.tasks.retrying.lock().unwrap() = 2,
+            _ => {}
+        }
+        let mut app = p.join().await;
+        let me = app.app_id();
+        if matches!(hold, Hold::OwedCall) {
+            // The call `tasks` fails, and owes, at a read of its own.
+            let now = p.w.clock.now_ms();
+            p.w.switch.push_missed(3, now, now);
+            app.receive(None).await.unwrap();
+        }
+        let seq = p.send(me, "tasks.item");
+        // The hold's cause, for two reads.
+        let error = |path: &str, code| Fault::Error {
+            path: path.into(),
+            code,
+            current: json!(null),
+        };
+        let faults = match hold {
+            Hold::ClaimRead => vec![
+                error("claims/", ErrorCode::Unavailable),
+                error("claims/", ErrorCode::Unavailable),
+            ],
+            Hold::Conflict => vec![error("ops", ErrorCode::Conflict); 4],
+            Hold::StaleEpoch => vec![error("ops", ErrorCode::StaleEpoch); 2],
+            Hold::KeyFetchFails => vec![
+                error("ops", ErrorCode::StaleEpoch),
+                error("/keys", ErrorCode::Unavailable),
+                error("ops", ErrorCode::StaleEpoch),
+            ],
+            Hold::LostAnswer => vec![
+                error("claims/", ErrorCode::Unavailable),
+                Fault::LoseAnswer { path: "ops".into() },
+            ],
+            Hold::OwedCall | Hold::StoreRetry => Vec::new(),
+        };
+        for fault in faults {
+            p.w.switch.fail_next(fault);
+        }
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::KeyFetchFails), "{hold:?}");
+        assert!(app.cursor().seq < seq, "{hold:?}: held");
+        let Some(first) = app.state.held.get(&seq).copied() else {
+            panic!("{hold:?}: no observation kept")
+        };
+        p.w.clock.advance_ms(1);
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::LostAnswer), "{hold:?}");
+        assert!(app.cursor().seq < seq, "{hold:?}: held again");
+        drop(app);
+        let mut app = p.load(me).await.unwrap();
+        assert_eq!(
+            app.state.held.get(&seq),
+            Some(&first),
+            "{hold:?}: the first observation stays, through a reload"
+        );
+        read(&mut app, 2).await;
+        assert!(app.cursor().seq >= seq, "{hold:?}: processed");
+        assert!(p.tasks.taken.lock().unwrap().contains(&seq), "{hold:?}");
+        assert!(app.state.parked.is_empty(), "{hold:?}: not stored");
+        assert!(
+            app.state.held.is_empty(),
+            "{hold:?}: the observation goes with it"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1063,6 +1211,58 @@ async fn test_protocol_set_join_refuses_a_certificate_a_protocol_refuses() {
     );
     let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
     assert!(p.store.is_empty(&ns));
+}
+
+/// Inspecting the kept duties names each one's owners, so a host gating `chat` on a pending
+/// duty sees that it is `tasks`'s alone, without taking it from the reports.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_names_its_owners() {
+    let p = Pair::with(
+        Named {
+            huge_missed: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(1, now, now);
+    read(&mut app, 2).await;
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert!(matches!(duty.event, AppEvent::LocalWritesRefused { .. }));
+    assert_eq!(duty.owners, ["tasks"]);
+}
+
+/// A duty for both protocols names both until one acknowledges it, then the other alone.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_owners_shrink_as_each_acknowledges() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(
+        &mut tx,
+        vec!["tasks".into(), "chat".into()],
+        crate::app::events::Duty::KeptBatchDropped { batch_id: [9; 16] },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert_eq!(duty.owners, ["tasks", "chat"]);
+    let id = duty.event.id().unwrap();
+    app.unacknowledged_events().await.unwrap();
+    app.ack_events_for("chat", id).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].owners, ["tasks"]);
 }
 
 #[tokio::test]

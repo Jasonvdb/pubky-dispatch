@@ -166,12 +166,14 @@ impl App {
     /// At the end of a read: read again the records an upload listed (Switch wire 7.4.14),
     /// at most [`RECORD_REREADS_PER_READ`] of them, the oldest marks first, one request
     /// each, and take each view as any read write is. A record read is unmarked in the
-    /// commit of what it read, and so is one the switch doesn't know (`404`), one whose read
-    /// scope the app lacks (`403 permission_missing`), and one whose view names another key,
-    /// which isn't taken. Any other failure, on the network or an answer the switch may
-    /// change, such as `403 cert_expired` before a renewal, stops the reads here, its record
-    /// and the rest still marked, and the feed's read still succeeds; an alarm or a store
-    /// failure fails it.
+    /// commit of what it read, and so is one the switch doesn't know (`404` at an account it
+    /// hosts, which is absence: the rollback alarm for a permanent record the app holds live,
+    /// Switch spec 10.3.1 "Absence"), one whose read scope the app lacks (`403
+    /// permission_missing`), and one whose view names another key, which isn't taken. Any
+    /// other failure, on the network or an answer the switch may change, such as `403
+    /// cert_expired` before a renewal or the signed `404` saying it doesn't host the identity
+    /// (Switch spec 12.7 step 5), stops the reads here, its record and the rest still marked,
+    /// and the feed's read still succeeds; an alarm or a store failure fails it.
     ///
     /// A record is read again as it stands then, not in feed order: only for a protocol
     /// that is with the read, told through everything it covered ([`App::may_tell`], Switch
@@ -209,7 +211,7 @@ impl App {
                 return Ok(true);
             }
             let view = match self.record_view(&key).await {
-                Ok(view) => view.filter(|view| view.key == key),
+                Ok(view) => view.filter(|(view, _)| view.key == key),
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::PermissionMissing,
                     ..
@@ -221,8 +223,8 @@ impl App {
             // any read of it is; another as the protocol's collections take it.
             let collection = self.held_collection(&key).await?;
             let mut tx = self.tx()?;
-            if let Some(view) = view {
-                self.take_view(&view, collection.as_ref().map(|c| (&key, c)), &mut tx)
+            if let Some((view, at)) = view {
+                self.take_view(&view, at, collection.as_ref().map(|c| (&key, c)), &mut tx)
                     .await?;
             }
             tx.delete(&record_reread_key(&key))?;

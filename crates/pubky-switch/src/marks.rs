@@ -74,11 +74,15 @@ const STORE_DIRS: [&str; 4] = ["marks", "retired", "erasures", "erasure-attempts
 /// it showed (Switch wire 7.3, "Trusted time").
 pub const TIME_FLOOR_STEP_MS: u64 = 60_000;
 
-/// An identity's mark (Switch wire 7.3, "Accounts and marks").
+/// An identity's mark (Switch wire 7.3, "Accounts and marks"): (generation, `seq`, chain
+/// hash, count, tag). One that records no head is (0, 0) with count 0 and the zero tag, or,
+/// at a serving account before its first chain item, its generation, `seq` 0 and the zero
+/// hash with the count and tag it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountMark {
-    /// The generation of the newest head signed for the identity, 0 before any.
+    /// The generation of the newest head signed for the identity, or of a count recorded
+    /// before any head; 0 before either.
     pub generation: u64,
     /// That head's `seq`, 0 before any.
     pub seq: u64,
@@ -86,8 +90,11 @@ pub struct AccountMark {
     #[serde(with = "hex_bytes")]
     pub chain_hash: [u8; 32],
     /// The account's count of changed commits as of the last commit acknowledged under the
-    /// mark, 0 before any head (Switch wire 7.3, "The mark").
+    /// mark, 0 before any (Switch wire 7.3, "The mark").
     pub state_version: u64,
+    /// The tag written with that count, the zero tag before any.
+    #[serde(with = "hex_bytes")]
+    pub state_tag: [u8; 16],
     /// The time floor, in Unix milliseconds: at or above every time an answer for the
     /// identity carried (Switch wire 7.3, "Trusted time").
     pub time_floor_ms: u64,
@@ -104,20 +111,24 @@ impl From<&AccountMark> for crate::account::Mark {
             generation: mark.generation,
             seq: mark.seq,
             chain_hash: mark.chain_hash,
-            state_version: mark.state_version,
+            count: crate::account::Count {
+                version: mark.state_version,
+                tag: mark.state_tag,
+            },
             created_at_ms: mark.created_at_ms,
         }
     }
 }
 
 impl AccountMark {
-    /// A mark that has recorded no head: (0, 0), its count 0 and no time floor.
+    /// A mark that has recorded nothing: (0, 0), its count 0 and its tag zero and no time floor.
     pub fn zero(key: [u8; 32], created_at_ms: u64) -> Self {
         Self {
             generation: 0,
             seq: 0,
             chain_hash: ZERO_HASH,
             state_version: 0,
+            state_tag: [0; 16],
             time_floor_ms: 0,
             key,
             created_at_ms,
@@ -133,48 +144,82 @@ impl AccountMark {
         }
     }
 
-    /// Whether it records a head, rather than being (0, 0).
+    /// Whether it records a head: a `seq` of at least 1.
     pub fn records_head(&self) -> bool {
-        self.generation != 0
+        self.seq != 0
     }
 
-    /// Whether it is a mark some writer stores: (0, 0) with the zero hash and count 0, or a
-    /// head at a generation and a `seq` of at least 1 each; its time floor a time the
-    /// service can show.
+    /// Whether it is a mark some writer stores: (0, 0) with the zero hash, count 0 and the
+    /// zero tag; a head at a generation and a `seq` of at least 1 each; or a generation of
+    /// at least 1 with `seq` 0 and the zero hash, before the first head.
     fn is_valid(&self) -> bool {
-        let head = if self.generation == 0 {
+        if self.time_floor_ms > pubky_switch_core::time::MAX_TIME_MS
+            || (self.state_version == 0 && self.state_tag != [0; 16])
+        {
+            return false;
+        }
+        if self.generation == 0 {
             self.seq == 0 && self.chain_hash == ZERO_HASH && self.state_version == 0
         } else {
-            self.seq != 0
-        };
-        head && self.time_floor_ms <= pubky_switch_core::time::MAX_TIME_MS
+            self.seq != 0 || self.chain_hash == ZERO_HASH
+        }
     }
 }
 
-/// Whether `head` is one a mark can move to: generation and `seq` at least 1 each.
+/// Whether `head` is one a mark can move to: a generation of at least 1, at a `seq` of at
+/// least 1 or, before the first head, at `seq` 0 with the zero hash.
+fn is_position(head: &ChainTip) -> bool {
+    head.generation != 0 && (head.seq != 0 || head.chain_hash == ZERO_HASH)
+}
+
+/// Whether `head` is a head: generation and `seq` at least 1 each.
 fn is_head(head: &ChainTip) -> bool {
     head.generation != 0 && head.seq != 0
 }
 
 /// What a mark moves to once the commit that holds it is durable (Switch wire 7.3, "The
-/// mark", "Moving it"): the committed chain head, the account's count of changed commits as
-/// committed, and the time the commit stamped, which a mark written anew takes as its time
-/// floor.
+/// mark", "Moving it"): the committed chain head, or the position before the first, and the
+/// account's count of changed commits and its tag as committed, and the time the commit stamped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarkTarget {
-    /// The committed chain head.
+    /// The committed chain head; before the first, the generation, `seq` 0 and the zero
+    /// hash.
     pub head: ChainTip,
     /// The account's count of changed commits, as committed.
     pub state_version: u64,
+    /// The tag written with that count.
+    pub state_tag: [u8; 16],
     /// The service time the commit stamped, in Unix milliseconds.
     pub stamped_ms: u64,
 }
 
 impl MarkTarget {
-    /// Whether a mark can move to it: a head at a generation and a `seq` of at least 1
-    /// each, and a time the service can show.
+    /// The target of a committed position: `tip`, the chain tip the next item links to, with
+    /// the count and its tag. Before the first chain item there is one only at a serving
+    /// account (`serving`) whose count has moved: its generation, `seq` 0 and the zero hash
+    /// (Switch wire 7.3, "The mark"). `None` where there is nothing to cover.
+    pub fn of(
+        tip: ChainTip,
+        state_version: u64,
+        state_tag: [u8; 16],
+        stamped_ms: u64,
+        serving: bool,
+    ) -> Option<Self> {
+        let target = Self {
+            head: tip,
+            state_version,
+            state_tag,
+            stamped_ms,
+        };
+        if is_head(&tip) {
+            return Some(target);
+        }
+        (serving && state_version != 0 && is_position(&tip)).then_some(target)
+    }
+
+    /// Whether a mark can move to it: a valid position, and a time the service can show.
     fn is_valid(&self) -> bool {
-        is_head(&self.head) && self.stamped_ms <= pubky_switch_core::time::MAX_TIME_MS
+        is_position(&self.head) && self.stamped_ms <= pubky_switch_core::time::MAX_TIME_MS
     }
 
     /// The mark it makes, with `key`, `created_at_ms` and the time floor `time_floor_ms`, or
@@ -185,6 +230,7 @@ impl MarkTarget {
             seq: self.head.seq,
             chain_hash: self.head.chain_hash,
             state_version: self.state_version,
+            state_tag: self.state_tag,
             time_floor_ms: time_floor_ms.max(self.stamped_ms),
             key,
             created_at_ms,
@@ -195,9 +241,9 @@ impl MarkTarget {
 /// Where a move to `target` stands against the held mark (Switch wire 7.3, "The mark"). A
 /// later generation moves it and an earlier one is overtaken. Within the mark's generation,
 /// the head's `seq` and the count move together: neither lower and one higher moves it,
-/// neither higher and one lower is overtaken, both equal is the same mark; another chain
-/// hash at the mark's `seq`, or one of the two lower and the other higher, is a fork. The
-/// mark moved to carries `key`, and keeps its time floor.
+/// neither higher and one lower is overtaken, both equal with the mark's tag is the same
+/// mark; another chain hash at the mark's `seq`, another tag at the mark's count, or one of
+/// the two lower and the other higher, is a fork. The mark moved to carries `key` and keeps its time floor.
 fn order(held: &AccountMark, target: &MarkTarget, key: [u8; 32]) -> Advance {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let moved = || Advance::Moved(target.mark(key, held.created_at_ms, held.time_floor_ms));
@@ -208,7 +254,9 @@ fn order(held: &AccountMark, target: &MarkTarget, key: [u8; 32]) -> Advance {
     }
     let seq = target.head.seq.cmp(&held.seq);
     let count = target.state_version.cmp(&held.state_version);
-    if seq == Equal && target.head.chain_hash != held.chain_hash {
+    if (seq == Equal && target.head.chain_hash != held.chain_hash)
+        || (count == Equal && target.state_tag != held.state_tag)
+    {
         return Advance::Fork(*held);
     }
     match (seq, count) {
@@ -249,7 +297,8 @@ pub enum Advance {
     /// The mark is past the target: a later move overtook it. The mark stays.
     Overtaken(AccountMark),
     /// The target doesn't follow on from the mark in its generation: another chain hash at
-    /// the mark's `seq`, or a head and a count one lower and one higher. Refused.
+    /// the mark's `seq`, another tag at its count, or a head and a count one lower and one
+    /// higher. Refused.
     Fork(AccountMark),
     /// The mark is another account's: created at another time than the account the move
     /// is for, which was erased, and another enrolled, since its commit. The mark stays.
@@ -480,10 +529,10 @@ impl MarkStore {
     }
 
     /// A new account takes the identity's mark `read`, the one it was judged with: its
-    /// generation, `seq`, chain hash and time floor stay, as do the identity's retirements;
-    /// its key and
-    /// creation time become `key` and `created_at_ms`, and its count the new account's, 0
-    /// (Switch wire 7.3, Table 3, "The mark"). Where the
+    /// generation, `seq` and chain hash stay, as do the time floor and the identity's retirements; its key and
+    /// creation time become `key` and `created_at_ms`, and its count and tag the new
+    /// account's, 0 and the zero tag (Switch wire 7.3, Table 3, "The mark"). A mark that
+    /// records no head then records nothing: it becomes (0, 0). Where the
     /// store holds another mark than `read`, or none, nothing changes.
     ///
     /// # Errors
@@ -502,10 +551,15 @@ impl MarkStore {
         let identity = valid_identity(identity)?;
         blocking(move || {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
+                MarkRead::Mark(mark) if mark == read && !mark.records_head() => Some(AccountMark {
+                    time_floor_ms: mark.time_floor_ms,
+                    ..AccountMark::zero(key, created_at_ms)
+                }),
                 MarkRead::Mark(mark) if mark == read => Some(AccountMark {
                     key,
                     created_at_ms,
                     state_version: 0,
+                    state_tag: [0; 16],
                     ..mark
                 }),
                 MarkRead::Mark(_) | MarkRead::Missing | MarkRead::NotAMark => None,
@@ -529,6 +583,7 @@ impl MarkStore {
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
         if !target.is_valid()
+            || !is_head(&target.head)
             || target.head.generation <= read.generation
             || created_at_ms <= read.created_at_ms
             || created_at_ms > pubky_switch_core::time::MAX_TIME_MS
@@ -634,8 +689,8 @@ impl MarkStore {
     /// # Errors
     ///
     /// The store can't be read or the write failed; [`MarkStoreError::InvalidIdentity`];
-    /// [`MarkStoreError::InvalidHead`] for a head at generation or `seq` 0, or a stamp past
-    /// the latest time the service shows.
+    /// [`MarkStoreError::InvalidHead`] for a head at generation 0, or at `seq` 0 with another
+    /// hash than the zero hash, or a stamp past the latest service time.
     pub async fn advance(
         &self,
         identity: &str,
@@ -677,7 +732,7 @@ impl MarkStore {
         let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        if !target.is_valid() {
+        if !target.is_valid() || !is_head(&target.head) {
             return Err(MarkStoreError::InvalidHead);
         }
         blocking(move || {
@@ -1896,6 +1951,7 @@ mod tests {
 
     fn mark_at(generation: u64, seq: u64, hash: u8, created_at_ms: u64) -> AccountMark {
         AccountMark {
+            state_tag: [0; 16],
             generation,
             seq,
             chain_hash: [hash; 32],
@@ -1909,6 +1965,7 @@ mod tests {
     /// A move to `head` with count 0, stamped at time 0.
     fn at(head: ChainTip) -> MarkTarget {
         MarkTarget {
+            state_tag: [0; 16],
             head,
             state_version: 0,
             stamped_ms: 0,
@@ -2027,6 +2084,7 @@ mod tests {
         let (dir, store) = open();
         store.create_zero(ALICE, KEY, 100).await.expect("zero");
         let held = MarkTarget {
+            state_tag: [3; 16],
             state_version: 50,
             ..at(head(2, 9, 1))
         };
@@ -2035,7 +2093,10 @@ mod tests {
         };
         let taken = store.take(ALICE, mark, OTHER_KEY, 500).await.expect("take");
         assert!(
-            matches!(taken, MarkWrite::Written(taken) if taken.state_version == 0),
+            matches!(
+                taken,
+                MarkWrite::Written(taken) if taken.state_version == 0 && taken.state_tag == [0; 16]
+            ),
             "{taken:?}"
         );
         // A restart reads the taken mark, its count the new account's.
@@ -2044,10 +2105,14 @@ mod tests {
         let MarkRead::Mark(read) = store.read(ALICE).await.expect("read") else {
             panic!("no mark");
         };
-        assert_eq!((read.head(), read.state_version), (mark.head(), 0));
+        assert_eq!(
+            (read.head(), read.state_version, read.state_tag),
+            (mark.head(), 0, [0; 16])
+        );
         // The new account's first write at the mark's head moves the mark, and the state
         // there is judged healthy, not behind (Switch wire 7.3, Table 3).
         let first = MarkTarget {
+            state_tag: [0; 16],
             state_version: 1,
             ..at(head(2, 9, 1))
         };
@@ -2061,7 +2126,10 @@ mod tests {
         let account = crate::account::Account {
             activation: pubky_switch_core::records::AccountActivation::Ordinary,
             state: crate::account::AccountState::Serving(head(2, 9, 1)),
-            state_version: 1,
+            count: crate::account::Count {
+                version: 1,
+                tag: [0; 16],
+            },
             created_at_ms: 500,
             document_generation: Some(2),
             enrolled_generation: 2,
@@ -2070,6 +2138,7 @@ mod tests {
             account: Some(&account),
             mark: &crate::account::MarkInput::Mark((&moved).into()),
             stub_at_mark: None,
+            tag_at_mark: Some(first.state_tag),
             erasure_at_ms: None,
             retired: &[],
         });
@@ -2086,6 +2155,7 @@ mod tests {
             ..mark_at(2, 5, 1, 100)
         };
         let stamped = |generation, seq, hash, state_version, stamped_ms| MarkTarget {
+            state_tag: [0; 16],
             head: head(generation, seq, hash),
             state_version,
             stamped_ms,
@@ -2163,6 +2233,142 @@ mod tests {
         for (case, target, expected) in cases {
             assert_eq!(order(&held, &target, OTHER_KEY), expected, "{case}");
         }
+        // The count's tag: at the mark's count another tag is another history, a fork; past
+        // it, the target's own tag moves with it.
+        let tagged = |seq, hash, state_version, tag| MarkTarget {
+            state_tag: [tag; 16],
+            ..to(2, seq, hash, state_version)
+        };
+        assert_eq!(
+            order(&held, &tagged(5, 1, 8, 4), OTHER_KEY),
+            Advance::Fork(held)
+        );
+        assert_eq!(
+            order(&held, &tagged(6, 4, 8, 4), OTHER_KEY),
+            Advance::Fork(held)
+        );
+        assert_eq!(
+            order(&held, &tagged(5, 1, 9, 4), OTHER_KEY),
+            Advance::Moved(AccountMark {
+                state_version: 9,
+                state_tag: [4; 16],
+                key: OTHER_KEY,
+                ..held
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marks_position_before_the_first_head_holds_a_count() {
+        // A serving account before its first chain item: its generation, `seq` 0 and the
+        // zero hash, with its count and tag (Switch wire 7.3, "The mark").
+        let (dir, store) = open();
+        store.create_zero(ALICE, KEY, 100).await.expect("zero");
+        let before_head = |state_version, tag| MarkTarget {
+            stamped_ms: 250,
+            head: ChainTip {
+                generation: 2,
+                seq: 0,
+                chain_hash: ZERO_HASH,
+            },
+            state_version,
+            state_tag: [tag; 16],
+        };
+        let Advance::Moved(moved) = store
+            .advance(ALICE, before_head(3, 1), KEY, 100)
+            .await
+            .expect("moved")
+        else {
+            panic!("not moved");
+        };
+        assert!(!moved.records_head());
+        assert_eq!(moved.time_floor_ms, 250);
+        assert_eq!((moved.generation, moved.seq), (2, 0));
+        // It reads back as a mark after a restart, and moves on to the count and to the
+        // first head.
+        drop(store);
+        let store = MarkStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.read(ALICE).await.expect("read"),
+            MarkRead::Mark(moved)
+        );
+        assert!(matches!(
+            store.advance(ALICE, before_head(4, 2), KEY, 100).await,
+            Ok(Advance::Moved(_))
+        ));
+        assert!(matches!(
+            store.advance(ALICE, before_head(4, 5), KEY, 100).await,
+            Ok(Advance::Fork(_))
+        ));
+        let first = MarkTarget {
+            stamped_ms: 0,
+            head: head(2, 1, 7),
+            state_version: 5,
+            state_tag: [3; 16],
+        };
+        assert!(matches!(
+            store.advance(ALICE, first, KEY, 100).await,
+            Ok(Advance::Moved(mark)) if mark.records_head()
+        ));
+        // `seq` 0 with another hash than the zero hash, or generation 0, is no position.
+        for bad in [
+            ChainTip {
+                generation: 2,
+                seq: 0,
+                chain_hash: [1; 32],
+            },
+            head(0, 1, 1),
+        ] {
+            let target = MarkTarget { head: bad, ..first };
+            assert!(matches!(
+                store.advance(ALICE, target, KEY, 100).await,
+                Err(MarkStoreError::InvalidHead)
+            ));
+        }
+        // A file of a mark before any head with another hash, or of generation 0 with a
+        // count, doesn't read as a mark.
+        for shape in [
+            AccountMark {
+                chain_hash: [1; 32],
+                ..moved
+            },
+            AccountMark {
+                generation: 0,
+                ..moved
+            },
+        ] {
+            assert!(!shape.is_valid(), "{shape:?}");
+        }
+        assert!(moved.is_valid());
+        // A new account that takes a mark with no head over takes it as (0, 0): its count
+        // was the lost account's. Its time floor still bounds the new lifetime.
+        let (_dir, store) = open();
+        store.create_zero(ALICE, KEY, 100).await.expect("zero");
+        let Ok(Advance::Moved(held)) = store.advance(ALICE, before_head(3, 1), KEY, 100).await
+        else {
+            panic!("not moved");
+        };
+        assert_eq!(
+            store.take(ALICE, held, OTHER_KEY, 500).await.expect("take"),
+            MarkWrite::Written(AccountMark {
+                time_floor_ms: 250,
+                ..AccountMark::zero(OTHER_KEY, 500)
+            })
+        );
+    }
+
+    #[test]
+    fn test_marks_target_before_the_first_head_only_at_a_serving_account_with_a_count() {
+        let tip = ChainTip {
+            generation: 2,
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        };
+        assert!(MarkTarget::of(tip, 3, [1; 16], 0, true).is_some());
+        assert_eq!(MarkTarget::of(tip, 3, [1; 16], 0, false), None);
+        assert_eq!(MarkTarget::of(tip, 0, [0; 16], 0, true), None);
+        // A head is a target wherever the account is.
+        assert!(MarkTarget::of(head(2, 1, 1), 0, [0; 16], 0, false).is_some());
     }
 
     #[tokio::test]
@@ -2669,6 +2875,10 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .remove("time_floor_ms");
+        let mut headless = good.clone();
+        headless["seq"] = 0.into();
+        headless["chain_hash"] = zero_hash.clone().into();
+        headless["state_tag"] = hex::encode([1u8; 16]).into();
         for value in [
             extra,
             zero_seq,
@@ -2678,6 +2888,7 @@ mod tests {
             short,
             far_floor,
             no_floor,
+            headless,
         ] {
             cases.push(serde_json::to_vec(&value).expect("bytes"));
         }

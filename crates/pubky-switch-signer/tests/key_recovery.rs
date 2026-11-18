@@ -2692,3 +2692,41 @@ async fn test_key_recovery_past_a_backup_its_service_refuses() {
     let mut signer = recovered(&world, &[]).await.unwrap();
     signs_on(&world, &mut signer).await;
 }
+
+#[tokio::test]
+async fn test_key_recovery_never_delivers_into_a_replaced_account() {
+    // The account is erased and created again between the recovery's commit and its step:
+    // its enrollment, bound to the account surveyed, is refused there, and nothing is
+    // delivered into the replacement. Surveyed afresh, the replacement is shown as such.
+    let world = World::new();
+    let (first, _) = world.enrolled().await;
+    drop(first);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store).await.unwrap();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    Signer::restore_new(
+        world.env(store.clone()),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await
+    .unwrap_err();
+    world.create_after_erasure().await;
+    let result = Signer::restore_new(
+        world.env(store.clone()),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(world.switch.identity_doc().is_none());
+    assert!(survey(&world, &Arc::new(MemoryStore::new())).await.is_err());
+}

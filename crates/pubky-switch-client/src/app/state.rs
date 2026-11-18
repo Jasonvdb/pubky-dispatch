@@ -456,11 +456,25 @@ impl ParkedRound {
     }
 }
 
-/// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).
+/// `held/<seq>`: the first observation of an entry held or processed ahead of the cursor,
+/// kept until the cursor passes it (Switch spec 8.2, wire 7.4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
+    /// When it was first held: the bounded wait of an entry whose sender can't be checked
+    /// runs from it.
     pub(crate) since_ms: u64,
     pub(crate) receipt: EntryReceipt,
+    /// The acceptance time the page of the receipt showed: a later page shows the same.
+    pub(crate) accepted_at_ms: u64,
+}
+
+impl HeldEntry {
+    pub(super) fn validate(&self) -> Result<(), AppError> {
+        if self.accepted_at_ms > self.receipt.read_at_ms {
+            return Err(super::corrupt());
+        }
+        Ok(())
+    }
 }
 
 /// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry
@@ -1264,6 +1278,7 @@ mod tests {
                 &HeldEntry {
                     receipt: receipt(),
                     since_ms: seq,
+                    accepted_at_ms: seq,
                 },
             )
             .unwrap();
@@ -1284,7 +1299,8 @@ mod tests {
             held.get(&599),
             Some(&HeldEntry {
                 receipt: receipt(),
-                since_ms: 599
+                since_ms: 599,
+                accepted_at_ms: 599,
             })
         );
         assert_eq!(reader.get_raw(b"p/x").await.unwrap(), Some(b"1".to_vec()));

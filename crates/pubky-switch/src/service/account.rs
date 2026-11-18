@@ -66,7 +66,7 @@ impl Service {
         base_ms: u64,
     ) -> SwitchResponse {
         let result = async {
-            let _lock = self
+            let mut lock = self
                 .store
                 .lock_identity(identity)
                 .await
@@ -77,13 +77,13 @@ impl Service {
                 .await
                 .map_err(|_| discovery_unavailable())?;
             let inputs = self.mark_inputs(identity).await;
-            let found = self
-                .store
-                .lookup(identity)
+            let found = crate::store::Store::lookup_with(lock.conn(), identity)
                 .await
                 .map_err(|e| store_error(&e))?;
             let account = found.as_ref().map(|found| self.found_input(found));
-            let judged = self.judge_with(identity, account, inputs).await;
+            let judged = self
+                .judge_with(lock.conn(), identity, account, inputs)
+                .await;
             if self
                 .marks
                 .identity()
@@ -150,7 +150,7 @@ impl Service {
                         self.record_failure(request, identity.to_string());
                     }
                 })?;
-            let _lock = self
+            let mut lock = self
                 .store
                 .lock_identity(identity)
                 .await
@@ -163,13 +163,13 @@ impl Service {
                 .await
                 .map_err(|_| discovery_unavailable())?;
             let inputs = self.mark_inputs(identity).await;
-            let found = self
-                .store
-                .lookup(identity)
+            let found = crate::store::Store::lookup_with(lock.conn(), identity)
                 .await
                 .map_err(|e| store_error(&e))?;
             let account = found.as_ref().map(|found| self.found_input(found));
-            let judged = self.judge_with(identity, account, inputs).await;
+            let judged = self
+                .judge_with(lock.conn(), identity, account, inputs)
+                .await;
             if matches!(judged.mark, MarkInput::StoreUnreadable)
                 || (matches!(judged.mark, MarkInput::NotAMark) && judged.account.is_none())
                 || judged.judgement.decision.erase_account_again

@@ -98,8 +98,8 @@ use super::provider::TakeOver;
 use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect,
-    Processed, RetryEntry, Tx, encode, key,
+    HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -1104,17 +1104,15 @@ impl App {
             // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
             self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
             let step = match item {
-                _ if kept_call => Step::Pass,
-                // Processed past a held entry in an earlier read.
-                FeedItem::Entry(_) if self.state.seen.contains(&seq) => Step::Pass,
                 FeedItem::Entry(entry) => {
-                    let receipt = EntryReceipt {
-                        entry_id: entry.entry_id,
-                        service_key: page.service_key,
-                        read_at_ms: page.server_time_ms,
-                    };
-                    self.handle_entry(entry, receipt, &mut read).await?
+                    let receipt = self.observe_entry(entry, &page, &mut read.tx)?;
+                    if kept_call || self.state.seen.contains(&seq) {
+                        Step::Pass
+                    } else {
+                        self.handle_entry(entry, receipt, &mut read).await?
+                    }
                 }
+                _ if kept_call => Step::Pass,
                 FeedItem::Unreadable {
                     seq,
                     sender,
@@ -1230,9 +1228,7 @@ impl App {
             (None, Some(blocked)) => blocked.saturating_sub(1).min(through),
             (None, None) => through,
         };
-        if end > self.state.cursor.seq {
-            self.state.cursor.seq = end;
-        }
+        self.advance_feed_cursor(end, None, &mut read.tx)?;
         // The page is covered through its end, for the protocols in step with it.
         if stopped.is_none() {
             let none = std::collections::BTreeSet::new();
@@ -1295,12 +1291,52 @@ impl App {
             FeedItem::Unreadable { accepted_at, .. } => Some(*accepted_at),
             _ => None,
         };
-        if let Some(at) = accepted {
-            self.state.cursor.time_ms = self.state.cursor.time_ms.max(at);
+        self.advance_feed_cursor(seq, accepted, &mut read.tx)
+    }
+
+    /// Stage the entry's first observation before handling it. A saved effect or callback
+    /// can commit the read before the cursor passes the entry (Switch spec 8.2, wire 7.4.4).
+    fn observe_entry(
+        &mut self,
+        entry: &EntryItem,
+        page: &FeedPage,
+        tx: &mut Tx,
+    ) -> Result<EntryReceipt, AppError> {
+        if let Some(held) = self.state.held.get(&entry.seq) {
+            return Ok(held.receipt);
         }
-        self.state.cursor.seq = self.state.cursor.seq.max(seq);
-        if self.state.held.remove(&seq).is_some() {
-            read.tx.delete(&key::held(seq))?;
+        let receipt = EntryReceipt {
+            entry_id: entry.entry_id,
+            service_key: page.service_key,
+            read_at_ms: page.server_time_ms,
+        };
+        let held = HeldEntry {
+            since_ms: self.now(),
+            receipt,
+            accepted_at_ms: entry.accepted_at,
+        };
+        tx.put(&key::held(entry.seq), &held)?;
+        self.state.held.insert(entry.seq, held);
+        Ok(receipt)
+    }
+
+    /// Keep observations only for feed positions the local cursor can still read.
+    fn advance_feed_cursor(
+        &mut self,
+        seq: u64,
+        accepted_at: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let cursor = &mut self.state.cursor;
+        cursor.seq = cursor.seq.max(seq);
+        if let Some(at) = accepted_at {
+            cursor.time_ms = cursor.time_ms.max(at);
+        }
+        while let Some((&passed, _)) = self.state.held.first_key_value()
+            && passed <= cursor.seq
+        {
+            tx.delete(&key::held(passed))?;
+            self.state.held.pop_first();
         }
         Ok(())
     }
@@ -1310,32 +1346,36 @@ impl App {
     /// entry stored locally from the sequence the cursor follows, which a cooperative move
     /// continues, at a `seq` the cursor hasn't passed, which later reads meet again. Every
     /// item the page carries of a type this version reads is compared (Switch wire 7.5):
-    /// only that entry, accepted by the observation's time, may stand there. Another entry,
+    /// only that entry, with the acceptance time first shown, may stand there. Another entry,
     /// an `unreadable` or `missed` item, which take new `seq`s, or a chain item or stub at
     /// that `seq` means the service signed two histories (Switch spec 10.1, wire 7.4.4).
     fn contradicted_observation(&self, page: &FeedPage) -> Option<u64> {
         let cursor = self.state.cursor;
-        let stored: HashMap<u64, EntryReceipt> = self
+        let stored: HashMap<u64, ([u8; 16], u64)> = self
             .state
             .parked
             .values()
             .filter(|stored| {
                 self.same_sequence(stored.generation, cursor.generation) && stored.seq > cursor.seq
             })
-            .map(|stored| (stored.seq, stored.receipt))
+            .map(|stored| (stored.seq, (stored.receipt.entry_id, stored.accepted_at_ms)))
             .collect();
         page.items.iter().find_map(|item| {
             let seq = item.seq();
-            let observed = self
+            let shown = match item {
+                FeedItem::Entry(entry) => Some((entry.entry_id, entry.accepted_at)),
+                _ => None,
+            };
+            let held = self
                 .state
                 .held
                 .get(&seq)
-                .map(|held| held.receipt)
-                .or_else(|| stored.get(&seq).copied())?;
-            let same = matches!(item, FeedItem::Entry(entry)
-                if entry.entry_id == observed.entry_id
-                    && entry.accepted_at <= observed.read_at_ms);
-            (!same).then_some(seq)
+                .map(|held| (held.receipt.entry_id, held.accepted_at_ms));
+            let differs = held
+                .into_iter()
+                .chain(stored.get(&seq).copied())
+                .any(|observation| Some(observation) != shown);
+            differs.then_some(seq)
         })
     }
 
@@ -1358,26 +1398,6 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        // The first observation of an entry held at this `seq` is kept, and only for that
-        // entry, accepted by then. A page that contradicts what an earlier page showed raised
-        // the alarm before any of its items was handled (`contradicted_observation`), and a page
-        // shows one item per `seq` (`FeedPage`), so no other entry takes the held receipt
-        // and no kept observation precedes its entry's acceptance (Switch wire 7.4.4).
-        let receipt = match self.state.held.get(&item.seq) {
-            Some(held)
-                if held.receipt.entry_id == item.entry_id
-                    && item.accepted_at <= held.receipt.read_at_ms =>
-            {
-                held.receipt
-            }
-            Some(_) => {
-                return Err(AppError::InvalidData(
-                    "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at its seq"
-                        .into(),
-                ));
-            }
-            None => receipt,
-        };
         let entry = Entry {
             receipt,
             seq: item.seq,
@@ -2004,6 +2024,9 @@ impl App {
         read: &mut Read,
     ) -> Result<Option<Step>, AppError> {
         if self.key_may_come_by_fetch(data_epoch) {
+            if entry.stored.is_none() {
+                self.commit_read(read).await?;
+            }
             self.fetch_key_parts().await?;
             if self.holds_epoch_keys(data_epoch) {
                 return Ok(None);
@@ -2153,7 +2176,7 @@ impl App {
         {
             return Ok(Sent::TooLarge);
         }
-        // Everything read so far, with the kept batch, before it is sent.
+        // Commit the read so far with the saved batch before sending it.
         read.tx.put(key::PENDING_EFFECT, &pending)?;
         read.tx.put(key::CURSOR, &self.state.cursor)?;
         let tx = std::mem::replace(&mut read.tx, self.tx()?);
@@ -2298,8 +2321,7 @@ impl App {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
-            self.state.cursor.seq = self.state.cursor.seq.max(pending.seq);
-            self.state.cursor.time_ms = self.state.cursor.time_ms.max(pending.accepted_at_ms);
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), &mut tx)?;
         }
         tx.delete(key::PENDING_EFFECT)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
@@ -2432,9 +2454,8 @@ impl App {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), tx)?;
             let cursor = &mut self.state.cursor;
-            cursor.seq = cursor.seq.max(pending.seq);
-            cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
             if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
                 cursor.deferred_since_ms = Some(now);
             }
@@ -2530,14 +2551,6 @@ impl App {
             return Ok(Step::Pass);
         }
         let now = self.now();
-        if entry.stored.is_none() && !self.state.held.contains_key(&entry.seq) {
-            let held = HeldEntry {
-                receipt: entry.receipt,
-                since_ms: now,
-            };
-            read.tx.put(&key::held(entry.seq), &held)?;
-            self.state.held.insert(entry.seq, held);
-        }
         let fresh = RetryEntry {
             reads: 0,
             since_ms: now,
@@ -2604,19 +2617,14 @@ impl App {
         plaintext: &MessagePlaintext,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        // Held since its first hold, whatever that waited for; the read keeps its
+        // observation as it holds it.
         let now = self.now();
-        let since = match self.state.held.get(&entry.seq) {
-            Some(held) => held.since_ms,
-            None => {
-                let held = HeldEntry {
-                    receipt: entry.receipt,
-                    since_ms: now,
-                };
-                read.tx.put(&key::held(entry.seq), &held)?;
-                self.state.held.insert(entry.seq, held);
-                now
-            }
-        };
+        let since = self
+            .state
+            .held
+            .get(&entry.seq)
+            .map_or(now, |held| held.since_ms);
         if now.saturating_sub(since) >= self.config.park_after_ms {
             self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read)
                 .await?;
@@ -2712,12 +2720,6 @@ impl App {
             keys_at: reason.awaited_epoch().map(|_| self.keys_held()),
         };
         read.tx.put(&key::parked(id), &parked)?;
-        // An entry read from the feed may have been held there; a stored one's `seq` names
-        // no position of the feed read now.
-        if entry.stored.is_none() {
-            read.tx.delete(&key::held(entry.seq))?;
-            self.state.held.remove(&entry.seq);
-        }
         self.state.parked.insert(id, parked);
         if reason.tried_again() {
             if reason.awaited_epoch().is_some() {
@@ -3144,7 +3146,7 @@ impl App {
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
     /// minutes old, read again from the Homeserver otherwise (`force` reads it again
     /// whatever its age), with whether it was read in this call. `None` when it can't be
-    /// read now, or the identity equivocated.
+    /// read now, the read gave no copy under 10 minutes old, or the identity equivocated.
     async fn sender_doc(
         &mut self,
         sender: &[u8; 32],
@@ -3170,9 +3172,8 @@ impl App {
             Ok(None) | Err(_) => return Ok(None),
         };
         let mut tx = self.tx()?;
-        let held_doc = held.as_ref().map(|(doc, _)| doc);
-        let taken = identity::take_copy(&reader, &mut tx, &fetched, held_doc, now).await?;
-        let doc = match taken {
+        let taken = identity::take_peer_read(&reader, &mut tx, fetched, held, now, now).await?;
+        let (doc, read_ms) = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
                     identity: *sender,
@@ -3181,20 +3182,15 @@ impl App {
                 self.commit(tx).await?;
                 return Ok(None);
             }
-            Ok(Taken::Newer) => fetched,
-            Ok(Taken::Same | Taken::Older) => {
-                let doc = held_doc.cloned().unwrap_or(fetched);
-                tx.put(
-                    &key::ident_doc(sender),
-                    &CachedDoc {
-                        doc: doc.signed().clone(),
-                        fetched_ms: now,
-                    },
-                )?;
-                doc
-            }
+            Ok(taken) => taken,
         };
         self.commit(tx).await?;
+        // A read that served an older copy doesn't confirm the one held: past its 10
+        // minutes when the read ends, it verifies no sender until a read gives it again, or
+        // a newer one.
+        if self.now().saturating_sub(read_ms) >= DOC_CACHE_MS {
+            return Ok(None);
+        }
         Ok(Some((doc, true)))
     }
 

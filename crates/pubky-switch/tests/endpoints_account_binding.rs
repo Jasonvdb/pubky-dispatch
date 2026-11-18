@@ -554,6 +554,116 @@ async fn sql(replay: &Replay, statement: &str) {
     connection.close().await.unwrap();
 }
 
+// Bring a fresh account near the history limit. Exercise the boundary through the service.
+async fn seed_staged_history(replay: &Replay, count: u64) {
+    let id = key().id();
+    assert_eq!(support::state_version_of(replay, &id).await, 0);
+    sql(
+        replay,
+        &format!(
+            "INSERT INTO state_history (account_id, state_version, state_tag)
+         SELECT '{id}', n, uuid_send(gen_random_uuid()) FROM generate_series(1, {count}) n;
+         UPDATE accounts SET state_version = h.state_version, state_tag = h.state_tag
+         FROM state_history h WHERE accounts.id = '{id}' AND h.account_id = accounts.id
+         AND h.state_version = {count}"
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_staged_account_leaves_room_for_its_first_identity_after_restart() {
+    let Some(replay) = trusted_replay().await else {
+        return;
+    };
+    let (_, created) = create(&replay, NOW, 2).await;
+    let id = key().id();
+    seed_staged_history(&replay, 1022).await;
+    let MarkRead::Mark(mark) = replay.marks.read(&id).await.unwrap() else {
+        panic!("missing staged mark")
+    };
+    let existing = |nonce| make_enrollment(EnrollmentIntent::Existing { created }, nonce);
+    let accepted = existing(3);
+    status(
+        &replay
+            .service
+            .handle(enrollment_request(&accepted, NOW))
+            .await,
+        200,
+    );
+    assert_eq!(support::state_version_of(&replay, &id).await, 1023);
+
+    let receipt = existing(4);
+    let refused = replay
+        .service
+        .handle(enrollment_request(&receipt, NOW))
+        .await;
+    status(&refused, 503);
+    assert_eq!(value(&refused)["code"], "unavailable");
+    // A signed read whose minute's maintenance is due also leaves the final slot free.
+    let read = signed("GET", &path("apps"), vec![], Some(created), NOW);
+    let refused = replay.service.handle(read).await;
+    status(&refused, 503);
+    assert_eq!(value(&refused)["code"], "unavailable");
+    assert_eq!(
+        replay.marks.read(&id).await.unwrap(),
+        MarkRead::Mark(pubky_switch::marks::AccountMark {
+            time_floor_ms: NOW + pubky_switch::marks::TIME_FLOOR_STEP_MS,
+            ..mark
+        })
+    );
+    assert_eq!(support::state_version_of(&replay, &id).await, 1023);
+
+    let marks = MarkStore::open(replay.key_dir()).unwrap();
+    let restarted = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        replay.keys.clone(),
+        marks.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    let doc = serde_json::from_value(
+        support::named(
+            &support::vectors("documents.json")["documents"],
+            "alice identity.json, first delivery (version 1)",
+        )["signed"]
+            .clone(),
+    )
+    .unwrap();
+    let body = http::IdentityDelivery {
+        identity: doc,
+        prev: None,
+    }
+    .to_json();
+    status(
+        &restarted
+            .handle(signed("PUT", &path("identity"), body, Some(created), NOW))
+            .await,
+        200,
+    );
+    let MarkRead::Mark(first) = marks.read(&id).await.unwrap() else {
+        panic!("missing first head")
+    };
+    assert!(first.seq > 0);
+    assert_eq!(first.state_version, 1024);
+    let mut connection = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .unwrap();
+    let retained = async |connection: &mut sqlx::PgConnection| -> (i64, i64, i64) {
+        sqlx::query_as("SELECT count(*), min(state_version), max(state_version) FROM state_history WHERE account_id = $1")
+            .bind(&id).fetch_one(connection).await.unwrap()
+    };
+    assert_eq!(retained(&mut connection).await, (1024, 1, 1024));
+    status(
+        &restarted.handle(enrollment_request(&receipt, NOW)).await,
+        200,
+    );
+    assert_eq!(retained(&mut connection).await, (2, 1024, 1025));
+    connection.close().await.unwrap();
+    replay.db.drop_database().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_account_binding_corrupt_mark_observation_requires_a_readable_account() {
     let Some(replay) = support::replay().await else {
@@ -1690,6 +1800,9 @@ async fn test_account_activation_requires_higher_version_and_generation() {
     let Some((replay, doc, created)) = replacement_account().await else {
         return;
     };
+    // This account's ordinary requests cannot cover its mark. Only its authorized
+    // higher-generation delivery can use the final slot.
+    seed_staged_history(&replay, 1023).await;
     let before = replay
         .db
         .store()
@@ -1741,6 +1854,7 @@ async fn test_account_activation_requires_higher_version_and_generation() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(after.state_version, 1024);
     assert_eq!(after.activation, AccountActivation::Ordinary);
     assert_eq!(after.generation, 9);
     assert!(after.chain.is_some());

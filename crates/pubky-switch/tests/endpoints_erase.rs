@@ -37,6 +37,7 @@ use support::*;
 /// `accounts` with `ON DELETE CASCADE`.
 const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("accounts", "id"),
+    ("state_history", "account_id"),
     ("kept_app_ids", "account_id"),
     ("chain_items", "account_id"),
     ("chain_retention", "account_id"),
@@ -408,8 +409,8 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
     // http.json's erasure naming alice's version 1 while her account holds version 3: the
     // vector's `409 conflict`, signed with the service key, without a head, carrying the
     // creation time it was checked against in `current.created` and, at a healthy account,
-    // nothing else there; nothing is deleted, the record and the mark included (Switch wire
-    // 7.4.16).
+    // nothing else there. The account stays and its mark covers the due sweep (Switch wire
+    // 7.3, 7.4.16).
     let Some(replay) = replay().await else { return };
     serve_alice(&replay).await;
     let before = rows(&replay, &alice_id()).await;
@@ -432,7 +433,11 @@ async fn test_erase_vector_naming_another_identity_json_is_conflict() {
         serde_json::json!({ "created": enrolled_time() })
     );
     assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
-    assert_same_but_floor(held_mark(&replay, &alice_id()).await, mark);
+    let after = held_mark(&replay, &alice_id()).await;
+    assert_eq!(after.head(), mark.head());
+    assert_eq!(after.state_version, mark.state_version + 1);
+    assert_ne!(after.state_tag, mark.state_tag);
+    assert!(after.time_floor_ms >= mark.time_floor_ms);
     assert_eq!(record_of(&replay).await, None);
     replay.db.drop_database().await.expect("drop");
 }
@@ -1573,6 +1578,29 @@ async fn expired_invite(replay: &Replay, at: &str) {
 }
 
 #[tokio::test]
+async fn test_erase_conflict_covers_the_sweep_it_committed() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    expired_invite(&replay, &at).await;
+    log_swept_invite_codes(&replay).await;
+    let before = held_mark(&replay, &alice_id()).await;
+
+    let answer = erase(&replay, None, &at).await;
+    assert_eq!(code_of(&answer), (409, json!("conflict")));
+    assert!(no_head(&answer));
+    assert_eq!(swept_invite_codes(&replay).await, 1);
+    let after = held_mark(&replay, &alice_id()).await;
+    assert_eq!(after.head(), before.head());
+    assert_eq!(after.state_version, before.state_version + 1);
+    assert_eq!(
+        state_version_of(&replay, &alice_id()).await,
+        after.state_version
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
     // A request that sweeps and the erasure, at the same moment, in either order: each
     // takes the account's lock, so one runs after the other. A sweep before the erasure is
@@ -1614,6 +1642,11 @@ async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
 /// A push key alice's erasure left owed deleting (Switch wire 8.1): made in the key store,
 /// and owed in `erased_keys`.
 async fn owed_push_key(replay: &Replay) -> KeyId {
+    replay
+        .marks
+        .record_erasure(&alice_id(), 7)
+        .await
+        .expect("completed erasure");
     let id = KeyId::random().expect("id");
     replay.keys.generate_as(&id).await.expect("key");
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())

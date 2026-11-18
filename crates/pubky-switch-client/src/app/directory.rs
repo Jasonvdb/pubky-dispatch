@@ -34,8 +34,8 @@ use serde_json::Value;
 use super::context::LocalView;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
-use super::identity::{self, DOC_CACHE_MS, Taken};
-use super::state::{CachedDoc, Tx};
+use super::identity::{self, DOC_CACHE_MS};
+use super::state::Tx;
 use super::{App, AppError};
 use crate::client::answers::Directory;
 use crate::client::read::Obj;
@@ -745,8 +745,9 @@ impl App {
     }
 
     /// Take a counterparty's copy, from its Homeserver, its switch's public read or a
-    /// directory answer, and return the newest held. A Homeserver or public read is a fresh
-    /// read of the document, kept as its source's last read, at the time it completed.
+    /// directory answer, and return the newest held. A Homeserver or public read is kept as
+    /// its source's last read, at the time it completed, and is a fresh read of the copy
+    /// held only when it gave that copy or a newer one ([`identity::take_peer_read`]).
     async fn take_peer_copy(
         &mut self,
         pubky: &[u8; 32],
@@ -755,9 +756,10 @@ impl App {
     ) -> Result<IdentityDoc, AppError> {
         let reader = self.reader();
         let held = identity::held_copy(&reader, pubky).await?;
+        let now = self.now();
         let read_ms = match source {
             CopySource::Switch { read_ms } => read_ms,
-            CopySource::Homeserver | CopySource::Directory => self.now(),
+            CopySource::Homeserver | CopySource::Directory => now,
         };
         let fresh = source != CopySource::Directory;
         let mut tx = self.tx()?;
@@ -768,18 +770,20 @@ impl App {
                 .unwrap_or_default();
             match source {
                 CopySource::Homeserver => reads.homeserver_ms = Some(read_ms),
-                CopySource::Switch { .. } => reads.switch_ms = Some(read_ms),
+                CopySource::Switch { .. } => {
+                    let held_ms = reads.switch_ms.unwrap_or(0);
+                    reads.switch_ms = Some(identity::later_read(held_ms, read_ms, now));
+                }
                 CopySource::Directory => {}
             }
             tx.put(&source_reads_key(pubky), &reads)?;
         }
-        let held_doc = held.as_ref().map(|(doc, _)| doc);
         let fetched_ms = if fresh {
             read_ms
         } else {
             held.as_ref().map_or(0, |(_, at)| *at)
         };
-        let taken = identity::take_copy(&reader, &mut tx, &doc, held_doc, fetched_ms).await?;
+        let taken = identity::take_peer_read(&reader, &mut tx, doc, held, fetched_ms, now).await?;
         let newest = match taken {
             Err(equivocation) => {
                 self.events.push(AppEvent::PeerEquivocation {
@@ -792,20 +796,7 @@ impl App {
                 )
                 .into());
             }
-            Ok(Taken::Newer) => doc,
-            Ok(Taken::Same | Taken::Older) => {
-                let kept = held_doc.cloned().unwrap_or(doc);
-                if fresh {
-                    tx.put(
-                        &super::state::key::ident_doc(pubky),
-                        &CachedDoc {
-                            doc: kept.signed().clone(),
-                            fetched_ms: read_ms,
-                        },
-                    )?;
-                }
-                kept
-            }
+            Ok((newest, _)) => newest,
         };
         self.commit(tx).await?;
         Ok(newest)

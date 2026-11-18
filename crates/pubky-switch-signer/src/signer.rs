@@ -73,7 +73,8 @@ pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use key_recovery::{
-    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoverySurvey, RestoreConfirmed,
+    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoveryKind, KeyRecoverySurvey,
+    RestoreConfirmed,
 };
 pub use renewal::{CertChange, RunDue};
 pub use restore::RecordsDiscarded;
@@ -810,7 +811,9 @@ impl Signer {
             return self.managed_by(doc.body().signer).await;
         }
         if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
-            return self.records_behind(Source::Backup, doc.version()).await;
+            return self
+                .records_behind(Source::Backup, doc.version(), doc.generation())
+                .await;
         }
         Ok(())
     }
@@ -957,6 +960,29 @@ impl Signer {
         body.version = version;
         body.signer = state.install;
         change(&mut body);
+        // A removed app's earlier time a recovery with the key alone found is taken: it only
+        // ever trusts the app less (Switch spec 12.8).
+        for removed in &mut body.removed {
+            if let Some(earlier) = state
+                .earlier_distrust
+                .iter()
+                .find(|e| e.app_id == removed.app_id)
+            {
+                removed.distrust_from = removed.distrust_from.min(earlier.distrust_from);
+            }
+        }
+        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
+        Self::measured(state, body, Some(base.hash()), room)
+    }
+
+    /// `body`, once measured against the cap with `room` as a delivery built on `prev`, for
+    /// the records `state`. Nothing is signed.
+    fn measured(
+        state: &SignerState,
+        body: IdentityBody,
+        prev: Option<[u8; 32]>,
+        room: Room,
+    ) -> Result<IdentityBody> {
         // Never a version the switch can't take: its delivery would be over `PUT /identity`'s
         // body cap (Switch wire 7.1), and could never be delivered. Nor one whose closings
         // couldn't be: an open `renewed` entry is closed in a later version, its `null` turned
@@ -970,8 +996,6 @@ impl Signer {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
-        let prev = Some(base.hash());
         for measure in measures(state, &closed, prev)? {
             if over_cap(measure.bytes, measure.limit, room) {
                 return Err(Refusal::IdentityTooLarge {
@@ -1422,7 +1446,7 @@ impl Signer {
         }
         if signer == self.state.install && copy.version() > self.state.signed_through {
             return self
-                .records_behind(Source::Homeserver, copy.version())
+                .records_behind(Source::Homeserver, copy.version(), copy.generation())
                 .await;
         }
         Ok(())
@@ -1981,7 +2005,9 @@ impl Signer {
             }
         }
         if signer == self.state.install {
-            return self.records_behind(source, version).await;
+            return self
+                .records_behind(source, version, copy.generation())
+                .await;
         }
         let mut state = self.state.clone();
         state.handing_over = None;
@@ -2002,10 +2028,16 @@ impl Signer {
         Err(SignerError::NotNamed { install: signer })
     }
 
-    /// A newer version of this install's own, `version`, seen at `source`: its records are
-    /// behind, and it signs nothing more until a restore, ending the flow.
-    async fn records_behind(&mut self, source: Source, version: u64) -> Result<()> {
+    /// A newer version of this install's own, `version` at `generation`, seen at `source`:
+    /// its records are behind, and it signs nothing more until a restore, ending the flow.
+    async fn records_behind(
+        &mut self,
+        source: Source,
+        version: u64,
+        generation: u64,
+    ) -> Result<()> {
         let mut state = self.state.clone();
+        state.generation_seen = state.generation_seen.max(generation);
         // A backup owed would hold the older records: the one there is newer.
         state.backup_owed = false;
         state.records_behind = Some(version);

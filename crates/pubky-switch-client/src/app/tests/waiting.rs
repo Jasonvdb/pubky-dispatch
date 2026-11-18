@@ -316,8 +316,10 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
         let mut app = wallet(&w, &p).await;
         p.hold.store(true, Ordering::SeqCst);
         let (seq, _) = w.note(app.app_id(), "held");
+        let (ahead, _) = w.note(app.app_id(), "free");
         app.receive(None).await.unwrap();
         let receipt = app.state.held[&seq].receipt;
+        let processed_ahead = app.state.held[&ahead];
         let backup = if layered {
             app.backup_layered().await.unwrap()
         } else {
@@ -332,6 +334,11 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
             Some(receipt),
             "a backup retains the original held observation"
         );
+        assert_eq!(
+            restored.state.held.get(&ahead),
+            Some(&processed_ahead),
+            "and that of an entry processed ahead of the cursor"
+        );
         w.clock.advance_ms(10_000);
         p.hold.store(false, Ordering::SeqCst);
         restored.refresh_identity().await.unwrap();
@@ -343,6 +350,109 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
         );
         assert!(restored.highest_service_time().unwrap() > receipt.read_at_ms);
     }
+}
+
+#[tokio::test]
+async fn test_admission_entries_consumed_ahead_keep_their_observations_until_passed() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    let (parked, _) = w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    let first = app.stored_at(parked).unwrap().receipt;
+    p.set(Mode::Consume);
+    w.clock.advance_ms(1);
+    let (direct, message) = w.note(me, "consume");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq < held);
+    assert!(app.stored_at(parked).is_none());
+    assert!(
+        p.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &message.msg_id)
+    );
+    assert!(app.state.seen.contains(&direct));
+    drop(app);
+
+    let mut app = App::load(w.env(), p.clone(), World::config(), me)
+        .await
+        .unwrap();
+    assert!(app.state.held.contains_key(&direct));
+    assert_eq!(app.state.held[&parked].receipt, first);
+    p.hold.store(false, Ordering::SeqCst);
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= direct);
+    assert!(app.state.held.is_empty());
+}
+
+#[tokio::test]
+async fn test_admission_drops_observations_passed_by_a_shared_cursor() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    app.set_multi_device(true).await.unwrap();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    app.receive(None).await.unwrap();
+    assert!(app.state.held.contains_key(&held));
+    assert!(!app.state.seen.contains(&held));
+
+    // Another device of the app passes the entry. The switch releases its copy.
+    w.switch.move_cursor(me, held).unwrap();
+    assert!(!w.switch.shown(me).iter().any(|item| item["seq"] == held));
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= held);
+    assert!(!app.state.held.contains_key(&held));
+    drop(app);
+    let app = App::load(w.env(), p, World::config(), me).await.unwrap();
+    assert!(!app.state.held.contains_key(&held));
+}
+
+#[tokio::test]
+async fn test_admission_backup_checks_the_first_observation() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    let (parked, _) = w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let first = app.stored_at(parked).unwrap().receipt;
+    assert!(
+        backup
+            .waiting
+            .held
+            .iter()
+            .any(|(seq, observation)| *seq == parked && observation.receipt == first)
+    );
+
+    let mut timing = backup.clone();
+    let (_, observation) = timing
+        .waiting
+        .held
+        .iter_mut()
+        .find(|(seq, _)| *seq == held)
+        .unwrap();
+    observation.accepted_at_ms = observation.receipt.read_at_ms + 1;
+    assert!(timing.waiting.validate(&timing, &app.protocols).is_err());
+
+    let mut custody = backup;
+    let (_, stored) = custody
+        .waiting
+        .entries
+        .iter_mut()
+        .find(|(_, stored)| stored.seq == parked)
+        .unwrap();
+    stored.receipt.entry_id[0] ^= 1;
+    assert!(custody.waiting.validate(&custody, &app.protocols).is_err());
 }
 
 #[tokio::test]
@@ -707,7 +817,7 @@ async fn test_admission_acknowledgment_refusals_do_not_write_locals() {
     assert!(app.ack_event_with("sample", foreign, &local).await.is_err());
     assert_eq!(app.protocol_get("sample", b"refused").await.unwrap(), None);
     assert!(
-        app.pending_duty_events()
+        crate::app::tests::pending_events(&mut app)
             .await
             .unwrap()
             .iter()
@@ -1189,6 +1299,7 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         Chain,
         Stub,
         OtherThanAStoredEntry,
+        OtherThanAnEntryProcessedAhead,
     }
     for shown in [
         Shown::OtherEntry,
@@ -1198,20 +1309,24 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         Shown::Chain,
         Shown::Stub,
         Shown::OtherThanAStoredEntry,
+        Shown::OtherThanAnEntryProcessedAhead,
     ] {
         let w = World::new();
         let p = Admission::new();
         let mut app = wallet(&w, &p).await;
         let me = app.app_id();
         w.clock.advance_ms(10_000);
-        // An entry held at the first page, before an entry the read stores past it.
+        // An entry held at the first page, before an entry the read stores past it and one
+        // it processes past it.
         let (held_seq, message) = w.note(me, "held");
         let (stored_seq, _) = w.note(me, "wait");
+        let (ahead_seq, _) = w.note(me, "free");
         p.hold.store(true, Ordering::SeqCst);
         app.receive(None).await.unwrap();
         p.hold.store(false, Ordering::SeqCst);
         let cursor = app.cursor();
         assert!(cursor.seq < held_seq && app.stored_at(stored_seq).is_some());
+        assert!(app.state.seen.contains(&ahead_seq));
         let observed = app.state.held[&held_seq];
         let now = w.clock.now_ms();
         // The observation an earlier page left at `at`, which the next page contradicts.
@@ -1221,10 +1336,16 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
                 let mut held = observed;
                 match shown {
                     Shown::OtherEntry => held.receipt.entry_id[0] ^= 1,
-                    _ => held.receipt.read_at_ms = message.created_at_ms - 1,
+                    _ => held.accepted_at_ms -= 1,
                 }
                 tx.put(&key::held(held_seq), &held).unwrap();
                 held_seq
+            }
+            Shown::OtherThanAnEntryProcessedAhead => {
+                let mut ahead = app.state.held[&ahead_seq];
+                ahead.receipt.entry_id[0] ^= 1;
+                tx.put(&key::held(ahead_seq), &ahead).unwrap();
+                ahead_seq
             }
             Shown::OtherThanAStoredEntry => {
                 let id = app.stored_id_at(stored_seq).unwrap();

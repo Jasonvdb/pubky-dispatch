@@ -184,7 +184,8 @@ pub(crate) struct Equivocation {
 }
 
 /// Take a verified copy of `doc`'s identity against what the store holds for it, and add
-/// the records it changes to `tx`. `held` is the newest copy held, if any.
+/// the records it changes to `tx`. `held` is the newest copy held, if any; a newer copy is
+/// kept as read at `read_ms`, app clock.
 ///
 /// # Errors
 ///
@@ -195,7 +196,7 @@ pub(crate) async fn take_copy(
     tx: &mut Tx,
     doc: &IdentityDoc,
     held: Option<&IdentityDoc>,
-    now_ms: u64,
+    read_ms: u64,
 ) -> Result<Result<Taken, Equivocation>, AppError> {
     let identity = doc.identity();
     let version = doc.version();
@@ -240,10 +241,58 @@ pub(crate) async fn take_copy(
         &key::ident_doc(&identity),
         &CachedDoc {
             doc: doc.signed().clone(),
-            fetched_ms: now_ms,
+            fetched_ms: read_ms,
         },
     )?;
     Ok(Ok(Taken::Newer))
+}
+
+/// Take a counterparty's copy `doc`, given by a source at `read_ms`, app clock, against
+/// `held`, the newest copy held and when it was last read ([`take_copy`]), and return the
+/// newest copy held after it, with when it was last read. The copy held counts as read at
+/// `read_ms` only when the source gave it: a newer copy, or the one held again, and then
+/// at the later of the two reads, never after `now_ms` ([`later_read`]). An older copy
+/// leaves its read time as it was, so a source serving a copy rolled back doesn't make the
+/// one held count as fresh (Switch spec 4.3).
+///
+/// # Errors
+///
+/// As [`take_copy`].
+pub(crate) async fn take_peer_read(
+    reader: &Reader,
+    tx: &mut Tx,
+    doc: IdentityDoc,
+    held: Option<(IdentityDoc, u64)>,
+    read_ms: u64,
+    now_ms: u64,
+) -> Result<Result<(IdentityDoc, u64), Equivocation>, AppError> {
+    let held_doc = held.as_ref().map(|(held, _)| held);
+    let taken = match take_copy(reader, tx, &doc, held_doc, read_ms).await? {
+        Ok(taken) => taken,
+        Err(equivocation) => return Ok(Err(equivocation)),
+    };
+    Ok(Ok(match (taken, held) {
+        (Taken::Newer, _) | (_, None) => (doc, read_ms),
+        (Taken::Same, Some((held, held_ms))) => {
+            let read_ms = later_read(held_ms, read_ms, now_ms);
+            tx.put(
+                &key::ident_doc(&held.identity()),
+                &CachedDoc {
+                    doc: held.signed().clone(),
+                    fetched_ms: read_ms,
+                },
+            )?;
+            (held, read_ms)
+        }
+        (Taken::Older, Some(held)) => held,
+    }))
+}
+
+/// When a copy given by two reads counts as read: at the later of `held_ms` and `read_ms`,
+/// so a read that finishes after a later one doesn't take its time back, but never after
+/// `now_ms`, so a time kept from before the clock was set back doesn't stay ahead of it.
+pub(crate) fn later_read(held_ms: u64, read_ms: u64, now_ms: u64) -> u64 {
+    held_ms.max(read_ms).min(now_ms)
 }
 
 /// The newest copy held for `identity`, verified, with when it was read.

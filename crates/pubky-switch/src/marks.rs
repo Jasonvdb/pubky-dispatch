@@ -73,6 +73,36 @@ const STORE_DIRS: [&str; 4] = ["marks", "retired", "erasures", "erasure-attempts
 /// stamp (Switch wire 7.3, "Time base").
 pub const TIME_FLOOR_STEP_MS: u64 = 60_000;
 
+/// Independent evidence of the contents of a fresh enrollment (Switch account binding 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CreationAnchor {
+    /// No independently committed fresh enrollment is known.
+    #[default]
+    Unproven,
+    /// The expected SQL contents. Their presence in committed SQL establishes creation.
+    Bound {
+        /// The creation to which the evidence belongs, including after a takeover.
+        created_at_ms: u64,
+        /// The nonzero content commitment.
+        #[serde(with = "hex_bytes")]
+        digest: [u8; 32],
+    },
+}
+
+impl CreationAnchor {
+    /// The content commitment for precisely this creation.
+    pub fn for_creation(self, created: u64) -> Option<[u8; 32]> {
+        match self {
+            Self::Bound {
+                created_at_ms,
+                digest,
+            } if created == created_at_ms => Some(digest),
+            _ => None,
+        }
+    }
+}
+
 /// An identity's mark (Switch wire 7.3, "Accounts and marks"): (generation, `seq`, chain
 /// hash, count, tag). One that records no head is (0, 0) with count 0 and the zero tag, or,
 /// at a serving account before its first chain item, its generation, `seq` 0 and the zero
@@ -94,6 +124,8 @@ pub struct AccountMark {
     /// The tag written with that count, the zero tag before any.
     #[serde(with = "hex_bytes")]
     pub state_tag: [u8; 16],
+    /// The initial SQL content commitment and the creation it covers.
+    pub creation_anchor: CreationAnchor,
     /// The time floor, in Unix milliseconds: at or above every time an answer for the
     /// identity carried (Switch wire 7.3, "Trusted time").
     pub time_floor_ms: u64,
@@ -128,6 +160,7 @@ impl AccountMark {
             chain_hash: ZERO_HASH,
             state_version: 0,
             state_tag: [0; 16],
+            creation_anchor: Default::default(),
             time_floor_ms: 0,
             key,
             created_at_ms,
@@ -152,6 +185,14 @@ impl AccountMark {
     /// zero tag; a head at a generation and a `seq` of at least 1 each; or a generation of
     /// at least 1 with `seq` 0 and the zero hash, before the first head.
     fn is_valid(&self) -> bool {
+        if let CreationAnchor::Bound {
+            created_at_ms,
+            digest,
+        } = self.creation_anchor
+            && (created_at_ms > self.created_at_ms || digest == [0; 32])
+        {
+            return false;
+        }
         if self.time_floor_ms > pubky_switch_core::time::MAX_TIME_MS
             || (self.state_version == 0 && self.state_tag != [0; 16])
         {
@@ -230,6 +271,7 @@ impl MarkTarget {
             chain_hash: self.head.chain_hash,
             state_version: self.state_version,
             state_tag: self.state_tag,
+            creation_anchor: Default::default(),
             time_floor_ms: time_floor_ms.max(self.stamped_ms),
             key,
             created_at_ms,
@@ -245,7 +287,12 @@ impl MarkTarget {
 /// the two lower and the other higher, is a fork. The mark moved to carries `key` and keeps its time floor.
 fn order(held: &AccountMark, target: &MarkTarget, key: [u8; 32]) -> Advance {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    let moved = || Advance::Moved(target.mark(key, held.created_at_ms, held.time_floor_ms));
+    let moved = || {
+        Advance::Moved(AccountMark {
+            creation_anchor: held.creation_anchor,
+            ..target.mark(key, held.created_at_ms, held.time_floor_ms)
+        })
+    };
     match target.head.generation.cmp(&held.generation) {
         Less => return Advance::Overtaken(*held),
         Greater => return moved(),
@@ -527,6 +574,36 @@ impl MarkStore {
         .await
     }
 
+    /// Create the first mark from the fresh SQL transaction, before that transaction commits.
+    pub(crate) async fn create_anchored(
+        &self,
+        identity: &str,
+        store_id: [u8; 16],
+        key: [u8; 32],
+        created_at_ms: u64,
+        anchor: [u8; 32],
+    ) -> Result<MarkWrite, MarkStoreError> {
+        self.check_gate()?;
+        if anchor == [0; 32] {
+            return Err(MarkStoreError::InvalidHead);
+        }
+        let gate = self.gate.clone();
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
+                (held == MarkRead::Missing).then_some(AccountMark {
+                    creation_anchor: CreationAnchor::Bound {
+                        created_at_ms,
+                        digest: anchor,
+                    },
+                    ..AccountMark::zero(key, created_at_ms)
+                })
+            })
+        })
+        .await
+    }
+
     /// A new account takes the identity's mark `read`, the one it was judged with: its
     /// generation, `seq` and chain hash stay, as do the time floor and the identity's retirements; its key and
     /// creation time become `key` and `created_at_ms`, and its count and tag the new
@@ -552,6 +629,7 @@ impl MarkStore {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark) if mark == read && !mark.records_head() => Some(AccountMark {
                     time_floor_ms: mark.time_floor_ms,
+                    creation_anchor: mark.creation_anchor,
                     ..AccountMark::zero(key, created_at_ms)
                 }),
                 MarkRead::Mark(mark) if mark == read => Some(AccountMark {
@@ -594,11 +672,10 @@ impl MarkStore {
         let identity = valid_identity(identity)?;
         blocking(move || {
             inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
-                (held == MarkRead::Mark(read)).then_some(target.mark(
-                    key,
-                    created_at_ms,
-                    read.time_floor_ms,
-                ))
+                (held == MarkRead::Mark(read)).then_some(AccountMark {
+                    creation_anchor: read.creation_anchor,
+                    ..target.mark(key, created_at_ms, read.time_floor_ms)
+                })
             })
         })
         .await
@@ -1954,6 +2031,7 @@ mod tests {
             generation,
             seq,
             chain_hash: [hash; 32],
+            creation_anchor: Default::default(),
             state_version: 0,
             time_floor_ms: 0,
             key: KEY,

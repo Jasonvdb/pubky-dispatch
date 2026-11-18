@@ -12509,8 +12509,27 @@ async fn second_device_write_unopened(s: &Setup) -> (App, App, RecordTarget, [u8
 #[tokio::test]
 async fn test_records_second_device_write_reopened_with_its_key_marks_its_value() {
     let s = Setup::new();
+    s.protocol
+        .observe_values
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    assert_eq!(
+        ids(a
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["a", "x"],
+    );
     a.receive(None).await.unwrap();
+    assert_eq!(
+        ids(a
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["a", "x", "y"],
+    );
     let held = a.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), ["a", "x", "y"]);
     assert_eq!(

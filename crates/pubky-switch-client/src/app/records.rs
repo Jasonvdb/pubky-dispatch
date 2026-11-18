@@ -800,8 +800,14 @@ pub(crate) enum CurrentAt {
 }
 
 impl CurrentAt {
-    fn in_generation(self, generation: u64) -> bool {
-        matches!(self, Self::Answer(v) | Self::KeyAtKnownTip(v, _) if v.generation == generation)
+    fn observation(self, covered: bool, divergent: bool) -> ObservationSource {
+        let at = match self {
+            Self::Answer(v) | Self::KeyAtKnownTip(v, _) if covered => {
+                Some(position(v.generation, v.version))
+            }
+            _ => None,
+        };
+        ObservationSource::View { at, divergent }
     }
 
     /// What a record view read now with `head` is current at: `seq` in the head's
@@ -1029,7 +1035,10 @@ impl WriteRead {
 /// What the source of a readable write establishes at this application.
 #[derive(Clone, Copy)]
 enum ObservationSource {
-    View { covered: bool, divergent: bool },
+    View {
+        at: Option<FeedPosition>,
+        divergent: bool,
+    },
     Applied,
     Reopened,
 }
@@ -2252,10 +2261,7 @@ impl App {
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
             current_at: at,
-            observation: ObservationSource::View {
-                covered: covers_uploads && at.in_generation(self.state.meta.generation),
-                divergent: view.divergent,
-            },
+            observation: at.observation(covers_uploads, view.divergent),
         };
         let read = self.read_write(&evidence, expect, key, tx).await?;
         // An earlier view can supply the signed write, while the latest upload's
@@ -2414,11 +2420,7 @@ impl App {
                 )),
                 view_revision: Some(current_view.revision),
                 current_at: at,
-                observation: ObservationSource::View {
-                    covered: observed.covers_uploads
-                        && at.in_generation(self.state.meta.generation),
-                    divergent: current_view.divergent,
-                },
+                observation: at.observation(observed.covers_uploads, current_view.divergent),
             };
             outcome =
                 Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
@@ -3226,7 +3228,7 @@ impl App {
         page_time_ms: Option<u64>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
-        Box::pin(async move {
+        let result = Box::pin(async {
             let key = accepted.key;
             // The application proof settles an own submission even while a foreign
             // observation is owed. Foreign handovers still follow the owner's feed order.
@@ -3517,7 +3519,11 @@ impl App {
                 Taken::New
             })
         })
-        .await
+        .await;
+        if result.is_err() {
+            self.reload = true;
+        }
+        result
     }
 
     /// Commit what the collection owner learned with the accepted record. A protocol
@@ -3542,27 +3548,34 @@ impl App {
             Some(held) => held,
             None => self.is_divergent(key).await?,
         };
-        let (current, divergent) = match source {
-            ObservationSource::View { covered, divergent } => {
-                (covered, if covered { divergent } else { prior_divergence })
+        let at = match source {
+            ObservationSource::View { at, .. } => at,
+            ObservationSource::Applied => {
+                Some(position(record.applied.generation, record.applied.seq))
             }
-            ObservationSource::Applied | ObservationSource::Reopened => {
-                let listing = self.read_in::<ListDue>(LIST_DUE, tx).await?;
-                let uploads = [
+            ObservationSource::Reopened => Some(record.observed),
+        };
+        let current = if let Some(at) = at.filter(|at| at.generation == self.state.meta.generation)
+        {
+            // A prior item in this transaction may have raised the minimum for this
+            // collection or key since the service read began.
+            let listing = self.read_in::<ListDue>(LIST_DUE, tx).await?;
+            self.covers_uploads(
+                at,
+                [
                     self.record_upload_in(key, tx).await?,
                     listing
                         .as_ref()
                         .and_then(|due| self.collection_upload(&record.collection, due)),
-                ];
-                let at = if matches!(source, ObservationSource::Reopened) {
-                    record.observed
-                } else {
-                    position(record.applied.generation, record.applied.seq)
-                };
-                let covered =
-                    at.generation == self.state.meta.generation && self.covers_uploads(at, uploads);
-                (covered, prior_divergence && !(newer && covered))
-            }
+                ],
+            )
+        } else {
+            false
+        };
+        let divergent = match source {
+            ObservationSource::View { divergent, .. } if current => divergent,
+            ObservationSource::Applied if newer && current => false,
+            _ => prior_divergence,
         };
         let accepted = record.shared(key, divergent);
         let before = previous.map(|held| held.shared(key, prior_divergence));

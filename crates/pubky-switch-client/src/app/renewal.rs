@@ -136,23 +136,18 @@ impl App {
         let updated_at = self.next_record_time(previous).await?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
-        let held_cert = AppRecord::verify(&self.state.record, &self.state.meta.identity)?
-            .cert()
-            .clone();
         let accepted = match &self.state.accepted {
             Some(accepted) => Some(AppRecord::verify(accepted, &self.state.meta.identity)?),
             None => None,
         };
-        let (held, old, changed) = match over {
+        let (held, changed) = match over {
             Some(later) => {
                 let accepted = accepted.as_ref().map(AppRecord::body);
-                let (held, changed) = held.over(accepted, later.body(), &self.protocols);
-                (held, cert, changed)
+                held.over(accepted, later, &self.protocols)
             }
-            // The members held were given for the certificate their record carries.
-            None => (held, &held_cert, Vec::new()),
+            None => (held, Vec::new()),
         };
-        let judging = CertBody::judged(held, old, cert, &self.protocols, &asks, |ask| {
+        let judging = CertBody::judged(held, cert, &self.protocols, &asks, |ask| {
             ask.at(updated_at, max_age).is_some()
         });
         let expires_at = self.resolve_record_expiries(&judging.asks, updated_at)?;
@@ -490,7 +485,7 @@ impl App {
                     None => None,
                 };
                 let accepted = accepted.as_ref().map(AppRecord::body);
-                (body, changed) = body.over(accepted, held.body(), &self.protocols);
+                (body, changed) = body.over(accepted, &held, &self.protocols);
             }
             let members = body.body().clone();
             let record = self

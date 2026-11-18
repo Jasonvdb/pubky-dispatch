@@ -15,14 +15,15 @@ use super::AppState;
 use super::own_record::{RecordExpiries, RecordExpiry};
 use super::protocols::ProtocolSet;
 
-/// The body of the app's next record under the certificate of the record it holds.
-pub(super) struct NextBody(AppRecordBody);
+/// The body of the app's next record under the certificate of the record it holds, and
+/// the certificate its members were given for.
+pub(super) struct NextBody(AppRecordBody, AppCert);
 
 impl NextBody {
     /// The body of the record the app holds.
     pub(super) fn held(state: &AppState) -> pubky_switch_core::Result<Self> {
         let record = AppRecord::verify(&state.record, &state.meta.identity)?;
-        Ok(Self(record.body().clone()))
+        Ok(Self(record.body().clone(), record.cert().clone()))
     }
 
     pub(super) fn body(&self) -> &AppRecordBody {
@@ -37,9 +38,11 @@ impl NextBody {
     pub(super) fn over(
         mut self,
         accepted: Option<&AppRecordBody>,
-        later: &AppRecordBody,
+        later: &AppRecord,
         protocols: &ProtocolSet,
     ) -> (Self, Vec<String>) {
+        let later_cert = later.cert().clone();
+        let later = later.body();
         let mut members = later.protocols.clone();
         let mut changed = Vec::new();
         for name in protocols.names() {
@@ -59,6 +62,8 @@ impl NextBody {
             };
         }
         self.0.protocols = members;
+        // The members not given here were given for the later record's certificate.
+        self.1 = later_cert;
         (self, changed)
     }
 
@@ -108,7 +113,7 @@ impl CertBody {
         Self(body)
     }
 
-    /// `held`, the record held under `old`, under `cert`, its renewal: `accepts` and each
+    /// `held` under `cert`, a renewal of the certificate its members were given for: `accepts` and each
     /// registered protocol's member and expiry ask as it gives them for `cert`
     /// ([`super::Protocol::member_for`]). A member that breaks the JSON rules (Switch wire
     /// 1.1), or whose ask isn't `writable`, is dropped with its ask; `None` drops the ask.
@@ -116,13 +121,12 @@ impl CertBody {
     /// permission of `old`, and dropped otherwise.
     pub(super) fn judged(
         held: NextBody,
-        old: &AppCert,
         cert: &AppCert,
         protocols: &ProtocolSet,
         asks: &RecordExpiries,
         writable: impl Fn(RecordExpiry) -> bool,
     ) -> Judging {
-        let mut body = held.0;
+        let NextBody(mut body, old) = held;
         body.cert = cert.signed().clone();
         body.accepts = protocols.accepts(cert);
         let carried = std::mem::take(&mut body.protocols);

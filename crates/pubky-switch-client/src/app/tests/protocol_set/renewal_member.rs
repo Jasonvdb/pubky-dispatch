@@ -325,9 +325,17 @@ async fn test_renewal_member_judged_for_the_new_certificate_before_signing() {
 /// dropped with its ask, the host told once; the renewal is taken.
 #[tokio::test]
 async fn test_renewal_member_invalid_answer_is_dropped() {
-    let answers: [MemberFor; 2] = [
+    let answers: [MemberFor; 3] = [
         |_, ask, _| (Some(object(json!({ "n": 1.5 }))), ask),
         |member, _, _| (member.cloned(), RecordExpiry::At(1)),
+        // Within the nesting limit alone, past it where the record holds it.
+        |_, ask, _| {
+            let mut deep = json!(0);
+            for _ in 0..126 {
+                deep = json!([deep]);
+            }
+            (Some(object(json!({ "deep": deep }))), ask)
+        },
     ];
     for answer in answers {
         let p = Pair::new();
@@ -680,6 +688,39 @@ async fn test_renewal_member_other_device_change_is_told() {
     assert_eq!(changed(report.events), ["chat"]);
     assert_eq!(b.record(), a.record());
     assert!(!members(&b).contains_key("chat"));
+    // A member new there is told too.
+    a.set_protocol_member("chat", Some(object(json!({ "room": 4 }))), None)
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1000);
+    assert_eq!(changed(b.receive(None).await.unwrap().events), ["chat"]);
+}
+
+/// A renewal holding a scope root no registered protocol owns is refused, also when its
+/// record would be too large.
+#[tokio::test]
+async fn test_renewal_member_refused_certificate_before_its_record() {
+    let p = Pair::new();
+    *p.tasks.member_for.lock().unwrap() = Some(|_, ask, _| {
+        (
+            Some(object(json!({ "blob": "a".repeat(MAX_OP_BYTES) }))),
+            ask,
+        )
+    });
+    let (mut app, _) = join(&p).await;
+    let old = app.cert().clone();
+    p.w.clock.advance_ms(1000);
+    renew_to(&p, &app, &["tasks", "chat", "news"]);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|event| matches!(event, AppEvent::CertificateRefused { .. })),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.cert().hash(), old.hash());
 }
 
 /// A change kept here that meets another device's later record under the same certificate

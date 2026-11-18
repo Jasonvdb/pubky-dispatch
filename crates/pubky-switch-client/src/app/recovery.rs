@@ -27,6 +27,8 @@
 //! 12.6 steps 5 and 6, 12.4): the obligations from before the loss are uncertain, which is
 //! the protocol's to judge with the declaration time and the residual window.
 
+mod roster;
+
 use pubky_switch_core::chain::{
     ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, ZERO_HASH,
 };
@@ -42,7 +44,6 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::App;
 use super::chain::ChainView;
 use super::context::LocalView;
 use super::error::{AppError, Refusal};
@@ -52,6 +53,7 @@ use super::protocol::{
     LocalWrite, MAX_LOSS_CONVERSATIONS, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
 };
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
+use super::{App, KeptOp, SharedEvidence};
 use crate::client::Batch;
 use crate::client::answers::{FeedItem, FeedQuery, RecoveryUpload, UploadLists, UploadedOp};
 use crate::error::{ClientError, StoreError};
@@ -68,6 +70,9 @@ pub(crate) mod keys {
 
     /// A provider loss being followed, or followed.
     pub(crate) const LOSS: &str = "loss";
+
+    /// The identity document at the opening of the latest loss.
+    pub(super) const OPENING: &str = "loss/opening";
 
     /// A kept operation, by its document hash.
     pub(crate) fn op(hash: &[u8; 32]) -> String {
@@ -110,14 +115,6 @@ impl std::fmt::Debug for Evidence {
             Evidence::Proof(_) => f.write_str("Evidence::Proof"),
         }
     }
-}
-
-/// `ev/op/<hash>`: a kept operation.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KeptOp {
-    op: SignedDoc,
-    cert: SignedDoc,
-    proof: Option<SignedDoc>,
 }
 
 /// A provider loss as the protocol sees it (Switch spec 12.6).
@@ -328,80 +325,53 @@ impl App {
         .await
     }
 
-    /// The kept operations, as uploads: the `record.put`s and the claim entries, those kept
-    /// here and those the shared state holds (Switch spec 12.5 step 3, 12.6 step 3), each
-    /// once.
-    async fn kept_ops(&self) -> Result<(Vec<UploadedOp>, Vec<UploadedOp>), AppError> {
-        let mut records = Vec::new();
-        let mut claims = Vec::new();
-        let mut kept: Vec<KeptOp> = self
-            .reader()
+    /// All retained evidence for the upload, including the omissions counted in the same
+    /// shared-state scan (Switch spec 12.5 step 3, 12.6 step 3).
+    async fn retained_evidence(&self) -> Result<SharedEvidence, AppError> {
+        let reader = self.reader();
+        let shared = self.shared_evidence().await?;
+        let mut ops: Vec<_> = reader
             .scan::<KeptOp>("ev/op/")
             .await?
             .into_iter()
-            .map(|(_, kept)| kept)
+            .map(|(_, op)| op)
             .collect();
-        for shared in self.shared_evidence().await?.ops {
-            if !kept.iter().any(|k| k.op == shared.op) {
-                kept.push(KeptOp {
-                    op: shared.op,
-                    cert: shared.cert,
-                    proof: shared.proof,
-                });
-            }
-        }
-        for kept in kept {
-            let claim = SignedOp::peek(&kept.op)
-                .map(|op| matches!(op.body().kind, OpKind::Claim(_)))
-                .map_err(|_| corrupt())?;
-            let upload = UploadedOp {
-                op: kept.op,
-                cert: kept.cert,
-                proof: kept.proof,
-            };
-            if claim {
-                claims.push(upload);
-            } else {
-                records.push(upload);
-            }
-        }
-        Ok((records, claims))
-    }
-
-    /// The kept proofs, those kept on their own and those of kept operations; with
-    /// `service_key`, only those that verify with it.
-    pub(crate) async fn kept_proofs(
-        &self,
-        service_key: Option<&[u8; 32]>,
-    ) -> Result<Vec<SignedDoc>, AppError> {
-        let reader = self.reader();
-        let mut proofs: Vec<SignedDoc> = reader
+        let mut proofs: Vec<_> = reader
             .scan::<SignedDoc>("ev/proof/")
             .await?
             .into_iter()
             .map(|(_, proof)| proof)
             .collect();
-        for (_, kept) in reader.scan::<KeptOp>("ev/op/").await? {
-            if let Some(proof) = kept.proof
-                && !proofs.contains(&proof)
-            {
-                proofs.push(proof);
+        for proof in ops
+            .iter()
+            .filter_map(|op| op.proof.as_ref())
+            .chain(&shared.proofs)
+            .chain(shared.ops.iter().filter_map(|op| op.proof.as_ref()))
+        {
+            if !proofs.contains(proof) {
+                proofs.push(proof.clone());
             }
         }
-        // The shared state's evidence: its SETTLED and tombstone proofs, and the proofs of
-        // the record writes and claim entries it holds.
-        let shared = self.shared_evidence().await?;
-        let shared_proofs = shared
-            .proofs
-            .into_iter()
-            .chain(shared.ops.into_iter().filter_map(|kept| kept.proof));
-        for proof in shared_proofs {
-            if !proofs.contains(&proof) {
-                proofs.push(proof);
+        for item in shared.ops {
+            if !ops.iter().any(|kept| kept.op == item.op) {
+                ops.push(item);
             }
         }
-        let identity = self.state.meta.identity;
+        Ok(SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out: shared.claim_entries_left_out,
+        })
+    }
+
+    /// The retained proofs that verify with the selected service key, or all of them.
+    pub(crate) async fn kept_proofs(
+        &self,
+        service_key: Option<&[u8; 32]>,
+    ) -> Result<Vec<SignedDoc>, AppError> {
+        let mut proofs = self.retained_evidence().await?.proofs;
         if let Some(key) = service_key {
+            let identity = self.state.meta.identity;
             proofs.retain(|proof| TransitionProof::verify(proof, key, &identity).is_ok());
         }
         Ok(proofs)
@@ -578,6 +548,7 @@ impl App {
         tx.put(key::RESTORE, restore)?;
         // Every protocol reconciles again, whichever ended an earlier reconcile mode.
         tx.delete(key::RECONCILED)?;
+        tx.delete_prefix("loss/")?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,
@@ -819,7 +790,7 @@ impl App {
         ) {
             loss.clock_offset_ms = old.abs_diff(new);
         }
-        loss.declared_at_ms = Some(self.recovery_time().await?);
+        loss.declared_at_ms = Some(self.recovery_time(loss, &mut tx).await?);
         loss.batch.clear();
         self.commit(tx).await?;
         if let Some(record) = accepted {
@@ -830,12 +801,16 @@ impl App {
 
     /// The recovery record's time: the first item of the new sequence, checked against the
     /// chain view (Switch spec 12.6 step 1). Without one, the time of the latest answer.
-    async fn recovery_time(&mut self) -> Result<u64, AppError> {
+    async fn recovery_time(
+        &mut self,
+        loss: &LossRecord,
+        tx: &mut super::state::Tx,
+    ) -> Result<u64, AppError> {
         let fallback = self.client.last_server_time().unwrap_or(0);
         let generation = self.state.meta.generation;
         let query = FeedQuery {
             after: Some(Position { generation, seq: 0 }),
-            limit: Some(1),
+            limit: Some(2),
             wait: None,
         };
         let result = self.client.feed(query).await;
@@ -850,6 +825,11 @@ impl App {
             Err(AppError::Alarm(alarm)) => return Err(self.raise(alarm).await),
             Err(error) => return Err(error),
         };
+        if let [first, second, ..] = page.items.as_slice()
+            && let Some(doc) = roster::opening(first, second, &self.state.own_doc, loss)
+        {
+            self.keep_recovery_opening(&doc, tx).await?;
+        }
         let Some(FeedItem::Chain(item)) = page.items.first() else {
             return Ok(fallback);
         };
@@ -873,9 +853,26 @@ impl App {
     /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on. Returns how
     /// many kept claim entries it left out, without a certificate of their writer.
     async fn loss_upload(&mut self, loss: &LossRecord) -> Result<u64, AppError> {
-        let left_out = self.shared_evidence().await?.claim_entries_left_out;
-        let (records, claims) = self.kept_ops().await?;
-        let proofs = self.kept_proofs(None).await?;
+        let SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out: left_out,
+        } = self.retained_evidence().await?;
+        let mut records = Vec::new();
+        let mut claims = Vec::new();
+        for kept in ops {
+            let op = SignedOp::peek(&kept.op).map_err(|_| corrupt())?;
+            let upload = UploadedOp {
+                op: kept.op,
+                cert: kept.cert,
+                proof: kept.proof,
+            };
+            if matches!(op.body().kind, OpKind::Claim(_)) {
+                claims.push(upload);
+            } else {
+                records.push(upload);
+            }
+        }
         let heads: Vec<SignedHead> = match &loss.newest_head {
             Some(value) => vec![SignedHead::from_value(value).map_err(|_| corrupt())?],
             None => Vec::new(),

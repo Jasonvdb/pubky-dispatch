@@ -304,6 +304,12 @@ pub async fn provider_loss(world: &World) -> FlowResult {
     // and staged admission doesn't start again (Switch wire 7.4.14).
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;
+    let opening = Box::pin(wallet.recovery_roster())
+        .await?
+        .ok_or("the recovery roster is missing")?;
+    if opening.hash() != doc.hash() {
+        return Err("the wallet kept a different opening document".into());
+    }
 
     send(
         world,
@@ -853,7 +859,7 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
-    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
     let (phone, _) = joined(world, &alice, &mut signer, "phone").await?;
 
     world.lose_switch(ORIGIN);
@@ -947,6 +953,18 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
              apps and removes {gone:?}, dated {dated:?}, not {revoked_at}"
         )
         .into());
+    }
+    // A surviving app first goes online after the removal (Switch spec 12.6).
+    Box::pin(follow_recovery(world, &mut wallet, "wallet", 1)).await?;
+    let opening = Box::pin(wallet.recovery_roster())
+        .await?
+        .ok_or("the recovery roster is missing")?;
+    if opening.listed_cert(&phone.app_id()).is_none()
+        || !Box::pin(wallet.recovery_removal(&phone.app_id()))
+            .await?
+            .is_some_and(|doc| doc.lists_removed(&phone.app_id()))
+    {
+        return Err("the original roster or the subsequent removal is missing".into());
     }
     Ok(())
 }

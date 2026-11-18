@@ -1534,6 +1534,72 @@ async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_call
 }
 
 #[tokio::test]
+async fn test_loss_roster_selects_the_new_opening_after_a_second_loss() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let first = app.recovery_roster().await.unwrap().unwrap();
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let next = third.identity_doc().unwrap();
+    app.refresh_identity().await.unwrap();
+    assert_ne!(
+        app.recovery_roster()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(IdentityDoc::hash),
+        Some(first.hash())
+    );
+    app.follow_provider().await.unwrap();
+    let second = app.recovery_roster().await.unwrap().unwrap();
+    assert_eq!(second.hash(), next.hash());
+    assert_eq!(second.body().recovery_from, Some(2));
+}
+
+#[tokio::test]
+async fn test_loss_roster_keeps_the_opening_document_after_a_later_version_and_reload() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let opening = lost.next.identity_doc().unwrap();
+    let later = lost.w.signer.sign_next(|_| {}).unwrap();
+    lost.next.deliver_identity(&later).unwrap();
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.own_identity().hash(), later.hash());
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+
+    // A loss followed before its roster was kept can still read the original pair.
+    let mut tx = app.tx().unwrap();
+    tx.delete("loss/opening").unwrap();
+    app.commit(tx).await.unwrap();
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+
+    let app_id = app.app_id();
+    drop(app);
+    let mut reloaded = App::load(
+        lost.router.env(&lost.w, store as Arc<dyn StateStore>),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        app_id,
+    )
+    .await
+    .unwrap();
+    lost.next.lock().not_hosted_unpinned = true;
+    let kept = reloaded.recovery_roster().await.unwrap().unwrap();
+    assert_eq!(kept.hash(), opening.hash());
+    assert_eq!(kept.body().recovery_from, Some(1));
+}
+
+#[tokio::test]
 async fn test_loss_recovers_at_the_new_generation() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

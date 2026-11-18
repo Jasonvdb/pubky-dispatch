@@ -156,10 +156,16 @@ impl Protocol for ItemsProtocol {
         if !self.observe_values.load(Relaxed) || !observed.current || observed.record.divergent {
             return Ok(Vec::new());
         }
-        let target = RecordTarget::new(items(), b"n1");
-        if observed.record.key != cx.record_key(&target).unwrap() {
+        let targets = [
+            RecordTarget::new(items(), b"n1"),
+            RecordTarget::new(items(), b"n2"),
+        ];
+        let Some(target) = targets
+            .iter()
+            .find(|target| observed.record.key == cx.record_key(target).unwrap())
+        else {
             return Ok(Vec::new());
-        }
+        };
         let signed = SignedOp::peek(observed.operation).unwrap();
         assert_eq!(signed.item_hash().unwrap(), observed.application.item_hash);
         assert_eq!(signed.body().app_id, Some(observed.record.writer));
@@ -12262,8 +12268,15 @@ async fn test_records_protocol_observations_follow_the_record_and_its_selected_b
         .put_record(&target, &value(&["first"]), vec![])
         .await
         .unwrap();
+    // A superseded record is served as a stub (Switch wire 7.5). Read the first
+    // value before its replacement, then read two still-live writes in one page.
+    wallet.receive(None).await.unwrap();
     phone
         .put_record(&target, &value(&["first", "second"]), vec![])
+        .await
+        .unwrap();
+    phone
+        .put_record(&s.target("n2"), &value(&["other"]), vec![])
         .await
         .unwrap();
     wallet.receive(None).await.unwrap();
@@ -12273,7 +12286,7 @@ async fn test_records_protocol_observations_follow_the_record_and_its_selected_b
             .await
             .unwrap()
             .as_deref()),
-        ["first", "second"]
+        ["first", "second", "other"]
     );
     wallet
         .put_record(&target, &value(&["third"]), vec![])
@@ -12306,6 +12319,7 @@ async fn test_records_protocol_observations_follow_the_record_and_its_selected_b
         [
             Vec::<String>::new(),
             vec!["first".to_owned()],
+            Vec::<String>::new(),
             vec!["first".to_owned(), "second".to_owned()]
         ]
     );
@@ -12324,7 +12338,7 @@ async fn test_records_protocol_observations_follow_the_record_and_its_selected_b
             .await
             .unwrap()
             .as_deref()),
-        ["first", "second", "third"]
+        ["first", "second", "other", "third"]
     );
 }
 

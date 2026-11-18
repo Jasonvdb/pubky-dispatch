@@ -316,7 +316,7 @@ impl Protocol for ApiProtocol {
     fn record_regression(
         &self,
         c: &str,
-        seen: &[u8],
+        seen: Option<&[u8]>,
         value: Option<&[u8]>,
         base: crate::app::WriteBase,
     ) -> Option<String> {
@@ -4355,7 +4355,9 @@ async fn test_backup_outbox_restore_in_place_keeps_a_give_up_told_since() {
         .await
         .unwrap();
     assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
-    let pending = restored.pending_duty_events().await.unwrap();
+    let pending = crate::app::tests::pending_events(&mut restored)
+        .await
+        .unwrap();
     assert_eq!(undelivered(&pending, &msg_id), vec![false]);
     assert_eq!(unknown(&pending, &msg_id), 0);
 }
@@ -4408,7 +4410,9 @@ async fn test_backup_outbox_restore_in_place_keeps_the_record_job_of_a_given_up_
         restored.delivery(&msg_id).await.unwrap(),
         Some(Delivery::Accepted { .. })
     ));
-    let pending = restored.pending_duty_events().await.unwrap();
+    let pending = crate::app::tests::pending_events(&mut restored)
+        .await
+        .unwrap();
     assert_eq!(undelivered(&pending, &msg_id), vec![true]);
 }
 
@@ -4436,7 +4440,9 @@ async fn test_backup_outbox_restore_in_place_keeps_a_refused_record_told_unknown
         restored.delivery(&msg_id).await.unwrap(),
         Some(Delivery::Failed { .. })
     ));
-    let pending = restored.pending_duty_events().await.unwrap();
+    let pending = crate::app::tests::pending_events(&mut restored)
+        .await
+        .unwrap();
     assert_eq!(unknown(&pending, &msg_id), 1);
 }
 

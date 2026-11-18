@@ -77,7 +77,7 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ParkReason, RefusedCall, StoredMessageIdentity, WaitingReason,
+    EventIdError, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use held_cursor::HeldCursor;
@@ -123,7 +123,8 @@ pub use directory::{
 };
 pub use records::{
     Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord,
+    ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,
@@ -2803,7 +2804,8 @@ impl App {
         Ok(u64::try_from(owed.len()).unwrap_or(u64::MAX))
     }
 
-    /// Inspect the duty events kept and not acknowledged yet, by ascending ID.
+    /// Inspect the duty events kept and not acknowledged yet, by ascending ID, each with
+    /// the protocols it is for that haven't acknowledged it ([`PendingDuty::owners`]).
     ///
     /// After a failed commit, this first reloads the durable state and queues any duty
     /// events still owed to the host, just as the next app call would. Inspection does
@@ -2820,9 +2822,9 @@ impl App {
     /// # Errors
     ///
     /// A failed store read or reload. An error hands no events to the host.
-    pub async fn pending_duty_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+    pub async fn pending_duty_events(&mut self) -> Result<Vec<PendingDuty>, AppError> {
         self.ready_local().await?;
-        self.kept_duties().await
+        self.kept_duties_owned().await
     }
 
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
@@ -2896,6 +2898,21 @@ impl App {
     /// [`StoreError::Corrupt`] for one for no protocol, or for one that isn't registered
     /// ([`App::kept_duty_owned`]).
     pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
+        Ok(self
+            .kept_duties_owned()
+            .await?
+            .into_iter()
+            .map(|pending| pending.event)
+            .collect())
+    }
+
+    /// The duty events kept, by ascending ID, each with the protocols it is for, without
+    /// handing them to the host or noting their owners for [`App::event_owners`].
+    ///
+    /// # Errors
+    ///
+    /// As [`App::kept_duties`].
+    async fn kept_duties_owned(&self) -> Result<Vec<PendingDuty>, AppError> {
         let kept = self
             .reader()
             .scan_numbered::<events::KeptDuty>(key::DUTY_PREFIX)
@@ -2903,9 +2920,12 @@ impl App {
         kept.into_iter()
             .map(|(n, kept)| {
                 self.kept_duty_owned(&kept)?;
-                Ok(kept
-                    .duty
-                    .event(EventId::new(self.state.duty_epoch.epoch, n)))
+                Ok(PendingDuty {
+                    event: kept
+                        .duty
+                        .event(EventId::new(self.state.duty_epoch.epoch, n)),
+                    owners: kept.to,
+                })
             })
             .collect()
     }

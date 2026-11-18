@@ -1076,12 +1076,15 @@ async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag(
                 );
                 faulty.fail_scan(b"duty/", failing_scan);
                 assert!(
-                    app.pending_duty_events().await.is_err(),
+                    crate::app::tests::pending_events(&mut app).await.is_err(),
                     "{fault:?}, scan {failing_scan}"
                 );
                 assert_eq!(app.duty_handed, 0);
                 for _ in 0..2 {
-                    assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                    assert_eq!(
+                        crate::app::tests::pending_events(&mut app).await.unwrap(),
+                        kept
+                    );
                     assert!(!app.reload);
                     assert_eq!(app.duty_handed, 0);
                 }
@@ -1092,7 +1095,10 @@ async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag(
                     value: vec![1],
                 }];
                 assert!(app.protocol_commit("sample", &writes).await.is_err());
-                assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                assert_eq!(
+                    crate::app::tests::pending_events(&mut app).await.unwrap(),
+                    kept
+                );
                 assert!(!app.reload);
                 assert_eq!(app.protocol_get("sample", b"pause").await.unwrap(), None);
                 assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
@@ -1100,13 +1106,21 @@ async fn test_pending_duty_events_keep_divergence_after_reload_and_cleared_flag(
                 let ids = divergent_ids(&kept, key);
                 if let Some(id) = ids.first() {
                     app.ack_events(*id).await.unwrap();
-                    assert_eq!(app.pending_duty_events().await.unwrap(), kept);
+                    assert_eq!(
+                        crate::app::tests::pending_events(&mut app).await.unwrap(),
+                        kept
+                    );
                 }
                 assert_eq!(app.take_events(), kept);
                 if let Some(id) = ids.first() {
                     app.ack_events(*id).await.unwrap();
                 }
-                assert!(app.pending_duty_events().await.unwrap().is_empty());
+                assert!(
+                    crate::app::tests::pending_events(&mut app)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
             }
         }
     })

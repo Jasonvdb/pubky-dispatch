@@ -57,8 +57,8 @@ use super::send::{RecordJob, SentMessage};
 use crate::error::StoreError;
 use crate::store::KeyValue;
 
-/// What a newer write of a record builds on, as the reading app sees it
-/// ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
+/// What a newer write of a record builds on, and when it was made, as the reading app sees
+/// it ([`Protocol::record_regression`], Switch spec 8.2, 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
@@ -81,6 +81,13 @@ pub struct WriteBase {
     /// applied the write; a protocol's reader rule may require one, such as a condition on
     /// the claim of what the write drops, and flag a write without it (Switch spec 8.2).
     pub conditions: Vec<Condition>,
+    /// The service time, in Unix milliseconds, the write's verified chain stub or transition
+    /// proof dates it at (Switch spec 8.2, 10.3 check 2): an earlier generation's proof that
+    /// verifies with the key the newest own `identity.json` lists for it dates it too, a lost
+    /// generation's never. `None` when nothing dates it, as for a record taken from a
+    /// recovery upload (Switch spec 12.6). For a rule from one version to the next that
+    /// depends on when the write was made.
+    pub written_at_ms: Option<u64>,
 }
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
@@ -1111,13 +1118,18 @@ pub trait Protocol: Send + Sync {
         None
     }
 
-    /// Whether a newer write of a record goes back on what the app has seen there (Switch
-    /// spec 8.2), such as dropping or replacing a message of a role it saw: the rule it
-    /// breaks, without content, and the write is flagged and not acted on. `value` is
-    /// `None` for a delete or an unreadable value. Never by default.
+    /// Whether a newer write of a record goes back on what the app has seen there, or fails
+    /// another of the protocol's checks (Switch spec 8.2), such as dropping or replacing a
+    /// message of a role it saw: the rule it breaks, without content, and the write is
+    /// flagged with the app that signed it and not acted on. `seen` is the protocol's mark
+    /// of what the app has seen of the record ([`Protocol::record_seen`]), `None` when it
+    /// has seen nothing yet, such as at the first read of a record: every write of another
+    /// app the app would take is checked, the first included. `value` is `None` for a
+    /// delete or an unreadable value. Never by default.
     ///
     /// `base` tells what the newer write builds on ([`WriteBase`]): its `expected_version`,
-    /// whether the app holds that version, and the conditions its operation signed. A
+    /// whether the app holds that version, the conditions its operation signed, and the
+    /// service time its stub or proof dates it at, if anything dates it. A
     /// protocol whose rules hold only for a writer that built on the value the app holds,
     /// such as one that may drop only what it held itself, applies them when `base.held`;
     /// one whose rule fences a change on a condition, such as a `claim_step` on the claim of
@@ -1129,7 +1141,7 @@ pub trait Protocol: Send + Sync {
     fn record_regression(
         &self,
         collection: &str,
-        seen: &[u8],
+        seen: Option<&[u8]>,
         value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {

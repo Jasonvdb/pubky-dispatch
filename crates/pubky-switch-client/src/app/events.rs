@@ -187,6 +187,19 @@ impl std::str::FromStr for EventId {
 #[error("not an event ID")]
 pub struct EventIdError;
 
+/// A duty event kept and not acknowledged yet, as [`super::App::pending_duty_events`]
+/// inspects it, with the protocols it is for, so a host that gates one protocol on a
+/// pending duty tells whose it is without taking it from the reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingDuty {
+    /// The duty event.
+    pub event: AppEvent,
+    /// The protocols it is for that haven't acknowledged it yet, in the order they had when
+    /// the duty was kept.
+    pub owners: Vec<String>,
+}
+
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -925,6 +938,19 @@ pub enum AppEvent {
     WriteNotTaken {
         /// The record key.
         key: [u8; 32],
+    },
+    /// The switch showed, as a shared record's current write, an older one than the app
+    /// holds, or one not shown newer, by an answer current past the held write (Switch spec
+    /// 10.3): the app keeps the write it holds. `write.authenticated` `false`, or a held
+    /// version that is the service's word only, says this is the service's claim of the
+    /// record now; two authenticated versions are a rollback instead. Told at each read,
+    /// listing or feed write that shows it, so the host may hear it again.
+    #[non_exhaustive]
+    RecordShownOlder {
+        /// The record key.
+        key: [u8; 32],
+        /// The write shown.
+        write: super::ShownWrite,
     },
     /// A shared record write failed a check, or went back on what the app had seen: it is
     /// ignored and shown with the app that signed it (Switch spec 8.2, 10.3).

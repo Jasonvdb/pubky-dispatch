@@ -707,7 +707,7 @@ async fn test_admission_acknowledgment_refusals_do_not_write_locals() {
     assert!(app.ack_event_with("sample", foreign, &local).await.is_err());
     assert_eq!(app.protocol_get("sample", b"refused").await.unwrap(), None);
     assert!(
-        app.pending_duty_events()
+        crate::app::tests::pending_events(&mut app)
             .await
             .unwrap()
             .iter()

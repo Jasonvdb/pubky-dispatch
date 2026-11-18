@@ -193,9 +193,32 @@ pub(crate) struct PendingChanges {
     pub(crate) recovery_changed: bool,
 }
 
+/// The account's writes and exact projected position, still held under the identity lock.
+/// Dropping this value rolls back the writes and their tagged history together.
+pub(crate) struct PreparedAccountCommit {
+    transaction: Transaction<'static, Postgres>,
+    head: AccountHead,
+    mark_target: Option<crate::marks::MarkTarget>,
+    counted: bool,
+}
+
+impl PreparedAccountCommit {
+    /// A result may be acknowledged only once its PostgreSQL commit succeeds.
+    pub(crate) async fn commit(self) -> Result<Committed, StoreError> {
+        self.transaction
+            .commit()
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(Committed {
+            mark_target: self.mark_target,
+            head: self.head,
+            counted: self.counted,
+        })
+    }
+}
+
 /// A committed request: what it committed is durable, so its answer may go out once the
-/// mark has moved to its head and count (Switch wire 7.3 step 10, "Moving it"). Only
-/// [`AccountTxn::commit`] makes one.
+/// mark has moved to its head and count (Switch wire 7.3 step 10, "Moving it").
 #[derive(Debug)]
 pub struct Committed {
     pub(crate) mark_target: Option<crate::marks::MarkTarget>,
@@ -709,7 +732,7 @@ impl AccountTxn {
         coverage: MarkCoverage,
     ) -> Result<Committed, StoreError> {
         let changes = self.pending_changes(false).await?;
-        self.commit_prepared(coverage, changes).await
+        self.prepare_commit(coverage, changes).await?.commit().await
     }
 
     pub(crate) async fn pending_changes(
@@ -741,12 +764,13 @@ impl AccountTxn {
         })
     }
 
-    /// Commit the prepared transaction after any read of the facts it will cover.
-    pub(crate) async fn commit_prepared(
+    /// Prepare the account's exact counted result while all its changes can still roll
+    /// back (Switch account binding 3.3). The identity lock remains held through commit.
+    pub(crate) async fn prepare_commit(
         mut self,
         coverage: MarkCoverage,
         changes: PendingChanges,
-    ) -> Result<Committed, StoreError> {
+    ) -> Result<PreparedAccountCommit, StoreError> {
         let PendingChanges { moved, counts, .. } = changes;
         let chain_seq = self
             .head
@@ -885,10 +909,10 @@ impl AccountTxn {
                 .await
                 .map_err(StoreError::from_db)?;
         }
-        self.tx.commit().await.map_err(StoreError::from_db)?;
-        Ok(Committed {
-            mark_target,
+        Ok(PreparedAccountCommit {
+            transaction: self.tx,
             head: self.head,
+            mark_target,
             counted,
         })
     }
@@ -1004,4 +1028,81 @@ impl AccountTxn {
 pub(super) fn stamped_by(row: &sqlx::postgres::PgRow) -> Result<[u8; 16], StoreError> {
     let stamped_by: Vec<u8> = row.try_get("stamped_by")?;
     <[u8; 16]>::try_from(stamped_by.as_slice()).map_err(|_| StoreError::Corrupt("stamped_by"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, testing::test_database};
+    use pubky_switch_core::{keys::IdentityKey, records::Limits};
+
+    async fn prepare_hold(store: &Store, id: &str) -> PreparedAccountCommit {
+        let mut txn = store.begin(id).await.expect("begin").expect("account");
+        txn.hold_revoked_apps(&[[5; 16]]).await.expect("hold");
+        let changes = txn.pending_changes(false).await.expect("changed rows");
+        txn.prepare_commit(MarkCoverage::ServingPosition, changes)
+            .await
+            .expect("project the counted position")
+    }
+
+    /// The account, tagged history and held row as another connection sees them.
+    async fn visible(store: &Store, id: &str) -> (i64, Vec<u8>, Option<Vec<u8>>, i64) {
+        sqlx::query_as(
+            "SELECT state_version, state_tag, \
+             (SELECT state_tag FROM state_history WHERE account_id = $1 AND state_version = 1), \
+             (SELECT count(*) FROM held_revoked_apps WHERE account_id = $1) \
+             FROM accounts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read committed account")
+    }
+
+    async fn create_account(store: &Store) -> String {
+        let key = IdentityKey::from_secret([7; 32]);
+        let id = key.id();
+        let account = NewAccount {
+            activation: AccountActivation::Ordinary,
+            id: id.clone(),
+            identity_key: key.public(),
+            generation: 1,
+            created_at_ms: 10,
+            limits: Limits::default(),
+            identity_doc: None,
+            revoked_apps: Vec::new(),
+            enrollment_hash: [0; 32],
+            enrollment_store_id: [1; 16],
+            stamped_time_ms: 10,
+            stamped_by: [2; 16],
+        };
+        assert!(store.create_account(&account).await.expect("create"));
+        id
+    }
+
+    #[tokio::test]
+    async fn test_prepared_account_position_is_visible_only_after_commit() {
+        let Some(db) = test_database().await else {
+            return;
+        };
+        let store = db.store();
+        let id = create_account(store).await;
+        let initial = (0, vec![0; 16], None, 0);
+
+        let first = prepare_hold(store, &id).await;
+        let rolled_back = first.head.state_tag;
+        assert_eq!(first.head.state_version, 1);
+        assert_eq!(visible(store, &id).await, initial);
+        drop(first);
+
+        let second = prepare_hold(store, &id).await;
+        let projected = second.head.clone();
+        assert_ne!(projected.state_tag, rolled_back);
+        assert_eq!(visible(store, &id).await, initial);
+        let committed = second.commit().await.expect("commit");
+        assert_eq!(committed.head(), &projected);
+        let tag = projected.state_tag.to_vec();
+        assert_eq!(visible(store, &id).await, (1, tag.clone(), Some(tag), 1));
+        db.drop_database().await.expect("drop the test database");
+    }
 }

@@ -301,6 +301,13 @@ pub struct RestoreContext<'a> {
     app_id: [u8; 16],
     naming: &'a NamingKey,
     cert: &'a AppCert,
+    pub(super) previous: Option<PreviousInstallation<'a>>,
+}
+
+#[derive(Debug)]
+pub(super) struct PreviousInstallation<'a> {
+    pub(super) local: LocalView<'a>,
+    pub(super) protocols: &'a ProtocolSet,
 }
 
 impl<'a> RestoreContext<'a> {
@@ -315,7 +322,53 @@ impl<'a> RestoreContext<'a> {
             app_id,
             naming,
             cert,
+            previous: None,
         }
+    }
+
+    /// Values under this protocol's own prefix in the installation being replaced.
+    /// An empty destination and a backup being checked on its own return no values.
+    /// The owner can retain evidence it verifies alongside the selected layer.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn previous_local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
+        match &self.previous {
+            Some(previous) => previous.local.local_scan(prefix),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Read the installation's held records of this protocol's registered collection,
+    /// in store key order. Each value opens under both certificates' read permissions.
+    /// A recovery upload can have a signed readable value with an unproved version.
+    /// The records retain the version trust and flags the installation held.
+    ///
+    /// A fresh destination and a backup being checked on its own yield no records.
+    /// Only local data is read. A store or integrity error ends the iterator.
+    pub fn previous_records_of<'s>(
+        &'s self,
+        collection: &'s str,
+    ) -> impl Iterator<Item = Result<SharedRecord, AppError>> + 's {
+        self.previous.iter().flat_map(move |previous| {
+            let local = &previous.local;
+            let members = previous
+                .protocols
+                .get(local.name)
+                .into_iter()
+                .flat_map(|protocol| protocol.collections())
+                .filter(|c| {
+                    c.name == collection
+                        && c.readable_by(self.cert)
+                        && previous
+                            .protocols
+                            .of_scope(&c.policy.read_scope)
+                            .is_some_and(|owner| owner.name == local.name)
+                })
+                .collect();
+            super::records::previous::records(local.store, local.ns, self.cert, local.name, members)
+        })
     }
 
     /// The certificate the restore installs: the backup's own, which the app has checked

@@ -127,6 +127,28 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   service's facts about an entry are checked when its page is read: a page that shows an
   entry accepted after the page's time, or after the observation kept for it, is refused,
   so a kept observation that precedes its entry's acceptance is a corrupt store.
+- A foreign record deletion whose owner cannot yet save its observation is kept under
+  `delobs/<key>/<generation>/<version>/<item hash>`. Its original signed delete,
+  preceding signed readable write when available, certificates, proof, prior mark
+  and verified feed-page time travel together. The owner waits there while another
+  owner can continue. Proof of an app's own submission settles its record write while
+  an earlier foreign observation remains owed. Both backup forms carry unanswered observations. A restore
+  verifies the deletion, checks the predecessor's identity against the signed base or
+  dated proof, and keeps outstanding observations from the same install.
+- The owner's bounded observation writes and their acknowledgement commit together.
+  `delack/<key>/<generation>/<version>/<item hash>` holds the identity of the
+  observed deletion, owner, read scope and application position. It contains no record
+  body. A later authenticated write, a different current view or confirmed absence
+  within the app's read scope retires it. Only a layered backup carries this
+  acknowledgement, inside the layer whose writes it identifies. An older layer can
+  receive the deletion again. During an in-place restore its owner can read its
+  own earlier installation's local state and return verified evidence to retain. The
+  owner can stream its collection's held records from the old namespace. One record
+  is read at a time, under both certificates' read scopes. The write, writer and
+  opened bytes are checked before returning its existing version and flags. A fresh
+  installation and the backup's standalone check supply no previous records.
+  Each feed item reserves 6 MiB for the observation or the owner's writes of up to
+  4 MiB and their acknowledgement. Restoring still has to fit one 32 MiB store commit.
 - **A restore is one commit:** the namespace cleared, the app's restored state and each
   registered protocol's backup layer under its `p/<name>/`, all checked before it, so a
   failure leaves none of them. A layer of a protocol not registered refuses the restore,

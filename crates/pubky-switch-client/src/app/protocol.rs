@@ -90,6 +90,47 @@ pub struct WriteBase {
     pub written_at_ms: Option<u64>,
 }
 
+/// A record deletion offered to its collection's protocol (Switch spec 8.2, 10.3).
+/// Its mark, predecessor and base describe what the app held before the delete, including
+/// when the collection owner takes the observation on a later read.
+#[non_exhaustive]
+pub struct RecordDeletion<'a> {
+    /// The collection that registered the callback.
+    pub collection: &'a str,
+    /// The deleted record.
+    pub key: &'a [u8; 32],
+    /// The version of the delete.
+    pub version: RecordVersion,
+    /// The app that signed the deletion.
+    pub writer: [u8; 16],
+    /// The delete's signed item hash.
+    pub item_hash: [u8; 32],
+    /// The verified server time of the feed page on which the app took the delete.
+    /// A delete seen only in a record view has no such observation.
+    pub page_time_ms: Option<u64>,
+    /// The policy of a readable, authenticated record held before this delete.
+    /// With no such source the policy is unknown.
+    pub policy: Option<&'a pubky_switch_core::ident::Policy>,
+    /// The protocol's last mark before the delete.
+    pub seen: Option<&'a [u8]>,
+    /// The readable value of the authenticated write this delete builds on. It can
+    /// differ from the protocol's mark or exceed its bound. An older or unopened
+    /// predecessor, or a different application at the same version, gives no value.
+    pub exact_value: Option<&'a [u8]>,
+    /// The version and conditions the deletion signed.
+    pub base: WriteBase,
+}
+
+/// How a protocol answers a record deletion (Switch spec 8.2, 10.3).
+#[non_exhaustive]
+pub enum PutBack {
+    /// Pass this deletion and keep the owner's observation.
+    Observe {
+        /// The owner's local writes for this deletion.
+        observed: Vec<LocalWrite>,
+    },
+}
+
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1116,6 +1157,19 @@ pub trait Protocol: Send + Sync {
     ) -> Option<Vec<u8>> {
         let _ = (collection, seen, value);
         None
+    }
+
+    /// Observe another app's verified deletion of a record in this collection. The
+    /// callback follows the regression check and sees the evidence from before the
+    /// delete. Its bounded local writes commit under this protocol's namespace.
+    /// A store failure leaves the observation owed before later handovers to its owner.
+    fn record_put_back(
+        &self,
+        deletion: &RecordDeletion<'_>,
+        context: &ReceiveContext<'_>,
+    ) -> Result<Option<PutBack>, StoreFailure> {
+        let _ = (deletion, context);
+        Ok(None)
     }
 
     /// Whether a newer write of a record goes back on what the app has seen there, or fails

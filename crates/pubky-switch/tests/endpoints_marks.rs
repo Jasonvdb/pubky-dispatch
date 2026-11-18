@@ -1233,15 +1233,10 @@ async fn test_marks_crash_after_the_mark_move_before_the_answer_is_healthy() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_marks_failed_commit_leaves_the_mark() {
-    let Some(replay) = replay().await else {
-        return;
-    };
-    let (mark, _) = served(&replay).await;
-    let before = account_row(&replay).await;
+/// Make an account update fail at commit, after its time reservation is durable.
+async fn fail_account_commits(replay: &Replay) {
     sql(
-        &replay,
+        replay,
         &[
             "CREATE FUNCTION fail_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
              RAISE EXCEPTION 'a commit that fails'; END $$",
@@ -1250,6 +1245,60 @@ async fn test_marks_failed_commit_leaves_the_mark() {
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_marks_restart_uses_time_reserved_by_a_failed_commit() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let candidate = served_past_the_floor(&replay).await;
+    let sent = Sent::of(&public_read());
+    let key = service_public(&replay);
+    let last = replay.service.handle(public_read()).await;
+    assert_eq!(last.status, 200);
+    assert!(signed_with(&last, &key, &sent));
+    let shown = time_shown(&last);
+    let mark = mark_in(&replay.marks).await;
+    let row = account_row(&replay).await;
+
+    replay.clock.set_wall_ms(candidate);
+    fail_account_commits(&replay).await;
+    let failed = replay.service.handle(public_read()).await;
+    assert_eq!(
+        (failed.status, code(&failed).as_str()),
+        (503, "unavailable")
+    );
+    assert!(signed_with(&failed, &key, &sent));
+    assert_eq!(time_shown(&failed), shown);
+    assert_eq!(account_row(&replay).await, row);
+    let step = pubky_switch::marks::TIME_FLOOR_STEP_MS;
+    let reserved = AccountMark {
+        time_floor_ms: candidate + step,
+        ..mark
+    };
+    assert_eq!(mark_in(&replay.marks).await, reserved);
+
+    sql(&replay, &["DROP TRIGGER fail_at_commit ON accounts"]).await;
+    replay.clock.set_wall_ms(shown);
+    let (service, marks) = restarted(&replay, Limits::default());
+    let next = service.handle(public_read()).await;
+    assert_eq!(next.status, 200);
+    assert!(signed_with(&next, &key, &sent));
+    assert_eq!(time_shown(&next), reserved.time_floor_ms);
+    assert!(time_shown(&next) > shown + step);
+    assert_eq!(mark_in(&marks).await, reserved);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_failed_commit_leaves_the_mark() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, _) = served(&replay).await;
+    let before = account_row(&replay).await;
+    fail_account_commits(&replay).await;
     let request = wallet_batch(&replay, &[3, 4]);
     let sent = Sent::of(&request);
     let answer = replay.service.handle(request).await;

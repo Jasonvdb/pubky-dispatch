@@ -68,10 +68,9 @@ const MAX_ERASURE_FILE: u64 = 20;
 /// The store's directories under `accounts/`.
 const STORE_DIRS: [&str; 4] = ["marks", "retired", "erasures", "erasure-attempts"];
 
-/// How far past the time step 3 stamps the mark's time floor rises once that time passes it,
-/// in milliseconds: one minute, so the mark is written for time at most once a minute per
-/// account, and after a restore the service time is at most this far ahead of the last time
-/// it showed (Switch wire 7.3, "Trusted time").
+/// How far the mark reserves past the time selected by step 3, in milliseconds. The
+/// reservation survives a failed commit, even when the last answer carried an earlier
+/// stamp (Switch wire 7.3, "Time base").
 pub const TIME_FLOOR_STEP_MS: u64 = 60_000;
 
 /// An identity's mark (Switch wire 7.3, "Accounts and marks"): (generation, `seq`, chain

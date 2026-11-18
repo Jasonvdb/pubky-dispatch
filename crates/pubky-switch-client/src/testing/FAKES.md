@@ -109,7 +109,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     of included, not by the service's account model.
   - the time floor (wire 7.3, "Time base"): the switch has no restarts, so its controls
     leave its service time as it is, where the service, run again after a restore, stamps
-    the mark's floor first, up to a minute ahead.
+    the mark's floor first. A reservation runs up to one minute past the time the service
+    selected for a request, even if the request failed before committing its stamp.
 - **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
   feed read with `wait` that has nothing to show its app, until the account's sequence
   grows or the wait has passed. The wait passes by the switch's clock, a test clock that

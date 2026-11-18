@@ -607,8 +607,8 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The mark's time floor is at or above the time `answer` carried, and at most one step past
-/// it (Switch wire 7.3, "Trusted time").
+/// These generation starts commit at the request's selected time. Their marks cover that
+/// stamp within one reservation step (Switch wire 7.3, "Time base").
 fn assert_floor_covers(mark: &AccountMark, answer: &SwitchResponse) {
     let shown = ms(header_text(answer, header::SERVER_TIME).expect("server time"));
     assert!(

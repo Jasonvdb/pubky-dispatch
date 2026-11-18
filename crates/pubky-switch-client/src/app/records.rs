@@ -1621,8 +1621,10 @@ impl App {
             // never another's (Switch spec 10.3).
             let at = self.current_at(page.head, Some(page.seq)).await?;
             if upload.is_some_and(|upload| {
-                page.seq > page.head.seq
-                    || !self.covers_upload(position(page.head.generation, page.seq), upload)
+                // Inbox entries can advance the snapshot past the last chain item.
+                // Both the page and its chain head must have reached the upload.
+                let covered = |seq| self.covers_upload(position(page.head.generation, seq), upload);
+                !covered(page.seq) || !covered(page.head.seq)
             }) {
                 return Ok(Listed::Paused(listed));
             }

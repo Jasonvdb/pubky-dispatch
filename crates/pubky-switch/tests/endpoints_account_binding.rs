@@ -431,6 +431,38 @@ async fn test_first_counted_change_checks_the_actual_opening_contents() {
 }
 
 #[tokio::test]
+async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let (opening, _) = create(&replay, NOW, 43).await;
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    let completed = std::fs::read(&path).unwrap();
+    let mut reserved: pubky_switch::marks::AccountMark =
+        serde_json::from_slice(&completed).unwrap();
+    let pubky_switch::marks::CreationAnchor::Bound { confirmed, .. } =
+        &mut reserved.creation_anchor
+    else {
+        panic!("missing opening commitment");
+    };
+    assert!(*confirmed);
+    *confirmed = false;
+    // SQL committed before the process could sync the confirmation into its mark.
+    let reopened = service_with_restored_mark(&replay, &serde_json::to_vec(&reserved).unwrap());
+    let request = enrollment_request(&opening, NOW);
+    let sent = support::Sent::of(&request);
+    let answer = reopened.handle(request).await;
+    status(&answer, 200);
+    assert!(support::signed_with(
+        &answer,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), completed);
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
     let Some(replay) = support::replay().await else {
         return;

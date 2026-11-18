@@ -1270,12 +1270,16 @@ async fn created_at_of(replay: &Replay, id: &str) -> u64 {
     u64::try_from(at).expect("a time")
 }
 
-fn assert_fresh_creation_mark(mark: AccountMark, key: [u8; 32], created: u64) {
+fn assert_fresh_creation_mark(mark: AccountMark, key: [u8; 32], created: u64, committed: bool) {
     let anchor = mark
         .creation_anchor
         .for_creation(created)
         .expect("fresh creation commitment");
     assert_ne!(anchor, [0; 32]);
+    assert!(matches!(
+        mark.creation_anchor,
+        pubky_switch::marks::CreationAnchor::Bound { confirmed, .. } if confirmed == committed
+    ));
     assert_eq!(
         mark,
         AccountMark {
@@ -1301,17 +1305,17 @@ async fn test_enroll_writes_the_zero_mark_before_the_account() {
         (503, "unavailable")
     );
     assert_eq!(accounts_of(&replay, &alice.id).await, 0, "no account");
-    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T));
+    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T), false);
     replay.db.drop_database().await.expect("drop");
 
-    // Where the creation commits: the same mark, and the account's creation time is its.
+    // A durable account confirms its opening and retains the same creation time.
     let Some(replay) = support::replay().await else {
         return;
     };
     set_time(&replay.clock, T);
     let enrolled = enroll(&replay, 1).await;
     assert_eq!(enrolled.status, 200);
-    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T));
+    assert_fresh_creation_mark(mark_of(&replay, &alice.id).await, key, ms(T), true);
     assert_eq!(created_at_of(&replay, &alice.id).await, ms(T));
     replay.db.drop_database().await.expect("drop");
 }
@@ -1541,6 +1545,7 @@ async fn test_enroll_while_the_mark_store_cant_be_read_is_503() {
         mark_of(&replay, &alice.id).await,
         service_public(&replay),
         ms(T),
+        true,
     );
     replay.db.drop_database().await.expect("drop");
 }

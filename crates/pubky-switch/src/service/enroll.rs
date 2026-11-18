@@ -221,8 +221,8 @@ impl Service {
                 {
                     return Ok(created);
                 }
-                // Another enrollment made the account first: answered as at an account that
-                // exists.
+                // Read the committed opening receipt under the lock. Another enrollment
+                // may also have created the account while this request waited.
             }
             Route::Proceed { head: false } => {}
             // While the mark store can't be read no mark is created (Switch wire 7.4.1).
@@ -252,7 +252,7 @@ impl Service {
     /// time. A (0, 0) mark without an account, left by a crash between the two or a restore,
     /// is taken, and so is a lost account's mark, whose head and retirements stay: the
     /// account is then staged and bounded. An erasure's leftover mark is deleted first.
-    /// `None` when another enrollment made the account first.
+    /// `None` when the caller must read the committed receipt at the selected account.
     async fn create_account(
         &self,
         enrollment: &Enrollment,
@@ -458,9 +458,11 @@ impl Service {
             tx.commit()
                 .await
                 .map_err(|e| store_error(&crate::store::StoreError::from_db(e)))?;
-        } else {
-            creation.commit().await.map_err(|e| store_error(&e))?;
+            // A mark reserved before SQL committed cannot establish that a creation
+            // happened. The caller confirms it from committed state before success.
+            return Ok(None);
         }
+        creation.commit().await.map_err(|e| store_error(&e))?;
         // Answered at the time it first stamped, which may be past `base_ms`.
         Ok(Some(Enrolled {
             time_ms: account.stamped_time_ms,
@@ -701,6 +703,11 @@ impl Service {
                     .covers_opening_receipt(store_id, enrollment_hash, &limits, mark)
                     .await
                     .map_err(|e| store_error(&e))?
+                    || !self
+                        .marks
+                        .confirm_creation(identity_text, store_id, *mark)
+                        .await
+                        .map_err(|_| unavailable())?
                 {
                     return Err(unavailable());
                 }

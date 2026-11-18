@@ -87,6 +87,8 @@ pub enum CreationAnchor {
         /// The nonzero content commitment.
         #[serde(with = "hex_bytes")]
         digest: [u8; 32],
+        /// Whether the service observed the matching creation in committed SQL.
+        confirmed: bool,
     },
 }
 
@@ -97,6 +99,7 @@ impl CreationAnchor {
             Self::Bound {
                 created_at_ms,
                 digest,
+                ..
             } if created == created_at_ms => Some(digest),
             _ => None,
         }
@@ -188,6 +191,7 @@ impl AccountMark {
         if let CreationAnchor::Bound {
             created_at_ms,
             digest,
+            ..
         } = self.creation_anchor
             && (created_at_ms > self.created_at_ms || digest == [0; 32])
         {
@@ -596,10 +600,56 @@ impl MarkStore {
                     creation_anchor: CreationAnchor::Bound {
                         created_at_ms,
                         digest: anchor,
+                        confirmed: false,
                     },
                     ..AccountMark::zero(key, created_at_ms)
                 })
             })
+        })
+        .await
+    }
+
+    /// Seal an observed SQL creation in its independent mark. The caller verified the
+    /// committed opening receipt while holding the identity lock (account binding 3.3).
+    pub(crate) async fn confirm_creation(
+        &self,
+        identity: &str,
+        store_id: [u8; 16],
+        read: AccountMark,
+    ) -> Result<bool, MarkStoreError> {
+        let CreationAnchor::Bound {
+            created_at_ms,
+            digest,
+            confirmed,
+        } = read.creation_anchor
+        else {
+            return Ok(false);
+        };
+        if created_at_ms != read.created_at_ms {
+            return Ok(false);
+        }
+        if confirmed {
+            return Ok(true);
+        }
+        self.check_gate()?;
+        let gate = self.gate.clone();
+        let inner = self.inner.clone();
+        let identity = valid_identity(identity)?;
+        blocking(move || {
+            let sealed = AccountMark {
+                creation_anchor: CreationAnchor::Bound {
+                    created_at_ms,
+                    digest,
+                    confirmed: true,
+                },
+                ..read
+            };
+            let result =
+                inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), |held| {
+                    (held == MarkRead::Mark(read) && !inner.erased_after(&identity, created_at_ms))
+                        .then_some(sealed)
+                })?;
+            Ok(result == MarkWrite::Written(sealed))
         })
         .await
     }

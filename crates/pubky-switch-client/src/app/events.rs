@@ -873,12 +873,13 @@ pub enum AppEvent {
     /// The shared record write a sent message named ([`super::RecordJob`]) was stopped: the
     /// app took a delete of the record that the job wasn't queued against, and the job
     /// never writes over a delete its protocol hasn't seen (Switch spec 10.3). The delete is
-    /// at (`generation`, `version`), which the service may have forgotten since. With
-    /// `batch_id` `None` the write was never made. With a `batch_id`, an earlier try left
-    /// that batch kept and its fate can't be known: the write may have applied before the
-    /// delete, and [`super::App::kept_batch`] tells what the store still keeps of it. The
-    /// protocol reads the record and decides again. A duty event, in the commit that stops
-    /// the job.
+    /// identified by (`generation`, `version`, `item_hash`), even after the service forgets it.
+    /// The stopping try wrote nothing. If the outbox kept a batch ID for an earlier try
+    /// whose fate is unknown, `batch_id` names it and [`super::App::kept_batch`] shows
+    /// its retained status. A restored outbox may predate an earlier applied write. The
+    /// collection's protocol reads the record and decides again. The duty also goes to the
+    /// message kind's owner. The commit that stops the job keeps the duty until each
+    /// distinct owner acknowledges it.
     #[non_exhaustive]
     RecordJobStopped {
         /// The duty event's ID.
@@ -891,6 +892,8 @@ pub enum AppEvent {
         generation: u64,
         /// The delete's version.
         version: u64,
+        /// The item hash of the signed delete operation (Switch wire 6.3).
+        item_hash: [u8; 32],
         /// The batch an earlier try left kept that may have applied, if one did.
         batch_id: Option<[u8; 16]>,
     },
@@ -1289,6 +1292,8 @@ pub(crate) enum Duty {
         key: [u8; 32],
         generation: u64,
         version: u64,
+        #[serde(with = "serde_b64")]
+        item_hash: [u8; 32],
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<String>,
     },
@@ -1455,6 +1460,7 @@ impl Duty {
                 key,
                 generation,
                 version,
+                item_hash,
                 batch_id,
             } => AppEvent::RecordJobStopped {
                 id,
@@ -1462,6 +1468,7 @@ impl Duty {
                 key,
                 generation,
                 version,
+                item_hash,
                 batch_id: batch_id
                     .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
             },

@@ -552,7 +552,7 @@ mod version_serde {
     }
 }
 
-pub(crate) mod opt_version_serde {
+mod opt_version_serde {
     use pubky_switch_core::ops::RecordVersion;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -665,6 +665,17 @@ impl std::fmt::Debug for HeldRecord {
     }
 }
 
+/// A delete a record's next write builds on ([`HeldRecord::delete_base`]): its version, and
+/// the item hash of its operation, which tells apart two deletes at one version after a
+/// provider loss, as two uploads can share a version (Switch spec 12.6 step 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeleteBase {
+    #[serde(with = "version_serde")]
+    pub(crate) version: RecordVersion,
+    #[serde(with = "serde_b64")]
+    pub(crate) item_hash: [u8; 32],
+}
+
 impl HeldRecord {
     /// The write the next one builds on: the switch's current write, also when the app
     /// refused it or held an older one at its version: its version, its application and
@@ -680,11 +691,14 @@ impl HeldRecord {
         }
     }
 
-    /// The version of the delete the next write builds on, held or followed, also once the
-    /// service forgot it; `None` when that write isn't a delete.
-    pub(crate) fn delete_base(&self) -> Option<RecordVersion> {
-        let (version, _, deleted) = self.base_write();
-        deleted.then_some(version)
+    /// The delete the next write builds on, held or followed, also once the service forgot
+    /// it; `None` when that write isn't a delete.
+    pub(crate) fn delete_base(&self) -> Option<DeleteBase> {
+        let (version, applied, deleted) = self.base_write();
+        deleted.then_some(DeleteBase {
+            version,
+            item_hash: applied.item_hash,
+        })
     }
 
     /// What the next write at `key` names (Switch spec 10.3, Switch wire 6.2, 6.3): the
@@ -970,7 +984,7 @@ pub(crate) enum Updated {
     /// Stopped at `deleted`, a delete other than the call's base, before anything was
     /// written over it; `last` is the conflict a try met before, if one did.
     Stopped {
-        deleted: RecordVersion,
+        deleted: DeleteBase,
         last: Option<AppError>,
     },
 }
@@ -2100,52 +2114,48 @@ impl App {
             }
         }
         // Boxed: the checks hold a deep future, which a receive on a small stack can't.
-        let mut outcome = Box::pin(self.accept_write(evidence, expect, tx)).await?;
-        let mut version = evidence
+        let mut evidence = *evidence;
+        let mut outcome = Box::pin(self.accept_write(&evidence, expect, tx)).await?;
+        // A write the app holds no certificate in force at its time for: the record's view,
+        // whose cert is the one the service checked the write against, decides (Switch
+        // wire 6.2 "Accepting a write" step 1, 7.4.9).
+        let current_view;
+        if let Err(Refused::Unheld(collection)) = outcome {
+            let Some((view, at)) = self.record_view(&shown_key).await? else {
+                return Ok(WriteRead::Refused);
+            };
+            current_view = view;
+            if current_view.key == shown_key {
+                *viewed = Some(current_view.divergent);
+            }
+            // A re-read of the feed operation keeps its stub and proof. When the view
+            // shows another operation, both acceptance and refusal judge only that one.
+            let same = current_view.op == *evidence.op;
+            evidence = Evidence {
+                op: &current_view.op,
+                cert: Some(&current_view.cert),
+                proof: current_view
+                    .proof
+                    .as_ref()
+                    .or(evidence.proof.filter(|_| same)),
+                stub: evidence.stub.filter(|_| same),
+                view_version: Some(RecordVersion::new(
+                    current_view.generation,
+                    current_view.version,
+                )),
+                view_revision: Some(current_view.revision),
+                current_at: at,
+            };
+            outcome =
+                Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
+        }
+        let version = evidence
             .stub
             .map(|env| RecordVersion::new(env.generation, env.seq))
             .or(evidence.view_version)
             .unwrap_or(RecordVersion::NONE);
-        let mut view_revision = evidence.view_revision;
-        // A write the app holds no certificate in force at its time for: the record's view,
-        // whose `cert` is the one the service checked the write against, decides (Switch
-        // wire 6.2 "Accepting a write" step 1, 7.4.9).
-        if let Err(Refused::Unheld(collection)) = &outcome {
-            let collection = collection.clone();
-            outcome = match self.record_view(&shown_key).await? {
-                Some((view, at)) => {
-                    if view.key == shown_key {
-                        *viewed = Some(view.divergent);
-                    }
-                    // A view of the feed's own write keeps what the feed gave it: the
-                    // verified stub, which dates the write and gives its version whatever
-                    // proof the view shows, and the item's proof. A view of another write
-                    // is judged on its own evidence, and the feed write not at all.
-                    let same = view.op == *evidence.op;
-                    let stub = evidence.stub.filter(|_| same);
-                    let view_version = RecordVersion::new(view.generation, view.version);
-                    version = stub.map_or(view_version, |env| {
-                        RecordVersion::new(env.generation, env.seq)
-                    });
-                    view_revision = Some(view.revision);
-                    let evidence = Evidence {
-                        op: &view.op,
-                        cert: Some(&view.cert),
-                        proof: view.proof.as_ref().or(evidence.proof.filter(|_| same)),
-                        stub,
-                        view_version: Some(view_version),
-                        view_revision: Some(view.revision),
-                        current_at: at,
-                    };
-                    Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx))
-                        .await?
-                }
-                None => Err(Refused::Ignored),
-            };
-        }
-        // A refused write's application: the view's, else at its version.
         let revision_of = |version: RecordVersion, write: [u8; 32]| {
-            view_revision.unwrap_or(applied_at(version, write))
+            evidence.view_revision.unwrap_or(applied_at(version, write))
         };
         match outcome {
             Ok(accepted) => {
@@ -2392,6 +2402,18 @@ impl App {
             )
             .is_ok();
         let item_hash = certs.op.item_hash()?;
+        // A view's revision names this signed operation, even when a recovery upload
+        // changed its position (Switch wire 6.3). A mismatch invalidates the response,
+        // including the divergence state it reports. It says nothing about the writer.
+        if evidence
+            .view_revision
+            .is_some_and(|revision| revision.item_hash != item_hash)
+        {
+            return Err(ClientError::InvalidResponse(
+                "Switch wire 6.3: the record revision names a different operation".into(),
+            )
+            .into());
+        }
         let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
             if own {
                 return Ok(Err(Refused::Ignored));
@@ -3463,14 +3485,15 @@ impl App {
     /// [`App::update_record`] from `base`, the delete the record's next write built on when
     /// its caller decided to write (`Some(None)` for none), or, for `None`, the one it
     /// builds on when the call begins. Each try first compares the delete the next write
-    /// would build on with that base ([`HeldRecord::delete_base`]): another one, also a
-    /// delete where the base was none, stops the call before anything is written over it
-    /// (Switch spec 10.3). A delete the service forgot since still counts as that delete.
+    /// would build on with that base ([`HeldRecord::delete_base`]), by its version and its
+    /// operation: another one, also one at the base's version, or a delete where the base
+    /// was none, stops the call before anything is written over it (Switch spec 10.3, 12.6
+    /// step 3). A delete the service forgot since still counts as that delete.
     pub(crate) async fn update_record_on(
         &mut self,
         target: &RecordTarget,
         conditions: Vec<Condition>,
-        base: Option<Option<RecordVersion>>,
+        base: Option<Option<DeleteBase>>,
         mut change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
     ) -> Result<Updated, AppError> {
         Box::pin(async move {

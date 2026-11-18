@@ -1652,7 +1652,7 @@ async fn test_outbox_give_up_reads_state_again_before_going_on() {
     // The next try's own write is refused as too large: given up.
     store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id]);
+    assert_eq!(report.unknown, vec![msg_id]);
     // The refused commit was read past: what the app holds is the store's again, so a
     // backup, only ever of committed state, is given at once.
     assert!(
@@ -2468,7 +2468,7 @@ async fn test_queue_stored_given_up_once_is_refused_after() {
     wallet.flush_outbox().await.unwrap();
     p.clock.advance_ms(5 * DAY_MS);
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert_eq!(report.unknown, vec![msg_id.clone()]);
     assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     for _ in 0..2 {
         let error = wallet.queue_stored(signed.plaintext()).await.unwrap_err();
@@ -2682,7 +2682,7 @@ async fn test_queue_stored_after_a_too_large_give_up_is_refused() {
     store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(report.unknown, vec![msg_id.clone()], "{report:?}");
     assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     let error = wallet.queue_stored(signed.plaintext()).await.unwrap_err();
     assert!(
@@ -2773,7 +2773,7 @@ async fn test_queue_stored_given_up_then_its_kept_batch_settles_queues_nothing()
     }
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(report.unknown, vec![msg_id.clone()], "{report:?}");
     assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     p.alice.switch().lock().faults.clear();
     let mut shop = shop;
@@ -3991,7 +3991,7 @@ async fn test_backup_outbox_past_the_window_gives_the_delivery_up() {
     let msg_id = signed.msg_id().to_owned();
     restored.take_events();
     let report = restored.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert_eq!(report.unknown, vec![msg_id.clone()]);
     let events = restored.take_events();
     assert_eq!(unknown(&events, &msg_id), 1);
     assert!(undelivered(&events, &msg_id).is_empty());
@@ -4054,7 +4054,8 @@ async fn test_backup_outbox_give_up_without_a_known_acceptance_is_unknown() {
     // Past the replay deadline, the carried message is given up untried.
     p.clock.advance_ms(SENT_RETENTION_MS + MINUTE);
     let report = restored.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![carried.clone()]);
+    assert_eq!(report.unknown, vec![carried.clone()]);
+    assert!(report.undelivered.is_empty(), "{report:?}");
     let events = restored.take_events();
     assert_eq!(unknown(&events, &carried), 1);
     assert!(undelivered(&events, &carried).is_empty());
@@ -4080,7 +4081,7 @@ async fn test_backup_outbox_restored_in_time_and_tried_past_the_window_isnt_sent
     ));
     p.clock.advance_ms(2 * DAY_MS);
     let report = restored.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+    assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
     shop.receive(None).await.unwrap();
     assert_eq!(protocol.seen().len(), 1, "applied once");
 }
@@ -4104,7 +4105,7 @@ async fn test_backup_outbox_window_holds_on_a_device_clock_behind() {
         .await
         .unwrap();
     let report = restored.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+    assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
     assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
 }
 
@@ -4166,7 +4167,7 @@ async fn test_backup_outbox_deadline_survives_a_later_backup() {
     shop.invite(&p.alice.identity().public()).await.unwrap();
     p.clock.advance_ms(11 * DAY_MS);
     let report = second.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+    assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
 }
 
 /// A message a restore put back, accepted only after the restore: a re-send of it goes by
@@ -4234,6 +4235,9 @@ async fn test_backup_outbox_resend_given_up_says_resend() {
 }
 
 /// A message refused for good is carried as it stands: the restored app reports it failed.
+/// The refusal answers only the try it ends, which was sent: an earlier copy may have been
+/// accepted, so the protocol is told the delivery is unknown, and a backup taken before it
+/// acknowledged that carries it, for the restore to tell again.
 #[tokio::test]
 async fn test_backup_outbox_carries_failed_messages() {
     let p = Pair::new();
@@ -4248,13 +4252,40 @@ async fn test_backup_outbox_carries_failed_messages() {
     });
     let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
     assert!(matches!(delivery, Delivery::Failed { .. }), "{delivery:?}");
+    let events = wallet.take_events();
+    assert_eq!(unknown(&events, &msg_id), 1);
+    assert!(undelivered(&events, &msg_id).is_empty());
     let backup = wallet.backup().await.unwrap();
     drop(wallet);
-    let restored = restored_wallet(&p, &protocol, &backup).await;
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
     assert!(matches!(
         restored.delivery(&msg_id).await.unwrap(),
         Some(Delivery::Failed { .. })
     ));
+    assert_eq!(unknown(&restored.take_events(), &msg_id), 1);
+}
+
+/// A restore in place keeps the give-ups the store told: the backup's older copy of a
+/// message withdrawn since is neither put back nor told again.
+#[tokio::test]
+async fn test_backup_outbox_restore_in_place_keeps_a_give_up_told_since() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "gone")).unwrap();
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    let msg_id = signed.msg_id().to_owned();
+    let backup = wallet.backup().await.unwrap();
+    assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+    drop(wallet);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
+    let pending = restored.pending_duty_events().await.unwrap();
+    assert_eq!(undelivered(&pending, &msg_id), vec![false]);
+    assert_eq!(unknown(&pending, &msg_id), 0);
 }
 
 /// An outbox over the byte budget is carried oldest first; the rest are told to the
@@ -4591,7 +4622,7 @@ async fn test_hold_queued_copy_past_its_deadline_is_given_up_once() {
     p.clock.advance_ms(6 * DAY_MS);
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert_eq!(report.unknown, vec![msg_id.clone()]);
     assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     wallet.release_queued(&bob).await.unwrap();
     wallet.flush_outbox().await.unwrap();
@@ -5103,7 +5134,7 @@ async fn test_hold_message_past_its_deadline_is_given_up_and_the_hold_ends() {
     p.clock.advance_ms(6 * DAY_MS);
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
-    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert_eq!(report.unknown, vec![msg_id.clone()]);
     assert_eq!(unknown(&wallet.take_events(), &msg_id), 1);
     assert!(
         wallet

@@ -767,9 +767,10 @@ pub enum AppEvent {
         /// The acceptance time, the recipient's service time.
         accepted_at_ms: u64,
     },
-    /// The app gave up delivery of a message it knows was not delivered: no request
-    /// carrying it can have reached the recipient's switch, from this app or from a copy
-    /// of its store (Switch spec 11). It was given up after `403 not_admitted` or
+    /// The app gave up delivery of a message, or of a re-send of it, knowing the outcome
+    /// (Switch spec 11). With `resend: false` no request carrying it can have reached the
+    /// recipient's switch, from this app or from a copy of its store. It was given up after
+    /// `403 not_admitted` or
     /// `403 not_current` refusals ([`super::UNDELIVERABLE_MS`]), for writes over the
     /// store's sizes ([`crate::error::StoreError::TooLarge`]), past a replay deadline while
     /// held, or withdrawn ([`super::App::withdraw_message`]). A message never accepted is
@@ -789,8 +790,9 @@ pub enum AppEvent {
         /// given up.
         resend: bool,
     },
-    /// The app gave up delivery of a message that may have been delivered (Switch spec
-    /// 11): it no longer tries it, and can't know the recipient doesn't have it. Either a
+    /// The app gave up delivery of a message that may have been delivered, or it was refused
+    /// for good after a try that may have been accepted (Switch spec 11): it no longer
+    /// tries it, and can't know the recipient doesn't have it. Either a
     /// request carrying it may have reached the recipient's switch, its answer lost, or a
     /// copy of this app's store may have delivered it: a message a restore put back or a
     /// backup left out, one [`super::App::queue_stored`] queued, or one whose acceptance a
@@ -804,8 +806,10 @@ pub enum AppEvent {
     /// The app keeps no record of each try's answer: once it committed an envelope of the
     /// message to be sent, a give-up says this, even when every try was answered with a
     /// refusal and the recipient never took it.
-    /// The message left the outbox, plaintext and all, and `queue_stored` refuses it
-    /// ([`super::WontDeliver::GivenUp`]). A duty event.
+    /// The message left the outbox, plaintext and all, unless it is kept as refused for
+    /// good, and `queue_stored` refuses it ([`super::WontDeliver::GivenUp`]). A flush lists
+    /// it in [`super::OutboxReport::unknown`], never in `undelivered`. A backup carries the
+    /// event until it is acknowledged, so a restore tells it again. A duty event.
     #[non_exhaustive]
     DeliveryUnknown {
         /// The duty event's ID.

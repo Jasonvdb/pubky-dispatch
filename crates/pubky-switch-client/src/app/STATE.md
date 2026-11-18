@@ -165,11 +165,15 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   records back in its one commit, so a message queued before the backup goes after the
   restore with the same `msg_id`, signed plaintext and last sealed envelope.
 - **A give-up says "undelivered" only when no request can have carried the message:** an
-  `out/` record keeps `envelope_sent` from the commit that first holds an envelope of it,
-  before it is sent, and never clears it. A give-up of a message not accepted before keeps
-  `MessageUndelivered` only without it and without a replay deadline, which marks a copy
-  another store may have delivered; else `DeliveryUnknown`. A message a backup left out
-  past its budget is `DeliveryUnknown` too, unless it was accepted before.
+  `out/` record keeps `envelope_sent`, always written, set in the commit that first holds an
+  envelope of it, before it is sent, and never cleared. A give-up of a message not accepted
+  before keeps `MessageUndelivered` only without it and without a replay deadline, which
+  marks a copy another store may have delivered; else `DeliveryUnknown`, as does a refusal
+  for good of a message with it. A message a backup left out past its budget is
+  `DeliveryUnknown` too, unless it was accepted before. A backup names the messages whose
+  `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each; a
+  restore in place neither puts back nor tells again a message whose give-up the store's
+  carried duty events tell.
 - **A restored delivery has a replay deadline** (`replay_until_ms` on its record): the
   backup's verified service time, or its device time without one, less the clock tolerance,
   plus `SENT_RETENTION_MS` (30 days), or a message's first acceptance plus 30 days when it

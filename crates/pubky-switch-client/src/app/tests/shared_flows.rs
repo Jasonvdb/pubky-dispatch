@@ -11428,15 +11428,10 @@ async fn test_record_lifetime_keeps_its_mark_through_an_unreadable_value_and_rel
     let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
         .await
         .unwrap();
-    assert!(
-        wallet
-            .shared_record(&key)
-            .await
-            .unwrap()
-            .unwrap()
-            .content
-            .waits_for_key()
-    );
+    assert!(matches!(
+        wallet.shared_record(&key).await.unwrap().unwrap().content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { .. })
+    ));
     assert_eq!(
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["a", "x"]

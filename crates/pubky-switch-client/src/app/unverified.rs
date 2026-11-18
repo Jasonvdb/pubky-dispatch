@@ -142,7 +142,6 @@ impl WaitingChange {
             app.state.stored_retries.remove(&id);
         }
         if let Some(seq) = self.feed {
-            app.state.held.remove(&seq);
             app.state.retries.remove(&seq);
         }
         if let Some((id, retry)) = self.retry_move {
@@ -160,6 +159,9 @@ impl WaitingChange {
 
 impl App {
     pub(super) fn validate_waiting_state(&self) -> Result<(), AppError> {
+        for held in self.state.held.values() {
+            held.validate()?;
+        }
         for stored in self
             .state
             .parked
@@ -296,7 +298,6 @@ impl App {
                 }
                 change.next_stored_id = id.checked_add(1).ok_or_else(super::corrupt)?;
                 change.tx.put(key::STORED_NEXT, &change.next_stored_id)?;
-                change.tx.delete(&key::held(seq))?;
                 change.tx.delete(&key::retry(seq))?;
             } else if !self.state.parked.contains_key(id) {
                 return Err(super::corrupt());
@@ -430,11 +431,7 @@ impl WaitingOut {
         let held: Vec<_> = state
             .held
             .iter()
-            .filter(|(seq, _)| {
-                **seq > state.cursor.seq
-                    && !state.seen.contains(seq)
-                    && pending.is_none_or(|effect| effect.stored.is_some() || effect.seq != **seq)
-            })
+            .filter(|(seq, _)| **seq > state.cursor.seq)
             .map(|(seq, held)| (*seq, *held))
             .collect();
         Self {
@@ -496,29 +493,39 @@ impl WaitingOut {
                 }
             }
         }
-        let mut held = std::collections::BTreeSet::new();
-        for (seq, _) in &self.held {
-            if *seq <= backup.cursor.seq
-                || !held.insert(*seq)
-                || backup
-                    .beyond_cursor
-                    .as_ref()
-                    .is_some_and(|layer| layer.seen.contains(seq))
-                || self.entries.iter().any(|(_, entry)| {
-                    entry.generation == backup.cursor.generation && entry.seq == *seq
-                })
-                || self.notices.iter().any(|notice| {
-                    matches!(&notice.duty,
-                    Duty::StoredEntryDropped { seq: seen, generation, .. }
-                    if *seen == *seq && *generation == backup.cursor.generation)
-                })
-            {
+        let mut held = BTreeMap::new();
+        for (seq, observation) in &self.held {
+            observation.validate()?;
+            if *seq <= backup.cursor.seq || held.insert(*seq, observation).is_some() {
                 return Err(super::corrupt());
             }
         }
+        // Local custody may end ahead of the cursor. While both copies are present,
+        // they must describe the same observation.
+        let disagrees = |generation, seq, receipt, accepted_at| {
+            generation == backup.cursor.generation
+                && held.get(&seq).is_some_and(|observation| {
+                    observation.receipt != receipt || observation.accepted_at_ms != accepted_at
+                })
+        };
+        let layered = backup.beyond_cursor.iter().flat_map(|layer| &layer.parked);
+        if self.entries.iter().chain(layered).any(|(_, entry)| {
+            disagrees(
+                entry.generation,
+                entry.seq,
+                entry.receipt,
+                entry.accepted_at_ms,
+            )
+        }) || self.notices.iter().any(|notice| {
+            matches!(&notice.duty,
+                Duty::StoredEntryDropped { seq, generation, receipt, accepted_at_ms, .. }
+                if disagrees(*generation, *seq, *receipt, *accepted_at_ms))
+        }) {
+            return Err(super::corrupt());
+        }
         let mut retries = std::collections::BTreeSet::new();
         for (seq, _) in &self.feed_retries {
-            if !held.contains(seq) || !retries.insert(*seq) {
+            if !held.contains_key(seq) || !retries.insert(*seq) {
                 return Err(super::corrupt());
             }
         }

@@ -465,6 +465,55 @@ async fn test_opening_receipt_confirms_a_committed_creation_after_restart() {
 }
 
 #[tokio::test]
+async fn test_opening_receipt_confirms_a_mark_written_without_a_confirmation_flag() {
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    let observation = discover(&replay, NOW).await;
+    let opening = make_enrollment(EnrollmentIntent::Create { observation }, 45);
+    let original = replay
+        .service
+        .handle(enrollment_request(&opening, NOW))
+        .await;
+    status(&original, 200);
+    let MarkRead::Mark(position) = replay.marks.read(&key().id()).await.unwrap() else {
+        panic!("missing opening mark");
+    };
+    let mut flat = serde_json::to_value(position).unwrap();
+    let anchor = flat["creation_anchor"]["bound"].as_object_mut().unwrap();
+    assert_eq!(anchor.remove("confirmed"), Some(json!(true)));
+    let service = service_with_restored_mark(&replay, &serde_json::to_vec(&flat).unwrap());
+    let read_position = || async {
+        let marks = MarkStore::open(replay.key_dir()).unwrap();
+        let MarkRead::Mark(mark) = marks.read(&key().id()).await.unwrap() else {
+            panic!("missing restored opening mark");
+        };
+        serde_json::to_value(mark).unwrap()
+    };
+    flat["creation_anchor"]["bound"]["confirmed"] = json!(false);
+    assert_eq!(read_position().await, flat);
+
+    let request = enrollment_request(&opening, NOW);
+    let sent = support::Sent::of(&request);
+    let answer = service.handle(request).await;
+    status(&answer, 200);
+    assert_eq!(answer.body, original.body);
+    assert!(support::signed_with(
+        &answer,
+        &support::service_public(&replay),
+        &sent
+    ));
+    let confirmed = serde_json::to_value(position).unwrap();
+    assert_eq!(read_position().await, confirmed);
+    let path = replay.key_dir().join("accounts/marks").join(key().id());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
+        confirmed
+    );
+    replay.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_opening_mark_keeps_the_confirmed_limits_and_exclusions() {
     let Some(replay) = support::replay().await else {
         return;

@@ -1,4 +1,4 @@
-//! Complete recovery evidence in the account's independent mark (account binding 3.3).
+//! Complete recovery evidence in the account's independent mark (account binding 3).
 
 use super::{AccountMark, MAX_MARK_FILE, MarkRead, MarkStoreError};
 use crate::keys::hex_bytes;

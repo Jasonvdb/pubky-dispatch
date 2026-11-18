@@ -90,6 +90,7 @@ pub enum CreationAnchor {
         #[serde(with = "hex_bytes")]
         digest: [u8; 32],
         /// Whether the service observed the matching creation in committed SQL.
+        #[serde(default)]
         confirmed: bool,
     },
 }
@@ -613,7 +614,7 @@ impl MarkStore {
     }
 
     /// Seal an observed SQL creation in its independent mark. The caller verified the
-    /// committed opening receipt while holding the identity lock (account binding 3.3).
+    /// committed opening receipt while holding the identity lock (account binding 3).
     pub(crate) async fn confirm_creation(
         &self,
         identity: &str,

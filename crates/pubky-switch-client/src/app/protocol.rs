@@ -46,10 +46,11 @@
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
+use super::own_record::RecordExpiry;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
@@ -855,6 +856,29 @@ pub trait Protocol: Send + Sync {
     /// The kinds the app's record lists in `accepts` for a certificate: never wider than
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
+
+    /// The protocol's member of the app's record, and its expiry ask, under `cert`, a
+    /// renewal the app takes, from `member` and `ask`, the ones it has now (Switch spec 3.2
+    /// step 3, 4.2). The app builds the record carrying `cert` from these answers alone and
+    /// signs it once, in the commit that takes `cert`: a member whose content `cert` no
+    /// longer covers, such as one naming a scope it dropped, is changed or removed here, and
+    /// the earlier member is never signed under `cert`. `None` removes the member and its
+    /// ask. A member that breaks the JSON rules (Switch wire 1.1), or an ask that can't be
+    /// signed, removes the member and its ask ([`super::AppEvent::MemberDropped`]). A member
+    /// of a protocol not registered here stays while `cert` holds every scope and
+    /// permission of the one before, and is removed otherwise, for its protocol to write
+    /// again where it runs. Keeps both by default, so a protocol whose member depends on
+    /// the certificate's scopes overrides this. Pure and synchronous: it reads no store,
+    /// writes nothing, and must not panic, which would unwind through the read.
+    fn member_for(
+        &self,
+        member: Option<&Map<String, Value>>,
+        ask: RecordExpiry,
+        cert: &AppCert,
+    ) -> (Option<Map<String, Value>>, RecordExpiry) {
+        let _ = cert;
+        (member.cloned(), ask)
+    }
 
     /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
     /// the body parses as its kind's body, the members read have their types, and the

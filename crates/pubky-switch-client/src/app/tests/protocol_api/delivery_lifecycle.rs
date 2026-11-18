@@ -1042,13 +1042,13 @@ async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retent
         assert!(wallet.outbox_record(signed.msg_id()).await.is_none());
         assert!(wallet.held_messages("sample").await.unwrap().is_empty());
         assert_eq!(
-            undelivered(
+            unknown(
                 &crate::app::tests::pending_events(&mut wallet)
                     .await
                     .unwrap(),
                 signed.msg_id()
             ),
-            [false]
+            1
         );
         p.clock.advance_ms(SENT_RETENTION_MS + DAY_MS);
         wallet.resume_batches().await.unwrap();
@@ -1062,13 +1062,13 @@ async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retent
             Some(vec![1])
         );
         assert_eq!(
-            undelivered(
+            unknown(
                 &crate::app::tests::pending_events(&mut wallet)
                     .await
                     .unwrap(),
                 signed.msg_id()
             ),
-            [false]
+            1
         );
     })
     .await;
@@ -1643,13 +1643,13 @@ async fn test_delivery_lifecycle_expiry_commits_producers_with_its_notice() {
                 !applied
             );
             assert_eq!(
-                undelivered(
+                unknown(
                     &crate::app::tests::pending_events(&mut loaded)
                         .await
                         .unwrap(),
                     signed.msg_id()
                 ),
-                if applied { vec![false] } else { vec![] }
+                usize::from(applied)
             );
         }
     })

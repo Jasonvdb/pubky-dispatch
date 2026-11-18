@@ -6,6 +6,7 @@ mod callback_batches;
 mod current_inputs;
 mod gap_completion;
 mod ownership;
+mod renewal_member;
 mod retained_authority;
 
 use std::sync::{Arc, Mutex};
@@ -79,7 +80,21 @@ struct Named {
     taken: Mutex<Vec<u64>>,
     /// Its collections.
     collections: Vec<crate::app::Collection>,
+    /// Its member of the record for a renewed certificate; the default's while `None`.
+    member_for: Mutex<Option<MemberFor>>,
+    /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
+    assign_kind: Mutex<bool>,
 }
+
+/// A [`Protocol::member_for`] of a test protocol.
+type MemberFor = fn(
+    Option<&serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+    &AppCert,
+) -> (
+    Option<serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+);
 
 fn named(name: &str) -> Named {
     Named {
@@ -266,11 +281,14 @@ impl Protocol for Named {
         }
     }
 
-    fn accepts(&self, _cert: &AppCert) -> Vec<String> {
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
         let mut kinds = vec![
             format!("{}.item", self.name),
             format!("{}.clear", self.name),
         ];
+        if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.push(format!("{}.assign", self.name));
+        }
         kinds.extend(self.foreign.clone());
         kinds
     }
@@ -415,6 +433,21 @@ impl Protocol for Named {
             );
         }
         Ok(!*self.holding.lock().unwrap())
+    }
+
+    fn member_for(
+        &self,
+        member: Option<&serde_json::Map<String, serde_json::Value>>,
+        ask: crate::app::RecordExpiry,
+        cert: &AppCert,
+    ) -> (
+        Option<serde_json::Map<String, serde_json::Value>>,
+        crate::app::RecordExpiry,
+    ) {
+        match *self.member_for.lock().unwrap() {
+            Some(member_for) => member_for(member, ask, cert),
+            None => (member.cloned(), ask),
+        }
     }
 
     fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {

@@ -3539,7 +3539,10 @@ impl App {
                 .feed_claim_entry(item, envelope, tx)
                 .await
                 .map(|()| false),
-            OpKind::AppPut { record } => self.feed_app_record(record, tx).map(|()| false),
+            OpKind::AppPut { record } => {
+                self.feed_app_record(record, tx)?;
+                Box::pin(self.take_own_later(record, tx)).await
+            }
             _ => self.feed_list_change(item, tx).map(|()| false),
         }
     }

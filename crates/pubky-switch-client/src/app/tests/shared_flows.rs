@@ -9223,6 +9223,11 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
+    let mut reader = if restore {
+        None
+    } else {
+        Some(s.join("reader").await)
+    };
     let target = s.target("bob");
     wallet
         .put_record(&target, &value(&["a"]), vec![])
@@ -9237,6 +9242,10 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
     let original_delete = s.w.switch.record(&key).unwrap();
     assert!(original_delete.state.deleted);
+    if let Some(reader) = &mut reader {
+        let held = reader.read_record(&target).await.unwrap().unwrap();
+        assert_eq!(held.content, RecordContent::Deleted);
+    }
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
     message.record = Some(RecordJob {
@@ -9319,6 +9328,15 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
         taken.revision.item_hash == original_delete.revision.item_hash,
         uploaded != UploadedDelete::Other
     );
+    if let Some(reader) = &mut reader {
+        reader.receive(None).await.unwrap();
+        let held = reader.read_record(&target).await.unwrap().unwrap();
+        assert_eq!(
+            held.different_write_at_held_version,
+            uploaded == UploadedDelete::Other,
+            "only a different signed delete at the held version changes the write base"
+        );
+    }
     wallet.receive(None).await.unwrap();
     if wallet.reconcile_mode() {
         wallet
@@ -9347,6 +9365,20 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
                 && *item_hash == op.item_hash().unwrap()),
             "{told:?}"
         );
+        if let Some(reader) = &mut reader {
+            // The service reports that it has forgotten the delete. The next write creates
+            // the record, and no longer builds on either signed delete.
+            s.w.switch.lock().shared.records.remove(&key);
+            let held = reader.read_record(&target).await.unwrap().unwrap();
+            assert!(!held.different_write_at_held_version);
+            assert_eq!(
+                reader.record_condition(&key).await.unwrap(),
+                Condition::RecordVersion {
+                    key,
+                    version: RecordVersion::NONE
+                }
+            );
+        }
     }
 }
 
@@ -11329,6 +11361,10 @@ async fn test_records_undated_write_under_a_closed_renewal_is_not_taken_until_on
     assert_eq!(told, 1);
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert!(shared.not_taken && !shared.flagged, "{shared:?}");
+    assert!(
+        !shared.different_write_at_held_version,
+        "the refused write is newer"
+    );
     assert_eq!(ids(shared.content.value()), vec!["a"]);
     {
         let mut switch = s.w.switch.lock();

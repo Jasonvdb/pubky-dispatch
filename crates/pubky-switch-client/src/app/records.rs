@@ -471,6 +471,10 @@ pub struct SharedRecord {
     /// write's version (Switch spec 8.2). A protocol that pauses a record over a write it
     /// can't trust sees the pause here; it lasts until a write the app takes replaces it.
     pub not_taken: bool,
+    /// The next write builds on a different signed operation at [`Self::version`] than the
+    /// one that supplied [`Self::content`]. Two uploads after a provider loss can share a
+    /// record version (Switch spec 8.2, 12.6).
+    pub different_write_at_held_version: bool,
     /// The latest view the app read shows uploads after a provider loss that conflict with
     /// the current write, kept at the switch until a writer writes a newer version there
     /// (Switch spec 12.6 step 3). The content is still the current write's, taken by the
@@ -745,6 +749,7 @@ impl HeldRecord {
     }
 
     pub(crate) fn shared(&self, key: &[u8; 32], divergent: bool) -> SharedRecord {
+        let (base_version, base_application, _) = self.base_write();
         SharedRecord {
             key: *key,
             collection: self.collection.clone(),
@@ -767,6 +772,9 @@ impl HeldRecord {
             flagged: (self.follow.is_some() && self.follow_named)
                 || self.content == RecordContent::Unreadable(Unopened::Refused),
             not_taken: self.follow.is_some() && !self.follow_named,
+            different_write_at_held_version: !self.gone
+                && base_version == self.version
+                && base_application.item_hash != self.item_hash,
             divergent,
         }
     }

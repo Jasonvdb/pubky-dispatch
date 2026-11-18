@@ -169,6 +169,11 @@ fn fixture() -> Fixture {
 /// The fixture, its shared record's write and its claim's attempt signed by these keys: the
 /// app's own, or another app's naming the app as their writer.
 fn fixture_signed_by(write_signer: &AppKeys, attempt_signer: &AppKeys) -> Fixture {
+    fixture_of(write_signer, attempt_signer, record_put())
+}
+
+/// [`fixture_signed_by`], its shared record's write being `put`.
+fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) -> Fixture {
     let ik = identity();
     let id = ik.public();
     let keys = app();
@@ -212,7 +217,6 @@ fn fixture_signed_by(write_signer: &AppKeys, attempt_signer: &AppKeys) -> Fixtur
         },
         batch(10, 2),
     );
-    let put = record_put();
     let write = op_by(write_signer, OpKind::RecordPut(put.clone()), batch(11, 1));
     let attempt = op_by(
         attempt_signer,
@@ -1910,6 +1914,35 @@ fn test_activation_records() {
         f.run_with(&parts),
         ErrorCode::Conflict,
         "isn't its key's current write",
+    );
+}
+
+#[test]
+fn test_activation_records_permanent_rule() {
+    // The fixture's record is created in generation 1: at a policy naming generation 1 it
+    // imports; at one naming generation 2 its create breaks the rule (Switch wire 6.2, 10.5).
+    let at = |generation: u64| {
+        let mut put = record_put();
+        put.policy = put.policy.permanent(Some(generation));
+        let blinded = NamingKey::from_root(&identity().switch_root()).blind(b"natural");
+        put.key =
+            record_key_from_blinded("sample.collection", &blinded, &put.policy.hash().unwrap());
+        put.value_sealed = SealedValue::seal(
+            &identity().scope_key(1, SCOPE),
+            &identity().public(),
+            1,
+            SCOPE,
+            &put.key,
+            b"{}",
+        )
+        .unwrap();
+        fixture_of(&app(), &app(), put)
+    };
+    at(1).run().unwrap();
+    refused(
+        at(2).run(),
+        ErrorCode::Conflict,
+        "breaks its permanent policy's rule",
     );
 }
 

@@ -72,7 +72,12 @@ fn client_at(
 }
 
 /// A record read and a list page each carry the head, of the generation the account serves.
-async fn read_and_page_carry_the_head(client: &SwitchClient, who: &TestIdentity, key: &[u8; 32], generation: u64) {
+async fn read_and_page_carry_the_head(
+    client: &SwitchClient,
+    who: &TestIdentity,
+    key: &[u8; 32],
+    generation: u64,
+) {
     let answer = client.record(key).await.unwrap();
     assert_eq!(answer.head.generation, generation);
     assert!(answer.head.seq >= answer.view.seq);

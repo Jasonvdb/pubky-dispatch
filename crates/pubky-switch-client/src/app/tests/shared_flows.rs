@@ -8608,6 +8608,51 @@ async fn test_records_read_finding_a_delete_forgotten_lets_the_next_write_create
 }
 
 #[tokio::test]
+async fn test_records_not_hosted_read_over_a_held_delete_marks_nothing_gone() {
+    // The `404` saying the switch doesn't host the identity says nothing of the record
+    // (Switch spec 12.7 step 5): over a held delete the switch still keeps, the next write
+    // names that delete, as before the read, rather than creating at `{0, 0}`.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    assert!(held_at_switch(&s, &key), "kept");
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let read = wallet.read_record_fresh(&target).await;
+    assert!(
+        matches!(
+            read,
+            Ok(RecordRead::Kept {
+                reason: KeptReason::Unreachable(_),
+                ..
+            })
+        ),
+        "{read:?}"
+    );
+    let written = wallet.put_record(&target, &value(&["b"]), vec![]).await;
+    assert!(written.is_ok(), "{written:?}");
+    // A `404` at an account the switch hosts does mark the delete gone: the next write
+    // creates, and the switch, which still keeps the delete, refuses it.
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: serde_json::Value::Null,
+    });
+    wallet.read_record_fresh(&target).await.unwrap();
+    let refused = wallet.put_record(&target, &value(&["c"]), vec![]).await;
+    assert_eq!(
+        refused.as_ref().err().and_then(AppError::code),
+        Some(ErrorCode::Conflict),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_records_write_followed_after_a_forgotten_delete_is_named() {
     // The wallet's delete is forgotten, and a read marks it so. The phone then creates the
     // record without what the wallet saw, which the wallet follows rather than takes
@@ -10928,4 +10973,382 @@ async fn test_records_undated_write_under_a_closed_renewal_is_not_taken_until_on
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert!(!shared.not_taken, "{shared:?}");
     assert_eq!(ids(shared.content.value()), vec!["a", "b", "c"]);
+}
+
+/// A collection of the neutral protocol under a permanent policy naming no generation
+/// (Switch spec 10.3.1).
+fn kept_items() -> Collection {
+    Collection::new(
+        "sample.kept",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    )
+}
+
+/// A setup whose protocol has [`items`] and [`kept_items`], with one record written in each
+/// by the wallet and taken by the phone: the setup, the wallet, the phone, and the two
+/// targets, the ordinary one first.
+async fn with_kept_records() -> (Setup, App, App, RecordTarget, RecordTarget) {
+    let s = Setup::new();
+    *s.protocol.collections.lock().unwrap() = Some(vec![items(), kept_items()]);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let ordinary = s.target("n1");
+    let kept = RecordTarget::new(kept_items(), b"n1");
+    for target in [&ordinary, &kept] {
+        wallet
+            .put_record(target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+    }
+    phone.receive(None).await.unwrap();
+    (s, wallet, phone, ordinary, kept)
+}
+
+#[tokio::test]
+async fn test_permanent_delete_refused_before_it_is_sent() {
+    let (s, mut wallet, _, ordinary, kept) = with_kept_records().await;
+    let written = s.w.switch.applied().len();
+    let error = wallet.delete_record(&kept, vec![]).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
+    );
+    // Nothing was signed, kept or sent.
+    assert_eq!(s.w.switch.applied().len(), written);
+    assert!(wallet.kept_batches().await.unwrap().is_empty());
+    // An ordinary record is deleted as before, and the permanent one is still written to.
+    let deleted = wallet.delete_record(&ordinary, vec![]).await.unwrap();
+    assert_eq!(deleted.content, RecordContent::Deleted);
+    let changed = wallet
+        .put_record(&kept, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    assert_eq!(ids(changed.content.value()), vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn test_permanent_delete_a_switch_applied_raises_the_alarm() {
+    let (s, mut wallet, mut phone, ordinary, kept) = with_kept_records().await;
+    // A faulty switch applies the wallet's deletes without the shape check: the ordinary
+    // one is taken, the permanent one, which its proof shows applied, is a rollback.
+    for target in [&ordinary, &kept] {
+        let (_, delete) = wallet.record_op(target, None, vec![]).await.unwrap();
+        s.w.switch.skip_next_shape_check();
+        s.w.switch.app_op(&app_keys("wallet"), delete).unwrap();
+        let _ = phone.receive(None).await;
+        let key = phone.record_key(target).unwrap();
+        if target == &ordinary {
+            assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+            let held = phone.shared_record(&key).await.unwrap().unwrap();
+            assert_eq!(held.content, RecordContent::Deleted);
+        } else {
+            assert!(
+                matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+                "{:?}",
+                phone.alarm()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_permanent_absent_raises_the_alarm() {
+    let (s, _, mut phone, ordinary, kept) = with_kept_records().await;
+    let mut tablet = s.join("tablet").await;
+    tablet.list_collection(&kept_items()).await.unwrap();
+    let kept_key = tablet.record_key(&kept).unwrap();
+    assert!(tablet.shared_record(&kept_key).await.unwrap().is_some());
+    // An ordinary record the switch no longer holds reads as not found.
+    s.w.switch
+        .drop_record(&phone.record_key(&ordinary).unwrap())
+        .unwrap();
+    let read = phone.read_record_fresh(&ordinary).await.unwrap();
+    assert!(
+        matches!(
+            read,
+            RecordRead::Kept {
+                reason: KeptReason::NotFound,
+                ..
+            }
+        ),
+        "{read:?}"
+    );
+    assert!(phone.alarm().is_none());
+    // A permanent one seen live in this generation is a rollback, at a read of the key and
+    // at a listing that leaves it out.
+    s.w.switch
+        .drop_record(&phone.record_key(&kept).unwrap())
+        .unwrap();
+    assert!(phone.read_record_fresh(&kept).await.is_err());
+    assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
+    assert!(tablet.list_collection(&kept_items()).await.is_err());
+    assert!(matches!(tablet.alarm(), Some(Alarm::Rollback { .. })));
+}
+
+#[tokio::test]
+async fn test_permanent_not_hosted_read_raises_no_alarm() {
+    let (s, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    // The switch lost the account with its mark: its signed `404` says it doesn't host the
+    // identity, which says nothing of the record (Switch spec 12.7 step 5).
+    s.w.switch.lose_account();
+    s.w.switch.lose_mark();
+    let read = phone.read_record_fresh(&kept).await;
+    // The read keeps the copy, as for a switch it couldn't reach: not a record not found.
+    assert!(
+        matches!(
+            read,
+            Ok(RecordRead::Kept {
+                record: Some(_),
+                reason: KeptReason::Unreachable(_),
+            })
+        ),
+        "{read:?}"
+    );
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+}
+
+/// A setup where the phone holds a permanent record live, its own create, and its next
+/// read finds in the feed the wallet's later write of it, under a certificate the phone never
+/// holds, which a renewal then reduced: the phone judges that write by the record's view
+/// (Switch wire 6.2 "Accepting a write" step 1). The setup, the phone and the record's key.
+async fn unheld_write_at_a_kept_record() -> (Setup, App, [u8; 32]) {
+    let s = Setup::new();
+    *s.protocol.collections.lock().unwrap() = Some(vec![items(), kept_items()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let kept = RecordTarget::new(kept_items(), b"n1");
+    phone
+        .put_record(&kept, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&kept).unwrap();
+    wallet.receive(None).await.unwrap();
+    wallet
+        .put_record(&kept, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    (s, phone, key)
+}
+
+#[tokio::test]
+async fn test_permanent_feed_write_judged_by_a_view_that_reads_absent_raises_the_alarm() {
+    let (s, mut phone, key) = unheld_write_at_a_kept_record().await;
+    // The switch lets the record go after its feed showed the write: the view is a `404`
+    // at an account it hosts.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: serde_json::Value::Null,
+    });
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "{read:?}");
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+#[tokio::test]
+async fn test_permanent_feed_write_judged_by_a_not_hosted_view_raises_no_alarm() {
+    let (s, mut phone, key) = unheld_write_at_a_kept_record().await;
+    // The view answered with the `404` saying the switch doesn't host the identity: the
+    // switch is unreachable, and the record isn't absent.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(
+        matches!(&read, Err(AppError::Switch(error)) if error.is_not_hosted()),
+        "{read:?}"
+    );
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_permanent_upload_reread_that_reads_absent_raises_the_alarm() {
+    let (s, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        records: [key].into(),
+        ..Default::default()
+    };
+    s.w.switch
+        .chain_upload([9; 16], changes.to_value())
+        .unwrap();
+    // The read again answered with the `404` saying the switch doesn't host the identity:
+    // unreachable, so the record stays marked and nothing is absent.
+    s.w.switch.fail_next(Fault::Error {
+        path: "/records/".into(),
+        code: ErrorCode::NotFound,
+        current: pubky_switch_core::http::not_hosted_current(),
+    });
+    let before = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    // The switch lets the record go: the next read again is a `404` at an account it hosts.
+    s.w.switch.drop_record(&key).unwrap();
+    let before = s.log().len();
+    let read = phone.receive(None).await;
+    assert!(read.is_err(), "{read:?}");
+    assert_eq!(record_reads(&s.log()[before..]).len(), 1);
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+#[tokio::test]
+async fn test_permanent_listing_of_another_collection_raises_no_alarm() {
+    let (_, _, mut phone, _, kept) = with_kept_records().await;
+    let key = phone.record_key(&kept).unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    // A listing of the ordinary collection covers every key, and lists none of the
+    // permanent collection's: that says nothing of them.
+    let listed = phone.list_collection(&items()).await;
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+}
+
+#[tokio::test]
+async fn test_permanent_listing_across_pages_judges_each_page_by_its_range() {
+    let (s, mut wallet, mut phone, _, kept) = with_kept_records().await;
+    let mut targets = vec![kept];
+    for natural in [b"n2", b"n3"] {
+        let target = RecordTarget::new(kept_items(), natural);
+        wallet
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        targets.push(target);
+    }
+    phone.receive(None).await.unwrap();
+    let mut keys: Vec<[u8; 32]> = targets
+        .iter()
+        .map(|target| phone.record_key(target).unwrap())
+        .collect();
+    keys.sort_by_key(|key| pubky_switch_core::enc::b64(key));
+    // One record to a page: each page covers the keys after the one before it, through its
+    // own, and the records of the other pages are outside its range, on either side.
+    s.w.switch.lock().max_page_bytes = 1;
+    let pages = s.w.switch.lock().shared.listings;
+    let mut listed = 0;
+    loop {
+        let page = phone.list_collection(&kept_items()).await.unwrap();
+        listed += page.records;
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(listed, 3);
+    assert_eq!(s.w.switch.lock().shared.listings - pages, 3);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    // The middle record gone: the page after the first covers its key without it.
+    s.w.switch.drop_record(&keys[1]).unwrap();
+    let mut outcome = Ok(());
+    for _ in 0..3 {
+        match phone.list_collection(&kept_items()).await {
+            Ok(page) if page.more => {}
+            Ok(_) => break,
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(
+        matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+        "{:?}",
+        phone.alarm()
+    );
+}
+
+#[tokio::test]
+async fn test_permanent_listing_after_a_narrowing_raises_no_alarm() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes(
+        "sample.kept",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    );
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk", "sample-a:till"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(3_000);
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_some());
+    // A renewal drops `sample-a:till`: the listing leaves the record out, as any record
+    // the wallet can't read.
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk"]);
+    store_parts_for(&s, &renewed);
+    renewal_another_device_took(&s, &earlier, &renewed);
+    for _ in 0..3 {
+        wallet.receive(None).await.unwrap();
+        if wallet.cert().hash() == renewed.hash() {
+            break;
+        }
+    }
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    let listed = wallet.list_collection(&family).await;
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(wallet.alarm().is_none(), "{:?}", wallet.alarm());
+}
+
+#[tokio::test]
+async fn test_permanent_create_over_a_record_seen_live_raises_the_alarm() {
+    let (s, _, mut phone, ordinary, kept) = with_kept_records().await;
+    let mut tablet = s.join("tablet").await;
+    // A switch that lets each record go takes another app's create at `{0, 0}` in its
+    // place: taken for an ordinary record, a rollback for a permanent one seen live.
+    for target in [&ordinary, &kept] {
+        let key = phone.record_key(target).unwrap();
+        s.w.switch.drop_record(&key).unwrap();
+        tablet
+            .put_record(target, &value(&["a", "b"]), vec![])
+            .await
+            .unwrap();
+        let _ = phone.receive(None).await;
+        if target == &ordinary {
+            assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+            let held = phone.shared_record(&key).await.unwrap().unwrap();
+            assert_eq!(ids(held.content.value()), vec!["a", "b"]);
+        } else {
+            assert!(
+                matches!(phone.alarm(), Some(Alarm::Rollback { .. })),
+                "{:?}",
+                phone.alarm()
+            );
+        }
+    }
 }

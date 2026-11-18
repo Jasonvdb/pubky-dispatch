@@ -41,7 +41,9 @@ use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, record_key_from_blinded};
-use pubky_switch_core::ops::{Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp};
+use pubky_switch_core::ops::{
+    Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp, check_permanent,
+};
 use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, Standing};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::shared::{ApplicationRef, WriteVersion, date_write};
@@ -59,6 +61,10 @@ use crate::client::answers::{ChainItem, SharedRecordView};
 use crate::error::ClientError;
 
 const RECORD_PREFIX: &str = "rec/";
+/// The index of the records at a permanent policy the app holds live, by key, each with
+/// its collection's name (Switch spec 10.3.1 "Absence"): kept with `rec/` by
+/// [`put_held`], so a listing page judges absence without reading every held record.
+const PERMANENT_PREFIX: &str = "recp/";
 const SEEN_PREFIX: &str = "hw/";
 const FLAG_PREFIX: &str = "flag/";
 /// The most flagged writes kept for one record ([`App::flagged_writes`]).
@@ -254,8 +260,45 @@ impl ListProgress {
     }
 }
 
+/// The switch's answer to a read of one record key ([`App::record_answer`]).
+enum RecordAnswer {
+    /// The record's view, with what it is current at.
+    View(Box<(SharedRecordView, CurrentAt)>),
+    /// `404`: the switch holds no record at the key.
+    Absent,
+    /// `404` with `current: { "hosted": false }`: the switch doesn't host the identity
+    /// (Switch wire 7.3 step 2). That says nothing of the record: the service reads as
+    /// unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+    NotHosted(Box<ClientError>),
+}
+
+/// What a read of one record key came to ([`App::fetch_record`]).
+#[derive(Debug)]
+pub(crate) enum Fetched {
+    /// The switch's view, and what reading its write came to.
+    Read(WriteRead),
+    /// `404` at an account the switch hosts: it holds no record at the key.
+    Absent,
+    /// The signed `404` saying the switch doesn't host the identity: the service reads as
+    /// unreachable, and the record isn't absent (Switch spec 10.3.1 "Absence", 12.7 step 5).
+    NotHosted(Box<ClientError>),
+}
+
 pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
     format!("{RECORD_PREFIX}{}", b64(key))
+}
+
+/// Write `held` as the record the app holds at `key`, and keep its entry in the index of
+/// permanent records held live (`recp/`) in step: there while it is live and was seen live
+/// at a permanent policy, else gone.
+pub(crate) fn put_held(tx: &mut Tx, key: &[u8; 32], held: &HeldRecord) -> Result<(), AppError> {
+    tx.put(&record_key_of(key), held)?;
+    let index = format!("{PERMANENT_PREFIX}{}", b64(key));
+    if held.live_in.is_some() && held.content != RecordContent::Deleted {
+        tx.put(&index, &held.collection)
+    } else {
+        tx.delete(&index)
+    }
 }
 
 pub(crate) fn seen_key(key: &[u8; 32]) -> String {
@@ -611,6 +654,9 @@ pub(crate) struct HeldRecord {
     /// `false` for one refused only on the service's word, which names nobody and reads as
     /// not flagged.
     follow_named: bool,
+    /// At a permanent policy, the newest generation the app saw the record live in (Switch
+    /// spec 10.3.1 "Absence"); `None` for an ordinary policy, or one never seen live.
+    live_in: Option<u64>,
 }
 
 impl std::fmt::Debug for HeldRecord {
@@ -976,7 +1022,7 @@ pub enum RecordRead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeptReason {
-    /// The switch holds no record at the key, or forgot it (`404`).
+    /// The switch holds no record at the key, or forgot it (`404`, at an account it hosts).
     NotFound,
     /// The switch's write was refused: a failed check, or one that goes back on what the
     /// app has seen ([`super::AppEvent::WriteFlagged`]).
@@ -1006,8 +1052,10 @@ pub enum KeptReason {
         /// The error code.
         code: ErrorCode,
     },
-    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, or an answer
-    /// that didn't verify; the error, without content.
+    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, an answer
+    /// that didn't verify, or the signed `404` saying it doesn't host the identity, which
+    /// says nothing of the record (Switch spec 10.3.1 "Absence", 12.7 step 5); the error,
+    /// without content.
     Unreachable(String),
 }
 
@@ -1220,7 +1268,7 @@ impl App {
             {
                 held.gone = true;
                 let mut tx = self.tx()?;
-                tx.put(&record_key_of(key), &held)?;
+                put_held(&mut tx, key, &held)?;
                 self.commit(tx).await?;
             }
             Ok(())
@@ -1228,23 +1276,34 @@ impl App {
         .await
     }
 
-    /// Read the record at `key` from the switch and take its write; what came of it, `None`
-    /// for a key the switch doesn't know.
+    /// Read the record at `key` from the switch and take its write; what came of it.
     pub(crate) async fn fetch_record(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<Option<WriteRead>, AppError> {
-        let Some((view, at)) = self.record_view(key).await? else {
-            self.note_gone(key).await?;
-            return Ok(None);
+    ) -> Result<Fetched, AppError> {
+        let (view, at) = match Box::pin(self.record_answer(key)).await? {
+            RecordAnswer::View(view) => *view,
+            // The switch holds no record at the key, at an account it hosts: absence
+            // (Switch spec 10.3.1 "Absence").
+            // It may have forgotten a delete the app's next write builds on (Switch spec
+            // 10.3), which [`App::note_gone`] marks; a permanent record the app holds live
+            // can't be gone, and [`App::note_absent`] raises the alarm for it.
+            RecordAnswer::Absent => {
+                self.note_gone(key).await?;
+                Box::pin(self.note_absent(key)).await?;
+                return Ok(Fetched::Absent);
+            }
+            // It doesn't host the identity: that says nothing of the record, and the
+            // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+            RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
         };
         let mut tx = self.tx()?;
         let read = self
             .take_view(&view, at, Some((key, collection)), &mut tx)
             .await?;
         self.commit(tx).await?;
-        Ok(Some(read))
+        Ok(Fetched::Read(read))
     }
 
     /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
@@ -1269,18 +1328,23 @@ impl App {
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
             let reason = match self.fetch_record(&key, &target.collection).await {
-                Ok(Some(WriteRead::Taken | WriteRead::Equal)) => {
+                Ok(Fetched::Read(WriteRead::Taken | WriteRead::Equal)) => {
                     if let Some(record) = self.shared_record(&key).await? {
                         return Ok(RecordRead::Fresh(record));
                     }
                     KeptReason::Refused
                 }
-                Ok(Some(WriteRead::Older(write))) => KeptReason::Older(write),
-                Ok(Some(WriteRead::Overtaken(write, current_at))) => {
+                Ok(Fetched::Read(WriteRead::Older(write))) => KeptReason::Older(write),
+                Ok(Fetched::Read(WriteRead::Overtaken(write, current_at))) => {
                     KeptReason::Overtaken { write, current_at }
                 }
-                Ok(Some(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
-                Ok(None) => KeptReason::NotFound,
+                Ok(Fetched::Read(WriteRead::Refused | WriteRead::Waits)) => KeptReason::Refused,
+                Ok(Fetched::Absent) => KeptReason::NotFound,
+                // A switch that doesn't host the identity says nothing of the record: it
+                // reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
+                Ok(Fetched::NotHosted(error)) => {
+                    KeptReason::Unreachable(AppError::Switch(*error).to_string())
+                }
                 Err(AppError::Switch(ClientError::Switch { code, .. }))
                     if code.retry() == pubky_switch_core::http::Retry::No =>
                 {
@@ -1300,19 +1364,43 @@ impl App {
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what
-    /// it is current at: the answer's head, of the generation it names; `None` for a key it
-    /// doesn't know, or forgot.
+    /// it is current at: the answer's head, of the generation it names; `None`
+    /// for a key it doesn't know, or forgot, at an account it hosts, which is absence
+    /// (Switch spec 10.3.1 "Absence", [`App::note_absent`]).
+    ///
+    /// # Errors
+    ///
+    /// The signed `404` saying the switch doesn't host the identity, as the failed call it
+    /// is: the service reads as unreachable, and the record isn't absent (Switch spec
+    /// 10.3.1 "Absence", 12.7 step 5). The rollback alarm for a permanent record the app
+    /// holds live that reads absent; a failed call.
     pub(crate) async fn record_view(
         &mut self,
         key: &[u8; 32],
     ) -> Result<Option<(SharedRecordView, CurrentAt)>, AppError> {
+        match Box::pin(self.record_answer(key)).await? {
+            RecordAnswer::View(view) => Ok(Some(*view)),
+            RecordAnswer::Absent => {
+                Box::pin(self.note_absent(key)).await?;
+                Ok(None)
+            }
+            RecordAnswer::NotHosted(error) => Err(AppError::Switch(*error)),
+        }
+    }
+
+    /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
+    /// doesn't hold from an identity it doesn't host.
+    async fn record_answer(&mut self, key: &[u8; 32]) -> Result<RecordAnswer, AppError> {
         let result = self.client.record(key).await;
         match self.take(result).await {
             Ok(answer) => {
                 let at = self.current_at(answer.head, None).await?;
-                Ok(Some((answer.view, at)))
+                Ok(RecordAnswer::View(Box::new((answer.view, at))))
             }
-            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(None),
+            Err(AppError::Switch(error)) if error.is_not_hosted() => {
+                Ok(RecordAnswer::NotHosted(Box::new(error)))
+            }
+            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(RecordAnswer::Absent),
             Err(error) => Err(error),
         }
     }
@@ -1464,6 +1552,9 @@ impl App {
                 tx.put(key, &**progress)?;
             }
             self.commit(tx).await?;
+            let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
+            Box::pin(self.note_unlisted(&collection.name, after.as_ref(), next.as_ref(), &shown))
+                .await?;
             match next {
                 Some(next) => after = Some(next),
                 None => return Ok(Listed::Done(listed)),
@@ -2101,7 +2192,7 @@ impl App {
                     && held.content.waits_for_key()
                 {
                     held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
-                    tx.put(&record_key_of(&shown_key), &held)?;
+                    put_held(tx, &shown_key, &held)?;
                 }
                 let deleted = writes_a_delete(evidence.op);
                 let shown = Shown {
@@ -2216,7 +2307,7 @@ impl App {
             held.follow_deleted = deleted;
             held.follow_named = named;
             held.gone = false;
-            tx.put(&record_key_of(key), &held)?;
+            put_held(tx, key, &held)?;
             if !named {
                 self.events.push(AppEvent::WriteNotTaken { key: *key });
             }
@@ -2321,6 +2412,16 @@ impl App {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
+        // Step 3, a permanent policy's rule, by the write's own generation (Switch wire 6.2,
+        // Switch spec 10.3.1): a write the service applied against it, as its proof or
+        // verified stub shows, is signed misbehaviour; without that, it is only the
+        // service's word, and names no app.
+        if let Err(refused) = check_permanent(put, body.generation) {
+            return Ok(Err(match proven {
+                Some(_) => Refused::Misbehaviour(refused.reason),
+                None => Refused::Ignored,
+            }));
+        }
         // The version step 6 checks, `None` when nothing gives one.
         let shown = match (proven, evidence.view_version) {
             (Some(version), _) => Some(WriteVersion {
@@ -2817,6 +2918,7 @@ impl App {
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
                 if accepted.order == Order::Equal {
                     let mut upgraded = held.clone();
+                    upgraded.live_in = self.live_in(&held.policy, &held.content, held.live_in);
                     if accepted.version.authenticated && !held.authenticated {
                         upgraded.version = accepted.version.version;
                         upgraded.authenticated = true;
@@ -2837,7 +2939,7 @@ impl App {
                         }
                     }
                     if upgraded != *held {
-                        tx.put(&record_key_of(&key), &upgraded)?;
+                        put_held(tx, &key, &upgraded)?;
                     }
                     return Ok(Taken::Equal);
                 }
@@ -2854,6 +2956,23 @@ impl App {
                         Order::Overtaken(_, at) => Taken::Overtaken(write, at),
                         _ => Taken::Older(write),
                     });
+                }
+                // A proven create over a permanent record the app holds live: the switch let
+                // the record go and took a create at `{0, 0}` in its place, which absence
+                // would show had the app read it in between (Switch spec 10.3.1 "Absence").
+                if accepted.version.authenticated
+                    && accepted.version.expected_version.is_none()
+                    && held.content != RecordContent::Deleted
+                    && absence_is_rollback(
+                        &held.policy,
+                        held.live_in,
+                        self.state.meta.generation,
+                        self.state.own_doc.body().recovery_from,
+                    )
+                {
+                    let reason =
+                        "Switch spec 10.3.1: a create over a permanent record seen live".into();
+                    return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
                 }
             }
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
@@ -2928,8 +3047,9 @@ impl App {
                         follow_deleted: false,
                         gone: false,
                         follow_named: true,
+                        live_in: None,
                     };
-                    tx.put(&record_key_of(&key), &refused)?;
+                    put_held(tx, &key, &refused)?;
                 }
                 self.flag_write(shown, accepted.writer, reason, deleted, tx)
                     .await?;
@@ -2982,7 +3102,13 @@ impl App {
                 None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
                 None => {}
             }
+            let live_in = self.live_in(
+                &accepted.collection.policy,
+                &accepted.content,
+                held.as_ref().and_then(|held| held.live_in),
+            );
             let record = HeldRecord {
+                live_in,
                 collection: accepted.collection.name.clone(),
                 policy: accepted.collection.policy.clone(),
                 op: accepted.op,
@@ -3009,7 +3135,7 @@ impl App {
                 gone: false,
                 follow_named: held.as_ref().is_none_or(|held| held.follow_named) || !reopened,
             };
-            tx.put(&record_key_of(&key), &record)?;
+            put_held(tx, &key, &record)?;
             self.events.push(AppEvent::RecordChanged { key });
             Ok(if reopened {
                 Taken::Reopened
@@ -3018,6 +3144,77 @@ impl App {
             })
         })
         .await
+    }
+
+    /// The newest generation a record at `policy` was seen live in, once it is seen with
+    /// `content` in the generation the app follows: that one for a live record at a
+    /// permanent policy, else `held` (Switch spec 10.3.1 "Absence").
+    fn live_in(&self, policy: &Policy, content: &RecordContent, held: Option<u64>) -> Option<u64> {
+        if policy.permanent.is_none() || *content == RecordContent::Deleted {
+            return held;
+        }
+        let now = self.state.meta.generation;
+        Some(held.map_or(now, |held| held.max(now)))
+    }
+
+    /// A signed answer shows the key absent (a `404`, or a listing page that covers the key
+    /// without it): the rollback alarm when the app holds a permanent record there live
+    /// (Switch spec 10.3.1 "Absence", [`absence_is_rollback`]).
+    ///
+    /// # Errors
+    ///
+    /// The alarm; a store failure.
+    async fn note_absent(&mut self, key: &[u8; 32]) -> Result<(), AppError> {
+        let Some(held) = self.held_record(key).await? else {
+            return Ok(());
+        };
+        // The switch shows only records whose read scope the caller's certificate covers:
+        // one the app no longer reads, after a renewal that dropped its scope, is left out
+        // of a listing as any record it can't read is (Switch wire 7.4.9).
+        if held.content != RecordContent::Deleted
+            && self.state.cert.holds_scope(&held.policy.read_scope)
+            && absence_is_rollback(
+                &held.policy,
+                held.live_in,
+                self.state.meta.generation,
+                self.state.own_doc.body().recovery_from,
+            )
+        {
+            let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
+            return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
+        }
+        Ok(())
+    }
+
+    /// [`App::note_absent`] for each record of `collection` the app holds whose key a
+    /// listing page covered, after `after` and through `last` (to the end for `None`), and
+    /// that the page didn't list.
+    ///
+    /// It reads only the index of permanent records held live (`recp/`), a key and a
+    /// collection name each, so a page costs one scan of that index, whatever the
+    /// collection, and one held record read for each permanent record of this collection
+    /// the page left out; ordinary records are never read.
+    async fn note_unlisted(
+        &mut self,
+        collection: &str,
+        after: Option<&[u8; 32]>,
+        last: Option<&[u8; 32]>,
+        listed: &[[u8; 32]],
+    ) -> Result<(), AppError> {
+        let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
+        for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
+            if of != collection
+                || after.as_ref().is_some_and(|after| rest <= *after)
+                || last.as_ref().is_some_and(|last| rest > *last)
+            {
+                continue;
+            }
+            let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
+            if !listed.contains(&key) {
+                Box::pin(self.note_absent(&key)).await?;
+            }
+        }
+        Ok(())
     }
 
     /// An own `record.put` the switch answered: taken at the version its proof gives.
@@ -3624,6 +3821,7 @@ pub(crate) fn with_named(
 pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
     for prefix in [
         RECORD_PREFIX,
+        PERMANENT_PREFIX,
         SEEN_PREFIX,
         "recname/",
         "out/",
@@ -3654,6 +3852,26 @@ pub(crate) fn pending_name_key(key: &[u8; 32]) -> String {
 pub(crate) struct SeenMark {
     #[serde(with = "serde_b64_vec")]
     pub(crate) mark: Vec<u8>,
+}
+
+/// Whether a signed answer that shows a permanent record's key absent is a rollback (Switch
+/// spec 10.3.1 "Absence"), for a record the app holds live at `policy`, last seen live in
+/// generation `live_in`, while the app follows `generation` and its newest own
+/// `identity.json` names `recovery_from`: not for an ordinary policy or one never seen live,
+/// nor when the provider lost the record since (`recovery_from` at or past `live_in`), nor
+/// once the account is past the generation the policy names.
+pub(crate) fn absence_is_rollback(
+    policy: &Policy,
+    live_in: Option<u64>,
+    generation: u64,
+    recovery_from: Option<u64>,
+) -> bool {
+    let (Some(permanent), Some(seen)) = (policy.permanent, live_in) else {
+        return false;
+    };
+    let lost_since = recovery_from.is_some_and(|lost| lost >= seen);
+    let passed = permanent.generation.is_some_and(|named| generation > named);
+    !lost_since && !passed
 }
 
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
@@ -3816,6 +4034,47 @@ mod tests {
             let got = compare_with_held(&shown_write, (hash, [3; 16]), &held, [1; 32], at)
                 .map_err(|_| String::new());
             assert_eq!(got, wanted, "case {i}");
+        }
+    }
+
+    #[test]
+    fn test_permanent_sub_scope_policy_keeps_the_member() {
+        let base = Policy::new("scope-a", &["scope-a"]);
+        let kept = Collection::with_sub_scopes("sample.kept", base.clone().permanent(Some(3)));
+        let policy = kept.sub_scope_policy("s1").unwrap();
+        assert_eq!(policy.read_scope, "scope-a:s1");
+        assert_eq!(policy.permanent, base.clone().permanent(Some(3)).permanent);
+        assert!(kept.admits(&policy));
+        let ordinary = Collection::with_sub_scopes("sample.items", base);
+        assert_eq!(ordinary.sub_scope_policy("s1").unwrap().permanent, None);
+    }
+
+    #[test]
+    fn test_permanent_absence_by_generation() {
+        let ordinary = Policy::new("scope-a", &["scope-a"]);
+        let none = ordinary.clone().permanent(None);
+        let named = ordinary.clone().permanent(Some(2));
+        // (policy, live in, generation followed, recovery_from, rollback)
+        let cases = [
+            (&ordinary, Some(1), 1, None, false),
+            (&none, None, 1, None, false),
+            (&none, Some(1), 1, None, true),
+            // A move carries every record: absent after it is a rollback too.
+            (&none, Some(1), 2, None, true),
+            // Lost with the provider, and an upload may bring it back.
+            (&none, Some(1), 2, Some(1), false),
+            (&none, Some(2), 3, Some(2), false),
+            // Seen live after the loss: the new switch lost it.
+            (&none, Some(2), 2, Some(1), true),
+            (&named, Some(2), 2, None, true),
+            (&named, Some(2), 3, None, false),
+        ];
+        for (policy, live_in, generation, recovery_from, rollback) in cases {
+            assert_eq!(
+                absence_is_rollback(policy, live_in, generation, recovery_from),
+                rollback,
+                "{policy:?} {live_in:?} {generation} {recovery_from:?}"
+            );
         }
     }
 

@@ -121,11 +121,12 @@ Use `identity_of` for the newest checked peer document available. For an action 
 
 | Case | What happened and what to do |
 |---|---|
-| `HomeserverCopy::Read` | The lookup read the homeserver document. Use the selected version and check the service's status too. `fresh_until_ms` uses the earlier of the held document read and last switch lookup. A pending lookup's grace runs from `switch_lookup_ms`. |
+| `HomeserverCopy::Read` | The lookup read the homeserver document. Check the service's status too. `PeerIdentity::read_at_ms` records when a source supplied the selected version. A version seen only in a directory answer has no read time and `fresh_until_ms` returns zero. A pending lookup's grace runs from `switch_lookup_ms`. |
 | `HomeserverCopy::Unavailable` | The file was absent or the lookup failed. A previously held or service copy can still exist. Use its actual read time. |
 | `HomeserverCopy::Held` | The lookup reused a recent copy and recent switch lookup. Consult the saved switch outcome. |
 | `SwitchCopy::Read` | The lookup obtained a switch copy. Use the selected document under the version floor and the freshness decision. |
 | `SwitchCopy::Unavailable` | The switch copy could not be obtained. Ask `may_act` before relying on public app data. |
+| `SwitchCopy::Stale` | The pinned switch signed a response outside the accepted time window. Check `may_act` on the held document before acting. Automatic actions wait for a fresh lookup. |
 | `SwitchCopy::Pending` | The switch half has yet to finish. Run it on the host executor and deliver the result. |
 | `Initiator::User` | Use for a user-started action where the user can explicitly confirm proceeding. |
 | `Initiator::Automatic` | Use for an unattended action. It needs service confirmation. |
@@ -438,6 +439,7 @@ Only `TransportError::Refused` and `TransportError::Connect` allow the client to
 | `ClientError::Switch` | The pinned key authenticated a refusal bound to the request. Use `code()`, `retry()`, the current value and any retry interval. Honour backoff and conditions. A caller-level refusal may leave a batch pending. |
 | `ClientError::BodyUnread` | A signed size, rate or not-found answer binds the request without its body. It cannot settle that body's fate. Honour any retry delay and keep the original batch. |
 | `ClientError::BadServiceSignature` | The response signature is missing, unreadable or fails under the pin. Even the status is untrusted. Keep any pending write and check the provider through the signed identity. |
+| `ClientError::StaleAnswer` | The pinned service signed the public identity response at `server_time_ms`, outside the reader's accepted time window. Retry the lookup before treating the switch copy as current. |
 | `ClientError::BodyOverCap` | The client refused an oversized outbound body before sending. Reduce it. Retrying the same bytes cannot work. |
 | `ClientError::Transport` | No usable service answer came back. Use the underlying transport error's delivery guarantee. |
 | `ClientError::Unpinned` | The call requires a pinned service key and none was supplied. Obtain the correct key through the identity or enrollment flow before retrying. |

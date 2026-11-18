@@ -509,15 +509,6 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn forget_deletion_receipts(&mut self, key: [u8; 32]) -> Result<(), AppError> {
-        let mut tx = self.tx()?;
-        self.retire_deletion_receipts(key, None, &mut tx)?;
-        if !tx.is_empty() {
-            self.commit(tx).await?;
-        }
-        Ok(())
-    }
-
     pub(super) fn deletion_hold(&self, observed: Observation) -> RecordHold {
         let protects =
             observed.page_time_ms.is_some() && observed.seq > self.state.cursor.at_service;

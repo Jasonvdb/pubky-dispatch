@@ -284,7 +284,7 @@ impl App {
         };
         let id = hold.observation.id();
         let mut tx = self.tx()?;
-        if write.revision == hold.observation.revision() {
+        if write.revision() == hold.observation.revision() {
             let changed = write.confirm_deletion(&mut hold.observation);
             let signed =
                 SignedOp::peek(&hold.observation.operation).map_err(|_| super::corrupt())?;
@@ -351,33 +351,39 @@ impl App {
         self.commit(tx).await
     }
 
-    pub(super) async fn check_put_back_absence(
+    /// A protected deletion sets the earliest position that can speak for this key.
+    /// At or beyond that point the service still owes the record (Switch spec 10.3).
+    pub(super) async fn put_back_absence_is_current(
         &mut self,
         key: &[u8; 32],
-        through: Option<super::FeedPosition>,
-    ) -> Result<(), AppError> {
+        through: super::FeedPosition,
+    ) -> Result<bool, AppError> {
+        let mut current = true;
         let mut protected = false;
-        for hold in at_key(&self.state.put_backs, key).filter(|h| h.protects && !h.needs_cursor) {
+        for hold in at_key(&self.state.put_backs, key).filter(|h| h.protects) {
+            if !self
+                .state
+                .cert
+                .holds_scope(&hold.observation.put()?.policy.read_scope)
+            {
+                return Ok(false);
+            }
             let at = super::FeedPosition {
                 generation: hold.observation.generation,
                 seq: hold.observation.seq,
             };
-            if through.is_some_and(|head| {
-                self.received_order(head, at)
-                    .is_none_or(std::cmp::Ordering::is_lt)
-            }) {
+            if hold.needs_cursor || !self.covers(through, at) {
+                current = false;
                 continue;
             }
-            protected |= self
-                .state
-                .cert
-                .holds_scope(&hold.observation.put()?.policy.read_scope);
+            protected = true;
+            break;
         }
         if protected {
             let reason = "Switch spec 10.3: a record held for replacement is absent".into();
             return Err(self.raise(Alarm::Rollback { reason }).await);
         }
-        Ok(())
+        Ok(current)
     }
 
     pub(super) fn keep_waiting(

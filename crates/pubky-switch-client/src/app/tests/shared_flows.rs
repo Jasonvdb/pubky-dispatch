@@ -2100,6 +2100,252 @@ async fn test_records_flagged_write_is_refused_on_use_and_followed() {
     assert_eq!(ids(held.content.value()), vec!["a", "b", "c", "d"]);
 }
 
+/// A delayed read between the content taken and the later refused write describes that
+/// earlier snapshot. The repair builds directly on the refused write, also after restart.
+#[tokio::test]
+async fn test_records_followed_write_survives_an_overtaken_read_and_reload() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let held = wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.read_record(&target).await.unwrap();
+    let middle = wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let earlier = phone.client.record(&held.key).await.unwrap();
+    let refused = wallet
+        .put_record(&target, &value(&["c"]), vec![])
+        .await
+        .unwrap();
+    let displayed = phone.read_record(&target).await.unwrap().unwrap();
+    assert!(displayed.flagged);
+    assert_eq!(displayed.content, held.content);
+
+    let at = crate::app::records::CurrentAt::Answer(RecordVersion::new(
+        earlier.head.generation,
+        earlier.head.seq,
+    ));
+    let mut tx = phone.tx().unwrap();
+    let read = phone
+        .take_view(
+            &earlier.view,
+            at,
+            Some((&held.key, &target.collection)),
+            &mut tx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, crate::app::records::WriteRead::Overtaken(w, _) if w.version == middle.version)
+    );
+    phone.commit(tx).await.unwrap();
+    assert_eq!(
+        phone.shared_record(&held.key).await.unwrap(),
+        Some(displayed.clone())
+    );
+    let id = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(
+        phone.shared_record(&held.key).await.unwrap(),
+        Some(displayed)
+    );
+    let condition = phone.record_condition(&held.key).await.unwrap();
+    assert_eq!(
+        condition,
+        Condition::RecordVersion {
+            key: held.key,
+            version: refused.version
+        }
+    );
+    let repaired = phone
+        .put_record(&target, &value(&["a", "b", "c"]), vec![condition])
+        .await
+        .unwrap();
+    let applied = s.w.switch.record(&held.key).unwrap();
+    let signed = SignedOp::peek(&applied.op).unwrap();
+    assert!(
+        matches!(&signed.body().kind, OpKind::RecordPut(p) if p.expected_version == refused.version)
+    );
+    assert_eq!(applied.state.version, repaired.version);
+    assert!(!repaired.flagged && !repaired.not_taken);
+    assert_eq!(ids(repaired.content.value()), ["a", "b", "c"]);
+}
+
+/// Two devices prepared distinct creates before a loss. Each is applied by an upload
+/// to a successor service. Their lower-bound versions match, their applications differ.
+#[tokio::test]
+async fn test_records_followed_upload_keeps_its_application_across_an_earlier_view() {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("uploaded");
+    let key = phone.record_key(&target).unwrap();
+    let mut uploads = Vec::new();
+    for (writer, text) in [(&mut wallet, "one"), (&mut phone, "two")] {
+        let op = writer
+            .record_op(&target, Some(&value(&[text])), vec![])
+            .await
+            .unwrap();
+        let batch = writer.sign_ops(vec![op], None).unwrap();
+        uploads.push(RecoveryUpload {
+            records: vec![UploadedOp {
+                op: batch.ops()[0].signed().clone(),
+                cert: writer.cert().signed().clone(),
+                proof: None,
+            }],
+            ..Default::default()
+        });
+    }
+    let mut views = Vec::new();
+    for (lost, upload) in [1, 2].into_iter().zip(uploads) {
+        let prev = s.w.switch.identity_doc().unwrap().hash();
+        let doc =
+            s.w.signer
+                .sign_next(|body| {
+                    body.generation = lost + 1;
+                    body.recovery_from = Some(lost);
+                })
+                .unwrap();
+        s.w.switch.recover_in_place(&doc, prev).unwrap();
+        wallet.receive(None).await.unwrap();
+        let answer = wallet.client.recovery_upload(&upload, false).await.unwrap();
+        assert!(answer.result.unwrap().records.contains(&key));
+        phone.receive(None).await.unwrap();
+        phone.read_record(&target).await.unwrap();
+        views.push(phone.client.record(&key).await.unwrap());
+    }
+    let [first, later] = &views[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        (first.view.generation, first.view.version),
+        (later.view.generation, later.view.version)
+    );
+    assert_ne!(first.view.revision, later.view.revision);
+    let condition = Condition::RecordCurrent {
+        key,
+        revision: later.view.revision,
+        deleted: false,
+    };
+    assert_eq!(phone.record_condition(&key).await.unwrap(), condition);
+    let displayed = phone.shared_record(&key).await.unwrap().unwrap();
+    assert!(displayed.different_write_at_held_version);
+    assert_eq!(ids(displayed.content.value()), ["one"]);
+    let mut tx = phone.tx().unwrap();
+    let at = crate::app::records::CurrentAt::Answer(RecordVersion::new(
+        first.head.generation,
+        first.head.seq,
+    ));
+    let read = phone
+        .take_view(&first.view, at, Some((&key, &target.collection)), &mut tx)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read,
+        crate::app::records::WriteRead::Overtaken(..)
+    ));
+    phone.commit(tx).await.unwrap();
+    let id = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(phone.shared_record(&key).await.unwrap(), Some(displayed));
+    assert_eq!(phone.record_condition(&key).await.unwrap(), condition);
+    if phone.reconcile_mode() {
+        phone
+            .end_reconcile(crate::app::UserConfirmed::new())
+            .await
+            .unwrap();
+    }
+    let taken = phone
+        .put_record(&target, &value(&["one", "two"]), vec![])
+        .await
+        .unwrap();
+    assert!(!taken.different_write_at_held_version);
+    let signed = SignedOp::peek(&s.w.switch.record(&key).unwrap().op).unwrap();
+    assert!(signed.body().conditions.contains(&condition));
+}
+
+/// A service-only read, a proved read of the same write, and a later proofless repeat
+/// all concern one operation. Only the proved read authenticates its version.
+#[tokio::test]
+async fn test_records_followed_proof_upgrades_and_survives_a_proofless_read() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("shared");
+    let held = wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.read_record(&target).await.unwrap();
+    *s.protocol.forbidden.lock().unwrap() = Some("b".into());
+    let refused = wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let proved = s.w.switch.record(&held.key).unwrap().proof.unwrap();
+    for (with_proof, authenticated) in [(false, false), (true, true), (false, true)] {
+        s.w.switch.lock().shared.hide_proofs = !with_proof;
+        let displayed = phone.read_record(&target).await.unwrap().unwrap();
+        assert_eq!(displayed.content, held.content);
+        assert!(displayed.flagged);
+        let stored =
+            serde_json::to_value(phone.held_record(&held.key).await.unwrap().unwrap()).unwrap();
+        let f = &stored["follow"];
+        assert_eq!(
+            f["version"]["expected"],
+            json!([held.version.generation, held.version.version])
+        );
+        if authenticated {
+            assert_eq!(f["version"]["authenticated"], true);
+            assert_eq!(f["proof"], json!(proved));
+        } else {
+            assert_eq!(f["version"]["authenticated"], false);
+            assert!(f["proof"].is_null());
+        }
+    }
+    let id = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    let stored =
+        serde_json::to_value(phone.held_record(&held.key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(stored["follow"]["proof"], json!(proved));
+    assert_eq!(stored["follow"]["version"]["authenticated"], true);
+    assert_eq!(
+        phone.record_condition(&held.key).await.unwrap(),
+        Condition::RecordVersion {
+            key: held.key,
+            version: refused.version
+        }
+    );
+    // Local reopening and the previous-install reader decode the same record fields.
+    let mut mismatched = stored;
+    mismatched["follow"]["applied"] = mismatched["applied"].clone();
+    assert!(serde_json::from_value::<crate::app::records::HeldRecord>(mismatched).is_err());
+    *s.protocol.forbidden.lock().unwrap() = None;
+    let promoted = phone.read_record(&target).await.unwrap().unwrap();
+    assert!(promoted.authenticated && !promoted.flagged && !promoted.not_taken);
+    assert_eq!(ids(promoted.content.value()), ["a", "b"]);
+    let stored =
+        serde_json::to_value(phone.held_record(&held.key).await.unwrap().unwrap()).unwrap();
+    assert!(stored["follow"].is_null());
+    assert_eq!(stored["proof"], json!(proved));
+}
+
 #[tokio::test]
 async fn test_records_listed_at_join_and_other_collections_left_alone() {
     let s = Setup::new();
@@ -8991,6 +9237,78 @@ async fn test_records_read_finding_a_delete_forgotten_lets_the_next_write_create
     wallet.read_record(&target).await.unwrap();
     let created = wallet.put_record(&target, &value(&["b"]), vec![]).await;
     assert!(created.is_ok(), "{created:?}");
+}
+
+/// The key was absent both before the create and after the service forgot its delete.
+/// Only the latter head covers the application's intervening observations.
+#[tokio::test]
+async fn test_records_hosted_absence_covers_the_write_the_wallet_follows() {
+    Box::pin(async {
+        let s = Setup::new();
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = s.target("shared");
+        let before = s.w.switch.seq();
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                record: None,
+                reason: KeptReason::NotFound
+            }
+        ));
+        let first = wallet
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        phone.read_record(&target).await.unwrap();
+        phone.delete_record(&target, vec![]).await.unwrap();
+        s.protocol
+            .refuses_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        read_on(&mut wallet).await;
+        read_on(&mut phone).await;
+        assert!(!held_at_switch(&s, &first.key));
+        let held = wallet.shared_record(&first.key).await.unwrap().unwrap();
+        assert_eq!(held.content, first.content);
+        assert!(held.flagged);
+
+        // The hosted absence at the earlier genuine chain head predates this key's
+        // creation. It cannot describe the currently followed write or clear it.
+        s.w.switch.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(before),
+            forked: false,
+        });
+        assert_eq!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                record: Some(held.clone()),
+                reason: KeptReason::Refused
+            }
+        );
+        let id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        assert_eq!(wallet.shared_record(&first.key).await.unwrap(), Some(held));
+
+        // Both readers passed the actual delete. The current hosted answer now covers
+        // it, and an ordinary new write uses the absent base.
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept {
+                reason: KeptReason::NotFound,
+                ..
+            }
+        ));
+        let written = wallet
+            .put_record(&target, &value(&["a", "b"]), vec![])
+            .await
+            .unwrap();
+        assert_eq!(ids(written.content.value()), ["a", "b"]);
+    })
+    .await;
 }
 
 #[tokio::test]

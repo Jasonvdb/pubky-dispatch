@@ -474,6 +474,7 @@ impl App {
                 // A condition or write naming a delete the service forgot since: the next
                 // write builds on the absent record.
                 if let Some(key) = super::records::conflict_absent_key(&error) {
+                    self.forget_deletion_receipts(key).await?;
                     self.note_gone(&key).await?;
                 }
                 return Err(error);

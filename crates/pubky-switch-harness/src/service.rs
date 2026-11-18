@@ -362,6 +362,7 @@ impl RealSwitch {
                 },
                 state_version: mark.state_version + 1,
                 state_tag: mark.state_tag,
+                stamped_ms: mark.time_floor_ms,
             };
             match marks
                 .advance(identity, past, mark.key, mark.created_at_ms)
@@ -390,6 +391,7 @@ impl RealSwitch {
                 head: mark.head(),
                 state_version: mark.state_version,
                 state_tag: mark.state_tag,
+                stamped_ms: mark.time_floor_ms,
             };
             other.head.chain_hash[0] ^= 0xff;
             marks.delete(identity).await.map_err(setup)?;

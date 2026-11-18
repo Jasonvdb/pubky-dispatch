@@ -295,6 +295,7 @@ mod tests {
             chain_hash: if generation == 0 { [0; 32] } else { [hash; 32] },
             key: MARK_KEY,
             state_version: 0,
+            time_floor_ms: 0,
             created_at_ms,
         }
     }
@@ -447,6 +448,7 @@ mod tests {
             chain_hash: [1; 32],
             key: CURRENT,
             state_version: 0,
+            time_floor_ms: 0,
             created_at_ms: 0,
         };
         // Past the mark in its generation, and at a later generation: the stub at the

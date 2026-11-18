@@ -126,6 +126,8 @@ async fn create_staged(replay: &Replay, id: &str, origin: Option<&str>) {
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: replay.marks.identity().await.expect("store identity"),
+        stamped_time_ms: T0,
+        stamped_by: replay.service.run().id(),
     };
     assert!(
         replay
@@ -522,6 +524,8 @@ async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_cl
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: replay.marks.identity().await.expect("store identity"),
+        stamped_time_ms: T0,
+        stamped_by: replay.service.run().id(),
     };
     assert!(
         replay

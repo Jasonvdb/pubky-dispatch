@@ -322,6 +322,7 @@ mod tests {
             chain_hash: [1; 32],
             key: KEY,
             state_version: 0,
+            time_floor_ms: 0,
             created_at_ms: 10,
         })
     }
@@ -442,6 +443,7 @@ mod tests {
             chain_hash: [1; 32],
             key: KEY,
             state_version: 0,
+            time_floor_ms: 0,
             created_at_ms: 20,
         });
         let older = account(AccountState::Serving(tip(3)));

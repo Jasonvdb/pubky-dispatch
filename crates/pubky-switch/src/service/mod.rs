@@ -88,7 +88,7 @@ use crate::{
     limits::Limits,
     marks::MarkStore,
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
-    store::{AccountTxn, LockFreshness, MarkCoverage, Store, StoreError},
+    store::{AccountTxn, LockFreshness, MarkCoverage, ServiceRun, Store, StoreError},
     time::TrustedTime,
 };
 
@@ -108,6 +108,9 @@ pub struct Service {
     keys: Arc<dyn KeyStore>,
     /// The per-account marks, the retirements and the store's identity (Switch wire 7.3).
     marks: MarkStore,
+    /// This run of the service, which the states it stamps record (Switch wire 7.3,
+    /// "Trusted time").
+    run: ServiceRun,
     /// When the instance lock was last confirmed, where the service holds one: a commit that
     /// gives out a `seq`, signs a head or moves a mark is refused once it is stale.
     lock_freshness: Option<LockFreshness>,
@@ -408,6 +411,7 @@ impl Service {
             store,
             keys,
             marks,
+            run: ServiceRun::start(),
             lock_freshness: None,
             time,
             limits,
@@ -570,6 +574,13 @@ impl Service {
         self
     }
 
+    /// This run of the service, for tests that make accounts it stamped (Switch wire 7.3,
+    /// "Trusted time").
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn run(&self) -> ServiceRun {
+        self.run
+    }
+
     /// How many recovery uploads had their items judged before the account's lock, and how
     /// many under it, for tests of what a refused upload costs (Switch wire 7.4.14).
     #[cfg(any(test, feature = "test-util"))]
@@ -705,8 +716,14 @@ impl Service {
         // commits nothing carries, so none shows a time later than the next commit stamps,
         // even after the time base went back. An identity without an account has none: every
         // answer to it counts in no comparison and carries the time base (Switch wire 7.1
-        // Timestamp, spec 10.1).
-        let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
+        // Timestamp, spec 10.1). A state another run of the service stamped, as a restored
+        // one, takes its mark's time floor where that is later, so no answer's time goes back
+        // across a restore; the mark was read before the account (Switch wire 7.3, "Trusted
+        // time").
+        let mark_floor_ms = judged.time_floor_ms();
+        let committed_ms = found
+            .as_ref()
+            .map(|found| found.committed_ms(self.run, mark_floor_ms));
         // The identity's service time (step 3), which the checks before the lock that depend
         // on time take: the time base, or the last time it stamped where the time base is
         // earlier.
@@ -852,6 +869,7 @@ impl Service {
                 txn,
                 &request,
                 base_ms,
+                mark_floor_ms,
                 due,
                 asked,
                 &class,
@@ -1105,6 +1123,7 @@ impl Service {
         mut txn: AccountTxn,
         request: &SwitchRequest,
         base_ms: u64,
+        mark_floor_ms: Option<u64>,
         due: Option<u64>,
         asked: Asked<'_>,
         class: &RequestClass,
@@ -1117,8 +1136,9 @@ impl Service {
         let identity = txn.head().id.clone();
         let identity_key = txn.head().identity_key;
         // The time the account last committed: what an answer that commits nothing carries
-        // (Switch wire 7.1 Timestamp).
-        let committed_ms = txn.head().stamped_time_ms;
+        // (Switch wire 7.1 Timestamp), under the time floor of the mark read before the lock
+        // (Switch wire 7.3, "Trusted time").
+        let committed_ms = txn.head().committed_ms(self.run, mark_floor_ms);
         let bound_signer = caller.is_some_and(|claimed| claimed.caller == Caller::Signer);
         let store_id = if bound_signer {
             match self.marks.identity().await {
@@ -1167,6 +1187,9 @@ impl Service {
         );
         let judged = self.judge(&mut txn, &identity, Some(account)).await;
         txn.retain_from_mark(judged.mark());
+        // The mark read under the lock may hold a later floor than the one read before it.
+        let committed_ms =
+            committed_ms.max(txn.head().committed_ms(self.run, judged.time_floor_ms()));
         if let Some(store_id) = store_id
             && self.marks.identity().await.ok() != Some(store_id)
         {
@@ -1209,8 +1232,24 @@ impl Service {
         // Table 2): the start of a generation carries its own.
         let carries_head = matches!(routed.route, Route::Proceed { head: true });
         let healthy = matches!(judged.judgement.decision.verdict, verdict::Verdict::Healthy);
-        // Step 3: the identity's service time, which never goes back.
-        let time_ms = txn.stamp(base_ms);
+        // Step 3: the identity's service time, which never goes back, also across a restore
+        // of the state; the mark's time floor rises first where it passes it (Switch wire
+        // 7.3, "Trusted time"). An erasure's stamp too: a refused one commits it.
+        let time_ms = match self
+            .stamp_under_lock(&mut txn, base_ms, judged.mark())
+            .await
+        {
+            Ok(time_ms) => time_ms,
+            Err(error) => {
+                drop(txn);
+                return Self::signed_error(
+                    &signer,
+                    asked,
+                    AnswerTime::Account(committed_ms),
+                    &error,
+                );
+            }
+        };
         // A failure under the lock: the transaction is dropped, nothing of it stays, and the
         // answer is signed at the time last committed.
         let failed = |txn: AccountTxn| {
@@ -1719,6 +1758,7 @@ impl Service {
                 let answer = self
                     .feed(
                         &head,
+                        judged.time_floor_ms(),
                         signer.public_key_bytes(),
                         writer.as_ref(),
                         &request.route.query,

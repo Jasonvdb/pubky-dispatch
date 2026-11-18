@@ -65,6 +65,8 @@ fn new_account(id: &str, service_key: [u8; 32], store_id: [u8; 16], serving: boo
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: store_id,
+        stamped_time_ms: T0,
+        stamped_by: [2; 16],
     }
 }
 
@@ -289,6 +291,7 @@ async fn test_check_marks_reports_counts_and_tags_for_behind_and_fork() {
                 &alice,
                 pubky_switch::marks::MarkTarget {
                     head: held.head(),
+                    stamped_ms: held.time_floor_ms,
                     state_version,
                     state_tag,
                 },
@@ -387,7 +390,13 @@ async fn test_check_marks_full_history_catches_up_after_a_read() {
         "a sweep is due"
     );
     assert_eq!(state_version_of(&replay, &id).await, full);
-    assert_eq!(mark_of(&replay, &id).await, held);
+    assert_eq!(
+        mark_of(&replay, &id).await,
+        AccountMark {
+            time_floor_ms: at + pubky_switch::marks::TIME_FLOOR_STEP_MS,
+            ..held
+        }
+    );
     assert!(!check(&replay, false).await.needs_attention());
 
     // The public read commits no sweep. It can cover the durable position before the

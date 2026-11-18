@@ -70,9 +70,53 @@ fn matches(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// Every accepted difference, by flow. Empty while the two switches answer every flow
-/// alike.
-pub static ALLOWED: &[Allowed] = &[];
+/// Why the service's times after a restart lie a minute ahead of the scripted switch's.
+const AFTER_A_RESTART: &str = "The service runs again after the restore, the fork or the \
+     retirement, and its first stamp at the account is the mark's time floor, a minute past \
+     the last time it raised it; every time stamped from then on is that one until the clock \
+     passes it. The scripted switch has no time floor and no restart: it stamps its clock's \
+     time. Both times go forward, and the app compares only times of one switch.";
+
+/// Every accepted difference, by flow.
+pub static ALLOWED: &[Allowed] = &[
+    Allowed {
+        flow: "records, permanent",
+        label: "{alice/phone} GET /v1/{alice}/records/CHdYjXQXGW5gl33STmNxu9RCATOLaXifTflPYFST8as",
+        fact: "header switch-server-time",
+        service: "time 2026-01-01T00:25:30.000Z",
+        scripted: "time 2026-01-01T00:24:30.000Z",
+        reason: "The service restarts after the record is lost. Its first read stamps the \
+                 reserved time floor. The scripted switch keeps running at the same clock time.",
+        reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
+    },
+    Allowed {
+        flow: "recovery notice, a restore behind the mark",
+        label: "*",
+        fact: "*",
+        service: "time 2026-01-01T00:06:06.250Z",
+        scripted: "time 2026-01-01T00:05:06.250Z",
+        reason: AFTER_A_RESTART,
+        reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
+    },
+    Allowed {
+        flow: "recovery notice, a fork",
+        label: "*",
+        fact: "*",
+        service: "time 2026-01-01T00:05:05.000Z",
+        scripted: "time 2026-01-01T00:04:05.000Z",
+        reason: AFTER_A_RESTART,
+        reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
+    },
+    Allowed {
+        flow: "recovery notice, the generation retired",
+        label: "*",
+        fact: "*",
+        service: "time 2026-01-01T00:06:06.250Z",
+        scripted: "time 2026-01-01T00:05:06.250Z",
+        reason: AFTER_A_RESTART,
+        reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
+    },
+];
 
 #[cfg(test)]
 mod tests {

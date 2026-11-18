@@ -599,6 +599,7 @@ mod tests {
             chain_hash: [hash; 32],
             key: KEY,
             state_version: 0,
+            time_floor_ms: 0,
             created_at_ms: 10,
         })
     }

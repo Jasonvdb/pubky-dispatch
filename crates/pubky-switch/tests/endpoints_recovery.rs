@@ -589,19 +589,33 @@ async fn test_recovery_in_place_moves_the_mark_to_the_new_generations_first_head
     );
     let head = head_of(&answer);
     assert_eq!((head.generation, head.seq), (2, 2));
+    let held = mark_of(&replay).await;
     assert_eq!(
-        mark_of(&replay).await,
+        held,
         AccountMark {
             state_tag: state_tag_of(&replay, &alice_id()).await,
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
             state_version: state_version_of(&replay, &alice_id()).await,
+            time_floor_ms: held.time_floor_ms,
             key,
             created_at_ms: mark_before.created_at_ms,
         }
     );
+    assert_floor_covers(&held, &answer);
     replay.db.drop_database().await.expect("drop");
+}
+
+/// These generation starts commit at the request's selected time. Their marks cover that
+/// stamp within one reservation step (Switch wire 7.3, "Time base").
+fn assert_floor_covers(mark: &AccountMark, answer: &SwitchResponse) {
+    let shown = ms(header_text(answer, header::SERVER_TIME).expect("server time"));
+    assert!(
+        (shown..=shown + pubky_switch::marks::TIME_FLOOR_STEP_MS).contains(&mark.time_floor_ms),
+        "floor {} against {shown}",
+        mark.time_floor_ms
+    );
 }
 
 /// The App IDs alice's account holds for the next generation, and whether [`HELD_REVOKED`]
@@ -1461,18 +1475,21 @@ async fn test_recovery_failing_mark_lost_start_writes_the_mark_anew() {
     );
     assert!(signed_by(&answer, &key, &signature));
     let head = head_of(&answer);
+    let held = mark_of(&replay).await;
     assert_eq!(
-        mark_of(&replay).await,
+        held,
         AccountMark {
             state_tag: state_tag_of(&replay, &alice_id()).await,
             generation: 2,
             seq: 2,
             chain_hash: head.chain_hash,
             state_version: state_version_of(&replay, &alice_id()).await,
+            time_floor_ms: held.time_floor_ms,
             key,
             created_at_ms: created,
         }
     );
+    assert_floor_covers(&held, &answer);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -3613,6 +3630,17 @@ async fn test_recovery_enrollment_retry_after_a_failed_mark_move_moves_the_mark(
     let at = replay.clock.now_ms() + 60_000;
     set_time(&replay.clock, &rfc3339(at));
     let body = alice_enrollment_body(&replay, 3, Some(vec![HELD_REVOKED]), None, at).await;
+    // Reserve the enrollment's time so only the mark move after its commit can fail.
+    let read = request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    assert_eq!(replay.service.handle(read).await.status, 200);
+    let reserved = mark_of(&replay).await;
+    assert!(reserved.time_floor_ms >= at);
+    assert_eq!(reserved.state_version, count);
     let marks_dir = replay.key_dir().join("accounts").join("marks");
     std::fs::set_permissions(&marks_dir, std::fs::Permissions::from_mode(0o500))
         .expect("read-only");

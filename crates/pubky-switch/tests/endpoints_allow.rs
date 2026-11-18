@@ -734,6 +734,8 @@ async fn test_allow_waits_for_a_reader_without_the_lock() {
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: replay.marks.identity().await.expect("store identity"),
+        stamped_time_ms: 0,
+        stamped_by: replay.service.run().id(),
     };
     assert!(
         replay

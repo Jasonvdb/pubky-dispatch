@@ -31,6 +31,8 @@ pub struct FeedSnapshot {
     pub created_at_ms: u64,
     /// The last service time the account stamped.
     pub stamped_time_ms: u64,
+    /// The run of the service that stamped it (Switch wire 7.3, "Trusted time").
+    pub stamped_by: [u8; 16],
     /// The newest `identity.json` the account holds.
     pub identity_doc: Option<SignedDoc>,
     /// The reader's app row.
@@ -230,7 +232,7 @@ pub(super) async fn read_feed(
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
         "SELECT generation, last_seq, chain_seq, chain_hash, state_version, state_tag, created_at_ms, \
-         stamped_time_ms, activation_requirement, identity_doc, r.checkpoint FROM accounts \
+         stamped_time_ms, stamped_by, activation_requirement, identity_doc, r.checkpoint FROM accounts \
          LEFT JOIN chain_retention r ON r.account_id = accounts.id WHERE id = $1",
     )
     .bind(id)
@@ -278,6 +280,7 @@ pub(super) async fn read_feed(
         generation,
         created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+        stamped_by: super::account::stamped_by(&row)?,
         identity_doc: identity_doc
             .map(|bytes| decode_doc(&bytes, "identity_doc"))
             .transpose()?,

@@ -31,6 +31,8 @@ async fn with_account() -> Option<TestDatabase> {
         revoked_apps: Vec::new(),
         enrollment_hash: [0; 32],
         enrollment_store_id: [1; 16],
+        stamped_time_ms: T0,
+        stamped_by: [2; 16],
     };
     assert!(db.store().create_account(&account).await.expect("create"));
     Some(db)
@@ -300,7 +302,7 @@ async fn test_state_count_moves_once_for_a_changed_commit_and_not_otherwise() {
         .await
     );
     let mut txn = db.store().begin(ID).await.expect("begin").expect("account");
-    txn.stamp(T0 + 1_000);
+    txn.stamp(T0 + 1_000, pubky_switch::store::ServiceRun::start());
     assert!(!txn.commit().await.expect("commit").counted());
     assert_eq!(
         db.store()
@@ -368,7 +370,7 @@ async fn test_state_count_refused_write_rolled_back_counts_nothing() {
     // The endpoint's write, undone at its refusal: the commit keeps only the stamp, and
     // counts nothing.
     let mut txn = db.store().begin(ID).await.expect("begin").expect("account");
-    txn.stamp(T0 + 1_000);
+    txn.stamp(T0 + 1_000, pubky_switch::store::ServiceRun::start());
     let savepoint = txn.savepoint().await.expect("savepoint");
     sqlx::query("INSERT INTO connect_requests (account_id, pubky, at_ms) VALUES ($1, $2, 1)")
         .bind(ID)

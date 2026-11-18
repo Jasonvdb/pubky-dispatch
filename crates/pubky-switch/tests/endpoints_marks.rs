@@ -208,6 +208,22 @@ fn mark_at(old: &AccountMark, seq: u64) -> AccountMark {
     }
 }
 
+/// `held` is the mark `moved`, its time floor kept or risen (Switch wire 7.3, "Time base").
+fn assert_moved(held: AccountMark, moved: AccountMark) {
+    assert!(
+        held.time_floor_ms >= moved.time_floor_ms,
+        "the floor never goes back"
+    );
+    assert_eq!(
+        held,
+        AccountMark {
+            time_floor_ms: held.time_floor_ms,
+            ..moved
+        },
+        "moved"
+    );
+}
+
 /// alice served (`chain.json` seqs 1 and 2), the clock a minute past her last commit, so
 /// the time base and her stamped time differ: her mark, and the time base.
 async fn served(replay: &Replay) -> (AccountMark, u64) {
@@ -389,10 +405,9 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
         "{}",
         String::from_utf8_lossy(&batch.body)
     );
-    assert_eq!(
+    assert_moved(
         mark_in(&replay.marks).await,
         moved_to(&replay, &mark, 4).await,
-        "moved"
     );
     // The mark back at seq 2, as a move that failed after its commit leaves it.
     replay.marks.delete(&alice_id()).await.expect("delete");
@@ -424,12 +439,270 @@ async fn test_marks_state_ahead_of_the_mark_is_healthy_and_moves_it() {
         &Sent::of(&apps_read(at))
     ));
     // The answer carried a head: the mark moved to it (Table 3).
-    assert_eq!(
+    assert_moved(
         mark_in(&replay.marks).await,
         moved_to(&replay, &mark, 4).await,
-        "moved"
     );
     assert_eq!(replay.service.mark_refusals(), 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The run of the service that stamped alice's state.
+async fn stamped_by(replay: &Replay) -> Vec<u8> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let run = sqlx::query_scalar("SELECT stamped_by FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("run");
+    conn.close().await.expect("close");
+    run
+}
+
+/// alice served, and the time past every time shown for her by two minutes.
+async fn served_past_the_floor(replay: &Replay) -> u64 {
+    serve_alice(replay).await;
+    let stamped = u64::try_from(account_row(replay).await.1).expect("time");
+    stamped.max(mark_in(&replay.marks).await.time_floor_ms) + 120_000
+}
+
+/// A read at `read_at`, past every time shown for alice, which commits only its stamp: the
+/// mark's time floor rises first, to a minute past it (Switch wire 7.3, "Trusted time").
+/// The raised mark.
+async fn read_raises_the_floor(replay: &Replay, read_at: u64) -> AccountMark {
+    let before = mark_in(&replay.marks).await;
+    assert!(read_at > before.time_floor_ms);
+    replay.clock.set_wall_ms(read_at);
+    let read = replay.service.handle(public_read()).await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
+    assert_eq!(time_shown(&read), read_at);
+    let raised = mark_in(&replay.marks).await;
+    assert_eq!(
+        raised,
+        AccountMark {
+            time_floor_ms: read_at + pubky_switch::marks::TIME_FLOOR_STEP_MS,
+            ..before
+        }
+    );
+    raised
+}
+
+/// alice's state as a backup holds it: its stamped time and count.
+async fn backup_of(replay: &Replay) -> (i64, u64) {
+    (
+        account_row(replay).await.1,
+        state_version_of(replay, &alice_id()).await,
+    )
+}
+
+/// A restore of alice's state to `backup`, stamped by another run, as a backup taken before
+/// a restart: no `seq` is lost.
+async fn restore(replay: &Replay, backup: (i64, u64)) {
+    let (stamped, count) = backup;
+    sql(
+        replay,
+        &[&format!(
+            "UPDATE accounts SET stamped_time_ms = {stamped}, state_version = {count}, \
+             stamped_by = decode(repeat('ab', 16), 'hex') WHERE id = '{}'",
+            alice_id()
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_marks_restore_of_time_only_commits_stays_healthy_and_time_never_goes_back() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let read_at = served_past_the_floor(&replay).await;
+    let (last_seq, _) = account_row(&replay).await;
+    let backup = backup_of(&replay).await;
+    // A restarted run's first request, a read, commits only its stamp: at the floor it
+    // raises first, and with this run as the one that stamped it. The count doesn't move,
+    // so the mark's doesn't either (Switch wire 7.3, "The state", "Time base").
+    let restarted = replay.restarted_with(Limits::default());
+    replay.clock.set_wall_ms(read_at);
+    let read = restarted.handle(public_read()).await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
+    let floor_ms = read_at + pubky_switch::marks::TIME_FLOOR_STEP_MS;
+    assert_eq!(time_shown(&read), floor_ms);
+    let raised = mark_in(&replay.marks).await;
+    assert_eq!(raised.time_floor_ms, floor_ms);
+    assert_eq!(account_row(&replay).await.0, last_seq, "no seq given out");
+    assert_eq!(stamped_by(&replay).await, restarted.run().id());
+    assert_eq!(backup_of(&replay).await.1, backup.1, "nothing counted");
+    assert_eq!(raised.state_version, backup.1, "the mark's count unchanged");
+    // A restore of a backup taken before the read, with the service stopped: nothing
+    // acknowledged is lost, but the stamped time goes back; the time base goes back half a
+    // minute too.
+    restore(&replay, backup).await;
+    let again_run = replay.restarted_with(Limits::default());
+    let back = read_at - 30_000;
+    replay.clock.set_wall_ms(back);
+    // Healthy: the next request is served, with the head, stamped no earlier than the read.
+    let again = again_run.handle(apps_read(back)).await;
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
+    assert!(header_text(&again, header::HEAD).is_some(), "the head");
+    assert_eq!(time_shown(&again), floor_ms);
+    assert_eq!(again_run.mark_refusals(), 0);
+    // The authenticated read also commits the due sweep. Its count and tag advance
+    // while the reopened service stamps at the existing floor.
+    let after = mark_in(&replay.marks).await;
+    assert_eq!(after.state_version, raised.state_version + 1);
+    assert_ne!(after.state_tag, raised.state_tag);
+    assert_eq!(
+        after,
+        AccountMark {
+            state_version: after.state_version,
+            state_tag: state_tag_of(&replay, &alice_id()).await,
+            ..raised
+        }
+    );
+    assert_eq!(
+        account_row(&replay).await.1,
+        i64::try_from(floor_ms).expect("ms")
+    );
+    assert_eq!(stamped_by(&replay).await, again_run.run().id());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_pre_lock_refusal_after_a_restore_is_not_earlier_than_the_last_answer() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let read_at = served_past_the_floor(&replay).await;
+    let backup = backup_of(&replay).await;
+    let raised = read_raises_the_floor(&replay, read_at).await;
+    restore(&replay, backup).await;
+    let restarted = replay.restarted_with(Limits::default());
+    replay.clock.set_wall_ms(read_at - 30_000);
+    // A refusal before the lock carries the last time committed: for a state another run
+    // stamped, the mark's floor, not the restored stamp (Switch wire 7.3, "Trusted time").
+    let refused = restarted
+        .handle(bad_signature(apps_read(read_at - 30_000)))
+        .await;
+    assert_eq!(refused.status, 401);
+    assert!(
+        time_shown(&refused) >= read_at,
+        "{} went back behind {read_at}",
+        time_shown(&refused)
+    );
+    assert_eq!(time_shown(&refused), raised.time_floor_ms);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_restore_inside_one_floor_window_never_shows_an_earlier_time() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    // Commit A raises the floor; commit B, inside the same floor window, shows a later
+    // time T2 and doesn't raise it.
+    let read_at = served_past_the_floor(&replay).await;
+    let raised = read_raises_the_floor(&replay, read_at).await;
+    let after_a = backup_of(&replay).await;
+    let t2 = read_at + 10_000;
+    replay.clock.set_wall_ms(t2);
+    let b = replay.service.handle(public_read()).await;
+    assert_eq!(b.status, 200, "{}", String::from_utf8_lossy(&b.body));
+    assert_eq!(time_shown(&b), t2);
+    assert_eq!(mark_in(&replay.marks).await, raised, "B raised nothing");
+    // A restore to just after A, with the service stopped: B's stamp is lost, and the state
+    // records A's run, which the restart ends.
+    restore(&replay, after_a).await;
+    let restarted = replay.restarted_with(Limits::default());
+    replay.clock.set_wall_ms(read_at);
+    // An answer before the lock shows no time before T2 (Switch wire 7.3, "Trusted time").
+    let refused = restarted.handle(bad_signature(apps_read(read_at))).await;
+    assert_eq!(refused.status, 401);
+    assert!(
+        time_shown(&refused) >= t2,
+        "{} went back behind {t2}",
+        time_shown(&refused)
+    );
+    // The new run's first committed stamp is the floor.
+    let again = restarted.handle(public_read()).await;
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
+    assert_eq!(time_shown(&again), raised.time_floor_ms);
+    assert_eq!(
+        account_row(&replay).await.1,
+        i64::try_from(raised.time_floor_ms).expect("ms")
+    );
+    assert_eq!(stamped_by(&replay).await, restarted.run().id());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_time_within_one_run_is_not_pushed_to_the_floor() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let read_at = served_past_the_floor(&replay).await;
+    let raised = read_raises_the_floor(&replay, read_at).await;
+    // In the run that stamped the state, a request before the floor shows its own time and
+    // an answer before the lock the time last stamped, neither the floor.
+    let later = read_at + 10_000;
+    replay.clock.set_wall_ms(later);
+    let refused = replay.service.handle(bad_signature(apps_read(later))).await;
+    assert_eq!(refused.status, 401);
+    assert_eq!(time_shown(&refused), read_at);
+    let next = replay.service.handle(public_read()).await;
+    assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));
+    assert_eq!(time_shown(&next), later);
+    assert_eq!(
+        account_row(&replay).await.1,
+        i64::try_from(later).expect("ms")
+    );
+    assert_eq!(mark_in(&replay.marks).await, raised);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_new_run_past_the_floor_stamps_the_raised_floor() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let read_at = served_past_the_floor(&replay).await;
+    let raised = read_raises_the_floor(&replay, read_at).await;
+    // After a restart, a request past the floor raises it; the state another run stamped
+    // is stamped at the raised floor, at or above any time an answer before the lock showed
+    // once the floor rose (Switch wire 7.3, "Trusted time").
+    let restarted = replay.restarted_with(Limits::default());
+    let past = raised.time_floor_ms + 5_000;
+    replay.clock.set_wall_ms(past);
+    let first = restarted.handle(apps_read(past)).await;
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    let floor_ms = past + pubky_switch::marks::TIME_FLOOR_STEP_MS;
+    assert_eq!(mark_in(&replay.marks).await.time_floor_ms, floor_ms);
+    assert_eq!(time_shown(&first), floor_ms);
+    assert_eq!(
+        account_row(&replay).await.1,
+        i64::try_from(floor_ms).expect("ms")
+    );
+    // From then on the run's own stamps: the next request doesn't jump again.
+    let next = restarted.handle(apps_read(past)).await;
+    assert_eq!(next.status, 200, "{}", String::from_utf8_lossy(&next.body));
+    assert_eq!(time_shown(&next), floor_ms);
+    assert_eq!(mark_in(&replay.marks).await.time_floor_ms, floor_ms);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -752,11 +1025,7 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
     assert_eq!(retried["head"]["seq"], 4);
     assert!(header_text(&retry, header::HEAD).is_some(), "the head");
     assert_eq!(account_row(&replay).await.0, 4, "no seq given out again");
-    assert_eq!(
-        mark_in(&marks).await,
-        moved_to(&replay, &mark, 4).await,
-        "moved"
-    );
+    assert_moved(mark_in(&marks).await, moved_to(&replay, &mark, 4).await);
     assert_eq!(service.mark_refusals(), 0);
     replay.db.drop_database().await.expect("drop");
 }
@@ -964,15 +1233,10 @@ async fn test_marks_crash_after_the_mark_move_before_the_answer_is_healthy() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_marks_failed_commit_leaves_the_mark() {
-    let Some(replay) = replay().await else {
-        return;
-    };
-    let (mark, _) = served(&replay).await;
-    let before = account_row(&replay).await;
+/// Make an account update fail at commit, after its time reservation is durable.
+async fn fail_account_commits(replay: &Replay) {
     sql(
-        &replay,
+        replay,
         &[
             "CREATE FUNCTION fail_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
              RAISE EXCEPTION 'a commit that fails'; END $$",
@@ -981,6 +1245,60 @@ async fn test_marks_failed_commit_leaves_the_mark() {
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_marks_restart_uses_time_reserved_by_a_failed_commit() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let candidate = served_past_the_floor(&replay).await;
+    let sent = Sent::of(&public_read());
+    let key = service_public(&replay);
+    let last = replay.service.handle(public_read()).await;
+    assert_eq!(last.status, 200);
+    assert!(signed_with(&last, &key, &sent));
+    let shown = time_shown(&last);
+    let mark = mark_in(&replay.marks).await;
+    let row = account_row(&replay).await;
+
+    replay.clock.set_wall_ms(candidate);
+    fail_account_commits(&replay).await;
+    let failed = replay.service.handle(public_read()).await;
+    assert_eq!(
+        (failed.status, code(&failed).as_str()),
+        (503, "unavailable")
+    );
+    assert!(signed_with(&failed, &key, &sent));
+    assert_eq!(time_shown(&failed), shown);
+    assert_eq!(account_row(&replay).await, row);
+    let step = pubky_switch::marks::TIME_FLOOR_STEP_MS;
+    let reserved = AccountMark {
+        time_floor_ms: candidate + step,
+        ..mark
+    };
+    assert_eq!(mark_in(&replay.marks).await, reserved);
+
+    sql(&replay, &["DROP TRIGGER fail_at_commit ON accounts"]).await;
+    replay.clock.set_wall_ms(shown);
+    let (service, marks) = restarted(&replay, Limits::default());
+    let next = service.handle(public_read()).await;
+    assert_eq!(next.status, 200);
+    assert!(signed_with(&next, &key, &sent));
+    assert_eq!(time_shown(&next), reserved.time_floor_ms);
+    assert!(time_shown(&next) > shown + step);
+    assert_eq!(mark_in(&marks).await, reserved);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_marks_failed_commit_leaves_the_mark() {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let (mark, _) = served(&replay).await;
+    let before = account_row(&replay).await;
+    fail_account_commits(&replay).await;
     let request = wallet_batch(&replay, &[3, 4]);
     let sent = Sent::of(&request);
     let answer = replay.service.handle(request).await;
@@ -1003,10 +1321,9 @@ async fn test_marks_failed_commit_leaves_the_mark() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert_eq!(
+    assert_moved(
         mark_in(&replay.marks).await,
         moved_to(&replay, &mark, 4).await,
-        "moved"
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -1050,10 +1367,28 @@ async fn test_marks_stale_instance_lock_refuses_a_write() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(account_row(&replay).await.0, 4);
-    assert_eq!(
+    // The restarted run's first stamp at alice is the mark's time floor, past the vectors'
+    // time for the batch (Switch wire 7.3, "Time base"): the mark moves to the head the
+    // account committed.
+    assert!(time_shown(&answer) >= mark.time_floor_ms);
+    let committed: Vec<u8> = {
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        let hash = sqlx::query_scalar("SELECT chain_hash FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .fetch_one(&mut conn)
+            .await
+            .expect("chain hash");
+        conn.close().await.expect("close");
+        hash
+    };
+    assert_moved(
         mark_in(&replay.marks).await,
-        moved_to(&replay, &mark, 4).await,
-        "moved"
+        AccountMark {
+            chain_hash: committed.try_into().expect("32 bytes"),
+            ..moved_to(&replay, &mark, 4).await
+        },
     );
     replay.db.drop_database().await.expect("drop");
 }

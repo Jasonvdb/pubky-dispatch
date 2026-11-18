@@ -225,6 +225,8 @@ pub async fn serve_bob(replay: &Replay) -> String {
             revoked_apps: Vec::new(),
             enrollment_hash: [0; 32],
             enrollment_store_id: replay.marks.identity().await.expect("store identity"),
+            stamped_time_ms: 0,
+            stamped_by: replay.service.run().id(),
         })
         .await
         .expect("bob's account");
@@ -1136,16 +1138,18 @@ pub async fn keeping_count(
         head,
         state_version,
         state_tag,
+        stamped_ms: 0,
     }
 }
 
-/// The move of a mark to `head` with count 0, at or below every state's (Switch wire 7.3,
-/// "The mark").
+/// The move of a mark to `head` with count 0, at or below every state's, stamped at time 0
+/// (Switch wire 7.3, "The mark").
 pub fn at_head(head: pubky_switch_core::chain::ChainTip) -> pubky_switch::marks::MarkTarget {
     pubky_switch::marks::MarkTarget {
         head,
         state_version: 0,
         state_tag: [0; 16],
+        stamped_ms: 0,
     }
 }
 

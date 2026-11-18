@@ -579,7 +579,9 @@ async fn test_staged_account_leaves_room_for_its_first_identity_after_restart() 
     let (_, created) = create(&replay, NOW, 2).await;
     let id = key().id();
     seed_staged_history(&replay, 1022).await;
-    let mark = replay.marks.read(&id).await.unwrap();
+    let MarkRead::Mark(mark) = replay.marks.read(&id).await.unwrap() else {
+        panic!("missing staged mark")
+    };
     let existing = |nonce| make_enrollment(EnrollmentIntent::Existing { created }, nonce);
     let accepted = existing(3);
     status(
@@ -603,7 +605,13 @@ async fn test_staged_account_leaves_room_for_its_first_identity_after_restart() 
     let refused = replay.service.handle(read).await;
     status(&refused, 503);
     assert_eq!(value(&refused)["code"], "unavailable");
-    assert_eq!(replay.marks.read(&id).await.unwrap(), mark);
+    assert_eq!(
+        replay.marks.read(&id).await.unwrap(),
+        MarkRead::Mark(pubky_switch::marks::AccountMark {
+            time_floor_ms: NOW + pubky_switch::marks::TIME_FLOOR_STEP_MS,
+            ..mark
+        })
+    );
     assert_eq!(support::state_version_of(&replay, &id).await, 1023);
 
     let marks = MarkStore::open(replay.key_dir()).unwrap();
@@ -2094,7 +2102,20 @@ async fn test_account_enrollment_removed_app_stays_excluded_after_recovery() {
         .await;
     status(&answer, 400);
     assert_eq!(value(&answer)["code"], "bad_request");
-    assert_eq!(replay.db.store().lookup(&key().id()).await.unwrap(), before);
+    // The refusal commits only its stamp: the reopened run's first, at the mark's time
+    // floor (Switch wire 7.3, "Time base").
+    let floor = match replay.marks.read(&key().id()).await.unwrap() {
+        MarkRead::Mark(mark) => mark.time_floor_ms,
+        other => panic!("no mark: {other:?}"),
+    };
+    assert_eq!(
+        replay.db.store().lookup(&key().id()).await.unwrap(),
+        before.map(|before| pubky_switch::store::FoundAccount {
+            stamped_time_ms: floor,
+            stamped_by: reopened.run().id(),
+            ..before
+        })
+    );
     let apps = reopened
         .handle(signed("GET", &path("apps"), vec![], Some(created), NOW))
         .await;

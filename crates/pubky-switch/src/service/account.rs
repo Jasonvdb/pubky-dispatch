@@ -95,7 +95,9 @@ impl Service {
                 return Err(discovery_unavailable());
             }
             let routed = verdict::answer(&judged.judgement, class, self.current_key());
-            let committed_ms = found.as_ref().map(|found| found.stamped_time_ms);
+            let committed_ms = found
+                .as_ref()
+                .map(|found| found.committed_ms(self.run, judged.time_floor_ms()));
             if judged.created_at_ms()?.is_some()
                 && !matches!(routed.route, Route::Unavailable)
                 && !matches!(

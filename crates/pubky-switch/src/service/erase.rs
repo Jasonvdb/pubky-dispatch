@@ -353,13 +353,19 @@ impl Service {
         let at = AnswerTime::TimeBase(base_ms, Uncompared::Erasure);
         let unavailable = || ApiError::unavailable("7.6: an erasure outcome is unresolved");
         let refuse = |error: ApiError| self.service_error(asked, at, &error);
+        // The mark before the account, as every reader before the lock reads them
+        // (`committed_time_ms`).
+        let mark_floor_ms = match self.marks.read(identity).await {
+            Ok(crate::marks::MarkRead::Mark(mark)) => Some(mark.time_floor_ms),
+            _ => None,
+        };
         let found = match self.store.lookup(identity).await {
             Ok(found) => found,
             Err(error) => return refuse(store_error(&error)),
         };
-        let service_ms = found
-            .as_ref()
-            .map_or(base_ms, |found| base_ms.max(found.stamped_time_ms));
+        let service_ms = found.as_ref().map_or(base_ms, |found| {
+            base_ms.max(found.committed_ms(self.run, mark_floor_ms))
+        });
         let pre = match self.pre_lock(identity, request, base_ms, service_ms).await {
             Ok(pre) => pre,
             Err(error) => return refuse(error),
@@ -431,13 +437,23 @@ impl Service {
             if let Err(error) = erasure_binding(request, held.as_ref(), &judged) {
                 return Self::signed_error(&signer, asked, at, &error);
             }
-            let time_ms = txn.stamp(base_ms);
+            // Step 3 as for every request, so the erasure's answer shows no time before one
+            // shown for the identity, and the floor rises past it (Switch wire 7.3,
+            // "Trusted time").
+            let committed_ms = head.committed_ms(self.run, judged.time_floor_ms());
+            let time_ms = match self
+                .stamp_under_lock(&mut txn, base_ms, judged.mark())
+                .await
+            {
+                Ok(time_ms) => time_ms,
+                Err(error) => return Self::signed_error(&signer, asked, at, &error),
+            };
             let answer = match self.erase_answer(request, held.as_ref(), &judged, time_ms) {
                 Ok(answer) => answer,
                 Err(error) => return Self::signed_error(&signer, asked, at, &error),
             };
             return self
-                .finish_erasure(txn, &signer, asked, head.stamped_time_ms, time_ms, answer)
+                .finish_erasure(txn, &signer, asked, committed_ms, time_ms, answer)
                 .await;
         }
         // This is new authenticated authorization at an absent account, not an inference

@@ -8,7 +8,7 @@ The client's public API for protocols and hosts is in place: record answers that
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
-- **Service.** The database and its separate rollback mark now record the count and tag of acknowledged changes at a healthy account. A later mark format will also record a lower bound on the time the service can report.
+- **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
 **Additions still to come**
 
@@ -71,7 +71,7 @@ The client's public API for protocols and hosts is in place: record answers that
 ### Specification
 
 - [keys] **Changing a service key does not retire its authority for every account.** The specification leaves the signer notification and authenticated link between successive keys undefined, so clients can continue trusting a compromised old key while their identity documents name it. Replacing the operator's key alone is insufficient to secure those accounts.
-- [specification] **The service-time guarantee is stronger than the stored evidence.** The specification says an account's time never goes backward, but a failover can restore an earlier database timestamp while the separate rollback mark still matches. Do not use two service timestamps alone to establish the order of actions across failover.
+- [specification] **A failover during a running service can briefly expose an older account time.** A fresh service run uses the separate mark's time floor. If the database switches underneath a running process, a restored stamp can still belong to that same run until it detects the lost instance lock. Stop the service before restoring or switching databases and restart it afterwards.
 - [specification] **`ProviderStatus::Current` can be reported for a frozen account.** The wire rules require a signed request to establish the absence of a freeze, but `check_for_move` can return `Current` after a public read that shows none. Use a response to a signed account request before telling the user that the account can accept writes.
 - [specification] **Enrollment reports only some effective service limits.** Clients receive limits such as batch size and storage quota, but must assume defaults for others, including contact and conversation counts. Handle limit refusals even when a request fits the published default.
 

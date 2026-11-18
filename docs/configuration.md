@@ -255,6 +255,8 @@ The service holds no per-account key in a KMS: the keys are files on that volume
 
 ### No restore and continue
 
+Stop the service before restoring its database or switching to a replica. On restart, the mark's time floor keeps the first answers for an account at or above the time shown before the restore. The service reserves up to one minute past the time it selects for a request. If the database commit fails, the reservation survives. The first stamp after restart can then be more than one minute ahead of the last answer and stay there until the clock catches up. If the database switches under a running process, the instance-lock check may take up to ten seconds to detect it.
+
 Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Switch spec 6.5). The service never continues from it under the same generation:
 
 1. The marks stop the affected accounts on their own, and the readiness answer stays up for the others: their requests answer the recovery notice, `503 recovery_required`, with the generation and the reason (`behind`, `fork`, `mark_lost`; Switch wire 7.6).

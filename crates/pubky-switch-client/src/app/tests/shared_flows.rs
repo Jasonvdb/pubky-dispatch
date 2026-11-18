@@ -2048,7 +2048,6 @@ async fn test_records_two_views_of_one_key_on_a_page_are_judged_together() {
 }
 
 /// An older write whose version is only the switch's word is kept apart from the held one:
-
 /// the read keeps the held write and hands the older one over with its version, item hash
 /// and writer, and that the version isn't authenticated (Switch spec 10.3).
 #[tokio::test]

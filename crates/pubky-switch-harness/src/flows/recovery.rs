@@ -545,11 +545,10 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     if answered.as_deref() != Some("200") {
         return Err(format!("bob's note was answered {answered:?}").into());
     }
-    // The directory's versions are the account's: they went on counting across the
-    // recovery, so the version bob's shop held before it names no other set of apps now
-    // (Switch wire 7.4.10).
+    // The wallet stopped being reachable at recovery and became reachable again when
+    // it registered its receive key (Switch wire 7.4.10).
     let after = directory_versions(world)?;
-    if after.0 <= before.0 || after.1 <= before.1 {
+    if after.0 <= before.0 || after.1.checked_sub(before.1) != Some(2) {
         return Err(format!(
             "the directory's versions were {before:?} before the recovery and are {after:?}"
         )

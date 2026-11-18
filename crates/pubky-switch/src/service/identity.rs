@@ -7,7 +7,7 @@ use pubky_switch_core::{
     http::IdentityDelivery,
     records::{
         AccountActivation, AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc,
-        KeptProofs, check_delivery,
+        KeptProofs, check_delivery, recovery_apps_version,
     },
 };
 use serde_json::{Value, json};
@@ -157,7 +157,8 @@ impl Service {
             // A provider loss at this service: the account starts afresh (Switch wire 3.3,
             // 7.4.2).
             Ok(Delivery::New(Some(GenerationChange::ProviderLoss))) => {
-                self.recover_in_place(txn, &doc, trusted, time_ms).await
+                self.recover_in_place(txn, held, &doc, trusted, time_ms)
+                    .await
             }
             // Without `recovery_from`, a service key change: its key differs from the ending
             // generation's (Switch wire 3.3).
@@ -248,7 +249,6 @@ impl Service {
         if !verdict::recovery_starts_above(floor, doc.generation(), doc.body().recovery_from) {
             return Err(refused());
         }
-        let recovery_from = doc.body().recovery_from.ok_or_else(refused)?;
         // Exempt from the compare-and-swap of `prev` only: it still needs a higher version
         // than the one held, else `409 stale_identity` with that copy (Switch wire 3.3).
         if let Some(held) = held
@@ -296,22 +296,8 @@ impl Service {
                 "3.3: apps lists an App ID the service revoked or saw depart",
             ));
         }
-        txn.start_afresh(
-            doc.generation(),
-            recovery_from,
-            time_ms,
-            !doc.body().apps.is_empty(),
-        )
-        .await
-        .map_err(|e| store_error(&e))?;
-        self.chain_recovery(txn, &new_signer, recovery_from, time_ms)
-            .await?;
-        let mut answer = self
-            .chain_delivery(txn, &new_signer, None, doc, trusted, time_ms)
-            .await?;
-        answer.key = Some(doc.inbox().service_key);
-        answer.starts_generation = true;
-        Ok(answer)
+        self.start_recovered_generation(txn, held, doc, &new_signer, trusted, time_ms)
+            .await
     }
 
     /// A provider loss at this service (Switch wire 3.3, 3.7, 7.4.2): `doc`, at the next
@@ -323,16 +309,17 @@ impl Service {
     async fn recover_in_place(
         &self,
         txn: &mut AccountTxn,
+        held: Option<&IdentityDoc>,
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
-        let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        let generation = txn.head().generation;
         // The generation after the one it ends, the account's (wire 3.3): checked by the
         // delivery's rules, and again here, where the account's generation changes.
-        if recovery_from != txn.head().generation
-            || recovery_from.checked_add(1) != Some(doc.generation())
+        if doc.body().recovery_from != Some(generation)
+            || generation.checked_add(1) != Some(doc.generation())
         {
             return Err(temporary());
         }
@@ -353,6 +340,39 @@ impl Service {
             .keys
             .signer_for(&doc.inbox().service_key)
             .ok_or_else(temporary)?;
+        self.start_recovered_generation(txn, held, doc, &new_signer, trusted, time_ms)
+            .await
+    }
+
+    /// Clear the ending generation and chain the recovery and its first document
+    /// together (Switch wire 3.3, 7.4.2, 7.4.10).
+    async fn start_recovered_generation(
+        &self,
+        txn: &mut AccountTxn,
+        held: Option<&IdentityDoc>,
+        doc: &IdentityDoc,
+        signer: &ServiceSigner,
+        trusted: bool,
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let temporary = || ApiError::unavailable("7.6: a temporary failure");
+        let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        // Read reachability before the reset deletes the app records and receive keys.
+        let apps = super::batch::load_apps(txn, held, time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
+        let (directory, old_version) = txn
+            .directory_versions()
+            .await
+            .map_err(|e| store_error(&e))?;
+        let version =
+            recovery_apps_version(directory, old_version, !apps.reachable_app_ids().is_empty())
+                .ok_or_else(temporary)?;
+        if version != old_version {
+            txn.set_directory_versions(directory, version)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         txn.start_afresh(
             doc.generation(),
             recovery_from,
@@ -361,10 +381,10 @@ impl Service {
         )
         .await
         .map_err(|e| store_error(&e))?;
-        self.chain_recovery(txn, &new_signer, recovery_from, time_ms)
+        self.chain_recovery(txn, signer, recovery_from, time_ms)
             .await?;
         let mut answer = self
-            .chain_delivery(txn, &new_signer, None, doc, trusted, time_ms)
+            .chain_delivery(txn, signer, None, doc, trusted, time_ms)
             .await?;
         answer.key = Some(doc.inbox().service_key);
         answer.starts_generation = true;

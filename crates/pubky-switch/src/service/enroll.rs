@@ -692,22 +692,13 @@ impl Service {
             if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
                 return Err(unavailable());
             }
-            if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. })
-                && txn.head().state_version == 0
-                && txn.head().last_seq == 0
-            {
-                let mark = judged
-                    .mark()
-                    .filter(|m| {
-                        m.created_at_ms == created && m.generation == 0 && m.state_version == 0
-                    })
-                    .ok_or_else(unavailable)?;
-                let anchor = mark
-                    .creation_anchor
-                    .for_creation(created)
-                    .ok_or_else(unavailable)?;
-                if !txn
-                    .matches_creation_anchor(store_id, enrollment_hash, anchor)
+            if matches!(enrollment.body().intent, EnrollmentIntent::Create { .. }) {
+                let mark = judged.mark().ok_or_else(unavailable)?;
+                if !matches!(
+                    judged.judgement.decision.verdict,
+                    verdict::Verdict::Healthy | verdict::Verdict::Staged
+                ) || !txn
+                    .covers_opening_receipt(store_id, enrollment_hash, &limits, mark)
                     .await
                     .map_err(|e| store_error(&e))?
                 {

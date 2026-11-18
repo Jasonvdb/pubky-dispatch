@@ -297,7 +297,11 @@ impl Inner {
                 // service's one rule judges it (Switch wire 7.3, Table 1).
                 Some(NoticeReason::Behind)
             } else if (mark.state_version > 0
-                && self.state_history.get(&mark.state_version) != Some(&mark.state_tag))
+                && self
+                    .state_history
+                    .get(&mark.state_version)
+                    .map(|(tag, _)| *tag)
+                    != Some(mark.state_tag))
                 || (self.state_version == mark.state_version && self.state_tag != mark.state_tag)
             {
                 Some(NoticeReason::Fork)
@@ -732,7 +736,12 @@ impl ScriptedSwitch {
         let (version, tag) = (inner.state_version, inner.state_tag);
         inner.state_history.retain(|count, _| *count <= version);
         if version > 0 {
-            inner.state_history.insert(version, tag);
+            let origin = inner
+                .state_history
+                .get(&version)
+                .filter(|(old, _)| *old == tag)
+                .and_then(|(_, origin)| *origin);
+            inner.state_history.insert(version, (tag, origin));
         }
     }
 

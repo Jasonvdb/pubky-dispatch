@@ -240,6 +240,7 @@ pub struct Savepoint {
 
 /// One request's transaction on one account, holding the account's lock.
 pub struct AccountTxn {
+    creation_origin: Option<[u8; 32]>,
     covered_version: u64,
     tx: Transaction<'static, Postgres>,
     head: AccountHead,
@@ -351,20 +352,23 @@ impl Creation {
         mut self,
     ) -> Result<(Transaction<'static, Postgres>, [u8; 32]), StoreError> {
         self.populate().await?;
-        let anchor = super::creation_anchor::contents(
+        let opening = super::creation_anchor::contents(
             &mut self.tx,
             &self.account.id,
             self.account.enrollment_store_id,
             self.account.enrollment_hash,
         )
         .await?;
-        sqlx::query("UPDATE accounts SET creation_anchor = $2 WHERE id = $1")
-            .bind(&self.account.id)
-            .bind(anchor.as_slice())
-            .execute(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-        Ok((self.tx, anchor))
+        sqlx::query(
+            "UPDATE accounts SET creation_anchor = $2, opening_material = $3 WHERE id = $1",
+        )
+        .bind(&self.account.id)
+        .bind(opening.anchor.as_slice())
+        .bind(opening.material.as_slice())
+        .execute(&mut *self.tx)
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok((self.tx, opening.anchor))
     }
 
     async fn populate(&mut self) -> Result<(), StoreError> {
@@ -479,7 +483,10 @@ impl AccountTxn {
     ) -> Result<Option<Self>, StoreError> {
         let row = sqlx::query(
             "SELECT id, identity_key, generation, last_seq, chain_seq, chain_hash, state_version, \
-             state_tag, stamped_time_ms, stamped_by, created_at_ms, activation_requirement FROM accounts \
+             state_tag, stamped_time_ms, stamped_by, created_at_ms, activation_requirement, \
+             creation_anchor, (SELECT h.creation_anchor FROM state_history h WHERE \
+             h.account_id = accounts.id AND h.state_version = accounts.state_version AND \
+             h.state_tag = accounts.state_tag) AS history_origin FROM accounts \
              WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -516,8 +523,22 @@ impl AccountTxn {
             stamped_by: stamped_by(&row)?,
             created_at_ms: from_db(row.try_get("created_at_ms")?, "created_at_ms")?,
         };
+        let stored: Option<Vec<u8>> = row.try_get("creation_anchor")?;
+        let creation_origin = match stored.as_deref() {
+            Some(stored) if head.state_version == 0 && head.last_seq == 0 => {
+                super::creation_anchor::opening_origin(&mut tx, &head, stored).await?
+            }
+            Some(stored) if head.state_version > 0 => {
+                let previous: Option<Vec<u8>> = row.try_get("history_origin")?;
+                previous
+                    .filter(|origin| origin == stored)
+                    .and_then(|origin| origin.try_into().ok())
+            }
+            _ => None,
+        };
         Ok(Some(Self {
             tx,
+            creation_origin,
             covered_version: 0,
             loaded: head.clone(),
             head,
@@ -535,6 +556,12 @@ impl AccountTxn {
             #[cfg(any(test, feature = "test-util"))]
             snapshot_pause: None,
         }))
+    }
+
+    /// The original SQL contents from which the locked transaction descends. The
+    /// consumer must match this value with evidence outside SQL (account binding 3).
+    pub(crate) fn creation_origin(&self) -> Option<[u8; 32]> {
+        self.creation_origin
     }
 
     /// The account's position, with this request's changes.
@@ -741,8 +768,8 @@ impl AccountTxn {
             const HISTORY_LIMIT: i64 = 1024;
             let limit = HISTORY_LIMIT - i64::from(mark_target.is_none());
             let inserted = sqlx::query(
-                "INSERT INTO state_history (account_id, state_version, state_tag) \
-                 SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM state_history \
+                "INSERT INTO state_history (account_id, state_version, state_tag, creation_anchor) \
+                 SELECT $1, $2, $3, $6 WHERE NOT EXISTS (SELECT 1 FROM state_history \
                  WHERE account_id = $1 AND state_version > $4 LIMIT 1 OFFSET $5)",
             )
             .bind(&self.head.id)
@@ -750,6 +777,11 @@ impl AccountTxn {
             .bind(self.head.state_tag.as_slice())
             .bind(to_db(self.covered_version, "state_version")?)
             .bind(limit - 1)
+            .bind(
+                self.creation_origin
+                    .as_ref()
+                    .map(|origin| origin.as_slice()),
+            )
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;

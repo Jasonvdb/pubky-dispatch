@@ -325,7 +325,8 @@ pub(crate) struct Inner {
     /// The tags given out, which no restore takes back.
     pub(crate) tags_made: u64,
     /// Tags retained at and after the count covered by the mark.
-    pub(crate) state_history: BTreeMap<u64, u64>,
+    pub(crate) state_history: BTreeMap<u64, (u64, Option<[u8; 32]>)>,
+    creation_origin: Option<[u8; 32]>,
     /// The count and its tag as each `seq` was given out, for a restore to that `seq`.
     pub(crate) versions: Vec<(u64, u64, u64)>,
     pub(crate) items: Vec<Item>,
@@ -490,6 +491,7 @@ impl Inner {
             state_tag: 0,
             tags_made: 0,
             state_history: BTreeMap::new(),
+            creation_origin: None,
             versions: Vec::new(),
             items: Vec::new(),
             tips: vec![tip],
@@ -1274,6 +1276,7 @@ impl ScriptedSwitch {
         if let Some(refused) = inner.preflight_refusal(request) {
             return Ok(refused);
         }
+        inner.creation_origin = inner.opening_origin();
         let answer = Self::answer_unsettled(&mut inner, request, held);
         // What the request committed is durable at once here, and the mark moves to it
         // before the answer goes out, lost or not (Switch wire 7.3 step 10).
@@ -2256,7 +2259,7 @@ impl Inner {
                 .retain(|version, _| *version >= mark.state_version);
         }
         self.state_history
-            .insert(self.state_version, self.state_tag);
+            .insert(self.state_version, (self.state_tag, self.creation_origin));
     }
 
     /// Wake every held feed read, to look again.

@@ -787,9 +787,8 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
         /// A claim read, then its effect's answer is lost: the kept effect sent again
         /// processes it.
         LostAnswer,
-        /// The protocol's store fails, which kept an observation before through a write of
-        /// its own.
-        RetryAsBefore,
+        /// The protocol's store asks the app to retry.
+        StoreRetry,
     }
     for hold in [
         Hold::OwedCall,
@@ -798,17 +797,17 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
         Hold::StaleEpoch,
         Hold::KeyFetchFails,
         Hold::LostAnswer,
-        Hold::RetryAsBefore,
+        Hold::StoreRetry,
     ] {
-        let tasks = Named {
-            with_ops: !matches!(hold, Hold::OwedCall | Hold::ClaimRead | Hold::RetryAsBefore),
+        let mut p = Pair::new();
+        p.tasks = Arc::new(Named {
+            with_ops: !matches!(hold, Hold::OwedCall | Hold::ClaimRead | Hold::StoreRetry),
             needs_claim: matches!(hold, Hold::ClaimRead | Hold::LostAnswer),
             ..named("tasks")
-        };
-        let p = Pair::with(tasks, named("chat"));
+        });
         match hold {
             Hold::OwedCall => *p.tasks.failing_missed.lock().unwrap() = 3,
-            Hold::RetryAsBefore => *p.tasks.retrying.lock().unwrap() = 2,
+            Hold::StoreRetry => *p.tasks.retrying.lock().unwrap() = 2,
             _ => {}
         }
         let mut app = p.join().await;
@@ -842,7 +841,7 @@ async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold
                 error("claims/", ErrorCode::Unavailable),
                 Fault::LoseAnswer { path: "ops".into() },
             ],
-            Hold::OwedCall | Hold::RetryAsBefore => Vec::new(),
+            Hold::OwedCall | Hold::StoreRetry => Vec::new(),
         };
         for fault in faults {
             p.w.switch.fail_next(fault);

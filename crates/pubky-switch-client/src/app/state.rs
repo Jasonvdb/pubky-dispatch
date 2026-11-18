@@ -456,9 +456,8 @@ impl ParkedRound {
     }
 }
 
-/// `held/<seq>`: an entry of the feed the cursor stays before, unprocessed, whatever it
-/// waits for, with the first observation of it, kept until the cursor passes it or it is
-/// stored locally (Switch spec 8.2, wire 7.4.4).
+/// `held/<seq>`: the first observation of an entry held or processed ahead of the cursor,
+/// kept until the cursor passes it (Switch spec 8.2, wire 7.4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
     /// When it was first held: the bounded wait of an entry whose sender can't be checked
@@ -467,6 +466,15 @@ pub(crate) struct HeldEntry {
     pub(crate) receipt: EntryReceipt,
     /// The acceptance time the page of the receipt showed: a later page shows the same.
     pub(crate) accepted_at_ms: u64,
+}
+
+impl HeldEntry {
+    pub(super) fn validate(&self) -> Result<(), AppError> {
+        if self.accepted_at_ms > self.receipt.read_at_ms {
+            return Err(super::corrupt());
+        }
+        Ok(())
+    }
 }
 
 /// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry

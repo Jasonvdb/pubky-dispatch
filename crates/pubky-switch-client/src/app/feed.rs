@@ -1170,22 +1170,13 @@ impl App {
                     {
                         read.tx.put(&key::seen(seq), &())?;
                         self.state.seen.insert(seq);
-                        // Processed ahead of the cursor, it keeps its observation as a held
-                        // entry does, unless it is stored locally, whose copy is compared.
-                        let generation = self.state.cursor.generation;
-                        if !self
-                            .state
-                            .parked
-                            .values()
-                            .any(|stored| stored.seq == seq && stored.generation == generation)
-                        {
-                            self.keep_observation(
-                                seq,
-                                observed(entry),
-                                entry.accepted_at,
-                                &mut read.tx,
-                            )?;
-                        }
+                        // Local custody can end before the cursor reaches this entry.
+                        self.keep_observation(
+                            seq,
+                            observed(entry),
+                            entry.accepted_at,
+                            &mut read.tx,
+                        )?;
                     }
                 }
                 Step::Hold => {
@@ -1299,6 +1290,7 @@ impl App {
         for seq in passed {
             read.tx.delete(&key::seen(seq))?;
             self.state.seen.remove(&seq);
+            self.drop_observation(seq, &mut read.tx)?;
         }
         let asked: Vec<u64> = self.state.asked.range(..=cursor).copied().collect();
         for seq in asked {
@@ -1334,9 +1326,8 @@ impl App {
     /// Keeps the first observation of an entry of the feed the cursor stays before, at
     /// `held/<seq>`: from the read that holds it, whatever it waits for, or processes it
     /// past an earlier one, or the commit that keeps its effect, so no later step can lose
-    /// it. Kept until the cursor passes the entry
-    /// or it is stored locally ([`App::drop_observation`]), so a later page that shows
-    /// anything else there raises the alarm (Switch spec 8.2, 10.1; wire 7.4.4).
+    /// it. A later page must agree until the cursor passes it (Switch spec 8.2, 10.1;
+    /// wire 7.4.4).
     fn keep_observation(
         &mut self,
         seq: u64,
@@ -1357,8 +1348,7 @@ impl App {
         Ok(())
     }
 
-    /// The cursor passed the entry at `seq` of the feed, or it is stored locally: its
-    /// observation goes.
+    /// The cursor passed the entry at `seq` of the feed.
     fn drop_observation(&mut self, seq: u64, tx: &mut Tx) -> Result<(), AppError> {
         if self.state.held.remove(&seq).is_some() {
             tx.delete(&key::held(seq))?;
@@ -1387,15 +1377,20 @@ impl App {
             .collect();
         page.items.iter().find_map(|item| {
             let seq = item.seq();
-            let (entry_id, accepted_at) = self
+            let shown = match item {
+                FeedItem::Entry(entry) => Some((entry.entry_id, entry.accepted_at)),
+                _ => None,
+            };
+            let held = self
                 .state
                 .held
                 .get(&seq)
-                .map(|held| (held.receipt.entry_id, held.accepted_at_ms))
-                .or_else(|| stored.get(&seq).copied())?;
-            let same = matches!(item, FeedItem::Entry(entry)
-                if entry.entry_id == entry_id && entry.accepted_at == accepted_at);
-            (!same).then_some(seq)
+                .map(|held| (held.receipt.entry_id, held.accepted_at_ms));
+            let differs = held
+                .into_iter()
+                .chain(stored.get(&seq).copied())
+                .any(|observation| Some(observation) != shown);
+            differs.then_some(seq)
         })
     }
 
@@ -1418,26 +1413,12 @@ impl App {
         receipt: EntryReceipt,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        // The first observation of an entry held at this `seq` is kept, and only for that
-        // entry, accepted when it first showed. A page that contradicts what an earlier page showed raised
-        // the alarm before any of its items was handled (`contradicted_observation`), and a page
-        // shows one item per `seq` (`FeedPage`), so no other entry takes the held receipt
-        // and no kept observation precedes its entry's acceptance (Switch wire 7.4.4).
-        let receipt = match self.state.held.get(&item.seq) {
-            Some(held)
-                if held.receipt.entry_id == item.entry_id
-                    && item.accepted_at == held.accepted_at_ms =>
-            {
-                held.receipt
-            }
-            Some(_) => {
-                return Err(AppError::InvalidData(
-                    "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at its seq"
-                        .into(),
-                ));
-            }
-            None => receipt,
-        };
+        // The page has already been compared with every kept observation (Switch wire 7.4.4).
+        let receipt = self
+            .state
+            .held
+            .get(&item.seq)
+            .map_or(receipt, |held| held.receipt);
         let entry = Entry {
             receipt,
             seq: item.seq,
@@ -2064,6 +2045,15 @@ impl App {
         read: &mut Read,
     ) -> Result<Option<Step>, AppError> {
         if self.key_may_come_by_fetch(data_epoch) {
+            if entry.stored.is_none() {
+                self.keep_observation(
+                    entry.seq,
+                    entry.receipt,
+                    entry.accepted_at_ms,
+                    &mut read.tx,
+                )?;
+                self.commit_read(read).await?;
+            }
             self.fetch_key_parts().await?;
             if self.holds_epoch_keys(data_epoch) {
                 return Ok(None);
@@ -2478,9 +2468,6 @@ impl App {
         };
         tx.put(&key::parked(id), &parked)?;
         self.state.parked.insert(id, parked);
-        if pending.stored.is_none() {
-            self.drop_observation(pending.seq, tx)?;
-        }
         // Stored for good: a count of the store's retries at it goes.
         self.drop_retries(pending.stored.is_none().then_some(pending.seq), id, tx)?;
         // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
@@ -2500,6 +2487,7 @@ impl App {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
+            self.drop_observation(pending.seq, tx)?;
             let cursor = &mut self.state.cursor;
             cursor.seq = cursor.seq.max(pending.seq);
             cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
@@ -2767,11 +2755,6 @@ impl App {
             keys_at: reason.awaited_epoch().map(|_| self.keys_held()),
         };
         read.tx.put(&key::parked(id), &parked)?;
-        // An entry read from the feed may have been held there; a stored one's `seq` names
-        // no position of the feed read now.
-        if entry.stored.is_none() {
-            self.drop_observation(entry.seq, &mut read.tx)?;
-        }
         self.state.parked.insert(id, parked);
         if reason.tried_again() {
             if reason.awaited_epoch().is_some() {

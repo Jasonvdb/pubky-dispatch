@@ -353,6 +353,85 @@ async fn test_admission_held_backup_restore_keeps_the_first_observation() {
 }
 
 #[tokio::test]
+async fn test_admission_entries_consumed_ahead_keep_their_observations_until_passed() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    let (parked, _) = w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    let first = app.stored_at(parked).unwrap().receipt;
+    p.set(Mode::Consume);
+    w.clock.advance_ms(1);
+    let (direct, message) = w.note(me, "consume");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq < held);
+    assert!(app.stored_at(parked).is_none());
+    assert!(
+        p.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &message.msg_id)
+    );
+    assert!(app.state.seen.contains(&direct));
+    drop(app);
+
+    let mut app = App::load(w.env(), p.clone(), World::config(), me)
+        .await
+        .unwrap();
+    assert_eq!(app.state.held[&parked].receipt, first);
+    assert!(app.state.held.contains_key(&direct));
+    p.hold.store(false, Ordering::SeqCst);
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= direct);
+    assert!(app.state.held.is_empty());
+}
+
+#[tokio::test]
+async fn test_admission_backup_checks_the_first_observation() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let me = app.app_id();
+    p.hold.store(true, Ordering::SeqCst);
+    let (held, _) = w.note(me, "held");
+    let (parked, _) = w.note(me, "wait");
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let first = app.stored_at(parked).unwrap().receipt;
+    assert!(
+        backup
+            .waiting
+            .held
+            .iter()
+            .any(|(seq, observation)| *seq == parked && observation.receipt == first)
+    );
+
+    let mut timing = backup.clone();
+    let (_, observation) = timing
+        .waiting
+        .held
+        .iter_mut()
+        .find(|(seq, _)| *seq == held)
+        .unwrap();
+    observation.accepted_at_ms = observation.receipt.read_at_ms + 1;
+    assert!(timing.waiting.validate(&timing, &app.protocols).is_err());
+
+    let mut custody = backup;
+    let (_, stored) = custody
+        .waiting
+        .entries
+        .iter_mut()
+        .find(|(_, stored)| stored.seq == parked)
+        .unwrap();
+    stored.receipt.entry_id[0] ^= 1;
+    assert!(custody.waiting.validate(&custody, &app.protocols).is_err());
+}
+
+#[tokio::test]
 async fn test_admission_retry_is_fair_and_keeps_receipts_across_reload() {
     let w = World::new();
     let p = Admission::new();

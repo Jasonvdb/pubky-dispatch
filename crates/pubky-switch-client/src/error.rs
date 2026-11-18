@@ -97,6 +97,12 @@ pub enum BatchError {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
+    /// The transport could not establish a timely first handoff.
+    #[error("the first handoff cannot be established")]
+    FirstSendUnavailable,
+    /// The exclusive deadline passed before the guarded request could be released.
+    #[error("the first-handoff deadline has passed")]
+    FirstSendExpired,
     /// The origin, or an address its host resolves to, isn't one the client may connect to
     /// (Switch wire 7.1, 8.2). Nothing was sent.
     #[error("refused origin: {0}")]

@@ -221,6 +221,15 @@ impl SwitchClient {
         batch: &Batch,
         proof_key: &[u8; 32],
     ) -> Result<Submitted, CallError> {
+        self.submit_before(batch, proof_key, None).await
+    }
+
+    pub(crate) async fn submit_before(
+        &self,
+        batch: &Batch,
+        proof_key: &[u8; 32],
+        first: Option<&crate::transport::FirstSend>,
+    ) -> Result<Submitted, CallError> {
         let checked = self
             .call_with_head(
                 "POST",
@@ -228,6 +237,7 @@ impl SwitchClient {
                 batch.body.clone(),
                 Body::Json,
                 Auth {
+                    first_send: first,
                     timeout: batch.timeout(),
                     ..Auth::default()
                 },

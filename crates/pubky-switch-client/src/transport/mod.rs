@@ -131,6 +131,84 @@ impl Response {
     }
 }
 
+/// Admission for the first local handoff of one exact signed operation body. A
+/// transport checks this after its last wait, at the point it releases the request.
+pub struct FirstSend {
+    clock: std::sync::Arc<dyn crate::clock::Clock>,
+    local_ms: u64,
+    service_ms: u64,
+    before_ms: u64,
+    observed: std::time::Instant,
+    confirmed: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for FirstSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirstSend")
+            .field("before_ms", &self.before_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FirstSend {
+    pub(crate) fn new(
+        clock: std::sync::Arc<dyn crate::clock::Clock>,
+        highest_ms: u64,
+        offset_ms: i64,
+        before_ms: u64,
+    ) -> Self {
+        let observed = std::time::Instant::now();
+        let local_ms = clock.now_ms();
+        Self {
+            local_ms,
+            clock,
+            service_ms: highest_ms.max(local_ms.saturating_add_signed(offset_ms)),
+            before_ms,
+            observed,
+            confirmed: false.into(),
+        }
+    }
+
+    /// Check immediately before releasing the request. A delayed transport checks
+    /// again after becoming writable. Equality is too late (Switch spec 10.1).
+    /// Report `FirstSendExpired` to the client only if no part of this request was
+    /// released. After a partial write, report an uncertain transport failure.
+    ///
+    /// # Errors
+    ///
+    /// The deadline has passed or the clocks cannot establish a timely first handoff.
+    pub fn check(&self) -> Result<(), TransportError> {
+        if self.confirmed() {
+            return Ok(());
+        }
+        let now = self.clock.now_ms();
+        let elapsed = now
+            .checked_sub(self.local_ms)
+            .ok_or(TransportError::FirstSendUnavailable)?;
+        let monotonic = u64::try_from(self.observed.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let latest = self
+            .service_ms
+            .saturating_add(elapsed.max(monotonic))
+            .max(now);
+        if self.local_ms.abs_diff(self.service_ms) > pubky_switch_core::records::CLOCK_TOLERANCE_MS
+        {
+            return Err(TransportError::FirstSendUnavailable);
+        }
+        if latest >= self.before_ms {
+            return Err(TransportError::FirstSendExpired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirm(&self) {
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn confirmed(&self) -> bool {
+        self.confirmed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Carries requests to a switch and their responses back.
 ///
 /// Object-safe, so a client holds an `Arc<dyn Transport>`. An implementation follows no
@@ -138,6 +216,17 @@ impl Response {
 pub trait Transport: Send + Sync {
     /// Send one request and return its response, whatever its status.
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>>;
+
+    /// Carry a batch whose first local handoff has a deadline. A transport that
+    /// delegates or queues the request passes the check to the component releasing
+    /// it. A transport without that facility leaves the request unsent.
+    fn send_before<'a>(
+        &'a self,
+        _request: Request,
+        _first: &'a FirstSend,
+    ) -> BoxFuture<'a, Result<Response, TransportError>> {
+        Box::pin(async { Err(TransportError::FirstSendUnavailable) })
+    }
 }
 
 #[cfg(test)]

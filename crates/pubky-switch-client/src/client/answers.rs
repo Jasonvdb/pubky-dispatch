@@ -1055,7 +1055,7 @@ impl AppsAnswer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicIdentity {
     /// The time the service signed for this answer, in Unix milliseconds.
-    pub(crate) server_time_ms: u64,
+    server_time_ms: u64,
     /// The newest `identity.json` the service holds, verified with the account's identity.
     pub identity: IdentityDoc,
     /// The freeze while the account is frozen, verified with the account's identity.
@@ -1063,6 +1063,13 @@ pub struct PublicIdentity {
 }
 
 impl PublicIdentity {
+    /// The verified service time for this public response, in Unix milliseconds. A reader
+    /// caching the document measures its age from the earlier of this time and its request
+    /// start (Switch wire 3.3).
+    pub fn server_time_ms(&self) -> u64 {
+        self.server_time_ms
+    }
+
     pub(crate) fn read(
         o: Obj<'_>,
         account: &[u8; 32],

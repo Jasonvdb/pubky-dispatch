@@ -965,6 +965,81 @@ async fn test_identity_lookup_directory_version_needs_its_own_read() {
 }
 
 #[tokio::test]
+async fn test_peer_lookup_reports_successor_service_observation_after_a_move() {
+    use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
+    for homeserver_before_finish in [false, true] {
+        let p = Pair::new();
+        let protocol = ReadsProtocol::new(Mode::Settle);
+        let mut wallet = p
+            .join_on(
+                &p.alice,
+                "wallet",
+                protocol.clone(),
+                Arc::new(MemoryStore::new()),
+            )
+            .await;
+        let _shop = p
+            .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+            .await;
+        let bob = p.bob.identity().public();
+        let old_body = p.bob.body();
+        let next_origin = "https://next.example";
+        let secret = [23; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let next_inbox = Inbox::new(next_origin, key.verifying_key().to_bytes());
+        let generation = old_body.generation + 1;
+        let freeze = Freeze::sign(
+            p.bob.identity().key(),
+            FreezeBody {
+                identity: bob,
+                inbox: next_inbox.clone(),
+                next_generation: generation,
+                issued_at: p.clock.now_ms(),
+                nonce: [17; 16],
+            },
+        )
+        .unwrap();
+        p.bob.switch().freeze(&freeze).unwrap();
+        let next = p.bob.switch().import_into_at(secret, next_origin);
+        let service_time = p.clock.now_ms();
+        next.lock().clock = Arc::new(crate::clock::TestClock::new(service_time));
+        p.router.add_switch(next_origin, &next);
+        let mut body = old_body;
+        body.version += 1;
+        body.generation = generation;
+        body.inbox = next_inbox;
+        let moved = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+        next.deliver_identity(&moved).unwrap();
+        p.clock.advance_ms(4 * MINUTE);
+        let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+        let switch = lookup.switch.unwrap().await;
+        assert!(switch.read());
+        p.bob.homeserver().publish(&moved).unwrap();
+        if homeserver_before_finish {
+            let routed = wallet.peer_identity(&bob, true).await.unwrap();
+            assert_eq!(routed.version(), moved.version());
+        }
+        let first = wallet.finish_identity_lookup(switch).await.unwrap();
+        assert_eq!(first.doc.version(), moved.version());
+        assert_eq!(first.homeserver_read_ms, homeserver_before_finish.then(|| p.clock.now_ms()));
+        assert_eq!(first.switch_lookup_ms, service_time);
+        assert_eq!(first.switch_read_ms, Some(service_time));
+        assert_eq!(first.fresh_until_ms(), service_time + DOC_CACHE_MS);
+        p.clock.set_ms(service_time + DOC_CACHE_MS);
+        // Ordinary routing refreshes an expired document from the Homeserver.
+        let routed = wallet.peer_identity(&bob, false).await.unwrap();
+        assert_eq!(routed.version(), moved.version());
+        let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+        assert_eq!(lookup.identity.homeserver_read_ms, Some(p.clock.now_ms()));
+        assert_eq!(lookup.identity.switch_read_ms, Some(service_time));
+        assert!(
+            lookup.switch.is_some(),
+            "the successor's public observation is ten minutes old; it needs a new switch lookup"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_identity_lookup_freeze_retains_the_first_source() {
     use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
     let p = Pair::new();
@@ -1008,14 +1083,24 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     assert_eq!(unavailable.switch_read_ms, Some(first));
     let next = p.bob.switch().import_into_at(secret, next_origin);
     p.router.add_switch(next_origin, &next);
+    let staged_time = first;
+    next.lock().clock = Arc::new(crate::clock::TestClock::new(staged_time));
+    p.clock.advance_ms(4 * MINUTE);
+    let predecessor_time = p.clock.now_ms();
     let staged = wallet.identity_of(&bob, true).await.unwrap();
     assert_eq!(staged.switch_copy, SwitchCopy::Read);
-    assert_eq!(staged.read_at_ms, Some(first));
+    assert_eq!(staged.read_at_ms, Some(predecessor_time));
+    assert_eq!(staged.switch_read_ms, Some(predecessor_time));
+    assert_eq!(staged.switch_lookup_ms, staged_time);
+    assert_eq!(staged.fresh_until_ms(), staged_time + DOC_CACHE_MS);
     next.lock().clock = Arc::new(crate::clock::TestClock::new(first + 20 * MINUTE));
     let refused = wallet.identity_of(&bob, true).await.unwrap();
     assert_eq!(refused.switch_copy, SwitchCopy::Stale);
-    assert_eq!(refused.switch_read_ms, Some(first));
-    assert_eq!(refused.may_act(first, Initiator::Automatic, 0), MayAct::No);
+    assert_eq!(refused.switch_read_ms, Some(predecessor_time));
+    assert_eq!(
+        refused.may_act(predecessor_time, Initiator::Automatic, 0),
+        MayAct::No
+    );
     let kept = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(kept.switch_copy, SwitchCopy::Stale);
 }

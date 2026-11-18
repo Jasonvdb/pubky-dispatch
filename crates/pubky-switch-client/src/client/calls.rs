@@ -409,6 +409,7 @@ impl SwitchClient {
                     timeout: TimeoutClass::Bulk,
                     ..Auth::default()
                 },
+                &mut None,
             )
             .await?;
         Ok(AppendCall(step))
@@ -418,7 +419,7 @@ impl SwitchClient {
         &self,
         call: AppendCall,
     ) -> Result<AppendAnswer, ClientError> {
-        let checked = self.finish_call(call.0).await?;
+        let checked = self.finish_call(call.0, &mut None).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.3: an append answer")?;
         AppendAnswer::read(Obj::of(&value, what)?)
@@ -955,8 +956,17 @@ impl SwitchClient {
     /// [`ClientError::Unpinned`] before sending without a service key, [`ClientError::StaleAnswer`]
     /// for a response outside the time window, or [`ClientError::Core`] for an invalid document.
     pub async fn public_identity(&self) -> Result<PublicIdentity, ClientError> {
-        let checked = self
-            .call(
+        self.public_identity_with_time(&mut None).await
+    }
+
+    /// Also keep the verified time of a fresh refusal, including a staged successor
+    /// that completes a public lookup without supplying a document (Switch wire 3.3).
+    pub(crate) async fn public_identity_with_time(
+        &self,
+        public_time: &mut Option<u64>,
+    ) -> Result<PublicIdentity, ClientError> {
+        let step = self
+            .start_call(
                 "GET",
                 &self.path("identity"),
                 Vec::new(),
@@ -965,8 +975,10 @@ impl SwitchClient {
                     public: true,
                     ..Auth::default()
                 },
+                public_time,
             )
             .await?;
+        let checked = self.finish_call(step, public_time).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.15: a public read")?;
         PublicIdentity::read(

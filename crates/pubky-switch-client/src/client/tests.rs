@@ -1068,7 +1068,9 @@ async fn test_public_read_signed_time_window() {
                         ClientError::StaleAnswer { server_time_ms: at }
                     );
                 } else if status == 200 {
-                    assert_eq!(answer.unwrap().identity.version(), doc.version());
+                    let public = answer.unwrap();
+                    assert_eq!(public.identity.version(), doc.version());
+                    assert_eq!(public.server_time_ms(), at);
                 } else {
                     assert!(matches!(
                         answer,

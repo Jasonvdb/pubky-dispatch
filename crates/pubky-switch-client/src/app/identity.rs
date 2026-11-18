@@ -92,11 +92,11 @@ impl App {
     /// waking, and before an attempt that needs a fresh copy.
     ///
     /// An app makes no attempt without an `identity.json` revalidated in the last
-    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Before one, a wallet calls
-    /// this and goes ahead only when [`IdentityRefresh::confirmed_at`] is `Some`, or when
-    /// [`App::identity_confirmed_at`] is less than [`REVALIDATION_MS`] before the app's clock:
-    /// `Missing`, `Older`, `Unavailable` and an error confirm nothing, so a document missing
-    /// from the Homeserver stops attempts once the last confirmation is 60 seconds old.
+    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Before an attempt, compare
+    /// the time from [`IdentityRefresh::confirmed_at`] or [`App::identity_confirmed_at`]
+    /// with the device clock after the read completes. The time must be at or before now
+    /// and less than [`REVALIDATION_MS`] old. A missing, older or unavailable copy and a
+    /// failed read leave the current version without a new confirmation.
     ///
     /// # Errors
     ///

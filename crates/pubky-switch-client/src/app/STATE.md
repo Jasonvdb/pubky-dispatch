@@ -231,7 +231,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
 | `ident/<pubky>/equivocated` | the version at which another body was seen | |
-| `ident/<pubky>/sw` | the version covered by the lookup, its starting time capped by the signed time, its number, and whether the switch copy was read, stale or unavailable | |
+| `ident/<pubky>/sw` | the version covered by the lookup, its starting time capped by the signed time of each service needed to complete it, its number, and whether the switch copy was read, stale or unavailable | |
 | `ident/<pubky>/swn` | the number of the last switch lookup begun for a counterparty, which orders the lookups whatever the clock reads | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq` and service time, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |

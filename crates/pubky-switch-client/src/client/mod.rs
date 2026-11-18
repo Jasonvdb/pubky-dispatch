@@ -989,9 +989,9 @@ impl SwitchClient {
         auth: Auth<'_>,
     ) -> Result<CheckedResponse, ClientError> {
         let step = self
-            .start_call(method, path_and_query, body, content, auth)
+            .start_call(method, path_and_query, body, content, auth, &mut None)
             .await?;
-        self.finish_call(step).await
+        self.finish_call(step, &mut None).await
     }
 
     pub(crate) async fn start_call(
@@ -1001,12 +1001,15 @@ impl SwitchClient {
         body: Vec<u8>,
         content: Body,
         auth: Auth<'_>,
+        public_time: &mut Option<u64>,
     ) -> Result<CallStep, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
-        let checked = self.send_checked(signed, key, auth.success_key).await?;
+        let checked = self
+            .send_checked(signed, key, auth.success_key, public_time)
+            .await?;
         let Some(at) = stale_timestamp_hint(&checked) else {
             return checked.map(CallStep::Answer);
         };
@@ -1022,11 +1025,15 @@ impl SwitchClient {
         })))
     }
 
-    pub(crate) async fn finish_call(&self, step: CallStep) -> Result<CheckedResponse, ClientError> {
+    pub(crate) async fn finish_call(
+        &self,
+        step: CallStep,
+        public_time: &mut Option<u64>,
+    ) -> Result<CheckedResponse, ClientError> {
         match step {
             CallStep::Answer(answer) => Ok(answer),
             CallStep::Retry(retry) => {
-                self.send_checked(retry.signed, retry.key, retry.success_key)
+                self.send_checked(retry.signed, retry.key, retry.success_key, public_time)
                     .await?
             }
         }
@@ -1160,7 +1167,9 @@ impl SwitchClient {
         signed: SignedRequest,
         key: [u8; 32],
         success_key: Option<[u8; 32]>,
+        public_time: &mut Option<u64>,
     ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
+        *public_time = None;
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
         let key = match success_key {
@@ -1192,7 +1201,10 @@ impl SwitchClient {
                 {
                     Err(ClientError::StaleAnswer { server_time_ms })
                 }
-                _ => checked,
+                _ => {
+                    *public_time = signed_ms;
+                    checked
+                }
             }
         } else {
             checked
@@ -1212,7 +1224,7 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.forget_latest();
-        self.send_checked(signed, key, None).await?
+        self.send_checked(signed, key, None, &mut None).await?
     }
 
     /// The App ID as a path segment.

@@ -374,12 +374,13 @@ impl SwitchAnswer {
         self.pubky
     }
 
-    /// Whether the switch gave its copy.
+    /// Whether the whole switch lookup succeeded. Finish the answer even after a failed
+    /// successor lookup to retain a verified copy from the preceding service.
     pub fn read(&self) -> bool {
         self.outcome == SwitchCopy::Read
     }
 
-    /// When the lookup began, capped by the first verified copy's service time.
+    /// The lookup start, capped by the signed time of each service needed to complete it.
     pub fn read_ms(&self) -> u64 {
         self.read_ms
     }
@@ -709,7 +710,7 @@ impl App {
                     return answer;
                 }
             };
-            let observed = started.min(public.server_time_ms).min(clock.now_ms());
+            let observed = started.min(public.server_time_ms()).min(clock.now_ms());
             answer.read_ms = observed;
             answer.version = answer.version.max(public.identity.version());
             answer.copies.push((public.identity, observed));
@@ -725,9 +726,10 @@ impl App {
                     return answer;
                 };
                 let next_started = clock.now_ms();
-                match next.public_identity().await {
+                let mut signed_time = None;
+                match next.public_identity_with_time(&mut signed_time).await {
                     Ok(public) => {
-                        let observed = next_started.min(public.server_time_ms).min(clock.now_ms());
+                        let observed = next_started.min(public.server_time_ms()).min(clock.now_ms());
                         answer.version = answer.version.max(public.identity.version());
                         answer.copies.push((public.identity, observed));
                         if public.freeze.is_some() {
@@ -743,6 +745,14 @@ impl App {
                         return answer;
                     }
                 }
+                let Some(signed_time) = signed_time else {
+                    return answer;
+                };
+                answer.read_ms = answer
+                    .read_ms
+                    .min(next_started)
+                    .min(signed_time)
+                    .min(clock.now_ms());
             }
             answer.outcome = SwitchCopy::Read;
             answer

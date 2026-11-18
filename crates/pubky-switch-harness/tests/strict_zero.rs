@@ -320,6 +320,8 @@ async fn two_uploads_at_one_version(world: &World) {
         .put_record(&target, br#"{"n":2}"#, Vec::new())
         .await
         .unwrap();
+    let held = wallet.app.shared_record(&key).await.unwrap().unwrap();
+    assert!(!held.different_write_at_held_version);
     let a_view = wallet.get(&key).await;
     let a_op = SignedOp::peek(&serde_json::from_value(a_view["op"].clone()).unwrap()).unwrap();
     // B: the phone's operation on the same base as A, so one version with it at N.
@@ -368,11 +370,16 @@ async fn two_uploads_at_one_version(world: &World) {
         Some(ErrorCode::Conflict),
         "naming A over B: {first:?}"
     );
+    let held = wallet.app.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.version, a.version);
+    assert!(held.different_write_at_held_version);
     wallet
         .app
         .put_record(&target, br#"{"n":3}"#, Vec::new())
         .await
         .unwrap();
+    let held = wallet.app.shared_record(&key).await.unwrap().unwrap();
+    assert!(!held.different_write_at_held_version);
     let written = wallet.get(&key).await;
     let op = SignedOp::peek(&serde_json::from_value(written["op"].clone()).unwrap()).unwrap();
     assert!(op.body().conditions.contains(&Condition::RecordCurrent {

@@ -7041,6 +7041,94 @@ async fn test_records_fresh_read_after_a_list_ending_at_an_inbox_entry() {
 }
 
 #[tokio::test]
+async fn test_records_key_read_remembers_a_new_head_after_an_interrupted_list() {
+    use crate::app::state::{ChainRecord, key};
+
+    let s = Setup::new();
+    let wallet = s.join("wallet").await;
+    let id = wallet.app_id();
+    drop(wallet);
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    let mut wallet = App::load(
+        s.env_on(store.clone()),
+        s.protocol.clone(),
+        World::config(),
+        id,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    let target = s.target("notes");
+    let written = phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let (inbox, _) = s.w.note(id, "after the record");
+    let earlier = wallet.client.record(&written.key).await.unwrap().head;
+    assert!(earlier.seq < inbox);
+    assert!(
+        !wallet
+            .list_collection(&target.collection)
+            .await
+            .unwrap()
+            .more
+    );
+
+    phone
+        .put_record(&s.target("another"), &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let later = wallet.client.record(&written.key).await.unwrap().head;
+    assert!(later.seq > inbox);
+    // The page arrives, but the local certificate read fails before its first commit.
+    let certs = format!(
+        "ocert/{}/",
+        pubky_switch_core::enc::zbase32_encode(&phone.app_id())
+    );
+    store.fail_scan(certs.as_bytes(), 0);
+    assert!(matches!(
+        wallet.list_collection(&target.collection).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(wallet.state.chain.as_ref().unwrap().newest, Some(later));
+    assert_eq!(
+        wallet
+            .reader()
+            .get::<ChainRecord>(key::CHAIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .newest,
+        Some(earlier.to_value())
+    );
+
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    s.w.switch.fail_next(Fault::Head {
+        path: "/records/".into(),
+        at: Some(earlier.seq),
+        forked: false,
+    });
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::Overtaken { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+}
+
+#[tokio::test]
 async fn test_records_read_fresh_tells_a_fresh_read_from_a_kept_copy() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;

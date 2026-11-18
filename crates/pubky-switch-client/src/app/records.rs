@@ -58,7 +58,7 @@ use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
 use super::order::{Handover, Kept};
 use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
-use super::state::Tx;
+use super::state::{ChainRecord, Tx, key};
 use super::{App, AppError, FeedPosition, IdentityRefresh};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, SharedRecordView};
@@ -1489,28 +1489,8 @@ impl App {
             }
             Err(error) => return Err(error),
         };
-        let active = head.generation == self.state.meta.generation;
-        let at_known_tip = active
-            && self.state.chain.as_ref().is_some_and(|chain| {
-                chain.newest == Some(head) && chain.verified_seq() <= head.seq
-            });
         let at = self.current_at(head, None).await?;
-        // A later key observation, including an absence, must still disqualify an
-        // earlier GET after a restart (Switch wire 7.1, 7.4.9).
-        if active
-            && (!at_known_tip || view.is_none())
-            && self
-                .state
-                .chain
-                .as_ref()
-                .is_some_and(|chain| chain.newest == Some(head))
-        {
-            let mut tx = self.tx()?;
-            if let Some(chain) = self.state.chain.as_mut() {
-                chain.write(&mut tx)?;
-                self.commit(tx).await?;
-            }
-        }
+        let at_known_tip = self.keep_record_tip(head).await?;
         // An upload has no record.put of its own. Only an observation covering that
         // transition can judge what the upload changed, even at a previously unknown key.
         let covers_uploads = self.covers_uploads(position(head.generation, head.seq), uploads);
@@ -1535,6 +1515,45 @@ impl App {
         } else {
             RecordAnswer::Inconclusive
         })
+    }
+
+    /// Keep the newest observed head before a key read takes effect. A listing can
+    /// learn it in memory before a local read interrupts its first commit. Only a tip
+    /// already saved by an earlier observation can confirm an inbox-only advance.
+    async fn keep_record_tip(&mut self, head: SignedHead) -> Result<bool, AppError> {
+        let Some(chain) = &self.state.chain else {
+            return Ok(false);
+        };
+        let Some(tip) = chain.newest else {
+            return Ok(false);
+        };
+        if head.generation != self.state.meta.generation || tip.generation != head.generation {
+            return Ok(false);
+        }
+        let saved = self.reader().get::<ChainRecord>(key::CHAIN).await?;
+        if let Some(saved) = saved {
+            if saved.last_seq > tip.seq {
+                return Ok(false);
+            }
+            if let Some(value) = saved.newest {
+                let prior = SignedHead::from_value(&value)
+                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+                if prior == tip {
+                    return Ok(head == tip && chain.verified_seq() <= head.seq);
+                }
+                if prior.generation > tip.generation
+                    || (prior.generation == tip.generation && prior.seq >= tip.seq)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        let mut tx = self.tx()?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+            self.commit(tx).await?;
+        }
+        Ok(false)
     }
 
     /// Compare a refused batch's record evidence at the head of that reply (Switch wire

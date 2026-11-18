@@ -30,7 +30,7 @@ use crate::{
     service::verdict::{self, Account, AccountState, Inputs, Judgement, MarkInput, Verdict},
     store::{
         StoreError,
-        heads::{self, StoredHead},
+        heads::{self, MarkEvidence, StoredHead},
     },
 };
 
@@ -357,7 +357,7 @@ pub(crate) fn judge_identity(
     identity: &str,
     head: Option<&StoredHead>,
     mark: &MarkInput,
-    stub_at_mark: Option<[u8; 32]>,
+    evidence: MarkEvidence,
     marks: &MarkView,
     retired: &[u64],
     origin: &str,
@@ -367,7 +367,8 @@ pub(crate) fn judge_identity(
     let judgement = verdict::judge(&Inputs {
         account: judged.as_ref().map(|(account, _)| account),
         mark,
-        stub_at_mark,
+        stub_at_mark: evidence.stub,
+        tag_at_mark: evidence.tag,
         erasure_at_ms: marks.erasure(identity)?,
         retired,
         current_key: *service_key,
@@ -395,7 +396,7 @@ fn judge_line(
     identity: &str,
     head: Option<&StoredHead>,
     mark: &MarkInput,
-    stub_at_mark: Option<[u8; 32]>,
+    evidence: MarkEvidence,
     marks: &MarkView,
     origin: &str,
     service_key: &[u8; 32],
@@ -405,7 +406,7 @@ fn judge_line(
         identity,
         head,
         mark,
-        stub_at_mark,
+        evidence,
         marks,
         &retired,
         origin,
@@ -446,8 +447,7 @@ pub(crate) struct IdentityRead {
     pub(crate) mark: MarkInput,
     /// Its account, read after the mark, if the database holds one.
     pub(crate) head: Option<StoredHead>,
-    /// The hash of the stub the account holds at the mark's `seq`, where that counts.
-    pub(crate) stub_at_mark: Option<[u8; 32]>,
+    pub(crate) evidence: MarkEvidence,
 }
 
 /// Read one identity: its mark, then its account, then the stub at the mark.
@@ -461,14 +461,14 @@ pub(crate) async fn read_identity(
         .await?
         .into_iter()
         .find(|head| head.id == identity);
-    let stub_at_mark = match &head {
-        Some(head) => stub_at(conn, head, &mark).await?,
-        None => None,
+    let evidence = match &head {
+        Some(head) => evidence_at(conn, marks, head, &mark).await?,
+        None => MarkEvidence::default(),
     };
     Ok(IdentityRead {
         mark,
         head,
-        stub_at_mark,
+        evidence,
     })
 }
 
@@ -512,8 +512,9 @@ async fn check(
                 seen.remove(id);
                 continue;
             };
-            let stub = stub_at(conn, head, mark).await?;
-            if let Some(line) = judge_line(id, Some(head), mark, stub, marks, origin, service_key)?
+            let evidence = evidence_at(conn, marks, head, mark).await?;
+            if let Some(line) =
+                judge_line(id, Some(head), mark, evidence, marks, origin, service_key)?
             {
                 report.add(line, options.all);
             }
@@ -531,7 +532,7 @@ async fn check(
             &identity,
             read.head.as_ref(),
             &read.mark,
-            read.stub_at_mark,
+            read.evidence,
             marks,
             origin,
             service_key,
@@ -545,19 +546,27 @@ async fn check(
 /// The stub `head`'s account holds at the mark's generation and `seq`, where its state is
 /// past the mark, whatever the state's generation, as the service reads it
 /// ([`verdict::stub_for_fork_rule`]).
-async fn stub_at(
+async fn evidence_at(
     conn: &mut PgConnection,
+    marks: &MarkView,
     head: &StoredHead,
     mark: &MarkInput,
-) -> Result<Option<[u8; 32]>, CheckError> {
+) -> Result<MarkEvidence, CheckError> {
     let MarkInput::Mark(held) = mark else {
-        return Ok(None);
+        return Ok(MarkEvidence::default());
     };
+    if held.created_at_ms != head.created_at_ms {
+        return Ok(MarkEvidence::default());
+    }
     let state = head.chain.map(|(seq, _)| (head.generation, seq));
-    let Some((generation, seq)) = verdict::stub_for_fork_rule(state, held) else {
-        return Ok(None);
-    };
-    Ok(heads::stub_hash_at(conn, &head.id, generation, seq).await?)
+    let stub = verdict::stub_for_fork_rule(state, held);
+    let evidence = heads::evidence_at(conn, &head.id, stub, held).await?;
+    if held.state_version > 0 && evidence.tag.is_none() && mark_input(marks, &head.id)? != *mark {
+        return Err(
+            StoreError::Raced("the mark advanced during the check; run check-marks again").into(),
+        );
+    }
+    Ok(evidence)
 }
 
 /// The identity's mark as the verdict takes it.
@@ -620,6 +629,7 @@ mod tests {
             account: account.as_ref(),
             mark,
             stub_at_mark: None,
+            tag_at_mark: None,
             erasure_at_ms: erasure,
             retired: &[],
             current_key: KEY,
@@ -687,7 +697,7 @@ mod tests {
                     "alice",
                     None,
                     &MarkInput::Missing,
-                    None,
+                    MarkEvidence::default(),
                     &view,
                     "https://switch.example",
                     &KEY
@@ -705,7 +715,7 @@ mod tests {
                     "alice",
                     None,
                     &MarkInput::Missing,
-                    None,
+                    MarkEvidence::default(),
                     &view,
                     "https://switch.example",
                     &KEY

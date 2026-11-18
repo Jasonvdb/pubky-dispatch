@@ -317,6 +317,103 @@ async fn test_check_marks_reports_counts_and_tags_for_behind_and_fork() {
 }
 
 #[tokio::test]
+async fn test_check_marks_reads_the_tag_at_the_acknowledged_count() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let id = alice_id();
+    let held = mark_of(&replay, &id).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&id)
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.next_seq().expect("next seq");
+    let committed = txn.commit().await.expect("commit");
+    assert_eq!(committed.head().state_version, held.state_version + 1);
+    let report = check(&replay, true).await;
+    assert_eq!(find(&report.accounts, &id).state, MarkState::Healthy);
+
+    // The current count and its tag stay the same. Without the marked ancestor this
+    // database cannot account for the acknowledged commit.
+    write(
+        &replay.db,
+        &format!(
+            "DELETE FROM state_history WHERE account_id = '{id}' AND state_version = {}",
+            held.state_version
+        ),
+    )
+    .await;
+    let report = check(&replay, false).await;
+    assert_eq!(find(&report.accounts, &id).state, MarkState::Fork);
+    let answer = replay
+        .service
+        .handle(request("GET", &format!("/v1/{id}/identity"), &[], vec![]))
+        .await;
+    assert_eq!(answer.status, 503);
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("notice");
+    assert_eq!(body["current"]["reason"], "fork");
+    assert_eq!(mark_of(&replay, &id).await, held);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_check_marks_full_history_catches_up_after_a_read() {
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let id = alice_id();
+    let held = mark_of(&replay, &id).await;
+    // A database 1,024 commits ahead, with the acknowledged tag still retained.
+    let full = held.state_version + 1024;
+    write(
+        &replay.db,
+        &format!(
+            "INSERT INTO state_history (account_id, state_version, state_tag)
+         SELECT '{id}', n, uuid_send(gen_random_uuid()) FROM generate_series({}, {full}) n;
+         UPDATE accounts SET state_version = {full}, state_tag = h.state_tag
+         FROM state_history h WHERE accounts.id = '{id}' AND h.account_id = accounts.id
+         AND h.state_version = {full}",
+            held.state_version + 1
+        ),
+    )
+    .await;
+    let at = ms(&item_time(&vectors("chain.json")["items"][1])) + 120_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(at));
+    let apps = || signer_request("GET", &format!("/v1/{id}/apps"), Vec::new(), at);
+    assert_eq!(
+        replay.service.handle(apps()).await.status,
+        503,
+        "a sweep is due"
+    );
+    assert_eq!(state_version_of(&replay, &id).await, full);
+    assert_eq!(mark_of(&replay, &id).await, held);
+    assert!(!check(&replay, false).await.needs_attention());
+
+    // The public read commits no sweep. It can cover the durable position before the
+    // next counted write, even when the backlog is full.
+    let read = request("GET", &format!("/v1/{id}/identity"), &[], Vec::new());
+    assert_eq!(replay.service.handle(read).await.status, 200);
+    assert_eq!(mark_of(&replay, &id).await.state_version, full);
+    assert_eq!(replay.service.handle(apps()).await.status, 200);
+    assert_eq!(mark_of(&replay, &id).await.state_version, full + 1);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT state_version FROM state_history WHERE account_id = $1 ORDER BY state_version",
+    )
+    .bind(&id)
+    .fetch_all(&mut conn)
+    .await
+    .expect("retained positions");
+    let full = i64::try_from(full).expect("version");
+    assert_eq!(versions, [full, full + 1]);
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_check_marks_reports_retired_generations() {
     // alice's state went behind her mark and the operator retired generation 1: her line
     // lists it, and the notice is permanent (Switch spec 6.5, Switch wire 7.3, Table 1).

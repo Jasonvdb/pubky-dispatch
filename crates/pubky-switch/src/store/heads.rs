@@ -106,6 +106,58 @@ pub async fn stub_hash_at(
     .transpose()
 }
 
+/// What the selected SQL lifetime retains at the mark's position.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MarkEvidence {
+    pub(crate) stub: Option<[u8; 32]>,
+    pub(crate) tag: Option<[u8; 16]>,
+}
+
+pub(crate) async fn evidence_at<'a>(
+    reader: impl sqlx::PgExecutor<'a>,
+    id: &str,
+    stub: Option<(u64, u64)>,
+    mark: &crate::marks::AccountMark,
+) -> Result<MarkEvidence, StoreError> {
+    if stub.is_none() && mark.state_version == 0 {
+        return Ok(MarkEvidence::default());
+    }
+    let mut query = sqlx::QueryBuilder::new("SELECT ");
+    if let Some((generation, seq)) = stub {
+        query
+            .push("(SELECT chain_hash FROM chain_items WHERE account_id = a.id AND generation = ")
+            .push_bind(to_db(generation, "generation")?)
+            .push(" AND seq = ")
+            .push_bind(to_db(seq, "seq")?)
+            .push(")");
+    } else {
+        query.push("NULL::bytea");
+    }
+    query.push(" AS stub, (SELECT state_tag FROM state_history WHERE account_id = a.id AND state_version = ")
+        .push_bind(to_db(mark.state_version, "state_version")?)
+        .push(") AS tag FROM accounts a WHERE a.id = ").push_bind(id)
+        .push(" AND a.created_at_ms = ").push_bind(to_db(mark.created_at_ms, "created_at_ms")?);
+    let row = query
+        .build()
+        .fetch_optional(reader)
+        .await
+        .map_err(StoreError::from_db)?;
+    let Some(row) = row else {
+        return Ok(MarkEvidence::default());
+    };
+    let stub: Option<Vec<u8>> = row.try_get("stub")?;
+    let tag: Option<Vec<u8>> = row.try_get("tag")?;
+    Ok(MarkEvidence {
+        stub: stub
+            .map(|hash| {
+                hash.try_into()
+                    .map_err(|_| StoreError::Corrupt("chain_hash"))
+            })
+            .transpose()?,
+        tag: tag.map(super::state_tag).transpose()?,
+    })
+}
+
 /// The heads of the accounts `ids` names that are there now, in the order of their IDs.
 pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<StoredHead>, StoreError> {
     let rows = sqlx::query(

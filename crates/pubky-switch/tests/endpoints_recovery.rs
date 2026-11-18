@@ -323,6 +323,20 @@ async fn deliver(
     (replay.service.handle(request).await, signature)
 }
 
+/// Run the minute's maintenance before comparing the marks of two requests at this time.
+async fn sweep_before_delivery(replay: &Replay, at: u64) {
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            at,
+        ))
+        .await;
+    assert_eq!(answer.status, 200);
+}
+
 /// alice serving at generation 1 with the vectors' chain through the phone's revocation,
 /// then an enrollment at the serving account naming [`HELD_REVOKED`]: the key the answer
 /// names, the service key, and the time after.
@@ -840,6 +854,7 @@ async fn test_recovery_key_change_naming_the_same_key_is_400() {
     let Some(replay) = replay().await else { return };
     let (key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
+    sweep_before_delivery(&replay, at).await;
     let mark_before = mark_of(&replay).await;
     let change = key_change(&before, key);
     let (answer, _) = deliver(&replay, change, Some(before.hash()), at).await;
@@ -1097,6 +1112,7 @@ async fn test_recovery_in_place_refuses_an_app_an_enrollment_held() {
     assert_eq!(answer.status, 200);
     let key = answered_key(&answer);
     let before = held(&replay).await;
+    sweep_before_delivery(&replay, at).await;
     let mark_before = mark_of(&replay).await;
     assert!(before.body().apps.iter().any(|a| a.app_id == wallet_id));
     let recovery = next_generation(&before, key, Some(1));

@@ -304,7 +304,13 @@ impl Service {
         };
         let store_id = self.marks.identity().await.map_err(|_| unavailable())?;
         let inputs = self.mark_inputs(identity_text).await;
-        let judged = self.judge_with(identity_text, account_input, inputs).await;
+        let reader = match &mut source {
+            Source::Empty(lock) => lock.conn(),
+            Source::Account(txn) => txn.conn(),
+        };
+        let judged = self
+            .judge_with(reader, identity_text, account_input, inputs)
+            .await;
         if self.marks.identity().await.map_err(|_| unavailable())? != store_id {
             return Err(unavailable());
         }
@@ -596,7 +602,8 @@ impl Service {
             held.as_ref().map(IdentityDoc::body),
             head.activation,
         );
-        let judged = self.judge(identity_text, Some(account)).await;
+        let judged = self.judge(txn, identity_text, Some(account)).await;
+        txn.retain_from_mark(judged.mark());
         let routed = verdict::answer(&judged.judgement, &RequestClass::Enroll, self.current_key());
         if judged.judgement.decision.erase_account_again {
             return Err(unavailable());

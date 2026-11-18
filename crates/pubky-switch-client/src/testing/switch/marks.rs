@@ -290,14 +290,14 @@ impl Inner {
         };
         // Rows "Staged, holding an activated import", "Serving" and "Frozen".
         let by_count = |mark: &Mark| {
-            if state.generation != mark.generation {
-                None
-            } else if self.state_version < mark.state_version {
+            if state.generation < mark.generation || self.state_version < mark.state_version {
                 // Fewer changes than the mark covers: an acknowledged one was lost, as the
                 // service's one rule judges it (Switch wire 7.3, Table 1).
                 Some(NoticeReason::Behind)
-            } else if self.state_version == mark.state_version && self.state_tag != mark.state_tag {
-                // The mark's count with another tag: another history.
+            } else if (mark.state_version > 0
+                && self.state_history.get(&mark.state_version) != Some(&mark.state_tag))
+                || (self.state_version == mark.state_version && self.state_tag != mark.state_tag)
+            {
                 Some(NoticeReason::Fork)
             } else {
                 None
@@ -721,6 +721,11 @@ impl ScriptedSwitch {
                 (inner.state_version, inner.state_tag) = (0, 0);
                 inner.versions.clear();
             }
+        }
+        let (version, tag) = (inner.state_version, inner.state_tag);
+        inner.state_history.retain(|count, _| *count <= version);
+        if version > 0 {
+            inner.state_history.insert(version, tag);
         }
     }
 

@@ -75,9 +75,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   service's (wire 7.3, "The state"): one more at each `seq` it gives out, at each cursor
   move, at each push registration and at each new peer copy (`PUT /peers`), the changes it
   models; it counts no other write. Each move takes a tag no other move took, a number
-  where the service's is random. Table 1 compares them as the service's one rule does: in
-  the mark's generation, a lower count is `behind` and the mark's count with another tag
-  a `fork`, a fork of the heads staying a fork. A mark that records no head, only a count,
+  where the service's is random. Within the account lifetime, a lower count is `behind`.
+  A higher or equal count needs the tag
+  retained at the marked count. A missing or different tag gives `fork`. A mark that records no head, only a count,
   is compared by its count alone, and an identity without an account whose mark records
   either is lost. The mark moves to the state, count and tag after each request whose
   account is healthy, never while it is behind or a fork, only forward (a later

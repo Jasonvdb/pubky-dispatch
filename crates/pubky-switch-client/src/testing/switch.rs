@@ -324,6 +324,8 @@ pub(crate) struct Inner {
     pub(crate) state_tag: u64,
     /// The tags given out, which no restore takes back.
     pub(crate) tags_made: u64,
+    /// Tags retained at and after the count covered by the mark.
+    pub(crate) state_history: BTreeMap<u64, u64>,
     /// The count and its tag as each `seq` was given out, for a restore to that `seq`.
     pub(crate) versions: Vec<(u64, u64, u64)>,
     pub(crate) items: Vec<Item>,
@@ -487,6 +489,7 @@ impl Inner {
             state_version: 0,
             state_tag: 0,
             tags_made: 0,
+            state_history: BTreeMap::new(),
             versions: Vec::new(),
             items: Vec::new(),
             tips: vec![tip],
@@ -2248,6 +2251,12 @@ impl Inner {
         self.state_version = self.state_version.saturating_add(1);
         self.tags_made = self.tags_made.saturating_add(1);
         self.state_tag = self.tags_made;
+        if let marks::MarkSlot::At(mark) = &self.marks.slot {
+            self.state_history
+                .retain(|version, _| *version >= mark.state_version);
+        }
+        self.state_history
+            .insert(self.state_version, self.state_tag);
     }
 
     /// Wake every held feed read, to look again.

@@ -2621,10 +2621,7 @@ async fn test_claims_swept_tombstone_restored_is_behind_the_mark() {
 }
 
 #[tokio::test]
-async fn test_sweeps_that_delete_nothing_count_nothing() {
-    // The minute's sweep at a request that finds nothing due moves only the sweep minute,
-    // which the count leaves out: the mark stays, and a restore to before that read is
-    // the state the mark covers, healthy (Switch wire 7.3, "The state").
+async fn test_sweeps_mark_the_minute_before_answering() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
@@ -2633,9 +2630,17 @@ async fn test_sweeps_that_delete_nothing_count_nothing() {
     assert_eq!(counts.0, counts.1);
     save_image(&replay, &alice_id(), "before_read").await;
     wallet_request_at(&replay, &after(3 * 60_000)).await;
-    assert_eq!(count_and_mark(&replay).await, counts, "nothing counted");
+    assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
+    save_image(&replay, &alice_id(), "after_sweep").await;
     restore_image(&replay, &alice_id(), "before_read").await;
-    wallet_request_at(&replay, &after(5 * 60_000)).await;
-    assert_eq!(count_and_mark(&replay).await, counts);
+    let at = after(3 * 60_000);
+    let (status, body) = read_claim(&replay, &at).await;
+    assert_eq!(
+        (status, body["current"]["reason"].as_str()),
+        (503, Some("behind"))
+    );
+    restore_image(&replay, &alice_id(), "after_sweep").await;
+    wallet_request_at(&replay, &at).await;
+    assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
     replay.db.drop_database().await.expect("drop");
 }

@@ -887,7 +887,7 @@ async fn test_push_minted_key_of_a_cancelled_start_is_deleted() {
 async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_stays_owed() {
     // The request is dropped while its commit, which owes the replaced key's deletion, is
     // under way: the commit lands, but no mark moved for it and nothing was answered, so
-    // the replaced key stays, owed, until the sweep at the next start (Switch wire 7.3,
+    // the replaced key stays owed until the mark covers the replacement (Switch wire 7.3,
     // "Moving it"; 8.1).
     let Some((replay, keys)) = pushing().await else {
         return;
@@ -926,10 +926,22 @@ async fn test_push_replaced_key_of_a_start_dropped_during_its_commit_stays_owed(
     assert_ne!(new_id, old_id, "the replacement committed");
     assert!(exists(&keys, &old_id).await, "the replaced key stays");
     assert_eq!(owed(&replay).await, vec![old_id.as_str().to_string()]);
-    // The sweep at the next start deletes it.
     let _ = replay.service.sweep_erased_keys().await;
+    assert!(exists(&keys, &old_id).await);
+    assert_eq!(owed(&replay).await, vec![old_id.as_str().to_string()]);
+    assert!(exists(&keys, &new_id).await);
+    let read = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
+    assert_eq!(replay.service.sweep_erased_keys().await, Some(Vec::new()));
     assert!(!exists(&keys, &old_id).await);
-    assert!(owed(&replay).await.is_empty());
     assert!(exists(&keys, &new_id).await);
     replay.db.drop_database().await.expect("drop");
 }

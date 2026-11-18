@@ -47,9 +47,14 @@ const GENERATION_STATE: &[&str] = &[
 ];
 
 /// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
-/// 3.7): the App IDs kept for good, the enrollment answers, and the push keys owed deleting.
+/// 3.7): the App IDs kept for good, the enrollment answers, the push keys owed deleting, and the account's retained count tags.
 /// The account's row stays too, its service time and the directory's two versions with it.
-pub const RECOVERY_KEEPS: &[&str] = &["kept_app_ids", "enrollment_answers", "erased_keys"];
+pub const RECOVERY_KEEPS: &[&str] = &[
+    "kept_app_ids",
+    "enrollment_answers",
+    "erased_keys",
+    "state_history",
+];
 
 /// Every table with an account column that a recovery in place empties: the generation's own state,
 /// `claim_entries` with their claims, `divergent_uploads` with their records, and

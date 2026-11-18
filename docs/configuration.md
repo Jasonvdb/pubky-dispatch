@@ -164,7 +164,7 @@ The last rule fires on any request answered with the recovery notice, `503 recov
 
 ### `[database]`
 
-PostgreSQL 14 or later.
+PostgreSQL 14 or later. The service database role needs the `TEMPORARY` database privilege. Each writing connection uses a temporary table to compare the first and last values of the rows a request touches. Space usage grows with the rows touched in that transaction. PostgreSQL clears these entries at commit.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -276,8 +276,8 @@ Each line gets one state:
 | `healthy` | the state is at or past the mark |
 | `staged` | a staged account at its (0, 0) mark |
 | `bounded` | a staged account holding no chain, whose mark records a head |
-| `behind` | the state is behind the mark: of an earlier generation, or of the mark's with a lower `seq` or a lower count (`head_count` below `mark_count`): a write the service acknowledged is missing, a chain item or any other, such as an inbox entry, a cursor move or a peer's `identity.json` |
-| `fork` | the state is at the mark's pair, or past it, with another chain hash; or at the mark's count with another tag (`head_count` equal to `mark_count`, `head_tag` not `mark_tag`): the database holds another history than the one acknowledged, as after a restore of an image taken before a crash and the writes acknowledged since |
+| `behind` | the state is behind the mark: of an earlier generation, at a lower `seq` in the same generation, or at a lower count in the selected account lifetime (`head_count` below `mark_count`): a write the service acknowledged is missing, a chain item or any other, such as an inbox entry, a cursor move or a peer's `identity.json` |
+| `fork` | the chain hash disagrees at the marked position, or the account lacks the matching tag at `mark_count`. A database can report `fork` even when its `head_count` is higher. Choose a database that retains the acknowledged history. |
 | `mark_lost` | the account's mark is missing or doesn't read as a mark |
 | `lost` | a mark that records something acknowledged, a head or a count above 0, with no account and no erasure's record covering it: the database lost the account |
 | `leftover` | a mark an erasure's record covers, with no account; the service deletes it |
@@ -285,9 +285,11 @@ Each line gets one state:
 
 `healthy` and `staged` need no attention; every other state does, serving or not, since a database to fail over to must hold what the service signed for every account.
 
+A healthy account can have committed writes waiting for its mark to advance. The database retains up to 1,024 newer tags. At that limit a request that would record another change returns `503 unavailable` and rolls back. Once the authoritative mark store is writable, a public `GET /v1/{id}/identity` on the healthy account covers its committed position. Retry the write. The next counted commit keeps the tag at the covered position and discards older ones.
+
 It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `retired` (the generations retired for the identity, ascending), `head_seq` and `mark_seq`, `head_count` and `mark_count`, and `head_tag` and `mark_tag` (the counts' tags, in hex); then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
 
-**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. A database on which the check exits 0 holds every chain item and signed head the service acknowledged, since such an answer leaves only after its mark moved (Switch spec 6.5): it is safe to fail over to. The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
+**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. An exit code of 0 means the candidate passed every account's mark check, including ordinary writes acknowledged for healthy accounts (Switch spec 6.5). Check the recovery-enrollment and webhook limitations before resuming either operation after a restore. See [Known issues](known-issues.md). The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
 
 ### Retiring a generation
 

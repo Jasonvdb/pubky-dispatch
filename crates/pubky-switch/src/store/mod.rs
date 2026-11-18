@@ -499,12 +499,19 @@ impl Store {
     /// mark reads (Switch wire 7.3 step 2) and the service time it last committed, for the
     /// checks that come before the lock (Switch wire 7.2 Order).
     pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
+        Self::lookup_with(&self.pool, id).await
+    }
+
+    pub(crate) async fn lookup_with<'a>(
+        reader: impl sqlx::PgExecutor<'a>,
+        id: &str,
+    ) -> Result<Option<FoundAccount>, StoreError> {
         let row = sqlx::query(
             "SELECT generation, chain_seq, chain_hash, state_version, state_tag, stamped_time_ms, \
              created_at_ms, identity_doc, activation_requirement FROM accounts WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(reader)
         .await
         .map_err(StoreError::from_db)?;
         let Some(row) = row else {
@@ -807,6 +814,10 @@ impl std::fmt::Debug for IdentityLock {
 }
 
 impl IdentityLock {
+    pub(crate) fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+
     /// Lock the identity's account's row too, the lock held on in the account's
     /// transaction; `None`, letting the identity's lock go, when there is no account.
     pub async fn account(self) -> Result<Option<AccountTxn>, StoreError> {

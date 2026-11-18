@@ -142,11 +142,11 @@ impl AccountMark {
     /// zero tag; a head at a generation and a `seq` of at least 1 each; or a generation of
     /// at least 1 with `seq` 0 and the zero hash, before the first head.
     fn is_valid(&self) -> bool {
+        if self.state_version == 0 && self.state_tag != [0; 16] {
+            return false;
+        }
         if self.generation == 0 {
-            self.seq == 0
-                && self.chain_hash == ZERO_HASH
-                && self.state_version == 0
-                && self.state_tag == [0; 16]
+            self.seq == 0 && self.chain_hash == ZERO_HASH && self.state_version == 0
         } else {
             self.seq != 0 || self.chain_hash == ZERO_HASH
         }
@@ -2063,6 +2063,7 @@ mod tests {
             account: Some(&account),
             mark: &crate::account::MarkInput::Mark((&moved).into()),
             stub_at_mark: None,
+            tag_at_mark: Some(first.state_tag),
             erasure_at_ms: None,
             retired: &[],
         });
@@ -2689,6 +2690,10 @@ mod tests {
         upper["key"] = hex::encode_upper([0xab_u8; 32]).into();
         let mut short = good.clone();
         short["chain_hash"] = "0101".into();
+        let mut headless = good.clone();
+        headless["seq"] = 0.into();
+        headless["chain_hash"] = zero_hash.clone().into();
+        headless["state_tag"] = hex::encode([1u8; 16]).into();
         for value in [
             extra,
             zero_seq,
@@ -2696,6 +2701,7 @@ mod tests {
             zero_with_hash,
             upper,
             short,
+            headless,
         ] {
             cases.push(serde_json::to_vec(&value).expect("bytes"));
         }

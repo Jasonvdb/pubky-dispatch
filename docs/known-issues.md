@@ -9,7 +9,7 @@ The client's public API for protocols and hosts is in place: record answers that
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
 - **Client.** What a kept record job remembers about the delete it follows, and what the app keeps about feed entries it holds or processes ahead of a held one.
-- **Service.** The rollback mark, kept separately from the account database, will cover every acknowledged write and a lower bound on the time the service can report. This changes the database schema and the mark files.
+- **Service.** The database and its separate rollback mark now record the count and tag of acknowledged changes at a healthy account. A later mark format will also record a lower bound on the time the service can report.
 
 **Additions still to come**
 
@@ -21,7 +21,9 @@ The client's public API for protocols and hosts is in place: record answers that
 
 ### Service
 
-- [data] **An acknowledged message can disappear after a database restore or failover.** The rollback mark tracks the signed chain head, so losing inbox entries can leave the account looking healthy and allow their sequence numbers to be reused. A sender's receipt and a receiver's saved position can then refer to history the service no longer serves.
+- [data] **Recovery enrollment can acknowledge exclusions a restore loses.** A successful enrollment during account creation or while an account needs recovery can leave the rollback mark without evidence of the exclusions it acknowledged. A restore can then lose an App ID the signer expected the service to keep. Preserve the complete database for this account before recovering at the same provider.
+- [data] **Takeover can lose the generation recorded before the first chain item.** When the database loses that account, replacing its surviving mark can clear the generation needed for recovery. Keep the service stopped for the affected identity until a database that retains the acknowledged state is available or the signer completes a separately confirmed recovery at another provider.
+- [data] **A database restore can repeat a webhook.** The send worker's attempt count and its decision to use a registration are not both covered by the account's rollback mark. Keep outbound push delivery disabled on a restored database until its registrations and pending deliveries are reconciled.
 - [data] **Recovery can select the wrong shared record.** An upload without proof from the lost service can displace a proven write, and the first upload at an empty key can determine its collection and policy. Independently reconcile records that authorize an irreversible action before using a recovered value.
 - [data] **An embedded service can write without checking that it still holds the instance lock.** The standard executable installs the lock check, but the service constructor allows an embedder to omit it. If you embed the service, connect the instance lock's freshness check before accepting writes.
 - [data] **Erasure can report that an account is absent while its data remains.** This happens when an older account is still in storage beside a newer rollback mark that has no chain head. A `not_hosted` response in that state does not confirm erasure.

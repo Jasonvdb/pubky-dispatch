@@ -178,6 +178,8 @@ pub struct Inputs<'a> {
     /// The chain hash of the stub the service still holds at the mark's generation and
     /// `seq`, if it holds one.
     pub stub_at_mark: Option<[u8; 32]>,
+    /// The database's retained tag at the mark's positive count (Switch wire 7.3).
+    pub tag_at_mark: Option<[u8; 16]>,
     /// The time of the erasure's record for the identity, in Unix milliseconds, if there is
     /// one (Switch wire 7.4.16).
     pub erasure_at_ms: Option<u64>,
@@ -255,12 +257,12 @@ enum Column {
     Head,
     /// The mark records a head; the state is at or past it.
     AtOrPast,
-    /// The state is behind the mark: of an earlier generation, or of the mark's with a
-    /// lower `seq` or a lower count.
+    /// The state has an earlier generation, a lower `seq` in the same generation, or a
+    /// lower count within the account lifetime.
     Behind,
     /// The mark is at the state's pair with another chain hash, or the state is past the
-    /// mark with another chain hash at the mark's `seq`; or, in the mark's generation, the
-    /// state is at the mark's count with another tag.
+    /// mark with another chain hash at its `seq`, or the state lacks the matching tag at
+    /// the mark's positive count.
     Fork,
 }
 
@@ -456,7 +458,13 @@ fn lost(mark: &Mark, permanent: bool) -> Verdict {
 fn judge_account(account: &Account, inputs: &Inputs<'_>, retired: Option<u64>) -> Verdict {
     let state = account.state.state();
     let mark = inputs.mark.mark();
-    let column = column(state, account.count, mark, inputs.stub_at_mark);
+    let column = column(
+        state,
+        account.count,
+        mark,
+        inputs.stub_at_mark,
+        inputs.tag_at_mark,
+    );
     // A retirement is of the generation [`retirement_generation`] selects, and counts
     // only while the state isn't of a later generation than that.
     let retired =
@@ -538,6 +546,7 @@ fn column(
     count: Count,
     mark: Option<&Mark>,
     stub_at_mark: Option<[u8; 32]>,
+    tag_at_mark: Option<[u8; 16]>,
 ) -> Column {
     let Some(mark) = mark else {
         return Column::NoMark;
@@ -572,14 +581,15 @@ fn column(
             Column::AtOrPast
         }
     };
-    // Read after the heads, so a fork stays a fork: in the mark's generation, a state with
-    // fewer changed commits than the mark covers lost an acknowledged write, and one at the
-    // mark's count with another tag holds another history than the one acknowledged.
-    if matches!(by_head, Column::AtOrPast | Column::Zero) && state.generation == mark.generation {
-        if count.version < mark.count.version {
+    // A later generation in SQL still belongs to the same account lifetime. An ordinary
+    // request can only advance a mark whose acknowledged history this database retains.
+    if matches!(by_head, Column::AtOrPast | Column::Zero) {
+        if state.generation < mark.generation || count.version < mark.count.version {
             return Column::Behind;
         }
-        if count.version == mark.count.version && count.tag != mark.count.tag {
+        if (mark.count.version > 0 && tag_at_mark != Some(mark.count.tag))
+            || (count.version == mark.count.version && count.tag != mark.count.tag)
+        {
             return Column::Fork;
         }
     }

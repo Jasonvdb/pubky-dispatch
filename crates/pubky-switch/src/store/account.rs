@@ -167,6 +167,7 @@ pub struct Savepoint {
 
 /// One request's transaction on one account, holding the account's lock.
 pub struct AccountTxn {
+    covered_version: u64,
     tx: Transaction<'static, Postgres>,
     head: AccountHead,
     loaded: AccountHead,
@@ -416,6 +417,7 @@ impl AccountTxn {
         };
         Ok(Some(Self {
             tx,
+            covered_version: 0,
             loaded: head.clone(),
             head,
             changed: false,
@@ -437,6 +439,15 @@ impl AccountTxn {
     /// The account's position, with this request's changes.
     pub fn head(&self) -> &AccountHead {
         &self.head
+    }
+
+    pub(crate) fn retain_from_mark(&mut self, mark: Option<&crate::marks::AccountMark>) {
+        if let Some(mark) = mark.filter(|mark| {
+            mark.created_at_ms == self.loaded.created_at_ms
+                && mark.state_version <= self.loaded.state_version
+        }) {
+            self.covered_version = mark.state_version;
+        }
     }
 
     /// Stamp the service time for this request: the time base, or the last time the account
@@ -549,15 +560,11 @@ impl AccountTxn {
             || self.head.last_seq != self.loaded.last_seq
             || self.head.chain != self.loaded.chain;
         // With the position unchanged, the row is written only where the count moves.
-        let flagged = self.head == self.loaded && {
-            let flagged: Option<bool> = sqlx::query_scalar(
-                "SELECT coalesce(current_setting('switch.changed', true), '') = 'on'",
-            )
-            .fetch_one(&mut *self.tx)
-            .await
-            .map_err(StoreError::from_db)?;
-            flagged.unwrap_or(false)
-        };
+        let counts = moved
+            || sqlx::query_scalar::<_, bool>("SELECT retained_state_change()")
+                .fetch_one(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
         let chain_seq = self
             .head
             .chain
@@ -571,27 +578,25 @@ impl AccountTxn {
                 self.loaded.state_tag.to_vec(),
             ))
         };
-        let count: Option<(i64, Vec<u8>)> = if self.head == self.loaded && !flagged {
+        let count: Option<(i64, Vec<u8>)> = if self.head == self.loaded && !counts {
             Some(loaded_count()?)
         } else {
             // The tag: a version 4 UUID's 16 bytes, 122 of them random.
             sqlx::query_as(
-                "WITH moved AS (SELECT $6 OR coalesce(current_setting('switch.changed', true), \
-                 '') = 'on' AS counts) \
-                 UPDATE accounts SET last_seq = $2, chain_seq = $3, chain_hash = $4, \
+                "UPDATE accounts SET last_seq = $2, chain_seq = $3, chain_hash = $4, \
                  stamped_time_ms = $5, \
-                 state_version = CASE WHEN moved.counts THEN state_version + 1 \
+                 state_version = CASE WHEN $6 THEN state_version + 1 \
                  ELSE state_version END, \
-                 state_tag = CASE WHEN moved.counts THEN uuid_send(gen_random_uuid()) \
+                 state_tag = CASE WHEN $6 THEN uuid_send(gen_random_uuid()) \
                  ELSE state_tag END \
-                 FROM moved WHERE id = $1 RETURNING state_version, state_tag",
+                 WHERE id = $1 RETURNING state_version, state_tag",
             )
             .bind(&self.head.id)
             .bind(to_db(self.head.last_seq, "last_seq")?)
             .bind(chain_seq)
             .bind(chain_hash)
             .bind(to_db(self.head.stamped_time_ms, "stamped_time_ms")?)
-            .bind(moved)
+            .bind(counts)
             .fetch_optional(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?
@@ -605,6 +610,31 @@ impl AccountTxn {
         self.head.state_version = from_db(state_version, "state_version")?;
         self.head.state_tag = super::state_tag(state_tag)?;
         let counted = self.head.state_version != self.loaded.state_version;
+        if counted {
+            sqlx::query("DELETE FROM state_history WHERE account_id = $1 AND state_version < $2")
+                .bind(&self.head.id)
+                .bind(to_db(self.covered_version, "state_version")?)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
+            let inserted = sqlx::query(
+                "INSERT INTO state_history (account_id, state_version, state_tag) \
+                 SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM state_history \
+                 WHERE account_id = $1 AND state_version > $4 LIMIT 1 OFFSET 1023)",
+            )
+            .bind(&self.head.id)
+            .bind(state_version)
+            .bind(self.head.state_tag.as_slice())
+            .bind(to_db(self.covered_version, "state_version")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+            if inserted.rows_affected() == 0 {
+                return Err(StoreError::Raced(
+                    "the rollback mark must advance before another write",
+                ));
+            }
+        }
         // A new seq or chain head is a change waiting readers care about; a stamped time
         // alone, which every request may move, isn't.
         if moved {

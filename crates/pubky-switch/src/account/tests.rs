@@ -100,6 +100,7 @@ fn judged_with(row: Row, mark: MarkInput, stub: Option<[u8; 32]>, retired: &[u64
         account: account.as_ref(),
         mark: &mark,
         stub_at_mark: stub,
+        tag_at_mark: Some([0; 16]),
         erasure_at_ms,
         retired,
     })
@@ -206,6 +207,7 @@ fn test_verdict_rule_fork_stub_of_the_marks_generation_whatever_the_states() {
         account: Some(&serving),
         mark: &MarkInput::Mark(marked),
         stub_at_mark: Some([9; 32]),
+        tag_at_mark: Some([0; 16]),
         erasure_at_ms: None,
         retired: &[],
     });
@@ -469,9 +471,12 @@ fn assert_at_or_past(row: Row) {
     for mark in at_or_past_marks() {
         assert_eq!(verdict(row, mark, &[]), Verdict::Healthy);
     }
-    // Past the mark in a later generation, whatever count the mark's covers.
+    // A later generation can keep the marked history even when its sequence starts over.
     assert_eq!(verdict(row, mark(1, 30, 7), &[]), Verdict::Healthy);
-    assert_eq!(verdict(row, counting(1, 30, 7, 90), &[]), Verdict::Healthy);
+    assert_eq!(
+        verdict(row, counting(1, 30, 7, COUNT - 1), &[]),
+        Verdict::Healthy
+    );
     // In the mark's generation, at or past the count it covers.
     for at_count in [counting(2, 10, 1, COUNT), counting(2, 5, 7, COUNT - 1)] {
         assert_eq!(verdict(row, at_count, &[]), Verdict::Healthy);
@@ -479,6 +484,10 @@ fn assert_at_or_past(row: Row) {
 }
 
 fn assert_behind(row: Row) {
+    assert_eq!(
+        verdict(row, counting(1, 30, 7, COUNT + 1), &[]),
+        failing(2, NoticeReason::Behind, false, abort_at(row))
+    );
     assert_eq!(
         verdict(row, mark(2, 12, 7), &[]),
         failing(2, NoticeReason::Behind, false, abort_at(row))
@@ -677,6 +686,7 @@ fn test_verdict_rule_first_row_by_creation_time() {
             account: Some(&serving),
             mark: &mark,
             stub_at_mark: None,
+            tag_at_mark: Some([0; 16]),
             erasure_at_ms: Some(erasure_at_ms),
             retired: &[],
         })
@@ -766,6 +776,7 @@ fn test_verdict_rule_activated_import_without_a_document_has_its_chain_generatio
             account: Some(account),
             mark: &mark,
             stub_at_mark: None,
+            tag_at_mark: Some([0; 16]),
             erasure_at_ms: None,
             retired,
         })
@@ -916,6 +927,7 @@ fn test_verdict_rule_notice_generation_is_the_higher() {
         account: Some(&serving),
         mark: &MarkInput::Missing,
         stub_at_mark: None,
+        tag_at_mark: Some([0; 16]),
         erasure_at_ms: None,
         retired: &[],
     });
@@ -938,6 +950,7 @@ fn test_verdict_rule_abort_while_the_mark_is_not_above_the_enrolled_generation()
             account: Some(staged),
             mark: &mark,
             stub_at_mark: None,
+            tag_at_mark: Some([0; 16]),
             erasure_at_ms: None,
             retired: &[],
         })
@@ -1462,6 +1475,7 @@ fn test_answer_recovery_held_document_bounds_start() {
             account: Some(&account),
             mark: &MarkInput::Missing,
             stub_at_mark: None,
+            tag_at_mark: Some([0; 16]),
             erasure_at_ms: None,
             retired: &[],
         });
@@ -1491,6 +1505,7 @@ fn test_answer_recovery_lost_mark_uses_document_floor() {
         account: Some(&account),
         mark: &MarkInput::Missing,
         stub_at_mark: None,
+        tag_at_mark: Some([0; 16]),
         erasure_at_ms: None,
         retired: &[],
     });
@@ -1513,6 +1528,7 @@ fn test_account_association_retains_physical_sql_floor() {
             account: Some(&held),
             mark: &MarkInput::Mark(mark_created(0, 0, 0, created)),
             stub_at_mark: None,
+            tag_at_mark: Some([0; 16]),
             erasure_at_ms: None,
             retired: &[],
         })
@@ -1615,6 +1631,7 @@ fn test_retirement_generation_is_the_one_the_verdict_reads() {
                 account: account.as_ref(),
                 mark: &mark,
                 stub_at_mark: None,
+                tag_at_mark: Some([0; 16]),
                 erasure_at_ms,
                 retired,
             })
@@ -1685,7 +1702,7 @@ fn tagged(generation: u64, seq: u64, hash: u8, count: u64, tag: u8) -> MarkInput
 #[test]
 fn test_verdict_no_head_count_column_rows() {
     // Table 1 for a mark that records no head but a count: like (0, 0), but a state of its
-    // generation with a lower count is behind and one at its count with another tag a fork;
+    // lifetime with a lower count is behind and one lacking its matching tag is a fork;
     // with no account, it records something acknowledged, so the identity is lost.
     let at_count = no_head(2, COUNT, 0);
     let above = no_head(2, COUNT + 1, 0);
@@ -1703,7 +1720,7 @@ fn test_verdict_no_head_count_column_rows() {
     for row in STATE_ROWS {
         assert_eq!(verdict(row, at_count, &[]), Verdict::Healthy);
         assert_eq!(
-            verdict(row, no_head(2, COUNT - 1, 9), &[]),
+            verdict(row, no_head(2, COUNT - 1, 0), &[]),
             Verdict::Healthy
         );
         assert_eq!(
@@ -1714,10 +1731,14 @@ fn test_verdict_no_head_count_column_rows() {
             verdict(row, other_tag, &[]),
             failing(2, NoticeReason::Fork, false, abort_at(row))
         );
-        // Of an earlier generation than the state's: its count doesn't compare.
+        // A higher SQL generation still needs the writes acknowledged to this lifetime.
         assert_eq!(
             verdict(row, no_head(1, COUNT + 9, 5), &[]),
-            Verdict::Healthy
+            failing(2, NoticeReason::Behind, false, abort_at(row))
+        );
+        assert_eq!(
+            verdict(row, no_head(1, COUNT - 1, 5), &[]),
+            failing(2, NoticeReason::Fork, false, abort_at(row))
         );
         // The fork rule of the heads doesn't look at a mark without a head.
         assert_eq!(
@@ -1749,10 +1770,10 @@ fn test_verdict_tag_at_the_marks_count_is_a_fork() {
             verdict(row, tagged(2, 8, 7, COUNT, 5), &[]),
             failing(2, NoticeReason::Fork, false, abort_at(row))
         );
-        // Past the mark's count, another tag is the state's later history.
+        // A later state must still contain the tag at the marked count.
         assert_eq!(
             verdict(row, tagged(2, 8, 7, COUNT - 1, 5), &[]),
-            Verdict::Healthy
+            failing(2, NoticeReason::Fork, false, abort_at(row))
         );
         // A lower count stays behind, whatever the tag.
         assert_eq!(

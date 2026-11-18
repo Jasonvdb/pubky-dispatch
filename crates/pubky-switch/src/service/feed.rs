@@ -944,7 +944,7 @@ impl Service {
             body.as_ref(),
             head.activation,
         );
-        let judged = self.judge(&read.account.id, Some(account)).await;
+        let judged = self.judge(&mut txn, &read.account.id, Some(account)).await;
         if judged.judgement.decision.erase_account_again {
             let committed_ms = txn.head().stamped_time_ms;
             drop(txn);
@@ -1091,7 +1091,9 @@ impl Service {
                 snapshot.activation,
             )
         });
-        let judged = self.judge_with(&read.account.id, account, inputs).await;
+        let judged = self
+            .judge_with(self.store.pool(), &read.account.id, account, inputs)
+            .await;
         let routed = verdict::answer(
             &judged.judgement,
             &RequestClass::Ordinary,

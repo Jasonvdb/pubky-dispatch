@@ -77,6 +77,13 @@ CREATE TABLE accounts (
     CHECK ((recovery_from IS NULL) = (recovery_declared_at_ms IS NULL))
 );
 
+CREATE TABLE state_history (
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    state_version BIGINT NOT NULL CHECK (state_version > 0),
+    state_tag BYTEA NOT NULL CHECK (octet_length(state_tag) = 16),
+    PRIMARY KEY (account_id, state_version)
+);
+
 -- App IDs the account keeps for good: revoked, departed, or named by an enrollment's
 -- revoked_apps, or removed in a verified document (Switch wire 3.3, 3.7, 9.1).
 CREATE TABLE kept_app_ids (
@@ -677,12 +684,11 @@ LANGUAGE sql IMMUTABLE AS $$ VALUES
      'the count itself'),
     ('column', 'accounts', 'state_tag',
      'the count''s tag, written with the count'),
+    ('column', 'state_history', '*',
+     'the count''s own record, retained until the mark covers it'),
     ('column', 'accounts', 'stamped_time_ms',
      'service time, stamped at nearly every request; that it never goes back is a rule of '
      'its own (Switch spec 10.1)'),
-    ('column', 'accounts', 'swept_at_ms',
-     'sets only when the next sweep runs: a restored earlier minute runs it sooner, and what '
-     'the sweep deletes is counted'),
     ('column', 'apps', 'last_seen_ms',
      'shown by GET /apps only; no decision reads it'),
     ('column', 'sender_flags', '*',
@@ -693,20 +699,19 @@ LANGUAGE sql IMMUTABLE AS $$ VALUES
      'before it is minted: a restored row has the deletion run again, a lost one leaves a '
      'key nothing names, and a key owed deleting signs nothing'),
     ('background', 'push_deliveries', NULL,
-     'the webhook worker claims, retries and deletes rows: a restored row is sent at most '
-     'again within its entry''s minute, as a retry is (Switch wire 8.2)')
+     'the webhook worker commits attempts separately; after a restore its retry count '
+     'and registration require reconciliation before dispatch (Switch wire 8.2)')
 $$;
 
--- The row trigger on every account's table: it marks the transaction as one that changed
--- counted state, `switch.changed`, which `AccountTxn::commit` reads to move the count. A
--- rollback to a savepoint undoes the mark with the writes, so a refused request counts
--- nothing; an update that changes no counted column counts nothing either. A write outside
--- an identity's lock (`switch.locked`, set where the lock is taken) raises, unless its table
--- is listed as background-written: a writer outside the request path fails loudly instead
--- of going uncounted.
+-- Remember the first and last values of a touched row until commit. Replacing a row with
+-- its original value, or removing a row this request inserted, leaves no change to count.
 CREATE FUNCTION count_state_change() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     left_out TEXT[];
+    old_value JSONB;
+    new_value JSONB;
+    old_key JSONB;
+    new_key JSONB;
 BEGIN
     IF coalesce(current_setting('switch.locked', true), '') <> 'on' THEN
         IF EXISTS (SELECT 1 FROM state_uncounted() u
@@ -716,19 +721,53 @@ BEGIN
         RAISE EXCEPTION 'a write to %, an account''s state, outside an identity''s lock',
             TG_TABLE_NAME;
     END IF;
-    IF coalesce(current_setting('switch.changed', true), '') = 'on' THEN
-        RETURN NULL;
-    END IF;
     SELECT coalesce(array_agg(u.col), '{}') INTO left_out FROM state_uncounted() u
         WHERE u.kind = 'column' AND u.tab = TG_TABLE_NAME;
     IF '*' = ANY (left_out) THEN
         RETURN NULL;
     END IF;
-    IF TG_OP = 'UPDATE' AND (to_jsonb(OLD) - left_out) = (to_jsonb(NEW) - left_out) THEN
+    IF TG_NARGS = 0 THEN
+        RAISE EXCEPTION 'no primary key columns for count_state_change on %', TG_TABLE_NAME;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN old_value := to_jsonb(OLD) - left_out; END IF;
+    IF TG_OP <> 'DELETE' THEN new_value := to_jsonb(NEW) - left_out; END IF;
+    IF old_value IS NOT DISTINCT FROM new_value THEN
         RETURN NULL;
     END IF;
-    PERFORM set_config('switch.changed', 'on', true);
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        IF to_regclass('pg_temp.switch_state_rows') IS NULL THEN
+            CREATE TEMP TABLE switch_state_rows (
+                relation OID, row_key JSONB, initial JSONB, final_value JSONB,
+                PRIMARY KEY (relation, row_key)
+            ) ON COMMIT DELETE ROWS;
+        END IF;
+        PERFORM set_config('switch.changed', 'on', true);
+    END IF;
+    IF old_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, old_value -> k) INTO old_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF new_value IS NOT NULL THEN
+        SELECT jsonb_object_agg(k, new_value -> k) INTO new_key FROM unnest(TG_ARGV) k;
+    END IF;
+    IF old_key IS NOT NULL AND old_key IS DISTINCT FROM new_key THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, old_key, old_value, NULL)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = NULL;
+    END IF;
+    IF new_key IS NOT NULL THEN
+        INSERT INTO pg_temp.switch_state_rows VALUES (TG_RELID, new_key,
+            CASE WHEN old_key = new_key THEN old_value END, new_value)
+        ON CONFLICT (relation, row_key) DO UPDATE SET final_value = excluded.final_value;
+    END IF;
     RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION retained_state_change() RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('switch.changed', true), '') <> 'on' THEN
+        RETURN false;
+    END IF;
+    RETURN EXISTS (SELECT FROM pg_temp.switch_state_rows WHERE initial IS DISTINCT FROM final_value);
 END
 $$;
 
@@ -737,14 +776,19 @@ $$;
 DO $$
 DECLARE
     t TEXT;
+    key_columns TEXT;
 BEGIN
     FOR t IN
         SELECT table_name FROM information_schema.columns
         WHERE table_schema = current_schema() AND column_name = 'account_id'
         UNION SELECT 'accounts'
     LOOP
+        SELECT string_agg(quote_literal(a.attname), ', ' ORDER BY a.attnum) INTO STRICT key_columns
+        FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = t::regclass AND i.indisprimary;
+        IF key_columns IS NULL THEN RAISE EXCEPTION '% has no primary key', t; END IF;
         EXECUTE format('CREATE TRIGGER count_state_change AFTER INSERT OR UPDATE OR DELETE '
-                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change()', t);
+                       'ON %I FOR EACH ROW EXECUTE FUNCTION count_state_change(%s)', t, key_columns);
     END LOOP;
 END
 $$;

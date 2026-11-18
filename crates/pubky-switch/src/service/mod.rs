@@ -1165,7 +1165,8 @@ impl Service {
             held.as_ref().map(IdentityDoc::body),
             head.activation,
         );
-        let judged = self.judge(&identity, Some(account)).await;
+        let judged = self.judge(&mut txn, &identity, Some(account)).await;
+        txn.retain_from_mark(judged.mark());
         if let Some(store_id) = store_id
             && self.marks.identity().await.ok() != Some(store_id)
         {
@@ -1228,7 +1229,14 @@ impl Service {
         // claim a request reads or writes goes when it is due, whatever the batch reached.
         // Chain stub retention comes last (`retention.rs`). What they delete counts toward
         // the account's count like any other write (Switch wire 7.3, "The state").
-        if let (Some(base), Some(_)) = (due, caller) {
+        // A failing or bounded account cannot cover maintenance in the state it is
+        // recovering from. Its authorized recovery or erasure makes its own changes.
+        if let (Some(base), Some(_)) = (due, caller)
+            && !matches!(
+                judged.judgement.decision.verdict,
+                verdict::Verdict::Failing { .. } | verdict::Verdict::Bounded { .. }
+            )
+        {
             let swept = match self.step_four(&mut txn, base).await {
                 Ok(()) => self.retain_chain(&mut txn, &signer, healthy, base).await,
                 Err(error) => Err(error),
@@ -1327,7 +1335,7 @@ impl Service {
             || txn.head().chain != txn.loaded().chain
             || answer.head.is_some()
             || fallback_head.is_some()
-            || ((carries_head || answer.starts_generation) && has_position);
+            || ((healthy || carries_head || answer.starts_generation) && has_position);
         if gives && !self.lock_is_fresh() {
             tracing::error!("the instance lock isn't confirmed: a commit refused");
             return failed(txn);
@@ -1356,16 +1364,16 @@ impl Service {
         };
         // The mark moves to the committed position, its head or the position before the
         // first, with its count and tag, durably, before the answer is released: after a
-        // commit whose answer carries a head or starts a generation. At a healthy account
-        // every answer here carries a head (Switch wire 7.3, Table 2; an enrollment moves it
-        // in `enroll_at_account`), so every commit there that changed counted state moves the
-        // mark to its count. No answer carries a head where the verdict is behind or a fork,
+        // commit at a healthy account, one whose answer carries a head, or a generation
+        // start. This includes a refused erasure that committed the sweep before its
+        // savepoint (Switch wire 7.3). No answer carries a head where the verdict is behind or a fork,
         // so no mark moves there but by a start. A commit that held whose mark didn't move
         // answers `503`, and its retry is answered as a retry (Switch wire 7.3, "Moving it").
-        let target = committed.head().mark_target(healthy);
-        if (carries_head || answer.starts_generation)
-            && let Some(target) = target
-        {
+        let target = committed
+            .head()
+            .mark_target(healthy)
+            .filter(|_| healthy || carries_head || answer.starts_generation);
+        if let Some(target) = target {
             let moved = if answer.starts_generation
                 && matches!(routed.route, Route::StartAfresh)
                 && let Some(old) = judged
@@ -1406,7 +1414,7 @@ impl Service {
                 );
             }
         }
-        if !owed.is_empty() {
+        if target.is_some() && !owed.is_empty() {
             // In a task of its own, so a request dropped meanwhile leaves no key to the next
             // start's deletion.
             let (store, keys) = (self.store.clone(), self.keys.clone());

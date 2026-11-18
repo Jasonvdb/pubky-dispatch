@@ -140,9 +140,23 @@ fn record_put(
     expected: RecordVersion,
     value: &[u8],
 ) -> RecordPut {
+    let policy = Policy::new(read_scope, &["tasks"]);
+    record_put_at(collection, natural, &policy, expected, value)
+}
+
+/// [`record_put`] at `policy`, its key derived for it.
+fn record_put_at(
+    collection: &str,
+    natural: &[u8],
+    policy: &Policy,
+    expected: RecordVersion,
+    value: &[u8],
+) -> RecordPut {
     let alice = alice_key();
     let naming = NamingKey::from_root(&alice.switch_root());
-    let policy = Policy::new(read_scope, &["tasks"]);
+    let policy = policy.clone();
+    let read_scope = policy.read_scope.clone();
+    let read_scope = read_scope.as_str();
     let blinded = naming.blind(natural);
     let key = record_key_from_blinded(collection, &blinded, &policy.hash().expect("policy"));
     let value_sealed = SealedValue::seal(
@@ -928,6 +942,77 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// A later write at a permanent key repeats its policy whole (Switch spec 10.3.1, wire 6.2
+/// "Later writes"): one that drops the `permanent` member, or names another generation,
+/// is `400`, a delete among them, which the dropped member would let through, and the
+/// record stays as it was.
+#[tokio::test]
+async fn test_records_later_write_without_the_permanent_member_is_400() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let ordinary = Policy::new("tasks", &["tasks"]);
+    let permanent = ordinary.clone().permanent(None);
+    let create = record_put_at(
+        TASK_ITEMS,
+        b"kept",
+        &permanent,
+        RecordVersion::NONE,
+        b"{\"n\":1}",
+    );
+    let key = create.key;
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 1, vec![OpKind::RecordPut(create)]),
+        AT,
+    )
+    .await;
+    let path = format!("records/{}", b64(&key));
+    let before = body(&get_as(&replay, "wallet", &path).await);
+    let held = RecordVersion::new(
+        before["generation"].as_u64().expect("generation"),
+        before["version"].as_u64().expect("version"),
+    );
+    let cases: [(&Policy, &[u8]); 4] = [
+        (&ordinary, b"{\"n\":2}"),
+        (&ordinary, b""),
+        (&ordinary.clone().permanent(Some(1)), b"{\"n\":2}"),
+        (&ordinary.clone().permanent(Some(1)), b""),
+    ];
+    for (id, (policy, value)) in (2u8..).zip(cases) {
+        // At the permanent key, signed for the other policy.
+        let mut later = record_put_at(TASK_ITEMS, b"kept", &permanent, held, value);
+        later.id_inputs = None;
+        later.policy = policy.clone();
+        let answer = post_answer(
+            &replay,
+            "wallet",
+            &batch("wallet", id, vec![OpKind::RecordPut(later)]),
+            AT,
+        )
+        .await;
+        assert_eq!(
+            code_of(&answer),
+            (400, json!("bad_request")),
+            "{policy:?}: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+    assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
+    // The same write at the record's own policy is taken.
+    let mut later = record_put_at(TASK_ITEMS, b"kept", &permanent, held, b"{\"n\":2}");
+    later.id_inputs = None;
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 9, vec![OpKind::RecordPut(later)]),
+        AT,
+    )
+    .await;
+    replay.db.drop_database().await.expect("drop");
+}
+
 /// Move app `name`'s cursor to `seq` at `at`, in a request of its own.
 async fn move_cursor(replay: &Replay, name: &str, seq: u64, at: &str) {
     let keys = vectors("keys.json");
@@ -1679,7 +1764,7 @@ async fn test_record_current_conflict_respects_read_scope() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"privacy", "tasks_people").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
     let put = record_put(
@@ -1773,7 +1858,7 @@ async fn test_record_current_store_failure_and_restart_keep_application() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"durable", "tasks").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let seq = last_seq(&replay).await;
     let expected = RecordVersion::new(1, before["version"].as_u64().expect("version"));
@@ -1888,7 +1973,7 @@ async fn test_record_current_stored_reference_is_checked() {
         return;
     };
     let (key, _, _) = create(&replay, 1, b"corrupt", "tasks").await;
-    let path = format!("records/{}?revision=1", b64(&key));
+    let path = format!("records/{}", b64(&key));
     let before = body(&get_as(&replay, "wallet", &path).await);
     let old_seq = last_seq(&replay).await;
     let put = record_put(
@@ -1972,14 +2057,7 @@ async fn test_record_current_generated_condition_is_applied() {
     let revision = bound[0].record_revision().expect("revision");
     assert_eq!(revision.item_hash, op.item_hash().expect("hash"));
     assert_eq!(revision.seq, 10);
-    let read = body(
-        &get_as(
-            &replay,
-            "wallet",
-            &format!("records/{}?revision=1", b64(&key)),
-        )
-        .await,
-    );
+    let read = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
     assert_eq!(
         read["revision"],
         serde_json::from_slice::<Value>(&revision.to_json().expect("reference"))

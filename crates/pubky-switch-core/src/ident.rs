@@ -108,17 +108,30 @@ impl NamingKey {
 }
 
 /// A shared record's policy: one read scope and the write scopes, any one of which allows
-/// writing (Switch spec 10.3).
+/// writing, and whether it is permanent (Switch spec 10.3, 10.3.1).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     /// The scope needed to read; values are sealed under its key.
     pub read_scope: String,
     /// The scopes that allow writing, sorted ascending by bytes, without duplicates.
     pub write_scopes: Vec<String>,
+    /// `Some` for a permanent policy (Switch wire 6.2 `permanent`), `None` for an ordinary
+    /// one.
+    pub permanent: Option<Permanent>,
+}
+
+/// A permanent policy's member (Switch wire 6.2, Switch spec 10.3.1): its records are never
+/// deleted while the account is in `generation` or before, and, with `generation` named, are
+/// created only in it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Permanent {
+    /// The generation the policy names, at least 1, or `None` for none: then its records are
+    /// never deleted.
+    pub generation: Option<u64>,
 }
 
 impl Policy {
-    /// A policy, with its write scopes sorted and without duplicates.
+    /// An ordinary policy, with its write scopes sorted and without duplicates.
     pub fn new(read_scope: &str, write_scopes: &[&str]) -> Self {
         let mut write_scopes: Vec<String> = write_scopes.iter().map(|s| (*s).to_owned()).collect();
         write_scopes.sort();
@@ -126,16 +139,27 @@ impl Policy {
         Self {
             read_scope: read_scope.to_owned(),
             write_scopes,
+            permanent: None,
         }
     }
 
-    /// `hash(lp("pubky-switch/v1/policy", read_scope, u64(n), write_scope_1, ...,
-    /// write_scope_n))` (Switch wire 1.5).
+    /// This policy made permanent, naming `generation` or none (Switch spec 10.3.1).
+    #[must_use]
+    pub fn permanent(mut self, generation: Option<u64>) -> Self {
+        self.permanent = Some(Permanent { generation });
+        self
+    }
+
+    /// The policy hash (Switch wire 1.5): for an ordinary policy `hash(lp(
+    /// "pubky-switch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n))`;
+    /// for a permanent one the same parts under `"pubky-switch/v1/permanent-policy"`, then
+    /// `u64(generation)`, 0 for none.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] unless there is at least one write scope and they are
-    /// sorted ascending by bytes without duplicates.
+    /// sorted ascending by bytes without duplicates, and a permanent policy's generation,
+    /// when named, is at least 1.
     pub fn hash(&self) -> Result<[u8; 32]> {
         if self.write_scopes.is_empty() {
             return invalid("Switch wire 1.5: a policy needs at least one write scope");
@@ -145,13 +169,22 @@ impl Policy {
                 "Switch wire 1.5: write scopes must be sorted ascending without duplicates",
             );
         }
+        let label = match self.permanent {
+            None => labels::derive::POLICY,
+            Some(Permanent {
+                generation: Some(0),
+            }) => {
+                return invalid("Switch wire 6.2: a permanent policy's generation is at least 1");
+            }
+            Some(_) => labels::derive::PERMANENT_POLICY,
+        };
         let count = u64be(self.write_scopes.len() as u64);
-        let mut parts: Vec<&[u8]> = vec![
-            labels::derive::POLICY.as_bytes(),
-            self.read_scope.as_bytes(),
-            &count,
-        ];
+        let mut parts: Vec<&[u8]> = vec![label.as_bytes(), self.read_scope.as_bytes(), &count];
         parts.extend(self.write_scopes.iter().map(String::as_bytes));
+        let generation = self.permanent.map(|p| u64be(p.generation.unwrap_or(0)));
+        if let Some(generation) = &generation {
+            parts.push(generation);
+        }
         Ok(hash(&lp(&parts)))
     }
 }
@@ -213,19 +246,47 @@ mod tests {
         let sorted = Policy {
             read_scope: "a".into(),
             write_scopes: vec!["a".into(), "b".into()],
+            permanent: None,
         };
         assert!(sorted.hash().is_ok());
         let unsorted = Policy {
             read_scope: "a".into(),
             write_scopes: vec!["b".into(), "a".into()],
+            permanent: None,
         };
         assert!(unsorted.hash().is_err());
         let empty = Policy {
             read_scope: "a".into(),
             write_scopes: Vec::new(),
+            permanent: None,
         };
         assert!(empty.hash().is_err());
         assert_eq!(Policy::new("a", &["b", "a", "b"]).hash(), sorted.hash());
+    }
+
+    #[test]
+    fn test_policy_hash_permanent_label_and_generation() {
+        let ordinary = Policy::new("a", &["a"]);
+        let none = ordinary.clone().permanent(None);
+        let named = ordinary.clone().permanent(Some(3));
+        let hashes = [
+            ordinary.hash().unwrap(),
+            none.hash().unwrap(),
+            named.hash().unwrap(),
+        ];
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+        let count = u64be(1);
+        let zero = u64be(0);
+        let parts: [&[u8]; 5] = [
+            b"pubky-switch/v1/permanent-policy",
+            b"a",
+            &count,
+            b"a",
+            &zero,
+        ];
+        assert_eq!(hashes[1], hash(&lp(&parts)));
+        assert!(ordinary.permanent(Some(0)).hash().is_err());
     }
 
     #[test]

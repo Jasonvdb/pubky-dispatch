@@ -5,7 +5,7 @@
 use serde_json::json;
 
 use super::Refusal;
-use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, carrying};
+use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut, carrying};
 use crate::error::{Error, Result};
 use crate::http::ErrorCode;
 use crate::ident::{collection_id, record_key_from_blinded};
@@ -105,7 +105,8 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
 /// - `record.put`: write scopes sorted ascending without duplicates and at least one; the
 ///   sealed value's scope is the read scope and its `ct` a length the rule allows (`413`
 ///   past the cap); `id_inputs` on a create and only then, and at creation the key and the
-///   collection recomputed from them, the policy hash and the identity;
+///   collection recomputed from them, the policy hash and the identity; and, at a
+///   permanent policy, its rule ([`check_permanent`]);
 /// - `invite_code.put`: at least one use, and its context at most 1024 bytes (`413`);
 /// - `receive_key.put`: a record whose key isn't of low order and whose `suite_keys` has the
 ///   right form;
@@ -140,6 +141,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             }
             let policy_hash = put.policy.hash()?;
             put.value_sealed.check_shape(&put.policy.read_scope)?;
+            check_permanent(put, body.generation)?;
             match (put.expected_version.is_none(), &put.id_inputs) {
                 (true, None) => bad("a create lacks id_inputs"),
                 (false, Some(_)) => bad("id_inputs on a write that isn't a create"),
@@ -227,6 +229,41 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
         | OpKind::InviteCodeDelete { .. }
         | OpKind::AppPut { .. } => Ok(()),
     }
+}
+
+/// The rule of a permanent policy (Switch wire 6.2 "Permanent policies", Switch spec
+/// 10.3.1), for a `record.put` signed for `generation`, its operation's own: a delete (its
+/// `ct` the 16-byte tag alone) only when `generation` is above the generation the policy
+/// names, so never when it names none; a create (`expected_version` `{0, 0}`) only in the
+/// generation the policy names, when it names one. An ordinary policy passes.
+///
+/// It reads the operation alone, so the service ([`check_shape`]), a recovery upload's
+/// check, an import, an app before it sends and a reader all judge one write alike.
+///
+/// # Errors
+///
+/// `400 bad_request`, naming the rule.
+pub fn check_permanent(put: &RecordPut, generation: u64) -> std::result::Result<(), Refusal> {
+    let Some(permanent) = put.policy.permanent else {
+        return Ok(());
+    };
+    if put.value_sealed.looks_like_delete()
+        && permanent.generation.is_none_or(|named| generation <= named)
+    {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
+        ));
+    }
+    if put.expected_version.is_none()
+        && permanent
+            .generation
+            .is_some_and(|named| named != generation)
+    {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a create at a permanent policy, in another generation than it names",
+        ));
+    }
+    Ok(())
 }
 
 fn reason(error: Error) -> String {
@@ -654,6 +691,126 @@ mod tests {
                 kind.name()
             );
         }
+    }
+
+    /// A `record.put` at the policy `scope-a` / `scope-a` made permanent naming `named`,
+    /// signed for `generation`: built on `expected`, its key derived for that policy, and a
+    /// delete when `delete`.
+    fn permanent_body(
+        named: Option<Option<u64>>,
+        generation: u64,
+        expected: RecordVersion,
+        delete: bool,
+    ) -> OpBody {
+        let id = identity();
+        let mut put = record_put(expected, expected.is_none());
+        if let Some(named) = named {
+            put.policy = put.policy.permanent(named);
+        }
+        let blinded = NamingKey::from_root(&id.switch_root()).blind(b"natural");
+        put.key =
+            record_key_from_blinded("sample.collection", &blinded, &put.policy.hash().unwrap());
+        let value: &[u8] = if delete { b"" } else { b"{}" };
+        put.value_sealed = SealedValue::seal(
+            &id.scope_key(1, "scope-a"),
+            &id.public(),
+            1,
+            "scope-a",
+            &put.key,
+            value,
+        )
+        .unwrap();
+        let mut body = body(OpKind::RecordPut(put));
+        body.generation = generation;
+        body
+    }
+
+    #[test]
+    fn test_permanent_rule_by_generation() {
+        let create = RecordVersion::NONE;
+        let update = RecordVersion::new(1, 6);
+        // (policy, operation generation, expected_version, delete, taken)
+        let cases = [
+            (None, 1, update, true, true),
+            (Some(None), 1, create, false, true),
+            (Some(None), 7, create, false, true),
+            (Some(None), 1, update, false, true),
+            (Some(None), 1, update, true, false),
+            (Some(None), 9, update, true, false),
+            (Some(None), 1, create, true, false),
+            (Some(Some(2)), 2, create, false, true),
+            (Some(Some(2)), 1, create, false, false),
+            (Some(Some(2)), 3, create, false, false),
+            (Some(Some(2)), 3, update, false, true),
+            (Some(Some(2)), 2, update, true, false),
+            (Some(Some(2)), 1, update, true, false),
+            (Some(Some(2)), 3, update, true, true),
+        ];
+        for (named, generation, expected, delete, taken) in cases {
+            let body = permanent_body(named, generation, expected, delete);
+            let outcome = check_shape(&body);
+            let case = format!("{named:?} at {generation}, {expected:?}, delete {delete}");
+            match outcome {
+                Ok(()) => assert!(taken, "{case}"),
+                Err(refused) => {
+                    assert!(!taken, "{case}: {refused}");
+                    assert_eq!(refused.code, ErrorCode::BadRequest, "{case}");
+                }
+            }
+            let OpKind::RecordPut(put) = &body.kind else {
+                unreachable!()
+            };
+            assert_eq!(check_permanent(put, generation).is_ok(), taken, "{case}");
+        }
+    }
+
+    #[test]
+    fn test_permanent_generation_above_the_integer_range_isnt_signed() {
+        // A writer refuses to sign an `int` above 2^53 - 1 (Switch wire 1.1), the
+        // generation a permanent policy names among them.
+        let update = RecordVersion::new(1, 6);
+        let largest = permanent_body(Some(Some(crate::json::MAX_INT)), 1, update, false);
+        assert!(crate::ops::SignedOp::sign(&app(), largest).is_ok());
+        let above = permanent_body(Some(Some(crate::json::MAX_INT + 1)), 1, update, false);
+        assert!(matches!(
+            crate::ops::SignedOp::sign(&app(), above),
+            Err(Error::Invalid(why)) if why.contains("2^53 - 1")
+        ));
+    }
+
+    #[test]
+    fn test_permanent_member_read_strictly() {
+        let body = permanent_body(Some(Some(4)), 4, RecordVersion::NONE, false);
+        let bytes = body.to_json().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let member = r#""permanent":{"generation":4}"#;
+        assert!(text.contains(&format!(
+            r#""write_scopes":["scope-a"],{member},"expected_version""#
+        )));
+        assert_eq!(OpBody::parse(&bytes).unwrap(), body);
+        let none = permanent_body(Some(None), 4, RecordVersion::NONE, false);
+        let none_bytes = none.to_json().unwrap();
+        assert!(
+            String::from_utf8_lossy(&none_bytes).contains(r#""permanent":{"generation":null}"#)
+        );
+        assert_eq!(OpBody::parse(&none_bytes).unwrap(), none);
+        for refused in [
+            r#""permanent":null"#,
+            r#""permanent":{}"#,
+            r#""permanent":{"generation":4,"other":1}"#,
+            r#""permanent":{"generation":"4"}"#,
+            r#""permanent":[4]"#,
+        ] {
+            let changed = text.replace(member, refused);
+            assert!(OpBody::parse(changed.as_bytes()).is_err(), "{refused}");
+        }
+        // Generation 0 reads, but names no generation: its hash, and so the shape, refuse it.
+        let zero = OpBody::parse(
+            text.replace(member, r#""permanent":{"generation":0}"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(check_shape(&zero).unwrap_err().code, ErrorCode::BadRequest);
     }
 
     #[test]

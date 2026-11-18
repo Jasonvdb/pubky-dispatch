@@ -36,7 +36,7 @@
 
 use pubky_switch_core::claims::{ClaimView, EntryKind};
 use pubky_switch_core::ident::NamingKey;
-use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion};
+use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind};
 use pubky_switch_core::records::AppCert;
 
 use super::admission::{LISTS_AT, SenderDisposition, deny_key, flag_key};
@@ -507,19 +507,19 @@ impl<'a> ReceiveContext<'a> {
         Ok(self.get::<SeenMark>(&seen_key(key))?.map(|mark| mark.mark))
     }
 
-    /// A `record_version` condition on the version of record `key` the app holds, or the
-    /// version the switch showed for a write the app refused (Switch wire 6.3); `{0, 0}` for
-    /// a record it holds nothing of, and when that write, held or refused, is a delete, which
-    /// `{0, 0}` matches as it matches a forgotten key (Switch spec 10.3).
+    /// The condition on record `key` a write depending on it carries, as
+    /// [`super::App::record_condition`] gives it.
     ///
     /// # Errors
     ///
     /// A store failure.
     pub fn record_condition(&self, key: &[u8; 32]) -> Result<Condition, AppError> {
-        let version = self
-            .held(key)?
-            .map_or(RecordVersion::NONE, |held| held.write_base());
-        Ok(Condition::RecordVersion { key: *key, version })
+        let held = self.held(key)?;
+        Ok(super::records::record_condition(
+            key,
+            held.as_ref(),
+            self.state.own_doc.body().recovery_from,
+        ))
     }
 
     /// The newest view the app keeps of the claim `claim_key` (Switch wire 6.8), including
@@ -719,14 +719,15 @@ impl<'a> ReceiveContext<'a> {
             );
         }
         let held = self.held(&key)?;
-        let put = match record_put(self.state, target, value, held.as_ref()) {
-            Ok(put) => put,
+        let (put, named) = match record_put(self.state, target, value, held.as_ref()) {
+            Ok(built) => built,
             Err(AppError::Refused(Refusal::NotNow(why))) => {
                 self.writes.not_now = Some(why.clone());
                 return Err(Refusal::NotNow(why).into());
             }
             Err(error) => return Err(error),
         };
+        let conditions = super::records::with_named(conditions, named);
         self.writes.ops.push((conditions, OpKind::RecordPut(put)));
         self.writes.records.push((key, target.collection.clone()));
         Ok(key)

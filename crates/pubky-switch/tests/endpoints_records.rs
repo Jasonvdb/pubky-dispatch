@@ -720,7 +720,16 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
         .expect("row");
         row
     };
-    // Two writes here: the first builds on the uploaded version, the second on the first.
+    // Two writes here: the first builds on the uploaded version, naming the uploaded write
+    // exactly, the second on the first.
+    let named = pubky_switch_core::ops::Condition::RecordCurrent {
+        key,
+        revision: pubky_switch_core::shared::ApplicationRef::parse(
+            &serde_json::to_vec(&view["revision"]).expect("revision"),
+        )
+        .expect("revision"),
+        deleted: false,
+    };
     let mut expected_version = uploaded;
     for id in [2u8, 3] {
         let mut put = record_put(
@@ -731,7 +740,8 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
             b"{\"n\":2}",
         );
         put.id_inputs = None;
-        let ops = batch("wallet", id, vec![OpKind::RecordPut(put)]);
+        let conditions = if id == 2 { vec![named] } else { Vec::new() };
+        let ops = with_conditions(id, conditions, OpKind::RecordPut(put));
         post(&replay, "wallet", &ops, AT).await;
         // Written here, the divergent uploads gone, and the base the first write built on
         // kept by the second.
@@ -823,9 +833,10 @@ async fn test_records_conflict_on_an_uploaded_record_shows_its_view() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// A deleted record taken from an upload, created again here with `{0, 0}`: the write here
-/// builds on the uploaded delete, so its version is the upload base, and the divergent
-/// upload goes.
+/// A deleted record taken from an upload, written again here: a create at `{0, 0}` is
+/// refused, since the service holds the delete, and so is a bare version, since uploads can
+/// share one; a write naming the uploaded delete exactly builds on it, so its version is
+/// the upload base, and the divergent upload goes.
 #[tokio::test]
 async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     use sqlx::Connection;
@@ -854,17 +865,43 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
         view["generation"].as_u64().expect("generation"),
         view["version"].as_u64().expect("version"),
     );
-    let again = record_put(
+    let create = record_put(
         TASK_ITEMS,
         b"gone",
         "tasks",
         RecordVersion::NONE,
         b"{\"n\":3}",
     );
+    let refused = post_answer(
+        &replay,
+        "wallet",
+        &batch("wallet", 3, vec![OpKind::RecordPut(create)]),
+        AT,
+    )
+    .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    let mut again = record_put(TASK_ITEMS, b"gone", "tasks", uploaded, b"{\"n\":3}");
+    again.id_inputs = None;
+    let bare = post_answer(
+        &replay,
+        "wallet",
+        &batch("wallet", 4, vec![OpKind::RecordPut(again.clone())]),
+        AT,
+    )
+    .await;
+    assert_eq!(code_of(&bare), (409, json!("conflict")));
+    let named = pubky_switch_core::ops::Condition::RecordCurrent {
+        key,
+        revision: pubky_switch_core::shared::ApplicationRef::parse(
+            &serde_json::to_vec(&view["revision"]).expect("revision"),
+        )
+        .expect("revision"),
+        deleted: true,
+    };
     post(
         &replay,
         "wallet",
-        &batch("wallet", 3, vec![OpKind::RecordPut(again)]),
+        &with_conditions(5, vec![named], OpKind::RecordPut(again)),
         AT,
     )
     .await;
@@ -1258,6 +1295,28 @@ async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
 
 /// A batch of the wallet's with batch ID `[id; 16]`: a create at `natural` under the
 /// condition that the record at `key` is at `version`.
+/// The wallet's batch `id` of one operation, `kind`, with `conditions`.
+fn with_conditions(
+    id: u8,
+    conditions: Vec<pubky_switch_core::ops::Condition>,
+    kind: OpKind,
+) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
+        .expect("app id");
+    sign_batch(
+        &signing,
+        &alice_key().public(),
+        Some(app_id),
+        1,
+        [id; 16],
+        vec![(conditions, kind)],
+    )
+    .expect("batch")
+}
+
 fn conditioned(id: u8, key: [u8; 32], version: RecordVersion, natural: &[u8]) -> Vec<SignedOp> {
     let keys = vectors("keys.json");
     let wallet = app(&keys, "wallet");
@@ -1286,37 +1345,34 @@ fn conditioned(id: u8, key: [u8; 32], version: RecordVersion, natural: &[u8]) ->
 }
 
 #[tokio::test]
-async fn test_records_condition_zero_matches_a_held_delete_and_a_forgotten_key() {
-    // A `record_version` condition of `{0, 0}` holds for a record that is absent,
-    // forgotten or deleted, as `expected_version` `{0, 0}` does: a writer holding a delete
-    // names it the same way before the key is forgotten and after (Switch wire 6.3). A live
-    // record fails it, `409 conflict`.
+async fn test_records_condition_zero_names_only_a_key_the_service_holds_nothing_for() {
+    // A `record_version` condition of `{0, 0}` holds only where the service holds nothing,
+    // as `expected_version` `{0, 0}` does: a live record and a kept delete fail it, `409
+    // conflict`; the delete holds by its own version while the service keeps it, and once
+    // the key is forgotten that version fails with version 0 current, and `{0, 0}` holds
+    // (Switch wire 6.3).
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
     register_executor(&replay).await;
     let (live, ..) = create(&replay, 1, b"live", "tasks").await;
-    let keys = vectors("keys.json");
-    let refused = replay
-        .service
-        .handle(app_request(
-            app(&keys, "wallet"),
-            "POST",
-            &format!("/v1/{}/ops", alice_id()),
-            OpsRequest::new(&conditioned(2, live, RecordVersion::NONE, b"c1"), None).to_json(),
-            ms(AT),
-        ))
-        .await;
+    let refused = post_answer(
+        &replay,
+        "wallet",
+        &conditioned(2, live, RecordVersion::NONE, b"c1"),
+        AT,
+    )
+    .await;
     assert_eq!(code_of(&refused), (409, json!("conflict")));
     let (key, deleted_at) = created_and_deleted(&replay, 3, b"gone").await;
-    post(
+    let refused = post_answer(
         &replay,
         "wallet",
         &conditioned(5, key, RecordVersion::NONE, b"c2"),
         AT,
     )
     .await;
-    // The delete's own version holds too, while the service keeps it.
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
     post(
         &replay,
         "wallet",
@@ -1328,10 +1384,22 @@ async fn test_records_condition_zero_matches_a_held_delete_and_a_forgotten_key()
     next_minute(&replay);
     get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(record_rows(&replay, &key).await, 0, "forgotten");
+    let refused = post_answer(
+        &replay,
+        "wallet",
+        &conditioned(7, key, RecordVersion::new(1, deleted_at), b"c4"),
+        AT,
+    )
+    .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    assert_eq!(
+        body(&refused)["current"]["record_version"],
+        json!({"key": b64(&key), "generation": 0, "version": 0})
+    );
     post(
         &replay,
         "wallet",
-        &conditioned(7, key, RecordVersion::NONE, b"c4"),
+        &conditioned(8, key, RecordVersion::NONE, b"c5"),
         AT,
     )
     .await;

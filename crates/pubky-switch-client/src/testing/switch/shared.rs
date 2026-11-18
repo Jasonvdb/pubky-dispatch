@@ -195,13 +195,6 @@ impl ConditionState for Before<'_> {
             .map_or(RecordVersion::NONE, |held| held.state.version)
     }
 
-    fn record_deleted(&self, key: &[u8; 32]) -> bool {
-        self.shared
-            .records
-            .get(key)
-            .is_some_and(|held| held.state.deleted)
-    }
-
     fn may_read_record(&self, key: &[u8; 32]) -> bool {
         self.shared
             .records
@@ -294,7 +287,8 @@ impl Shared {
         let view = held.map(|h| record_view(h, cx.apps, true, divergent));
         check_record_put(
             put,
-            held.map(|h| &h.state),
+            &op.body().conditions,
+            held.map(|h| (&h.state, h.revision)),
             cx.data_epoch,
             cx.may_read(&put.policy.read_scope),
             view.as_ref(),

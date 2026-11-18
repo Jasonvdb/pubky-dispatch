@@ -422,7 +422,7 @@ async fn test_receive_context_condition_names_zero_for_a_held_delete() {
     let live = app.shared_record(&key).await.unwrap().unwrap().version;
     w.note(app.app_id(), "two");
     app.receive(None).await.unwrap();
-    app.delete_record(&inbox(), vec![]).await.unwrap();
+    let deleted = app.delete_record(&inbox(), vec![]).await.unwrap().version;
     w.note(app.app_id(), "three");
     app.receive(None).await.unwrap();
     let seen = protocol.seen();
@@ -433,7 +433,14 @@ async fn test_receive_context_condition_names_zero_for_a_held_delete() {
         Some(Condition::RecordVersion { key, version: live }),
         "live"
     );
-    assert_eq!(seen[2].condition, Some(zero), "held as deleted");
+    assert_eq!(
+        seen[2].condition,
+        Some(Condition::RecordVersion {
+            key,
+            version: deleted
+        }),
+        "held as deleted: named by its version"
+    );
 }
 
 #[tokio::test]

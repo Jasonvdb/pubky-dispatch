@@ -103,6 +103,9 @@ pub enum RecordsFault {
     /// A flow is present without the state committed together with it.
     #[error("flow without state")]
     Incomplete,
+    /// The state read from the store breaks a binding checked before every write.
+    #[error("stored signer state is damaged: {0}")]
+    Damaged(&'static str),
     /// The bounded write batch refused a write before calling the host store.
     #[error("{0}")]
     WriteRefused(pubky_switch_client::store::BatchError),

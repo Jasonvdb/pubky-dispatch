@@ -44,7 +44,7 @@ use crate::client::{Batch, Submitted};
 use crate::error::ClientError;
 
 /// The prefix of the kept batches.
-const PENDING_PREFIX: &str = "opq/";
+pub(super) const PENDING_PREFIX: &str = "opq/";
 
 /// The most bytes the batches kept unanswered (`opq/`) take together, as stored:
 /// [`App::submit_batch`] keeps no batch past it. A provider change carries those batches
@@ -278,6 +278,9 @@ impl OpBatch {
 pub(crate) struct PendingBatch {
     #[serde(with = "serde_b64_vec")]
     pub(crate) body: Vec<u8>,
+    /// The exact base of an already-sent publication whose original result is still due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) record_deletion: Option<super::records::DeleteBase>,
     pub(crate) invites: Vec<InviteNote>,
     pub(crate) deadlines: Vec<(String, ObligationDeadline)>,
     /// The protocol's local writes, qualified under its prefix
@@ -632,10 +635,9 @@ impl App {
         let id = signed
             .id()
             .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
-        // The creation number, given out in the commit that keeps it, below.
-        let queued_n: u64 = self.reader().get(KEPT_NEXT).await?.unwrap_or(0);
-        let pending = PendingBatch {
+        let mut pending = PendingBatch {
             body: signed.body().to_vec(),
+            record_deletion: None,
             invites: batch.invites,
             deadlines: batch
                 .deadlines
@@ -648,29 +650,11 @@ impl App {
             // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
             // the next call that writes when this one can't reach the service.
             kept_ms: None,
-            queued_n,
+            queued_n: 0,
         };
-        // The kept batches together stay within what a provider change carries in its one
-        // commit ([`MAX_KEPT_BATCHES_BYTES`]).
-        let kept: usize = self
-            .reader()
-            .scan_raw(PENDING_PREFIX)
-            .await?
-            .iter()
-            .map(|(_, value)| value.len())
-            .sum();
-        let this = super::state::encode(&pending)?.len();
-        if kept.saturating_add(this) > MAX_KEPT_BATCHES_BYTES {
-            return Err(Refusal::NotNow(format!(
-                "the batches kept unanswered take {kept} bytes, and this one {this} more, over \
-                 {MAX_KEPT_BATCHES_BYTES}: it is not kept, nor sent, until they are answered"
-            ))
-            .into());
-        }
         let mut tx = self.tx()?;
-        tx.put(KEPT_NEXT, &queued_n.saturating_add(1))?;
-        tx.put(&pending_key(&id), &pending)?;
-        index_kept(&mut tx, &id, &pending, &signed)?;
+        self.stage_kept_batch(&id, &mut pending, &signed, &mut tx)
+            .await?;
         if let Some(error) = behind {
             // Kept behind the batches from earlier calls: it goes after them, by the reads
             // and writes that send them again.
@@ -1397,6 +1381,60 @@ impl App {
         Ok(())
     }
 
+    /// Keep a signed batch and its effects in the same commit that hands them to the queue.
+    pub(super) async fn stage_kept_batch(
+        &self,
+        id: &[u8; 16],
+        pending: &mut PendingBatch,
+        signed: &Batch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        // The kept batches together stay within what a provider change carries in its one
+        // commit ([`MAX_KEPT_BATCHES_BYTES`]).
+        let mut kept: usize = self
+            .reader()
+            .scan_raw(PENDING_PREFIX)
+            .await?
+            .iter()
+            .filter(|(suffix, _)| {
+                tx.pending_state(&format!("{PENDING_PREFIX}{suffix}"))
+                    .is_none()
+            })
+            .map(|(_, value)| value.len())
+            .sum();
+        for suffix in tx.pending_put_keys(PENDING_PREFIX) {
+            if let Some(Some(staged)) =
+                tx.pending_get::<PendingBatch>(&format!("{PENDING_PREFIX}{suffix}"))?
+            {
+                kept = kept.saturating_add(super::state::encode(&staged)?.len());
+            }
+        }
+        pending.queued_n = self.read_in(KEPT_NEXT, tx).await?.unwrap_or(0);
+        Self::stage_signed_batch(id, pending, signed, &mut kept, tx)
+    }
+
+    /// Stage the signed submission and its index within the total space for retained batches.
+    pub(super) fn stage_signed_batch(
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        signed: &Batch,
+        kept: &mut usize,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let this = super::state::encode(pending)?.len();
+        if kept.saturating_add(this) > MAX_KEPT_BATCHES_BYTES {
+            return Err(Refusal::NotNow(format!(
+                "the batches kept unanswered take {kept} bytes, and this one {this} more, over \
+                 {MAX_KEPT_BATCHES_BYTES}: it is not kept, nor sent, until they are answered"
+            ))
+            .into());
+        }
+        *kept += this;
+        tx.put(KEPT_NEXT, &pending.queued_n.saturating_add(1))?;
+        tx.put(&pending_key(id), pending)?;
+        index_kept(tx, id, pending, signed)
+    }
+
     /// The batches kept under `opq/`, by ID.
     pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
         super::send::validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
@@ -1470,6 +1508,11 @@ impl App {
                 code: ErrorCode::StaleGeneration,
                 ..
             })) => {
+                if pending.record_deletion.is_some() {
+                    return self
+                        .kept_batch_refused(id, pending, ErrorCode::StaleGeneration)
+                        .await;
+                }
                 let ops = batch
                     .ops()
                     .iter()

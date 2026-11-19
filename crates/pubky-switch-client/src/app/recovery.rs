@@ -542,6 +542,16 @@ impl App {
         self.state.held.clear();
         // An in-place restore can have kept a later installation's hold in the new
         // sequence. A loss retires only replacements belonging to the sequence it lost.
+        let retired: Vec<_> = self
+            .state
+            .put_backs
+            .values()
+            .filter(|hold| hold.observation.generation <= lost && hold.pending.is_some())
+            .map(|hold| hold.observation.id())
+            .collect();
+        for id in retired {
+            self.discard_put_back(id, "provider_loss", &mut tx).await?;
+        }
         self.state
             .put_backs
             .retain(|_, hold| hold.observation.generation > lost);

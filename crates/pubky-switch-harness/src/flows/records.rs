@@ -243,7 +243,7 @@ mod tests {
         Ok(())
     }
 
-    async fn observe_deleted_record(world: &World) -> FlowResult {
+    async fn observe_deleted_record(world: &World, publish: bool) -> FlowResult {
         let alice = world.identity("alice")?;
         world.add_switch(ORIGIN, &[&alice]).await?;
         let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
@@ -257,9 +257,12 @@ mod tests {
         ))
         .await?;
         let spec = notes_protocol_with_records().spec().clone();
-        let protocol = std::sync::Arc::new(
-            pubky_switch_client::testing::TestProtocol::new(spec).observing_deletions(),
-        );
+        let protocol = pubky_switch_client::testing::TestProtocol::new(spec);
+        let protocol = std::sync::Arc::new(if publish {
+            protocol.publishing_records()
+        } else {
+            protocol.observing_deletions()
+        });
         let (mut reader, _) = Box::pin(joined_as(
             world,
             &alice,
@@ -278,7 +281,54 @@ mod tests {
             return Err("expected the deleted record".into());
         };
         let hash = SignedOp::peek(&write.op)?.item_hash()?;
+        if publish {
+            let backup = reader.backup_layered().await?;
+            drop(reader);
+            reader = Box::pin(App::restore(
+                world.app_env(std::sync::Arc::new(
+                    pubky_switch_client::store::MemoryStore::new(),
+                )),
+                std::sync::Arc::new(
+                    pubky_switch_client::testing::TestProtocol::new(
+                        notes_protocol_with_records().spec().clone(),
+                    )
+                    .publishing_records(),
+                ),
+                pubky_switch_client::app::AppConfig::default(),
+                &backup,
+            ))
+            .await?;
+            reader.refresh_identity().await?;
+        }
         Box::pin(reader.receive(None)).await?;
+        if publish {
+            let held = Box::pin(writer.read_record(&target))
+                .await?
+                .ok_or("missing published record")?;
+            assert_eq!(held.content.value(), Some(value.as_slice()));
+            assert!(held.version > delete.version);
+            let published = reader.shared_evidence().await?;
+            let op = SignedOp::peek(
+                &published
+                    .ops
+                    .first()
+                    .ok_or("missing signed publication")?
+                    .op,
+            )?;
+            assert_eq!(op.body().app_id, Some(reader.app_id()));
+            assert_eq!(
+                op.body().conditions,
+                vec![pubky_switch_core::ops::Condition::RecordCurrent {
+                    key: delete.key,
+                    deleted: true,
+                    revision: pubky_switch_core::shared::ApplicationRef {
+                        generation: delete.version.generation,
+                        seq: delete.version.version,
+                        item_hash: hash,
+                    },
+                }]
+            );
+        }
         assert_eq!(
             reader
                 .protocol_get(crate::parties::NOTES, &hash)
@@ -294,9 +344,22 @@ mod tests {
     #[tokio::test]
     async fn test_record_deletion_observation_at_both_switches() {
         for backend in [Backend::Service, Backend::Scripted] {
-            Box::pin(run_here(backend, observe_deleted_record))
-                .await
-                .unwrap();
+            Box::pin(run_here(backend, async |world| {
+                observe_deleted_record(world, false).await
+            }))
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_publication_by_a_restored_reader_at_both_switches() {
+        for backend in [Backend::Service, Backend::Scripted] {
+            Box::pin(run_here(backend, async |world| {
+                observe_deleted_record(world, true).await
+            }))
+            .await
+            .unwrap();
         }
     }
 

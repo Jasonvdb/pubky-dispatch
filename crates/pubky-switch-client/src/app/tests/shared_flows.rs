@@ -51,6 +51,7 @@ pub(crate) struct ItemsProtocol {
     observe_deletes: std::sync::atomic::AtomicBool,
     hold_deletes: std::sync::atomic::AtomicBool,
     pending_publication: Mutex<Option<RecordVersion>>,
+    publish_records: std::sync::atomic::AtomicBool,
     observation_unavailable: std::sync::atomic::AtomicBool,
     /// Whether a delete fails a check of the protocol's own, seen or not.
     pub(crate) refuses_deletes: std::sync::atomic::AtomicBool,
@@ -175,6 +176,22 @@ impl Protocol for ItemsProtocol {
                 .is_some_and(|v| ids(Some(v)).iter().all(|id| current.contains(id)));
         Ok(if covered {
             crate::app::PutBackSuccessor::Covered
+        } else if self
+            .publish_records
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(prior) = deletion.exact_value
+            && deletion.exact_version_authenticated
+        {
+            let mut merged: serde_json::Value = serde_json::from_slice(successor.value).unwrap();
+            let items = merged["items"].as_array_mut().unwrap();
+            for id in ids(Some(prior)).into_iter().map(serde_json::Value::String) {
+                if !items.contains(&id) {
+                    items.push(id);
+                }
+            }
+            crate::app::PutBackSuccessor::Merge {
+                value: merged.to_string().into_bytes(),
+            }
         } else {
             crate::app::PutBackSuccessor::Wait
         })
@@ -186,6 +203,16 @@ impl Protocol for ItemsProtocol {
         cx: &crate::app::ReceiveContext<'_>,
     ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
         use std::sync::atomic::Ordering::SeqCst;
+        if self.publish_records.load(SeqCst)
+            && deletion.original_in_current_generation
+            && deletion.exact_version_authenticated
+            && let Some(value) = deletion.exact_value
+        {
+            return Ok(Some(crate::app::PutBack::Write {
+                value: value.to_vec(),
+                observed: vec![],
+            }));
+        }
         if self.hold_deletes.load(SeqCst) && deletion.exact_value.is_some() {
             return Ok(Some(crate::app::PutBack::Prepare { observed: vec![] }));
         }
@@ -13753,4 +13780,124 @@ async fn test_record_publication_shared_store_handoff_keeps_the_real_service_cur
     read_on(&mut next).await;
     next.flush_cursor().await.unwrap();
     assert!(s.w.switch.app(&id).cursor >= delete.version.version);
+}
+
+#[tokio::test]
+async fn test_record_publication_retries_the_signed_merge_after_reopening() {
+    Box::pin(async {
+        let s = Setup::new();
+        let (mut writer, mut reader, target, deleted) = delete_for_put_back(&s).await;
+        let key = reader.record_key(&target).unwrap();
+        read_on(&mut reader).await;
+        let later = writer
+            .put_record(&target, br#"{"items":["next"],"note":"keep"}"#, vec![])
+            .await
+            .unwrap();
+        let base = Condition::RecordCurrent {
+            key,
+            revision: pubky_switch_core::shared::ApplicationRef {
+                generation: later.version.generation,
+                seq: later.version.version,
+                item_hash: s.w.switch.applied().last().unwrap().item_hash().unwrap(),
+            },
+            deleted: false,
+        };
+        s.protocol
+            .publish_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let count = s.w.switch.applied().len();
+        s.w.switch.fail_next(Fault::Unanswered {
+            path: "ops".into(),
+            after: 0,
+        });
+        read_on(&mut reader).await;
+        assert_eq!(s.w.switch.applied().len(), count);
+        assert!(s.w.switch.app(&reader.app_id()).cursor < deleted);
+        let hold = replacement_at(&reader, &key).unwrap();
+        let pending = hold.pending.as_ref().unwrap();
+        assert!(pending.kept_ms.is_some());
+        let batch = crate::client::Batch::from_body(pending.body.clone()).unwrap();
+        assert_eq!(batch.ops()[0].body().conditions, vec![base]);
+        let item = batch.ops()[0].item_hash().unwrap();
+        let id = reader.app_id();
+        drop(reader);
+        let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        read_on(&mut reader).await;
+        reader.flush_cursor().await.unwrap();
+        let current = writer.read_record_fresh(&target).await.unwrap();
+        let RecordRead::Fresh(current) = current else {
+            panic!("expected current record")
+        };
+        assert!(current.version > later.version);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(current.content.value().unwrap()).unwrap(),
+            json!({"items":["next","trusted"],"note":"keep"})
+        );
+        assert_eq!(s.w.switch.applied().len(), count + 1);
+        assert_eq!(
+            s.w.switch.applied().last().unwrap().item_hash().unwrap(),
+            item
+        );
+        assert!(s.w.switch.app(&id).cursor >= deleted);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_publication_lost_reply_keeps_one_signed_replacement() {
+    Box::pin(async {
+        let s = Setup::new();
+        let (mut writer, mut reader, target, deleted) = delete_for_put_back(&s).await;
+        let key = reader.record_key(&target).unwrap();
+        let base = Condition::RecordCurrent {
+            key,
+            revision: pubky_switch_core::shared::ApplicationRef {
+                generation: reader.cursor().generation,
+                seq: deleted,
+                item_hash: s.w.switch.applied().last().unwrap().item_hash().unwrap(),
+            },
+            deleted: true,
+        };
+        let count = s.w.switch.applied().len();
+        s.protocol
+            .publish_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.w.switch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        read_on(&mut reader).await;
+        let pending = replacement_at(&reader, &key)
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap();
+        let batch = crate::client::Batch::from_body(pending.body.clone()).unwrap();
+        assert_eq!(batch.ops()[0].body().conditions, vec![base]);
+        assert_eq!(
+            s.w.switch.applied().last().unwrap().item_hash().unwrap(),
+            batch.ops()[0].item_hash().unwrap()
+        );
+        assert_eq!(s.w.switch.app(&reader.app_id()).cursor, deleted);
+        let id = reader.app_id();
+        drop(reader);
+        let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        read_on(&mut reader).await;
+        reader.flush_cursor().await.unwrap();
+        assert!(replacement_at(&reader, &key).is_none());
+        assert_eq!(s.w.switch.applied().len(), count + 1);
+        assert_eq!(
+            writer
+                .read_record(&target)
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .value(),
+            Some(value(&["trusted"]).as_slice())
+        );
+    })
+    .await;
 }

@@ -953,9 +953,9 @@ impl Accepted {
         deletion: &super::deletion::Observation,
         repair: Option<&super::RecordRepair>,
         tx: &Tx,
-    ) -> Result<super::PutBackSuccessor, AppError> {
+    ) -> Result<Option<super::PutBackSuccessor>, AppError> {
         let Some(value) = self.content.value() else {
-            return Ok(super::PutBackSuccessor::Wait);
+            return Ok(None);
         };
         let version = self.write.version.version;
         if !self.covers_uploads
@@ -964,14 +964,14 @@ impl Accepted {
             || self.write.applied.generation != deletion.generation
             || version != RecordVersion::new(self.write.applied.generation, self.write.applied.seq)
         {
-            return Ok(super::PutBackSuccessor::Wait);
+            return Ok(None);
         }
         let op = SignedOp::peek(&self.op).map_err(|_| super::corrupt())?;
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(super::corrupt());
         };
         if put.policy != deletion.put()?.policy || op.body().generation != deletion.generation {
-            return Ok(super::PutBackSuccessor::Wait);
+            return Ok(None);
         }
         let successor = super::RecordSuccessor {
             repair: repair.filter(|r| r.deletion == deletion.revision()),
@@ -985,7 +985,9 @@ impl Accepted {
         };
         let signed = SignedOp::peek(&deletion.operation).map_err(|_| super::corrupt())?;
         app.with_deletion(deletion, &signed, tx, |owner, original, cx| {
-            owner.record_put_back_successor(original, &successor, cx)
+            owner
+                .record_put_back_successor(original, &successor, cx)
+                .map(Some)
         })
     }
 }
@@ -3402,13 +3404,15 @@ impl App {
         write: Accepted,
         due: &super::deletion::Id,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
+        let mut selected = false;
         if let Some(owner) = self.protocols.of_collection(&write.collection.name)
             && self.may_tell(&owner.name)
         {
-            self.take_write(write, false, None, Some(due), tx).await?;
+            self.take_write(write, false, None, Some((due, &mut selected)), tx)
+                .await?;
         }
-        Ok(())
+        Ok(selected)
     }
 
     /// Take an accepted write if it is newer than the one held and the protocol finds it
@@ -3424,7 +3428,7 @@ impl App {
         mut accepted: Accepted,
         settling_own: bool,
         page_time_ms: Option<u64>,
-        due: Option<&super::deletion::Id>,
+        due: Option<(&super::deletion::Id, &mut bool)>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         Box::pin(async move {
@@ -3441,6 +3445,7 @@ impl App {
             }
             self.keep_cert(&accepted.cert, tx)?;
             let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
+            let (due, selected) = due.unzip();
             let mut repair = None;
             if accepted.current_for_publication()
             {
@@ -3457,13 +3462,14 @@ impl App {
                     Some((&accepted, evidence.as_ref())),
                     page_time_ms,
                     tx,
-                )?;
+                ).await?;
                 // A retry for a different deletion checks only that duty. The feed or
                 // the matching duty takes the repair with its own owner's decision.
                 let other_delete = due.zip(original.as_ref()).is_some_and(|(due, original)| due != original);
                 if !settling_own && (matches!(decision, Publication::PendingObservation) || other_delete) {
                     return Ok(Taken::Waits);
                 }
+                if matches!(decision, Publication::Selected) && let Some(selected) = selected { *selected = true; }
                 if let Publication::Covered(deletion) = decision {
                     repair = evidence.filter(|r| r.deletion == deletion);
                 }
@@ -4402,8 +4408,39 @@ pub(crate) fn record_put(
     value: Option<&[u8]>,
     held: Option<&HeldRecord>,
 ) -> Result<(RecordPut, Option<Condition>), AppError> {
-    refuse_non_json(value)?;
     let policy = &target.collection.policy;
+    let identity = state.meta.identity;
+    let key = state.naming.record_key(
+        &target.collection.name,
+        &target.natural_key,
+        &policy.hash()?,
+    );
+    let sealed = seal_record(state, policy, &key, value)?;
+    let lost = state.own_doc.body().recovery_from;
+    let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, lost));
+    let id_inputs = base.is_none().then(|| IdInputs {
+        collection: target.collection.name.clone(),
+        blinded_key: state.naming.blind(&target.natural_key),
+    });
+    let put = RecordPut {
+        key,
+        collection: target.collection.id(&identity),
+        policy: policy.clone(),
+        expected_version: base,
+        value_sealed: sealed,
+        id_inputs,
+    };
+    Ok((put, named))
+}
+
+/// Seal a write to an existing key, whose natural key need not be known to the reader.
+pub(super) fn seal_record(
+    state: &super::AppState,
+    policy: &Policy,
+    key: &[u8; 32],
+    value: Option<&[u8]>,
+) -> Result<SealedValue, AppError> {
+    refuse_non_json(value)?;
     if !policy
         .write_scopes
         .iter()
@@ -4424,34 +4461,14 @@ pub(crate) fn record_put(
                 "Switch spec 3.5: no key of the read scope at the current data epoch yet".into(),
             ))
         })?;
-    let key = state.naming.record_key(
-        &target.collection.name,
-        &target.natural_key,
-        &policy.hash()?,
-    );
-    let sealed = SealedValue::seal(
+    Ok(SealedValue::seal(
         &scope_key,
         &identity,
         epoch,
         &policy.read_scope,
-        &key,
-        value.unwrap_or_default(),
-    )?;
-    let lost = state.own_doc.body().recovery_from;
-    let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, lost));
-    let id_inputs = base.is_none().then(|| IdInputs {
-        collection: target.collection.name.clone(),
-        blinded_key: state.naming.blind(&target.natural_key),
-    });
-    let put = RecordPut {
         key,
-        collection: target.collection.id(&identity),
-        policy: policy.clone(),
-        expected_version: base,
-        value_sealed: sealed,
-        id_inputs,
-    };
-    Ok((put, named))
+        value.unwrap_or_default(),
+    )?)
 }
 
 /// The record material a failed write or condition may return (Switch wire 6.3, 7.6).

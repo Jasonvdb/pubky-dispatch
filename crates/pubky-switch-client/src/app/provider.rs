@@ -1355,8 +1355,10 @@ impl App {
             // A batch never sent has no answer to wait for: it is signed again for the new
             // generation, and sent as a first send, its old bytes never resent.
             let never_sent = pending.kept_ms.is_none();
-            if resend_first && !never_sent {
-                if !answer_decides(pending.kept_ms) {
+            // A displaced record replacement only needs its original answer. A lost
+            // provider's missing proof cannot establish that it refused the write.
+            if (resend_first || pending.record_deletion.is_some()) && !never_sent {
+                if pending.record_deletion.is_some() && carry == Carry::AfterLoss || !answer_decides(pending.kept_ms) {
                     self.kept_batch_dropped(&id, &pending, &kept, tx).await?;
                 }
                 continue;

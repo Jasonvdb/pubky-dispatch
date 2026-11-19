@@ -150,7 +150,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   A prepared observation moves to `hold/<key>/<generation>/<version>/<item hash>`.
   The hold retains the same signed delete and predecessor and whether this app still
   protects the deletion at the service. Its wait notice names the exact deletion.
-  The earliest protected position bounds each service cursor request. On restore the
+  The hold also carries the signed conditional operation, its first-send time and any
+  cursor generation sent with it. A backup carries the same outstanding submission.
+  A competing write can satisfy the hold independently. A sent operation whose exact
+  target was displaced can move to `opq/` for its original result within the deciding
+  window. It keeps its signed bytes and batch ID across reload and restore.
+  The earliest protected position bounds a cursor request other than its own atomic replacement. On restore the
   first verified service cursor reconciles the held positions. A local in-place hold
   survives an older owner layer and the owner can save its evidence again. A
   compatible applied write, owner release, loss of write scope, departure or provider

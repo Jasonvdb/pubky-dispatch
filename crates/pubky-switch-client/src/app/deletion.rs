@@ -17,12 +17,16 @@ use super::{App, AppError, FeedPosition, ProtocolSet, PutBack};
 pub(super) const PREFIX: &str = "delobs/";
 pub(super) const RECEIPTS: &str = "delack/";
 /// Space for the signed delete, sealed predecessor, their certificates and proof,
-/// the owner's observation writes and the protocol mark.
+/// the outstanding signed batch, its successor merge, the owner's local writes and mark.
 pub(super) const ROOM: u64 = 8 << 20;
 const _: () = assert!(
     2 * pubky_switch_core::ops::MAX_OP_BYTES as u64
         + (128 << 10)
-        + ((super::MAX_STEP_LOCAL_BYTES + super::MAX_SEEN_MARK_BYTES) as u64 * 4 / 3)
+        + ((2 * pubky_switch_core::ops::MAX_OP_BYTES
+            + super::MAX_STEP_LOCAL_BYTES
+            + super::MAX_SEEN_MARK_BYTES) as u64
+            * 4
+            / 3)
         < ROOM
         && ROOM < crate::store::MAX_VALUE_BYTES
 );
@@ -516,6 +520,8 @@ impl App {
             observation: observed,
             protects,
             needs_cursor: false,
+            pending: None,
+            cursor_generation: None,
             waited: false,
             observing: false,
         }
@@ -528,13 +534,15 @@ impl App {
         mut hold: RecordHold,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        use PutBack::{Observe, Prepare};
+        use PutBack::{Observe, Prepare, Write};
         let observed = &hold.observation;
         let deletion = SignedOp::peek(&observed.operation).map_err(|_| super::corrupt())?;
         let answer = match self.consult_deletion(observed, &deletion, tx) {
             Ok(mut answer) => {
                 let writes = match &mut answer {
-                    Some(Observe { observed } | Prepare { observed }) => std::mem::take(observed),
+                    Some(Observe { observed } | Prepare { observed } | Write { observed, .. }) => {
+                        std::mem::take(observed)
+                    }
                     None => vec![],
                 };
                 let bytes = super::local_writes_bytes(&writes);
@@ -568,6 +576,7 @@ impl App {
         hold.observing = false;
         match answer {
             Some(Prepare { .. }) => self.keep_waiting(hold, tx),
+            Some(Write { .. }) => self.keep_put_back(hold, tx),
             None if self.state.put_backs.contains_key(&observed.id()) => {
                 self.keep_waiting(hold, tx)
             }

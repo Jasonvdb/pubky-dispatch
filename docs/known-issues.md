@@ -24,6 +24,8 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 **Caller changes already on main**
 
+- Register the protocol that owns an outgoing kind if its messages should open a conversation for replies. A kind without a registered owner adds no conversation entry.
+
 - When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
 
 - To restore an existing account from a signed first setup, offer `Signer::survey_first_enrollment_restore` at the original service. Show the account, the survey's signed `identity_doc` and the recoverable history, explain that the earlier send may have committed, and call `Signer::restore_first_enrollment` only after confirmation. A fresh setup with no signed creation uses the ordinary restore described above.

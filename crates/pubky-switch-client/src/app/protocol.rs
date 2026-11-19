@@ -1158,6 +1158,18 @@ pub trait Protocol: Send + Sync {
         true
     }
 
+    /// Whether the content of this signed first message admits its recipient to the
+    /// sender's conversation list (Switch spec 7). Called only for kinds for which
+    /// [`Protocol::adds_conversation`] returns true. By default every such message does.
+    ///
+    /// Decide from the signed content alone: the app uses the same rule when rebuilding
+    /// a delivery from its plaintext. `plaintext.json()` holds the exact signed JSON,
+    /// including opaque body members. Returning false omits the sender's conversation
+    /// entry and leaves the delivery and the recipient's admission checks in place.
+    fn message_adds_conversation(&self, _message: &Message, _plaintext: &MessagePlaintext) -> bool {
+        true
+    }
+
     /// The protocol's collections, each with its fixed policy (Switch spec 10.3). The app
     /// lists those it may read at join and after a `missed` item, and takes writes to them
     /// from the feed; writes to any other collection are left alone. None by default.

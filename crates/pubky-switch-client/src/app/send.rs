@@ -2,7 +2,7 @@
 //!
 //! A message is signed once and recorded in the durable outbox (`out/<msg_id>`) before
 //! anything is sent, with its jobs: the conversation entry a first message to a
-//! counterparty that isn't a contact needs (except the protocol's re-send kind), the
+//! counterparty that isn't a contact needs when the protocol admits it, the
 //! delivery, and the matching shared record write the protocol names. Each job is retried
 //! until it completes, at the flushes of the outbox ([`App::flush_outbox`], which goes round
 //! it at most [`OUTBOX_TRIES_PER_FLUSH`] messages a call); every step commits before the
@@ -1321,7 +1321,7 @@ impl App {
         Ok(SignedMessage {
             to: message.to,
             signing_cert: self.state.cert.hash(),
-            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&built, &plaintext),
             kind: message.kind,
             msg_id: built.msg_id,
             plaintext,
@@ -1848,7 +1848,7 @@ impl App {
     /// The plaintext must be signed with this app's key, the one its certificate names,
     /// with the App ID and `from` of this app and identity; the recipient, the kind and the
     /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one, with
-    /// the conversation entry its kind needs, and no record job, since the record holds it
+    /// the conversation entry its signed content calls for, and no record job, since the record holds it
     /// already. The copy carries no invite code and notifies the recipient: a first message
     /// that needed an invite code is for the host to send again with one.
     ///
@@ -1941,7 +1941,7 @@ impl App {
         Ok(OutboxItem {
             origin: DeliveryOrigin::Reconstructed,
             to: message.to,
-            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message, plaintext),
             kind: message.kind,
             msg_id: message.msg_id,
             plaintext: plaintext.encode(),
@@ -2588,6 +2588,16 @@ impl App {
         // earlier call, whose settlement may commit local policy the holds read. So that
         // batch goes first and the holds are read again after it: the entry and the
         // delivery go by this one decision, with nothing kept settled after it.
+        if item.conversation && !held {
+            // A backup or a kept batch may carry an outstanding entry. Only this message's
+            // signed content can authorize it, even on the first try after a restore.
+            let plaintext = item.plaintext()?;
+            let message =
+                super::protocols::kept_message(plaintext.json()).ok_or_else(store_corrupt)?;
+            item.conversation = !item.is_resend()
+                && message.to != self.state.meta.identity
+                && self.protocols.adds_conversation(&message, &plaintext);
+        }
         let mut settled = Ok(());
         if item.conversation && !held && self.entry_owed(&item.to).await? {
             match self

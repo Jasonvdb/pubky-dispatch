@@ -30,7 +30,7 @@ impl App {
             let remaining = self.protocols.without(name)?;
             remaining.check_cert(&self.state.cert)?;
             remaining.check_own_certificate(&self.state.cert)?;
-            if let Some(cert) = &self.state.renewal {
+            if let Some(cert) = self.kept_renewal() {
                 remaining.check_cert(cert)?;
                 remaining.check_own_certificate(cert)?;
             }

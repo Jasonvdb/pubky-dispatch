@@ -577,7 +577,7 @@ impl SwitchClient {
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
         Ok(RecordAnswer {
             view: SharedRecordView::read(Obj::of(&value, what)?)?,
-            head: own_head(&checked, "a record view")?,
+            head: own_head(checked.head, "a record view")?,
         })
     }
 
@@ -602,7 +602,10 @@ impl SwitchClient {
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
-        RecordPage::read(Obj::of(&value, what)?, own_head(&checked, "a record page")?)
+        RecordPage::read(
+            Obj::of(&value, what)?,
+            own_head(checked.head, "a record page")?,
+        )
     }
 
     /// `GET /v1/{id}/directory` (own app, or an admitted app of another identity, Switch wire
@@ -613,6 +616,21 @@ impl SwitchClient {
     ///
     /// As every call; [`ClientError::Core`] for a document that doesn't verify.
     pub async fn directory(&self, invite_code: Option<&str>) -> Result<Directory, ClientError> {
+        self.directory_with_head(invite_code)
+            .await
+            .map(|(directory, _)| directory)
+    }
+
+    /// The service must attach its signed head for an authenticated own app (Switch wire 7.1).
+    pub(crate) async fn own_directory(&self) -> Result<(Directory, SignedHead), ClientError> {
+        let (directory, head) = self.directory_with_head(None).await?;
+        Ok((directory, own_head(head, "a directory")?))
+    }
+
+    async fn directory_with_head(
+        &self,
+        invite_code: Option<&str>,
+    ) -> Result<(Directory, Option<SignedHead>), ClientError> {
         let checked = self
             .call(
                 "GET",
@@ -627,7 +645,10 @@ impl SwitchClient {
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.10: a directory")?;
-        Directory::read(Obj::of(&value, what)?, &self.account())
+        Ok((
+            Directory::read(Obj::of(&value, what)?, &self.account())?,
+            checked.head,
+        ))
     }
 
     /// `GET /v1/{id}/apps/{app_id}/keys` for the calling app (Switch wire 7.4.11).
@@ -1086,8 +1107,8 @@ impl SwitchClient {
 
 /// The head of an own app's answer, which every one carries (Switch wire 7.1): an answer
 /// without it isn't the service's, whatever it says.
-fn own_head(checked: &CheckedResponse, what: &str) -> Result<SignedHead, ClientError> {
-    checked.head.ok_or_else(|| {
+fn own_head(head: Option<SignedHead>, what: &str) -> Result<SignedHead, ClientError> {
+    head.ok_or_else(|| {
         ClientError::InvalidResponse(format!(
             "Switch wire 7.1: {what} for an own app carries no Switch-Head"
         ))

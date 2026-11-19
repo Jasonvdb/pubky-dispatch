@@ -141,6 +141,24 @@ async fn test_retire_protocol_requires_a_compatible_certificate() {
 }
 
 #[tokio::test]
+async fn test_retire_protocol_checks_the_kept_certificate_after_reload() {
+    let p = Pair::new();
+    let mut app = Box::pin(compatible_pair(&p)).await;
+    let id = app.app_id();
+    let current = app.cert().hash();
+    let renewal = renewal_member::cert_put(&p, &app, &["tasks", "chat"]);
+    read(&mut app, 2).await;
+    drop(app);
+
+    let app = p.load(id).await.unwrap();
+    assert_eq!(app.cert().hash(), current);
+    assert_eq!(app.kept_renewal(), Some(&renewal));
+    let before = p.snapshot(&id);
+    usage(app.retire_protocol("chat").await, "chat");
+    assert_eq!(p.snapshot(&id), before);
+}
+
+#[tokio::test]
 async fn test_retire_protocol_commit_reopens_one_complete_roster() {
     for after in [false, true] {
         let p = Pair::new();

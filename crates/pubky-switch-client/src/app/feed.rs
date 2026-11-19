@@ -4121,7 +4121,7 @@ impl App {
                         target_app_id,
                         cert,
                     } if *target_app_id == me && body.app_id.is_none() => {
-                        self.note_renewal(cert, &mut read.tx)?;
+                        self.note_renewal(cert, (envelope.generation, item.seq), &mut read.tx)?;
                         Ok(Step::Pass)
                     }
                     // A record write is judged and marked for the protocol of its collection:
@@ -4268,12 +4268,18 @@ impl App {
             });
             return Ok(Step::Stop);
         }
-        if self
+        if let Some(renewal) = self
             .state
             .renewal
-            .as_ref()
-            .is_some_and(|r| doc.listed_cert(&me) == Some(r.hash()))
+            .as_mut()
+            .filter(|renewal| doc.listed_cert(&me) == Some(renewal.cert.hash()))
         {
+            // If taking the certificate fails after the document is committed, a
+            // reopened app owes the widened listing at the same position.
+            if let Some(at) = at {
+                renewal.at = at;
+                renewal.keep(&mut read.tx)?;
+            }
             // Everything read so far first, so the delivery is in the store.
             read.tx.put(key::CURSOR, &self.state.cursor)?;
             self.put_told(&mut read.tx)?;
@@ -4299,7 +4305,7 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
-        self.take_own_copy_with(doc, |_| Ok(())).await
+        self.take_own_copy_with(doc, None, |_| Ok(())).await
     }
 
     /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
@@ -4307,13 +4313,14 @@ impl App {
     pub(crate) async fn take_own_copy_with(
         &mut self,
         doc: IdentityDoc,
+        at: Option<(u64, u64)>,
         also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
     ) -> Result<bool, AppError> {
         // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
         self.clear_erasing().await?;
         let version = self.state.own_doc.version();
         let mut read = Read::outside(self.tx()?);
-        let result = self.own_identity_copy(doc, None, &mut read).await;
+        let result = self.own_identity_copy(doc, at, &mut read).await;
         if result.is_err() {
             self.reload = true;
         }

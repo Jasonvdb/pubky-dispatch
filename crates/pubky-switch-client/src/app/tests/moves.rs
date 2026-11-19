@@ -1604,6 +1604,70 @@ async fn test_loss_roster_keeps_the_opening_document_after_a_later_version_and_r
 }
 
 #[tokio::test]
+async fn test_loss_roster_indexes_the_original_removal_after_an_interrupted_commit() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let store = Arc::new(FaultStore::new(
+        store as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let opening = lost.next.identity_doc().unwrap();
+    let phone = app_keys("phone").app_id_bytes();
+    assert!(opening.listed_cert(&phone).is_some());
+    let removed = lost
+        .w
+        .signer
+        .sign_next(|body| {
+            body.apps.retain(|app| app.app_id != phone);
+            body.removed.push(RemovedApp {
+                app_id: phone,
+                distrust_from: START,
+            });
+        })
+        .unwrap();
+    lost.next.deliver_identity(&removed).unwrap();
+    app.refresh_identity().await.unwrap();
+    let purged = lost
+        .w
+        .signer
+        .sign_next(|body| body.removed.clear())
+        .unwrap();
+    lost.next.deliver_identity(&purged).unwrap();
+    app.refresh_identity().await.unwrap();
+    assert_eq!(app.own_identity().hash(), purged.hash());
+
+    store.fail_put_once(b"loss/opening");
+    assert!(app.follow_provider().await.is_err());
+    drop(app);
+
+    // Reuse the signed copy kept on observation. The store can commit the opening
+    // and version indexes even when it cannot accept another copy of the document.
+    store.refuse_puts_as_too_large(Some(b"loss/removal/"));
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+    assert_eq!(
+        app.recovery_removal(&phone).await.unwrap().unwrap().hash(),
+        removed.hash()
+    );
+    drop(app);
+    let mut app = load_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.recovery_removal(&phone).await.unwrap().unwrap().hash(),
+        removed.hash()
+    );
+}
+
+#[tokio::test]
 async fn test_loss_upload_inputs_and_application_survive_an_unanswered_request() {
     use crate::app::LossUploadOutcome;
     let store = Arc::new(MemoryStore::new());

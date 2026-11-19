@@ -11,12 +11,16 @@ use pubky_switch_core::sig::SignedDoc;
 use super::{App, AppError, FeedItem, FeedQuery, LossRecord, keys};
 use crate::app::chain::ChainView;
 use crate::app::error::Alarm;
-use crate::app::state::{Tx, key};
+use crate::app::state::{Tx, decode, key};
 use crate::client::answers::FeedPage;
 
 const PENDING_ROSTER: &str = "pending-roster/";
 const POSSIBLE_MEMBERS: &str = "pending-roster/possible-members";
 const PENDING_REMOVALS: &str = "pending-roster/removal/";
+
+fn pending_removal_key(version: u64) -> String {
+    format!("{PENDING_REMOVALS}{}", key::num(version))
+}
 
 /// The two chain items the service commits together to open the generation (Switch wire
 /// 7.4.2). Start at the zero hash even when the ordinary feed already passed the pair.
@@ -89,21 +93,45 @@ impl App {
         }
         tx.put(&key, &hash)?;
         tx.put(keys::OPENING, doc.signed())?;
-        let pending = self
-            .reader()
-            .scan_numbered::<SignedDoc>(PENDING_REMOVALS)
-            .await?;
-        for (version, signed) in pending {
-            let removed =
-                IdentityDoc::verify(&signed, &doc.identity()).map_err(|_| super::corrupt())?;
-            if removed.version() != version {
-                return Err(super::corrupt());
-            }
-            self.keep_roster_removals(doc, &removed, tx).await?;
-        }
-        tx.delete_prefix(PENDING_ROSTER)?;
+        self.index_pending_removals(doc, tx).await?;
         self.keep_roster_removals(doc, &self.state.own_doc, tx)
             .await
+    }
+
+    /// Read one signed document at a time. The opening's commit links original members
+    /// to the durable copies by version (Switch spec 12.6).
+    async fn index_pending_removals(
+        &self,
+        opening: &IdentityDoc,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let reader = self.reader();
+        if !reader.exists(POSSIBLE_MEMBERS).await? {
+            return Ok(());
+        }
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = reader
+                .store
+                .scan(&reader.ns, PENDING_REMOVALS.as_bytes(), after.as_deref(), 1)
+                .await?;
+            let Some((key, bytes)) = page.into_iter().next() else {
+                break;
+            };
+            let signed = decode::<SignedDoc>(&bytes)?;
+            let removed =
+                IdentityDoc::verify(&signed, &opening.identity()).map_err(|_| super::corrupt())?;
+            let expected = pending_removal_key(removed.version());
+            if key.as_slice() != expected.as_bytes() {
+                return Err(super::corrupt());
+            }
+            if !self.index_roster_removals(opening, &removed, tx).await? {
+                tx.delete(&expected)?;
+            }
+            after = Some(key);
+        }
+        tx.delete(POSSIBLE_MEMBERS)?;
+        Ok(())
     }
 
     pub(crate) async fn note_roster_removals(
@@ -154,10 +182,7 @@ impl App {
         }
         if possible.len() < before {
             tx.put(POSSIBLE_MEMBERS, &possible)?;
-            tx.put(
-                &format!("{PENDING_REMOVALS}{}", key::num(doc.version())),
-                doc.signed(),
-            )?;
+            tx.put(&pending_removal_key(doc.version()), doc.signed())?;
         }
         Ok(())
     }
@@ -168,10 +193,22 @@ impl App {
         doc: &IdentityDoc,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        if self.index_roster_removals(opening, doc, tx).await? {
+            tx.put(&format!("loss/removal/{}", doc.version()), doc.signed())?;
+        }
+        Ok(())
+    }
+
+    async fn index_roster_removals(
+        &self,
+        opening: &IdentityDoc,
+        doc: &IdentityDoc,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
         if opening.body().recovery_from != doc.body().recovery_from
             || opening.check_successor(doc).is_err()
         {
-            return Ok(());
+            return Ok(false);
         }
         let mut added = false;
         for removed in &doc.body().removed {
@@ -184,10 +221,7 @@ impl App {
                 }
             }
         }
-        if added {
-            tx.put(&format!("loss/removal/{}", doc.version()), doc.signed())?;
-        }
-        Ok(())
+        Ok(added)
     }
 
     /// The accepted identity-signed successor that explicitly removed an app from the
@@ -214,10 +248,16 @@ impl App {
         else {
             return Ok(None);
         };
-        let signed = reader
+        let signed = match reader
             .get::<SignedDoc>(&format!("loss/removal/{version}"))
             .await?
-            .ok_or_else(super::corrupt)?;
+        {
+            Some(signed) => signed,
+            None => reader
+                .get::<SignedDoc>(&pending_removal_key(version))
+                .await?
+                .ok_or_else(super::corrupt)?,
+        };
         let doc =
             IdentityDoc::verify(&signed, &opening.identity()).map_err(|_| super::corrupt())?;
         if doc.version() != version

@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use pubky_switch_core::json::OpaqueMember;
-use pubky_switch_core::message::Message;
+use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::scopes::{is_protocol_name, owns_root};
@@ -322,10 +322,16 @@ impl ProtocolSet {
         }
     }
 
-    /// Whether a first message of `kind` adds a conversation entry, by its protocol.
-    pub(crate) fn adds_conversation(&self, kind: &str) -> bool {
-        self.of_kind(kind)
-            .is_none_or(|r| r.protocol.adds_conversation(kind))
+    /// Whether the owner of this signed first message admits its recipient (Switch spec 7).
+    pub(crate) fn adds_conversation(
+        &self,
+        message: &Message,
+        plaintext: &MessagePlaintext,
+    ) -> bool {
+        self.of_kind(&message.kind).is_some_and(|owner| {
+            owner.protocol.adds_conversation(&message.kind)
+                && owner.protocol.message_adds_conversation(message, plaintext)
+        })
     }
 
     /// A record's mark, by its collection's protocol; none for a collection none gives.

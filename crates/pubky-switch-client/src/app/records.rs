@@ -198,6 +198,7 @@ const LIST_PAGE: u32 = 1000;
 /// What taking one listed record writes, at most: its cached write (its operation, 512 KiB,
 /// and opened value, 256 KiB, in base64, with its proof: 1.2 MiB), its mark as stored
 /// ([`MAX_SEEN_MARK_BYTES`] in base64), a flagged write's rule, and its duty events.
+/// The reserved room covers either a deletion or the readable value's local observation.
 const LISTED_RECORD_ROOM_BYTES: u64 = super::feed::CACHED_RECORD_BYTES
     + super::feed::KEPT_MARK_BYTES
     + super::deletion::ROOM
@@ -274,6 +275,41 @@ pub(super) struct ObservedView {
     pub(super) covers_uploads: bool,
     /// This GET repeated the active service's already observed signed chain tip.
     at_known_tip: bool,
+}
+
+/// Local cursor identity for the set of policies this pass can admit. An older
+/// cursor for the collection ID alone cannot establish coverage of additional generations.
+fn listing_scope(
+    id: &[u8; 32],
+    collection: &Collection,
+    members: Option<&[Collection]>,
+) -> Result<[u8; 32], AppError> {
+    let members = members.unwrap_or_else(|| std::slice::from_ref(collection));
+    if !members.iter().any(|member| {
+        member.name == collection.name && member.family == PolicyFamily::PermanentGenerations
+    }) {
+        return Ok(*id);
+    }
+    let mut policies = Vec::new();
+    for member in members
+        .iter()
+        .filter(|member| member.name == collection.name)
+    {
+        let kind = match member.family {
+            PolicyFamily::Fixed => 0,
+            PolicyFamily::SubScopes => 1,
+            PolicyFamily::PermanentGenerations => 2,
+        };
+        policies.push((kind, member.policy.hash()?));
+    }
+    policies.sort_unstable();
+    policies.dedup();
+    let mut bytes = id.to_vec();
+    for (kind, policy) in policies {
+        bytes.push(kind);
+        bytes.extend_from_slice(&policy);
+    }
+    Ok(pubky_switch_core::enc::hash(&bytes))
 }
 
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
@@ -453,6 +489,28 @@ impl RecordContent {
     fn waits_for_key(&self) -> bool {
         matches!(self, Self::Unreadable(Unopened::KeyNotHeld { .. }))
     }
+}
+
+/// The retained write and the service application the app builds on for a record in a
+/// recovery inventory (Switch wire 6.3, 7.4.14). They can differ after a refused write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossRecordApplication {
+    /// The opaque record key.
+    #[serde(with = "serde_b64")]
+    pub key: [u8; 32],
+    /// The signed operation the app holds and its application.
+    #[serde(with = "revision_serde")]
+    pub held: ApplicationRef,
+    /// The application the app last followed at this key.
+    #[serde(with = "revision_serde")]
+    pub followed: ApplicationRef,
+    /// The version the app last followed.
+    #[serde(with = "version_serde")]
+    pub version: RecordVersion,
+    /// Whether that write was a delete.
+    pub deleted: bool,
+    /// Whether a later read found that delete forgotten.
+    pub gone: bool,
 }
 
 /// A shared record as the app holds it: the newest write it accepted.
@@ -1270,18 +1328,35 @@ impl App {
     ///
     /// A store failure.
     pub async fn shared_evidence(&self) -> Result<SharedEvidence, AppError> {
-        let mut ops: Vec<KeptOp> = self
-            .reader()
-            .scan::<HeldRecord>(RECORD_PREFIX)
-            .await?
-            .into_iter()
-            .map(|(_, held)| KeptOp {
+        self.shared_evidence_with_details(None).await
+    }
+
+    pub(super) async fn shared_evidence_with_details(
+        &self,
+        mut details: Option<&mut super::LossInventoryDetails>,
+    ) -> Result<SharedEvidence, AppError> {
+        let mut ops = Vec::new();
+        for (key, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
+            if let Some(details) = details.as_deref_mut() {
+                let (version, followed, deleted) = held.base_write();
+                details.records.push(LossRecordApplication {
+                    key: unb64_array(&key)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                    held: held.applied,
+                    followed,
+                    version,
+                    deleted,
+                    gone: held.gone,
+                });
+            }
+            ops.push(KeptOp {
                 op: held.op,
                 cert: held.cert,
                 proof: held.proof,
-            })
-            .collect();
-        let (claim_ops, proofs, claim_entries_left_out) = self.claim_evidence_items().await?;
+            });
+        }
+        let (claim_ops, proofs, claim_entries_left_out) =
+            self.claim_evidence_items(details).await?;
         ops.extend(claim_ops);
         Ok(SharedEvidence {
             ops,
@@ -1301,6 +1376,51 @@ impl App {
             .get::<SeenMark>(&seen_key(key))
             .await?
             .map(|mark| mark.mark))
+    }
+
+    /// Apply the collection owner's changes at the same verified boundary as its
+    /// native mark, including a later covering view of the delete (Switch spec 8.2).
+    fn end_record_lifetime(
+        &self,
+        key: [u8; 32],
+        collection: &Collection,
+        version: RecordVersion,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let owner = self
+            .protocols
+            .of_collection(&collection.name)
+            .ok_or_else(store_corrupt)?;
+        let record = super::RecordMarkContext {
+            key,
+            collection,
+            naming: &self.state.naming,
+        };
+        let context = super::ReceiveContext::new(
+            &self.state,
+            &self.protocols,
+            &owner.name,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            false,
+            &[],
+            tx.pending_local(),
+            tx.pending_writes(),
+        );
+        let local = owner
+            .protocol
+            .record_lifetime_ended(&record, version, &context)
+            .map_err(AppError::Protocol)?;
+        let bytes = super::local_writes_bytes(&local);
+        if bytes > super::MAX_STEP_LOCAL_BYTES {
+            return Err(crate::error::StoreError::TooLarge {
+                size: u64::try_from(bytes).unwrap_or(u64::MAX),
+                cap: super::MAX_STEP_LOCAL_BYTES as u64,
+            }
+            .into());
+        }
+        tx.local(&super::protocols::qualify(&owner.name, local))?;
+        tx.delete(&seen_key(&key))
     }
 
     // ---------------------------------------------------------------------------------
@@ -1333,18 +1453,28 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<Fetched, AppError> {
+        Ok(Box::pin(self.fetch_record_application(key, collection))
+            .await?
+            .0)
+    }
+
+    async fn fetch_record_application(
+        &mut self,
+        key: &[u8; 32],
+        collection: &Collection,
+    ) -> Result<(Fetched, Option<ApplicationRef>), AppError> {
         let uploads = self.record_uploads(key, collection).await?;
         let record = match Box::pin(self.record_answer(key, uploads)).await? {
             RecordAnswer::View(record) => record,
             RecordAnswer::Absent if self.state.cert.holds_scope(&collection.policy.read_scope) => {
-                return Ok(Fetched::Absent);
+                return Ok((Fetched::Absent, None));
             }
             RecordAnswer::Absent | RecordAnswer::Inconclusive => {
-                return Ok(Fetched::Read(WriteRead::Unordered));
+                return Ok((Fetched::Read(WriteRead::Unordered), None));
             }
             // It doesn't host the identity: that says nothing of the record, and the
             // service reads as unreachable (Switch spec 10.3.1 "Absence", 12.7 step 5).
-            RecordAnswer::NotHosted(error) => return Ok(Fetched::NotHosted(error)),
+            RecordAnswer::NotHosted(error) => return Ok((Fetched::NotHosted(error), None)),
         };
         let mut tx = self.tx()?;
         let expect = Some((key, collection));
@@ -1364,11 +1494,11 @@ impl App {
         // Only the service generation the app follows can report this key as fresh now.
         let current =
             matches!(record.at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
-        Ok(Fetched::Read(if current && record.covers_uploads {
-            read
+        Ok(if current && record.covers_uploads {
+            (Fetched::Read(read), Some(record.view.revision))
         } else {
-            WriteRead::Unordered
-        }))
+            (Fetched::Read(WriteRead::Unordered), None)
+        })
     }
 
     /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
@@ -1428,6 +1558,43 @@ impl App {
             })
         })
         .await
+    }
+
+    /// Read the service's current record and return its accepted contents, exact application
+    /// and signed input together (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
+    /// read returns no evidence. A divergent or doubtful record keeps its ordinary flags.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_record_fresh`].
+    pub async fn read_record_application(
+        &mut self,
+        target: &RecordTarget,
+    ) -> Result<Option<(SharedRecord, ApplicationRef, KeptOp)>, AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        let key = self.record_key(target)?;
+        let (Fetched::Read(WriteRead::Taken | WriteRead::Equal), Some(application)) =
+            Box::pin(self.fetch_record_application(&key, &target.collection)).await?
+        else {
+            return Ok(None);
+        };
+        let Some(held) = self.held_record(&key).await? else {
+            return Ok(None);
+        };
+        if held.gone || held.follow.is_some() || held.applied != application {
+            return Ok(None);
+        }
+        let record = held.shared(&key, self.is_divergent(&key).await?);
+        Ok(Some((
+            record,
+            application,
+            KeptOp {
+                op: held.op,
+                cert: held.cert,
+                proof: held.proof,
+            },
+        )))
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what
@@ -1711,7 +1878,7 @@ impl App {
             let id = collection.id(&self.state.meta.identity);
             let key = listc_key(&id);
             let mut progress: ListProgress = self.reader().get(&key).await?.unwrap_or_default();
-            let after = progress.after(&id)?;
+            let after = progress.after(&listing_scope(&id, collection, None)?)?;
             let mut pages = LISTING_PAGES_PER_READ;
             let listed = self
                 .list_from(
@@ -1756,6 +1923,7 @@ impl App {
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
         let upload = self.listing_upload(&collection.name).await?;
+        let scope = listing_scope(&id, collection, members)?;
         let mut listed = 0u64;
         loop {
             // Past a read's time budget, once it asked for one page, it pauses as on its
@@ -1855,7 +2023,7 @@ impl App {
                 )?;
             }
             if let Some((progress, key)) = progress.as_mut() {
-                progress.reached(&id, next.as_ref());
+                progress.reached(&scope, next.as_ref());
                 checkpoint.put(key, &**progress)?;
             }
             self.append_listing_writes(&mut tx, checkpoint).await?;
@@ -1993,10 +2161,11 @@ impl App {
             let collections = self.readable_collections(name);
             for collection in &collections {
                 let id = collection.id(&self.state.meta.identity);
-                if progress.done.contains(&b64(&id)) {
+                let scope = listing_scope(&id, collection, Some(&collections))?;
+                if progress.done.contains(&b64(&scope)) {
                     continue;
                 }
-                let after = progress.after(&id)?;
+                let after = progress.after(&scope)?;
                 if let Listed::Paused(_) = self
                     .list_from(
                         collection,
@@ -2144,10 +2313,11 @@ impl App {
             .collect();
         for collection in &collections {
             let id = collection.id(&self.state.meta.identity);
-            if progress.done.contains(&b64(&id)) {
+            let scope = listing_scope(&id, collection, Some(&collections))?;
+            if progress.done.contains(&b64(&scope)) {
                 continue;
             }
-            let after = progress.after(&id)?;
+            let after = progress.after(&scope)?;
             if let Listed::Paused(_) = self
                 .list_from(
                     collection,
@@ -2169,14 +2339,13 @@ impl App {
         Ok(true)
     }
 
-    /// Whether the certificate lacks, at the current data epoch, the key of a scope it
-    /// holds that reads one of `collections` (Switch spec 3.5).
+    /// Whether a readable collection member lacks its current scope key (Switch spec 3.5).
     fn listing_lacks_keys(&self, collections: &[Collection]) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        self.state.cert.scopes().iter().any(|scope| {
-            self.protocols.has_keys(scope)
-                && self.state.scope_keys.get(epoch, scope).is_none()
-                && collections.iter().any(|c| c.read_by_scope(scope))
+        collections.iter().any(|collection| {
+            collection.any_read_scope(&self.state.cert, |scope| {
+                self.protocols.has_keys(scope) && self.state.scope_keys.get(epoch, scope).is_none()
+            })
         })
     }
 
@@ -3326,7 +3495,7 @@ impl App {
         page_time_ms: Option<u64>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
-        Box::pin(async move {
+        let result = Box::pin(async {
             let key = accepted.key;
             // The application proof settles an own submission even while a foreign
             // observation is owed. Foreign handovers still follow the owner's feed order.
@@ -3421,7 +3590,7 @@ impl App {
                     }
                     // A fresh proof may be the first evidence that a held delete was current.
                     if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
-                        tx.delete(&seen_key(&key))?;
+                        self.end_record_lifetime(key, &accepted.collection, upgraded.version, tx)?;
                     }
                     if upgraded != *held {
                         put_held(tx, &key, &upgraded)?;
@@ -3429,6 +3598,7 @@ impl App {
                     if let Some(h) = placement.historical && !confirms {
                         return Ok(Taken::Historical(h));
                     }
+                    self.observe_readable_record(&key, &upgraded, Some(held), accepted.observation, false, tx).await?;
                     return Ok(Taken::Equal);
                 }
                 if let Some(h) = placement.historical {
@@ -3614,7 +3784,8 @@ impl App {
                     )?;
                 }
                 Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-                None if ends_mark || (own && !keeps_mark) => tx.delete(&seen_key(&key))?,
+                None if ends_mark => self.end_record_lifetime(key, &accepted.collection, accepted.write.version.version, tx)?,
+                None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
                 None => {}
             }
             let live_in = self.live_in(
@@ -3642,6 +3813,9 @@ impl App {
                 observed: held.as_ref().filter(|_| !selects_base).map_or(observed, |h| h.observed),
                 gone: !selects_base && held.as_ref().is_some_and(|h| h.gone),
             };
+            if placement.historical.is_none() {
+                self.observe_readable_record(&key, &record, held.as_ref(), accepted.observation, !reopened, tx).await?;
+            }
             put_held(tx, &key, &record)?;
             self.events.push(AppEvent::RecordChanged { key });
             Ok(if let Some(h) = placement.historical {
@@ -3652,7 +3826,11 @@ impl App {
                 Taken::New
             })
         })
-        .await
+        .await;
+        if result.is_err() {
+            self.reload = true;
+        }
+        result
     }
 
     async fn record_source_current(
@@ -3685,6 +3863,74 @@ impl App {
             false
         };
         Ok(current)
+    }
+
+    /// Commit what the collection owner learned with the accepted record. A protocol
+    /// can derive its physical target through the context and carry its own qualified
+    /// observations across a selected backup (Switch spec 8.2, 12.4).
+    async fn observe_readable_record(
+        &self,
+        key: &[u8; 32],
+        record: &HeldRecord,
+        previous: Option<&HeldRecord>,
+        source: ObservationSource,
+        newer: bool,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if !record.authenticated || record.content.value().is_none() {
+            return Ok(());
+        }
+        let Some(owner) = self.protocols.of_collection(&record.collection) else {
+            return Ok(());
+        };
+        let prior_divergence = match tx.pending_state(&super::uploaded::divergent_key(key)) {
+            Some(held) => held,
+            None => self.is_divergent(key).await?,
+        };
+        let current = self
+            .record_source_current(
+                key,
+                &record.collection,
+                source,
+                record.applied,
+                record.observed,
+                tx,
+            )
+            .await?;
+        let divergent = source.divergent(current, prior_divergence, newer);
+        let accepted = record.shared(key, divergent);
+        let before = previous.map(|held| held.shared(key, prior_divergence));
+        let input = super::RecordObservation {
+            record: &accepted,
+            previous: before.as_ref(),
+            operation: &record.op,
+            application: record.applied,
+            current,
+        };
+        let context = super::ReceiveContext::new(
+            &self.state,
+            &self.protocols,
+            &owner.name,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            false,
+            &[],
+            tx.pending_local(),
+            tx.pending_writes(),
+        );
+        let local = owner
+            .protocol
+            .observe_record(&input, &context)
+            .map_err(AppError::Protocol)?;
+        let bytes = super::local_writes_bytes(&local);
+        if bytes > super::MAX_STEP_LOCAL_BYTES {
+            return Err(crate::error::StoreError::TooLarge {
+                size: u64::try_from(bytes).unwrap_or(u64::MAX),
+                cap: super::MAX_STEP_LOCAL_BYTES as u64,
+            }
+            .into());
+        }
+        tx.local(&super::protocols::qualify(&owner.name, local))
     }
 
     /// The collection as held, registered, or named when building an own write.
@@ -4373,7 +4619,7 @@ pub(crate) fn record_put(
     held: Option<&HeldRecord>,
 ) -> Result<(RecordPut, Option<Condition>), AppError> {
     refuse_non_json(value)?;
-    let policy = &target.collection.policy;
+    let policy = target.concrete_policy()?;
     if !policy
         .write_scopes
         .iter()
@@ -4557,6 +4803,8 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         PERMANENT_PREFIX,
         SEEN_PREFIX,
         "recname/",
+        "loss-data/",
+        "loss-upload/",
         "out/",
         "sent/",
         "sentt/",

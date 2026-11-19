@@ -92,12 +92,15 @@ pub use protocol::{
     LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
     PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, RETRY_EVENT_READS, ReceivedMessage,
-    RecordDeletion, RecordMarkContext, ResendNeeded, ResendReason, StoreFailure, WriteBase,
-    decode_local_state, encode_local_state, local_writes_bytes,
+    RecordDeletion, RecordMarkContext, RecordObservation, ResendNeeded, ResendReason, StoreFailure,
+    WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
+pub use recovery::inventory::{
+    LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
+};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 pub use unverified::{
@@ -124,8 +127,8 @@ pub use directory::{
 };
 pub use records::{
     Collection, CollectionListed, CurrentCollection, FlaggedWrite, KeptOp, KeptReason,
-    LISTING_PAGES_PER_READ, PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence,
-    SharedRecord, ShownWrite, Unopened,
+    LISTING_PAGES_PER_READ, LossRecordApplication, PolicyFamily, RecordContent, RecordRead,
+    RecordTarget, SharedEvidence, SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,

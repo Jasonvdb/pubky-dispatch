@@ -94,6 +94,8 @@ pub(crate) struct LossProtocol {
     pub(crate) name: Option<&'static str>,
     pub(crate) sample: SampleProtocol,
     pub(crate) losses: Mutex<Vec<ProviderLoss>>,
+    /// Current coverage and divergence for the record reads a test follows.
+    pub(crate) observed_records: Mutex<Option<Vec<(bool, bool)>>>,
     pub(crate) counterparties: Vec<[u8; 32]>,
     /// How many of the next loss calls fail, as when the protocol can't read its state.
     pub(crate) failing: Mutex<u32>,
@@ -104,6 +106,17 @@ pub(crate) struct LossProtocol {
 }
 
 impl Protocol for LossProtocol {
+    fn observe_record(
+        &self,
+        observed: &crate::app::RecordObservation<'_>,
+        _: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        if let Some(reads) = self.observed_records.lock().unwrap().as_mut() {
+            reads.push((observed.current, observed.record.divergent));
+        }
+        Ok(Vec::new())
+    }
+
     fn name(&self) -> String {
         self.name.unwrap_or("sample").into()
     }
@@ -1481,17 +1494,21 @@ fn loss_set(protocol: &Arc<LossProtocol>, others: &[Arc<LossProtocol>]) -> crate
 
 /// The follow: the own identity.json from the Homeserver, then a read. Returns the app and
 /// the read's events.
-pub(crate) async fn follow_loss(
-    lost: &Lost,
-    store: Arc<dyn StateStore>,
-) -> Result<(App, Vec<AppEvent>), AppError> {
-    let mut app = App::load(
+async fn load_loss(lost: &Lost, store: Arc<dyn StateStore>) -> Result<App, AppError> {
+    App::load(
         lost.router.env(&lost.w, store),
         loss_set(&lost.protocol, &lost.others),
         World::config(),
         app_keys("wallet").app_id_bytes(),
     )
-    .await?;
+    .await
+}
+
+pub(crate) async fn follow_loss(
+    lost: &Lost,
+    store: Arc<dyn StateStore>,
+) -> Result<(App, Vec<AppEvent>), AppError> {
+    let mut app = load_loss(lost, store).await?;
     app.refresh_identity().await?;
     let report = app.receive(None).await?;
     Ok((app, report.events))
@@ -1531,6 +1548,285 @@ async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_call
         AppEvent::ProviderRecovered { generation: 2 }
     )));
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_loss_roster_selects_the_new_opening_after_a_second_loss() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let first = app.recovery_roster().await.unwrap().unwrap();
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let next = third.identity_doc().unwrap();
+    app.refresh_identity().await.unwrap();
+    assert_ne!(
+        app.recovery_roster()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(IdentityDoc::hash),
+        Some(first.hash())
+    );
+    app.follow_provider().await.unwrap();
+    let second = app.recovery_roster().await.unwrap().unwrap();
+    assert_eq!(second.hash(), next.hash());
+    assert_eq!(second.body().recovery_from, Some(2));
+}
+
+#[tokio::test]
+async fn test_loss_roster_keeps_the_opening_document_after_a_later_version_and_reload() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let opening = lost.next.identity_doc().unwrap();
+    let later = lost.w.signer.sign_next(|_| {}).unwrap();
+    lost.next.deliver_identity(&later).unwrap();
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.own_identity().hash(), later.hash());
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+
+    // A loss followed before its roster was kept can still read the original pair.
+    let mut tx = app.tx().unwrap();
+    tx.delete("loss/opening").unwrap();
+    app.commit(tx).await.unwrap();
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+
+    let app_id = app.app_id();
+    drop(app);
+    let mut reloaded = App::load(
+        lost.router.env(&lost.w, store as Arc<dyn StateStore>),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        app_id,
+    )
+    .await
+    .unwrap();
+    lost.next.lock().not_hosted_unpinned = true;
+    let kept = reloaded.recovery_roster().await.unwrap().unwrap();
+    assert_eq!(kept.hash(), opening.hash());
+    assert_eq!(kept.body().recovery_from, Some(1));
+}
+
+#[tokio::test]
+async fn test_loss_roster_indexes_the_original_removal_after_an_interrupted_commit() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let store = Arc::new(FaultStore::new(
+        store as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let opening = lost.next.identity_doc().unwrap();
+    let phone = app_keys("phone").app_id_bytes();
+    assert!(opening.listed_cert(&phone).is_some());
+    let removed = lost
+        .w
+        .signer
+        .sign_next(|body| {
+            body.apps.retain(|app| app.app_id != phone);
+            body.removed.push(RemovedApp {
+                app_id: phone,
+                distrust_from: START,
+            });
+        })
+        .unwrap();
+    lost.next.deliver_identity(&removed).unwrap();
+    app.refresh_identity().await.unwrap();
+    let purged = lost
+        .w
+        .signer
+        .sign_next(|body| body.removed.clear())
+        .unwrap();
+    lost.next.deliver_identity(&purged).unwrap();
+    app.refresh_identity().await.unwrap();
+    assert_eq!(app.own_identity().hash(), purged.hash());
+
+    store.fail_put_once(b"loss/opening");
+    assert!(app.follow_provider().await.is_err());
+    drop(app);
+
+    // Reuse the signed copy kept on observation. The store can commit the opening
+    // and version indexes even when it cannot accept another copy of the document.
+    store.refuse_puts_as_too_large(Some(b"loss/removal/"));
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.recovery_roster().await.unwrap().unwrap().hash(),
+        opening.hash()
+    );
+    assert_eq!(
+        app.recovery_removal(&phone).await.unwrap().unwrap().hash(),
+        removed.hash()
+    );
+    drop(app);
+    let mut app = load_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.recovery_removal(&phone).await.unwrap().unwrap().hash(),
+        removed.hash()
+    );
+}
+
+#[tokio::test]
+async fn test_loss_upload_inputs_and_application_survive_an_unanswered_request() {
+    use crate::app::LossUploadOutcome;
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(Arc::clone(&store) as Arc<dyn StateStore>, &[], true, false).await;
+    let load = || load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut app = load().await.unwrap();
+    app.retain_loss_uploads_for("sample", b"cutoff")
+        .await
+        .unwrap();
+    app.protocol_commit(
+        "sample",
+        &[crate::app::LocalWrite::Put {
+            key: b"cutoff".to_vec(),
+            value: b"first".to_vec(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    lost.next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.receive(None).await.is_err());
+    drop(app);
+    let mut app = load().await.unwrap();
+    let pending = app.loss_uploads(2).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].outcome, LossUploadOutcome::Pending);
+    let (inputs, local) = app.loss_upload_inputs(&pending[0]).await.unwrap();
+    assert_eq!(inputs.records.len(), 1);
+    assert_eq!(local.records.len(), 1);
+    assert!(local.omitted.is_empty());
+    assert_eq!(local.checkpoints.len(), 1);
+    let cutoff = Some(pubky_switch_core::enc::hash(b"first"));
+    assert_eq!(local.checkpoints[0].before, cutoff);
+    assert_eq!(local.checkpoints[0].after, cutoff);
+    app.receive(None).await.unwrap();
+    drop(app);
+    let mut app = load().await.unwrap();
+    let seen = app.loss_uploads(2).await.unwrap();
+    assert_eq!(seen.len(), 1);
+    let kept = &seen[0];
+    assert_eq!(kept.body_hash, pending[0].body_hash);
+    assert_eq!(
+        kept.opening_hash,
+        Some(app.recovery_roster().await.unwrap().unwrap().hash())
+    );
+    assert_eq!(kept.recovery_from, 1);
+    assert_eq!(
+        app.loss_upload_inputs(kept).await.unwrap(),
+        (inputs.clone(), local)
+    );
+    let LossUploadOutcome::Answered { proof, .. } = &kept.outcome else {
+        panic!("the checked retry is missing");
+    };
+    let pubky_switch_core::chain::ServiceTransition::Upload { by, changes, .. } =
+        pubky_switch_core::chain::ServiceTransition::from_value(&proof.body().state).unwrap()
+    else {
+        panic!("expected an upload");
+    };
+    assert_eq!(by, app.app_id());
+    assert!(changes["records"].as_array().unwrap().is_empty());
+    let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
+    let (record, applied, evidence) = app.read_record_application(&target).await.unwrap().unwrap();
+    assert_eq!(evidence.op, inputs.records[0].op);
+    assert_eq!(record.key, app.record_key(&target).unwrap());
+    assert_eq!(applied.generation, 2);
+    app.forget_loss_uploads(2).await.unwrap();
+    assert!(app.loss_uploads(2).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_loss_upload_empty_evidence_records_the_pass_without_posting() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(Arc::clone(&store) as Arc<dyn StateStore>, &[], false, false).await;
+    let mut app = load_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    app.forget_evidence(&[Evidence::Proof(first_proof(&lost.w.switch))])
+        .await
+        .unwrap();
+    // No verified old head can be uploaded across a gap (Switch spec 12.6 step 3).
+    app.state.chain.as_mut().unwrap().gap = Some((1, 2));
+    app.retain_loss_uploads_for("sample", b"cutoff")
+        .await
+        .unwrap();
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    let observations = app.loss_uploads(2).await.unwrap();
+    assert_eq!(observations.len(), 1);
+    let seen = &observations[0];
+    assert_eq!(seen.outcome, crate::app::LossUploadOutcome::NoRequest);
+    let (inputs, details) = app.loss_upload_inputs(seen).await.unwrap();
+    assert!(
+        inputs.records.is_empty()
+            && inputs.claims.is_empty()
+            && inputs.proofs.is_empty()
+            && inputs.heads.is_empty()
+    );
+    assert!(details.records.is_empty() && details.omitted.is_empty());
+    assert_eq!(details.checkpoints[0].before, None);
+    assert_eq!(details.checkpoints[0].after, None);
+    assert!(lost.next.uploads().is_empty());
+}
+
+#[tokio::test]
+async fn test_loss_upload_retains_the_unanswered_inputs_after_the_next_scan_changes() {
+    use crate::app::LossUploadOutcome;
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let mut app = load_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    app.retain_loss_uploads().await.unwrap();
+    lost.next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.receive(None).await.is_err());
+    let old = app.loss_uploads(2).await.unwrap().pop().unwrap();
+    app.forget_evidence(&[Evidence::Proof(first_proof(&lost.w.switch))])
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let observations = app.loss_uploads(2).await.unwrap();
+    assert_eq!(observations.len(), 2);
+    assert!(observations.contains(&old));
+    assert_eq!(old.outcome, LossUploadOutcome::Pending);
+    assert_eq!(
+        app.loss_upload_inputs(&old).await.unwrap().0.proofs.len(),
+        1
+    );
+    let new = observations
+        .iter()
+        .find(|v| v.body_hash != old.body_hash)
+        .unwrap();
+    assert!(matches!(new.outcome, LossUploadOutcome::Answered { .. }));
+    assert!(
+        app.loss_upload_inputs(new)
+            .await
+            .unwrap()
+            .0
+            .proofs
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2194,6 +2490,11 @@ async fn test_loss_upload_answered_429_waits_its_retry_after() {
 async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    app.retain_loss_uploads().await.unwrap();
+    drop(app);
     lost.next.fail_next(Fault::Error {
         path: "recovery/upload".into(),
         code: ErrorCode::Conflict,
@@ -2208,6 +2509,12 @@ async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     )));
     let info = app.recovery_info().await.unwrap().unwrap();
     assert!(info.steps_done);
+    let observations = app.loss_uploads(2).await.unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].outcome,
+        crate::app::LossUploadOutcome::Refused(ErrorCode::Conflict)
+    );
     // The refused evidence isn't sent again; the lists went.
     assert_eq!(lost.next.uploads().len(), 1);
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);

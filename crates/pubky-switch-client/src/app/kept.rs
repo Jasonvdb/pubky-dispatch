@@ -301,25 +301,42 @@ impl App {
             }))
     }
 
+    /// The latest indexed batch that queues this message, while its status is retained.
+    pub(crate) async fn batch_for_message(
+        &self,
+        msg_id: &str,
+    ) -> Result<Option<KeptBatch>, AppError> {
+        let Some(index) = self.reader().get::<KeptIndex>(&message_key(msg_id)).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .kept_batch(index.batch_id)
+            .await?
+            .map(|status| KeptBatch {
+                batch_id: index.batch_id,
+                status,
+            }))
+    }
+
     /// Where a message a kept batch queues is, when the outbox and the sent messages hold
     /// nothing of it: [`Delivery::Kept`] while the batch is kept, [`Delivery::Failed`] with
     /// the drop's time once it is dropped; `None` otherwise.
     pub(crate) async fn kept_delivery(&self, msg_id: &str) -> Result<Option<Delivery>, AppError> {
-        let Some(index) = self.reader().get::<KeptIndex>(&message_key(msg_id)).await? else {
+        let Some(batch) = self.batch_for_message(msg_id).await? else {
             return Ok(None);
         };
-        Ok(match self.kept_batch(index.batch_id).await? {
-            Some(KeptBatchStatus::Kept { .. }) => Some(Delivery::Kept {
-                batch_id: index.batch_id,
+        Ok(match batch.status {
+            KeptBatchStatus::Kept { .. } => Some(Delivery::Kept {
+                batch_id: batch.batch_id,
             }),
-            Some(KeptBatchStatus::Dropped {
+            KeptBatchStatus::Dropped {
                 dropped_at_ms,
                 reason,
-            }) => Some(Delivery::Failed {
+            } => Some(Delivery::Failed {
                 reason: reason.message_reason(),
                 failed_at_ms: dropped_at_ms,
             }),
-            Some(KeptBatchStatus::Applied { .. }) | None => None,
+            KeptBatchStatus::Applied { .. } => None,
         })
     }
 

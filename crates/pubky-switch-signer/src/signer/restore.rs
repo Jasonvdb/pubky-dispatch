@@ -37,7 +37,9 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
+use pubky_switch_core::records::{
+    IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup, app_record_path,
+};
 use pubky_switch_core::sig::SignedDoc;
 
 use super::SignerEnv;
@@ -48,6 +50,17 @@ use crate::alert::Alert;
 use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
+
+impl BackupView {
+    fn service(&self) -> Service {
+        Service {
+            origin: self.identity_doc.inbox().url.clone(),
+            service_key: self.identity_doc.inbox().service_key,
+            limits: self.limits,
+            created: self.account_created,
+        }
+    }
+}
 
 /// Confirmation that the user chose restoration after seeing what unusable local records
 /// may lose: claims, undelivered changes, pending effects and local history (Switch spec 12.8).
@@ -98,11 +111,60 @@ impl KeptCopy {
     }
 }
 
+/// A signed successor whose backup was saved before its delivery (Switch wire 3.13).
+struct PendingDelivery {
+    account: Service,
+    doc: SignedDoc,
+    prev: [u8; 32],
+    backup: SignerBackup,
+}
+
+impl PendingDelivery {
+    fn from_flow(flow: Flow) -> Option<Box<Self>> {
+        match flow {
+            Flow::Deliver {
+                account,
+                doc,
+                prev: Some(prev),
+                backup: Some(backup),
+                ..
+            } => Some(Box::new(Self {
+                account,
+                doc,
+                prev,
+                backup,
+            })),
+            _ => None,
+        }
+    }
+
+    /// Open the backup at the Homeserver only when it covers the entire saved delivery.
+    fn open(&self, keyring: &IdentityKeyring, bytes: Option<&[u8]>) -> Result<BackupView> {
+        let found = bytes.and_then(|bytes| serde_json::from_slice::<SignerBackup>(bytes).ok());
+        if found.as_ref() != Some(&self.backup) {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let view = keyring
+            .open_backup(&self.backup)?
+            .ok_or(Refusal::FlowInProgress)?;
+        if view.identity_doc.signed() != &self.doc
+            || view.prev != Some(self.prev)
+            || view.service() != self.account
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        Ok(view)
+    }
+}
+
 // Retained restrictions, never a ready signer or permission to sign. Only a whole decoded
 // current state for the requested identity contributes its scalar and collection members.
 pub(super) struct RestoreLocal {
+    pending_delivery: Option<Box<PendingDelivery>>,
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
+    /// A verified first discovery can locate a service when no signed copy names one.
+    pub(super) first_account_origin: Option<String>,
     pub(super) signed_through: Option<u64>,
     pub(super) epoch_through: Option<u64>,
 }
@@ -121,6 +183,8 @@ impl RestoreLocal {
             epoch_through: state.as_ref().map(|state| state.epoch_through),
             state,
             copies,
+            pending_delivery: None,
+            first_account_origin: None,
         };
         for copy in &local.copies {
             if let KeptCopy::Verified(doc) = copy {
@@ -132,12 +196,20 @@ impl RestoreLocal {
     }
 
     pub(super) fn intact(state: SignerState) -> Result<Self> {
-        state.check_copies()?;
+        state.check_stored_copies()?;
         let identity = state.identity;
         Ok(Self::from_state(Some(state), &identity))
     }
 
     pub(super) fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
+        let local = Self::unusable_for_backup(records, identity)?;
+        if local.pending_delivery.is_some() {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        Ok(local)
+    }
+
+    fn unusable_for_backup(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let mut damaged = false;
         let state = match records.state {
             Ok(state) => state,
@@ -156,7 +228,7 @@ impl RestoreLocal {
             }
         };
         if let Some(state) = &state {
-            if let Err(error) = state.check_copies() {
+            if let Err(error) = state.check_stored_copies() {
                 local_damage(error)?;
                 damaged = true;
             }
@@ -188,12 +260,12 @@ impl RestoreLocal {
             }
             .into());
         }
-        if let Some(state) = &state {
-            check_local_restore(state, intact_flow)?;
-        } else if intact_flow {
-            return Err(Refusal::FlowInProgress.into());
-        }
+        let verified_flow = flow.as_ref().filter(|_| intact_flow);
+        let pending = verified_flow.is_some_and(Flow::blocks_restore);
         let mut local = Self::from_state(state, identity);
+        local.first_account_origin = verified_flow
+            .and_then(Flow::first_account_origin)
+            .map(str::to_owned);
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
         let signed = match &flow {
@@ -207,6 +279,22 @@ impl RestoreLocal {
             local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
             local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
         }
+        if pending
+            && local.state.as_ref().is_none_or(|state| {
+                !state.recovering
+                    && !state.switch_unconfirmed
+                    && state.managed_by.is_none()
+                    && gate::held_alarm(state).is_none()
+            })
+        {
+            local.pending_delivery = flow.and_then(PendingDelivery::from_flow);
+        }
+        let blocked = pending && local.pending_delivery.is_none();
+        if let Some(state) = &local.state {
+            check_local_restore(state, blocked)?;
+        } else if blocked {
+            return Err(Refusal::FlowInProgress.into());
+        }
         Ok(local)
     }
 }
@@ -218,7 +306,8 @@ fn local_damage(error: SignerError) -> Result<()> {
             RecordsFault::Undecodable { .. }
             | RecordsFault::InvalidHeader
             | RecordsFault::OtherIdentity
-            | RecordsFault::Incomplete,
+            | RecordsFault::Incomplete
+            | RecordsFault::Damaged(_),
         ) => Ok(()),
         other => Err(other),
     }
@@ -346,7 +435,7 @@ impl Signer {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
         let local = match (
-            RestoreLocal::unusable(state::read(&store, &identity).await?, &identity),
+            RestoreLocal::unusable_for_backup(state::read(&store, &identity).await?, &identity),
             confirmed.0.clone(),
         ) {
             (Err(SignerError::Refused(Refusal::AlreadySetUp)), Some(key)) => {
@@ -429,7 +518,10 @@ impl Signer {
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
             return Box::pin(self.continue_key_recovery(key.clone())).await;
         }
-        check_local_restore(&self.state, self.flow.is_some())?;
+        check_local_restore(
+            &self.state,
+            self.flow.as_ref().is_some_and(Flow::blocks_restore),
+        )?;
         let local = RestoreLocal::intact(self.state.clone())?;
         match (self.restore_records(Some(local), key.is_some()).await, key) {
             (Err(error), Some(key)) if backup_refused(&error) => {
@@ -457,16 +549,17 @@ impl Signer {
             .homeserver
             .get(SIGNER_BACKUP_PATH)
             .await
-            .map_err(SignerError::Homeserver)?
-            .ok_or(Refusal::NoBackup)?;
-        let view = self.open_backup(&bytes)?.ok_or(Refusal::UnreadableBackup)?;
-        let doc = view.identity_doc.clone();
-        let service = Service {
-            origin: doc.inbox().url.clone(),
-            service_key: doc.inbox().service_key,
-            limits: view.limits,
-            created: view.account_created,
+            .map_err(SignerError::Homeserver)?;
+        let view = match local
+            .as_ref()
+            .and_then(|local| local.pending_delivery.as_deref())
+        {
+            Some(delivery) => delivery.open(&self.keyring, bytes.as_deref())?,
+            None => self
+                .open_backup(&bytes.ok_or(Refusal::NoBackup)?)?
+                .ok_or(Refusal::UnreadableBackup)?,
         };
+        let service = view.service();
         let target = Target {
             origin: &service.origin,
             pinned: Some(service.service_key),
@@ -517,6 +610,20 @@ impl Signer {
                 return Err(error.into());
             }
         };
+        Box::pin(self.restore_from_copy(view, answer, local, serving)).await
+    }
+
+    /// Restore the opened backup against the answer authenticated for its original account.
+    pub(super) async fn restore_from_copy(
+        &mut self,
+        view: BackupView,
+        answer: AppsAnswer,
+        mut local: Option<RestoreLocal>,
+        serving: Option<[u8; 32]>,
+    ) -> Result<IdentityDoc> {
+        let identity = self.state.identity;
+        let doc = view.identity_doc.clone();
+        let service = view.service();
         // In place, the service still serves the lost generation until it takes the version:
         // its copy of that generation counts as no copy (Switch wire 3.13).
         let answer = without_the_lost_copy(&view, answer, &identity);
@@ -572,12 +679,15 @@ impl Signer {
             account: service,
             doc: doc.signed().clone(),
             prev,
-            backup: None,
+            backup: local
+                .as_mut()
+                .and_then(|local| local.pending_delivery.take())
+                .map(|delivery| delivery.backup),
             step: DeliverStep::BackupWritten,
         });
         let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
-        match self.finish_flow().await {
+        match Box::pin(self.finish_flow()).await {
             Ok(()) => {}
             // The recovery's version wasn't taken: the restore is done, the recovery in
             // progress, resumed or declared again at another service from here.
@@ -586,7 +696,7 @@ impl Signer {
         }
 
         let next = self.sign_own_version().await?;
-        self.resume().await?;
+        Box::pin(self.resume()).await?;
         Ok(next)
     }
 

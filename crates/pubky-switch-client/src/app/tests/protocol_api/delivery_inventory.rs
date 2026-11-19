@@ -1712,6 +1712,233 @@ async fn test_delivery_origin_reload_and_both_restore_modes_preserve_snapshot() 
 }
 
 #[tokio::test]
+async fn test_queue_signed_with_commits_the_original_and_owner_state_together() {
+    Box::pin(async {
+        for applied in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            protocol
+                .require_send_fact
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let store = Arc::new(MemoryStore::new());
+            let wallet = p
+                .join_on(&p.alice, "wallet", protocol.clone(), store.clone())
+                .await;
+            let id = wallet.app_id();
+            drop(wallet);
+            let fault = if applied {
+                StoreFault::FailAfter(1)
+            } else {
+                StoreFault::FailBefore(1)
+            };
+            let mut wallet = App::load(
+                p.env(&p.alice, Arc::new(FaultStore::new(store.clone(), fault))),
+                protocol.clone(),
+                config(),
+                id,
+            )
+            .await
+            .unwrap();
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            let sender = wallet.identity();
+            shop.invite(&sender).await.unwrap();
+            let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+            let key = delivery_key(signed.msg_id());
+            let writes = [fact_write(
+                signed.msg_id(),
+                &delivery_fact(&wallet, signed.plaintext()),
+            )];
+            let result = wallet
+                .queue_signed_with("sample", signed.clone(), &writes)
+                .await;
+            assert!(matches!(result, Err(AppError::Store(_))));
+            drop(wallet);
+
+            let mut wallet = App::load(p.env(&p.alice, store), protocol, config(), id)
+                .await
+                .unwrap();
+            assert_eq!(
+                wallet.protocol_get("sample", &key).await.unwrap().is_some(),
+                applied
+            );
+            assert_eq!(
+                wallet.queued_messages("sample").await.unwrap().len(),
+                usize::from(applied)
+            );
+            assert_eq!(p.bob.switch().entries_from(&sender), 0);
+            if !applied {
+                assert_eq!(
+                    wallet
+                        .queue_signed_with("sample", signed.clone(), &writes)
+                        .await
+                        .unwrap(),
+                    signed.msg_id()
+                );
+            }
+            let remove = [LocalWrite::Delete { key: key.clone() }];
+            assert!(
+                wallet
+                    .queue_signed_with("sample", signed.clone(), &remove)
+                    .await
+                    .is_err()
+            );
+            let queued = listed_origin(&wallet, &signed).await;
+            assert_eq!(queued.origin, DeliveryOrigin::Original);
+            assert_eq!(queued.hash, signed.hash());
+            assert!(queued.may_send);
+            assert!(matches!(
+                wallet.flush_message(signed.msg_id()).await.unwrap(),
+                Some(Delivery::Accepted { .. })
+            ));
+            assert!(
+                wallet
+                    .queue_signed_with("sample", signed, &remove)
+                    .await
+                    .is_err()
+            );
+            assert!(wallet.protocol_get("sample", &key).await.unwrap().is_some());
+            assert_eq!(p.bob.switch().entries_from(&sender), 1);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_queue_signed_with_requires_a_fresh_message_of_the_registered_owner() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let shop = p.join(&p.bob, "shop", &protocol).await;
+        let signed = wallet.sign_message(Pair::note(&p.bob, "first")).unwrap();
+        let foreign = shop.sign_message(Pair::note(&p.alice, "reply")).unwrap();
+        let outside = wallet
+            .sign_message(OutgoingMessage::new(
+                shop.identity(),
+                "other.note",
+                Map::new(),
+            ))
+            .unwrap();
+        let writes = [LocalWrite::Put {
+            key: b"origin".to_vec(),
+            value: b"first".to_vec(),
+        }];
+        for (owner, message) in [
+            ("other", signed.clone()),
+            ("sample", foreign),
+            ("sample", outside),
+        ] {
+            assert!(matches!(
+                wallet.queue_signed_with(owner, message, &writes).await,
+                Err(AppError::Refused(Refusal::Usage(_)))
+            ));
+        }
+        let over_budget = [LocalWrite::Put {
+            key: b"origin".to_vec(),
+            value: vec![0; crate::app::MAX_STEP_LOCAL_BYTES],
+        }];
+        assert!(matches!(
+            wallet
+                .queue_signed_with("sample", signed.clone(), &over_budget)
+                .await,
+            Err(AppError::Refused(Refusal::Usage(_)))
+        ));
+        assert_eq!(wallet.delivery(signed.msg_id()).await.unwrap(), None);
+        wallet.queue_signed(signed.clone()).await.unwrap();
+        assert!(
+            wallet
+                .withdraw_message("sample", signed.msg_id())
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            wallet.queue_signed_with("sample", signed, &writes).await,
+            Err(AppError::Refused(Refusal::WontDeliver(
+                WontDeliver::GivenUp
+            )))
+        ));
+        let kept = wallet
+            .sign_message(Pair::note(&p.bob, "conditional"))
+            .unwrap();
+        kept_with(&p, &mut wallet, &kept).await;
+        assert!(matches!(
+            wallet.queue_signed_with("sample", kept, &writes).await,
+            Err(AppError::Refused(Refusal::Usage(_)))
+        ));
+        let old = wallet.sign_message(Pair::note(&p.bob, "earlier")).unwrap();
+        p.clock.advance_ms(SENT_RETENTION_MS);
+        assert!(matches!(
+            wallet.queue_signed_with("sample", old, &writes).await,
+            Err(AppError::Refused(Refusal::WontDeliver(
+                WontDeliver::PastReplayWindow { .. }
+            )))
+        ));
+        assert!(
+            wallet
+                .protocol_get("sample", b"origin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(p.bob.switch().entries_from(&wallet.identity()), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_queue_signed_with_preserves_a_refused_conditional_delivery() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let signed = wallet
+            .sign_message(Pair::note(&p.bob, "conditional"))
+            .unwrap();
+        let id = signed.msg_id().to_owned();
+        let batch = OpBatch::new()
+            .op(OpKind::AllowPut {
+                pubky: p.bob.identity().public(),
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            })
+            .when(Condition::RecordVersion {
+                key: [8; 32],
+                version: RecordVersion::new(1, 99),
+            })
+            .queue(signed.clone());
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+        assert!(
+            wallet
+                .submit_batch(batch)
+                .await
+                .unwrap_err()
+                .kept_batch()
+                .is_some()
+        );
+        wallet.receive(None).await.unwrap();
+        let ended = wallet.delivery(&id).await.unwrap();
+        assert!(matches!(ended, Some(Delivery::Failed { .. })));
+        let writes = [fact_write(&id, &delivery_fact(&wallet, signed.plaintext()))];
+        assert!(matches!(
+            wallet.queue_signed_with("sample", signed, &writes).await,
+            Err(AppError::Refused(Refusal::Usage(_)))
+        ));
+        assert_eq!(wallet.delivery(&id).await.unwrap(), ended);
+        assert!(
+            wallet
+                .protocol_get("sample", &delivery_key(&id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(p.bob.switch().entries_from(&wallet.identity()), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_delivery_origin_queue_commit_failure_keeps_origin_atomic() {
     Box::pin(async {
         for origin in [DeliveryOrigin::Original, DeliveryOrigin::Reconstructed] {

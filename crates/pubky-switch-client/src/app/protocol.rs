@@ -142,6 +142,23 @@ impl RecordMarkContext<'_> {
     }
 }
 
+/// A readable record application verified by the client (Switch spec 8.2, 10.3).
+/// The protocol can keep what it learned in its own backup layer.
+#[non_exhaustive]
+pub struct RecordObservation<'a> {
+    /// The accepted record, including the key, policy, signer and content.
+    pub record: &'a super::SharedRecord,
+    /// The record held immediately before this observation, if any.
+    pub previous: Option<&'a super::SharedRecord>,
+    /// The verified signed operation carrying this value.
+    pub operation: &'a pubky_switch_core::sig::SignedDoc,
+    /// The service application of the operation.
+    pub application: pubky_switch_core::shared::ApplicationRef,
+    /// Whether this observation covers the record's pending uploads in the current
+    /// generation. The record itself also reports its divergence and content status.
+    pub current: bool,
+}
+
 /// How a protocol answers a record deletion (Switch spec 8.2, 10.3).
 #[non_exhaustive]
 pub enum PutBack {
@@ -1141,6 +1158,18 @@ pub trait Protocol: Send + Sync {
         true
     }
 
+    /// Whether the content of this signed first message admits its recipient to the
+    /// sender's conversation list (Switch spec 7). Called only for kinds for which
+    /// [`Protocol::adds_conversation`] returns true. By default every such message does.
+    ///
+    /// Decide from the signed content alone: the app uses the same rule when rebuilding
+    /// a delivery from its plaintext. `plaintext.json()` holds the exact signed JSON,
+    /// including opaque body members. Returning false omits the sender's conversation
+    /// entry and leaves the delivery and the recipient's admission checks in place.
+    fn message_adds_conversation(&self, _message: &Message, _plaintext: &MessagePlaintext) -> bool {
+        true
+    }
+
     /// The protocol's collections, each with its fixed policy (Switch spec 10.3). The app
     /// lists those it may read at join and after a `missed` item, and takes writes to them
     /// from the feed; writes to any other collection are left alone. None by default.
@@ -1197,12 +1226,48 @@ pub trait Protocol: Send + Sync {
         None
     }
 
+    /// Observe an authenticated, readable write in one of the protocol's collections,
+    /// including one made by another installation of this app. An equal read can
+    /// confirm a previously uncertain application. The protocol returns idempotent
+    /// changes to its own local state, committed with the record and the read's progress.
+    /// Earlier local changes in this transaction are visible through `context`.
+    /// No changes by default. An absence, delete or unopened value makes no call.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`] leaves the observation pending. Changes exceeding
+    /// [`MAX_STEP_LOCAL_BYTES`] also hold the read before its progress commits.
+    fn observe_record(
+        &self,
+        observation: &RecordObservation<'_>,
+        context: &ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = (observation, context);
+        Ok(Vec::new())
+    }
+
     /// Whether the seen mark of records in this collection lasts until a verified
     /// current deletion (Switch spec 8.2). The client clears it in the same commit
     /// that takes the deletion. A live unreadable value keeps its previous mark.
     fn mark_ends_at_delete(&self, collection: &str) -> bool {
         let _ = collection;
         false
+    }
+
+    /// Update this collection owner's local state when a verified current deletion ends
+    /// the record's mark lifetime (Switch spec 8.2). The deletion may be this app's own.
+    /// A later read may first establish coverage or confirm the same deletion again.
+    /// Return idempotent writes bound to this key and deletion version. They commit with
+    /// the native mark change, including when the app holds no mark for this key.
+    /// A failure or writes exceeding [`MAX_STEP_LOCAL_BYTES`] hold the change for retry.
+    fn record_lifetime_ended(
+        &self,
+        record: &RecordMarkContext<'_>,
+        version: RecordVersion,
+        context: &ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = (record, version, context);
+        Ok(Vec::new())
     }
 
     /// Observe another app's verified deletion of a record in this collection. The

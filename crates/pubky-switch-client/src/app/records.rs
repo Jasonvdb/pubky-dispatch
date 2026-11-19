@@ -1810,7 +1810,10 @@ impl App {
                 .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
             // A page contains only the keys the service's current reader may see.
             // The app can still hold a wider certificate while the renewal is in its feed.
-            if let Some(directory) = self.unconfirmed_page_reader(page.head, progress).await? {
+            if let Some(directory) = self
+                .unconfirmed_page_reader(Some(page.head), progress, None)
+                .await?
+            {
                 if !tx.is_empty() {
                     self.commit(tx).await?;
                 }
@@ -1869,7 +1872,9 @@ impl App {
     /// List every collection of the protocol whose read scope the app's certificate holds
     /// (Switch spec 8.3, 12.1 step 3). Returns whether more is left. Call again when
     /// the time budget or [`LISTING_PAGES_PER_READ`] was reached, or the service's reader
-    /// certificate still needs to be established.
+    /// certificate still needs to be established. When the local certificate reads
+    /// none of the registered collections, the own directory checks that grant before
+    /// the listing can finish.
     ///
     /// The listing goes on from where the last one that stopped got, as an owed listing
     /// does (`list_at`), skipping the collections it listed to their end. The call that
@@ -1975,6 +1980,7 @@ impl App {
             self.state.cert.hash(),
             self.state.meta.generation,
         );
+        let before = *pages;
         for name in &listing {
             let collections = self.readable_collections(name);
             for collection in &collections {
@@ -1997,6 +2003,20 @@ impl App {
                     return Ok(Listing::Unfinished);
                 }
             }
+        }
+        // A grant can acquire its first readable collection while the app is
+        // offline. Settling that owner still requires the service's current reader.
+        if *pages == before
+            && listing.iter().any(|name| {
+                self.protocols
+                    .get(name)
+                    .is_some_and(|p| !p.collections().is_empty())
+            })
+            && !self
+                .reader_ready_without_a_page(&progress, due.upload)
+                .await?
+        {
+            return Ok(Listing::Unfinished);
         }
         // Settled for those listed, in one commit with their positions: each is told
         // through the item that owed its listing, unless a call about that item is still
@@ -2126,12 +2146,13 @@ impl App {
             self.state.cert.hash(),
             self.state.meta.generation,
         );
-        let collections: Vec<Collection> = self
-            .protocols
-            .collections()
+        let registered = self.protocols.collections();
+        let has_collections = !registered.is_empty();
+        let collections: Vec<Collection> = registered
             .into_iter()
             .filter(|c| c.readable_by(&self.state.cert))
             .collect();
+        let before = *pages;
         for collection in &collections {
             let id = collection.id(&self.state.meta.identity);
             if progress.done.contains(&b64(&id)) {
@@ -2147,6 +2168,15 @@ impl App {
                     (&mut progress, LIST_AT),
                     budget,
                 )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        if has_collections && *pages == before {
+            let due = self.reader().get::<ListDue>(LIST_DUE).await?;
+            if !self
+                .reader_ready_without_a_page(&progress, due.and_then(|due| due.upload))
                 .await?
             {
                 return Ok(false);

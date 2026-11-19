@@ -13612,6 +13612,96 @@ async fn test_wider_record_reader_lists_from_the_start_before_delivering_after_l
     assert_eq!(handed(&s, &note.msg_id), 1);
 }
 
+/// A restored installation can gain its first readable collection before its
+/// initial listing. Neither path may settle that listing under its old grant.
+#[tokio::test]
+async fn test_restored_receive_waits_for_the_first_readable_collection() {
+    restored_first_readable_collection(false).await;
+}
+
+#[tokio::test]
+async fn test_host_list_all_waits_for_the_first_readable_collection() {
+    restored_first_readable_collection(true).await;
+}
+
+async fn restored_first_readable_collection(host: bool) {
+    let s = Setup::new();
+    let mut original = join_scoped(&s, "wallet", &["sample-c"]).await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("sale");
+    let key = phone
+        .put_record(&target, &value(&["sale"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    assert!(!original.list_collections().await.unwrap());
+    assert!(original.shared_record(&key).await.unwrap().is_none());
+    let backup = original.backup().await.unwrap();
+    let earlier = original.cert().clone();
+    let store = Arc::new(MemoryStore::new());
+    let config = AppConfig {
+        page_size: 1,
+        ..World::config()
+    };
+    let mut restored = Box::pin(App::restore(
+        s.env_on(store.clone()),
+        s.protocol.clone(),
+        config.clone(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    let at = restored.cursor();
+    let owner_at = restored.told("sample");
+    s.w.clock.advance_ms(HOUR);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c", "sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    assert!(restored.listing_owed().await.unwrap());
+    if host {
+        assert!(restored.list_collections().await.unwrap());
+    } else {
+        let held = restored.receive(None).await.unwrap();
+        assert!(held.more);
+        assert!(
+            restored
+                .current_collection(&items(), &held)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(restored.listing_owed().await.unwrap());
+    assert_eq!(restored.cursor(), at);
+    assert_eq!(restored.told("sample"), owner_at);
+    let id = restored.app_id();
+    drop(restored);
+    let mut restored = App::load(s.env_on(store), s.protocol.clone(), config, id)
+        .await
+        .unwrap();
+    assert!(restored.listing_owed().await.unwrap());
+    store_parts_for(&s, &renewed);
+    let mut current = None;
+    for _ in 0..32 {
+        let report = restored.receive(None).await.unwrap();
+        current = restored
+            .current_collection(&items(), &report)
+            .await
+            .unwrap();
+        if current.as_ref().is_some_and(|range| !range.live.is_empty()) {
+            break;
+        }
+    }
+    let current = current.expect("the newly readable collection reached its end");
+    assert_eq!(
+        current.live.iter().map(|r| r.key).collect::<Vec<_>>(),
+        [key]
+    );
+    assert!(current.uncertain_keys.is_empty());
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(!restored.listing_owed().await.unwrap());
+    assert!(!restored.list_collections().await.unwrap());
+}
+
 #[tokio::test]
 async fn test_permanent_listing_after_a_narrowing_raises_no_alarm() {
     let s = Setup::new();

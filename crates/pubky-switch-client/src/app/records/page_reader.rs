@@ -4,7 +4,7 @@ use pubky_switch_core::chain::{ItemType, SignedHead};
 use pubky_switch_core::ops::{OpKind, Position, SignedOp};
 use serde::{Deserialize, Serialize};
 
-use super::{ListProgress, serde_b64};
+use super::{FeedPosition, ListProgress, position, serde_b64};
 use crate::app::renewal::Listed;
 use crate::app::{App, AppError};
 use crate::client::answers::{Directory, FeedItem, FeedQuery};
@@ -31,46 +31,96 @@ struct RenewalSearch {
 }
 
 impl App {
-    /// A matching own record and listed certificate settle either branch of the
-    /// service's certificate selection. The directory must describe the page's
-    /// exact authenticated account head.
+    /// Check the reader at the returned page's head. With no page to read, a
+    /// fresh own directory establishes whether the grant really reads nothing.
     pub(super) async fn unconfirmed_page_reader(
         &mut self,
-        head: SignedHead,
+        page: Option<SignedHead>,
         progress: &ListProgress,
+        upload: Option<FeedPosition>,
     ) -> Result<Option<Directory>, AppError> {
-        let reader = PageReader {
-            service: self.state.meta.service_key,
-            head,
-            cert: self.state.cert.hash(),
-        };
+        let service = self.state.meta.service_key;
+        let cert = self.state.cert.hash();
         // Opening a returned write can refresh the app's identity. Its new
         // certificate cannot complete a range begun under the earlier one.
-        let same_reader = progress.cert == reader.cert && progress.generation == head.generation;
-        if same_reader && self.record_page_reader.as_ref() == Some(&reader) {
+        let same_reader =
+            progress.cert == cert && progress.generation == self.state.meta.generation;
+        if same_reader
+            && let Some(head) = page
+            && self.record_page_reader.as_ref()
+                == Some(&PageReader {
+                    service,
+                    head,
+                    cert,
+                })
+        {
             return Ok(None);
         }
         let result = self.client.directory_with_head(None).await;
-        let (directory, at) = self
-            .take(result)
-            .await
-            .inspect_err(|_| self.last_collection_read = None)?;
+        let (directory, at) = self.take(result).await.inspect_err(|_| {
+            self.record_page_reader = None;
+            self.last_collection_read = None;
+        })?;
         let me = self.app_id();
         if same_reader
-            && at == Some(head)
+            && let Some(head) = at
             && head.generation == self.state.meta.generation
             && directory.identity.generation() == head.generation
-            && directory.identity.listed_cert(&me) == Some(reader.cert)
+            && directory.identity.listed_cert(&me) == Some(cert)
             && directory
                 .apps
                 .iter()
-                .any(|entry| entry.app_id == me && entry.record.cert().hash() == reader.cert)
+                .any(|entry| entry.app_id == me && entry.record.cert().hash() == cert)
+            && match page {
+                Some(expected) => expected == head,
+                None => self.current_directory_head(head, upload).await?,
+            }
         {
-            self.record_page_reader = Some(reader);
+            self.record_page_reader = Some(PageReader {
+                service,
+                head,
+                cert,
+            });
             return Ok(None);
         }
+        self.record_page_reader = None;
         self.last_collection_read = None;
         Ok(Some(directory))
+    }
+
+    /// An empty enumeration has no record page to qualify its ending. Its
+    /// own directory must cover the known account history and pending upload.
+    async fn current_directory_head(
+        &mut self,
+        head: SignedHead,
+        upload: Option<FeedPosition>,
+    ) -> Result<bool, AppError> {
+        self.current_at(head, None).await?;
+        if upload.is_some_and(|at| !self.covers_upload(position(head.generation, head.seq), at)) {
+            return Ok(false);
+        }
+        let mut tx = self.tx()?;
+        let Some(chain) = self.state.chain.as_mut() else {
+            return Ok(false);
+        };
+        if chain.newest != Some(head) || chain.verified_seq() > head.seq {
+            return Ok(false);
+        }
+        chain.write(&mut tx)?;
+        self.commit(tx).await?;
+        Ok(true)
+    }
+
+    pub(super) async fn reader_ready_without_a_page(
+        &mut self,
+        progress: &ListProgress,
+        upload: Option<FeedPosition>,
+    ) -> Result<bool, AppError> {
+        if let Some(directory) = self.unconfirmed_page_reader(None, progress, upload).await? {
+            Box::pin(self.follow_page_reader(directory)).await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Acquire only the listed account-signed certificate, even when every

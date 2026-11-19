@@ -570,6 +570,7 @@ impl App {
             asked: Vec::new(),
         };
         tx.put(keys::LOSS, &loss)?;
+        Box::pin(self.note_roster_removals(doc, &mut tx)).await?;
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         self.commit(tx).await?;

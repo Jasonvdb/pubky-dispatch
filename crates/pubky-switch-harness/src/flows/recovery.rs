@@ -11,6 +11,9 @@
 //! uploads what it holds. The other three compare neither the record nor the start of the
 //! chain. What an upload merges is in [`super::upload`].
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use pubky_switch::limits::Limits;

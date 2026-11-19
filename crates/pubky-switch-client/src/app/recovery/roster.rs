@@ -1,5 +1,7 @@
 //! The identity-signed document at the start of the recovered account (Switch spec 12.6).
 
+use std::collections::BTreeSet;
+
 use pubky_switch_core::chain::{ItemType, ServiceTransition, Verifier};
 use pubky_switch_core::enc::b64;
 use pubky_switch_core::ops::Position;
@@ -11,6 +13,10 @@ use crate::app::chain::ChainView;
 use crate::app::error::Alarm;
 use crate::app::state::{Tx, key};
 use crate::client::answers::FeedPage;
+
+const PENDING_ROSTER: &str = "pending-roster/";
+const POSSIBLE_MEMBERS: &str = "pending-roster/possible-members";
+const PENDING_REMOVALS: &str = "pending-roster/removal/";
 
 /// The two chain items the service commits together to open the generation (Switch wire
 /// 7.4.2). Start at the zero hash even when the ordinary feed already passed the pair.
@@ -83,6 +89,19 @@ impl App {
         }
         tx.put(&key, &hash)?;
         tx.put(keys::OPENING, doc.signed())?;
+        let pending = self
+            .reader()
+            .scan_numbered::<SignedDoc>(PENDING_REMOVALS)
+            .await?;
+        for (version, signed) in pending {
+            let removed =
+                IdentityDoc::verify(&signed, &doc.identity()).map_err(|_| super::corrupt())?;
+            if removed.version() != version {
+                return Err(super::corrupt());
+            }
+            self.keep_roster_removals(doc, &removed, tx).await?;
+        }
+        tx.delete_prefix(PENDING_ROSTER)?;
         self.keep_roster_removals(doc, &self.state.own_doc, tx)
             .await
     }
@@ -92,13 +111,53 @@ impl App {
         doc: &IdentityDoc,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        if doc.body().recovery_from.is_some()
-            && !doc.body().removed.is_empty()
-            && let Some(signed) = self.reader().get::<SignedDoc>(keys::OPENING).await?
-        {
-            let opening =
-                IdentityDoc::verify(&signed, &doc.identity()).map_err(|_| super::corrupt())?;
-            self.keep_roster_removals(&opening, doc, tx).await?;
+        let Some(from) = doc.body().recovery_from else {
+            return Ok(());
+        };
+        if self.state.own_doc.body().recovery_from != Some(from) {
+            tx.delete_prefix(PENDING_ROSTER)?;
+        }
+        if doc.body().removed.is_empty() {
+            return Ok(());
+        }
+        // A newer loss may already be on the Homeserver before the app follows it.
+        if from < self.state.meta.generation {
+            if !self
+                .read_in::<LossRecord>(keys::LOSS, tx)
+                .await?
+                .is_some_and(|loss| loss.lost_generation <= from && from < loss.generation)
+            {
+                return Ok(());
+            }
+            if let Some(signed) = self.read_in::<SignedDoc>(keys::OPENING, tx).await? {
+                let opening =
+                    IdentityDoc::verify(&signed, &doc.identity()).map_err(|_| super::corrupt())?;
+                return self.keep_roster_removals(&opening, doc, tx).await;
+            }
+        }
+        // A purged App ID never rejoins (Switch spec 12.2). Every original member
+        // still removable appears in this first document's apps or removed list.
+        let mut possible = self
+            .read_in::<BTreeSet<[u8; 16]>>(POSSIBLE_MEMBERS, tx)
+            .await?
+            .unwrap_or_else(|| {
+                doc.body()
+                    .apps
+                    .iter()
+                    .map(|app| app.app_id)
+                    .chain(doc.body().removed.iter().map(|app| app.app_id))
+                    .collect()
+            });
+        let before = possible.len();
+        for removed in &doc.body().removed {
+            possible.remove(&removed.app_id);
+        }
+        if possible.len() < before {
+            tx.put(POSSIBLE_MEMBERS, &possible)?;
+            tx.put(
+                &format!("{PENDING_REMOVALS}{}", key::num(doc.version())),
+                doc.signed(),
+            )?;
         }
         Ok(())
     }
@@ -114,13 +173,12 @@ impl App {
         {
             return Ok(());
         }
-        let reader = self.reader();
         let mut added = false;
         for removed in &doc.body().removed {
             let id = &removed.app_id;
             if opening.listed_cert(id).is_some() {
                 let index = format!("loss/removed/{}", b64(id));
-                if !reader.exists(&index).await? {
+                if self.read_in::<u64>(&index, tx).await?.is_none() {
                     tx.put(&index, &doc.version())?;
                     added = true;
                 }

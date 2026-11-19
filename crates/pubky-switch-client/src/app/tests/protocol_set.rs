@@ -8,6 +8,7 @@ mod gap_completion;
 mod ownership;
 mod renewal_member;
 mod retained_authority;
+mod retirement;
 
 use std::sync::{Arc, Mutex};
 

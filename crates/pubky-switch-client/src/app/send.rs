@@ -1182,6 +1182,18 @@ pub(crate) async fn validate_outbox(
     retained_copies(reader, meta, cert).await.map(|_| ())
 }
 
+impl App {
+    /// Queued and sent copies may still need their original protocol on a resend (Switch spec 11).
+    pub(super) async fn has_retained_messages_for(&self, protocol: &str) -> Result<bool, AppError> {
+        let copies = retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        Ok(copies.values().any(|copy| {
+            self.protocols
+                .of_kind(&copy.kind)
+                .is_some_and(|owner| owner.name == protocol)
+        }))
+    }
+}
+
 /// The exact condition under which settlement can materialize a retained queued intent.
 pub(crate) async fn kept_message_owed(
     reader: &super::state::Reader,

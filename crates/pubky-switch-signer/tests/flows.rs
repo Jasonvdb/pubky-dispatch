@@ -206,7 +206,7 @@ async fn test_first_enrollment_restart_keeps_another_installations_account() {
         ) || matches!(result, Err(SignerError::Switch(ClientError::Switch { ref current, .. })) if *current == serde_json::json!({ "binding": "changed" }))
     );
     assert_eq!(world.distinct_requests("POST", "/v1/enroll"), kept);
-    assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
+    assert_eq!(signer.status(), SignerStatus::Enrolling);
     assert_eq!(world.switch.identity_doc().unwrap().hash(), document.hash());
     assert_eq!(world.published().unwrap().hash(), document.hash());
 }
@@ -243,9 +243,9 @@ async fn test_first_enrollment_restart_preserves_the_request_when_an_identity_fi
         let mut signer = Signer::open(world.env(store), world.keyring())
             .await
             .unwrap();
-        assert_eq!(
-            signer.resume().await,
-            Err(Refusal::FirstEnrollmentHeld.into())
+        assert!(
+            matches!(signer.resume().await, Err(SignerError::Switch(ClientError::Switch { current, .. }))
+            if current == serde_json::json!({ "binding": "expired" }))
         );
         assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
         assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);

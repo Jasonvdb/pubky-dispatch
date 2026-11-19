@@ -480,10 +480,11 @@ impl Signer {
                     if self.first_enrollment_stop().is_some() {
                         return Err(Refusal::FirstEnrollmentHeld.into());
                     }
-                    match enrollment {
-                        Some(enrollment) => self.enroll(&origin, &enrollment, policy).await?,
-                        None => self.observe_first_account(&origin, nonce, policy).await?,
-                    }
+                    let result = match enrollment {
+                        Some(enrollment) => self.enroll(&origin, &enrollment, policy).await,
+                        None => self.observe_first_account(&origin, nonce, policy).await,
+                    };
+                    self.keep_first_answer(result).await?;
                 }
                 Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
@@ -1253,23 +1254,15 @@ impl Signer {
 
     /// Keep the first step's exact operands with the reason it needs the host. Only a fresh
     /// service answer can authorize a confirmed restart or restore (Switch account binding 3).
-    async fn first_answer<T>(&mut self, answer: std::result::Result<T, ClientError>) -> Result<T> {
-        match answer {
-            Ok(answer) => Ok(answer),
-            Err(error) => {
-                if let Some(reason) = FirstEnrollmentStop::from_error(&error)
-                    && self.first_enrollment_stop() != Some(reason)
-                {
-                    let mut state = self.state.clone();
-                    state
-                        .alerts
-                        .retain(|a| !matches!(a, Alert::FirstEnrollmentHeld { .. }));
-                    state.alert(Alert::FirstEnrollmentHeld { reason });
-                    self.commit(state, self.flow.clone()).await?;
-                }
-                Err(error.into())
-            }
+    async fn keep_first_answer(&mut self, result: Result<()>) -> Result<()> {
+        if let Err(SignerError::Switch(error)) = &result
+            && let Some(reason) = FirstEnrollmentStop::from_error(error)
+        {
+            let mut state = self.state.clone();
+            state.alert(Alert::FirstEnrollmentHeld { reason });
+            self.commit(state, self.flow.clone()).await?;
         }
+        result
     }
 
     /// The signed first creation this install can still continue at the selected service.
@@ -1366,10 +1359,9 @@ impl Signer {
             created: None,
             identity: self.state.identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+        let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .observe_account()
-            .await;
-        let observation = self.first_answer(answer).await?;
+            .await?;
         if observation.body().association != AccountAssociation::Absent {
             let flow = Flow::FirstAccountPresent {
                 origin: origin.to_owned(),
@@ -1433,8 +1425,7 @@ impl Signer {
         };
         let answer = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .enroll(&enrollment)
-            .await;
-        let answer = self.first_answer(answer).await?;
+            .await?;
         let key = self.signing_key()?;
         let body = IdentityBody::first(
             identity,

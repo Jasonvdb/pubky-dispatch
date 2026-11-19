@@ -50,6 +50,75 @@ async fn test_signer_enrollment_delivers_then_publishes_the_first_version() {
     assert!(signer.alerts().is_empty());
 }
 
+#[tokio::test]
+async fn test_first_enrollment_distinguishes_a_bound_refusal_from_an_unread_body() {
+    use pubky_switch_client::testing::Fault as SwitchFault;
+    use pubky_switch_core::http::ErrorCode;
+    use pubky_switch_signer::FirstEnrollmentStop;
+    for (fault, issue) in [
+        (
+            SwitchFault::Error {
+                path: "/v1/enroll".into(),
+                code: ErrorCode::TooLarge,
+                current: serde_json::Value::Null,
+            },
+            Some(FirstEnrollmentStop::Refused(ErrorCode::TooLarge)),
+        ),
+        (
+            SwitchFault::BeforeTheBody {
+                path: "/v1/enroll".into(),
+                code: ErrorCode::TooLarge,
+            },
+            Some(FirstEnrollmentStop::Unconfirmed),
+        ),
+        (
+            SwitchFault::Error {
+                path: "/v1/enroll".into(),
+                code: ErrorCode::Unavailable,
+                current: serde_json::Value::Null,
+            },
+            None,
+        ),
+        (
+            SwitchFault::Error {
+                path: "/account".into(),
+                code: ErrorCode::BadRequest,
+                current: serde_json::Value::Null,
+            },
+            Some(FirstEnrollmentStop::Unconfirmed),
+        ),
+    ] {
+        let world = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let mut signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+            .await
+            .unwrap();
+        world.switch.fail_next(fault);
+        assert!(matches!(signer.resume().await, Err(SignerError::Switch(_))));
+        drop(signer);
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        if let Some(reason) = issue {
+            let alert = Alert::FirstEnrollmentHeld { reason };
+            assert_eq!(signer.alerts(), std::slice::from_ref(&alert));
+            let sent = world.transport.requests().len();
+            assert_eq!(
+                signer.run_due().await.unwrap_err(),
+                Refusal::FirstEnrollmentHeld.into()
+            );
+            assert_eq!(world.transport.requests().len(), sent);
+            signer.clear_alert(&alert).await.unwrap();
+        } else {
+            assert_eq!(signer.status(), SignerStatus::Enrolling);
+            assert!(signer.alerts().is_empty());
+        }
+        signer.run_due().await.unwrap();
+        assert_eq!(signer.status(), SignerStatus::Signing);
+        assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
+    }
+}
+
 async fn expired_first_enrollment(world: &World, store: Arc<MemoryStore>) -> Signer {
     use pubky_switch_client::testing::Fault as SwitchFault;
     use pubky_switch_core::records::ACCOUNT_OBSERVATION_VALIDITY_MS;
@@ -73,7 +142,12 @@ async fn test_first_enrollment_restart_survives_interruption_at_selection() {
     for fault in [Fault::StopBefore(1), Fault::StopAfter(1)] {
         let world = World::new();
         let store = Arc::new(MemoryStore::new());
-        drop(expired_first_enrollment(&world, store.clone()).await);
+        let mut original = expired_first_enrollment(&world, store.clone()).await;
+        assert!(matches!(
+            original.resume().await,
+            Err(SignerError::Switch(ClientError::Switch { .. }))
+        ));
+        drop(original);
         let faulty = Arc::new(FaultStore::new(store.clone(), fault));
         let mut signer = Signer::open(world.env(faulty), world.keyring())
             .await
@@ -92,10 +166,10 @@ async fn test_first_enrollment_restart_survives_interruption_at_selection() {
             .unwrap();
         let resumed = signer.resume().await;
         if fault == Fault::StopBefore(1) {
-            assert!(
-                matches!(resumed, Err(SignerError::Switch(ClientError::Switch { current, .. }))
-                if current == serde_json::json!({ "binding": "expired" }))
-            );
+            assert!(matches!(
+                resumed,
+                Err(SignerError::Refused(Refusal::FirstEnrollmentHeld))
+            ));
             assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
             signer
                 .restart_first_enrollment(SWITCH_ORIGIN, confirm())
@@ -173,7 +247,7 @@ async fn test_first_enrollment_restart_preserves_the_request_when_an_identity_fi
             matches!(signer.resume().await, Err(SignerError::Switch(ClientError::Switch { current, .. }))
             if current == serde_json::json!({ "binding": "expired" }))
         );
-        assert_eq!(signer.status(), SignerStatus::Enrolling);
+        assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
         assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
         assert_eq!(world.homeserver.file(path), Some(kept));
     }

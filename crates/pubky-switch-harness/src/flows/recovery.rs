@@ -11,6 +11,9 @@
 //! uploads what it holds. The other three compare neither the record nor the start of the
 //! chain. What an upload merges is in [`super::upload`].
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use pubky_switch::limits::Limits;
@@ -153,6 +156,7 @@ pub(super) async fn follow_recovery(
     lost: u64,
 ) -> FlowResult {
     // As when the Homeserver's event stream names the document (Switch spec 4.3).
+    let start = world.trace().lines.len();
     let refreshed = app.refresh_identity().await;
     let followed = app.follow_provider().await;
     world.outcome(
@@ -169,7 +173,12 @@ pub(super) async fn follow_recovery(
         return Err(format!("the {name}'s follow ended {}", ended(&followed)).into());
     }
     let read = format!("{{alice/{name}}} GET /v1/{{alice}}/feed");
-    let fact = |fact: &str| world.last_fact(&read, &format!("body.items[0].{fact}"));
+    let trace = world.trace();
+    let opening = trace.lines[start..]
+        .iter()
+        .find(|line| line.label == read)
+        .ok_or("the app didn't read the new chain")?;
+    let fact = |fact: &str| opening.facts.get(&format!("body.items[0].{fact}")).cloned();
     let first = (
         fact("seq"),
         fact("item.body~.type"),
@@ -280,6 +289,8 @@ pub async fn provider_loss(world: &World) -> FlowResult {
     let (mut wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
 
+    Box::pin(wallet.retain_loss_uploads()).await?;
+
     // The service is gone, and another stands ready.
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
@@ -304,6 +315,30 @@ pub async fn provider_loss(world: &World) -> FlowResult {
     // and staged admission doesn't start again (Switch wire 7.4.14).
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;
+    let opening = Box::pin(wallet.recovery_roster())
+        .await?
+        .ok_or("the recovery roster is missing")?;
+    if opening.hash() != doc.hash() {
+        return Err("the wallet kept a different opening document".into());
+    }
+
+    let observations = Box::pin(wallet.loss_uploads(opening.generation())).await?;
+    let [observation] = observations.as_slice() else {
+        return Err("the recovery evidence step was not retained once".into());
+    };
+    let (inputs, local) = Box::pin(wallet.loss_upload_inputs(observation)).await?;
+    if observation.app_id != wallet.app_id()
+        || observation.opening_hash != Some(opening.hash())
+        || !local.omitted.is_empty()
+        || inputs.lists.is_some()
+        || !matches!(
+            observation.outcome,
+            pubky_switch_client::app::LossUploadOutcome::Answered { .. }
+                | pubky_switch_client::app::LossUploadOutcome::NoRequest
+        )
+    {
+        return Err("the wallet's loss evidence step has no matching outcome".into());
+    }
 
     send(
         world,
@@ -853,7 +888,7 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
-    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
     let (phone, _) = joined(world, &alice, &mut signer, "phone").await?;
 
     world.lose_switch(ORIGIN);
@@ -947,6 +982,36 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
              apps and removes {gone:?}, dated {dated:?}, not {revoked_at}"
         )
         .into());
+    }
+    // A surviving app first goes online after the removal (Switch spec 12.6).
+    Box::pin(follow_recovery(world, &mut wallet, "wallet", 1)).await?;
+    let opening = Box::pin(wallet.recovery_roster())
+        .await?
+        .ok_or("the recovery roster is missing")?;
+    if opening.listed_cert(&phone.app_id()).is_none()
+        || !Box::pin(wallet.recovery_removal(&phone.app_id()))
+            .await?
+            .is_some_and(|doc| doc.lists_removed(&phone.app_id()))
+    {
+        return Err("the original roster or the subsequent removal is missing".into());
+    }
+    let removed_version = newest
+        .as_ref()
+        .ok_or("the removing document is missing")?
+        .version();
+    world.advance_ms(STEP_MS);
+    let purged = Box::pin(signer.purge_removed(phone.app_id())).await?;
+    Box::pin(wallet.refresh_identity()).await?;
+    if purged.lists_removed(&phone.app_id())
+        || wallet.own_identity().hash() != purged.hash()
+        || !Box::pin(wallet.recovery_removal(&phone.app_id()))
+            .await?
+            .is_some_and(|doc| doc.version() == removed_version)
+        || Box::pin(wallet.recovery_removal(&wallet.app_id()))
+            .await?
+            .is_some()
+    {
+        return Err("the purged phone's original removal did not survive".into());
     }
     Ok(())
 }

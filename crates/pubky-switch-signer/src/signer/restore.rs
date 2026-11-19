@@ -49,6 +49,17 @@ use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
+impl BackupView {
+    fn service(&self) -> Service {
+        Service {
+            origin: self.identity_doc.inbox().url.clone(),
+            service_key: self.identity_doc.inbox().service_key,
+            limits: self.limits,
+            created: self.account_created,
+        }
+    }
+}
+
 /// Confirmation that the user chose restoration after seeing what unusable local records
 /// may lose: claims, undelivered changes, pending effects and local history (Switch spec 12.8).
 /// This is the host's attestation, not verification that a user interface was shown.
@@ -472,13 +483,7 @@ impl Signer {
             .map_err(SignerError::Homeserver)?
             .ok_or(Refusal::NoBackup)?;
         let view = self.open_backup(&bytes)?.ok_or(Refusal::UnreadableBackup)?;
-        let doc = view.identity_doc.clone();
-        let service = Service {
-            origin: doc.inbox().url.clone(),
-            service_key: doc.inbox().service_key,
-            limits: view.limits,
-            created: view.account_created,
-        };
+        let service = view.service();
         let target = Target {
             origin: &service.origin,
             pinned: Some(service.service_key),
@@ -529,6 +534,20 @@ impl Signer {
                 return Err(error.into());
             }
         };
+        Box::pin(self.restore_from_copy(view, answer, local, serving)).await
+    }
+
+    /// Restore the opened backup against the answer authenticated for its original account.
+    pub(super) async fn restore_from_copy(
+        &mut self,
+        view: BackupView,
+        answer: AppsAnswer,
+        local: Option<RestoreLocal>,
+        serving: Option<[u8; 32]>,
+    ) -> Result<IdentityDoc> {
+        let identity = self.state.identity;
+        let doc = view.identity_doc.clone();
+        let service = view.service();
         // In place, the service still serves the lost generation until it takes the version:
         // its copy of that generation counts as no copy (Switch wire 3.13).
         let answer = without_the_lost_copy(&view, answer, &identity);

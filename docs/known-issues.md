@@ -8,6 +8,8 @@ The client's public API for protocols and hosts is in place: record answers that
 
 A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
+Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
+
 **Caller changes already on main**
 
 - Custom transports used with `OpBatch::first_send_before` must implement `Transport::send_before`. Forward the supplied `FirstSend` through queues and wrappers. Check it with `FirstSend::check` after waiting for readiness, immediately before releasing the first request bytes. If bytes may already have been sent, report an uncertain transport failure. The default implementation returns `FirstSendUnavailable` without sending. The native HTTPS transport implements the check.
@@ -67,7 +69,7 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 - [keys] **A hand-over can strand the only sealed copy of the identity key.** The receiving device installs the key in its vault only after the service confirms that the device has taken over. Retain an independent copy of the key until the receiving vault has confirmed possession.
 - [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
-- [keys] **Some damaged signer stores cannot be restored in place.** Certain invalid stored values fall outside the damage the restore call accepts, and a surviving operation or alarm can also block replacement. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
+- [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
 - [availability] **First enrollment can become impossible to finish in place.** If its account observation expires or the service permanently refuses the creation request, `resume` keeps the original signed request and the signer stays `Enrolling`. Repeating setup on the same store cannot obtain a new enrollment.
 - [availability] **Changing answers can prevent key recovery from finishing.** If a read changes what the user confirmed, recovery at a serving account returns `SurveyChanged`. Survey again when the sources are stable. A provider loss declared with the key can proceed when a source shows less than before, but new evidence still requires confirmation.
 - [availability] **An interrupted key recovery has no ordinary cancel operation.** Persistent storage or communication errors can leave recovery pending and block other signing operations on that installation. Preserve the pending state so recovery can resume when the dependency is available.

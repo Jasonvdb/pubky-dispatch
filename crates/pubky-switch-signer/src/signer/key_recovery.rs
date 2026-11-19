@@ -2015,6 +2015,8 @@ fn fresh_records(
     state.signed_through = local.signed_through.unwrap_or(0);
     state.epoch_through = local.epoch_through.unwrap_or(0);
     if let Some(kept) = &local.state {
+        state.records_behind = kept.records_behind;
+        state.alerts = restored_alerts(kept);
         state.tombstones.clone_from(&kept.tombstones);
         state.revoking.clone_from(&kept.revoking);
         state.cleanup.clone_from(&kept.cleanup);

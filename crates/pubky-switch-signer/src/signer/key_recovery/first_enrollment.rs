@@ -2,7 +2,7 @@
 
 use pubky_switch_client::ClientError;
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::records::Enrollment;
+use pubky_switch_core::records::{Enrollment, IdentityDoc};
 
 use super::{
     BackupFound, BackupView, Held, KeyPlan, KeyRecoveryConfirmed, KeyRecoverySurvey, RestoreLocal,
@@ -17,6 +17,8 @@ use crate::error::{KeyRecoveryStop, Refusal, Result, SignerError};
 pub struct FirstEnrollmentRestore {
     /// The creation of the account the selected service currently serves, in Unix milliseconds.
     pub created: u64,
+    /// The verified identity document served at this creation, including its exact signed bytes.
+    pub identity_doc: IdentityDoc,
     /// The current signer, version, generation, backup and app consequences to show the user.
     pub recovery: KeyRecoverySurvey,
     original: [u8; 32],
@@ -136,6 +138,7 @@ impl Signer {
         };
         let shown = FirstEnrollmentRestore {
             created: plan.created,
+            identity_doc: plan.copy.clone(),
             original: original.hash(),
             recovery: plan.survey.clone(),
             backup: sources.backup_hash,

@@ -18,7 +18,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 - When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
 
-- To restore an existing account from a signed first setup, offer `Signer::survey_first_enrollment_restore` at the original service. Show the account and recoverable history, explain that the earlier send may have committed, and call `Signer::restore_first_enrollment` only after confirmation. A fresh setup with no signed creation uses the ordinary restore described above.
+- To restore an existing account from a signed first setup, offer `Signer::survey_first_enrollment_restore` at the original service. Show the account, the survey's signed `identity_doc` and the recoverable history, explain that the earlier send may have committed, and call `Signer::restore_first_enrollment` only after confirmation. A fresh setup with no signed creation uses the ordinary restore described above.
 
 - A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 

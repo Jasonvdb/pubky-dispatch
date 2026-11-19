@@ -70,6 +70,8 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
     );
     assert_eq!(store.scan(&ns, b"", None, 64)?, pending);
     let shown = first.survey_first_enrollment_restore(ORIGIN).await?;
+    assert!(first.identity_doc()?.is_none());
+    assert_eq!(shown.identity_doc.signed(), predecessor.signed());
     assert_eq!(shown.recovery.signer, predecessor.body().signer);
     assert_eq!(shown.recovery.generation, predecessor.generation());
     assert_eq!(shown.recovery.version, predecessor.version());
@@ -178,6 +180,8 @@ async fn restore_original_receipt(world: &World) -> FlowResult {
     let env = world.signer_env(&alice, snapshot)?;
     let mut signer = Signer::open(env, world.keyring(&alice)?).await?;
     let shown = signer.survey_first_enrollment_restore(ORIGIN).await?;
+    assert!(signer.identity_doc()?.is_none());
+    assert_eq!(shown.identity_doc.signed(), original.signed());
     Box::pin(signer.restore_first_enrollment(&shown, &[], UserConfirmed::shown_and_confirmed()))
         .await?;
     assert_eq!(signer.status(), SignerStatus::Signing);

@@ -793,6 +793,8 @@ pub(crate) enum CurrentAt {
     /// A record view of an answer current at this version: a read's head, a list page's
     /// `seq` in its head's generation (Switch wire 7.4.9).
     Answer(RecordVersion),
+    /// The view predates a known recovery upload for the key or its collection.
+    BeforeUpload(RecordVersion),
     /// A direct GET at the already known signed tip, with its checked view's divergence.
     KeyAtKnownTip(RecordVersion, bool),
 }
@@ -804,9 +806,21 @@ impl CurrentAt {
         Self::Answer(RecordVersion::new(head.generation, seq.unwrap_or(head.seq)))
     }
 
+    fn with_upload_coverage(self, covers_uploads: bool) -> Self {
+        match self {
+            Self::Answer(at) | Self::KeyAtKnownTip(at, _) if !covers_uploads => {
+                Self::BeforeUpload(at)
+            }
+            at => at,
+        }
+    }
+
     /// Whether a record view read now shows the write: the switch's current write.
     fn viewed(self) -> bool {
-        matches!(self, Self::Answer(_) | Self::KeyAtKnownTip(..))
+        matches!(
+            self,
+            Self::Answer(_) | Self::BeforeUpload(_) | Self::KeyAtKnownTip(..)
+        )
     }
 }
 
@@ -852,7 +866,9 @@ fn compare_with_held(
     let current_at = match at {
         CurrentAt::Local => return Ok(Order::Overtaken(write, shown.version)),
         CurrentAt::Itself => shown.version,
-        CurrentAt::Answer(version) | CurrentAt::KeyAtKnownTip(version, _) => version,
+        CurrentAt::Answer(version)
+        | CurrentAt::BeforeUpload(version)
+        | CurrentAt::KeyAtKnownTip(version, _) => version,
     };
     let before_held = if held.authenticated {
         current_at < held.version
@@ -1409,15 +1425,38 @@ impl App {
         }
     }
 
+    fn upload_for_collection(
+        &self,
+        collection: &str,
+        due: Option<ListDue>,
+    ) -> Option<FeedPosition> {
+        let due = due?;
+        let owner = self.protocols.of_collection(collection)?;
+        due.upload.filter(|_| due.at(&owner.name).is_some())
+    }
+
     async fn listing_upload(&self, collection: &str) -> Result<Option<FeedPosition>, AppError> {
-        let Some(due) = self.reader().get::<ListDue>(LIST_DUE).await? else {
-            return Ok(None);
-        };
-        Ok(due.upload.filter(|_| {
-            self.protocols
-                .of_collection(collection)
-                .is_some_and(|owner| due.at(&owner.name).is_some())
-        }))
+        Ok(self.upload_for_collection(collection, self.reader().get::<ListDue>(LIST_DUE).await?))
+    }
+
+    /// A protocol's mark can end only after the delete covers the key and collection
+    /// uploads, including an obligation already staged in this receive transaction.
+    async fn delete_covers_uploads(
+        &self,
+        key: &[u8; 32],
+        collection: &Collection,
+        at: FeedPosition,
+        tx: &Tx,
+    ) -> Result<bool, AppError> {
+        let key_upload = self.record_upload_in(key, tx).await?;
+        let due = self.read_in::<ListDue>(LIST_DUE, tx).await?;
+        Ok(self.covers_uploads(
+            at,
+            [
+                key_upload,
+                self.upload_for_collection(&collection.name, due),
+            ],
+        ))
     }
 
     async fn record_uploads(
@@ -2230,7 +2269,7 @@ impl App {
             stub: None,
             view_version: Some(RecordVersion::new(view.generation, view.version)),
             view_revision: Some(view.revision),
-            current_at: at,
+            current_at: at.with_upload_coverage(covers_uploads),
         };
         let read = self.read_write(&evidence, expect, key, tx).await?;
         // An earlier view can supply the signed write, while the latest upload's
@@ -2355,7 +2394,7 @@ impl App {
             let Some(observed) = self.record_view(&shown_key, &collection).await? else {
                 return Ok(WriteRead::Refused);
             };
-            let at = observed.at;
+            let at = observed.at.with_upload_coverage(observed.covers_uploads);
             current_view = observed.view;
             if current_view.key != shown_key
                 || !SignedOp::peek(&current_view.op).is_ok_and(
@@ -3220,6 +3259,12 @@ impl App {
             let selects_base = current.is_some() && (matches!(placement.base, Order::Newer | Order::Equal)
                 || (accepted.current_at.viewed() && held.as_ref().is_some_and(|h|
                     accepted.write.version.version == h.base_write().0)));
+            let lifetime_mark = accepted.collection.policy.permanent.is_none() && owner.is_some_and(|owner|
+                owner.protocol.mark_ends_at_delete(&accepted.collection.name));
+            let ends_mark = lifetime_mark && selects_base && accepted.write.version.authenticated
+                && !accepted.doubtful && accepted.content == RecordContent::Deleted
+                && !matches!(accepted.current_at, CurrentAt::BeforeUpload(_))
+                && self.delete_covers_uploads(&key, &accepted.collection, observed, tx).await?;
             if selects_base && let Some(at) = current {
                 self.retire_deletion_receipts(key, Some((accepted.write.applied.item_hash, RecordVersion::new(at.generation, at.seq))), tx)?;
             }
@@ -3259,6 +3304,10 @@ impl App {
                         } else {
                             upgraded.follow = None;
                         }
+                    }
+                    // A fresh proof may be the first evidence that a held delete was current.
+                    if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
+                        tx.delete(&seen_key(&key))?;
                     }
                     if upgraded != *held {
                         put_held(tx, &key, &upgraded)?;
@@ -3405,8 +3454,8 @@ impl App {
             // another device's at a data epoch whose key it hasn't fetched: the mark is set from
             // its value when the key comes and the record reopens (`reopen_unreadable`), which
             // takes it here again. Any other own write marks from the value it wrote.
-            let keeps_mark = own
-                && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key());
+            let keeps_mark = (own && (accepted.content == RecordContent::Deleted || accepted.content.waits_for_key()))
+                || (lifetime_mark && new_value.is_none());
             let marked = if keeps_mark {
                 None
             } else {
@@ -3443,7 +3492,7 @@ impl App {
                     )?;
                 }
                 Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-                None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
+                None if ends_mark || (own && !keeps_mark) => tx.delete(&seen_key(&key))?,
                 None => {}
             }
             let live_in = self.live_in(

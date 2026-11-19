@@ -104,6 +104,17 @@ impl App {
             .map(|mark| mark.upload))
     }
 
+    pub(super) async fn record_upload_in(
+        &self,
+        key: &[u8; 32],
+        tx: &Tx,
+    ) -> Result<Option<FeedPosition>, AppError> {
+        Ok(self
+            .read_in::<RecordReread>(&record_reread_key(key), tx)
+            .await?
+            .map(|mark| mark.upload))
+    }
+
     /// A replay before the cursor can revisit an earlier upload. Retain the higher
     /// verified position when individual obligations or listings are combined.
     pub(super) fn latest_upload(

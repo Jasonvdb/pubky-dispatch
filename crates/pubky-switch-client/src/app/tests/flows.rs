@@ -963,12 +963,13 @@ async fn test_app_restore_in_place_leaves_behind_an_owed_call_that_isnt_whole() 
     let mut app = w.join("wallet").await;
     let backup = app.backup().await.unwrap();
     app.receive(None).await.unwrap();
-    let missed = crate::app::feed::OwedCall::Missed {
+    let missed = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let unchecked = crate::app::feed::OwedCall::DenyUnverified {
         generation: 1,
         seq: 1,
@@ -3794,7 +3795,7 @@ async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
 #[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
-    let app = w.join("wallet").await;
+    let mut app = w.join("wallet").await;
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3806,9 +3807,10 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
         AppBackup::from_bytes(&other),
         Err(AppError::InvalidData(_))
     ));
-    value["layers"] = json!([{ "name": "sample", "data": "" }]);
-    value["beyond_cursor"] =
-        json!({ "protocols": ["sample"], "seen": [], "parked": [], "processed": [] });
+    let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&layered).unwrap();
+    assert!(value["beyond_cursor"].is_object());
+    value["v"] = json!(9);
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),
@@ -5431,6 +5433,7 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
     // The call fails: owed, made again by the next read, whose answer is over the bound.
     app.receive(None).await.unwrap();
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    w.clock.advance_ms(1000);
     let (plain, _) = w.note(app.app_id(), "plain");
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, plain), "{:?}", report.events);
@@ -5440,7 +5443,7 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
         AppEvent::LocalWritesRefused {
             call: RefusedCall::Missed(missed),
             ..
-        } if missed.seq == seq
+        } if missed.seq == seq && missed.read_at_ms == now
     )));
     let key = format!("missed/{seq}");
     assert!(
@@ -6758,12 +6761,13 @@ async fn test_deny_list_owed_call_of_a_generation_not_followed_yet_waits() {
     assert!(reader.cursor().seq > 1);
     // The join's gap is told by that first read.
     kinds.log.lock().unwrap().clear();
-    let call = crate::app::feed::OwedCall::Missed {
+    let call = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let mut tx = reader.tx().unwrap();
     tx.put(
         &crate::app::state::key::owed(5, 1),
@@ -7017,12 +7021,13 @@ async fn test_app_owed_call_whose_key_names_no_position_fails_closed() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     app.receive(None).await.unwrap();
-    let call = crate::app::feed::OwedCall::Missed {
+    let call = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let mut tx = app.tx().unwrap();
     tx.put(
         &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),

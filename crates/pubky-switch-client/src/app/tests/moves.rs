@@ -1969,12 +1969,13 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
     // A missed-entries call the protocol couldn't answer at generation 1.
     let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
-    let call = crate::app::feed::OwedCall::Missed {
+    let call = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: lost.note_at_ms + 1,
         seq: 9,
         entries: 2,
         accepted_from_ms: lost.note_at_ms,
         accepted_until_ms: lost.note_at_ms + 1,
-    };
+    });
     let mut tx = app.tx().unwrap();
     tx.put(
         &crate::app::state::key::owed(1, 9),

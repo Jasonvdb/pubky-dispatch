@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.
+
 - When an upgrade drops a registered protocol, call `App::retire_protocol` with that protocol still registered. Load the same App ID with the reduced set after it succeeds. A backup made before retirement can still require the former registration. The [app host guide](app-host-guide.md#running-several-protocols) describes how to finish outstanding work and take a backup for the new set.
 
 - Pass an explicit `TimeoutClass` as the final argument to `SwitchClient::sign_request`. Replace `TimeoutClass::default()` with the class appropriate for the call when constructing a transport `Request`. Use `Bulk` for claim, app-record, receive-key or shared-record writes and for batches with `record_current` or `claim_step` conditions. A small batch can return a claim view for each successful claim or a held record or claim view in a conflict.

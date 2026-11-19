@@ -84,7 +84,7 @@ pub(crate) struct RestoreCursor {
 /// `hgap`: the gap ahead last handed to the protocol as a `missed` item, by sequence (the
 /// generation `recovery_from` names, 0 before any loss) and held `seq`, so each occurrence
 /// is handed once, across loads and the generations a sequence continues through.
-const GAP_HANDED: &str = "hgap";
+pub(super) const GAP_HANDED: &str = "hgap";
 
 /// What comparing a page's `cursor` came to ([`App::compare_held_cursor`]).
 pub(crate) struct Compared {

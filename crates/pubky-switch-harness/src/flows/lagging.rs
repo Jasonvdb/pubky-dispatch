@@ -237,9 +237,15 @@ pub async fn missed_item(world: &World) -> FlowResult {
         .await?;
     }
 
+    let first_read_ms = world.now_ms();
     let step = "the phone reads at last";
     let read = raised(world, step, &mut phone, &phone_notes).await?;
     expect(&read, "Missed", step)?;
+    let notices = phone_notes.missed_entries();
+    if !matches!(notices.as_slice(), [notice] if notice.read_at_ms == first_read_ms && notice.accepted_until_ms <= first_read_ms)
+    {
+        return Err("the missed notice did not retain its feed page time".into());
+    }
     look(world, "the phone reads once more", &mut phone, &phone_notes).await?;
     Ok(())
 }

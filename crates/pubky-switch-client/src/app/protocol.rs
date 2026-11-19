@@ -801,8 +801,11 @@ pub enum ResendReason {
 /// asks the counterparties of its unfinished activity to re-send what their inboxes
 /// accepted from `accepted_from_ms`, through `accepted_until_ms` if it bounds its
 /// re-sends, and lists its collections again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MissedEntries {
+    /// The authenticated service time of the feed page that first incurred this call.
+    /// A retry or restore keeps that page's time, including Unix epoch zero.
+    pub read_at_ms: u64,
     /// The item's `seq`, in the sequence of the generation the app read it at: a call made
     /// again after a provider change keeps it, as information only.
     pub seq: u64,

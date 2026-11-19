@@ -300,12 +300,13 @@ fn retained_call(variant: usize, generation: u64, seq: u64) -> crate::app::feed:
             added: true,
             at_ms: 0,
         },
-        1 => OwedCall::Missed {
+        1 => OwedCall::from(crate::app::MissedEntries {
+            read_at_ms: 0,
             seq,
             entries: 1,
             accepted_from_ms: 0,
             accepted_until_ms: 1,
-        },
+        }),
         2 => OwedCall::Resend {
             sender: [92; 32],
             accepted_from_ms: 0,

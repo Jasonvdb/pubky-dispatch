@@ -6647,6 +6647,58 @@ async fn test_records_listing_named_generations_waits_for_the_new_child_or_paren
 }
 
 #[tokio::test]
+async fn test_records_retained_child_key_reads_the_same_collection_after_a_parent_grant() {
+    let s = Setup::new();
+    let family =
+        Collection::with_permanent_generations("sample.items", "sample-a:shop", &["sample-a:shop"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let member = Collection::new(&family.name, family.policy.clone().permanent(Some(1)));
+    let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+    let first = RecordTarget::new(member.clone(), b"first");
+    writer
+        .put_record(&first, &value(&["one"]), vec![])
+        .await
+        .unwrap();
+    let mut reader = join_scoped(&s, "wallet", &["sample-a:shop"]).await;
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&first).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["one"]);
+    s.w.clock.advance_ms(HOUR);
+    let old = reader.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &old, &renewed, None));
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.cert().hash(), renewed.hash());
+    assert!(!reader.listing_owed().await.unwrap());
+
+    let second = RecordTarget::new(member, b"second");
+    writer
+        .put_record(&second, &value(&["two"]), vec![])
+        .await
+        .unwrap();
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&second).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["two"]);
+
+    // An independent gap still needs its listing. Its records use the child key the
+    // reader already holds even though the wider bundle has not arrived.
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now - 1, now);
+    let before = s.w.switch.lock().shared.listings;
+    let report = reader.receive(None).await.unwrap();
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey))
+    );
+    assert!(s.w.switch.lock().shared.listings > before);
+    assert!(!reader.listing_owed().await.unwrap());
+}
+
+#[tokio::test]
 async fn test_records_listing_named_permanent_generations_restarts_a_narrow_scan() {
     let s = Setup::new();
     let family = Collection::with_permanent_generations("sample.items", "sample-a", &["sample-a"]);

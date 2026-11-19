@@ -486,6 +486,7 @@ impl Signer {
                     digest,
                     dropped,
                     fresh,
+                    ..
                 } => {
                     let held = if fresh {
                         key_recovery::Held::Fresh

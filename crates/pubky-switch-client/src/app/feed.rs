@@ -1897,17 +1897,15 @@ impl App {
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
                 Outcome::AwaitAdmission => {
-                    let custody = self
-                        .park_waiting(
-                            entry,
-                            &received.plaintext,
-                            ParkReason::AwaitingAdmission,
-                            None,
-                            read,
-                        )
-                        .await?;
-                    read.admission_declined.insert(custody.id);
-                    return Ok(Step::Pass);
+                    return self
+                        .await_admission(entry, &received.plaintext, &[], read)
+                        .await;
+                }
+                Outcome::AwaitAdmissionWithCustody(custody) => {
+                    let local = super::protocols::qualify(&owner.name, custody.into_writes());
+                    return self
+                        .await_admission(entry, &received.plaintext, &local, read)
+                        .await;
                 }
                 Outcome::Consume => Effect::default(),
                 Outcome::AwaitKey { data_epoch } => {
@@ -2173,7 +2171,7 @@ impl App {
             Some(self.keys_held())
         };
         let custody = self
-            .park_waiting(entry, &received.plaintext, reason, keys_at, read)
+            .park_waiting(entry, &received.plaintext, reason, keys_at, &[], read)
             .await?;
         Ok(Some(if entry.stored.is_some() && custody.retained {
             Step::Hold
@@ -2756,7 +2754,7 @@ impl App {
             .get(&entry.seq)
             .map_or(now, |held| held.since_ms);
         if now.saturating_sub(since) >= self.config.park_after_ms {
-            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read)
+            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, &[], read)
                 .await?;
             return Ok(Step::Pass);
         }
@@ -2764,14 +2762,36 @@ impl App {
         Ok(Step::Hold)
     }
 
-    /// Select bounds with the new input included, then attach every custody write before
-    /// the caller can pass its cursor (Switch spec 8.2). No callback write enters this Tx.
+    async fn await_admission(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        local: &[LocalWrite],
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let custody = self
+            .park_waiting(
+                entry,
+                plaintext,
+                ParkReason::AwaitingAdmission,
+                None,
+                local,
+                read,
+            )
+            .await?;
+        read.admission_declined.insert(custody.id);
+        Ok(Step::Pass)
+    }
+
+    /// Select bounds including the new input. Commit the selection and any designated
+    /// owner-local writes together before passing the cursor (Switch spec 8.2).
     async fn park_waiting(
         &mut self,
         entry: &Entry,
         plaintext: &MessagePlaintext,
         reason: ParkReason,
         keys_at: Option<u64>,
+        local: &[LocalWrite],
         read: &mut Read,
     ) -> Result<Custody, AppError> {
         let id = entry.stored.unwrap_or(self.state.next_stored_id);
@@ -2797,11 +2817,12 @@ impl App {
             },
         };
         let drops = self.waiting_drops(Some((id, &candidate)));
-        let change = self.waiting_change(
+        let mut change = self.waiting_change(
             Some((id, candidate)),
             entry.stored.is_none().then_some(entry.seq),
             &drops,
         )?;
+        change.keep_local(local)?;
         let retained = change.retained(id);
         if !self.make_room(read, change.size()).await? {
             return Err(crate::store::BatchError::BatchTooLarge {

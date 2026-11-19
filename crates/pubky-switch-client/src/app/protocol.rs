@@ -49,7 +49,7 @@ use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
-use super::error::AppError;
+use super::error::{AppError, Refusal};
 use super::own_record::RecordExpiry;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
@@ -655,6 +655,57 @@ impl std::fmt::Display for StoreFailure {
     }
 }
 
+/// Local writes that must commit even while ordinary admission of the input waits
+/// (Switch spec 8.2). On each retry the protocol returns only writes still owed.
+/// It must be safe to apply them again after another input changed its state.
+///
+/// ```
+/// use pubky_switch_client::app::{AdmissionCustody, LocalWrite, Outcome, Refusal};
+///
+/// fn wait_with_evidence(key: Vec<u8>, evidence: Vec<u8>) -> Result<Outcome, Refusal> {
+///     let mut custody = AdmissionCustody::default();
+///     custody.try_push(LocalWrite::Put { key, value: evidence })?;
+///     Ok(Outcome::AwaitAdmissionWithCustody(custody))
+/// }
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct AdmissionCustody {
+    writes: Vec<LocalWrite>,
+    bytes: usize,
+}
+
+impl AdmissionCustody {
+    /// Add an exact-key put or deletion to commit with the waiting input or its drop notice.
+    /// Add mandatory writes before optional cleanup.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a prefix deletion or a write that would exceed
+    /// [`MAX_STEP_LOCAL_BYTES`]. On refusal, all previously added writes remain.
+    pub fn try_push(&mut self, write: LocalWrite) -> Result<(), Refusal> {
+        if matches!(write, LocalWrite::DeletePrefix { .. }) {
+            return Err(Refusal::Usage(
+                "admission custody requires an exact key".into(),
+            ));
+        }
+        let bytes = self
+            .bytes
+            .saturating_add(local_writes_bytes(std::slice::from_ref(&write)));
+        if bytes > MAX_STEP_LOCAL_BYTES {
+            return Err(Refusal::Usage(format!(
+                "admission custody writes at most {MAX_STEP_LOCAL_BYTES} bytes of local state"
+            )));
+        }
+        self.writes.push(write);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn into_writes(self) -> Vec<LocalWrite> {
+        self.writes
+    }
+}
+
 /// The protocol's answer for a received message. Later versions may add answers: a host
 /// that matches on it keeps a catch-all arm.
 #[derive(Clone, Debug)]
@@ -746,6 +797,10 @@ pub enum Outcome {
     /// current state, retaining the input's original receipt and storage order. This is
     /// neither a storage failure nor an immediate request to repeat the read.
     AwaitAdmission,
+    /// Wait as for [`Outcome::AwaitAdmission`], committing the designated protocol-local
+    /// writes together with the waiting input or its drop notice. All work staged through
+    /// [`ReceiveContext`] is discarded. The input stays unprocessed (Switch spec 8.2).
+    AwaitAdmissionWithCustody(AdmissionCustody),
     /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
     /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
     /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data
@@ -1534,6 +1589,34 @@ pub trait Protocol: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_admission_custody_refuses_unbounded_cleanup_without_losing_the_replacement() {
+        let mut custody = AdmissionCustody::default();
+        let deletion = LocalWrite::Delete {
+            key: b"old".to_vec(),
+        };
+        let key = b"new".to_vec();
+        let value_len = MAX_STEP_LOCAL_BYTES
+            - LOCAL_WRITE_OVERHEAD_BYTES
+            - key.len()
+            - local_writes_bytes(std::slice::from_ref(&deletion));
+        let replacement = LocalWrite::Put {
+            key,
+            value: vec![7; value_len],
+        };
+        custody.try_push(replacement.clone()).unwrap();
+        assert!(matches!(
+            custody.try_push(LocalWrite::DeletePrefix { prefix: Vec::new() }),
+            Err(Refusal::Usage(_))
+        ));
+        custody.try_push(deletion.clone()).unwrap();
+        assert!(matches!(
+            custody.try_push(deletion.clone()),
+            Err(Refusal::Usage(_))
+        ));
+        assert_eq!(custody.into_writes(), [replacement, deletion]);
+    }
 
     #[test]
     fn test_local_write_debug_hides_values() {

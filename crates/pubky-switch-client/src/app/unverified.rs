@@ -124,6 +124,11 @@ pub(crate) struct WaitingChange {
 }
 
 impl WaitingChange {
+    /// Include the owner's designated local writes before sizing the whole change.
+    pub(super) fn keep_local(&mut self, writes: &[super::LocalWrite]) -> Result<(), AppError> {
+        self.tx.local(writes)
+    }
+
     pub(crate) fn size(&self) -> u64 {
         self.tx.size()
     }

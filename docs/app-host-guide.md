@@ -98,6 +98,7 @@ The client verifies the envelope and signed message, recipient, sender standing,
 | `ClaimFetch::Absent` | The service answered that it holds no claim at this key. Handle absence under the protocol's rules. |
 | `ClaimFetch::Refused` | The service gave a lasting refusal for this read. Handle the code without asking for the same read again. |
 | `Outcome::AwaitAdmission` | The protocol's ordinary storage rule cannot admit the input yet. Staged changes are discarded. The client keeps either the waiting payload or its drop notice before passing it. |
+| `Outcome::AwaitAdmissionWithCustody` | Use when the protocol must keep evidence now while ordinary admission waits. Put replay-safe, exact-key writes in `AdmissionCustody`. They commit with the original input or its drop notice. On retry, check ordinary admission again even if the evidence is already present. |
 | `Outcome::AwaitKey` | The step needs a scope key at this epoch. The client discards staged changes. Obtain the missing key and read again. The waiting copy can reach a shared limit or fail a recipient check on retry. |
 
 ### Waiting and push notifications

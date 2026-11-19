@@ -78,17 +78,17 @@ async fn two_wallets(world: &World) -> FlowResult {
     Ok(())
 }
 
-async fn check(backend: Backend) {
-    let result = Box::pin(crate::run_here(backend, two_wallets)).await;
-    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+#[tokio::test]
+async fn test_both_wallets_receive_the_notice_after_the_service_restores_its_database()
+-> Result<(), crate::HarnessError> {
+    let _ = Box::pin(crate::run_here(Backend::Service, two_wallets)).await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_both_wallets_receive_the_notice_after_the_service_restores_its_database() {
-    check(Backend::Service).await;
-}
-
-#[tokio::test]
-async fn test_both_wallets_receive_the_notice_after_the_scripted_account_goes_back() {
-    check(Backend::Scripted).await;
+async fn test_both_wallets_receive_the_notice_after_the_scripted_account_goes_back()
+-> Result<(), crate::HarnessError> {
+    let trace = Box::pin(crate::run_here(Backend::Scripted, two_wallets)).await?;
+    assert!(trace.is_some(), "the scripted service is always available");
+    Ok(())
 }

@@ -94,18 +94,32 @@ impl Batch {
         self.cursor
     }
 
-    /// A conflict can return a held app record or a full shared record view, even for a
-    /// small write. An exact current-record condition can return the same view on any
-    /// operation (Switch wire 6.3, 7.6).
+    /// Each claim proof carries its claim view. A refusal can carry a held app or receive
+    /// key record, a shared record view or a claim view (Switch wire 6.3, 6.5, 7.6).
     pub(crate) fn timeout(&self) -> TimeoutClass {
-        if self.ops.iter().any(|op| {
+        let carries_state = self.ops.iter().any(|op| {
             let body = op.body();
-            matches!(body.kind, OpKind::RecordPut(_) | OpKind::AppPut { .. })
-                || body
-                    .conditions
-                    .iter()
-                    .any(|c| matches!(c, Condition::RecordCurrent { .. }))
-        }) {
+            let state_in_answer = match &body.kind {
+                OpKind::Claim(_)
+                | OpKind::RecordPut(_)
+                | OpKind::AppPut { .. }
+                | OpKind::ReceiveKeyPut { .. } => true,
+                OpKind::AllowPut { .. }
+                | OpKind::AllowDelete { .. }
+                | OpKind::DenyPut { .. }
+                | OpKind::DenyDelete { .. }
+                | OpKind::InviteCodePut(_)
+                | OpKind::InviteCodeDelete { .. }
+                | OpKind::KeyBundlePut(_)
+                | OpKind::CertPut { .. } => false,
+            };
+            state_in_answer
+                || body.conditions.iter().any(|condition| match condition {
+                    Condition::RecordCurrent { .. } | Condition::ClaimStep { .. } => true,
+                    Condition::RecordVersion { .. } | Condition::ServerTimeIn { .. } => false,
+                })
+        });
+        if carries_state {
             TimeoutClass::Bulk
         } else {
             TimeoutClass::Ordinary

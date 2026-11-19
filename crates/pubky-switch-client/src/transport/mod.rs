@@ -67,8 +67,9 @@ pub enum TimeoutClass {
     /// unconditional allow-list update.
     Ordinary,
     /// A potentially large transfer, such as a page, listing or upload. A batch that
-    /// writes an app or shared record, or tests an exact current-record condition, can
-    /// receive the held record in a conflict (Switch wire 6.3, 7.1, 7.6).
+    /// writes claims can return several signed claim views. Other batches can return a
+    /// held signed record, shared record view or claim view in a conflict (Switch wire
+    /// 6.3, 6.5, 7.1, 7.6).
     Bulk,
     /// The feed's long poll (Switch wire 7.4.4): the service holds the read for up to
     /// `wait_s` seconds, then answers a page as a [`TimeoutClass::Bulk`] read does.

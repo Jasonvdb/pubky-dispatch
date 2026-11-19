@@ -457,7 +457,7 @@ For a batch with `OpBatch::first_send_before`, the HTTPS transport checks the ex
 | Case | What happened and what to do |
 |---|---|
 | `TimeoutClass::Ordinary` | Use a deadline for a small call, such as a setting or service-time read. |
-| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or batch whose conflict can carry a held app record or shared record view. |
+| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or batch that can return signed claim proofs, a held record or a claim view. |
 | `TimeoutClass::LongPoll` | Allow the requested `wait_s` at the service plus time to return a bulk page. |
 | `TransportError::Refused` | Local origin or address policy prevented sending. Return this only when zero request bytes left. Correct the destination. |
 | `TransportError::Connect` | A connection could not be made and zero request bytes left. Retry connection later. |

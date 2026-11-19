@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_client::TransportError;
-use pubky_switch_client::app::{App, AppConfig};
+use pubky_switch_client::app::{App, AppConfig, ClaimOp};
 use pubky_switch_client::client::{Batch, CheckedResponse, Credentials, SwitchClient};
 use pubky_switch_client::error::ClientError;
 use pubky_switch_client::store::MemoryStore;
@@ -13,6 +13,7 @@ use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_client::transport::{BoxFuture, Request, Response, TimeoutClass, Transport};
 use pubky_switch_core::chain::{TransitionProof, bind_answer};
 use pubky_switch_core::enc::{b64, pubky_id};
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{
@@ -205,10 +206,11 @@ fn guard(key: [u8; 32], view: &Value) -> Condition {
         deleted: view["deleted"].as_bool().unwrap(),
     }
 }
-fn conflict(result: Result<CheckedResponse, ClientError>) -> Value {
+fn conflict<T: std::fmt::Debug>(result: Result<T, ClientError>) -> Value {
     match result {
         Err(ClientError::Switch {
             status: 409,
+            code: ErrorCode::Conflict,
             current,
             ..
         }) => current,
@@ -487,8 +489,7 @@ impl Transport for BatchTransport {
     }
 }
 
-async fn app_record_timeouts(world: &World) {
-    let w = Box::pin(writer(world)).await;
+fn recording_client(world: &World, w: &Writer) -> (SwitchClient, Arc<BatchTransport>) {
     let transport = Arc::new(BatchTransport {
         inner: world.transport(),
         sent: Mutex::default(),
@@ -506,6 +507,12 @@ async fn app_record_timeouts(world: &World) {
         world.clock().clone(),
     )
     .unwrap();
+    (client, transport)
+}
+
+async fn app_record_timeouts(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let (client, transport) = recording_client(world, &w);
     let record =
         |time| AppRecord::sign(&w.keys, AppRecordBody::new(w.app.cert(), vec![], time)).unwrap();
     let put = |record: &AppRecord| {
@@ -538,18 +545,131 @@ async fn app_record_timeouts(world: &World) {
         let saved = batch.body().to_vec();
         let retry = Batch::from_body(saved.clone()).unwrap();
         for send in [&batch, &retry] {
-            let error = client.submit(send).await.unwrap_err();
-            let ClientError::Switch {
-                status: 409,
-                code: pubky_switch_core::http::ErrorCode::Conflict,
-                current,
-                ..
-            } = error
-            else {
-                panic!("expected a signed app-record conflict, got {error:?}");
-            };
-            assert_eq!(current, json!({"record": held.signed()}));
+            assert_eq!(
+                conflict(client.submit(send).await),
+                json!({"record": held.signed()})
+            );
             expected.push((TimeoutClass::Bulk, saved.clone()));
+        }
+    }
+    assert_eq!(*transport.sent.lock().unwrap(), expected);
+}
+
+async fn claim_and_receive_key_timeouts(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let (client, transport) = recording_client(world, &w);
+    let claims = (1u8..=8)
+        .map(|id| {
+            (
+                vec![],
+                ClaimOp::attempt([id; 32], 0, [id; 16], 3600, None).kind(),
+            )
+        })
+        .collect();
+    let batch = client.sign_batch(w.generation, claims, None).unwrap();
+    let first = client.submit(&batch).await.unwrap();
+    assert_eq!(first.proofs.len(), 8);
+    let retry = Batch::from_body(batch.body().to_vec()).unwrap();
+    assert_eq!(client.submit(&retry).await.unwrap().proofs, first.proofs);
+
+    // A different operation can ask about a claim. Its refusal returns the held view.
+    let condition = Condition::ClaimStep {
+        claim_key: [1; 32],
+        step: 0,
+    };
+    let checked = client
+        .sign_batch(
+            w.generation,
+            vec![(vec![condition], OpKind::DenyDelete { pubky: [7; 32] })],
+            None,
+        )
+        .unwrap();
+    for send in [
+        &checked,
+        &Batch::from_body(checked.body().to_vec()).unwrap(),
+    ] {
+        let current = conflict(client.submit(send).await);
+        assert_eq!(current["claim_step"]["step"], 1);
+        assert_eq!(current["claim"]["attempts"].as_array().unwrap().len(), 1);
+    }
+
+    let key = w
+        .client
+        .directory(None)
+        .await
+        .unwrap()
+        .apps
+        .into_iter()
+        .find(|app| app.app_id == w.keys.app_id_bytes())
+        .unwrap()
+        .receive_key
+        .unwrap();
+    let registration = client
+        .sign_batch(
+            w.generation,
+            vec![(
+                vec![],
+                OpKind::ReceiveKeyPut {
+                    record: key.signed().clone(),
+                },
+            )],
+            None,
+        )
+        .unwrap();
+    for send in [
+        &registration,
+        &Batch::from_body(registration.body().to_vec()).unwrap(),
+    ] {
+        assert!(client.submit(send).await.unwrap().proofs.is_empty());
+    }
+    let sent = transport.sent.lock().unwrap();
+    assert_eq!(sent.len(), 6);
+    for ((timeout, bytes), expected) in sent.iter().zip([
+        &batch,
+        &batch,
+        &checked,
+        &checked,
+        &registration,
+        &registration,
+    ]) {
+        assert_eq!(*timeout, TimeoutClass::Bulk);
+        assert_eq!(bytes, expected.body());
+    }
+}
+
+async fn list_condition_timeouts(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let old = w.write(1, b"notes", RecordVersion::NONE, b"{}").await;
+    let held = w
+        .write(2, b"notes", version(&old), br#"{"updated":true}"#)
+        .await;
+    let key = pubky_switch_core::enc::unb64_array(old["key"].as_str().unwrap()).unwrap();
+    let (client, transport) = recording_client(world, &w);
+    let mut expected = Vec::new();
+    for (condition, timeout, refusal) in [
+        (
+            guard(key, &old),
+            TimeoutClass::Bulk,
+            json!({"record_view": held}),
+        ),
+        (
+            Condition::RecordVersion {
+                key,
+                version: version(&old),
+            },
+            TimeoutClass::Ordinary,
+            json!({"record_version": {"key": held["key"], "generation": held["generation"], "version": held["version"]}}),
+        ),
+    ] {
+        let list = OpKind::DenyPut { pubky: [7; 32] };
+        let batch = client
+            .sign_batch(w.generation, vec![(vec![condition], list)], None)
+            .unwrap();
+        let saved = batch.body().to_vec();
+        let retry = Batch::from_body(saved.clone()).unwrap();
+        for send in [&batch, &retry] {
+            assert_eq!(conflict(client.submit(send).await), refusal);
+            expected.push((timeout, saved.clone()));
         }
     }
     assert_eq!(*transport.sent.lock().unwrap(), expected);
@@ -626,4 +746,26 @@ backend_test!(
     test_app_record_conflict_timeout_scripted,
     Backend::Scripted,
     app_record_timeouts
+);
+
+backend_test!(
+    test_claim_and_receive_key_batch_timeouts_scripted,
+    Backend::Scripted,
+    claim_and_receive_key_timeouts
+);
+backend_test!(
+    test_claim_and_receive_key_batch_timeouts_service,
+    Backend::Service,
+    claim_and_receive_key_timeouts
+);
+
+backend_test!(
+    test_list_condition_timeouts_scripted,
+    Backend::Scripted,
+    list_condition_timeouts
+);
+backend_test!(
+    test_list_condition_timeouts_service,
+    Backend::Service,
+    list_condition_timeouts
 );

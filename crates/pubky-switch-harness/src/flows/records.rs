@@ -243,7 +243,15 @@ mod tests {
         Ok(())
     }
 
-    async fn observe_deleted_record(world: &World, publish: bool) -> FlowResult {
+    #[derive(Clone, Copy, PartialEq)]
+    enum DeletedList {
+        Observe,
+        RestoreWitness,
+        EarlierBackup,
+    }
+
+    async fn observe_deleted_record(world: &World, how: DeletedList) -> FlowResult {
+        let publish = how != DeletedList::Observe;
         let alice = world.identity("alice")?;
         world.add_switch(ORIGIN, &[&alice]).await?;
         let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
@@ -282,6 +290,18 @@ mod tests {
         };
         let hash = SignedOp::peek(&write.op)?.item_hash()?;
         if publish {
+            if how == DeletedList::RestoreWitness {
+                Box::pin(reader.receive(None)).await?;
+                Box::pin(reader.flush_cursor()).await?;
+                assert!(reader.service_cursor().seq < delete.version.version);
+                assert_eq!(
+                    reader
+                        .protocol_get(crate::parties::NOTES, &hash)
+                        .await?
+                        .as_deref(),
+                    Some(value.as_slice())
+                );
+            }
             let backup = reader.backup_layered().await?;
             drop(reader);
             reader = Box::pin(App::restore(
@@ -299,8 +319,25 @@ mod tests {
             ))
             .await?;
             reader.refresh_identity().await?;
+            reader
+                .protocol_commit(
+                    crate::parties::NOTES,
+                    &[pubky_switch_client::app::LocalWrite::Put {
+                        key: b"publish list".to_vec(),
+                        value: hash.to_vec(),
+                    }],
+                )
+                .await?;
         }
         Box::pin(reader.receive(None)).await?;
+        if how == DeletedList::EarlierBackup {
+            let held = Box::pin(writer.read_record(&target))
+                .await?
+                .ok_or("missing deletion")?;
+            assert_eq!(held.version, delete.version);
+            assert!(held.content.value().is_none());
+            return Ok(());
+        }
         if publish {
             let held = Box::pin(writer.read_record(&target))
                 .await?
@@ -345,7 +382,7 @@ mod tests {
     async fn test_record_deletion_observation_at_both_switches() {
         for backend in [Backend::Service, Backend::Scripted] {
             Box::pin(run_here(backend, async |world| {
-                observe_deleted_record(world, false).await
+                observe_deleted_record(world, DeletedList::Observe).await
             }))
             .await
             .unwrap();
@@ -355,11 +392,13 @@ mod tests {
     #[tokio::test]
     async fn test_record_publication_by_a_restored_reader_at_both_switches() {
         for backend in [Backend::Service, Backend::Scripted] {
-            Box::pin(run_here(backend, async |world| {
-                observe_deleted_record(world, true).await
-            }))
-            .await
-            .unwrap();
+            for how in [DeletedList::RestoreWitness, DeletedList::EarlierBackup] {
+                Box::pin(run_here(backend, async |world| {
+                    observe_deleted_record(world, how).await
+                }))
+                .await
+                .unwrap();
+            }
         }
     }
 

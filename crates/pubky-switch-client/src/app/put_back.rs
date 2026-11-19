@@ -85,6 +85,20 @@ impl RecordHold {
         ))
     }
 
+    /// A confirmed application of this owner's original direct replacement.
+    fn directly_replaced_by(&self, revision: ApplicationRef) -> Result<bool, AppError> {
+        let Some(pending) = self.pending.as_ref().filter(|p| p.kept_ms.is_some()) else {
+            return Ok(false);
+        };
+        let batch = Batch::from_body(pending.body.clone())?;
+        let [op] = batch.ops() else {
+            return Err(super::corrupt());
+        };
+        Ok(op.body().generation == revision.generation
+            && op.item_hash()? == revision.item_hash
+            && op.body().conditions.as_slice() == std::slice::from_ref(&self.condition()))
+    }
+
     pub(super) fn check(
         &self,
         protocols: &ProtocolSet,
@@ -452,11 +466,23 @@ impl App {
                 let deletion = original.revision();
                 let id = original.id();
                 let current = write.revision();
+                let decision = if hold.directly_replaced_by(current)? {
+                    super::PutBackSuccessor::Covered
+                } else {
+                    decision
+                };
                 match decision {
                     super::PutBackSuccessor::Covered => {
                         self.displace_publication(&mut hold, Some(current), tx)
                             .await?;
                         self.forget_put_back(&id, tx)?;
+                        if hold.protects
+                            && !hold.needs_cursor
+                            && self.state.cursor.seq >= hold.observation.seq.saturating_sub(1)
+                        {
+                            self.advance_feed_cursor(hold.observation.seq, None, tx)?;
+                            tx.put(super::key::CURSOR, &self.state.cursor)?;
+                        }
                         return Ok(Publication::Covered(deletion));
                     }
                     super::PutBackSuccessor::Merge { value } if write.value() != Some(&value) => {
@@ -575,10 +601,12 @@ impl App {
         }
         let mut put = hold.observation.put()?;
         if value.len() > pubky_switch_core::sealed::MAX_JSON_LEN
-            || self
-                .protocols
-                .record_seen(&hold.observation.collection, None, Some(value))
-                .is_some_and(|m| m.len() > super::MAX_SEEN_MARK_BYTES)
+            || records::refuse_unmarkable(
+                &self.protocols,
+                &hold.observation.collection,
+                Some(value),
+            )
+            .is_err()
         {
             return Ok(false);
         }
@@ -731,6 +759,12 @@ impl App {
                 let proof = answer.proofs.first().ok_or_else(super::corrupt)?;
                 let mut tx = self.tx()?;
                 self.cache_own_write(op, proof, &mut tx).await?;
+                // The successful reply can confirm the first-send cursor. Its position
+                // and chain proof survive the very commit that retires the signed hold.
+                tx.put(super::key::CURSOR, &self.state.cursor)?;
+                if let Some(chain) = self.state.chain.as_mut() {
+                    chain.write(&mut tx)?;
+                }
                 self.commit(tx).await
             }
             Err(error)

@@ -16,14 +16,11 @@ The client's public API for protocols and hosts is in place: record answers that
 - **Client.** A pending collection listing records its upload position. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
-- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs` and `put_back_notices`, even when both lists are empty.
+- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs`, `put_back_notices` and `record_settlements`, even when both lists are empty.
 
 If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
 
 A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
-
-**Additions still to come**
-
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 

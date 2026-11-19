@@ -574,6 +574,15 @@ impl App {
             tx.delete(&observed.store_key())?;
         }
         hold.observing = false;
+        // A later view or the first feed page can enrich an existing observation.
+        // Settle an already-sent operation against the current record on retry.
+        if hold
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.kept_ms.is_some())
+        {
+            return self.keep_put_back(hold, tx);
+        }
         match answer {
             Some(Prepare { .. }) => self.keep_waiting(hold, tx),
             Some(Write { .. }) => self.keep_put_back(hold, tx),

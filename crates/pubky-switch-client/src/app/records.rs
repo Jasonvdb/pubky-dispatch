@@ -4008,7 +4008,7 @@ impl App {
             if self.state.scope_keys.get(epoch, read_scope).is_none() {
                 self.ensure_scope_keys().await?;
             }
-            refuse_unmarkable(&self.protocols, target, value)?;
+            refuse_unmarkable(&self.protocols, &target.collection.name, value)?;
             let key = self.record_key(target)?;
             let held = self.held_record(&key).await?;
             let (put, named) = record_put(&self.state, target, value, held.as_ref())?;
@@ -4375,13 +4375,13 @@ pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
 /// mark held and makes none, so it is never refused here.
 pub(crate) fn refuse_unmarkable(
     protocol: &super::ProtocolSet,
-    target: &RecordTarget,
+    collection: &str,
     value: Option<&[u8]>,
 ) -> Result<(), AppError> {
     let Some(value) = value else {
         return Ok(());
     };
-    match protocol.record_seen(&target.collection.name, None, Some(value)) {
+    match protocol.record_seen(collection, None, Some(value)) {
         Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => Err(Refusal::Usage(format!(
             "the protocol's mark of this write takes {} bytes, over {MAX_SEEN_MARK_BYTES}",
             mark.len()

@@ -1358,7 +1358,9 @@ impl App {
             // A displaced record replacement only needs its original answer. A lost
             // provider's missing proof cannot establish that it refused the write.
             if (resend_first || pending.record_deletion.is_some()) && !never_sent {
-                if pending.record_deletion.is_some() && carry == Carry::AfterLoss || !answer_decides(pending.kept_ms) {
+                if pending.record_deletion.is_some() && carry == Carry::AfterLoss
+                    || !answer_decides(pending.kept_ms)
+                {
                     self.kept_batch_dropped(&id, &pending, &kept, tx).await?;
                 }
                 continue;

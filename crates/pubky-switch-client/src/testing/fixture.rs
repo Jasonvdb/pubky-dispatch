@@ -553,20 +553,30 @@ impl Protocol for TestProtocol {
     fn record_put_back(
         &self,
         deletion: &crate::app::RecordDeletion<'_>,
-        _: &crate::app::ReceiveContext<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
     ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
         if self.publishes_record
             && deletion.original_in_current_generation
             && deletion.exact_version_authenticated
             && let Some(value) = deletion.exact_value
         {
-            return Ok(Some(crate::app::PutBack::Write {
-                observed: vec![LocalWrite::Put {
-                    key: deletion.item_hash.to_vec(),
-                    value: value.to_vec(),
-                }],
+            let observed = vec![LocalWrite::Put {
+                key: deletion.item_hash.to_vec(),
                 value: value.to_vec(),
-            }));
+            }];
+            return Ok(Some(
+                if cx
+                    .local_get(b"publish list")
+                    .is_ok_and(|saved| saved.as_deref() == Some(deletion.item_hash.as_slice()))
+                {
+                    crate::app::PutBack::Write {
+                        observed,
+                        value: value.to_vec(),
+                    }
+                } else {
+                    crate::app::PutBack::Prepare { observed }
+                },
+            ));
         }
         if self.waits_for_record
             && deletion.original_in_current_generation

@@ -764,7 +764,7 @@ impl<'a> ReceiveContext<'a> {
         // A value that isn't JSON is refused before the protocol marks it, as `record_op`
         // does: nothing is handed on first.
         super::records::refuse_non_json(value)?;
-        super::records::refuse_unmarkable(self.protocols, target, value)?;
+        super::records::refuse_unmarkable(self.protocols, &target.collection.name, value)?;
         let key = self.record_key(target)?;
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(

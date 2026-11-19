@@ -678,7 +678,7 @@ impl Facts<'_> {
                 // No count: each member that only one run shows is a difference of its own.
                 self.out.insert(at.to_owned(), "object".into());
                 for (name, member) in members {
-                    self.value(&format!("{at}.{name}"), Some(name), member);
+                    self.value(&member_path(at, name), Some(name), member);
                 }
             }
         }
@@ -727,6 +727,24 @@ impl Facts<'_> {
             format!("string of {}{NUMBER}{number}", text.len()),
         );
     }
+}
+
+/// Append a literal member name, escaping the separators used for arrays, carried JSON
+/// and signatures as well as the dot between members and the escape character itself.
+fn member_path(parent: &str, name: &str) -> String {
+    let mut path = format!("{parent}.");
+    for ch in name.chars() {
+        match ch {
+            '%' => path.push_str("%25"),
+            '.' => path.push_str("%2E"),
+            '[' => path.push_str("%5B"),
+            ']' => path.push_str("%5D"),
+            '~' => path.push_str("%7E"),
+            ' ' => path.push_str("%20"),
+            _ => path.push(ch),
+        }
+    }
+    path
 }
 
 /// What sets a long string's number off from its length, as in `string of 43 #12`.
@@ -809,6 +827,31 @@ mod tests {
         assert_eq!(fact("body.next"), Some("text 1.4"));
         assert_eq!(fact("body.apps"), Some("array of 2"));
         assert_eq!(fact("body.apps[1].n"), Some("number 2"));
+    }
+
+    #[test]
+    fn test_comparison_keeps_literal_members_distinct_from_paths() {
+        let trace = |value: &Value| {
+            let recorder = Recorder::new(
+                Arc::new(pubky_switch_client::transport::MockTransport::new()),
+                Arc::new(Names::default()),
+                Arc::new(Checker::default()),
+            );
+            recorder.outcome("read", value);
+            recorder.trace()
+        };
+        for (mut value, extra) in [
+            (json!({"a": {"b": 1}}), "a.b"),
+            (json!({"a": [1]}), "a[0]"),
+            (json!({"a.b": 1}), "a%2Eb"),
+        ] {
+            let original = trace(&value);
+            value[extra] = json!(1);
+            let differences = crate::compare::differences(&original, &trace(&value));
+            assert_eq!(differences.len(), 1, "extra member {extra}");
+            assert_eq!(differences[0].service, None);
+            assert_eq!(differences[0].scripted.as_deref(), Some("number 1"));
+        }
     }
 
     #[test]

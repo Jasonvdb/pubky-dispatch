@@ -11726,14 +11726,14 @@ async fn test_record_lifetime_waits_for_a_delete_view_covering_the_upload() {
             wallet.read_record_fresh(&target).await.unwrap(),
             RecordRead::Kept { .. }
         ));
-        // A list page also checks its signed head when its snapshot sequence is later.
+        // The listing omits deleted keys. Its empty page cannot finish this lifetime.
         s.w.switch.fail_next(Fault::Head {
             path: "records?collection".into(),
             at: Some(deletion),
             forked: false,
         });
         let listed = wallet.list_collection(&target.collection).await.unwrap();
-        assert_eq!(listed.records, 1);
+        assert_eq!(listed.records, 0);
         assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(mark));
         assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
             RecordRead::Fresh(r) if r.content == RecordContent::Deleted));

@@ -331,6 +331,12 @@ mod tests {
             signer.resume().await,
             Err(Refusal::FirstAccountPresent.into())
         );
+        assert_eq!(
+            signer
+                .restart_first_enrollment(ORIGIN, UserConfirmed::shown_and_confirmed())
+                .await,
+            Err(Refusal::FirstEnrollmentUnavailable.into())
+        );
         assert_eq!(world.requests_sent(), requests);
 
         let restored = match account {
@@ -365,6 +371,7 @@ mod tests {
         );
         assert_eq!(restored.body().signer, install);
         assert_eq!(restored.inbox(), previous.inbox());
+        assert_eq!(restored.body().record_max_age, Some(3600));
         assert_eq!(
             world
                 .files()

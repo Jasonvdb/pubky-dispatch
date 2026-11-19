@@ -166,18 +166,20 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
     Ok(())
 }
 
+async fn check_cancel(backend: Backend) {
+    let result = Box::pin(crate::run_here(backend, async |world: &World| {
+        Box::pin(cancel_and_sign(world)).await
+    }))
+    .await;
+    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+}
+
 #[tokio::test]
 async fn test_stop_interrupted_key_recovery_scripted() {
-    crate::run_here(Backend::Scripted, cancel_and_sign)
-        .await
-        .unwrap()
-        .unwrap();
+    check_cancel(Backend::Scripted).await;
 }
 
 #[tokio::test]
 async fn test_stop_interrupted_key_recovery_service() {
-    crate::run_here(Backend::Service, cancel_and_sign)
-        .await
-        .unwrap()
-        .unwrap();
+    check_cancel(Backend::Service).await;
 }

@@ -94,20 +94,31 @@ async fn winning_receiver(world: &World) -> FlowResult {
     let replacement = Arc::new(Router::new());
     replacement.add(RECOVERY_ORIGIN, world.transport());
     env.transport = replacement;
-    let receiver = Box::pin(Signer::resume_take_over(
+    let resumed = Box::pin(Signer::resume_take_over(
         env.clone(),
         identity,
         &recipient.keys,
         vault.clone(),
     ))
-    .await?;
+    .await;
+    // Installation finished before the ordinary publication tried to read its old service.
+    assert!(
+        matches!(
+            resumed,
+            Err(SignerError::Switch(
+                pubky_switch_client::ClientError::Transport(_)
+            ))
+        ),
+        "{resumed:?}"
+    );
+    let keyring = || IdentityKeyring::open(vault.clone());
+    let receiver = Box::pin(Signer::open(env.clone(), keyring()?)).await?;
     let won = receiver
         .identity_doc()?
         .ok_or("missing winning hand-over")?;
     assert_eq!(won.version(), original.version() + 1);
     assert_ne!(won.body().signer, original.body().signer);
     drop(receiver);
-    let keyring = || IdentityKeyring::open(vault.clone());
     assert_eq!(keyring()?.public_key(), identity);
     let survey = Box::pin(Signer::survey_provider_loss_with_key(
         env.clone(),
@@ -196,16 +207,29 @@ async fn undecided_receiver(world: &World, aborted: bool) -> FlowResult {
     let before = files();
     assert!(before.iter().all(Option::is_some));
     if aborted {
-        // The sender saw its successful withdrawal, then lost power before a backup or publication.
-        world.fail_homeserver_write(&alice, SIGNER_BACKUP_PATH);
-        let outcome = Box::pin(old.abort_hand_over(UserConfirmed::shown_and_confirmed())).await?;
+        // The old service accepted the withdrawal; the answer never reached the sender.
+        world.lose_answer("PUT", "/identity");
+        let result = Box::pin(old.abort_hand_over(UserConfirmed::shown_and_confirmed())).await;
         assert!(
-            matches!(outcome, AbortOutcome::Aborted { .. }),
-            "{outcome:?}"
+            matches!(
+                result,
+                Err(SignerError::Switch(
+                    pubky_switch_client::ClientError::Transport(_)
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(world.last_fact(DELIVERY, "status").as_deref(), Some("200"));
+        assert_eq!(
+            world.last_fact(DELIVERY, "fault").as_deref(),
+            Some("the answer was lost")
         );
     }
     drop(old);
-    assert_eq!(files(), before);
+    assert!(
+        files() == before,
+        "the receiver saw the same public document and backup"
+    );
     let ns = signer_namespace(&identity);
     let records = || store.scan(&ns, b"", None, 10);
     let held = records()?;

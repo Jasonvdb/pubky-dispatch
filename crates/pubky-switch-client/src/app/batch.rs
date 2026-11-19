@@ -396,12 +396,12 @@ impl App {
     /// the kept batch and its own batch. The read is of a feed page with no items, and is
     /// made only when a batch is kept to send again, or when the app holds no recent
     /// service time of the current key, under a day old, to stamp its own batch with: most
-    /// writes send their batch alone. The read has the
-    /// short timeout (10 s by default), a batch that writes no shared record the short
-    /// timeout and a share of the long one in proportion to its body, and one that writes
-    /// a shared record the long one (40 s), since its refusal can carry the record's view
-    /// ([`crate::transport::HttpConfig`]): a write of small batches without a record ends
-    /// within about 30 s at the default timeouts, one of record writes within about 90 s. A
+    /// writes send their batch alone. The service-time read has the ordinary timeout. A batch that can return
+    /// claim proofs, a signed record, a shared record view or a claim view has the bulk
+    /// timeout. A small list-only batch with scalar conditions uses the ordinary timeout,
+    /// which scales with the outgoing body ([`crate::transport::HttpConfig`]). At default
+    /// settings, the time read and two small ordinary batches have about 30 s combined.
+    /// The time read and two bulk batches have 90 s. A
     /// kept batch signed for a generation before a move and answered `409 stale_generation`
     /// is signed again and sent once more, a fourth request; a `409 stale_epoch` of the own
     /// batch adds the newer `identity.json`, the key bundle and one more send.

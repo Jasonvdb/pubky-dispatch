@@ -2277,20 +2277,13 @@ impl App {
     ///   again. A unit once begun goes whole. The call starts no unit once its time budget
     ///   ([`super::AppConfig::call_budget_ms`]) is spent, but its first. So its worst case is
     ///   the budget and one unit begun within it.
-    /// - One unit is bounded on its own. A delivery of the own `identity.json` is one
-    ///   request. A message's try is, at the default timeouts with every request waiting to
-    ///   the end of its timeout:
-    ///   - the service-time fetch of a message with a replay deadline, about 10 s;
-    ///   - its conversation entry, a write that may send a kept batch first under the long
-    ///     timeout, about 60 s;
-    ///   - one delivery round: its first attempt, at most four requests with the directory
-    ///     under the long timeout, and no retry once the budget has passed since the round
-    ///     began, about 90 s;
-    ///   - the own `identity.json` delivered after the acceptance asks for it, about 10 s;
-    ///   - its record job ([`super::App::update_record`], bounded the same way), about 130 s
-    ///     on a switch that answers nothing in time.
-    ///
-    ///   So about 5 minutes. A try against switches that answer takes seconds.
+    /// - A delivery of the own `identity.json` takes one bulk request (40 s by default).
+    ///   A message's try can fetch the service time for its replay deadline (10 s by
+    ///   default) and write its conversation entry, which may first resend a kept batch.
+    ///   The first delivery attempt can make up to four requests. The round checks its
+    ///   time budget before retrying. Acceptance can request another identity delivery.
+    ///   The message's record job has the bounds of [`super::App::update_record`]. The
+    ///   timeout for each request follows its class ([`crate::transport::HttpConfig`]).
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit

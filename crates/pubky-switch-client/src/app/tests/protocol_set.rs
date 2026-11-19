@@ -2941,38 +2941,48 @@ impl Owing {
                     .unwrap();
             }
             Shown::Widening => {
-                let renewed = issue_cert(
-                    &self.p.w.alice,
-                    &app_keys("wallet"),
-                    &owing_spec(&["chat_wide"]),
-                    now + 1000,
-                )
-                .unwrap();
-                let old = self.app.cert().clone();
-                self.p
-                    .w
-                    .switch
-                    .signer_op(OpKind::CertPut {
-                        target_app_id: me,
-                        cert: renewed.signed().clone(),
-                    })
-                    .unwrap();
-                self.p.w.next_doc(|body| {
-                    body.apps.retain(|a| a.app_id != me);
-                    body.apps.push(pubky_switch_core::records::ListedApp {
-                        app_id: me,
-                        cert: renewed.hash(),
-                    });
-                    body.renewed.retain(|r| r.app_id != me);
-                    body.renewed.push(pubky_switch_core::records::RenewedCert {
-                        app_id: me,
-                        cert: old.hash(),
-                        until: None,
-                    });
-                });
+                let renewed = self.put_wider_cert();
+                self.list_wider_cert(&renewed);
             }
         }
         false
+    }
+
+    fn put_wider_cert(&self) -> AppCert {
+        let renewed = issue_cert(
+            &self.p.w.alice,
+            &app_keys("wallet"),
+            &owing_spec(&["chat_wide"]),
+            self.p.w.clock.now_ms() + 1000,
+        )
+        .unwrap();
+        self.p
+            .w
+            .switch
+            .signer_op(OpKind::CertPut {
+                target_app_id: self.app.app_id(),
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+        renewed
+    }
+
+    fn list_wider_cert(&self, renewed: &AppCert) {
+        let me = self.app.app_id();
+        let old = self.app.cert();
+        self.p.w.next_doc(|body| {
+            body.apps.retain(|a| a.app_id != me);
+            body.apps.push(pubky_switch_core::records::ListedApp {
+                app_id: me,
+                cert: renewed.hash(),
+            });
+            body.renewed.retain(|r| r.app_id != me);
+            body.renewed.push(pubky_switch_core::records::RenewedCert {
+                app_id: me,
+                cert: old.hash(),
+                until: None,
+            });
+        });
     }
 
     /// `tasks` was handed nothing, and nothing of its records was judged, marked, flagged
@@ -3159,6 +3169,153 @@ async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_listing() {
         false,
     )
     .await;
+}
+
+async fn owing_owner_before_a_wider_reader() -> (Owing, AppCert) {
+    let mut w = Owing::new().await;
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.show(Shown::Widening).await;
+    let renewed = w.p.w.switch.app(&w.app.app_id()).renewed.unwrap();
+    (w, renewed)
+}
+
+#[tokio::test]
+async fn test_protocol_set_reopened_owing_owner_waits_for_a_wider_directory_reader() {
+    // A second device of this app has already published under the wider grant.
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    w.p.w.clock.advance_ms(2_000);
+    let body = pubky_switch_core::records::AppRecordBody::new(
+        &renewed,
+        w.p.set().accepts(&renewed),
+        w.p.w.clock.now_ms(),
+    );
+    let record = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.p.w
+        .switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    w.p.w.switch.fail_next(Fault::Head {
+        path: "/directory".into(),
+        at: None,
+        forked: false,
+    });
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Switch(
+            crate::error::ClientError::InvalidResponse(_)
+        ))
+    ));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_reload_retries_a_scanned_renewal_at_its_feed_position() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    drop(w.app);
+    let store = Arc::new(FaultStore::new(w.p.store.clone(), StoreFault::None));
+    w.app = App::load(w.p.w.env_on(store.clone()), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    store.fail_put_once(crate::app::state::key::CERT.as_bytes());
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_receive_after_reload_orders_a_previously_kept_renewal() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+
+    let mut w = Owing::new().await;
+    let id = w.app.app_id();
+    let renewed = w.put_wider_cert();
+    let put_seq = w.p.w.switch.tip_seq();
+    read_quiet(&mut w.app).await;
+    assert_eq!(w.app.kept_renewal(), Some(&renewed));
+    assert_eq!(w.app.state.renewal.as_ref().unwrap().at, (1, put_seq));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.list_wider_cert(&renewed);
+    let listing_seq = w.p.w.switch.tip_seq();
+    assert!(listing_seq > put_seq);
+
+    drop(w.app);
+    let store = Arc::new(FaultStore::new(w.p.store.clone(), StoreFault::None));
+    w.app = App::load(w.p.w.env_on(store.clone()), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    store.fail_put_once(crate::app::state::key::PENDING_RECORD.as_bytes());
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(w.app.own_identity().listed_cert(&id), Some(renewed.hash()));
+    assert_eq!(w.app.state.renewal.as_ref().unwrap().at, (1, listing_seq));
+    assert_eq!(w.app.kept_renewal(), Some(&renewed));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+
+    let (events, _) = read_quiet(&mut w.app).await;
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+    w.tasks_told_nothing(&events).await;
+    w.chat_in_order(true);
+    finish_owed_widening(w).await;
+}
+
+async fn take_wider_reader_in_order(mut w: Owing, renewed: &AppCert) {
+    assert!(w.app.list_collection(&w.chat_list).await.unwrap().more);
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.chat_in_order(true);
+    finish_owed_widening(w).await;
+}
+
+async fn finish_owed_widening(mut w: Owing) {
+    *w.p.tasks.failing_missed.lock().unwrap() = 0;
+    read_quiet(&mut w.app).await;
+    read_quiet(&mut w.app).await;
+    assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(
+        w.app.records_of("tasks.list").await.unwrap().len(),
+        w.held.len() + 1
+    );
 }
 
 #[tokio::test]

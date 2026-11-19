@@ -86,7 +86,7 @@ impl App {
     ) -> Result<Vec<AppCert>, AppError> {
         if *writer == self.state.meta.app_id {
             let mut certs = vec![self.state.cert.clone()];
-            certs.extend(self.state.renewal.iter().cloned());
+            certs.extend(self.kept_renewal().cloned());
             return Ok(certs);
         }
         let prefix = format!("ocert/{}/", pubky_switch_core::enc::zbase32_encode(writer));

@@ -46,7 +46,7 @@ pub enum Backend {
 
 #[cfg(test)]
 pub(crate) enum AccountSnapshot {
-    Database(pubky_switch::store::testing::TestDatabase),
+    Database(Box<pubky_switch::store::testing::TestDatabase>),
     Scripted(u64),
 }
 
@@ -319,7 +319,7 @@ impl World {
             Backend::Service => self
                 .change_service(origin, RealSwitch::snapshot_database)
                 .await
-                .map(AccountSnapshot::Database),
+                .map(|db| AccountSnapshot::Database(Box::new(db))),
             Backend::Scripted => self
                 .scripted_switch(origin, identity)?
                 .mark()
@@ -337,7 +337,7 @@ impl World {
     ) -> Result<(), HarnessError> {
         match snapshot {
             AccountSnapshot::Database(db) => {
-                self.change_service(origin, async |switch| switch.restore_database(db).await)
+                self.change_service(origin, async |switch| switch.restore_database(*db).await)
                     .await
             }
             AccountSnapshot::Scripted(seq) => {

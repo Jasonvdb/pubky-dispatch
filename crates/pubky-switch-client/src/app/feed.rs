@@ -645,6 +645,16 @@ impl App {
         // the read.
         self.reopen_if_due().await?;
         self.retry_deletions(budget).await?;
+        let mut attempted_put_backs = std::collections::BTreeSet::new();
+        if self
+            .state
+            .restore_cursor
+            .is_none_or(|check| check.verdict.is_some())
+            && !self.state.device.multi_device
+        {
+            self.retry_put_backs(&mut attempted_put_backs, budget)
+                .await?;
+        }
         let mut report = ReceiveReport {
             more: kept_left || unfinished,
             ..ReceiveReport::default()
@@ -713,6 +723,21 @@ impl App {
             // each read's budget again.
             let mut after = self.state.cursor.seq;
             let mut blocked = None;
+            let limit = self.put_back_limit(None);
+            if limit != u64::MAX {
+                blocked = Some(limit + 1);
+                if self
+                    .state
+                    .held
+                    .keys()
+                    .all(|seq| self.state.seen.contains(seq))
+                {
+                    after = self
+                        .told
+                        .values()
+                        .fold(after, |front, (_, seq)| front.max(*seq));
+                }
+            }
             let resumed: Option<FeedAt> = self.reader().get(FEED_AT).await?;
             if let Some(at) = resumed
                 && at.generation == self.state.cursor.generation
@@ -846,6 +871,8 @@ impl App {
         // everything the reads covered (`order` module).
         self.walk = None;
         if self.state.alarm.is_none() {
+            self.retry_put_backs(&mut attempted_put_backs, budget)
+                .await?;
             // What a fetch between pages owes, such as at a `missed` item's listing, before
             // the entries a key brought are tried again.
             self.reopen_if_due().await?;
@@ -881,6 +908,7 @@ impl App {
         // Held entries and failed callbacks need another read even when another protocol
         // reached the end of the feed and nothing new arrives (Switch spec 8.3).
         let again = !self.state.deletions.is_empty()
+            || !self.state.put_backs.is_empty()
             || !self.state.held.is_empty()
             || !self.state.retries.is_empty()
             || self.owed_held_reads != 0;
@@ -1035,6 +1063,9 @@ impl App {
         // The cursor the service holds, before anything of the page is processed, and not
         // a frozen service's (Switch spec 8.3, 12.4).
         let compared = self.compare_held_cursor(page.cursor).await?;
+        if self.state.restore_cursor.is_some() || self.state.device.multi_device {
+            self.note_put_backs_passed(page.cursor).await?;
+        }
         let mut stopped = None;
         let mut list_through = None;
         if let Some(check) = compared.restore {
@@ -1074,6 +1105,13 @@ impl App {
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
         let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
+        let viewed_deletes: HashMap<_, _> = self
+            .state
+            .put_backs
+            .values()
+            .filter(|hold| !hold.protects)
+            .map(|hold| (hold.observation.seq, hold.observation.id()))
+            .collect();
         for item in &page.items {
             if stopped.is_some() {
                 break;
@@ -1199,7 +1237,33 @@ impl App {
                         read.tx.put(super::claims::STUB_SEEN, &())?;
                         stub_noted = true;
                     }
-                    Step::Pass
+                    if let Some(key) = viewed_deletes.get(&seq)
+                        && let Some(envelope) = checked.envelopes.get(&seq)
+                        && let Some(hold) = self.state.put_backs.get(key)
+                        && hold.observation.generation == envelope.generation
+                        && hold.observation.delete.item_hash == envelope.item_hash
+                    {
+                        if self.may_tell_of(Some(&hold.observation.owner)) {
+                            self.saw_put_back_write(
+                                &key.0,
+                                Some(key),
+                                pubky_switch_core::shared::ApplicationRef {
+                                    generation: envelope.generation,
+                                    seq,
+                                    item_hash: envelope.item_hash,
+                                },
+                                None,
+                                Some(page.server_time_ms),
+                                &mut read.tx,
+                            )
+                            .await?;
+                            Step::Pass
+                        } else {
+                            Step::Hold
+                        }
+                    } else {
+                        Step::Pass
+                    }
                 }
             };
             if let Some(envelope) = checked.envelopes.get(&seq) {
@@ -1216,6 +1280,10 @@ impl App {
                 );
             }
             admission_declined.append(&mut read.admission_declined);
+            let limit = self.put_back_limit(None);
+            if seq > limit {
+                read.block(limit + 1);
+            }
             match step {
                 Step::Pass => {
                     // Processed, or stored locally with its count under its local ID.
@@ -1381,12 +1449,13 @@ impl App {
     }
 
     /// Keep observations only for feed positions the local cursor can still read.
-    fn advance_feed_cursor(
+    pub(super) fn advance_feed_cursor(
         &mut self,
         seq: u64,
         accepted_at: Option<u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let seq = seq.min(self.put_back_limit(None));
         let cursor = &mut self.state.cursor;
         cursor.seq = cursor.seq.max(seq);
         if let Some(at) = accepted_at {
@@ -4054,6 +4123,13 @@ impl App {
                         let waits = self
                             .feed_shared_item(item, envelope, page_time_ms, &mut read.tx)
                             .await?;
+                        if waits
+                            && let OpKind::RecordPut(put) = &body.kind
+                            && let Some(hold) =
+                                super::put_back::at_key(&self.state.put_backs, &put.key).next()
+                        {
+                            read.left.insert(hold.observation.owner.clone());
+                        }
                         Ok(if waits { Step::Hold } else { Step::Pass })
                     }
                     _ => Ok(Step::Pass),
@@ -4429,7 +4505,7 @@ const _: () = assert!(KEPT_EFFECT_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
 const _: () = assert!(
     (MAX_STEP_LOCAL_BYTES as u64) + PARK_ROOM_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
 );
-// - a chain item's cached record write, its mark, deletion observation and a flagged write's rule.
+// - a chain item's cached record write, mark, possible replacement and flagged write's rule.
 const _: () = assert!(
     CACHED_RECORD_BYTES
         + KEPT_MARK_BYTES

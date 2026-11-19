@@ -141,7 +141,15 @@ impl App {
     /// before its first send. So it is the committed cursor.
     fn furthest_sent(&self) -> u64 {
         let cursor = self.state.cursor;
-        cursor.seq.max(cursor.at_service)
+        let sent = self
+            .state
+            .put_backs
+            .values()
+            .filter(|hold| hold.cursor_generation == Some(cursor.generation))
+            .map(|hold| hold.observation.seq)
+            .max()
+            .unwrap_or(0);
+        cursor.seq.max(cursor.at_service).max(sent)
     }
 
     /// Whether a position of `generation` is of the current sequence (Switch spec 8.3).

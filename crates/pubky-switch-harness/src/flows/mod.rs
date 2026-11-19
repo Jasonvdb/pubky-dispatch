@@ -47,6 +47,7 @@ mod watching;
 use std::future::Future;
 use std::pin::Pin;
 
+pub use pubky_switch::http::route::CALLS;
 use pubky_switch::http::route::Call;
 
 pub use admission::{deny_list, invite_code};
@@ -425,41 +426,3 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         | Call::ImportActivate => None,
     }
 }
-
-/// One request per call of Switch wire 7.4: the method, and the path with `{id}` for the
-/// account, `{app}` for an App ID and `{key}` for any other parameter.
-pub const CALLS: &[(&str, &str)] = &[
-    ("POST", "/v1/enroll"),
-    ("PUT", "/v1/{id}/identity"),
-    ("GET", "/v1/{id}/identity"),
-    ("POST", "/v1/{id}/inbox"),
-    ("GET", "/v1/{id}/feed"),
-    ("PUT", "/v1/{id}/peers"),
-    ("GET", "/v1/{id}/allow"),
-    ("POST", "/v1/{id}/connect"),
-    ("GET", "/v1/{id}/connect"),
-    ("DELETE", "/v1/{id}/connect/{key}"),
-    ("POST", "/v1/{id}/ops"),
-    ("GET", "/v1/{id}/claims/{key}"),
-    ("GET", "/v1/{id}/records/{key}"),
-    ("GET", "/v1/{id}/records"),
-    ("GET", "/v1/{id}/directory"),
-    ("GET", "/v1/{id}/apps/{app}/keys"),
-    ("POST", "/v1/{id}/apps/{app}/keys"),
-    ("PUT", "/v1/{id}/push"),
-    ("POST", "/v1/{id}/apps/{app}/leave"),
-    ("GET", "/v1/{id}/apps"),
-    ("POST", "/v1/{id}/apps/{app}/revoke"),
-    ("POST", "/v1/{id}/freeze"),
-    ("POST", "/v1/{id}/unfreeze"),
-    ("GET", "/v1/{id}/export"),
-    ("GET", "/v1/{id}/export/chunks/{key}"),
-    ("POST", "/v1/{id}/import"),
-    ("PUT", "/v1/{id}/import/chunks/{key}"),
-    ("POST", "/v1/{id}/import/activate"),
-    ("POST", "/v1/{id}/recovery/admission"),
-    ("POST", "/v1/{id}/recovery/upload"),
-    ("POST", "/v1/{id}/erase"),
-    ("PUT", "/v1/{id}/handover"),
-    ("GET", "/v1/{id}/handover"),
-];

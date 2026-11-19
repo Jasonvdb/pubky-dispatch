@@ -1,6 +1,6 @@
 # App host guide
 
-Embed `App` to act for one approved app of an identity. The signer approves the app and can later renew or revoke it. The client holds the app's keys, checks signed documents and service answers, follows the feed and saves work across restarts. The host supplies the screens, storage, clock, network and the rules of each protocol. For the other side of approval, see the [signer host guide](signer-host-guide.md).
+Embed `App` to act for one approved app of an identity. The signer approves the app and can later renew or revoke it. The client holds the app's keys, checks signed documents and service answers, follows the feed and saves work across restarts. The host supplies the user interface, storage, clock, network and the rules of each protocol. It chooses how to present events and which diagnostic details to show. For the other side of approval, see the [signer host guide](signer-host-guide.md).
 
 ## Joining an identity
 
@@ -9,6 +9,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 - Serialize writers to the same app namespace across threads, extensions and processes. `App` uses ordinary store commits. The store also has an ownership API for callers that acquire a namespace. A memory store cannot preserve keys or unanswered writes across a restart.
 - Have the signer approve the request for this app's keys. Verify the enclosing companion claim's signature before passing the approval bytes, original request, identity and keys in `JoinRequest`. `App::join` checks the approval against them, the certificate against the registered protocols, and saves the first app record and receive-key registration before sending. Keep the App ID. If a call failed after that save, use `App::load` and `receive` to resume. A second join on that store is refused.
 - On startup, load the same App ID and protocols. Loading reads local state. Use `app_id`, `identity`, `own_identity`, `cert` and `record` for the app's current details. The app signs its own requests. The identity signing key stays with the signer.
+- A protocol SDK taking ownership of a built `App` can check its registered protocol with `protocols()` and use the app's `clock()`, `homeserver_reader()` and `publishes_record()` so its reads and publication decisions use the same settings.
 
 | Case | What happened and what to do |
 |---|---|
@@ -73,7 +74,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `AppEvent::Unreadable` | An entry was left unread after its target apps departed. A resend is requested only within the allowed time range and with verified departure evidence. Check `resend_asked`. |
 | `ResendReason::Unopenable` | The resend callback names the sender and acceptance interval for an input this app could not open. Queue the protocol's request for that interval. |
 | `ResendReason::Unreadable` | The callback asks on behalf of a departed target. Ask that sender for the indicated interval. |
-| `AppEvent::Missed` | The service deleted unread inbox entries. Show the count. The client owes a collection listing and calls the protocol about the gap when the acceptance times allow it. Rebuild from records and available senders. |
+| `AppEvent::Missed` | Tell the user unread inbox entries were lost. The event includes the count. The client owes a collection listing and calls the protocol about the gap when the acceptance times allow it. Rebuild from records and available senders. |
 | `AppEvent::OwedCallHeld` | Repeated reads are stalled before further handoff by a required callback or its lookup. Check `owed_protocol_calls`, repair storage or connectivity, then read again. |
 
 Use `parked_entries` to list saved inputs and `parked_entry` to inspect one. A waiting input stays readable when the protocol's body rules change. The client uses the signed common fields to load, inspect, back up and restore it, and to identify it in a drop notice. The next retry checks the current rules. Check `sender_verified` before showing the sender as verified.
@@ -109,7 +110,7 @@ Use `feed_wait(seconds)` and its `wait()` between reads. The handle makes no cha
 | `Woken::Quiet` | The wait returned an empty page with no read due. Take another wait handle, respecting the pace after a short wait. |
 | `Woken::ReadNow` | A real read is due, or the wait failed, saw a freeze or could not interpret the answer. Call `receive(None)` once with the prescribed pacing. |
 | `Woken::ReadLater` | No wait was sent. The last read stopped, needs keys, or the app is halted or gone. Address that condition and use the pause before another read. |
-| `AppEvent::PushRegistered` | The service accepted the push handles. Show the count as registered. |
+| `AppEvent::PushRegistered` | The service accepted the push handles. The count is available for diagnostics. |
 | `AppEvent::PushRemoved` | The old service registration no longer applies or the app ceased to be current. Register again when current and push is wanted. |
 | `Peeked::Show` | Read-only `peek` checked this message using available state. Show content according to the user's notification settings. The main app still has to receive it. |
 | `Peeked::Generic` | The peek could not safely show the contents. Show only a generic notification. If `PeekReport::more` is set, use one generic notification for the unchecked remainder. |
@@ -199,11 +200,15 @@ A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, an
 | `AppEvent::ListingWaitsForKey` | A required collection listing lacks its current scope key. The affected protocol waits, while another with a complete listing can receive. Obtain the key bundle and read again. |
 | `AppEvent::ReopeningOwed` | A key arrived but reopening held records failed. Keep them marked unreadable, address the reported problem and read again. The client retains the work. |
 
+Implement `Protocol::mark_ends_at_delete` for an ordinary collection whose next creation starts with a new seen mark. The client checks a proposed deletion against the previous mark and gives the observer its predecessor. A verified current deletion clears the mark when its record commits. If the app is waiting for a read after a recovery upload, an earlier view of the deletion keeps the mark until the app observes the record through that upload. An unreadable live record keeps its mark through restart and key recovery.
+
 The collection owner can implement `Protocol::record_put_back` to save what it saw when another app deleted a record. Identify the deletion by record key, version and signed item hash. `writer` identifies the signing app. `exact_value` contains the readable, authenticated predecessor when the delete builds on that write. The owner's earlier `seen` mark can contain different bytes. `page_time_ms` is available for a deletion seen on a verified feed page. Return `PutBack::Observe` with up to 4 MiB of owner-local writes, or `None` to pass. An unanswered observation is retried with its saved evidence before later work reaches that owner. The service cursor can advance once the client keeps the observation.
 
 A layered backup carries a completed observation with its owner's layer. During an in-place restore, `RestoreContext::previous_local_scan` lets the owner retain verified evidence in its own namespace that the selected layer predates. When the previous installation holds the only signed copy of a record, iterate `RestoreContext::previous_records_of` for the owner's registered collection. Each result carries the accepted value, version trust and flags. The stored write must open under its original scope key, and both the installed and selected certificates must permit that scope. The protocol can verify a receipt from those bytes and preserve it through its local restore writes. Propagate a read error to refuse the restore. A fresh destination can recover only the evidence available in the backup or from later reads.
 
 Use `record_op` to build a write in a batch, `put_record` or `delete_record` for a single change, and `update_record` for a bounded read/modify/write. A protocol's update function can be called again on conflict. Build an `OpBatch` with operations and conditions, optionally local writes and queued messages, then `submit_batch`. Use `for_protocol` to identify the owner of local state. Use `record_condition` and `claim_condition` for the version or step the change depends on. Add operations with `op`, `op_if` or `entry` and conditions with `when`. `server_time_in` constrains service time to a half-open interval. `obligation_deadline`, `local`, `locals` and `queue` attach the deadline, local changes and deliveries to settle with the batch. Inspect `ops`, `len` and `is_empty`, or take the operations with `into_ops`.
+
+Use `keep_id_at` on a protocol batch when a restart must associate an outstanding operation with its original batch. It stores the original 16-byte batch ID under a vacant protocol-local key in the first commit that keeps the batch. Read it with `protocol_get` and check `kept_batch`. An applied-only local write can remove the marker. A backup omits native pending batches and their outcomes, so let the protocol preserve unresolved markers in its layer. After a provider loss a refusal of newly signed bytes can leave the earlier send uncertain.
 
 A refused batch can report the competing write on the key it tried to write or the key of a record condition. The app checks that write at the signed head of the refusal, including when it retries a stored batch. A conflict that reports only a version leaves the held value in place. Use `read_record` when the protocol needs the current value of that key.
 
@@ -226,7 +231,7 @@ Keep the local batch ID returned in `AppError::Kept`. Look it up with `kept_batc
 |---|---|
 | `AppError::Kept` | The call's own batch is saved, possibly still unsent. Show pending, save its ID and read again. Building a replacement could apply the same work twice. |
 | `AppError::Ahead` | An older batch could not be settled first. Nothing from this new write was kept or sent. Call `receive` to let the client try the older batch first. When the client reaches a sent batch whose answer window has closed, it drops that batch. Check the outcome before deciding whether the new write is still needed. |
-| `Refusal::KeptBatchesAhead` | Earlier saved batches still need to go first. Inside a kept error, this call's batch is already queued behind them. Show the count and oldest ID and let reads drain the queue. |
+| `Refusal::KeptBatchesAhead` | Earlier saved batches still need to go first. Inside a kept error, this call's batch is already queued behind them. Let reads drain the queue. The count and oldest ID can help diagnose a delay. |
 | `KeptBatchStatus::Kept` | The batch is still outstanding. `wire_batch_id` names its current bytes. An absent send stamp means those bytes are unsent. If the client reseals record writes after `409 stale_epoch`, the original ID shows the dropped batch. Track the new local ID if the replacement is kept. |
 | `KeptBatchStatus::Applied` | The client has committed the batch's outcome. Use its local effects and stop retrying. |
 | `KeptBatchStatus::Dropped` | The client has discarded this batch with its proposed local writes and queued messages. Read the reason before deciding on replacement work. |
@@ -260,7 +265,7 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 | `AppEvent::RotationLost` | Another registration won this key number. The losing private key was discarded. Use the winning key if known, otherwise follow the sync or security notice. |
 | `AppEvent::KeysDeleted` | The cursor passed successor registrations, so retired receive keys were deleted locally. This device can no longer use those keys to open old envelopes. |
 | `AppEvent::AwaitingDeviceSync` | Another registration needs a receive key this shared-key device lacks. Bring keys through trusted device sync and read again. |
-| `AppEvent::AwaitingKeys` | Stored inputs need scope keys for the listed epochs. Show the count, fetch available bundle parts and ask the signer for missing grants or keys. Waiting copies remain subject to the shared limits. |
+| `AppEvent::AwaitingKeys` | Stored inputs need scope keys for the listed epochs. Fetch available bundle parts and ask the signer for missing grants or keys. Waiting copies remain subject to the shared limits. |
 | `AppEvent::KeysThrough` | The contiguous range for which the app holds its granted scope keys changed. Use the reported epoch to update readiness. |
 | `AppEvent::BundlePartSkipped` | A part failed a check, or the entire parts list could not be read. Show the reason and the range if available (a whole-list error carries `(0, 0)`). If `alert` is set, warn that the naming key differs and contact the signer. |
 | `AppEvent::FullBundleRequested` | The service accepted the request for a full key bundle. Wait for the signer to supply it and read again. |
@@ -296,7 +301,7 @@ Call `refresh_identity` before the first post-restore read. Check `restore_quest
 | `AppEvent::RestoreQuestion` | The client found registrations after the backup it cannot account for. Ask whether this app ran on that device after the backup. Use `confirm_restored_registrations` only on yes. On no or uncertainty use `refuse_restored_registrations`, which raises compromise and attempts to leave. |
 | `Refusal::RestoreQuestionOpen` | An attempt or the end of reconciliation was refused while registrations still require an answer. Return to the restore question. |
 | `HeldCursor::Clean` | The reported position did not exceed the comparison position. For the restore verdict the client also required confirmation of the own document, a comparable sequence and a successful key check indicating the key was current. Check protocol state and any activity outside the client before ending reconciliation. |
-| `HeldCursor::Ahead` | The service claims to have passed more than this single-device state accounts for. Show both positions and ask about restoration or another copy. The report alone cannot prove which party moved it. |
+| `HeldCursor::Ahead` | The service claims to have passed more than this single-device state accounts for. Explain the discrepancy and ask about restoration or another copy. Both positions are available for diagnosis. The report alone cannot prove which party moved it. |
 | `HeldCursor::Unknown` | The positions cannot settle continuity, for example across a loss, with a shared cursor ahead, or with a changed restore key. Reconcile with other devices and current claims. Before a verdict `restore_held_cursor` returns no value. |
 | `AppEvent::HeldCursorAhead` | A feed page reports a higher cursor than this non-sharing app committed or sent. Ask about other use or restored state. The client does not leave solely on the service's claim. |
 | `AppEvent::ContinuityUnverified` | The client resumed at a checkpoint without verifying the intervening history. Show the gap, compare current records and claims, and finish reconciliation before new attempts. |
@@ -326,7 +331,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::ProviderChangeSuperseded` | A later signed generation overtook an unfinished move or recovery. Follow the newer one instead of retrying the abandoned generation. |
 | `AppEvent::ReceiveKeyRolledBack` | The new service showed an older receive-key registration. Show the discrepancy and let the client re-register its current key. |
 | `AppEvent::ListsDiffer` | The new service's lists differed. Show how many contacts or denies were added back, unknown contacts left in place and codes withdrawn. Ask the user to check the unknown contacts. |
-| `AppEvent::EvidenceUploaded` | The service answered the evidence upload. Show the counts it reported (zero if absent). This answer alone does not settle every missing record or claim. |
+| `AppEvent::EvidenceUploaded` | The service answered the evidence upload. The reported counts (zero if absent) can help diagnose what was uploaded. This answer alone does not settle every missing record or claim. |
 | `AppEvent::EvidenceRefused` | The upload received a service refusal, or was too large to send. The client reports the code and goes on. Keep the evidence and involve the signer for import conflicts. Other transport failures can be retried. |
 | `AppEvent::ProviderLost` | The identity declared the old generation lost. Suspend new attempts. Show that old inbox entries and unbacked records may be unavailable, and that an unanswered action may already have run. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
@@ -339,7 +344,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `Refusal::Gone` | A gated operation encountered a removed app or an account considered erased. Stop retrying that operation and check membership through the signer. |
 | `AppEvent::Removed` | The app is no longer listed as current or is recorded as departed. Disable actions requiring membership. Ask the signer about the change. |
 | `AppEvent::AccountBack` | The account previously considered gone is current for this app again. Obsolete unacknowledged account-gone duties were removed. Refresh the UI, resume reads and re-register push if wanted. |
-| `AppEvent::ClockSkew` | A stamped offset or a verified service-time lower bound exceeds clock tolerance. Show `clock_skew_ms`, correct the device clock, then refresh. Automatic attempts pause while the difference remains too large. |
+| `AppEvent::ClockSkew` | A stamped offset or a verified service-time lower bound exceeds clock tolerance. Ask the user to correct the device clock, then refresh. The offset `clock_skew_ms` is available for diagnostics. Automatic attempts pause while the difference remains too large. |
 | `AppEvent::Alarm` | The app detected a security failure. Show the specific alarm below and keep its evidence. Read `alarm()` when reopening the store. |
 | `AppError::Alarm` | The call detected an alarm and stopped normal work. Show the details even on the error path. |
 | `Refusal::Stopped` | An alarm already blocks this operation. Consult the recorded alarm. Repeated service calls cannot clear it. |
@@ -347,7 +352,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `Alarm::ProtocolRollback` | A registered protocol supplied a rule broken by signed service data via `raise_rollback`. Display the protocol and rule. Resolve it with the signer as a service rollback. |
 | `Alarm::Equivocation` | Two signed bodies for the own identity have the same version. Stop using the conflicting authority and ask the signer to resolve it. |
 | `Alarm::IdentityRollback` | An own identity update violated its history, for example by reinstating a removed app. Keep the held history and involve the signer. |
-| `Alarm::ServiceTimeBackwards` | Comparable verified times under one service key went backwards. Show both times and take the evidence to the signer. Adjusting the device clock cannot repair signed history. |
+| `Alarm::ServiceTimeBackwards` | Comparable verified times under one service key went backwards. Explain that the service reported an earlier time and take both verified times to the signer as evidence. Adjusting the device clock cannot repair signed history. |
 | `Alarm::Compromise` | An unexplained own receive-key registration indicates another holder of this app's signing key. The client raises the alarm and attempts a leave. Ask the signer to revoke the App ID, supplying `compromise_distrust_from` if known. It may be a conservative bound, or unknown. The compromise leave keeps the local keys. Revocation is the signer's job. |
 
 In `Protocol::provider_lost`, use the supplied acceptance interval to queue resend requests in local writes. Return known conversations to restore admission where permitted. Blocked identities are excluded. Surface `conversations_left_out` and `claim_entries_left_out`: some senders may need fresh admission and some evidence may exist only with its writer. Resolve attempts that could have been authorized through `uncertain_until_ms`. Use `end_reconcile_for` as each protocol finishes or `end_reconcile` when the user confirms completion for all of them. The client does not decide an outside action's outcome for the host.
@@ -364,7 +369,7 @@ In the receive callback, read `sender_disposition`. A flag records repeated rate
 |---|---|
 | `WrittenBy::Service` | The service created this conversation from an invite-code append. Inspect its code hash and context to decide what the invitation authorized. |
 | `WrittenBy::App` | The named app wrote this conversation. Use the writer ID for attribution. |
-| `AppEvent::DenyListChangeRefused` | A feed change failed the writer, identity or authority checks. The client ignored it. Keep the previous trusted list and show the rule and position. |
+| `AppEvent::DenyListChangeRefused` | A feed change failed the writer, identity or authority checks. The client ignored it. Keep the previous trusted list and flag that the change was refused. The failed rule and feed position can help diagnose the refusal. |
 
 ## Running several protocols
 
@@ -398,7 +403,7 @@ A failed multi-step call may already have saved work. Read its outer error befor
 | `AppError::Transport` | The network, homeserver or relay operation failed. Check whether the request could have left and resume any saved work. |
 | `AppError::Store` | Reading or writing the host's store failed. Show the storage problem and follow its certainty about that commit. |
 | `AppError::Protocol` | A protocol callback failed in its own store, for example during loss recovery. Repair that store and resume the saved step. |
-| `AppError::InvalidData` | A document, proof, saved value or host input failed its checks. Show the rule and inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
+| `AppError::InvalidData` | A document, proof, saved value or host input failed its checks. Use the failed rule to inspect the source. Some proof checks happen after the remote write, so check its outcome before repeating any action. |
 | `AppError::Refused` | An app rule blocked a step. Use its detailed refusal. Earlier steps of the call may already be durable. |
 | `Refusal::NotNow` | A prerequisite is missing, such as completed reconciliation, a usable lookup or a required upload. Show the reason and retry after the prerequisite changes. |
 | `Refusal::Usage` | A host argument, permission, protocol registration or requested operation violates this API's rules. Correct the cause before calling again. |

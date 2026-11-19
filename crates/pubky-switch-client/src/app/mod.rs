@@ -92,8 +92,8 @@ pub use protocol::{
     LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
     PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, RETRY_EVENT_READS, ReceivedMessage,
-    RecordDeletion, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
-    encode_local_state, local_writes_bytes,
+    RecordDeletion, RecordMarkContext, RecordObservation, ResendNeeded, ResendReason, StoreFailure,
+    WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -3768,6 +3768,16 @@ impl App {
     /// identity uses this clock so both observe the same backwards adjustments.
     pub fn clock(&self) -> Arc<dyn Clock> {
         Arc::clone(&self.env.clock)
+    }
+
+    /// The reader this app uses for Homeserver files.
+    pub fn homeserver_reader(&self) -> Arc<dyn HomeserverReader> {
+        Arc::clone(&self.env.homeserver)
+    }
+
+    /// Whether this app is configured to publish its record on its Homeserver.
+    pub fn publishes_record(&self) -> bool {
+        self.config.publishes_record
     }
 
     pub(crate) fn now(&self) -> u64 {

@@ -36,8 +36,9 @@ use pubky_switch_core::enc::{pubky_id, random_bytes};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 
 use pubky_switch_core::records::{
-    AppCert, ConnectRequests, Enrollment, EnrollmentBody, EnrollmentIntent, IDENTITY_PATH,
-    IdentityBody, IdentityDoc, IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup,
+    AccountAssociation, AccountObservation, AppCert, ConnectRequests, Enrollment, EnrollmentBody,
+    EnrollmentIntent, IDENTITY_PATH, IdentityBody, IdentityDoc, IdentityPolicy, Inbox,
+    SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_switch_core::sig::SignedDoc;
 
@@ -137,6 +138,9 @@ pub enum SignerStatus {
     /// Set up, but no switch has accepted a first `identity.json` yet: [`Signer::resume`]
     /// finishes the enrollment.
     Enrolling,
+    /// The selected service already held an account or its mark before this install signed
+    /// a creation. Offer a confirmed [`Signer::restore`] (Switch spec 12.8).
+    FirstAccountPresent,
     /// This install signs for the identity.
     Signing,
     /// Another install is the identity's signer; this one signs nothing until the user has it
@@ -473,6 +477,7 @@ impl Signer {
                     Some(enrollment) => self.enroll(&origin, &enrollment, policy).await?,
                     None => self.observe_first_account(&origin, nonce, policy).await?,
                 },
+                Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
                 Flow::KeyRecover {
@@ -529,6 +534,7 @@ impl Signer {
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
         match &self.flow {
+            Some(Flow::FirstAccountPresent { .. }) => return SignerStatus::FirstAccountPresent,
             Some(Flow::Erase {
                 first_404_ms: Some(since_ms),
                 ..
@@ -1205,6 +1211,101 @@ impl Signer {
         gate::signing_key(&self.keyring, &self.state, &self.store)
     }
 
+    /// The original service to show when asking about a first enrollment that is still
+    /// pending or found an existing account or mark (Switch account binding 3). Read it
+    /// again after reopening the signer.
+    ///
+    /// # Errors
+    ///
+    /// A lost store lease or an uncertain commit that must first be reloaded.
+    pub fn first_enrollment_origin(&self) -> Result<Option<&str>> {
+        self.check_owned_state()?;
+        Ok(match &self.flow {
+            Some(Flow::Enroll { origin, .. } | Flow::FirstAccountPresent { origin, .. }) => {
+                Some(origin)
+            }
+            _ => None,
+        })
+    }
+
+    /// Restart setup at the original `origin` after the user accepts that the earlier
+    /// enrollment may have committed (Switch account binding 3). First retries the saved
+    /// enrollment. An exact receipt continues setup at the creation it names. Only an
+    /// authenticated expiry and fresh absence at the same service and store can authorize
+    /// a new creation. Its signed request is kept before sending it.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::FirstEnrollmentUnavailable`] if the signer is no longer awaiting the
+    /// original creation, the service's binding changed, or the Homeserver has a document
+    /// or signer backup. Otherwise the error of discovery, enrollment or [`Self::resume`].
+    pub async fn restart_first_enrollment(
+        &mut self,
+        origin: &str,
+        _confirmed: UserConfirmed,
+    ) -> Result<()> {
+        self.refresh().await?;
+        let Some(Flow::Enroll {
+            origin: pending_origin,
+            policy,
+            enrollment: Some(signed),
+            ..
+        }) = self.flow.clone()
+        else {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        };
+        if origin != pending_origin || !self.state.before_first_version() {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        }
+        let original = Enrollment::verify(&signed, &self.state.identity, origin)
+            .map_err(SignerError::StoredData)?;
+        let old = original
+            .observation()
+            .ok_or(Refusal::FirstEnrollmentUnavailable)?
+            .body();
+        match Box::pin(self.enroll(origin, &signed, policy)).await {
+            Ok(()) => return Box::pin(self.resume()).await,
+            Err(SignerError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            })) if current == serde_json::json!({ "binding": "expired" }) => {}
+            Err(error) => return Err(error),
+        }
+        let target = Target {
+            origin,
+            identity: self.state.identity,
+            pinned: Some(old.service_key),
+            created: None,
+        };
+        let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+            .observe_account()
+            .await?;
+        let now = observation.body();
+        if old.erased_at.is_some()
+            || now.erased_at.is_some()
+            || now.association != AccountAssociation::Absent
+            || now.store_id != old.store_id
+        {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        }
+        for path in [IDENTITY_PATH, SIGNER_BACKUP_PATH] {
+            if self
+                .env
+                .homeserver
+                .get(path)
+                .await
+                .map_err(SignerError::Homeserver)?
+                .is_some()
+            {
+                return Err(Refusal::FirstEnrollmentUnavailable.into());
+            }
+        }
+        self.keep_first_enrollment(origin, random_bytes()?, policy, &observation)
+            .await?;
+        Box::pin(self.resume()).await
+    }
+
     /// Retain the original authenticated observation and complete signed creation before
     /// its first enrollment send (Switch account binding 2-3).
     async fn observe_first_account(
@@ -1222,6 +1323,24 @@ impl Signer {
         let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .observe_account()
             .await?;
+        if observation.body().association != AccountAssociation::Absent {
+            let flow = Flow::FirstAccountPresent {
+                origin: origin.to_owned(),
+                observation: observation.carried().clone(),
+            };
+            return self.commit(self.state.clone(), Some(flow)).await;
+        }
+        self.keep_first_enrollment(origin, nonce, policy, &observation)
+            .await
+    }
+
+    async fn keep_first_enrollment(
+        &mut self,
+        origin: &str,
+        nonce: [u8; 16],
+        policy: IdentityPolicy,
+        observation: &AccountObservation,
+    ) -> Result<()> {
         let key = self.signing_key()?;
         let enrollment = Enrollment::sign(
             &key,

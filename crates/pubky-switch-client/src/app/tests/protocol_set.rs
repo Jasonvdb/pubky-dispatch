@@ -3161,6 +3161,102 @@ async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_listing() {
     .await;
 }
 
+async fn owing_owner_before_a_wider_reader() -> (Owing, AppCert) {
+    let mut w = Owing::new().await;
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.show(Shown::Widening).await;
+    let renewed = w.p.w.switch.app(&w.app.app_id()).renewed.unwrap();
+    (w, renewed)
+}
+
+#[tokio::test]
+async fn test_protocol_set_reopened_owing_owner_waits_for_a_wider_directory_reader() {
+    // A second device of this app has already published under the wider grant.
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    w.p.w.clock.advance_ms(2_000);
+    let body = pubky_switch_core::records::AppRecordBody::new(
+        &renewed,
+        w.p.set().accepts(&renewed),
+        w.p.w.clock.now_ms(),
+    );
+    let record = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.p.w
+        .switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    w.p.w.switch.fail_next(Fault::Head {
+        path: "/directory".into(),
+        at: None,
+        forked: false,
+    });
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Switch(
+            crate::error::ClientError::InvalidResponse(_)
+        ))
+    ));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_reload_retries_a_scanned_renewal_at_its_feed_position() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    drop(w.app);
+    let store = Arc::new(FaultStore::new(w.p.store.clone(), StoreFault::None));
+    w.app = App::load(w.p.w.env_on(store.clone()), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    store.fail_put_once(crate::app::state::key::CERT.as_bytes());
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+async fn take_wider_reader_in_order(mut w: Owing, renewed: &AppCert) {
+    assert!(w.app.list_collection(&w.chat_list).await.unwrap().more);
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.chat_in_order(true);
+
+    *w.p.tasks.failing_missed.lock().unwrap() = 0;
+    read_quiet(&mut w.app).await;
+    read_quiet(&mut w.app).await;
+    assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(
+        w.app.records_of("tasks.list").await.unwrap().len(),
+        w.held.len() + 1
+    );
+}
+
 #[tokio::test]
 async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_upload() {
     // An upload making a `tasks` record divergent past its call: the record is read again

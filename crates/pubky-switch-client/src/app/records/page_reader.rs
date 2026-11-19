@@ -38,7 +38,7 @@ impl App {
         page: Option<SignedHead>,
         progress: &ListProgress,
         upload: Option<FeedPosition>,
-    ) -> Result<Option<Directory>, AppError> {
+    ) -> Result<Option<(Directory, SignedHead)>, AppError> {
         let service = self.state.meta.service_key;
         let cert = self.state.cert.hash();
         // Opening a returned write can refresh the app's identity. Its new
@@ -56,14 +56,13 @@ impl App {
         {
             return Ok(None);
         }
-        let result = self.client.directory_with_head(None).await;
-        let (directory, at) = self.take(result).await.inspect_err(|_| {
+        let result = self.client.own_directory().await;
+        let (directory, head) = self.take(result).await.inspect_err(|_| {
             self.record_page_reader = None;
             self.last_collection_read = None;
         })?;
         let me = self.app_id();
         if same_reader
-            && let Some(head) = at
             && head.generation == self.state.meta.generation
             && directory.identity.generation() == head.generation
             && directory.identity.listed_cert(&me) == Some(cert)
@@ -85,7 +84,7 @@ impl App {
         }
         self.record_page_reader = None;
         self.last_collection_read = None;
-        Ok(Some(directory))
+        Ok(Some((directory, head)))
     }
 
     /// An empty enumeration has no record page to qualify its ending. Its
@@ -128,12 +127,12 @@ impl App {
     /// all entries, including any messages before the renewal.
     pub(super) async fn follow_page_reader(
         &mut self,
-        directory: Directory,
+        (directory, head): (Directory, SignedHead),
     ) -> Result<(), AppError> {
         let me = self.app_id();
         let listed = directory.identity.listed_cert(&me);
         if matches!(
-            self.take_directory_cert(directory).await?,
+            self.take_directory_cert(directory, head).await?,
             Listed::NotCurrentHere
         ) {
             return Ok(());
@@ -198,10 +197,16 @@ impl App {
                 && target_app_id == &me
                 && signed.doc_hash()? == cert
             {
-                self.note_renewal(signed, &mut tx)?;
+                if let Some(renewal) = self.renewal_from_feed(signed) {
+                    // The account already lists this renewal. Take it at its
+                    // feed position before retiring the search, so a failed
+                    // adoption can replay the same ordered grant after a restart.
+                    self.events.push(crate::app::AppEvent::RenewalSeen);
+                    self.take_listed_renewal(renewal, Some((generation, item.seq)))
+                        .await?;
+                }
                 tx.delete(READER_RENEWAL)?;
                 self.commit(tx).await?;
-                self.adopt_renewal(None).await?;
                 return Ok(());
             }
         }

@@ -17,7 +17,7 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
-- **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
+- **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. The client can adopt a wider certificate while a protocol still owes a callback. The protocol receives its earlier work before the newly visible records. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
 **Additions still to come**

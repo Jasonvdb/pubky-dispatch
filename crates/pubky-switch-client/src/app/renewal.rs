@@ -29,20 +29,22 @@ impl App {
     /// A `cert.put` for this app seen in the feed: kept if it renews the certificate the
     /// app presents (the same App ID, signing key and bundle key, a later `issued_at`).
     pub(crate) fn note_renewal(&mut self, signed: &SignedDoc, tx: &mut Tx) -> Result<(), AppError> {
-        let Ok(cert) = AppCert::verify(signed, &self.state.meta.identity) else {
-            return Ok(());
-        };
-        let newer_than_kept = self
-            .state
-            .renewal
-            .as_ref()
-            .is_none_or(|kept| cert.issued_at() > kept.issued_at());
-        if is_renewal(&self.state.cert, &cert) && newer_than_kept {
+        if let Some(cert) = self.renewal_from_feed(signed) {
             tx.put(key::CERT_RENEWAL, cert.signed())?;
             self.state.renewal = Some(cert);
             self.events.push(AppEvent::RenewalSeen);
         }
         Ok(())
+    }
+
+    pub(super) fn renewal_from_feed(&self, signed: &SignedDoc) -> Option<AppCert> {
+        let cert = AppCert::verify(signed, &self.state.meta.identity).ok()?;
+        let newer_than_kept = self
+            .state
+            .renewal
+            .as_ref()
+            .is_none_or(|kept| cert.issued_at() > kept.issued_at());
+        (is_renewal(&self.state.cert, &cert) && newer_than_kept).then_some(cert)
     }
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
@@ -51,6 +53,14 @@ impl App {
         let Some(renewal) = self.state.renewal.clone() else {
             return Ok(false);
         };
+        self.take_listed_renewal(renewal, at).await
+    }
+
+    pub(super) async fn take_listed_renewal(
+        &mut self,
+        renewal: AppCert,
+        at: Option<(u64, u64)>,
+    ) -> Result<bool, AppError> {
         let me = self.state.meta.app_id;
         if self.state.own_doc.listed_cert(&me) != Some(renewal.hash()) {
             return Ok(false);
@@ -685,18 +695,22 @@ impl App {
     /// registers nothing at this switch. Otherwise it returns the own receive key record the
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
     pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
-        let result = self.client.directory(None).await;
-        let directory = self.take(result).await?;
-        self.take_directory_cert(directory).await
+        let result = self.client.own_directory().await;
+        let (directory, head) = self.take(result).await?;
+        self.take_directory_cert(directory, head).await
     }
 
     pub(super) async fn take_directory_cert(
         &mut self,
         directory: crate::client::answers::Directory,
+        head: pubky_switch_core::chain::SignedHead,
     ) -> Result<Listed, AppError> {
         let me = self.state.meta.app_id;
+        let at = (head.generation == directory.identity.generation())
+            .then_some((head.generation, head.seq));
         if directory.identity.version() > self.state.own_doc.version() {
-            self.take_own_copy(directory.identity.clone()).await?;
+            self.take_own_copy_with(directory.identity.clone(), at, |_| Ok(()))
+                .await?;
         }
         if self.not_current_here().is_some() {
             return Ok(Listed::NotCurrentHere);
@@ -717,7 +731,7 @@ impl App {
             .as_ref()
             .is_some_and(|r| r.hash() == listed)
         {
-            self.adopt_renewal(None).await?;
+            self.adopt_renewal(at).await?;
             return Ok(Listed::Key(key));
         }
         let cert = entry.record.cert().clone();
@@ -733,7 +747,7 @@ impl App {
             // refused for its certificate, and read as the app not current.
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            Box::pin(self.take_later(cert, entry.record, None)).await?;
+            Box::pin(self.take_later(cert, entry.record, at)).await?;
         }
         Ok(Listed::Key(key))
     }

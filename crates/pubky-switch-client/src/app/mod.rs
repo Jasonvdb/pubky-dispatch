@@ -434,6 +434,7 @@ pub struct AppBackup {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deletions: Vec<deletion::Observation>,
     put_backs: Vec<put_back::RecordHold>,
+    record_settlements: Vec<batch::PendingBatch>,
     put_back_notices: Vec<events::KeptDuty>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
@@ -1300,8 +1301,7 @@ impl App {
             }
             app.validate_waiting_state()?;
             for hold in app.state.put_backs.values() {
-                hold.observation
-                    .check(&app.protocols, &app.state.meta.identity)?;
+                hold.check(&app.protocols, &app.state.meta.identity, &app.state.cert)?;
             }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
@@ -1501,6 +1501,7 @@ impl App {
             waiting: unverified::WaitingOut::of(state),
             deletions: state.deletions.values().cloned().collect(),
             put_backs: state.put_backs.values().cloned().collect(),
+            record_settlements: Vec::new(),
             put_back_notices: Vec::new(),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
@@ -1618,6 +1619,7 @@ impl App {
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
+        backup.record_settlements = put_back::settlements(reader).await?;
         for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
             if let Ok(notice) = state::decode::<events::KeptDuty>(&value)
                 && matches!(
@@ -2139,6 +2141,7 @@ impl App {
                 &backup.put_backs,
                 &protocols,
                 &backup.meta,
+                &cert,
                 &own_doc,
                 &layers,
             )
@@ -2425,6 +2428,8 @@ impl App {
                 let drops = app.waiting_drops_at(None, backup.taken_service_ms);
                 let change = app.waiting_change(None, None, &drops)?;
                 change.stage(&mut app, &mut tx)?;
+                app.restore_record_settlements(&backup.record_settlements, previous, &mut tx)
+                    .await?;
                 app.write_all(&mut tx).await?;
                 let mut put_back_notices = backup.put_back_notices.clone();
                 for hold in app.state.put_backs.values().filter(|h| h.waited) {
@@ -4140,15 +4145,16 @@ impl App {
         &'a mut self,
         batch: &'a Batch,
     ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
-        self.submit_before(batch, None)
+        self.submit_before(batch, None, None)
     }
 
     async fn submit_before(
         &mut self,
         batch: &Batch,
         first: Option<&crate::transport::FirstSend>,
+        applying: Option<&deletion::Id>,
     ) -> Result<Submitted, AppError> {
-        let bounded = self.bound_service_cursor(batch)?;
+        let bounded = self.bound_service_cursor(batch, applying)?;
         let batch = bounded.as_ref().unwrap_or(batch);
         self.refuse_before_upload_of(Some(batch)).await?;
         self.note_cursor_sent(batch).await?;
@@ -4230,7 +4236,7 @@ impl App {
     ) -> Result<Batch, AppError> {
         let cursor = cursor_to
             .filter(|seq| *seq > self.state.cursor.at_service)
-            .map(|seq| seq.min(self.put_back_limit()))
+            .map(|seq| seq.min(self.put_back_limit(None)))
             .map(|seq| Position {
                 generation: self.state.cursor.generation,
                 seq,

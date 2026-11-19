@@ -711,7 +711,7 @@ impl App {
             // each read's budget again.
             let mut after = self.state.cursor.seq;
             let mut blocked = None;
-            let limit = self.put_back_limit();
+            let limit = self.put_back_limit(None);
             if limit != u64::MAX {
                 blocked = Some(limit + 1);
                 if self
@@ -1222,7 +1222,8 @@ impl App {
                                 None,
                                 Some(page.server_time_ms),
                                 &mut read.tx,
-                            )?;
+                            )
+                            .await?;
                             Step::Pass
                         } else {
                             Step::Hold
@@ -1246,7 +1247,7 @@ impl App {
                 );
             }
             admission_declined.append(&mut read.admission_declined);
-            let limit = self.put_back_limit();
+            let limit = self.put_back_limit(None);
             if seq > limit {
                 read.block(limit + 1);
             }
@@ -1421,7 +1422,7 @@ impl App {
         accepted_at: Option<u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let seq = seq.min(self.put_back_limit());
+        let seq = seq.min(self.put_back_limit(None));
         let cursor = &mut self.state.cursor;
         cursor.seq = cursor.seq.max(seq);
         if let Some(at) = accepted_at {

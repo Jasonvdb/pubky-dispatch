@@ -319,7 +319,7 @@ impl App {
             Taken::AsIs(record) => (record, None),
         };
         tx.put(key::CERT, self.state.cert.signed())?;
-        self.put_backs_after_renewal(&mut tx)?;
+        self.put_backs_after_renewal(&mut tx).await?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {

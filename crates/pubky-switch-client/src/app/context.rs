@@ -776,7 +776,7 @@ impl<'a> ReceiveContext<'a> {
                 self.protocols,
                 &self.state.naming,
                 key,
-                target,
+                &target.collection,
                 value,
                 seen.as_deref(),
             )?;

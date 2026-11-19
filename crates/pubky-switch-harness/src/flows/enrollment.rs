@@ -267,6 +267,7 @@ mod tests {
         WithBackup,
         ServiceCopyOnly,
         MarkOnly,
+        DamagedStateWithBackup,
     }
 
     async fn check_existing_first_account(backend: Backend) {
@@ -274,6 +275,7 @@ mod tests {
             FirstAccount::WithBackup,
             FirstAccount::ServiceCopyOnly,
             FirstAccount::MarkOnly,
+            FirstAccount::DamagedStateWithBackup,
         ] {
             let result = Box::pin(crate::run_here(backend, async |world: &World| {
                 Box::pin(existing_first_account(world, account)).await
@@ -288,6 +290,15 @@ mod tests {
         );
     }
 
+    fn damage_first_state(store: &MemoryStore, identity: &TestIdentity) -> FlowResult {
+        use pubky_switch_client::store::{StateStore, WriteBatch};
+        let namespace = pubky_switch_signer::state::signer_namespace(&identity.public());
+        let mut batch = WriteBatch::new();
+        batch.put(&namespace, b"state", vec![0])?;
+        store.commit(batch)?;
+        Ok(())
+    }
+
     async fn signed_first_creation_changed(world: &World) -> FlowResult {
         use pubky_switch_client::ClientError;
         use pubky_switch_core::http::ErrorCode;
@@ -295,7 +306,8 @@ mod tests {
 
         let alice = world.identity("alice")?;
         world.add_switch(ORIGIN, &[&alice]).await?;
-        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        let store = Arc::new(MemoryStore::new());
+        let env = world.signer_env(&alice, store.clone())?;
         let mut first = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;
         world.unreachable("POST", "/v1/enroll");
         assert!(matches!(
@@ -305,7 +317,7 @@ mod tests {
         drop(first);
         let other = enroll(world, &alice, ORIGIN).await?;
         let original = other.identity_doc()?.ok_or("missing current document")?;
-        let mut first = Signer::open(env, world.keyring(&alice)?).await?;
+        let mut first = Signer::open(env.clone(), world.keyring(&alice)?).await?;
         assert!(
             matches!(first.resume().await, Err(SignerError::Switch(ClientError::Switch {
             code: ErrorCode::Conflict, current, ..
@@ -319,6 +331,17 @@ mod tests {
                 .unwrap_err(),
             Refusal::FlowInProgress.into()
         );
+        drop(first);
+        damage_first_state(&store, &alice)?;
+        assert!(matches!(
+            Signer::restore_over_unusable(
+                env,
+                world.keyring(&alice)?,
+                pubky_switch_signer::RecordsDiscarded::shown_and_confirmed()
+            )
+            .await,
+            Err(SignerError::Refused(Refusal::FlowInProgress))
+        ));
         assert_eq!(
             world
                 .files()
@@ -343,7 +366,10 @@ mod tests {
         let mut original = enroll(world, &alice, ORIGIN).await?;
         let previous = original.set_record_max_age(Some(3600)).await?;
         drop(original);
-        if account != FirstAccount::WithBackup {
+        if matches!(
+            account,
+            FirstAccount::ServiceCopyOnly | FirstAccount::MarkOnly
+        ) {
             world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
             world.files().remove(alice.public(), IDENTITY_PATH);
         }
@@ -351,7 +377,8 @@ mod tests {
             world.lose_account(ORIGIN, &alice).await?;
         }
 
-        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        let store = Arc::new(MemoryStore::new());
+        let env = world.signer_env(&alice, store.clone())?;
         let mut signer = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;
         let install = signer.install_id();
         let original_enrollments = world.enrollments_sent();
@@ -372,7 +399,7 @@ mod tests {
         assert_eq!(world.enrollments_sent(), original_enrollments);
         let requests = world.requests_sent();
         drop(signer);
-        let mut signer = Signer::open(env, world.keyring(&alice)?).await?;
+        let mut signer = Signer::open(env.clone(), world.keyring(&alice)?).await?;
         assert_eq!(signer.first_enrollment_origin()?, Some(ORIGIN));
         assert_eq!(
             signer.resume().await,
@@ -387,6 +414,17 @@ mod tests {
         assert_eq!(world.requests_sent(), requests);
 
         let restored = match account {
+            FirstAccount::DamagedStateWithBackup => {
+                drop(signer);
+                damage_first_state(&store, &alice)?;
+                signer = Box::pin(Signer::restore_over_unusable(
+                    env,
+                    world.keyring(&alice)?,
+                    pubky_switch_signer::RecordsDiscarded::shown_and_confirmed(),
+                ))
+                .await?;
+                signer.identity_doc()?.ok_or("missing restored document")?
+            }
             FirstAccount::WithBackup => {
                 signer.restore(UserConfirmed::shown_and_confirmed()).await?
             }
@@ -416,7 +454,10 @@ mod tests {
             (restored.version(), restored.generation()),
             (previous.version() + 1, previous.generation())
         );
-        assert_eq!(restored.body().signer, install);
+        assert_eq!(restored.body().signer, signer.install_id());
+        if account != FirstAccount::DamagedStateWithBackup {
+            assert_eq!(signer.install_id(), install);
+        }
         assert_eq!(restored.inbox(), previous.inbox());
         assert_eq!(restored.body().record_max_age, Some(3600));
         assert_eq!(

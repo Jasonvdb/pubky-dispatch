@@ -78,7 +78,7 @@ impl Historical {
 }
 
 impl App {
-    pub(super) fn covers(&self, at: FeedPosition, earlier: FeedPosition) -> bool {
+    pub(in crate::app) fn covers(&self, at: FeedPosition, earlier: FeedPosition) -> bool {
         self.received_order(at, earlier)
             .is_some_and(std::cmp::Ordering::is_ge)
     }

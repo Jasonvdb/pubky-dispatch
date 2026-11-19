@@ -62,6 +62,10 @@ use crate::store::KeyValue;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriteBase {
+    /// The evidence of a repair over a held record that directly answered a deletion.
+    /// Present only when both signed writes name their exact predecessors and the
+    /// collection owner accepted this application for that deletion as `Covered`.
+    pub repair: Option<RecordRepair>,
     /// The version the write builds on: the `expected_version` its operation signed,
     /// `{0, 0}` for a create.
     pub expected_version: RecordVersion,
@@ -101,6 +105,10 @@ pub struct RecordDeletion<'a> {
     pub key: &'a [u8; 32],
     /// The version of the delete.
     pub version: RecordVersion,
+    /// The delete's verified application is its original version, in the same
+    /// generation as its signature and the app's current service. A later recovery
+    /// upload or a version reported without a proof or verified stub does not qualify.
+    pub original_in_current_generation: bool,
     /// The app that signed the deletion.
     pub writer: [u8; 16],
     /// The delete's signed item hash.
@@ -117,6 +125,9 @@ pub struct RecordDeletion<'a> {
     /// differ from the protocol's mark or exceed its bound. An older or unopened
     /// predecessor, or a different application at the same version, gives no value.
     pub exact_value: Option<&'a [u8]>,
+    /// A verified transition proof or chain stub bound the complete predecessor's
+    /// item hash to the version the deletion signed as its expected version.
+    pub exact_version_authenticated: bool,
     /// The version and conditions the deletion signed.
     pub base: WriteBase,
 }
@@ -159,13 +170,94 @@ pub struct RecordObservation<'a> {
     pub current: bool,
 }
 
+/// The two complete record values a reader can compare with a proposed repair.
+/// Both signed writes are authenticated in the deletion's original generation.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordRepair {
+    /// The record both operations changed.
+    pub key: [u8; 32],
+    /// The deletion over which the held record was written.
+    pub deletion: pubky_switch_core::shared::ApplicationRef,
+    /// The read and write policy all three operations share.
+    pub policy: pubky_switch_core::ident::Policy,
+    /// The complete authenticated value on which the deletion was built.
+    pub prior_value: Vec<u8>,
+    /// The complete authenticated value of the write that answered the deletion.
+    pub held_value: Vec<u8>,
+}
+
+impl std::fmt::Debug for RecordRepair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordRepair")
+            .field("deletion", &self.deletion)
+            .field("prior_bytes", &self.prior_value.len())
+            .field("held_bytes", &self.held_value.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// How a protocol answers a record deletion (Switch spec 8.2, 10.3).
 #[non_exhaustive]
 pub enum PutBack {
     /// Pass this deletion and keep the owner's observation.
     Observe {
-        /// The owner's local writes for this deletion.
+        /// The owner's local writes for the first observation, or to enrich a held
+        /// view when its first verified feed page supplies the time.
         observed: Vec<LocalWrite>,
+    },
+    /// Keep the deletion while its owner gathers evidence outside this callback.
+    /// The owner receives [`super::AppEvent::PutBackWaits`]. It can use
+    /// [`super::App::ack_event_with`] to save its checked decision in its own local
+    /// state, keyed by the record and delete. Each receive calls back with that state.
+    Prepare {
+        /// The owner's local writes for the first observation, or to enrich a held
+        /// view when its first verified feed page supplies the time.
+        observed: Vec<LocalWrite>,
+    },
+    /// Publish the complete value over this exact signed deletion (Switch spec 10.3).
+    Write {
+        /// Local writes committed when the owner first observes the deletion.
+        observed: Vec<LocalWrite>,
+        /// Complete replacement as strict JSON.
+        value: Vec<u8>,
+    },
+}
+
+/// A readable, authenticated live application after a deletion of the same record.
+/// The protocol can inspect it even when its ordinary regression rule rejects the value.
+#[non_exhaustive]
+pub struct RecordSuccessor<'a> {
+    /// The original and held values when this candidate repairs the held write
+    /// over this deletion. The owner compares both with `value`.
+    pub repair: Option<&'a RecordRepair>,
+    /// The complete opened JSON value.
+    pub value: &'a [u8],
+    /// The logical version of this write.
+    pub version: RecordVersion,
+    /// The exact application of this signed write.
+    pub revision: pubky_switch_core::shared::ApplicationRef,
+    /// The app that signed the write.
+    pub writer: [u8; 16],
+    /// The version the writer signed as its predecessor.
+    pub expected_version: RecordVersion,
+    /// Conditions carried by the signed write.
+    pub conditions: &'a [Condition],
+    /// The record's authenticated policy.
+    pub policy: &'a pubky_switch_core::ident::Policy,
+}
+
+/// The collection owner's publication decision for one deletion and one live successor.
+#[non_exhaustive]
+pub enum PutBackSuccessor {
+    /// Keep the duty and its service cursor while evidence or a repair is unavailable.
+    Wait,
+    /// This applied value already contains everything required for this deletion.
+    Covered,
+    /// Publish the combined value, conditional on this exact live application.
+    Merge {
+        /// Complete strict JSON, including the successor's additional members.
+        value: Vec<u8>,
     },
 }
 
@@ -1309,6 +1401,9 @@ pub trait Protocol: Send + Sync {
     /// callback follows the regression check and sees the evidence from before the
     /// delete. Its bounded local writes commit under this protocol's namespace.
     /// A store failure leaves the observation owed before later handovers to its owner.
+    /// Return [`PutBack::Prepare`] to keep the service cursor before this deletion
+    /// while another writer publishes an acceptable record, or return [`PutBack::Write`]
+    /// to condition the owner's complete value on this exact deletion.
     fn record_put_back(
         &self,
         deletion: &RecordDeletion<'_>,
@@ -1316,6 +1411,18 @@ pub trait Protocol: Send + Sync {
     ) -> Result<Option<PutBack>, StoreFailure> {
         let _ = (deletion, context);
         Ok(None)
+    }
+
+    /// Decide whether a verified later application covers an outstanding deletion.
+    /// This separate decision does not repeat the original observation's local writes.
+    fn record_put_back_successor(
+        &self,
+        deletion: &RecordDeletion<'_>,
+        successor: &RecordSuccessor<'_>,
+        context: &ReceiveContext<'_>,
+    ) -> Result<PutBackSuccessor, StoreFailure> {
+        let _ = (deletion, successor, context);
+        Ok(PutBackSuccessor::Wait)
     }
 
     /// Whether a newer write of a record goes back on what the app has seen there, or fails

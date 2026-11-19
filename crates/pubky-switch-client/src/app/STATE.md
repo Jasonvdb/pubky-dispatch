@@ -147,8 +147,23 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   is read at a time, under both certificates' read scopes. The write, writer and
   opened bytes are checked before returning its existing version and flags. A fresh
   installation and the backup's standalone check supply no previous records.
-  Each feed item reserves 6 MiB for the observation or the owner's writes of up to
-  4 MiB and their acknowledgement. Restoring still has to fit one 32 MiB store commit.
+  A prepared observation moves to `hold/<key>/<generation>/<version>/<item hash>`.
+  The hold retains the same signed delete and predecessor and whether this app still
+  protects the deletion at the service. Its wait notice names the exact deletion.
+  The hold also carries the signed conditional operation, its first-send time and any
+  cursor generation sent with it. A backup carries the same outstanding submission.
+  A competing write can satisfy the hold independently. A sent operation whose exact
+  target was displaced can move to `opq/` for its original result within the deciding
+  window. It keeps its signed bytes and batch ID across reload and restore.
+  The earliest protected position bounds a cursor request other than its own atomic replacement. On restore the
+  first verified service cursor reconciles the held positions. A local in-place hold
+  survives an older owner layer and the owner can save its evidence again. A
+  compatible applied write, owner release, loss of write scope, departure or provider
+  loss retires the applicable hold. A second delete of the key keeps its own identity.
+  An ordinary reader compares a repair with its held signed record and the retained
+  predecessor before retirement. These comparisons need no separate stored history.
+  Each feed item reserves 8 MiB for both signed records, the prior mark, owner writes
+  of up to 4 MiB and their acknowledgement. Restoring still has to fit one 32 MiB store commit.
 - **A restore is one commit:** the namespace cleared, the app's restored state and each
   registered protocol's backup layer under its `p/<name>/`, all checked before it, so a
   failure leaves none of them. A layer of a protocol not registered refuses the restore,

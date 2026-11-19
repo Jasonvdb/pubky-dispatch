@@ -122,17 +122,17 @@ pub(crate) async fn joined_with(
     config: AppConfig,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let review = signer.review(asking.request.signed(), &asking.auth)?;
-    let approved = signer.approve(review).await?;
+    let approved = Box::pin(signer.approve(review)).await?;
     signer.claim_delivered(&approved.request).await?;
     world.advance_ms(STEP_MS);
-    let mut app = App::join(
+    let mut app = Box::pin(App::join(
         world.app_env(Arc::new(MemoryStore::new())),
         protocol.clone(),
         config,
         asking.join_request(identity.public(), &approved)?,
-    )
+    ))
     .await?;
-    app.receive(None).await?;
+    Box::pin(app.receive(None)).await?;
     world.outcome("joined", &app_status(&mut app));
     world.advance_ms(STEP_MS);
     Ok((app, protocol))

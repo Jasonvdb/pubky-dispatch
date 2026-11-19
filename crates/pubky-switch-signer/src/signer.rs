@@ -476,16 +476,7 @@ impl Signer {
                     nonce,
                     enrollment,
                     policy,
-                } => {
-                    if self.first_enrollment_stop().is_some() {
-                        return Err(Refusal::FirstEnrollmentHeld.into());
-                    }
-                    let result = match enrollment {
-                        Some(enrollment) => self.enroll(&origin, &enrollment, policy).await,
-                        None => self.observe_first_account(&origin, nonce, policy).await,
-                    };
-                    self.keep_first_answer(result).await?;
-                }
+                } => Box::pin(self.finish_first_setup(&origin, nonce, policy, enrollment)).await?,
                 Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
@@ -1254,7 +1245,20 @@ impl Signer {
 
     /// Keep the first step's exact operands with the reason it needs the host. Only a fresh
     /// service answer can authorize a confirmed restart or restore (Switch account binding 3).
-    async fn keep_first_answer(&mut self, result: Result<()>) -> Result<()> {
+    async fn finish_first_setup(
+        &mut self,
+        origin: &str,
+        nonce: [u8; 16],
+        policy: IdentityPolicy,
+        enrollment: Option<SignedDoc>,
+    ) -> Result<()> {
+        if self.first_enrollment_stop().is_some() {
+            return Err(Refusal::FirstEnrollmentHeld.into());
+        }
+        let result = match enrollment {
+            Some(signed) => self.enroll(origin, &signed, policy).await,
+            None => self.observe_first_account(origin, nonce, policy).await,
+        };
         if let Err(SignerError::Switch(error)) = &result
             && let Some(reason) = FirstEnrollmentStop::from_error(error)
         {

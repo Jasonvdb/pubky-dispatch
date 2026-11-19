@@ -1833,6 +1833,17 @@ async fn test_queue_signed_with_requires_a_fresh_message_of_the_registered_owner
                 Err(AppError::Refused(Refusal::Usage(_)))
             ));
         }
+        let over_budget = [LocalWrite::Put {
+            key: b"origin".to_vec(),
+            value: vec![0; crate::app::MAX_STEP_LOCAL_BYTES],
+        }];
+        assert!(matches!(
+            wallet
+                .queue_signed_with("sample", signed.clone(), &over_budget)
+                .await,
+            Err(AppError::Refused(Refusal::Usage(_)))
+        ));
+        assert_eq!(wallet.delivery(signed.msg_id()).await.unwrap(), None);
         wallet.queue_signed(signed.clone()).await.unwrap();
         assert!(
             wallet
@@ -1865,6 +1876,59 @@ async fn test_queue_signed_with_requires_a_fresh_message_of_the_registered_owner
         assert!(
             wallet
                 .protocol_get("sample", b"origin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(p.bob.switch().entries_from(&wallet.identity()), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_queue_signed_with_preserves_a_refused_conditional_delivery() {
+    Box::pin(async {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let signed = wallet
+            .sign_message(Pair::note(&p.bob, "conditional"))
+            .unwrap();
+        let id = signed.msg_id().to_owned();
+        let batch = OpBatch::new()
+            .op(OpKind::AllowPut {
+                pubky: p.bob.identity().public(),
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            })
+            .when(Condition::RecordVersion {
+                key: [8; 32],
+                version: RecordVersion::new(1, 99),
+            })
+            .queue(signed.clone());
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+        assert!(
+            wallet
+                .submit_batch(batch)
+                .await
+                .unwrap_err()
+                .kept_batch()
+                .is_some()
+        );
+        wallet.receive(None).await.unwrap();
+        let ended = wallet.delivery(&id).await.unwrap();
+        assert!(matches!(ended, Some(Delivery::Failed { .. })));
+        let writes = [fact_write(&id, &delivery_fact(&wallet, signed.plaintext()))];
+        assert!(matches!(
+            wallet.queue_signed_with("sample", signed, &writes).await,
+            Err(AppError::Refused(Refusal::Usage(_)))
+        ));
+        assert_eq!(wallet.delivery(&id).await.unwrap(), ended);
+        assert!(
+            wallet
+                .protocol_get("sample", &delivery_key(&id))
                 .await
                 .unwrap()
                 .is_none()

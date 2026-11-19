@@ -1772,7 +1772,7 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Usage`] for a kind outside the registered protocol, a foreign signature,
-    /// a changed signing certificate, an already retained ID (including a kept batch),
+    /// a changed signing certificate, an already retained ID (including an ended batch),
     /// or local writes exceeding [`MAX_STEP_LOCAL_BYTES`]. A given-up or expired original returns
     /// [`Refusal::WontDeliver`]. A refusal leaves the protocol writes untouched.
     /// Stopped apps and store failures propagate as for [`App::queue_signed`].
@@ -1820,7 +1820,9 @@ impl App {
                 );
             }
             let copies = retained_copies(&reader, &self.state.meta, &self.state.cert).await?;
-            if copies.contains_key(&item.msg_id) {
+            if copies.contains_key(&item.msg_id)
+                || self.batch_for_message(&item.msg_id).await?.is_some()
+            {
                 return Err(Refusal::Usage("the message ID is already retained".into()).into());
             }
             let mut tx = self.tx()?;

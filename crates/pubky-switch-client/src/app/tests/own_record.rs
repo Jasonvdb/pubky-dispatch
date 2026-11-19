@@ -2288,10 +2288,7 @@ async fn test_take_listed_renewal_keeps_a_later_held_renewal() {
         .unwrap();
     w.clock.advance_ms(1_000);
     app.receive(None).await.unwrap();
-    assert_eq!(
-        app.state.renewal.as_ref().map(|r| r.hash()),
-        Some(third.hash())
-    );
+    assert_eq!(app.kept_renewal().map(|r| r.hash()), Some(third.hash()));
     w.clock.advance_ms(1_000);
     app.receive(None).await.unwrap();
     list_renewal(&w, me, &renewed, &third);

@@ -143,7 +143,7 @@ fn renew_to(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
 }
 
 /// The signer stores a renewal of `app`'s certificate to `scopes` (Switch spec 3.2 step 1).
-fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
+pub(super) fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
     let renewed = issue_cert(
         &p.w.alice,
         &app_keys("wallet"),

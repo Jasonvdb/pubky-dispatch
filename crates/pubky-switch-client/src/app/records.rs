@@ -36,7 +36,9 @@
 mod collection;
 mod evidence;
 mod inventory;
+mod page_reader;
 use evidence::{FollowedWrite, Historical, Placement, position};
+pub(super) use page_reader::PageReader;
 pub(super) mod previous;
 
 pub use collection::{Collection, PolicyFamily, RecordTarget};
@@ -187,9 +189,9 @@ pub const LISTING_PAGES_PER_READ: u32 = 4;
 pub struct CollectionListed {
     /// How many records the switch listed in this call.
     pub records: u64,
-    /// The call stopped on its budget, [`LISTING_PAGES_PER_READ`] pages or the call's time
-    /// ([`super::AppConfig::call_budget_ms`]), before the collection's end: the host calls
-    /// again at once, and the next call goes on from where this one got.
+    /// The listing has more work. A page or time limit resumes from the last key.
+    /// A change in the certificate that can read the collection requires a fresh
+    /// range under the new grant. Keep the listing pending until it finishes.
     pub more: bool,
 }
 
@@ -233,8 +235,12 @@ enum Listed {
 }
 
 /// `list_at`: how far an owed listing got, kept with each page it takes.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ListProgress {
+    /// The authority under which the preceding ranges were visible.
+    #[serde(with = "serde_b64")]
+    cert: [u8; 32],
+    generation: u64,
     /// The collections listed to their end, by collection ID in base64url.
     done: Vec<String>,
     /// The collection being listed, and the last key of its last page taken.
@@ -242,6 +248,17 @@ pub(crate) struct ListProgress {
 }
 
 impl ListProgress {
+    fn for_reader(saved: Option<Self>, cert: [u8; 32], generation: u64) -> Self {
+        saved
+            .filter(|progress| progress.cert == cert && progress.generation == generation)
+            .unwrap_or(Self {
+                cert,
+                generation,
+                done: Vec::new(),
+                at: None,
+            })
+    }
+
     /// Where the listing of the collection `id` goes on: after the last key of its last
     /// page taken, or from its beginning.
     fn after(&self, id: &[u8; 32]) -> Result<Option<[u8; 32]>, AppError> {
@@ -2002,8 +2019,9 @@ impl App {
     /// says [`CollectionListed::more`], and each page's commit records how far it got
     /// (`listc/`), so the next call goes on from there, after a restart too. The call that
     /// reaches the end forgets that, and the next one starts at the beginning. Records
-    /// written between two calls come on the feed. Its worst case at the defaults is four
-    /// page requests, each under the request timeout.
+    /// written between two calls come on the feed. Each distinct account head can require
+    /// an own-directory read to establish the reader's scope. When its certificate
+    /// changes, a bounded feed read can obtain the renewal before the listing resumes.
     ///
     /// # Errors
     ///
@@ -2018,7 +2036,11 @@ impl App {
             let budget = self.begin_budget();
             let id = collection.id(&self.state.meta.identity);
             let key = listc_key(&id);
-            let mut progress: ListProgress = self.reader().get(&key).await?.unwrap_or_default();
+            let mut progress: ListProgress = ListProgress::for_reader(
+                self.reader().get(&key).await?,
+                self.state.cert.hash(),
+                self.state.meta.generation,
+            );
             let after = progress.after(&listing_scope(&id, collection, None)?)?;
             let mut pages = LISTING_PAGES_PER_READ;
             let listed = self
@@ -2027,7 +2049,7 @@ impl App {
                     None,
                     after,
                     &mut pages,
-                    Some((&mut progress, &key)),
+                    (&mut progress, &key),
                     Some(&budget),
                 )
                 .await?;
@@ -2059,7 +2081,7 @@ impl App {
         members: Option<&[Collection]>,
         mut after: Option<[u8; 32]>,
         pages: &mut u32,
-        mut progress: Option<(&mut ListProgress, &str)>,
+        (progress, progress_key): (&mut ListProgress, &str),
         budget: Option<&super::CallBudget>,
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
@@ -2141,6 +2163,18 @@ impl App {
             let next = page
                 .next
                 .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
+            // A page contains only the keys the service's current reader may see.
+            // The app can still hold a wider certificate while the renewal is in its feed.
+            if let Some(directory) = self
+                .unconfirmed_page_reader(Some(page.head), progress, None)
+                .await?
+            {
+                if !tx.is_empty() {
+                    self.commit(tx).await?;
+                }
+                Box::pin(self.follow_page_reader(directory)).await?;
+                return Ok(Listed::Paused(listed));
+            }
             let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
             Box::pin(self.note_unlisted(
                 &collection.name,
@@ -2163,10 +2197,8 @@ impl App {
                     &mut checkpoint,
                 )?;
             }
-            if let Some((progress, key)) = progress.as_mut() {
-                progress.reached(&scope, next.as_ref());
-                checkpoint.put(key, &**progress)?;
-            }
+            progress.reached(&scope, next.as_ref());
+            checkpoint.put(progress_key, progress)?;
             self.append_listing_writes(&mut tx, checkpoint).await?;
             if !tx.is_empty() {
                 self.commit(tx).await?;
@@ -2193,16 +2225,17 @@ impl App {
     }
 
     /// List every collection of the protocol whose read scope the app's certificate holds
-    /// (Switch spec 8.3, 12.1 step 3). Returns whether more is left: `true` when the call
-    /// stopped on its budget, [`LISTING_PAGES_PER_READ`] pages for all the collections or
-    /// the call's time ([`super::AppConfig::call_budget_ms`]), and the host calls again at
-    /// once.
+    /// (Switch spec 8.3, 12.1 step 3). Returns whether more is left. Call again when
+    /// the time budget or [`LISTING_PAGES_PER_READ`] was reached, or the service's reader
+    /// certificate still needs to be established. When the local certificate reads
+    /// none of the registered collections, the own directory checks that grant before
+    /// the listing can finish.
     ///
     /// The listing goes on from where the last one that stopped got, as an owed listing
     /// does (`list_at`), skipping the collections it listed to their end. The call that
     /// lists the last one to its end settles an owed listing ([`App::listing_owed`]), and
     /// the next call starts at the beginning. Records written between two calls come on the
-    /// feed. Its worst case at the defaults is four page requests.
+    /// feed. The same directory and renewal checks apply as for [`App::list_collection`].
     ///
     /// # Errors
     ///
@@ -2297,7 +2330,12 @@ impl App {
         if all_wait {
             return Ok(Listing::WaitsForKey);
         }
-        let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
+        let mut progress: ListProgress = ListProgress::for_reader(
+            self.reader().get(LIST_AT).await?,
+            self.state.cert.hash(),
+            self.state.meta.generation,
+        );
+        let before = *pages;
         for name in &listing {
             let collections = self.readable_collections(name);
             for collection in &collections {
@@ -2313,7 +2351,7 @@ impl App {
                         Some(&collections),
                         after,
                         pages,
-                        Some((&mut progress, LIST_AT)),
+                        (&mut progress, LIST_AT),
                         budget,
                     )
                     .await?
@@ -2321,6 +2359,20 @@ impl App {
                     return Ok(Listing::Unfinished);
                 }
             }
+        }
+        // A grant can acquire its first readable collection while the app is
+        // offline. Settling that owner still requires the service's current reader.
+        if *pages == before
+            && listing.iter().any(|name| {
+                self.protocols
+                    .get(name)
+                    .is_some_and(|p| !p.collections().is_empty())
+            })
+            && !self
+                .reader_ready_without_a_page(&progress, due.upload)
+                .await?
+        {
+            return Ok(Listing::Unfinished);
         }
         // Settled for those listed, in one commit with their positions: each is told
         // through the item that owed its listing, unless a call about that item is still
@@ -2446,13 +2498,18 @@ impl App {
         pages: &mut u32,
         budget: Option<&super::CallBudget>,
     ) -> Result<bool, AppError> {
-        let mut progress: ListProgress = self.reader().get(LIST_AT).await?.unwrap_or_default();
-        let collections: Vec<Collection> = self
-            .protocols
-            .collections()
+        let mut progress: ListProgress = ListProgress::for_reader(
+            self.reader().get(LIST_AT).await?,
+            self.state.cert.hash(),
+            self.state.meta.generation,
+        );
+        let registered = self.protocols.collections();
+        let has_collections = !registered.is_empty();
+        let collections: Vec<Collection> = registered
             .into_iter()
             .filter(|c| c.readable_by(&self.state.cert))
             .collect();
+        let before = *pages;
         for collection in &collections {
             let id = collection.id(&self.state.meta.identity);
             let scope = listing_scope(&id, collection, Some(&collections))?;
@@ -2466,9 +2523,18 @@ impl App {
                     Some(&collections),
                     after,
                     pages,
-                    Some((&mut progress, LIST_AT)),
+                    (&mut progress, LIST_AT),
                     budget,
                 )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        if has_collections && *pages == before {
+            let due = self.reader().get::<ListDue>(LIST_DUE).await?;
+            if !self
+                .reader_ready_without_a_page(&progress, due.and_then(|due| due.upload))
                 .await?
             {
                 return Ok(false);
@@ -3410,7 +3476,7 @@ impl App {
             .and_then(|signed| AppCert::verify(signed, &identity).ok())
             .and_then(verify);
         let mut candidates: Vec<AppCert> = vec![self.state.cert.clone()];
-        candidates.extend(self.state.renewal.iter().cloned());
+        candidates.extend(self.kept_renewal().cloned());
         candidates.extend(self.kept_certs(writer).await?);
         candidates.extend(self.pending_certs(tx, writer));
         let mut known: Vec<(AppCert, SignedOp)> =
@@ -5158,6 +5224,7 @@ pub(crate) fn with_named(
 /// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3), and the
 /// kept batches with their ends and indexes, which no flush of a left app would prune.
 pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete(page_reader::READER_RENEWAL)?;
     for prefix in [
         RECORD_PREFIX,
         PERMANENT_PREFIX,

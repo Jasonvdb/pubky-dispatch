@@ -904,6 +904,41 @@ pub trait Protocol: Send + Sync {
         Ok(true)
     }
 
+    /// The owning protocol's records to read in order before one transport attempt for
+    /// this authenticated message (Switch spec 8.2, 11). Each target must select a fixed
+    /// policy registered by this owner and readable by the current certificate. At most
+    /// [`super::MAX_APPEND_RECORDS`] distinct targets are read. Empty by default.
+    ///
+    /// Queued-message enumeration does not call this hook. A retry asks again.
+    ///
+    /// # Errors
+    ///
+    /// A local read failure holds the message for another try.
+    fn append_records(
+        &self,
+        delivery: &super::DeliveryView<'_>,
+    ) -> Result<Vec<super::RecordTarget>, StoreFailure> {
+        let _ = delivery;
+        Ok(Vec::new())
+    }
+
+    /// Decide one append using the exact targets requested by [`Self::append_records`] and
+    /// their checked read outcomes, in order (Switch spec 8.2, 11). Called once the reads
+    /// have finished. The decision expires with this transport attempt. A protocol that
+    /// asks for records holds its message until it explicitly permits or withdraws it.
+    ///
+    /// # Errors
+    ///
+    /// A local read failure holds the delivery and leaves the signed message queued.
+    fn judge_append(
+        &self,
+        delivery: &super::DeliveryView<'_>,
+        records: &[(super::RecordTarget, super::RecordRead)],
+    ) -> Result<super::AppendDecision, StoreFailure> {
+        let _ = (delivery, records);
+        Ok(super::AppendDecision::Hold)
+    }
+
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
     /// default.
     fn opaque_members(&self) -> Vec<OpaqueRule> {

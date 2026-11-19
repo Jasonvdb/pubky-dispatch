@@ -2,6 +2,9 @@
 //! stored at the switch for one of the identity's apps, fetched by it, and dropped by the
 //! next version of `identity.json`.
 
+#[cfg(test)]
+mod provider_loss;
+
 use std::sync::Arc;
 use std::time::Duration;
 

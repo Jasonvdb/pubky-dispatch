@@ -342,16 +342,24 @@ async fn test_upload_direct_read_keeps_divergence_until_its_observation_covers()
         });
         app.receive(None).await.unwrap();
         let divergent = lost.next.lock().shared.divergent.remove(&key).unwrap();
-        lost.next.fail_next(Fault::Head {
+        let before_upload = Fault::Head {
             path: "/records/".into(),
             at: Some(before),
             forked: false,
-        });
+        };
+        lost.next.fail_next(before_upload.clone());
         let old = app.read_record_fresh(&target).await.unwrap();
         assert!(matches!(
             old,
             crate::app::RecordRead::Kept { record: Some(held), .. } if held.divergent
         ));
+        lost.next.fail_next(before_upload);
+        assert!(
+            app.read_record_application(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
         lost.next.lock().shared.divergent.insert(key, divergent);
         let current = app.read_record_fresh(&target).await.unwrap();
         assert!(matches!(current, crate::app::RecordRead::Fresh(record) if record.divergent));

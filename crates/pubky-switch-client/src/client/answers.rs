@@ -1243,7 +1243,7 @@ pub struct UploadChanges {
 }
 
 impl UploadChanges {
-    fn read(o: Obj<'_>) -> Result<Self, ClientError> {
+    pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         Ok(Self {
             records: o.required_each("records", read::b64_32)?,
             divergent: o.required_each("divergent", read::b64_32)?,

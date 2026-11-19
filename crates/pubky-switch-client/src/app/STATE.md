@@ -321,6 +321,13 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
 | `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
 | `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back, every protocol's merged (at most `MAX_LOSS_CONVERSATIONS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::conversations_left_out`; and the protocols whose answers the re-send step committed so far (`asked`, written by every writer): each protocol's answer commits with its name, and the step asks only the others, so a protocol that fails is asked again and none twice; the last one's commit ends the step and empties it | |
+| `loss/opening` | the verified first identity document chained immediately after the recovery transition, replaced on a new loss and retained on a move | |
+| `pending-roster/possible-members`, `pending-roster/removal/<version>` | while the opening is unavailable, the remaining possible original App IDs and the signed documents that first removed them. The opening keeps the documents it links to original members and clears the rest. A new loss clears both | |
+| `loss/removed/<app>`, `loss/removal/<version>` | each original app explicitly removed and the signed successor at that version, shared by the apps it removed | |
+| `retain-loss-uploads` | the host opted in to keeping the exact inputs of its ordinary loss evidence step | |
+| `loss-checkpoint/<protocol>` | the protocol-local cutoff key registered by the host; its before/after digests are kept with each inventory | |
+| `loss-upload/<generation>/<body hash>/<details hash>` | an indexed inventory, the account, app, service key, signed loss generation and opening hash when known, with the checked result for that inventory | |
+| `loss-data/<generation>/<hash>/<part>` | exact bytes of the ordinary upload or the record applications and omitted signed entries, indexed while pending and committed before sending; retained across later losses until the host releases this generation | sealed protocol data and signed entries |
 | `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |
 | `ev/proof/<hash>` | a kept transition proof | |
 | `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |

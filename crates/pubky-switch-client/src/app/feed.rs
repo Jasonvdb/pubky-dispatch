@@ -4120,6 +4120,7 @@ impl App {
             Ok(Taken::Newer) => doc,
             Ok(Taken::Same | Taken::Older) => return Ok(Step::Pass),
         };
+        Box::pin(self.note_roster_removals(&doc, &mut read.tx)).await?;
         let me = self.state.meta.app_id;
         if doc.data_epoch() > held.data_epoch() {
             read.epoch_rose = true;

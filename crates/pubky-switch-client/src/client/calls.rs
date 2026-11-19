@@ -923,12 +923,20 @@ impl SwitchClient {
         upload: &RecoveryUpload,
         staged: bool,
     ) -> Result<UploadAnswer, ClientError> {
+        self.recovery_upload_body(upload.to_json(), staged).await
+    }
+
+    pub(crate) async fn recovery_upload_body(
+        &self,
+        body: Vec<u8>,
+        staged: bool,
+    ) -> Result<UploadAnswer, ClientError> {
         self.own_app_id()?;
         let checked = self
             .call(
                 "POST",
                 &self.path("recovery/upload"),
-                upload.to_json(),
+                body,
                 Body::Json,
                 Auth {
                     with_cert: staged,

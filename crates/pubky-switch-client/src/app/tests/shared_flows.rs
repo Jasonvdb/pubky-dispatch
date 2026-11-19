@@ -13537,16 +13537,6 @@ async fn test_wider_record_reader_lists_from_the_start_before_delivering_after_l
     let earlier = wallet.cert().clone();
     s.w.clock.advance_ms(HOUR);
     let missed = s.w.switch.push_missed(1, START, START);
-    let (_, note) = s
-        .peer
-        .send_to(
-            &s.w.switch,
-            s.peer.apps()[0].cert.app_id(),
-            "sample.note",
-            json!({ "text": "after the miss" }),
-            &[id],
-        )
-        .unwrap();
     let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
     s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
     wallet.config.page_size = 1;
@@ -13567,7 +13557,30 @@ async fn test_wider_record_reader_lists_from_the_start_before_delivering_after_l
             .unwrap()
             .is_none()
     );
-    assert_eq!(handed(&s, &note.msg_id), 0);
+    assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    for _ in 0..16 {
+        if wallet.cert().hash() == renewed.hash() {
+            break;
+        }
+        assert!(wallet.list_collection(&family).await.unwrap().more);
+    }
+    let published = s.w.switch.app(&id).record.unwrap();
+    let reader = AppRecord::verify(&published, &s.w.alice.public()).unwrap();
+    assert_eq!(reader.cert().hash(), renewed.hash());
+    assert!(reader.accepts("sample.note"));
+    assert_eq!(wallet.cursor(), at);
+    assert_eq!(wallet.told("sample"), owner_at);
+    assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    let (_, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            s.peer.apps()[0].cert.app_id(),
+            "sample.note",
+            json!({ "text": "after the miss" }),
+            &[id],
+        )
+        .unwrap();
     let mut current = None;
     for _ in 0..32 {
         let report = wallet.receive(None).await.unwrap();

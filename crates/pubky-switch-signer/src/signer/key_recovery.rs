@@ -561,7 +561,7 @@ impl Signer {
             Found::InPlace => (self.state.clone(), marks_of(&self.state)?, Held::InPlace),
             Found::Fresh(None) => (self.state.clone(), Vec::new(), Held::Fresh),
             Found::Fresh(Some(local)) => (
-                fresh_records(identity, self.state.install, Some(&local)),
+                fresh_records(self.state.identity, self.state.install, Some(&local)),
                 copies_of(&local),
                 Held::Unusable,
             ),

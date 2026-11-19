@@ -58,8 +58,7 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
     let mut other = enroll(world, &alice, ORIGIN).await?;
     let mut first = Signer::open(env.clone(), world.keyring(&alice)?).await?;
     let old = first.survey_first_enrollment_restore(ORIGIN).await?;
-    let predecessor = other.set_record_max_age(Some(3600)).await?;
-    drop(other);
+    let mut predecessor = other.set_record_max_age(Some(3600)).await?;
     if !backup {
         world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
         world.files().remove(alice.public(), IDENTITY_PATH);
@@ -108,7 +107,23 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
     assert_eq!(store.scan(&ns, b"", None, 64)?, selected);
     drop(first);
     let mut first = Signer::open(env, world.keyring(&alice)?).await?;
-    Box::pin(first.resume()).await?;
+    if backup {
+        Box::pin(first.resume()).await?;
+    } else {
+        // The serving signer made a normal change while the existing enrollment was pending.
+        predecessor = other.set_record_max_age(Some(7200)).await?;
+        world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
+        world.files().remove(alice.public(), IDENTITY_PATH);
+        assert_eq!(
+            Box::pin(first.resume()).await,
+            Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into())
+        );
+        let updated = first.survey_key_recovery().await?;
+        assert_eq!(updated.version, predecessor.version());
+        let accepted =
+            pubky_switch_signer::KeyRecoveryConfirmed::shown_and_confirmed(&updated, &[]);
+        Box::pin(first.restore(accepted)).await?;
+    }
     let next = first.identity_doc()?.ok_or("missing restored document")?;
     assert_eq!(first.status(), SignerStatus::Signing);
     assert_eq!(first.install_id(), install);
@@ -117,7 +132,10 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
         (next.generation(), next.version()),
         (predecessor.generation(), predecessor.version() + 1)
     );
-    assert_eq!(next.body().record_max_age, Some(3600));
+    assert_eq!(
+        next.body().record_max_age,
+        predecessor.body().record_max_age
+    );
     assert_eq!(next.inbox(), predecessor.inbox());
     assert_eq!(
         world

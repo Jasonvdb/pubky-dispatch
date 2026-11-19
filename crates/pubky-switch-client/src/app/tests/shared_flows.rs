@@ -2400,9 +2400,27 @@ async fn test_records_followed_upload_keeps_its_application_across_an_earlier_vi
         wallet.receive(None).await.unwrap();
         let answer = wallet.client.recovery_upload(&upload, false).await.unwrap();
         assert!(answer.result.unwrap().records.contains(&key));
+        let observed = s.protocol.bases.lock().unwrap().len();
         phone.receive(None).await.unwrap();
         phone.read_record(&target).await.unwrap();
-        views.push(phone.client.record(&key).await.unwrap());
+        let current = phone.client.record(&key).await.unwrap();
+        if lost == 1 {
+            assert_eq!(current.view.key, key);
+            assert_eq!(current.view.writer, wallet.app_id());
+            assert_eq!(current.view.op, upload.records[0].op);
+            assert!(current.view.proof.is_none());
+            assert_eq!(
+                s.protocol.bases.lock().unwrap()[observed..],
+                [WriteBase {
+                    repair: None,
+                    expected_version: RecordVersion::NONE,
+                    held: true,
+                    conditions: Vec::new(),
+                    written_at_ms: None,
+                }]
+            );
+        }
+        views.push(current);
     }
     let [first, later] = &views[..] else {
         unreachable!()

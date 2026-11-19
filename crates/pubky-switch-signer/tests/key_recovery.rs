@@ -1422,6 +1422,64 @@ async fn test_key_recovery_refused_after_its_commit_leaves_nothing() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_saved_enrollment_cannot_move_to_a_recreated_account() {
+    use pubky_switch_client::store::{Fault, FaultStore};
+
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let memory = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &memory).await.unwrap();
+    // The original existing enrollment succeeded; the answer is durable before the
+    // signer starts reading the survey again. Its commit acknowledgement is lost.
+    let cut = Arc::new(FaultStore::new(memory.clone(), Fault::FailAfter(3)));
+    let result = Signer::restore_new(
+        world.env(cut),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(SignerError::Store(pubky_switch_client::StoreError::Unknown))
+    ));
+    let created = world.switch.created();
+    old.close_account(confirmed()).await.unwrap();
+    world.clock.advance_ms(2000);
+    let (mut current, _) = world.enrolled().await;
+    assert!(world.switch.created() > created);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let current_survey = survey(&world, &memory).await.unwrap();
+    assert_ne!(current_survey, shown);
+    let before = current.identity_doc().unwrap().unwrap();
+    assert_eq!(
+        Signer::restore_new(
+            world.env(memory),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&current_survey, &[])
+        )
+        .await
+        .unwrap_err(),
+        refused(KeyRecoveryStop::SurveyChanged)
+    );
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        before.signed()
+    );
+    signs_on(&world, &mut current).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_in_place_goes_on_under_a_new_confirmation() {
     // In place, the recovery's enrollment doesn't arrive; the user surveys again and
     // confirms, and the recovery goes on from its flow.

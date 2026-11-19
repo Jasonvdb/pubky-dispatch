@@ -11663,6 +11663,86 @@ async fn test_record_lifetime_keeps_its_mark_through_an_unreadable_value_and_rel
 }
 
 #[tokio::test]
+async fn test_record_lifetime_waits_for_a_delete_view_covering_the_upload() {
+    Box::pin(async {
+        let s = Setup::new();
+        s.protocol
+            .end_mark_at_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = s.target("shared");
+        let key = wallet.record_key(&target).unwrap();
+        phone
+            .put_record(&target, &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        wallet.read_record_fresh(&target).await.unwrap();
+        let mark = wallet.record_seen(&key).await.unwrap().unwrap();
+        phone.delete_record(&target, vec![]).await.unwrap();
+        let deletion = s.w.switch.seq();
+
+        // The upload duty is recorded before its key GET is answered.
+        let mut changes = pubky_switch_core::recovery::UploadChanges::default();
+        changes.record(key);
+        s.w.switch
+            .chain_upload(phone.app_id(), changes.to_value())
+            .unwrap();
+        let upload = crate::app::FeedPosition {
+            generation: wallet.own_identity().generation(),
+            seq: s.w.switch.seq(),
+        };
+        let mut tx = wallet.tx().unwrap();
+        wallet
+            .mark_uploaded(upload, vec![key], vec![], &mut tx)
+            .await
+            .unwrap();
+        wallet.commit(tx).await.unwrap();
+        s.w.switch.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(deletion),
+            forked: false,
+        });
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept { .. }
+        ));
+        let id = wallet.app_id();
+        drop(wallet);
+        let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet.record_seen(&key).await.unwrap().as_deref(),
+            Some(mark.as_slice())
+        );
+        // Reading the same held delete from that earlier position still keeps the mark.
+        s.w.switch.fail_next(Fault::Head {
+            path: "/records/".into(),
+            at: Some(deletion),
+            forked: false,
+        });
+        assert!(matches!(
+            wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Kept { .. }
+        ));
+        // A list page also checks its signed head when its snapshot sequence is later.
+        s.w.switch.fail_next(Fault::Head {
+            path: "records?collection".into(),
+            at: Some(deletion),
+            forked: false,
+        });
+        let listed = wallet.list_collection(&target.collection).await.unwrap();
+        assert_eq!(listed.records, 1);
+        assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(mark));
+        assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
+            RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+        assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_record_lifetime_commits_the_deleted_value_and_mark_together() {
     let s = Setup::new();
     s.protocol

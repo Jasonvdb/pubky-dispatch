@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_client::TransportError;
-use pubky_switch_client::app::{App, AppConfig, ClaimOp};
+use pubky_switch_client::app::{App, AppConfig, ClaimOp, Protocol, RecordTarget};
 use pubky_switch_client::client::{Batch, CheckedResponse, Credentials, SwitchClient};
 use pubky_switch_client::error::ClientError;
 use pubky_switch_client::store::MemoryStore;
@@ -23,7 +23,9 @@ use pubky_switch_core::records::{AppRecord, AppRecordBody};
 use pubky_switch_core::sealed::SealedValue;
 use pubky_switch_core::shared::ApplicationRef;
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_harness::parties::{Asking, NOTES, notes_protocol};
+use pubky_switch_harness::parties::{
+    Asking, NOTES, notes_collection, notes_protocol, notes_protocol_with_records,
+};
 use pubky_switch_harness::{Backend, World};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::{Value, json};
@@ -43,6 +45,10 @@ struct Writer {
 }
 
 async fn writer(world: &World) -> Writer {
+    writer_with(world, notes_protocol()).await
+}
+
+async fn writer_with(world: &World, protocol: Arc<dyn Protocol>) -> Writer {
     let who = world.identity("alice").unwrap();
     world.add_switch(ORIGIN, &[&who]).await.unwrap();
     let mut signer = Box::pin(Signer::create(
@@ -63,7 +69,7 @@ async fn writer(world: &World) -> Writer {
     signer.claim_delivered(&approved.request).await.unwrap();
     let mut app = Box::pin(App::join(
         world.app_env(Arc::new(MemoryStore::new())),
-        notes_protocol(),
+        protocol,
         AppConfig::default(),
         asking.join_request(who.public(), &approved).unwrap(),
     ))
@@ -675,6 +681,47 @@ async fn list_condition_timeouts(world: &World) {
     assert_eq!(*transport.sent.lock().unwrap(), expected);
 }
 
+async fn current_collection(world: &World) {
+    let mut wallet = writer_with(world, notes_protocol_with_records()).await;
+    let collection = notes_collection();
+    wallet
+        .write(1, b"first", RecordVersion::NONE, br#"{"v":1}"#)
+        .await;
+    let report = Box::pin(wallet.app.receive(None)).await.unwrap();
+    let current = wallet
+        .app
+        .current_collection(&collection, &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.identity, wallet.who.public());
+    assert_eq!(current.live.len(), 1);
+    assert!(current.uncertain_keys.is_empty());
+    let target = RecordTarget::new(collection.clone(), b"second");
+    Box::pin(wallet.app.put_record(&target, br#"{"v":2}"#, vec![]))
+        .await
+        .unwrap();
+    let current = wallet
+        .app
+        .current_collection(&collection, &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 2);
+    assert!(current.uncertain_keys.is_empty());
+    Box::pin(wallet.app.delete_record(&target, vec![]))
+        .await
+        .unwrap();
+    let current = wallet
+        .app
+        .current_collection(&collection, &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 1);
+    assert!(current.uncertain_keys.is_empty());
+}
+
 macro_rules! backend_test {
     ($name:ident, $backend:expr, $flow:ident) => {
         #[tokio::test]
@@ -688,6 +735,17 @@ macro_rules! backend_test {
         }
     };
 }
+
+backend_test!(
+    test_current_collection_service,
+    Backend::Service,
+    current_collection
+);
+backend_test!(
+    test_current_collection_scripted,
+    Backend::Scripted,
+    current_collection
+);
 
 backend_test!(
     test_record_current_delete_repair_service,

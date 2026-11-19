@@ -129,9 +129,9 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    LossRecordApplication, PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence,
-    SharedRecord, ShownWrite, Unopened,
+    Collection, CollectionListed, CurrentCollection, FlaggedWrite, KeptOp, KeptReason,
+    LISTING_PAGES_PER_READ, LossRecordApplication, PolicyFamily, RecordContent, RecordRead,
+    RecordTarget, SharedEvidence, SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,
@@ -760,6 +760,7 @@ pub struct App {
     /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
+    last_collection_read: Option<Arc<feed::ReadCoverage>>,
     /// The sequence and highest held cursor reported ahead with
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
@@ -1124,6 +1125,7 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1295,6 +1297,7 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -2426,6 +2429,7 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,

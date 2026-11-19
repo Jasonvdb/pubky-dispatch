@@ -35,10 +35,12 @@
 
 mod collection;
 mod evidence;
+mod inventory;
 use evidence::{FollowedWrite, Historical, Placement, position};
 pub(super) mod previous;
 
 pub use collection::{Collection, PolicyFamily, RecordTarget};
+pub use inventory::CurrentCollection;
 
 use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
@@ -1860,6 +1862,19 @@ impl App {
         }
         let mut tx = self.tx()?;
         let current = self.note_absent(key, at, MissingFrom::Key, &mut tx).await?;
+        if current
+            && at_known_tip
+            && let Some(collection) = self.held_collection(key).await?
+        {
+            self.observe_member(
+                &collection.id(&self.identity()),
+                key,
+                position(head.generation, head.seq),
+                inventory::Member::Absent,
+                &mut tx,
+            )
+            .await?;
+        }
         if !tx.is_empty() {
             self.commit(tx).await?;
         }
@@ -2082,6 +2097,7 @@ impl App {
             {
                 chain.write(&mut tx)?;
             }
+            let mut listed_members = Vec::new();
             for view in &page.records {
                 // A page holds up to 1,000 views, each cached with its mark: the views taken
                 // so far are committed first once one more might not fit.
@@ -2107,8 +2123,15 @@ impl App {
                     .unwrap_or(collection);
                 let mark = self.record_upload(&view.key).await?;
                 let covers = mark.is_none_or(|upload| self.covers_upload(upload_at, upload));
-                self.take_view(view, at, Some((&view.key, member)), covers, &mut tx)
-                    .await?;
+                if members.is_some() {
+                    let read = self
+                        .judge_view(view, at, Some((&view.key, member)), covers, &mut tx)
+                        .await?;
+                    listed_members.push(inventory::ListedMember::new(view, &id, read, covers));
+                } else {
+                    self.take_view(view, at, Some((&view.key, member)), covers, &mut tx)
+                        .await?;
+                }
                 listed = listed.saturating_add(1);
             }
             // Records are listed by the base64url text of their keys, compared as ASCII
@@ -2118,21 +2141,36 @@ impl App {
             let next = page
                 .next
                 .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
-            if let Some((progress, key)) = progress.as_mut() {
-                progress.reached(&scope, next.as_ref());
-                tx.put(key, &**progress)?;
-            }
-            self.commit(tx).await?;
             let shown: Vec<[u8; 32]> = page.records.iter().map(|view| view.key).collect();
             Box::pin(self.note_unlisted(
                 &collection.name,
-                after.as_ref(),
-                next.as_ref(),
+                (after.as_ref(), next.as_ref()),
                 &shown,
                 at,
                 upload_at,
+                &mut tx,
             ))
             .await?;
+            // Keep the continuation and the covered inventory with the page's records.
+            // Only a page too large for one batch leaves earlier records to be read again.
+            let mut checkpoint = Tx::new(&self.ns);
+            if members.is_some() {
+                self.keep_inventory_page(
+                    collection,
+                    after,
+                    &page,
+                    listed_members,
+                    &mut checkpoint,
+                )?;
+            }
+            if let Some((progress, key)) = progress.as_mut() {
+                progress.reached(&scope, next.as_ref());
+                checkpoint.put(key, &**progress)?;
+            }
+            self.append_listing_writes(&mut tx, checkpoint).await?;
+            if !tx.is_empty() {
+                self.commit(tx).await?;
+            }
             match next {
                 Some(next) => after = Some(next),
                 None => return Ok(Listed::Done(listed)),
@@ -2575,6 +2613,46 @@ impl App {
         covers_uploads: bool,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
+        let read = self
+            .judge_view(view, at, expect, covers_uploads, tx)
+            .await?;
+        if let CurrentAt::Answer(version) | CurrentAt::KeyAtKnownTip(version, _) = at {
+            let (key, id) = expect.map_or((view.key, view.collection), |(key, collection)| {
+                (*key, collection.id(&self.identity()))
+            });
+            if self
+                .protocols
+                .collections()
+                .iter()
+                .any(|c| c.id(&self.identity()) == id)
+            {
+                let member = inventory::ListedMember::new(
+                    view,
+                    &id,
+                    read,
+                    covers_uploads && key == view.key,
+                );
+                self.observe_member(
+                    &id,
+                    &key,
+                    position(version.generation, version.version),
+                    member.member,
+                    tx,
+                )
+                .await?;
+            }
+        }
+        Ok(read)
+    }
+
+    async fn judge_view(
+        &mut self,
+        view: &SharedRecordView,
+        at: CurrentAt,
+        expect: Option<(&[u8; 32], &Collection)>,
+        covers_uploads: bool,
+        tx: &mut Tx,
+    ) -> Result<WriteRead, AppError> {
         let key = expect.map_or(view.key, |(key, _)| *key);
         if !SignedOp::peek(&view.op)
             .is_ok_and(|op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == key))
@@ -2636,6 +2714,8 @@ impl App {
         if read == WriteRead::Waits {
             return Ok(read);
         }
+        self.observe_collection_write(put, envelope, read, tx)
+            .await?;
         match viewed {
             // The record's view, read to judge the write, is the switch's latest word.
             WriterView::Current { divergent } if read.says_of_now() => {
@@ -4325,11 +4405,11 @@ impl App {
     async fn note_unlisted(
         &mut self,
         collection: &str,
-        after: Option<&[u8; 32]>,
-        last: Option<&[u8; 32]>,
+        (after, last): (Option<&[u8; 32]>, Option<&[u8; 32]>),
         listed: &[[u8; 32]],
         at: CurrentAt,
         upload_at: FeedPosition,
+        tx: &mut Tx,
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
         for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
@@ -4346,14 +4426,22 @@ impl App {
                     .await?
                     .is_none_or(|upload| self.covers_upload(upload_at, upload))
             {
-                let mut tx = self.tx()?;
-                Box::pin(self.note_absent(&key, at, MissingFrom::LiveListing, &mut tx)).await?;
-                if !tx.is_empty() {
-                    self.commit(tx).await?;
-                }
+                let mut omitted = Tx::new(&self.ns);
+                Box::pin(self.note_absent(&key, at, MissingFrom::LiveListing, &mut omitted))
+                    .await?;
+                self.append_listing_writes(tx, omitted).await?;
             }
         }
         Ok(())
+    }
+
+    /// Flush earlier records only when adding the next listing writes would exceed a batch.
+    async fn append_listing_writes(&mut self, tx: &mut Tx, writes: Tx) -> Result<(), AppError> {
+        if tx.size().saturating_add(writes.size()) > crate::store::MAX_BATCH_BYTES {
+            let full = std::mem::replace(tx, self.tx()?);
+            self.commit(full).await?;
+        }
+        tx.append(writes)
     }
 
     /// A pending observation may finish after the app settled an own write or read
@@ -4400,7 +4488,7 @@ impl App {
             observation: ObservationSource::Applied,
         };
         let key = put.key;
-        match self
+        let observed = match self
             .accept_write(&evidence, Some((&key, &collection)), tx)
             .await?
         {
@@ -4410,12 +4498,15 @@ impl App {
                 if self.take_write(accepted, true, None, None, tx).await? == Taken::New {
                     self.note_divergent(&key, false, tx).await?;
                 }
+                WriteRead::Taken
             }
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
-            Err(_) => {}
-        }
+            Err(_) => WriteRead::Refused,
+        };
+        self.observe_collection_write(put, proof.envelope(), observed, tx)
+            .await?;
         Ok(())
     }
 
@@ -5086,6 +5177,8 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "kbt/",
         "kbm/",
         "kba/",
+        "clpage/",
+        "clwrite/",
         LISTC_PREFIX,
     ] {
         tx.delete_prefix(prefix)?;

@@ -2,7 +2,7 @@
 //!
 //! A message is signed once and recorded in the durable outbox (`out/<msg_id>`) before
 //! anything is sent, with its jobs: the conversation entry a first message to a
-//! counterparty that isn't a contact needs (except the protocol's re-send kind), the
+//! counterparty that isn't a contact needs when the protocol admits it, the
 //! delivery, and the matching shared record write the protocol names. Each job is retried
 //! until it completes, at the flushes of the outbox ([`App::flush_outbox`], which goes round
 //! it at most [`OUTBOX_TRIES_PER_FLUSH`] messages a call); every step commits before the
@@ -68,7 +68,7 @@ use super::error::{Refusal, WontDeliver};
 use super::events::{AppEvent, Duty};
 use super::records::{Collection, DeleteBase, RecordTarget};
 use super::state::key;
-use super::{App, AppError};
+use super::{App, AppError, LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use crate::client::answers::AppendAnswer;
 use crate::error::{ClientError, StoreError};
 
@@ -437,6 +437,7 @@ impl OutgoingMessage {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SignedMessage {
     to: [u8; 32],
+    signing_cert: [u8; 32],
     kind: String,
     msg_id: String,
     plaintext: MessagePlaintext,
@@ -782,14 +783,18 @@ impl OutboxItem {
         meta: &super::state::Meta,
         cert: &pubky_switch_core::records::AppCert,
     ) -> bool {
-        own_message(&self.plaintext, &self.to, meta, cert)
-            .is_some_and(|message| message.kind == self.kind && message.msg_id == self.msg_id)
+        self.signed_message(meta, cert).is_some()
             && self.sealed.as_ref().is_none_or(|sealed| {
                 sealed
                     .envelope
                     .matches_plaintext(&self.plaintext)
                     .unwrap_or(false)
             })
+    }
+
+    fn signed_message(&self, meta: &super::state::Meta, cert: &AppCert) -> Option<Message> {
+        own_message(&self.plaintext, &self.to, meta, cert)
+            .filter(|message| message.kind == self.kind && message.msg_id == self.msg_id)
     }
 
     fn complete(&self) -> bool {
@@ -1096,6 +1101,12 @@ fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
 
+fn replay_deadline(created_at_ms: u64) -> u64 {
+    created_at_ms
+        .saturating_sub(CLOCK_TOLERANCE_MS)
+        .saturating_add(SENT_RETENTION_MS)
+}
+
 /// The immutable parts shared by every retained copy of one outgoing message.
 #[derive(PartialEq, Eq)]
 struct DeliveryCopy {
@@ -1309,7 +1320,8 @@ impl App {
         let plaintext = built.sign(&self.state.keys)?;
         Ok(SignedMessage {
             to: message.to,
-            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
+            signing_cert: self.state.cert.hash(),
+            conversation: message.to != me && self.protocols.adds_conversation(&built, &plaintext),
             kind: message.kind,
             msg_id: built.msg_id,
             plaintext,
@@ -1749,6 +1761,79 @@ impl App {
         .await
     }
 
+    /// Queue a freshly signed original with its owning protocol's local writes in one
+    /// store commit, without sending it (Switch spec 8.2, 11). On success the original
+    /// outbox item and the writes are durable together. Use the original live decision
+    /// to enqueue. If the commit outcome is unknown, reopen the store and check the
+    /// protocol state and [`App::delivery`] before retrying. An older backup can lack
+    /// evidence of a later delivery. For delivery conditional on a service operation,
+    /// use [`OpBatch::queue`] and [`OpBatch::locals`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a kind outside the registered protocol, a foreign signature,
+    /// a changed signing certificate, an already retained ID (including an ended batch),
+    /// or local writes exceeding [`MAX_STEP_LOCAL_BYTES`]. A given-up or expired original returns
+    /// [`Refusal::WontDeliver`]. A refusal leaves the protocol writes untouched.
+    /// Stopped apps and store failures propagate as for [`App::queue_signed`].
+    pub async fn queue_signed_with(
+        &mut self,
+        protocol: &str,
+        message: SignedMessage,
+        local: &[LocalWrite],
+    ) -> Result<String, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            if self
+                .protocols
+                .of_kind(message.kind())
+                .is_none_or(|owner| owner.name != protocol)
+            {
+                return Err(
+                    Refusal::Usage("the protocol does not own this message kind".into()).into(),
+                );
+            }
+            if local_writes_bytes(local) > MAX_STEP_LOCAL_BYTES {
+                return Err(Refusal::Usage(
+                    "the local queue writes exceed their byte bound".into(),
+                )
+                .into());
+            }
+            if message.signing_cert != self.state.cert.hash() {
+                return Err(
+                    Refusal::Usage("the signing certificate is no longer current".into()).into(),
+                );
+            }
+            let item = self.outbox_item(&message).await?;
+            let signed = item
+                .signed_message(&self.state.meta, &self.state.cert)
+                .ok_or_else(|| Refusal::Usage("a message this app did not sign".into()))?;
+            let until_ms = replay_deadline(signed.created_at_ms);
+            let reader = self.reader();
+            if given_up(&reader, &item.msg_id, self.now()).await? {
+                return Err(Refusal::WontDeliver(WontDeliver::GivenUp).into());
+            }
+            if self.kept_window_now() > until_ms {
+                return Err(
+                    Refusal::WontDeliver(WontDeliver::PastReplayWindow { until_ms }).into(),
+                );
+            }
+            let copies = retained_copies(&reader, &self.state.meta, &self.state.cert).await?;
+            if copies.contains_key(&item.msg_id)
+                || self.batch_for_message(&item.msg_id).await?.is_some()
+            {
+                return Err(Refusal::Usage("the message ID is already retained".into()).into());
+            }
+            let mut tx = self.tx()?;
+            put_outbox_item(&mut tx, &item)?;
+            tx.local(&super::protocols::qualify(protocol, local.iter().cloned()))?;
+            self.commit(tx).await?;
+            Ok(item.msg_id)
+        })
+        .await
+    }
+
     /// Queue again a message this app signed itself, from its stored signed plaintext, with
     /// the same bytes and so the same `msg_id`, sending nothing (Switch spec 11 "Queued
     /// again by its signer"). Returns its `msg_id`.
@@ -1763,7 +1848,7 @@ impl App {
     /// The plaintext must be signed with this app's key, the one its certificate names,
     /// with the App ID and `from` of this app and identity; the recipient, the kind and the
     /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one, with
-    /// the conversation entry its kind needs, and no record job, since the record holds it
+    /// the conversation entry its signed content calls for, and no record job, since the record holds it
     /// already. The copy carries no invite code and notifies the recipient: a first message
     /// that needed an invite code is for the host to send again with one.
     ///
@@ -1852,14 +1937,11 @@ impl App {
         plaintext
             .verify_signature(&self.state.cert.signing_key(), &message.to)
             .map_err(|_| not_ours())?;
-        let deadline = message
-            .created_at_ms
-            .saturating_sub(CLOCK_TOLERANCE_MS)
-            .saturating_add(SENT_RETENTION_MS);
+        let deadline = replay_deadline(message.created_at_ms);
         Ok(OutboxItem {
             origin: DeliveryOrigin::Reconstructed,
             to: message.to,
-            conversation: message.to != me && self.protocols.adds_conversation(&message.kind),
+            conversation: message.to != me && self.protocols.adds_conversation(&message, plaintext),
             kind: message.kind,
             msg_id: message.msg_id,
             plaintext: plaintext.encode(),
@@ -2506,6 +2588,16 @@ impl App {
         // earlier call, whose settlement may commit local policy the holds read. So that
         // batch goes first and the holds are read again after it: the entry and the
         // delivery go by this one decision, with nothing kept settled after it.
+        if item.conversation && !held {
+            // A backup or a kept batch may carry an outstanding entry. Only this message's
+            // signed content can authorize it, even on the first try after a restore.
+            let plaintext = item.plaintext()?;
+            let message =
+                super::protocols::kept_message(plaintext.json()).ok_or_else(store_corrupt)?;
+            item.conversation = !item.is_resend()
+                && message.to != self.state.meta.identity
+                && self.protocols.adds_conversation(&message, &plaintext);
+        }
         let mut settled = Ok(());
         if item.conversation && !held && self.entry_owed(&item.to).await? {
             match self

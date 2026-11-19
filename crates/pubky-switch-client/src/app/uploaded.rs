@@ -127,6 +127,7 @@ impl App {
             .map(|mark| mark.upload))
     }
 
+    /// The upload owed for this key after the earlier items in this transaction.
     pub(super) async fn record_upload_in(
         &self,
         key: &[u8; 32],

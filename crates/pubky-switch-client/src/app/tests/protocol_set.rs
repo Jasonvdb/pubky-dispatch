@@ -2085,6 +2085,56 @@ async fn cert_refusals(app: &mut App) -> Vec<(u64, CertificateRefusal)> {
 }
 
 #[tokio::test]
+async fn test_queue_signed_with_keeps_the_owner_and_signing_certificate() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let message = || {
+        OutgoingMessage::new(
+            p.w.bob.public(),
+            "tasks.item",
+            json!({"text": "task"}).as_object().unwrap().clone(),
+        )
+    };
+    let signed = app.sign_message(message()).unwrap();
+    let local = [LocalWrite::Put {
+        key: b"current".to_vec(),
+        value: b"yes".to_vec(),
+    }];
+    assert!(
+        app.queue_signed_with("chat", signed.clone(), &local)
+            .await
+            .is_err()
+    );
+    let renewed = renewed_and_listed(&p, &mut app, &["tasks"]).await;
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert!(
+        app.queue_signed_with("tasks", signed, &local)
+            .await
+            .is_err()
+    );
+    assert!(
+        app.protocol_get("tasks", b"current")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.protocol_get("chat", b"current")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = app.sign_message(message()).unwrap();
+    app.queue_signed_with("tasks", current, &local)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.protocol_get("tasks", b"current").await.unwrap(),
+        Some(b"yes".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_set_renewal_with_a_root_no_protocol_owns_is_not_taken() {
     // The signer renews an app running `tasks` alone with `chat`'s scopes too: taken, the
     // app would never load again, with `tasks` (an unowned root) or with both (another

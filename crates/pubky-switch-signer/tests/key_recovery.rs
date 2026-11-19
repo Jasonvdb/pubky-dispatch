@@ -419,6 +419,50 @@ async fn test_key_recovery_over_unusable_records_with_no_backup() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_over_damaged_account_binding_without_a_backup() {
+    let world = World::new();
+    let (first, store) = world.enrolled().await;
+    let original = first.identity_doc().unwrap().unwrap();
+    drop(first);
+    edit_state(&world, &store, |state| {
+        state["newest"]["account"] = serde_json::Value::Null;
+    });
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    assert_eq!(
+        Signer::restore_over_unusable(
+            world.env(store.clone()),
+            world.keyring(),
+            RecordsDiscarded::shown_and_confirmed()
+        )
+        .await
+        .unwrap_err(),
+        SignerError::Refused(Refusal::NoBackup)
+    );
+    let shown = survey(&world, &store).await.unwrap();
+    let signer = Box::pin(Signer::restore_over_unusable(
+        world.env(store.clone()),
+        world.keyring(),
+        RecordsDiscarded::shown_and_confirmed()
+            .and_key_recovery(KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[])),
+    ))
+    .await
+    .unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.version() > original.version());
+    assert_eq!(doc.generation(), original.generation());
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_in_place_with_records_behind_and_no_backup() {
     // An install put back to an older state, its records behind its own newer version, and
     // the backup unreadable: it recovers in place.
@@ -1120,13 +1164,18 @@ async fn test_key_recovery_in_place_never_clears_an_alarm_or_a_recovery() {
     // A held alarm, or a provider loss in progress, stops the recovery in place: the alarm
     // is cleared first, and the loss is declared again.
     let world = World::new();
-    let (mut signer, _) = world.enrolled().await;
+    let (mut signer, memory) = world.enrolled().await;
     let earlier = signer.identity_doc().unwrap().unwrap();
     signer.set_record_max_age(Some(60)).await.unwrap();
     world.switch.deliver_identity(&earlier).unwrap();
     let alarm = signer.set_record_max_age(Some(61)).await.unwrap_err();
     assert!(matches!(alarm, SignerError::Alarm(_)));
     assert_eq!(signer.survey_key_recovery().await.unwrap_err(), alarm);
+    drop(signer);
+    edit_state(&world, &memory, |state| {
+        state["newest"]["account"] = serde_json::Value::Null;
+    });
+    assert_eq!(survey(&world, &memory).await.unwrap_err(), alarm);
 
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
@@ -1370,6 +1419,166 @@ async fn test_key_recovery_refused_after_its_commit_leaves_nothing() {
             "{case}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_key_recovery_at_a_rotated_enrollment_key_keeps_an_unfinished_survey() {
+    use pubky_switch_client::client::SentRequest;
+    use pubky_switch_client::transport::MockTransport;
+    use pubky_switch_client::transport::{Header, Response};
+    use pubky_switch_core::enc::b64;
+    use pubky_switch_core::http::{ResponseParts, header, sign_response};
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::EnrollmentAnswer;
+
+    let world = World::new();
+    let (first, _) = world.enrolled().await;
+    let service_key = first.identity_doc().unwrap().unwrap().inbox().service_key;
+    drop(first);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store).await.unwrap();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(
+        Signer::restore_new(
+            world.env(store.clone()),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[])
+        )
+        .await
+        .is_err()
+    );
+    let ns = signer_namespace(&world.key.public());
+    let pending = store.get(&ns, b"flow").unwrap().unwrap();
+
+    // The operator's new current key answers successful enrollments while this account
+    // remains served under the previous key (Switch spec 12.5, Switch wire 3.7).
+    let switch = world.switch.clone();
+    let current = IdentityKey::from_secret([82; 32]);
+    let mut env = world.env(store.clone());
+    env.transport = Arc::new(MockTransport::with_handler(move |request| {
+        let response = switch.handle(request)?;
+        if request.path_and_query != "/v1/enroll" || response.status != 200 {
+            return Ok(response);
+        }
+        let mut answer = EnrollmentAnswer::from_json(&response.body).unwrap();
+        answer.service_key = current.public();
+        let body = answer.to_json().unwrap();
+        let time = response.header(header::SERVER_TIME).unwrap();
+        let signature = sign_response(
+            &current,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: time,
+                head: None,
+                body: &body,
+            },
+        );
+        Ok(Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVER_TIME, time),
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            ],
+            body,
+        })
+    }));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    assert_eq!(
+        signer.cancel_key_recovery(confirmed()).await.unwrap_err(),
+        refused(KeyRecoveryStop::NotServing)
+    );
+    assert_eq!(store.get(&ns, b"flow").unwrap().as_ref(), Some(&pending));
+
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/account".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        refused(KeyRecoveryStop::NotServing)
+    );
+    assert!(
+        store.get(&ns, b"flow").unwrap().as_ref() == Some(&pending),
+        "unresolved enrollment was discarded when the original account could not complete its survey"
+    );
+    signer.resume().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.inbox().service_key, service_key);
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::ServiceKeyNotFollowed { .. }))
+    );
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_key_recovery_saved_enrollment_cannot_move_to_a_recreated_account() {
+    use pubky_switch_client::store::{Fault, FaultStore};
+
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let memory = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &memory).await.unwrap();
+    // The original existing enrollment succeeded; the answer is durable before the
+    // signer starts reading the survey again. Its commit acknowledgement is lost.
+    let cut = Arc::new(FaultStore::new(memory.clone(), Fault::FailAfter(3)));
+    let result = Signer::restore_new(
+        world.env(cut),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(SignerError::Store(pubky_switch_client::StoreError::Unknown))
+    ));
+    let created = world.switch.created();
+    old.close_account(confirmed()).await.unwrap();
+    world.clock.advance_ms(2000);
+    let (mut current, _) = world.enrolled().await;
+    assert!(world.switch.created() > created);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let current_survey = survey(&world, &memory).await.unwrap();
+    assert_ne!(current_survey, shown);
+    let before = current.identity_doc().unwrap().unwrap();
+    assert_eq!(
+        Signer::restore_new(
+            world.env(memory),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&current_survey, &[])
+        )
+        .await
+        .unwrap_err(),
+        refused(KeyRecoveryStop::SurveyChanged)
+    );
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        before.signed()
+    );
+    signs_on(&world, &mut current).await;
 }
 
 #[tokio::test]
@@ -1706,7 +1915,7 @@ fn damage_flow(world: &World, store: &MemoryStore) {
 async fn test_key_recovery_over_unusable_records_keeps_their_floors_and_marks() {
     // The records are unusable, their state readable: its epochs past the service's next
     // one, or its own copy above the service's, stop the recovery.
-    for case in ["epoch", "mark"] {
+    for case in ["epoch", "mark", "records behind"] {
         let world = World::new();
         let (mut first, memory) = world.enrolled().await;
         let older = first.identity_doc().unwrap().unwrap();
@@ -1725,6 +1934,13 @@ async fn test_key_recovery_over_unusable_records_keeps_their_floors_and_marks() 
                     state["epoch_through"] = (newer.data_epoch() + 2).into();
                 });
                 (newer.version(), newer.version())
+            }
+            "records behind" => {
+                let seen = newer.version() + 1;
+                edit_state(&world, &memory, |state| {
+                    state["records_behind"] = seen.into();
+                });
+                (newer.version(), seen)
             }
             _ => {
                 world.switch.deliver_identity(&older).unwrap();

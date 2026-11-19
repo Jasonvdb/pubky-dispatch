@@ -50,6 +50,8 @@ pub(crate) struct ItemsProtocol {
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
     qualify_items: std::sync::atomic::AtomicBool,
     append_item_on_note: std::sync::atomic::AtomicBool,
+    observe_values: std::sync::atomic::AtomicBool,
+    observation_bytes: std::sync::atomic::AtomicUsize,
     observe_deletes: std::sync::atomic::AtomicBool,
     end_mark_at_delete: std::sync::atomic::AtomicBool,
     observation_unavailable: std::sync::atomic::AtomicBool,
@@ -199,11 +201,94 @@ impl Protocol for ItemsProtocol {
         Some(result)
     }
 
+    fn observe_record(
+        &self,
+        observed: &crate::app::RecordObservation<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.observe_values.load(Relaxed) || !observed.current || observed.record.divergent {
+            return Ok(Vec::new());
+        }
+        let targets = [
+            RecordTarget::new(items(), b"n1"),
+            RecordTarget::new(items(), b"n2"),
+        ];
+        let Some(target) = targets
+            .iter()
+            .find(|target| observed.record.key == cx.record_key(target).unwrap())
+        else {
+            return Ok(Vec::new());
+        };
+        let signed = SignedOp::peek(observed.operation).unwrap();
+        assert_eq!(signed.item_hash().unwrap(), observed.application.item_hash);
+        assert_eq!(signed.body().app_id, Some(observed.record.writer));
+        assert_eq!(observed.record.policy, target.collection.policy);
+        assert!(observed.record.authenticated);
+        let mut kept = ids(cx.local_get(b"accepted-items").unwrap().as_deref());
+        let mut changed = false;
+        for id in ids(observed.record.content.value()) {
+            if !kept.contains(&id) {
+                kept.push(id);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(Vec::new());
+        }
+        let mut value = value(&kept.iter().map(String::as_str).collect::<Vec<_>>());
+        value.resize(value.len() + self.observation_bytes.load(Relaxed), b' ');
+        let mut transitions: Vec<Vec<String>> = cx
+            .local_get(b"previous-items")
+            .unwrap()
+            .map(|v| serde_json::from_slice(&v).unwrap())
+            .unwrap_or_default();
+        transitions.push(ids(observed
+            .previous
+            .and_then(|prior| prior.content.value())));
+        Ok(vec![
+            LocalWrite::Put {
+                key: b"accepted-items".to_vec(),
+                value,
+            },
+            LocalWrite::Put {
+                key: b"previous-items".to_vec(),
+                value: serde_json::to_vec(&transitions).unwrap(),
+            },
+        ])
+    }
+
     fn mark_ends_at_delete(&self, collection: &str) -> bool {
         collection == items().name
             && self
                 .end_mark_at_delete
                 .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_lifetime_ended(
+        &self,
+        record: &crate::app::RecordMarkContext<'_>,
+        version: RecordVersion,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(record.collection.name, items().name);
+        if self.observation_unavailable.load(SeqCst) {
+            return Err(crate::app::StoreFailure::unavailable(
+                crate::error::StoreError::Unavailable,
+            ));
+        }
+        let mut value = lifetime_version(version);
+        if self.large_receipt.load(SeqCst) {
+            value.resize(crate::app::MAX_STEP_LOCAL_BYTES + 1, 0);
+        }
+        if cx.local_get(&record.key).unwrap().as_ref() == Some(&value) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![LocalWrite::Put {
+            key: record.key.to_vec(),
+            value,
+        }])
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -6543,6 +6628,151 @@ async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
 }
 
 #[tokio::test]
+async fn test_records_listing_named_generations_waits_for_the_new_child_or_parent_key() {
+    for grant in ["sample-a:shop", "sample-a"] {
+        let s = Setup::new();
+        let family = Collection::with_permanent_generations(
+            "sample.items",
+            "sample-a:shop",
+            &["sample-a:shop"],
+        );
+        *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+        let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+        let target = RecordTarget::new(
+            Collection::new(&family.name, family.policy.clone().permanent(Some(1))),
+            b"shop",
+        );
+        writer
+            .put_record(&target, &value(&["issued"]), vec![])
+            .await
+            .unwrap();
+        let key = writer.record_key(&target).unwrap();
+        let mut reader = join_scoped(&s, "wallet", &["sample-a:other"]).await;
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        s.w.clock.advance_ms(HOUR);
+        let earlier = reader.cert().clone();
+        let renewed = renewed_cert(&s, "wallet", &[grant]);
+        s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+        reader.receive(None).await.unwrap();
+        assert_eq!(reader.cert().hash(), renewed.hash());
+        assert!(family.readable_by(reader.cert()));
+        assert!(reader.listing_owed().await.unwrap(), "{grant}");
+        let before = s.w.switch.lock().shared.listings;
+        reader.receive(None).await.unwrap();
+        assert_eq!(s.w.switch.lock().shared.listings, before, "{grant}");
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        store_parts_for(&s, &renewed);
+        reader.receive(None).await.unwrap();
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        let held = reader.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), ["issued"], "{grant}");
+    }
+}
+
+#[tokio::test]
+async fn test_records_retained_child_key_reads_the_same_collection_after_a_parent_grant() {
+    let s = Setup::new();
+    let family =
+        Collection::with_permanent_generations("sample.items", "sample-a:shop", &["sample-a:shop"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let member = Collection::new(&family.name, family.policy.clone().permanent(Some(1)));
+    let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+    let first = RecordTarget::new(member.clone(), b"first");
+    writer
+        .put_record(&first, &value(&["one"]), vec![])
+        .await
+        .unwrap();
+    let mut reader = join_scoped(&s, "wallet", &["sample-a:shop"]).await;
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&first).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["one"]);
+    s.w.clock.advance_ms(HOUR);
+    let old = reader.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &old, &renewed, None));
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.cert().hash(), renewed.hash());
+    assert!(!reader.listing_owed().await.unwrap());
+
+    let second = RecordTarget::new(member, b"second");
+    writer
+        .put_record(&second, &value(&["two"]), vec![])
+        .await
+        .unwrap();
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&second).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["two"]);
+
+    // An independent gap still needs its listing. Its records use the child key the
+    // reader already holds even though the wider bundle has not arrived.
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now - 1, now);
+    let before = s.w.switch.lock().shared.listings;
+    let report = reader.receive(None).await.unwrap();
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey))
+    );
+    assert!(s.w.switch.lock().shared.listings > before);
+    assert!(!reader.listing_owed().await.unwrap());
+}
+
+#[tokio::test]
+async fn test_records_listing_named_permanent_generations_restarts_a_narrow_scan() {
+    let s = Setup::new();
+    let family = Collection::with_permanent_generations("sample.items", "sample-a", &["sample-a"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut reader = s.join("wallet").await;
+    let mut writer = s.join("phone").await;
+    let named = |g| Collection::new(&family.name, family.policy.clone().permanent(Some(g)));
+    for n in 0..6 {
+        let key = format!("recipient-{n}");
+        writer
+            .put_record(
+                &RecordTarget::new(named(1), key.as_bytes()),
+                &value(&["issued"]),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let first = reader.list_collection(&named(2)).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    assert!(reader.records_of(&family.name).await.unwrap().is_empty());
+
+    let first = reader.list_collection(&family).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    let second = reader.list_collection(&family).await.unwrap();
+    assert!(!second.more);
+    assert_eq!(second.records, 2);
+    let found = reader.records_of(&family.name).await.unwrap();
+    assert_eq!(found.len(), 6);
+    assert!(
+        found
+            .iter()
+            .all(|r| r.policy == named(1).policy && r.content.value().is_some())
+    );
+    let template = RecordTarget::new(family, b"recipient-7");
+    assert!(reader.record_key(&template).is_err());
+    assert!(
+        reader
+            .record_op(&template, Some(&value(&["issued"])), vec![])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_records_list_collections_reads_at_most_its_page_budget_and_goes_on() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
@@ -11794,6 +12024,10 @@ async fn seen_then_deleted(s: &Setup) -> (App, App, RecordTarget, [u8; 32]) {
     (wallet, phone, target, key)
 }
 
+fn lifetime_version(version: RecordVersion) -> Vec<u8> {
+    serde_json::to_vec(&[version.generation, version.version]).unwrap()
+}
+
 /// Both the author and an app reading a verified deletion accept a new first value
 /// after reloading. A live write that drops a seen item still fails its ordinary check.
 #[tokio::test]
@@ -11808,6 +12042,15 @@ async fn test_record_lifetime_ends_for_the_deleting_app_and_its_reader() {
     assert!(matches!(phone.read_record_fresh(&target).await.unwrap(),
         RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
     assert_eq!(phone.record_seen(&key).await.unwrap(), None);
+    let ended = lifetime_version(phone.shared_record(&key).await.unwrap().unwrap().version);
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(ended.clone())
+    );
+    assert_eq!(
+        phone.protocol_get("sample", &key).await.unwrap(),
+        Some(ended.clone())
+    );
     drop(wallet);
     let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), wallet_id)
         .await
@@ -11832,6 +12075,10 @@ async fn test_record_lifetime_ends_for_the_deleting_app_and_its_reader() {
     assert_eq!(
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["b"]
+    );
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(ended)
     );
 }
 
@@ -11862,6 +12109,7 @@ async fn test_record_lifetime_keeps_its_mark_through_an_unreadable_value_and_rel
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["a", "x", "y"]
     );
+    assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -11936,9 +12184,15 @@ async fn test_record_lifetime_waits_for_a_delete_view_covering_the_upload() {
         });
         let listed = wallet.list_collection(&target.collection).await.unwrap();
         assert_eq!(listed.records, 0);
+        assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
         assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(mark));
         assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
             RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+        let version = wallet.shared_record(&key).await.unwrap().unwrap().version;
+        assert_eq!(
+            wallet.protocol_get("sample", &key).await.unwrap(),
+            Some(lifetime_version(version))
+        );
         assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
     })
     .await;
@@ -11993,9 +12247,51 @@ async fn test_record_lifetime_commits_the_deleted_value_and_mark_together() {
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["a"]
     );
+    assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
     assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
         RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
     assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    let version = wallet.shared_record(&key).await.unwrap().unwrap().version;
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(lifetime_version(version))
+    );
+}
+
+/// An installation that has not read the original value can still observe its
+/// verified deletion. A callback failure or oversized local write leaves it for retry.
+#[tokio::test]
+async fn test_record_lifetime_owner_can_retry_a_deletion_without_a_native_mark() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    s.protocol.end_mark_at_delete.store(true, SeqCst);
+    let mut phone = s.join("phone").await;
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("shared");
+    let key = wallet.record_key(&target).unwrap();
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.delete_record(&target, vec![]).await.unwrap();
+    assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    for setting in [
+        &s.protocol.observation_unavailable,
+        &s.protocol.large_receipt,
+    ] {
+        setting.store(true, SeqCst);
+        assert!(wallet.read_record_fresh(&target).await.is_err());
+        setting.store(false, SeqCst);
+        assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
+    }
+    let RecordRead::Fresh(deleted) = wallet.read_record_fresh(&target).await.unwrap() else {
+        panic!("the read covers the deletion");
+    };
+    assert_eq!(deleted.content, RecordContent::Deleted);
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(lifetime_version(deleted.version))
+    );
 }
 
 /// The mark after an own delete is the one before it, not a mark of nothing.
@@ -12432,6 +12728,7 @@ async fn test_records_receive_checks_the_mark_of_the_preceding_write() {
     use std::sync::atomic::Ordering::Relaxed;
     let s = Setup::new();
     s.protocol.qualify_items.store(true, Relaxed);
+    s.protocol.observe_values.store(true, Relaxed);
     let mut wallet = s.join("wallet").await;
     let mut phone = s.join("phone").await;
     let target = s.target("n1");
@@ -12469,6 +12766,14 @@ async fn test_records_receive_checks_the_mark_of_the_preceding_write() {
     };
     assert_eq!(current.writer, wallet.app_id(), "{:?}", report.events);
     assert_eq!(current.content.value(), Some(expected.as_slice()));
+    assert_eq!(
+        wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected.as_slice())
+    );
     assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(expected));
 }
 
@@ -12730,6 +13035,159 @@ async fn test_records_second_device_write_waiting_for_its_key_keeps_the_mark() {
     assert_eq!(after_b, ["a", "x"]);
 }
 
+/// A record first taken from the feed and an own replacement share the observations
+/// kept for this protocol, including when its selected backup restores on a new store.
+#[tokio::test]
+async fn test_records_protocol_observations_follow_the_record_and_its_selected_backup() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    s.protocol.observe_values.store(true, Relaxed);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    phone.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    // A superseded record is served as a stub (Switch wire 7.5). Read the first
+    // value before its replacement, then read two still-live writes in one page.
+    wallet.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["first", "second"]), vec![])
+        .await
+        .unwrap();
+    phone
+        .put_record(&s.target("n2"), &value(&["other"]), vec![])
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first", "second", "other"]
+    );
+    wallet
+        .put_record(&target, &value(&["third"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["third"]
+    );
+    let before: Vec<Vec<String>> = serde_json::from_slice(
+        &wallet
+            .protocol_get("sample", b"previous-items")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before,
+        [
+            Vec::<String>::new(),
+            vec!["first".to_owned()],
+            Vec::<String>::new(),
+            vec!["first".to_owned(), "second".to_owned()]
+        ]
+    );
+    let backup = wallet.backup_layered().await.unwrap();
+    let restored = App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids(restored
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first", "second", "other", "third"]
+    );
+}
+
+/// A local effect that doesn't fit cannot advance the record or its feed position.
+/// The same signed application is taken after the owner can store its restriction.
+#[tokio::test]
+async fn test_records_protocol_observation_waits_for_its_local_writes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    s.protocol.observe_values.store(true, Relaxed);
+    s.protocol
+        .observation_bytes
+        .store(crate::app::MAX_STEP_LOCAL_BYTES, Relaxed);
+    let error = wallet.receive(None).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Store(crate::error::StoreError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    assert!(
+        wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let me = wallet.app_id();
+    drop(wallet);
+    s.protocol.observation_bytes.store(0, Relaxed);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["first"]
+    );
+    assert_eq!(
+        ids(wallet
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["first"]
+    );
+}
+
 /// The wallet changes `["a"]` to `["b"]`, loses the answer, and its feed shows the write
 /// first: its mark is `["b"]` from then on, through the answer of the resend. Another app's
 /// `["b", "c"]` on top of it is taken, not flagged.
@@ -12849,8 +13307,27 @@ async fn second_device_write_unopened(s: &Setup) -> (App, App, RecordTarget, [u8
 #[tokio::test]
 async fn test_records_second_device_write_reopened_with_its_key_marks_its_value() {
     let s = Setup::new();
+    s.protocol
+        .observe_values
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let (mut a, mut phone, target, key) = second_device_write_unopened(&s).await;
+    assert_eq!(
+        ids(a
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["a", "x"],
+    );
     a.receive(None).await.unwrap();
+    assert_eq!(
+        ids(a
+            .protocol_get("sample", b"accepted-items")
+            .await
+            .unwrap()
+            .as_deref()),
+        ["a", "x", "y"],
+    );
     let held = a.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), ["a", "x", "y"]);
     assert_eq!(

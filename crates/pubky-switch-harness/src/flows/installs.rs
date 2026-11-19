@@ -12,6 +12,9 @@
 //! switch answers as the delivery it already took. Only [`signer_two_installs_race`] has
 //! the switch refuse a delivery.
 
+#[cfg(test)]
+mod cancel_key_recovery;
+
 use std::sync::Arc;
 
 use pubky_switch_client::store::MemoryStore;
@@ -934,3 +937,94 @@ pub async fn signer_key_recovery_backup_gone(world: &World) -> FlowResult {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Backend;
+    use pubky_switch_client::StoreError;
+    use pubky_switch_client::store::{Fault, FaultStore, StateStore, WriteBatch};
+    use pubky_switch_signer::state::signer_namespace;
+    use pubky_switch_signer::{RecordsDiscarded, RecordsFault};
+
+    #[tokio::test]
+    async fn test_restore_damaged_account_binding_scripted() {
+        let result = crate::run_here(Backend::Scripted, restore_damaged_binding).await;
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_restore_damaged_account_binding_service() {
+        let result = crate::run_here(Backend::Service, restore_damaged_binding).await;
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+    }
+
+    async fn restore_damaged_binding(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let store = Arc::new(MemoryStore::new());
+        let env = world.signer_env(&alice, store.clone())?;
+        let mut signer =
+            Box::pin(Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN)).await?;
+        Box::pin(signer.resume()).await?;
+        let first = signer.identity_doc()?.ok_or("missing first version")?;
+        drop(signer);
+
+        // The signed document survives a damaged device snapshot, but its local account
+        // binding is missing. Ordinary reopening must preserve the snapshot (Switch spec 12.8).
+        let ns = signer_namespace(&alice.public());
+        let old = store.get(&ns, b"state")?.ok_or("missing signer state")?;
+        let mut state: Value = serde_json::from_slice(&old)?;
+        let account = state
+            .pointer_mut("/newest/account")
+            .ok_or("missing original account")?;
+        assert!(account.is_object());
+        *account = Value::Null;
+        let damaged = serde_json::to_vec(&state)?;
+        let mut batch = WriteBatch::new();
+        batch.put(&ns, b"state", damaged.clone())?;
+        store.commit(batch)?;
+        let opened = Signer::open(env.clone(), world.keyring(&alice)?).await;
+        assert!(matches!(
+            opened,
+            Err(SignerError::Records(RecordsFault::Damaged(_)))
+        ));
+        assert_eq!(store.get(&ns, b"state")?, Some(damaged));
+
+        // The user's confirmed replacement commits, but its result doesn't reach the host.
+        let faulty = Arc::new(FaultStore::new(store.clone(), Fault::FailAfter(1)));
+        let result = Box::pin(Signer::restore_over_unusable(
+            world.signer_env(&alice, faulty)?,
+            world.keyring(&alice)?,
+            RecordsDiscarded::shown_and_confirmed(),
+        ))
+        .await;
+        assert!(matches!(
+            result,
+            Err(SignerError::Store(StoreError::Unknown))
+        ));
+        let mut signer = Signer::open(env, world.keyring(&alice)?).await?;
+        Box::pin(signer.resume()).await?;
+        let doc = signer.identity_doc()?.ok_or("missing restored version")?;
+        assert_eq!(signer.status(), SignerStatus::Signing);
+        assert_eq!(
+            (doc.version(), doc.generation()),
+            (first.version() + 1, first.generation())
+        );
+        assert_eq!(doc.body().signer, signer.install_id());
+        assert_eq!(
+            world
+                .files()
+                .identity_doc(&alice.public())
+                .map(|published| published.hash()),
+            Some(doc.hash())
+        );
+        let next = Box::pin(signer.set_record_max_age(Some(60))).await?;
+        assert_eq!(next.version(), doc.version() + 1);
+        assert_eq!(published(world, &alice), Some(next.version()));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pending_delivery;

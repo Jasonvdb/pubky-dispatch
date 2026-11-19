@@ -80,6 +80,7 @@ const COVERED: &[&str] = &[
     "Alert",
     "Source",
     "RenewalSkip",
+    "FirstEnrollmentStop",
     "SignerError",
     "RecordsFault",
     "SignerRecord",

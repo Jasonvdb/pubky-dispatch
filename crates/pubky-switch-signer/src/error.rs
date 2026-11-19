@@ -103,6 +103,9 @@ pub enum RecordsFault {
     /// A flow is present without the state committed together with it.
     #[error("flow without state")]
     Incomplete,
+    /// The state read from the store breaks a binding checked before every write.
+    #[error("stored signer state is damaged: {0}")]
+    Damaged(&'static str),
     /// The bounded write batch refused a write before calling the host store.
     #[error("{0}")]
     WriteRefused(pubky_switch_client::store::BatchError),
@@ -341,10 +344,21 @@ pub enum Refusal {
     /// ([`crate::Signer::resume`] sends it).
     #[error("refused: the switch isn't confirmed since an alarm")]
     SwitchUnconfirmed,
+    /// There is no ordinary recovery that the holder can stop before its version is signed
+    /// (Switch spec 12.8). A signed delivery or other pending work resumes normally.
+    #[error("refused: no ordinary key recovery is pending before its signed version")]
+    NoPendingKeyRecovery,
     /// The original first creation cannot be restarted under the same absent account
     /// binding (Switch account binding 3). Resume the pending action or use recovery.
     #[error("refused: first enrollment cannot be restarted at this service")]
     FirstEnrollmentUnavailable,
+    /// Setup waits at the saved first step until the user addresses its alert.
+    #[error("refused: first enrollment is waiting for the user")]
+    FirstEnrollmentHeld,
+    /// First discovery found an account or its mark before this install signed a creation.
+    /// The user can restore the signer (Switch account binding 3 and spec 12.8).
+    #[error("refused: the service already has this identity's account or its mark")]
+    FirstAccountPresent,
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,

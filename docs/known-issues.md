@@ -4,13 +4,31 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
+
+- `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
+
+Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.
+
+- First setup can wait with `SignerStatus::FirstEnrollmentHeld`. Show the reason in `Alert::FirstEnrollmentHeld` after reopening. Keep the original request and let the user choose the applicable recovery or clear the alert to retry that step. Both `resume` and `run_due` return `Refusal::FirstEnrollmentHeld` while the alert is held. Signer stores can now contain this alert.
+
 A protocol can use `Protocol::qualify_record_mark` to bind a readable value and its mark to the actual record key. A local write that fails this check is refused before signing. After another installation has written the record, the client retains its service revision and the last qualified mark across restart. Hosts must check the shared record's `flagged` and `not_taken` fields before using its contents. A later qualifying write can make the record usable again. A message handler sees the record, mark and application established by earlier entries in the same receive call.
 
 The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, record reads and collection pages used to discover uploaded records must cover the relevant upload. An earlier or unordered answer keeps the read or page outstanding across restart. A direct fresh lookup reports an inconclusive result when its answer predates an outstanding upload. A replay can learn the signed write from that earlier view and keep the divergence flag until a covering observation settles it. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. Upcoming client additions are listed below.
 
+A protocol that needs evidence from successive verified record writes can implement `Protocol::observe_record`. Its local writes commit with the record and can be included in its selected backup layer. The observation carries the signed operation, the accepted and previously held records, and whether the source covers pending uploads. The host receives an error if the protocol cannot store its observation. The read or outstanding batch can then be retried.
+
 A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
+Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
+
 **Caller changes already on main**
+
+- Register the protocol that owns an outgoing kind if its messages should open a conversation for replies. A kind without a registered owner adds no conversation entry.
+
+- When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
+
+- To restore an existing account from a signed first setup, offer `Signer::survey_first_enrollment_restore` at the original service. Show the account, the survey's signed `identity_doc` and the recoverable history, explain that the earlier send may have committed, and call `Signer::restore_first_enrollment` only after confirmation. A fresh setup with no signed creation uses the ordinary restore described above.
 
 - A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 
@@ -71,10 +89,9 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 - [keys] **A hand-over can strand the only sealed copy of the identity key.** The receiving device installs the key in its vault only after the service confirms that the device has taken over. Retain an independent copy of the key until the receiving vault has confirmed possession.
 - [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
-- [keys] **Some damaged signer stores cannot be restored in place.** Certain invalid stored values fall outside the damage the restore call accepts, and a surviving operation or alarm can also block replacement. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
-- [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A changed binding, a permanent refusal other than expiry, or an existing identity document or backup requires the appropriate restore or confirmed provider-loss procedure.
+- [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
+- [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A signed changed binding can lead to confirmed same-service restore when the original service now serves a verified identity document for the current account. Other permanent refusals and a surviving mark retain the applicable recovery options.
 - [availability] **Changing answers can prevent key recovery from finishing.** If a read changes what the user confirmed, recovery at a serving account returns `SurveyChanged`. Survey again when the sources are stable. A provider loss declared with the key can proceed when a source shows less than before, but new evidence still requires confirmation.
-- [availability] **An interrupted key recovery has no ordinary cancel operation.** Persistent storage or communication errors can leave recovery pending and block other signing operations on that installation. Preserve the pending state so recovery can resume when the dependency is available.
 - [data] **Key recovery at a lost service can drop revoked App IDs without saying how many.** When more revoked IDs exist than one enrollment carries, the extra ones that no version of the identity document lists are dropped, and the survey does not show the count. A dropped ID comes back only through a new approval by the user.
 - [data] **A temporary rate limit can cause recovery to skip usable backup data.** If the backup's service returns `429` during its check, key recovery can proceed without the backup's key-bundle parts and with limits taken from enrollment. Retry after the rate limit clears before relying on the reconstructed state.
 

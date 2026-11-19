@@ -1221,6 +1221,28 @@ async fn test_policy_family_fixed_collection_flags_a_sub_scope_record() {
 }
 
 #[test]
+fn test_policy_family_named_permanent_generations_checks_every_policy_member() {
+    let family = Collection::with_permanent_generations("c", "name", &["name", "other"]);
+    for generation in [1, 2, pubky_switch_core::json::MAX_INT] {
+        assert!(family.admits(&family.policy.clone().permanent(Some(generation))));
+    }
+    for policy in [
+        family.policy.clone(),
+        family.policy.clone().permanent(None),
+        family.policy.clone().permanent(Some(0)),
+        family
+            .policy
+            .clone()
+            .permanent(Some(pubky_switch_core::json::MAX_INT + 1)),
+        Policy::new("else", &["name", "other"]).permanent(Some(1)),
+        Policy::new("name", &["name"]).permanent(Some(1)),
+        Policy::new("name", &["name", "other", "another"]).permanent(Some(1)),
+    ] {
+        assert!(!family.admits(&policy), "{policy:?}");
+    }
+}
+
+#[test]
 fn test_policy_family_members_follow_the_scope_rule() {
     let family = Collection {
         name: "c".into(),

@@ -15,8 +15,9 @@ use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AppCert, CarriedAccountObservation, DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentIntent,
-    IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover, StoredPart,
+    AccountAssociation, AccountObservation, AppCert, CarriedAccountObservation,
+    DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentAnswer, EnrollmentIntent, IdentityDoc,
+    IdentityPolicy, Limits, SignerBackup, SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
@@ -634,6 +635,11 @@ impl SignerState {
         }
     }
 
+    /// This installation has neither selected an account nor spent a document version.
+    pub(crate) fn before_first_version(&self) -> bool {
+        self.service.is_none() && self.newest.is_none() && self.signed_through == 0
+    }
+
     /// The newest document, verified.
     pub(crate) fn newest_doc(&self) -> Result<Option<IdentityDoc>> {
         self.newest
@@ -649,8 +655,18 @@ impl SignerState {
             .collect()
     }
 
+    /// Check state read from the store. A failed binding here describes the stored value.
+    pub(crate) fn check_stored_copies(&self) -> Result<()> {
+        self.check_copies().map_err(|error| match error {
+            SignerError::Records(RecordsFault::Invariant(binding)) => {
+                RecordsFault::Damaged(binding).into()
+            }
+            other => other,
+        })
+    }
+
     /// Check the signed copies independently of the service and of caller-supplied keys.
-    pub(crate) fn check_copies(&self) -> Result<()> {
+    fn check_copies(&self) -> Result<()> {
         for service in self
             .service
             .iter()
@@ -722,6 +738,17 @@ pub(crate) enum DeliverStep {
     BackupWritten,
 }
 
+/// Local progress of the exact existing enrollment for a key-only recovery (Switch spec 12.8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum KeyEnrollmentStep {
+    /// No send can start until this step has been durably replaced.
+    Unsent,
+    /// The original request may have reached the service.
+    Sending,
+    /// An authenticated success from the selected service key and creation.
+    Applied(Box<EnrollmentAnswer>),
+}
+
 /// A distinct recovery's enrollment, before discovery or retained for exact retries
 /// (Switch account binding 2-3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,6 +768,34 @@ pub(crate) enum RecoveryEnrollment {
 }
 
 impl RecoveryEnrollment {
+    /// Verify the ordinary recovery's selected serving account and its signed existing intent.
+    pub(crate) fn existing(
+        &self,
+        identity: &[u8; 32],
+        origin: &str,
+    ) -> Result<(AccountObservation, Enrollment)> {
+        let Self::Ready {
+            observation,
+            enrollment,
+        } = self
+        else {
+            return Err(RecordsFault::Invariant("a key recovery without its enrollment").into());
+        };
+        let observed = observation
+            .verify(identity, origin)
+            .map_err(SignerError::StoredData)?;
+        let signed =
+            Enrollment::verify(enrollment, identity, origin).map_err(SignerError::StoredData)?;
+        if observed.body().association != AccountAssociation::Account
+            || signed.body().intent != observed.enrollment_intent()?
+            || signed.body().identity_doc.is_some()
+            || !signed.revoked_apps().is_empty()
+        {
+            return Err(RecordsFault::Invariant("another key recovery enrollment").into());
+        }
+        Ok((observed, signed))
+    }
+
     /// Permanent exclusions are the retained tombstones outside the verified recovery base
     /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
     /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
@@ -795,6 +850,13 @@ pub(crate) enum Flow {
         enrollment: Option<SignedDoc>,
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
+    },
+    /// First setup found an account or surviving mark before signing a creation.
+    FirstAccountPresent {
+        /// The origin the user selected for setup.
+        origin: String,
+        /// The original authenticated discovery (Switch account binding 2.1).
+        observation: CarriedAccountObservation,
     },
     /// Recovering from a provider loss (Switch spec 12.6 step 1): enrolling at the service
     /// at `origin`, then signing the next generation's `identity.json` with `recovery_from`,
@@ -866,6 +928,8 @@ pub(crate) enum Flow {
         origin: String,
         /// The observation and the signed `existing` enrollment selected from it.
         enrollment: RecoveryEnrollment,
+        /// Whether the selected enrollment can already be stopped before signing its version.
+        step: KeyEnrollmentStep,
         /// The digest of the survey the user confirmed.
         digest: [u8; 32],
         /// The listed apps the user chose to drop.
@@ -890,8 +954,24 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    /// The chosen service where first setup stopped before signing any enrollment.
+    pub(crate) fn first_account_origin(&self) -> Option<&str> {
+        match self {
+            Self::FirstAccountPresent { origin, .. } => Some(origin),
+            _ => None,
+        }
+    }
+
+    /// A first setup stopped before signing has no pending action for a restore to displace.
+    pub(crate) fn blocks_restore(&self) -> bool {
+        self.first_account_origin().is_none()
+    }
+
     pub(crate) fn check_state(&self, state: &SignerState) -> Result<()> {
         self.check_copies(&state.identity)?;
+        if matches!(self, Self::FirstAccountPresent { .. }) && !state.before_first_version() {
+            return Err(RecordsFault::Invariant("first setup already selected an account").into());
+        }
         if let Self::Recover { origin, enrollment } = self {
             enrollment.check_exclusions(state, origin)?;
         }
@@ -920,29 +1000,36 @@ impl Flow {
                     }
                 }
             }
-            Self::KeyRecover {
-                origin, enrollment, ..
+            Self::FirstAccountPresent {
+                origin,
+                observation,
             } => {
-                let RecoveryEnrollment::Ready {
-                    observation,
-                    enrollment,
-                } = enrollment
-                else {
-                    return Err(
-                        RecordsFault::Invariant("a key recovery without its enrollment").into(),
-                    );
-                };
                 let observed = observation
                     .verify(identity, origin)
                     .map_err(SignerError::StoredData)?;
-                let signed = Enrollment::verify(enrollment, identity, origin)
-                    .map_err(SignerError::StoredData)?;
-                // The observation is of a serving account, so its intent is `existing`.
-                if signed.body().intent != observed.enrollment_intent()?
-                    || signed.body().identity_doc.is_some()
-                    || !signed.revoked_apps().is_empty()
-                {
-                    return Err(RecordsFault::Invariant("another key recovery enrollment").into());
+                if observed.body().association == AccountAssociation::Absent {
+                    return Err(
+                        RecordsFault::Invariant("first setup recorded an absent account").into(),
+                    );
+                }
+            }
+            Self::KeyRecover {
+                origin,
+                enrollment,
+                step,
+                ..
+            } => {
+                let (observed, signed) = enrollment.existing(identity, origin)?;
+                if let KeyEnrollmentStep::Applied(answer) = step {
+                    answer.check(&signed).map_err(SignerError::StoredData)?;
+                    if answer.service_key != observed.body().service_key
+                        || Some(answer.created) != signed.body().intent.created()
+                    {
+                        return Err(RecordsFault::Invariant(
+                            "another key recovery enrollment result",
+                        )
+                        .into());
+                    }
                 }
             }
             Self::Recover { origin, enrollment } => {
@@ -1092,7 +1179,7 @@ pub(crate) async fn load(
         return Ok(None);
     };
     let flow = records.flow?;
-    state.check_copies()?;
+    state.check_stored_copies()?;
     if let Some(flow) = &flow {
         flow.check_state(&state)?;
     }

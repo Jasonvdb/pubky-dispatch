@@ -2,6 +2,8 @@
 //!
 //! Each alert carries the facts to show; the wording is the host's.
 
+use pubky_switch_client::{ClientError, TransportError};
+use pubky_switch_core::http::{ErrorCode, Retry};
 use serde::{Deserialize, Serialize};
 
 /// Where the signer saw a copy of `identity.json`.
@@ -44,10 +46,98 @@ pub enum RenewalSkip {
     },
 }
 
+/// Why the original first enrollment is waiting for the host (Switch account binding 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum FirstEnrollmentStop {
+    /// The original service authenticated the expiry of the signed creation's observation.
+    Expired,
+    /// The original service authenticated a change to the signed creation's account binding.
+    Changed,
+    /// The service refused this request with a code requiring action before retry.
+    Refused(#[serde(with = "refusal_code")] ErrorCode),
+    /// No usable answer establishes what happened to the original setup.
+    Unconfirmed,
+}
+
+impl FirstEnrollmentStop {
+    pub(crate) fn from_error(error: &ClientError) -> Option<Self> {
+        match error {
+            ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            } if *current == serde_json::json!({ "binding": "expired" }) => Some(Self::Expired),
+            ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            } if *current == serde_json::json!({ "binding": "changed" }) => Some(Self::Changed),
+            ClientError::Switch { code, .. } if Self::needs_action(*code) => {
+                Some(Self::Refused(*code))
+            }
+            ClientError::BodyUnread {
+                code: ErrorCode::RateLimited,
+                ..
+            } => None,
+            ClientError::BadServiceSignature { .. }
+            | ClientError::InvalidResponse(_)
+            | ClientError::BodyUnread { .. }
+            | ClientError::Core(_)
+            | ClientError::Chain(_)
+            | ClientError::BodyOverCap { .. }
+            | ClientError::Unpinned
+            | ClientError::Usage(_)
+            | ClientError::StaleAnswer { .. }
+            | ClientError::Transport(
+                TransportError::Refused(_)
+                | TransportError::TooLarge(_)
+                | TransportError::InvalidRequest(_)
+                | TransportError::UnreadableSignedHeader { .. },
+            ) => Some(Self::Unconfirmed),
+            _ => None,
+        }
+    }
+
+    fn needs_action(code: ErrorCode) -> bool {
+        !matches!(
+            code.retry(),
+            Retry::WithNewTimestamp | Retry::AfterRetryAfter | Retry::WhenLimitFrees | Retry::Yes
+        )
+    }
+}
+
+/// Keep only a defined refusal code from spec 6.4 in the signer's alert.
+mod refusal_code {
+    use super::{ErrorCode, FirstEnrollmentStop};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(super) fn serialize<S: Serializer>(
+        code: &ErrorCode,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(code.as_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ErrorCode, D::Error> {
+        ErrorCode::parse(&String::deserialize(deserializer)?)
+            .filter(|code| FirstEnrollmentStop::needs_action(*code))
+            .ok_or_else(|| D::Error::custom("invalid first enrollment refusal code"))
+    }
+}
+
 /// Something the user needs to know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Alert {
+    /// First setup is paused at its original step. Clear after the user chooses to retry
+    /// that step, or use the applicable confirmed recovery (Switch account binding 3).
+    FirstEnrollmentHeld {
+        /// The result the host should explain.
+        reason: FirstEnrollmentStop,
+    },
     /// A copy of `identity.json` older than the newest one a service accepted from this signer:
     /// a rollback, which the signer doesn't build on (Switch spec 4.3, Switch wire 3.3 "Never
     /// back").
@@ -409,6 +499,7 @@ impl Alert {
             Self::Rollback { .. }
             | Self::Equivocation { .. }
             | Self::ManagedByOtherInstall { .. }
+            | Self::FirstEnrollmentHeld { .. }
             | Self::BackupUnreadable
             | Self::AdmissionNotEnded
             | Self::UnreadableBackupBeforeEnrollment

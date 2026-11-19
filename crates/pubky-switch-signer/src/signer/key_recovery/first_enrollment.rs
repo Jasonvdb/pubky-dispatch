@@ -1,7 +1,6 @@
 //! Confirmed restoration of a serving account from a pending first setup (Switch account binding 3).
 
-use pubky_switch_client::ClientError;
-use pubky_switch_core::http::ErrorCode;
+use crate::alert::FirstEnrollmentStop;
 use pubky_switch_core::records::{Enrollment, IdentityDoc};
 
 use super::{
@@ -71,11 +70,9 @@ impl Signer {
         }
         match Box::pin(self.enroll(origin, original.signed(), original.body().policy)).await {
             Ok(()) => return Box::pin(self.resume()).await,
-            Err(SignerError::Switch(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            })) if current == serde_json::json!({ "binding": "changed" }) => {}
+            Err(SignerError::Switch(error))
+                if FirstEnrollmentStop::from_error(&error)
+                    == Some(FirstEnrollmentStop::Changed) => {}
             Err(error) => return Err(error),
         }
         let (current, plan, backup) = Box::pin(self.serving_first_account(&original)).await?;

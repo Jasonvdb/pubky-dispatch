@@ -330,7 +330,14 @@ mod tests {
             code: ErrorCode::Conflict, current, ..
         })) if current == json!({ "binding": "changed" }))
         );
-        assert_eq!(first.status(), SignerStatus::Enrolling);
+        assert_eq!(first.status(), SignerStatus::FirstEnrollmentHeld);
+        assert!(
+            first
+                .alerts()
+                .contains(&pubky_switch_signer::Alert::FirstEnrollmentHeld {
+                    reason: pubky_switch_signer::FirstEnrollmentStop::Changed
+                })
+        );
         assert_eq!(
             first
                 .restore(UserConfirmed::shown_and_confirmed())

@@ -237,7 +237,7 @@ impl App {
         self.ready_local().await?;
         self.check_registered(protocol)?;
         let mut tx = self.tx()?;
-        tx.put(&format!("loss-checkpoint/{protocol}"), &key)?;
+        tx.put(&keys::checkpoint(protocol), &key)?;
         tx.put("retain-loss-uploads", &true)?;
         self.commit(tx).await
     }

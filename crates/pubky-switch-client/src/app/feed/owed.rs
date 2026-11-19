@@ -1,5 +1,7 @@
 //! Retained protocol calls and their completion (Switch spec 8.3).
 
+use std::collections::BTreeMap;
+
 use pubky_switch_core::ops::{OpKind, SignedOp};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -27,6 +29,47 @@ pub(crate) struct Owed {
 }
 
 impl Owed {
+    /// Each remaining owner receives the observation kept with its installed state.
+    pub(crate) fn missed_owners(reads: Vec<(String, MissedEntries)>) -> Option<Self> {
+        let (_, first) = reads.first()?;
+        let notice = first.clone();
+        let mut to = Vec::with_capacity(reads.len());
+        let mut other_reads = BTreeMap::new();
+        for (name, read) in reads {
+            if read != notice {
+                other_reads.insert(name.clone(), read);
+            }
+            to.push(name);
+        }
+        Some(Self {
+            to,
+            call: OwedCall::Missed {
+                notice,
+                other_reads,
+            },
+        })
+    }
+
+    pub(crate) fn check_place(&self, rest: &str) -> Result<(u64, u64), AppError> {
+        let (generation, seq) = owed_place(rest)?;
+        if self.call.stored_at(generation, seq) != format!("{}{rest}", key::OWED_PREFIX) {
+            return Err(super::super::corrupt());
+        }
+        if let OwedCall::Missed {
+            notice,
+            other_reads,
+        } = &self.call
+            && other_reads.iter().any(|(name, other)| {
+                !self.to.contains(name)
+                    || other.seq != notice.seq
+                    || other.entries != notice.entries
+            })
+        {
+            return Err(super::super::corrupt());
+        }
+        Ok((generation, seq))
+    }
+
     /// A remaining-owner set is nonempty, unique and registered. Completed owners may
     /// be absent: their effects and removal committed together (Switch spec 8.3).
     pub(crate) fn check_owners(
@@ -59,10 +102,11 @@ pub(crate) enum OwedCall {
         unreadable: bool,
     },
     Missed {
-        seq: u64,
-        entries: u64,
-        accepted_from_ms: u64,
-        accepted_until_ms: u64,
+        #[serde(flatten)]
+        notice: MissedEntries,
+        /// A restore can combine recipients whose calls came from different reads.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        other_reads: BTreeMap<String, MissedEntries>,
     },
     /// A deny list change, owed in feed order: the calls behind it wait for it.
     Deny {
@@ -85,6 +129,15 @@ pub(crate) enum OwedCall {
         /// The operation, as the feed showed it.
         op: SignedDoc,
     },
+}
+
+impl From<MissedEntries> for OwedCall {
+    fn from(notice: MissedEntries) -> Self {
+        Self::Missed {
+            notice,
+            other_reads: BTreeMap::new(),
+        }
+    }
 }
 
 impl From<&ResendNeeded> for OwedCall {
@@ -117,10 +170,68 @@ pub(crate) fn owed_place(rest: &str) -> Result<(u64, u64), AppError> {
     let (generation, seq) = rest
         .split_once('/')
         .ok_or(AppError::Store(crate::error::StoreError::Corrupt))?;
-    Ok((state::parse_num(generation)?, state::parse_num(seq)?))
+    let (seq, gap) = seq
+        .split_once('/')
+        .map_or((seq, None), |(seq, gap)| (seq, Some(gap)));
+    let seq = state::parse_num(seq)?;
+    if gap
+        .map(state::parse_num)
+        .transpose()?
+        .is_some_and(|held| held <= seq)
+    {
+        return Err(super::super::corrupt());
+    }
+    Ok((state::parse_num(generation)?, seq))
 }
 
 impl OwedCall {
+    pub(crate) fn missed_for(&self, name: &str) -> Option<&MissedEntries> {
+        match self {
+            Self::Missed {
+                notice,
+                other_reads,
+            } => Some(other_reads.get(name).unwrap_or(notice)),
+            _ => None,
+        }
+    }
+
+    fn for_owner(&self, name: &str) -> std::borrow::Cow<'_, Self> {
+        if let Self::Missed {
+            notice,
+            other_reads,
+        } = self
+            && !other_reads.is_empty()
+        {
+            return std::borrow::Cow::Owned(Self::from(
+                other_reads.get(name).unwrap_or(notice).clone(),
+            ));
+        }
+        std::borrow::Cow::Borrowed(self)
+    }
+
+    pub(crate) fn retain_owners(&mut self, to: &[String]) {
+        if let Self::Missed { other_reads, .. } = self {
+            other_reads.retain(|name, _| to.contains(name));
+        }
+    }
+
+    pub(crate) fn held_gap(&self, position: u64) -> Option<u64> {
+        match self {
+            Self::Missed { notice, .. } if notice.entries == 0 && notice.seq > position => {
+                Some(notice.seq)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn stored_at(&self, generation: u64, position: u64) -> String {
+        let at = key::owed(generation, position);
+        match self.held_gap(position) {
+            Some(held) => format!("{at}/{}", key::num(held)),
+            None => at,
+        }
+    }
+
     /// The operation a deny list change not checked yet keeps, as the feed showed it, read
     /// for its check; `None` for any other call. The change kept beside it is read from that
     /// operation: one that doesn't parse, or isn't that change, is a corrupt store.
@@ -183,17 +294,7 @@ impl OwedCall {
                     },
                 },
             },
-            Self::Missed {
-                seq,
-                entries,
-                accepted_from_ms,
-                accepted_until_ms,
-            } => RefusedCall::Missed(MissedEntries {
-                seq,
-                entries,
-                accepted_from_ms,
-                accepted_until_ms,
-            }),
+            Self::Missed { ref notice, .. } => RefusedCall::Missed(notice.clone()),
             Self::Deny {
                 generation,
                 seq,
@@ -243,6 +344,7 @@ impl App {
             seq,
             names: to.clone(),
             call: true,
+            held_gap: call.held_gap(seq),
             deny: call.is_deny(),
         });
         if call.is_deny() {
@@ -250,7 +352,7 @@ impl App {
             self.owed_known = Some(true);
         }
         read.tx.put(
-            &key::owed(self.state.cursor.generation, seq),
+            &call.stored_at(self.state.cursor.generation, seq),
             &Owed { to, call },
         )
     }
@@ -260,7 +362,7 @@ impl App {
     pub(crate) async fn owed_calls(&self) -> Result<Vec<(String, Owed)>, AppError> {
         let owed = self.reader().scan::<Owed>(key::OWED_PREFIX).await?;
         for (rest, call) in &owed {
-            owed_place(rest)?;
+            call.check_place(rest)?;
             call.check_owners(&self.protocols)?;
             call.call.kept_op_body()?;
         }
@@ -307,7 +409,7 @@ impl App {
                 Ok((order, place, rest, owed))
             })
             .collect::<Result<Vec<_>, AppError>>()?;
-        queue.sort_by_key(|(order, ..)| *order);
+        queue.sort_by_key(|(order, (_, seq), _, owed)| (*order, owed.call.held_gap(*seq)));
         let mut kept = due.kept();
         kept.extend(self.deletion_positions());
         kept.extend(queue.iter().map(|(_, (generation, seq), _, owed)| Kept {
@@ -315,6 +417,7 @@ impl App {
             seq: *seq,
             names: owed.to.clone(),
             call: true,
+            held_gap: owed.call.held_gap(*seq),
             deny: owed.call.is_deny(),
         }));
         kept.sort_by_key(|item| self.feed_order(item.generation, item.seq));
@@ -327,7 +430,15 @@ impl App {
             // and owed no listing at or before it, which goes first.
             let ready: Vec<String> = to
                 .iter()
-                .filter(|name| self.ready_at(name, order, Handover::Call))
+                .filter(|name| {
+                    self.ready_at(name, order, Handover::Call)
+                        && !kept.iter().any(|earlier| {
+                            earlier.call
+                                && earlier.names.contains(name)
+                                && self.feed_order(earlier.generation, earlier.seq) == order
+                                && earlier.held_gap < call.held_gap(seq)
+                        })
+                })
                 .cloned()
                 .collect();
             // The cursor hasn't passed its item: once the call is gone, the read still
@@ -474,7 +585,8 @@ impl App {
                 let Some(protocol) = self.protocols.get(&name).cloned() else {
                     return Err(AppError::Store(crate::error::StoreError::Corrupt));
                 };
-                let Ok(writes) = call.make(protocol.as_ref()) else {
+                let original = call.for_owner(&name);
+                let Ok(writes) = original.make(protocol.as_ref()) else {
                     failed_any = true;
                     continue;
                 };
@@ -487,7 +599,7 @@ impl App {
                         Duty::LocalWritesRefused {
                             call: KeptRefusal::Owed {
                                 seq,
-                                call: call.clone(),
+                                call: original.into_owned(),
                             },
                         },
                     )?;
@@ -500,17 +612,28 @@ impl App {
                         self.note_deny_change(pubky, *added, &mut tx)?;
                     }
                     self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
+                    if ahead
+                        && matches!(call, OwedCall::Missed { .. })
+                        && call.held_gap(seq).is_none()
+                    {
+                        tx.put(&key::asked(seq), &true)?;
+                    }
                 } else {
                     for item in &mut kept {
-                        if item.call && (item.generation, item.seq) == (generation, seq) {
+                        if item.call
+                            && (item.generation, item.seq, item.held_gap)
+                                == (generation, seq, call.held_gap(seq))
+                        {
                             item.names.clone_from(&left);
                         }
                     }
+                    let mut remaining = call.clone();
+                    remaining.retain_owners(&left);
                     tx.put(
                         &at,
                         &Owed {
                             to: left.clone(),
-                            call: call.clone(),
+                            call: remaining,
                         },
                     )?;
                 }

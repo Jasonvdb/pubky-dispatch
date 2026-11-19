@@ -109,6 +109,7 @@ async fn test_http_raw_send_dot_targets_are_rejected_before_connecting() {
                 &request(ORIGIN, "POST", "ops", 0).path_and_query,
                 vec![b'x'; 65_537],
                 None,
+                TimeoutClass::Bulk,
             )
             .unwrap()
             .request;

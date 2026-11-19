@@ -272,7 +272,7 @@ async fn test_scripted_apps_last_seen_stops_once_the_app_is_revoked() {
                 value: pubky_switch_core::enc::zbase32_encode(&app.app_id()),
             }],
             body: Vec::new(),
-            timeout: pubky_switch_client::transport::TimeoutClass::default(),
+            timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
         });
     assert_eq!(s.status(&app.app_id()).await.last_seen, seen);
 }
@@ -478,7 +478,7 @@ async fn test_scripted_apps_purge_at_the_recovery_upload_that_resolves_its_attem
             path_and_query: path,
             headers,
             body,
-            timeout: pubky_switch_client::transport::TimeoutClass::default(),
+            timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
         }
     };
     // The first document starts a recovery from the lost generation 1, delivered through

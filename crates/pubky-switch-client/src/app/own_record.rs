@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 
 use super::events::AppEvent;
 use super::next_body::NextBody;
-use super::state::{PendingRecord, key};
+use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Refusal};
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
@@ -522,13 +522,8 @@ impl App {
                 Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
                 None => self.sign_next_record(body, held.updated_at()).await?,
             };
-            let batch = self.record_batch(record.signed()).map_err(refused)?;
-            let pending = PendingRecord {
-                body: batch.body().to_vec(),
-            };
             let mut tx = self.tx()?;
-            tx.put(key::RECORD, record.signed())?;
-            tx.put(key::PENDING_RECORD, &pending)?;
+            let pending = self.stage_own_record(&record, &mut tx)?;
             if let Some((expiries, _)) = expiries {
                 tx.put(key::RECORD_EXPIRIES, expiries)?;
             }
@@ -543,7 +538,22 @@ impl App {
         self.deliver_record().await
     }
 
-    fn record_needs_new_delivery(&self) -> bool {
+    /// Keep the signed record with the exact batch that will deliver it (Switch wire 6.2).
+    pub(super) fn stage_own_record(
+        &self,
+        record: &AppRecord,
+        tx: &mut Tx,
+    ) -> Result<PendingRecord, AppError> {
+        let batch = self.record_batch(record.signed()).map_err(refused)?;
+        let pending = PendingRecord {
+            body: batch.body().to_vec(),
+        };
+        tx.put(key::RECORD, record.signed())?;
+        tx.put(key::PENDING_RECORD, &pending)?;
+        Ok(pending)
+    }
+
+    pub(super) fn record_needs_new_delivery(&self) -> bool {
         self.state.pending_record.is_none()
             && self
                 .state

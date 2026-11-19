@@ -310,9 +310,9 @@ impl RealSwitch {
     /// them, and reads them anew. Every request meanwhile fails to connect.
     async fn while_stopped<T>(
         &mut self,
-        change: impl AsyncFnOnce(&TestDatabase, &Path) -> Result<T, HarnessError>,
+        change: impl AsyncFnOnce(&mut TestDatabase, &Path) -> Result<T, HarnessError>,
     ) -> Result<T, HarnessError> {
-        let database = self
+        let mut database = self
             .database
             .take()
             .ok_or_else(|| setup("the service's database is dropped"))?;
@@ -322,11 +322,33 @@ impl RealSwitch {
             // Its end, aborted or not, is all this waits for.
             let _ = listening.await;
         }
-        let changed = change(&database, self.key_dir.path()).await;
+        let changed = change(&mut database, self.key_dir.path()).await;
         let started = self.serve_again(&database).await;
         self.database = Some(database);
         started?;
         changed
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn snapshot_database(&mut self) -> Result<TestDatabase, HarnessError> {
+        self.while_stopped(async |db, _| {
+            db.snapshot(&pubky_switch::store::DatabaseConfig::default())
+                .await
+                .map_err(setup)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn restore_database(
+        &mut self,
+        backup: TestDatabase,
+    ) -> Result<(), HarnessError> {
+        self.while_stopped(async |db, _| {
+            let later = std::mem::replace(db, backup);
+            later.drop_database().await.map_err(setup)
+        })
+        .await
     }
 
     async fn serve_again(&mut self, database: &TestDatabase) -> Result<(), HarnessError> {

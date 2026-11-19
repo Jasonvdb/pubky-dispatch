@@ -94,16 +94,32 @@ impl Batch {
         self.cursor
     }
 
-    /// How long the batch's call may take: a batch that writes a shared record may be
-    /// answered `409 conflict` with the record's view, up to about a mebibyte (Switch wire
-    /// 7.6, 7.1 "Answer sizes"), on its first send and on every resend of the same bytes;
-    /// any other batch's answer is small.
+    /// Each claim proof carries its claim view. A refusal can carry a held app or receive
+    /// key record, a shared record view or a claim view (Switch wire 6.3, 6.5, 7.6).
     pub(crate) fn timeout(&self) -> TimeoutClass {
-        let writes_a_record = self
-            .ops
-            .iter()
-            .any(|op| matches!(op.body().kind, OpKind::RecordPut(_)));
-        if writes_a_record {
+        let carries_state = self.ops.iter().any(|op| {
+            let body = op.body();
+            let state_in_answer = match &body.kind {
+                OpKind::Claim(_)
+                | OpKind::RecordPut(_)
+                | OpKind::AppPut { .. }
+                | OpKind::ReceiveKeyPut { .. } => true,
+                OpKind::AllowPut { .. }
+                | OpKind::AllowDelete { .. }
+                | OpKind::DenyPut { .. }
+                | OpKind::DenyDelete { .. }
+                | OpKind::InviteCodePut(_)
+                | OpKind::InviteCodeDelete { .. }
+                | OpKind::KeyBundlePut(_)
+                | OpKind::CertPut { .. } => false,
+            };
+            state_in_answer
+                || body.conditions.iter().any(|condition| match condition {
+                    Condition::RecordCurrent { .. } | Condition::ClaimStep { .. } => true,
+                    Condition::RecordVersion { .. } | Condition::ServerTimeIn { .. } => false,
+                })
+        });
+        if carries_state {
             TimeoutClass::Bulk
         } else {
             TimeoutClass::Ordinary
@@ -238,8 +254,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     first_send: first,
-                    timeout: batch.timeout(),
-                    ..Auth::default()
+                    ..Auth::new(batch.timeout())
                 },
             )
             .await?;

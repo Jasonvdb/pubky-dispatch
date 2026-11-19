@@ -11,6 +11,7 @@ use pubky_switch_client::client::{CheckedResponse, Credentials, SwitchClient};
 use pubky_switch_client::error::ClientError;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_client::transport::TimeoutClass;
 use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
@@ -158,7 +159,13 @@ impl Writer {
         let path = format!("/v1/{}/ops", pubky_id(&self.who.public()));
         let request = self
             .client
-            .sign_request("POST", &path, OpsRequest::new(&ops, None).to_json(), None)
+            .sign_request(
+                "POST",
+                &path,
+                OpsRequest::new(&ops, None).to_json(),
+                None,
+                TimeoutClass::Bulk,
+            )
             .unwrap();
         self.client.send(request).await
     }
@@ -169,7 +176,7 @@ impl Writer {
             .client
             .send(
                 self.client
-                    .sign_request("GET", &path, Vec::new(), None)
+                    .sign_request("GET", &path, Vec::new(), None, TimeoutClass::Bulk)
                     .unwrap(),
             )
             .await
@@ -351,7 +358,13 @@ async fn two_uploads_at_one_version(world: &World) {
     });
     let request = phone
         .client
-        .sign_request("POST", &path, serde_json::to_vec(&upload).unwrap(), None)
+        .sign_request(
+            "POST",
+            &path,
+            serde_json::to_vec(&upload).unwrap(),
+            None,
+            TimeoutClass::Bulk,
+        )
         .unwrap();
     phone.client.send(request).await.unwrap();
     Box::pin(wallet.app.refresh_identity()).await.unwrap();

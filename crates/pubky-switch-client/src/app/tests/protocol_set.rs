@@ -8,6 +8,7 @@ mod gap_completion;
 mod ownership;
 mod renewal_member;
 mod retained_authority;
+mod retirement;
 
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +42,8 @@ struct Named {
     checked: Mutex<Vec<String>>,
     /// The `seq` of each missed item it took.
     missed: Mutex<Vec<u64>>,
+    /// Keep each accepted notice as a separate request and invalidate a prior confirmation.
+    keep_missed_reads: bool,
     /// The pubkys of the deny list changes it took.
     denies: Mutex<Vec<[u8; 32]>>,
     /// How many of the next missed calls fail.
@@ -359,8 +362,20 @@ impl Protocol for Named {
         if count_down(&self.failing_missed) {
             return Err(StoreError::Unavailable.into());
         }
-        self.missed.lock().unwrap().push(missed.seq);
+        let mut received = self.missed.lock().unwrap();
+        received.push(missed.seq);
         self.taken.lock().unwrap().push(missed.seq);
+        if self.keep_missed_reads {
+            return Ok(vec![
+                LocalWrite::Put {
+                    key: format!("ask/{}", received.len()).into_bytes(),
+                    value: missed.read_at_ms.to_be_bytes().to_vec(),
+                },
+                LocalWrite::Delete {
+                    key: b"confirmed".to_vec(),
+                },
+            ]);
+        }
         let value = if self.huge_missed {
             vec![0; MAX_STEP_LOCAL_BYTES]
         } else {
@@ -3529,4 +3544,237 @@ async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadlin
     assert_eq!(app.record_expiries().await.unwrap(), policies);
     assert!(app.state.pending_record.is_some());
     assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(later.signed()));
+}
+
+async fn notice_asks(app: &App, owner: &str) -> Vec<u64> {
+    app.protocol_scan(owner, b"ask/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, bytes)| u64::from_be_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+async fn restored_notice_reads(layered: bool, same_time: bool, same_owner: bool) {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        Named {
+            keep_missed_reads: true,
+            ..named("chat")
+        },
+    );
+    let mut first = p.join().await;
+    read(&mut first, 1).await;
+    let common = first.backup_layered().await.unwrap();
+    let other = Arc::new(MemoryStore::new());
+    let mut second = Box::pin(App::restore(
+        p.w.env_on(other.clone()),
+        p.set(),
+        World::config(),
+        &common,
+    ))
+    .await
+    .unwrap();
+    let first_time = p.w.clock.now_ms();
+    let seq = p.w.switch.push_missed(1, first_time, first_time + 500);
+    *p.tasks.failing_missed.lock().unwrap() = 1;
+    read(&mut first, 1).await;
+    assert_eq!(notice_asks(&first, "chat").await, [first_time]);
+    first
+        .protocol_commit(
+            "chat",
+            &[LocalWrite::Put {
+                key: b"confirmed".to_vec(),
+                value: vec![1],
+            }],
+        )
+        .await
+        .unwrap();
+    let backup = if layered {
+        first.backup_layered().await.unwrap()
+    } else {
+        first.backup().await.unwrap()
+    };
+    if !same_time {
+        p.w.clock.advance_ms(1000);
+    }
+    let second_time = p.w.clock.now_ms();
+    if same_owner {
+        *p.tasks.failing_missed.lock().unwrap() = 1;
+    } else {
+        *p.chat.failing_missed.lock().unwrap() = 1;
+    }
+    read(&mut second, 1).await;
+    let id = second.app_id();
+    drop(second);
+    let restored = Box::pin(App::restore(
+        p.w.env_on(other.clone()),
+        p.set(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    assert!(notice_asks(&restored, "tasks").await.is_empty());
+    p.w.clock.advance_ms(5000);
+    drop(restored);
+    let mut restored = App::load(p.w.env_on(other), p.set(), World::config(), id)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 3).await;
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time]);
+    if layered {
+        assert_eq!(notice_asks(&restored, "chat").await, [first_time]);
+        assert_eq!(
+            restored.protocol_get("chat", b"confirmed").await.unwrap(),
+            Some(vec![1])
+        );
+    } else {
+        assert_eq!(notice_asks(&restored, "chat").await, [second_time]);
+    }
+    assert_eq!(p.tasks.missed.lock().unwrap().last(), Some(&seq));
+}
+
+#[tokio::test]
+async fn test_missed_notice_installed_layer_replays_only_the_effect_it_lacks() {
+    Box::pin(restored_notice_reads(true, false, false)).await;
+}
+
+#[tokio::test]
+async fn test_missed_notice_same_owner_owed_by_both_snapshots_uses_one_original_read() {
+    for same_time in [true, false] {
+        Box::pin(restored_notice_reads(true, same_time, true)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_missed_notice_independent_readers_keep_their_original_page() {
+    Box::pin(restored_notice_reads(false, false, false)).await;
+}
+
+#[tokio::test]
+async fn test_missed_notice_each_higher_cursor_reaches_the_available_owner() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        Named {
+            keep_missed_reads: true,
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let position = app.cursor().seq;
+    let id = app.app_id();
+    *p.chat.failing_missed.lock().unwrap() = 8;
+    let first_time = p.w.clock.now_ms();
+    p.w.switch.set_held_cursor(&id, position + 4);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [position + 4]);
+    let earlier = app.backup_layered().await.unwrap();
+    assert_eq!(earlier.owed.len(), 1);
+    assert_eq!(earlier.owed[0].1["to"], json!(["chat"]));
+    p.w.clock.advance_ms(1000);
+    p.w.switch.set_held_cursor(&id, position + 6);
+    read(&mut app, 1).await;
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 4, position + 6]
+    );
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    let second_time = p.w.clock.now_ms();
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(backup.owed.len(), 2);
+    drop(app);
+    let mut restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    p.w.clock.advance_ms(5000);
+    read(&mut restored, 4).await;
+    assert_eq!(*p.chat.missed.lock().unwrap(), [position + 4, position + 6]);
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 4, position + 6]
+    );
+    assert_eq!(
+        notice_asks(&restored, "chat").await,
+        [first_time, second_time]
+    );
+    assert_eq!(
+        notice_asks(&restored, "tasks").await,
+        [first_time, second_time]
+    );
+}
+
+#[tokio::test]
+async fn test_missed_notice_observation_at_epoch_zero_survives_restart() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    p.w.clock.set_ms(0);
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    *p.tasks.failing_missed.lock().unwrap() = 1;
+    p.w.switch.push_missed(1, 0, 0);
+    read(&mut app, 1).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    let id = app.app_id();
+    drop(app);
+    p.w.clock.advance_ms(1500);
+    let mut reopened = p.load(id).await.unwrap();
+    read(&mut reopened, 2).await;
+    assert_eq!(notice_asks(&reopened, "tasks").await, [0]);
+}
+
+#[tokio::test]
+async fn test_missed_notice_installed_gap_and_later_completed_live_gap() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let id = app.app_id();
+    let position = app.cursor().seq;
+    let first_time = p.w.clock.now_ms();
+    p.w.switch.set_held_cursor(&id, position + 2);
+    read(&mut app, 2).await;
+    let backup = app.backup_layered().await.unwrap();
+    assert!(backup.owed.is_empty());
+    assert_eq!(notice_asks(&app, "tasks").await, [first_time]);
+    p.w.clock.advance_ms(1000);
+    let later_time = p.w.clock.now_ms();
+    p.w.switch.set_held_cursor(&id, position + 5);
+    read(&mut app, 2).await;
+    assert_eq!(notice_asks(&app, "tasks").await, [first_time, later_time]);
+    drop(app);
+    let mut restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time]);
+    restored.refresh_identity().await.unwrap();
+    p.w.clock.advance_ms(1000);
+    let reread = p.w.clock.now_ms();
+    read(&mut restored, 3).await;
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time, reread]);
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 2, position + 5, position + 5]
+    );
 }

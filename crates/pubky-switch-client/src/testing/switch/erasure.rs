@@ -210,7 +210,7 @@ mod tests {
             path_and_query: format!("/v1/{}/identity", identity.id()),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         let answer = switch.handle(&request).unwrap();
         assert_eq!(answer.status, 503);

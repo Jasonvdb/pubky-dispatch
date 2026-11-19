@@ -33,11 +33,9 @@ use super::{BoxFuture, Header, Request, Response, TimeoutClass, Transport, Trans
 ///   the long timeout adds to it, in proportion to the request body: about the short timeout
 ///   for a body of a few KiB, the long one from a mebibyte on. So a slow uplink that sends a
 ///   mebibyte within the long timeout's extra time sends every smaller body too.
-/// - **[`TimeoutClass::Bulk`]:** [`HttpConfig::long_timeout_ms`]. A batch of operations that
-///   writes a shared record is one, whatever its size: its `409 conflict` carries the
-///   record's view, up to about 950 KB, and a batch kept for a resend meets the same answer
-///   every time, so the short timeout would hold it, and the writes behind it, on a slow
-///   downlink.
+/// - **[`TimeoutClass::Bulk`]:** [`HttpConfig::long_timeout_ms`], independent of the
+///   outgoing size. For example, a small batch can receive a held signed app record
+///   (up to 392,924 bytes) or a shared record view (up to 951,215 bytes) in a conflict.
 /// - **[`TimeoutClass::LongPoll`]:** the wait the request names, then
 ///   [`HttpConfig::long_timeout_ms`] for the page.
 ///
@@ -48,7 +46,7 @@ use super::{BoxFuture, Header, Request, Response, TimeoutClass, Transport, Trans
 pub struct HttpConfig {
     /// The timeout of a small call, in milliseconds: 10 s by default.
     pub request_timeout_ms: u64,
-    /// The timeout of a call that can carry megabytes, and what the feed's long poll has
+    /// The timeout of a bulk transfer, and what the feed's long poll has
     /// after its wait, in milliseconds: 40 s by default.
     pub long_timeout_ms: u64,
     /// The connection timeout, in milliseconds.
@@ -856,7 +854,7 @@ mod tests {
         // The answer signed for the request the client will send, built the same way.
         let answer = |origin: &str, extra: &[u8]| {
             let signed = client(origin)
-                .sign_request("GET", &path, Vec::new(), None)
+                .sign_request("GET", &path, Vec::new(), None, TimeoutClass::Bulk)
                 .unwrap();
             let body = br#"{"code":"unavailable","message":"m"}"#;
             let server_time = pubky_switch_core::time::rfc3339(now);

@@ -2946,7 +2946,13 @@ async fn raw_view(app: &App, key: &[u8; 32]) -> serde_json::Value {
     );
     let request = app
         .client
-        .sign_request("GET", &path, Vec::new(), None)
+        .sign_request(
+            "GET",
+            &path,
+            Vec::new(),
+            None,
+            crate::transport::TimeoutClass::Bulk,
+        )
         .unwrap();
     serde_json::from_slice(&app.client.send(request).await.unwrap().body).unwrap()
 }
@@ -6935,7 +6941,7 @@ fn scripted_answer(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value,
                 path_and_query: path,
                 headers,
                 body: Vec::new(),
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             })
             .unwrap();
     let head = response
@@ -7136,7 +7142,7 @@ async fn test_scripted_peer_identity_needed_carries_known_version() {
             ),
         ],
         body: Vec::new(),
-        timeout: crate::transport::TimeoutClass::default(),
+        timeout: crate::transport::TimeoutClass::Bulk,
     };
     let response = s.peer.transport().send(request).await.unwrap();
     assert_eq!(response.status, 409);
@@ -7831,7 +7837,7 @@ fn feed_read(s: &Setup, app: [u8; 16], rest: &str) -> crate::transport::Request 
             ),
         ],
         body: Vec::new(),
-        timeout: crate::transport::TimeoutClass::default(),
+        timeout: crate::transport::TimeoutClass::Bulk,
     }
 }
 
@@ -7899,7 +7905,7 @@ async fn test_scripted_peer_append_query_is_read_first() {
                 ),
             ],
             body: Vec::new(),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         let response = s.peer.transport().send(request).await.unwrap();
         assert_eq!(response.status, 400, "{query}");
@@ -8428,7 +8434,7 @@ fn scripted_request(
                     ),
                 ],
                 body,
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             })
             .unwrap();
     let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
@@ -11434,7 +11440,7 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
                     &pubky_switch_core::enc::zbase32_encode(&app_keys("phone").app_id_bytes()),
                 )],
                 body: upload.to_string().into_bytes(),
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             })
             .unwrap();
     assert_eq!(

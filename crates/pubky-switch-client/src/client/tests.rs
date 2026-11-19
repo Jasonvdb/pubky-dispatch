@@ -276,7 +276,7 @@ async fn test_unpinned_client_sends_nothing() {
         ClientError::Unpinned
     );
     let signed = client
-        .sign_request("GET", "/v1/x/feed", Vec::new(), None)
+        .sign_request("GET", "/v1/x/feed", Vec::new(), None, TimeoutClass::Bulk)
         .unwrap();
     assert_eq!(
         client.send(signed).await.unwrap_err(),
@@ -450,7 +450,7 @@ fn sent_request(method: &str, path_and_query: &str, headers: &[(&str, &str)]) ->
             .map(|(name, value)| Header::new(name, value))
             .collect(),
         body: Vec::new(),
-        timeout: TimeoutClass::default(),
+        timeout: TimeoutClass::Ordinary,
     })
 }
 
@@ -626,7 +626,7 @@ async fn test_head_header_moved_or_added_fails_the_signature() {
             Header::new(header::SIGNATURE, &signature),
         ],
         body: Vec::new(),
-        timeout: TimeoutClass::default(),
+        timeout: TimeoutClass::Bulk,
     });
     let other_origin = SentRequest::of(&Request {
         method: "GET".into(),
@@ -634,7 +634,7 @@ async fn test_head_header_moved_or_added_fails_the_signature() {
         path_and_query: path.clone(),
         headers: vec![Header::new(header::SIGNATURE, &signature)],
         body: Vec::new(),
-        timeout: TimeoutClass::default(),
+        timeout: TimeoutClass::Bulk,
     });
     for sent in [
         sent_request("POST", &path, &[(header::SIGNATURE, &signature)]),
@@ -877,7 +877,7 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     let transport = fixed(service_key(), 200, json!({}));
     let own = client_with(app(), Some(service_public()), Arc::clone(&transport));
     let request = own
-        .sign_request("GET", "/v1/x/feed", Vec::new(), None)
+        .sign_request("GET", "/v1/x/feed", Vec::new(), None, TimeoutClass::Bulk)
         .unwrap();
     assert!(request.request.header(header::CERT).is_none());
     assert!(request.request.header(header::APP).is_some());
@@ -895,7 +895,13 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     assert!(foreign.is_foreign());
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
     let request = foreign
-        .sign_request("GET", "/v1/x/directory", Vec::new(), Some(code))
+        .sign_request(
+            "GET",
+            "/v1/x/directory",
+            Vec::new(),
+            Some(code),
+            TimeoutClass::Bulk,
+        )
         .unwrap();
     let cert = request.request.header(header::CERT).unwrap();
     assert_eq!(cert, cert_of(&identity(), &app_keys()).signed().compact());
@@ -905,7 +911,13 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     for code in ["a b", ""] {
         assert!(
             matches!(
-                foreign.sign_request("GET", "/v1/x/directory", Vec::new(), Some(code)),
+                foreign.sign_request(
+                    "GET",
+                    "/v1/x/directory",
+                    Vec::new(),
+                    Some(code),
+                    TimeoutClass::Bulk
+                ),
                 Err(ClientError::Usage(_))
             ),
             "{code:?}"
@@ -914,7 +926,13 @@ fn test_requests_carry_the_cert_only_to_another_identity() {
     // Every request it builds keeps the header rule the service checks at routing.
     for (client, code) in [(&own, None), (&foreign, Some(code))] {
         let request = client
-            .sign_request("POST", "/v1/x/ops", b"{}".to_vec(), code)
+            .sign_request(
+                "POST",
+                "/v1/x/ops",
+                b"{}".to_vec(),
+                code,
+                TimeoutClass::Ordinary,
+            )
             .unwrap()
             .request;
         let received = http::ReceivedHeaders::of(
@@ -973,7 +991,7 @@ fn test_signer_requests_credential_signs_a_request_that_verifies() {
     );
     requests.signer_only().unwrap();
     let signed = requests
-        .sign_request("GET", "/v1/x/apps", Vec::new(), None)
+        .sign_request("GET", "/v1/x/apps", Vec::new(), None, TimeoutClass::Bulk)
         .unwrap();
     let signature =
         http::decode_signature(signed.request.header(header::SIGNATURE).unwrap()).unwrap();
@@ -993,7 +1011,7 @@ fn test_signer_requests_credential_signs_a_request_that_verifies() {
     // The same request, headers and signature as the signer's full credential gives.
     let full = client_with(signer(), Some(service_public()), transport);
     assert_eq!(
-        full.sign_request("GET", "/v1/x/apps", Vec::new(), None)
+        full.sign_request("GET", "/v1/x/apps", Vec::new(), None, TimeoutClass::Bulk)
             .unwrap(),
         signed
     );
@@ -1634,12 +1652,12 @@ async fn test_calls_pick_their_timeout_class() {
     assert_eq!(class(8), TimeoutClass::Bulk);
     let _ = client.append(vec![0; 16], 1, None).await;
     assert_eq!(class(9), TimeoutClass::Bulk);
-    // A small write and the public read are ordinary.
+    // A connect write is small. A public identity read can return the full document.
     let _ = client.connect().await;
     assert_eq!(class(10), TimeoutClass::Ordinary);
     let _ = client.public_identity().await;
-    assert_eq!(class(11), TimeoutClass::Ordinary);
-    // A batch that writes no shared record is ordinary.
+    assert_eq!(class(11), TimeoutClass::Bulk);
+    // Unconditional list changes have small answers.
     let lists = client.sign_batch(1, two_lists(), None).unwrap();
     let _ = client.submit(&lists).await;
     assert_eq!(class(12), TimeoutClass::Ordinary);
@@ -1651,11 +1669,50 @@ async fn test_calls_pick_their_timeout_class() {
     let kept = Batch::from_body(record.body().to_vec()).unwrap();
     let _ = client.submit(&kept).await;
     assert_eq!(class(14), TimeoutClass::Bulk);
-    // A request signed for the caller to send is ordinary until the caller says otherwise.
+    // A list change with an exact current-record condition can receive a whole view.
+    let mut ops = two_lists();
+    ops[1].0.push(Condition::RecordCurrent {
+        key: [3; 32],
+        revision: pubky_switch_core::shared::ApplicationRef {
+            generation: 1,
+            seq: 4,
+            item_hash: [5; 32],
+        },
+        deleted: false,
+    });
+    let conditional = client.sign_batch(1, ops, None).unwrap();
+    let _ = client.submit(&conditional).await;
+    assert_eq!(class(15), TimeoutClass::Bulk);
+    let kept = Batch::from_body(conditional.body().to_vec()).unwrap();
+    let _ = client.submit(&kept).await;
+    assert_eq!(class(16), TimeoutClass::Bulk);
+    // These calls can return a pending list or a held identity document.
+    let delivery = delivery_naming(service_public());
+    let _ = client.connect_requests().await;
+    assert_eq!(class(17), TimeoutClass::Bulk);
+    let _ = client.put_peers(&delivery.identity, None).await;
+    assert_eq!(class(18), TimeoutClass::Bulk);
+    let signer_client = client_with(signer(), Some(service_public()), Arc::clone(&transport));
+    let _ = signer_client.put_identity(&delivery).await;
+    assert_eq!(class(19), TimeoutClass::Bulk);
+    let _ = signer_client.erase(Some(0), None).await;
+    assert_eq!(class(20), TimeoutClass::Bulk);
+    let _ = signer_client.observe_account().await;
+    assert_eq!(class(21), TimeoutClass::Ordinary);
+    // The raw caller supplies the transport class as part of constructing the request.
     let signed = client
-        .sign_request("GET", "/v1/x/feed", Vec::new(), None)
+        .sign_request(
+            "GET",
+            "/v1/x/feed?wait=12",
+            Vec::new(),
+            None,
+            TimeoutClass::LongPoll { wait_s: 12 },
+        )
         .unwrap();
-    assert_eq!(signed.request.timeout, TimeoutClass::Ordinary);
+    assert_eq!(
+        signed.request.timeout,
+        TimeoutClass::LongPoll { wait_s: 12 }
+    );
 }
 
 /// A response to `request` signed with `key` over the empty body field, as the service
@@ -1946,17 +2003,17 @@ async fn test_raw_send_mutated_request_uses_current_cap() {
     let ops = format!("/v1/{}/ops", identity().id());
     let public = format!("/v1/{}/identity", identity().id());
     let mut body = client
-        .sign_request("POST", &inbox, vec![0; 65_536], None)
+        .sign_request("POST", &inbox, vec![0; 65_536], None, TimeoutClass::Bulk)
         .unwrap()
         .request;
     body.body.push(0);
     let mut route = client
-        .sign_request("POST", &ops, vec![0; 65_537], None)
+        .sign_request("POST", &ops, vec![0; 65_537], None, TimeoutClass::Bulk)
         .unwrap()
         .request;
     route.path_and_query = inbox;
     let mut method = client
-        .sign_request("PUT", &public, vec![0; 1], None)
+        .sign_request("PUT", &public, vec![0; 1], None, TimeoutClass::Bulk)
         .unwrap()
         .request;
     method.method = "GET".into();
@@ -2000,7 +2057,7 @@ fn test_response_malformed_time_preserves_binding_rejections() {
         path_and_query: format!("/v1/{}/erase", identity().id()),
         headers: Vec::new(),
         body: b"{}".to_vec(),
-        timeout: TimeoutClass::default(),
+        timeout: TimeoutClass::Bulk,
     };
     let sent = SentRequest::of(&request);
     let valid_head = SignedHead::sign(
@@ -2153,11 +2210,13 @@ fn test_account_creation_is_fixed_for_signer_calls() {
     let client = unbound_signer(transport.clone(), Some(service_public()));
     let path = client.path("apps");
     assert!(matches!(
-        client.sign_request("GET", &path, Vec::new(), None),
+        client.sign_request("GET", &path, Vec::new(), None, TimeoutClass::Bulk),
         Err(ClientError::Usage(_))
     ));
     let client = client.with_account_created(17).unwrap();
-    let signed = client.sign_request("GET", &path, Vec::new(), None).unwrap();
+    let signed = client
+        .sign_request("GET", &path, Vec::new(), None, TimeoutClass::Bulk)
+        .unwrap();
     assert_eq!(
         signed.request.header(header::CREATED),
         Some(rfc3339(17).as_str())
@@ -2209,7 +2268,13 @@ async fn test_raw_requests_keep_the_account_creation() {
     let transport = fixed(service_key(), 200, json!({}));
     let client = client_with(signer(), Some(service_public()), transport.clone());
     let original = client
-        .sign_request("GET", &client.path("apps"), Vec::new(), None)
+        .sign_request(
+            "GET",
+            &client.path("apps"),
+            Vec::new(),
+            None,
+            TimeoutClass::Bulk,
+        )
         .unwrap()
         .request;
     for value in [
@@ -2298,7 +2363,13 @@ async fn test_account_discovery_preserves_authenticated_bytes() {
         assert_eq!(client.latest_compared_time(), None);
         assert_eq!(
             client
-                .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                .sign_request(
+                    "GET",
+                    &client.path("apps"),
+                    Vec::new(),
+                    None,
+                    TimeoutClass::Bulk
+                )
                 .unwrap()
                 .request
                 .header(header::CREATED),
@@ -2390,15 +2461,17 @@ async fn test_discovery_is_only_the_canonical_signer_read() {
         ("GET", path.clone(), Vec::new(), Some("invite")),
     ] {
         assert!(matches!(
-            client.sign_request(method, &path, body, invite),
+            client.sign_request(method, &path, body, invite, TimeoutClass::Ordinary),
             Err(ClientError::Usage(_))
         ));
     }
     assert!(matches!(
-        client.sign_request("GET", &path, vec![b'x'], None),
+        client.sign_request("GET", &path, vec![b'x'], None, TimeoutClass::Ordinary),
         Err(ClientError::BodyOverCap { cap: 0 })
     ));
-    let signed = client.sign_request("GET", &path, Vec::new(), None).unwrap();
+    let signed = client
+        .sign_request("GET", &path, Vec::new(), None, TimeoutClass::Ordinary)
+        .unwrap();
     for name in [
         header::CREATED,
         header::APP,
@@ -2618,7 +2691,13 @@ async fn test_creation_conflict_preserves_time_evidence() {
             let client = client_with(signer(), Some(service_public()), transport.clone());
             let request = || {
                 client
-                    .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                    .sign_request(
+                        "GET",
+                        &client.path("apps"),
+                        Vec::new(),
+                        None,
+                        TimeoutClass::Bulk,
+                    )
                     .unwrap()
             };
             client.send(request()).await.unwrap();
@@ -2686,7 +2765,13 @@ async fn test_creation_conflict_requires_absent_raw_head() {
         let client = client_with(signer(), Some(service_public()), transport);
         let request = || {
             client
-                .sign_request("GET", &client.path("apps"), Vec::new(), None)
+                .sign_request(
+                    "GET",
+                    &client.path("apps"),
+                    Vec::new(),
+                    None,
+                    TimeoutClass::Bulk,
+                )
                 .unwrap()
         };
         client.send(request()).await.unwrap();
@@ -2735,13 +2820,19 @@ async fn test_raw_discovery_preserves_time_evidence() {
             }
         }));
         let client = client_with(signer(), Some(service_public()), transport);
-        let request = |rest| {
+        let request = |rest, timeout| {
             client
-                .sign_request("GET", &client.path(rest), Vec::new(), None)
+                .sign_request("GET", &client.path(rest), Vec::new(), None, timeout)
                 .unwrap()
         };
-        client.send(request("apps")).await.unwrap();
-        client.send(request("account")).await.unwrap();
+        client
+            .send(request("apps", TimeoutClass::Bulk))
+            .await
+            .unwrap();
+        client
+            .send(request("account", TimeoutClass::Ordinary))
+            .await
+            .unwrap();
         assert_eq!(client.last_server_time(), Some(NOW));
         assert_eq!(client.latest_server_time(), None);
         assert_eq!(client.latest_compared_time(), None);

@@ -64,7 +64,7 @@ pub async fn enrollment(world: &World) -> FlowResult {
         path_and_query: path.clone(),
         headers: Vec::new(),
         body: Vec::new(),
-        timeout: TimeoutClass::default(),
+        timeout: TimeoutClass::Bulk,
     });
     let answer = world.request("GET", ORIGIN, &path).await?;
     let mut expected = b"{\"identity\":".to_vec();
@@ -574,7 +574,7 @@ mod tests {
             path_and_query: path,
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: TimeoutClass::default(),
+            timeout: TimeoutClass::Bulk,
         };
         let checked = client.public_identity().await?;
         if checked.identity.identity() != alice.public() || checked.freeze.is_some() {

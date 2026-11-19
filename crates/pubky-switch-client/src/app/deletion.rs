@@ -447,6 +447,7 @@ impl App {
             seq: d.seq,
             names: vec![d.owner.clone()],
             call: false,
+            held_gap: None,
             deny: false,
         })
     }

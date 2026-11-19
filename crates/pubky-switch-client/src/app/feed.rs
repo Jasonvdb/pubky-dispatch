@@ -1078,7 +1078,7 @@ impl App {
             // page, unless this read made one before any item, as after a restore (Switch
             // spec 8.3 "Ahead", 12.4 condition 4).
             let listed = self.listed_before_items;
-            self.hand_held_gap(held, position, !listed, &mut read)
+            self.hand_held_gap(held, position, page.server_time_ms, !listed, &mut read)
                 .await?;
             if !listed {
                 list_through = Some(start);
@@ -1216,6 +1216,7 @@ impl App {
                         *seq,
                         *entries,
                         accepted_from.zip(*accepted_until),
+                        page.server_time_ms,
                         &mut read,
                     )
                     .await?
@@ -3334,15 +3335,17 @@ impl App {
         &mut self,
         held: u64,
         position: u64,
+        read_at_ms: u64,
         list: bool,
         read: &mut Read,
     ) -> Result<(), AppError> {
-        let call = OwedCall::Missed {
+        let call = OwedCall::from(crate::app::MissedEntries {
+            read_at_ms,
             seq: held,
             entries: 0,
             accepted_from_ms: self.resend_floor(),
             accepted_until_ms: u64::MAX,
-        };
+        });
         // Owed at the compared position, at or before the cursor, so the queue makes it
         // before anything after the gap (Switch spec 8.3).
         // The gap is no feed item: it is noted at the position the page starts from, which
@@ -3414,7 +3417,7 @@ impl App {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
         let mut owed_to = self.protocols.names();
         let generation = self.state.cursor.generation;
-        let at = key::owed(generation, seq);
+        let at = call.stored_at(generation, seq);
         read.tx.put(
             &at,
             &Owed {
@@ -3422,8 +3425,11 @@ impl App {
                 call: call.clone(),
             },
         )?;
-        self.state.asked.insert(seq);
-        read.tx.put(&key::asked(seq), &())?;
+        if call.held_gap(seq).is_none() {
+            self.state.asked.insert(seq);
+            read.tx
+                .put(&key::asked(seq), &matches!(call, OwedCall::Missed { .. }))?;
+        }
         self.commit_read(read).await?;
         for registered in protocols {
             // In step with the item, or waiting only for the listing the `missed` item
@@ -3945,9 +3951,16 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         tx.delete(at)?;
-        kept.retain(|item| !item.call || (item.generation, item.seq) != (generation, seq));
-        if ahead && self.state.asked.insert(seq) {
-            tx.put(&key::asked(seq), &())?;
+        let gap = at
+            .rsplit_once('/')
+            .and_then(|(prefix, held)| (prefix == key::owed(generation, seq)).then_some(held))
+            .map(super::state::parse_num)
+            .transpose()?;
+        kept.retain(|item| {
+            !item.call || (item.generation, item.seq, item.held_gap) != (generation, seq, gap)
+        });
+        if ahead && gap.is_none() && self.state.asked.insert(seq) {
+            tx.put(&key::asked(seq), &false)?;
         }
         Ok(())
     }
@@ -3993,13 +4006,14 @@ impl App {
         seq: u64,
         entries: u64,
         accepted: Option<(u64, u64)>,
+        read_at_ms: u64,
         read: &mut Read,
     ) -> Result<Step, AppError> {
         let Some((from, until)) = accepted else {
             // The service writes the item: one whose times don't parse asks for no re-send,
             // but still owes the listing (Switch spec 8.2, wire 7.4.4).
             if self.state.asked.insert(seq) {
-                read.tx.put(&key::asked(seq), &())?;
+                read.tx.put(&key::asked(seq), &false)?;
                 self.owe_item_listing(seq, true, None, read).await?;
             }
             return Ok(Step::Pass);
@@ -4007,12 +4021,13 @@ impl App {
         if self.state.asked.insert(seq) {
             self.commit_read(read).await?;
             let accepted_from_ms = from.max(self.resend_floor());
-            let call = OwedCall::Missed {
+            let call = OwedCall::from(crate::app::MissedEntries {
+                read_at_ms,
                 seq,
                 entries,
                 accepted_from_ms,
                 accepted_until_ms: until.max(accepted_from_ms),
-            };
+            });
             self.owe_item_listing(seq, true, None, read).await?;
             self.hand_call(seq, call, read).await?;
             self.events.push(AppEvent::Missed { seq, entries });

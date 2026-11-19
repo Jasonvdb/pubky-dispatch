@@ -194,7 +194,7 @@ impl Signs for DynSigner<'_> {
 }
 
 /// How a request is authenticated, beyond the caller's credentials.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Auth<'a> {
     /// The first transport handoff of a kept operation (Switch spec 10.1).
     first_send: Option<&'a crate::transport::FirstSend>,
@@ -215,6 +215,20 @@ pub(crate) struct Auth<'a> {
     /// How long the call may take ([`TimeoutClass`]), which goes to the transport with
     /// the request.
     pub(crate) timeout: TimeoutClass,
+}
+
+impl Auth<'_> {
+    fn new(timeout: TimeoutClass) -> Self {
+        Self {
+            first_send: None,
+            invite_code: None,
+            with_cert: false,
+            public: false,
+            timestamp_ms: None,
+            success_key: None,
+            timeout,
+        }
+    }
 }
 
 /// The `Content-Type` of a request body (Switch wire 7.1).
@@ -858,8 +872,8 @@ impl SwitchClient {
     /// The timestamp is the clock's time to the second. An app calling another identity's
     /// account sends `Switch-Cert`; the next service signs over the transfer label.
     ///
-    /// The request's timeout class is [`TimeoutClass::Ordinary`]; a caller whose request
-    /// or answer can be large sets [`Request::timeout`] before sending it.
+    /// Choose `timeout` for the request and its largest valid answer, including a refusal.
+    /// The transport receives the class in [`Request::timeout`].
     ///
     /// # Errors
     ///
@@ -871,6 +885,7 @@ impl SwitchClient {
         path_and_query: &str,
         body: Vec<u8>,
         invite_code: Option<&str>,
+        timeout: TimeoutClass,
     ) -> Result<SignedRequest, ClientError> {
         let content = if body.is_empty() {
             Body::Empty
@@ -884,7 +899,7 @@ impl SwitchClient {
             content,
             Auth {
                 invite_code,
-                ..Auth::default()
+                ..Auth::new(timeout)
             },
         )
     }

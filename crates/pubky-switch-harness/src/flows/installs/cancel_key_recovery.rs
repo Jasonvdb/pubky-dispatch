@@ -4,9 +4,10 @@
 use std::sync::Arc;
 
 use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
+use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_core::records::{IDENTITY_PATH, SIGNER_BACKUP_PATH};
-use pubky_switch_signer::IdentityKeyring;
 use pubky_switch_signer::state::signer_namespace;
+use pubky_switch_signer::{IdentityKeyring, SecretVault};
 use pubky_switch_signer::{KeyRecoveryConfirmed, Refusal, Signer, SignerError, UserConfirmed};
 
 use super::{ORIGIN, published};
@@ -16,9 +17,19 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let vault = world.identity_vault(&alice);
+    Box::pin(stop_in_place(world, &alice, &vault)).await?;
+    let version = Box::pin(stop_on_new_install(world, &alice, &vault)).await?;
+    Box::pin(stop_before_first_version(world, &alice, &vault, version)).await
+}
+
+async fn stop_in_place(
+    world: &World,
+    alice: &TestIdentity,
+    vault: &Arc<dyn SecretVault>,
+) -> FlowResult {
     let keyring = || IdentityKeyring::open(vault.clone());
     let memory = Arc::new(MemoryStore::new());
-    let env = world.signer_env(&alice, memory.clone())?;
+    let env = world.signer_env(alice, memory.clone())?;
     let mut owner = Box::pin(Signer::create(env.clone(), keyring()?, ORIGIN)).await?;
     Box::pin(owner.resume()).await?;
     let ns = signer_namespace(&alice.public());
@@ -37,7 +48,7 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
             memory.clone()
         };
         let mut signer =
-            Box::pin(Signer::open(world.signer_env(&alice, store)?, keyring()?)).await?;
+            Box::pin(Signer::open(world.signer_env(alice, store)?, keyring()?)).await?;
         assert!(Box::pin(signer.restore(confirmed)).await.is_err());
         drop(signer);
         let saved = memory
@@ -61,7 +72,7 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
             // Receipt for the original was verified and committed, but the local answer
             // was lost. Reopen offline and finish without another POST or survey read.
             let lost = Arc::new(FaultStore::new(memory.clone(), Fault::FailAfter(1)));
-            signer = Box::pin(Signer::open(world.signer_env(&alice, lost)?, keyring()?)).await?;
+            signer = Box::pin(Signer::open(world.signer_env(alice, lost)?, keyring()?)).await?;
             assert!(
                 Box::pin(signer.cancel_key_recovery(UserConfirmed::shown_and_confirmed()))
                     .await
@@ -80,16 +91,24 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
         assert_eq!(next.version(), doc.version() + 1);
         assert_eq!(next.generation(), doc.generation());
         assert_eq!(next.body().signer, doc.body().signer);
-        assert_eq!(published(world, &alice), Some(next.version()));
+        assert_eq!(published(world, alice), Some(next.version()));
         owner = signer;
     }
-    drop(owner);
+    Ok(())
+}
 
+async fn stop_on_new_install(
+    world: &World,
+    alice: &TestIdentity,
+    vault: &Arc<dyn SecretVault>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let keyring = || IdentityKeyring::open(vault.clone());
+    let ns = signer_namespace(&alice.public());
     // A store created just for recovery returns to the normal restore choice. Opening
     // the very same identity vault supplies the key for a new confirmed recovery.
     world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
     let fresh_store = Arc::new(MemoryStore::new());
-    let fresh = world.signer_env(&alice, fresh_store.clone())?;
+    let fresh = world.signer_env(alice, fresh_store.clone())?;
     let survey = Box::pin(Signer::survey_key_recovery_new(fresh.clone(), keyring()?)).await?;
     world.lose_answer("POST", "/enroll");
     let cut = Box::pin(Signer::restore_new(
@@ -129,14 +148,22 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
     Box::pin(new.resume()).await?;
     let next = Box::pin(new.set_record_max_age(Some(180))).await?;
     assert_eq!(next.version(), shown.version + 2);
-    assert_eq!(published(world, &alice), Some(next.version()));
-    drop(new);
+    assert_eq!(published(world, alice), Some(next.version()));
+    Ok(next.version())
+}
 
+async fn stop_before_first_version(
+    world: &World,
+    alice: &TestIdentity,
+    vault: &Arc<dyn SecretVault>,
+    previous: u64,
+) -> FlowResult {
+    let keyring = || IdentityKeyring::open(vault.clone());
     // Before a first version exists, stopping keeps the selected serving account even
     // when there is no public file left to locate it.
     world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
     world.files().remove(alice.public(), IDENTITY_PATH);
-    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let env = world.signer_env(alice, Arc::new(MemoryStore::new()))?;
     let mut initial = Box::pin(Signer::create(env.clone(), keyring()?, ORIGIN)).await?;
     assert_eq!(
         Box::pin(initial.resume()).await,
@@ -160,9 +187,9 @@ async fn cancel_and_sign(world: &World) -> FlowResult {
     assert_eq!(again, shown);
     let restored =
         Box::pin(initial.restore(KeyRecoveryConfirmed::shown_and_confirmed(&again, &[]))).await?;
-    assert_eq!(restored.version(), next.version() + 1);
+    assert_eq!(restored.version(), previous + 1);
     let last = Box::pin(initial.set_record_max_age(Some(240))).await?;
-    assert_eq!(published(world, &alice), Some(last.version()));
+    assert_eq!(published(world, alice), Some(last.version()));
     Ok(())
 }
 

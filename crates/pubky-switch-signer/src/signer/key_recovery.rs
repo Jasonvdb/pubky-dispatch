@@ -578,7 +578,7 @@ impl Signer {
             fresh,
         };
         self.commit(self.state.clone(), Some(flow)).await?;
-        Box::pin(self.finish_key_recovery()).await
+        self.finish_key_recovery().await
     }
 
     /// Start a recovery with the key alone from `found`, under `confirmed`: the survey read
@@ -661,7 +661,7 @@ impl Signer {
             };
             self.commit(kept, Some(flow)).await?;
         }
-        Box::pin(self.finish_key_recovery()).await
+        self.finish_key_recovery().await
     }
 
     /// Run the recovery to its version's delivery, its owed backup and publication, and the
@@ -721,16 +721,20 @@ impl Signer {
             }
             Err(error) => return Err(error),
         };
-        let selected =
-            (held == Held::InPlace && self.state.before_first_version()).then_some(&observed);
+        // A newer user survey may change the app selection. The existing enrollment
+        // and its saved answer still belong to the original service, store and creation.
         let planned = self
-            .key_plan(&self.state, marks, Some(origin), None, selected)
+            .key_plan(&self.state, marks, Some(origin), None, Some(&observed))
             .await;
+        let first = held == Held::InPlace && self.state.before_first_version();
         let built = match planned {
             Ok(plan) if plan.survey.digest == digest => {
                 self.recovered_records(origin, plan, &answer, dropped)
             }
             Ok(_) => Err(stop(KeyRecoveryStop::SurveyChanged)),
+            Err(SignerError::Refused(Refusal::FirstEnrollmentUnavailable)) if !first => {
+                Err(stop(KeyRecoveryStop::SurveyChanged))
+            }
             Err(error) => Err(error),
         };
         match built {

@@ -14606,15 +14606,16 @@ async fn test_record_publication_protection_covers_the_interval_before_a_later_r
         assert!(matches!(latest, crate::app::records::CurrentAt::Answer(v) if v.version > deleted));
 
         let at = |seq| crate::app::records::CurrentAt::Answer(RecordVersion::new(generation, seq));
+        let answer = crate::app::records::MissingFrom::Key;
         let mut tx = reader.tx().unwrap();
         assert!(
             !reader
-                .note_absent(&key, at(deleted - 1), &mut tx)
+                .note_absent(&key, at(deleted - 1), answer, &mut tx)
                 .await
                 .unwrap()
         );
         assert!(replacement_at(&reader, &key).is_some());
-        let outcome = reader.note_absent(&key, at(deleted), &mut tx).await;
+        let outcome = reader.note_absent(&key, at(deleted), answer, &mut tx).await;
         assert!(matches!(
             outcome,
             Err(AppError::Alarm(Alarm::Rollback { .. }))

@@ -9,27 +9,33 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::order::{Handover, Kept};
+use super::put_back::RecordHold;
 use super::records::{self, DeleteBase};
 use super::state::{Reader, Tx};
-use super::{App, AppError, FeedPosition, ProtocolSet};
+use super::{App, AppError, FeedPosition, ProtocolSet, PutBack};
 
 pub(super) const PREFIX: &str = "delobs/";
 pub(super) const RECEIPTS: &str = "delack/";
-/// An observation retains two signed operations, certificates and a mark. A successful
-/// observation instead commits the owner's bounded local state.
-pub(super) const ROOM: u64 = 6 << 20;
+/// Space for the signed delete, sealed predecessor, their certificates and proof,
+/// the outstanding signed batch, its successor merge, the owner's local writes and mark.
+pub(super) const ROOM: u64 = 8 << 20;
 const _: () = assert!(
-    ROOM >= super::MAX_STEP_LOCAL_BYTES as u64
-        && ROOM
-            > 2 * pubky_switch_core::ops::MAX_OP_BYTES as u64
-                + super::MAX_SEEN_MARK_BYTES as u64
-                + (128 << 10)
+    2 * pubky_switch_core::ops::MAX_OP_BYTES as u64
+        + (128 << 10)
+        + ((2 * pubky_switch_core::ops::MAX_OP_BYTES
+            + super::MAX_STEP_LOCAL_BYTES
+            + super::MAX_SEEN_MARK_BYTES) as u64
+            * 4
+            / 3)
+        < ROOM
+        && ROOM < crate::store::MAX_VALUE_BYTES
 );
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Predecessor {
     pub(super) source: records::KeptOp,
     pub(super) exact: bool,
+    pub(super) dated_at_expected: bool,
 }
 
 /// The immutable evidence still owed to the collection's owner.
@@ -41,6 +47,8 @@ pub(super) struct Observation {
     pub(super) collection: String,
     pub(super) delete: DeleteBase,
     pub(super) operation: SignedDoc,
+    pub(super) proof: Option<SignedDoc>,
+    pub(super) authenticated: bool,
     pub(super) cert: SignedDoc,
     pub(super) generation: u64,
     pub(super) seq: u64,
@@ -61,13 +69,33 @@ impl std::fmt::Debug for Observation {
 }
 
 impl Observation {
+    pub(super) fn revision(&self) -> pubky_switch_core::shared::ApplicationRef {
+        pubky_switch_core::shared::ApplicationRef {
+            generation: self.generation,
+            seq: self.seq,
+            item_hash: self.delete.item_hash,
+        }
+    }
+
+    pub(super) fn put(&self) -> Result<pubky_switch_core::ops::RecordPut, AppError> {
+        let op = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+        match &op.body().kind {
+            OpKind::RecordPut(put) => Ok(put.clone()),
+            _ => Err(super::corrupt()),
+        }
+    }
+
     pub(super) fn id(&self) -> ([u8; 32], RecordVersion, [u8; 32]) {
         (self.key, self.delete.version, self.delete.item_hash)
     }
 
     pub(super) fn store_key(&self) -> String {
+        self.key_in(PREFIX)
+    }
+
+    pub(super) fn key_in(&self, prefix: &str) -> String {
         format!(
-            "{PREFIX}{}/{}/{}/{}",
+            "{prefix}{}/{}/{}/{}",
             b64(&self.key),
             self.delete.version.generation,
             self.delete.version.version,
@@ -105,8 +133,14 @@ impl Observation {
     /// An imported mark or a claimed version cannot authenticate the predecessor. A
     /// delete can name its application directly. Otherwise its service proof must
     /// establish the signed predecessor at the delete's expected version.
-    fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+    pub(super) fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+        self.authenticated &= self
+            .proof
+            .as_ref()
+            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok())
+            .and_then(|dated| dated.version)
+            == Some(self.delete.version);
         let Some(op) = self.prior_write(&doc.identity(), &deletion)? else {
             return Ok(());
         };
@@ -134,6 +168,7 @@ impl Observation {
             .as_ref()
             .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
             .and_then(|d| d.version);
+        prior.dated_at_expected = version == Some(d.expected_version);
         let named_match = !named.is_empty()
             && named
                 .iter()
@@ -201,7 +236,7 @@ impl Observation {
     }
 }
 
-type Id = ([u8; 32], RecordVersion, [u8; 32]);
+pub(super) type Id = ([u8; 32], RecordVersion, [u8; 32]);
 pub(super) type Observations = BTreeMap<Id, Observation>;
 pub(super) type Receipts = BTreeMap<Id, Receipt>;
 
@@ -310,12 +345,28 @@ pub(super) async fn restore(
 }
 
 impl App {
-    fn consult_deletion(
+    pub(super) fn consult_deletion(
         &self,
         hold: &Observation,
         deletion: &SignedOp,
         tx: &Tx,
-    ) -> Result<Option<super::PutBack>, AppError> {
+    ) -> Result<Option<PutBack>, AppError> {
+        self.with_deletion(hold, deletion, tx, |owner, input, cx| {
+            owner.record_put_back(input, cx)
+        })
+    }
+
+    pub(super) fn with_deletion<T>(
+        &self,
+        hold: &Observation,
+        deletion: &SignedOp,
+        tx: &Tx,
+        consult: impl FnOnce(
+            &dyn super::Protocol,
+            &super::RecordDeletion<'_>,
+            &super::ReceiveContext<'_>,
+        ) -> Result<T, super::StoreFailure>,
+    ) -> Result<T, AppError> {
         let owner = self
             .protocols
             .of_collection(&hold.collection)
@@ -341,15 +392,25 @@ impl App {
             collection: &hold.collection,
             key: &hold.key,
             version: hold.delete.version,
+            original_in_current_generation: hold.authenticated
+                && hold.generation == self.state.meta.generation
+                && deletion.body().generation == hold.generation
+                && hold.delete.version == RecordVersion::new(hold.generation, hold.seq),
             writer: deletion.body().app_id.ok_or_else(super::corrupt)?,
             item_hash: hold.delete.item_hash,
             seen: hold.seen.as_ref().map(|m| m.mark.as_slice()),
             page_time_ms: hold.page_time_ms,
             policy: opened.as_ref().map(|_| &put.policy),
+            exact_version_authenticated: opened.is_some()
+                && hold
+                    .predecessor
+                    .as_ref()
+                    .is_some_and(|prior| prior.exact && prior.dated_at_expected),
             exact_value: opened
                 .as_deref()
                 .filter(|_| hold.predecessor.as_ref().is_some_and(|prior| prior.exact)),
             base: super::WriteBase {
+                repair: None,
                 expected_version: put.expected_version,
                 held: hold.held,
                 conditions: deletion.body().conditions.clone(),
@@ -367,14 +428,21 @@ impl App {
             tx.pending_local(),
             tx.pending_writes(),
         );
-        owner
-            .protocol
-            .record_put_back(&input, &cx)
-            .map_err(AppError::Protocol)
+        consult(owner.protocol.as_ref(), &input, &cx).map_err(AppError::Protocol)
+    }
+
+    pub(super) fn owed_deletions(&self) -> impl Iterator<Item = &Observation> {
+        let restored = self
+            .state
+            .put_backs
+            .values()
+            .filter(|h| h.observing)
+            .map(|h| &h.observation);
+        self.state.deletions.values().chain(restored)
     }
 
     pub(super) fn deletion_positions(&self) -> impl Iterator<Item = Kept> + '_ {
-        self.state.deletions.values().map(|d| Kept {
+        self.owed_deletions().map(|d| Kept {
             generation: d.generation,
             seq: d.seq,
             names: vec![d.owner.clone()],
@@ -445,17 +513,42 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn observe_deletion(
+    pub(super) fn deletion_hold(&self, observed: Observation) -> RecordHold {
+        let protects =
+            observed.page_time_ms.is_some() && observed.seq > self.state.cursor.at_service;
+        RecordHold {
+            observation: observed,
+            protects,
+            needs_cursor: false,
+            pending: None,
+            cursor_generation: None,
+            waited: false,
+            observing: false,
+        }
+    }
+
+    /// First observation of the delete, or the first feed page for a retained record
+    /// view. A retry of either sees its observation already committed.
+    pub(super) fn take_put_back_observation(
         &mut self,
-        observed: Observation,
+        mut hold: RecordHold,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        use PutBack::{Observe, Prepare, Write};
+        let observed = &hold.observation;
         let deletion = SignedOp::peek(&observed.operation).map_err(|_| super::corrupt())?;
-        match self.consult_deletion(&observed, &deletion, tx) {
-            Ok(None) => (),
-            Ok(Some(super::PutBack::Observe { observed: writes }))
-                if super::local_writes_bytes(&writes) <= super::MAX_STEP_LOCAL_BYTES =>
-            {
+        let answer = match self.consult_deletion(observed, &deletion, tx) {
+            Ok(mut answer) => {
+                let writes = match &mut answer {
+                    Some(Observe { observed } | Prepare { observed } | Write { observed, .. }) => {
+                        std::mem::take(observed)
+                    }
+                    None => vec![],
+                };
+                let bytes = super::local_writes_bytes(&writes);
+                if bytes > super::MAX_STEP_LOCAL_BYTES {
+                    return self.await_put_back_observation(hold, tx);
+                }
                 if !writes.is_empty() {
                     let OpKind::RecordPut(put) = &deletion.body().kind else {
                         return Err(super::corrupt());
@@ -472,18 +565,47 @@ impl App {
                     tx.put(&receipt.store_key(), &receipt)?;
                     self.state.deletion_receipts.insert(receipt.id(), receipt);
                 }
+                answer
             }
-            Ok(Some(_)) | Err(AppError::Protocol(_)) => {
-                if let Entry::Vacant(entry) = self.state.deletions.entry(observed.id()) {
-                    tx.put(&observed.store_key(), &observed)?;
-                    entry.insert(observed);
-                }
-                return Ok(());
-            }
+            Err(AppError::Protocol(_)) => return self.await_put_back_observation(hold, tx),
             Err(error) => return Err(error),
-        }
+        };
         if self.state.deletions.remove(&observed.id()).is_some() {
             tx.delete(&observed.store_key())?;
+        }
+        hold.observing = false;
+        // A later view or the first feed page can enrich an existing observation.
+        // Settle an already-sent operation against the current record on retry.
+        if hold
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.kept_ms.is_some())
+        {
+            return self.keep_put_back(hold, tx);
+        }
+        match answer {
+            Some(Prepare { .. }) => self.keep_waiting(hold, tx),
+            Some(Write { .. }) => self.keep_put_back(hold, tx),
+            None if self.state.put_backs.contains_key(&observed.id()) => {
+                self.keep_waiting(hold, tx)
+            }
+            _ => self.forget_put_back(&observed.id(), tx),
+        }
+    }
+
+    fn await_put_back_observation(
+        &mut self,
+        mut hold: RecordHold,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if self.state.put_backs.contains_key(&hold.observation.id()) {
+            hold.observing = true;
+            return self.keep_waiting(hold, tx);
+        }
+        let observed = hold.observation;
+        if let Entry::Vacant(entry) = self.state.deletions.entry(observed.id()) {
+            tx.put(&observed.store_key(), &observed)?;
+            entry.insert(observed);
         }
         Ok(())
     }
@@ -493,9 +615,7 @@ impl App {
         budget: &super::CallBudget,
     ) -> Result<(), AppError> {
         let mut due: Vec<_> = self
-            .state
-            .deletions
-            .values()
+            .owed_deletions()
             .map(|d| (self.feed_order(d.generation, d.seq), d.id()))
             .collect();
         due.sort_unstable();
@@ -503,12 +623,19 @@ impl App {
             if index > 0 && self.spent(budget) {
                 break;
             }
-            let Some(observation) = self.state.deletions.get(&id).cloned() else {
+            let hold = self.state.put_backs.get(&id).filter(|h| h.observing);
+            let Some(observed) = hold
+                .map(|h| &h.observation)
+                .or_else(|| self.state.deletions.get(&id))
+            else {
                 continue;
             };
-            if self.ready_at(&observation.owner, order, Handover::Call) {
+            if self.ready_at(&observed.owner, order, Handover::Call) {
+                let hold = hold
+                    .cloned()
+                    .unwrap_or_else(|| self.deletion_hold(observed.clone()));
                 let mut tx = self.tx()?;
-                self.observe_deletion(observation, &mut tx)?;
+                self.take_put_back_observation(hold, &mut tx)?;
                 if self.state.deletion_receipts.contains_key(&id) {
                     self.retire_completed_deletion(id.0, &mut tx).await?;
                 }

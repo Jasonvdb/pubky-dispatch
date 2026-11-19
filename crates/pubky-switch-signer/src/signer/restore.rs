@@ -135,7 +135,7 @@ impl RestoreLocal {
     }
 
     pub(super) fn intact(state: SignerState) -> Result<Self> {
-        state.check_copies()?;
+        state.check_stored_copies()?;
         let identity = state.identity;
         Ok(Self::from_state(Some(state), &identity))
     }
@@ -159,7 +159,7 @@ impl RestoreLocal {
             }
         };
         if let Some(state) = &state {
-            if let Err(error) = state.check_copies() {
+            if let Err(error) = state.check_stored_copies() {
                 local_damage(error)?;
                 damaged = true;
             }
@@ -226,7 +226,8 @@ fn local_damage(error: SignerError) -> Result<()> {
             RecordsFault::Undecodable { .. }
             | RecordsFault::InvalidHeader
             | RecordsFault::OtherIdentity
-            | RecordsFault::Incomplete,
+            | RecordsFault::Incomplete
+            | RecordsFault::Damaged(_),
         ) => Ok(()),
         other => Err(other),
     }

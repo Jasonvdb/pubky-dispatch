@@ -419,6 +419,50 @@ async fn test_key_recovery_over_unusable_records_with_no_backup() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_over_damaged_account_binding_without_a_backup() {
+    let world = World::new();
+    let (first, store) = world.enrolled().await;
+    let original = first.identity_doc().unwrap().unwrap();
+    drop(first);
+    edit_state(&world, &store, |state| {
+        state["newest"]["account"] = serde_json::Value::Null;
+    });
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    assert_eq!(
+        Signer::restore_over_unusable(
+            world.env(store.clone()),
+            world.keyring(),
+            RecordsDiscarded::shown_and_confirmed()
+        )
+        .await
+        .unwrap_err(),
+        SignerError::Refused(Refusal::NoBackup)
+    );
+    let shown = survey(&world, &store).await.unwrap();
+    let signer = Box::pin(Signer::restore_over_unusable(
+        world.env(store.clone()),
+        world.keyring(),
+        RecordsDiscarded::shown_and_confirmed()
+            .and_key_recovery(KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[])),
+    ))
+    .await
+    .unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.version() > original.version());
+    assert_eq!(doc.generation(), original.generation());
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_in_place_with_records_behind_and_no_backup() {
     // An install put back to an older state, its records behind its own newer version, and
     // the backup unreadable: it recovers in place.
@@ -1120,13 +1164,18 @@ async fn test_key_recovery_in_place_never_clears_an_alarm_or_a_recovery() {
     // A held alarm, or a provider loss in progress, stops the recovery in place: the alarm
     // is cleared first, and the loss is declared again.
     let world = World::new();
-    let (mut signer, _) = world.enrolled().await;
+    let (mut signer, memory) = world.enrolled().await;
     let earlier = signer.identity_doc().unwrap().unwrap();
     signer.set_record_max_age(Some(60)).await.unwrap();
     world.switch.deliver_identity(&earlier).unwrap();
     let alarm = signer.set_record_max_age(Some(61)).await.unwrap_err();
     assert!(matches!(alarm, SignerError::Alarm(_)));
     assert_eq!(signer.survey_key_recovery().await.unwrap_err(), alarm);
+    drop(signer);
+    edit_state(&world, &memory, |state| {
+        state["newest"]["account"] = serde_json::Value::Null;
+    });
+    assert_eq!(survey(&world, &memory).await.unwrap_err(), alarm);
 
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
@@ -1706,7 +1755,7 @@ fn damage_flow(world: &World, store: &MemoryStore) {
 async fn test_key_recovery_over_unusable_records_keeps_their_floors_and_marks() {
     // The records are unusable, their state readable: its epochs past the service's next
     // one, or its own copy above the service's, stop the recovery.
-    for case in ["epoch", "mark"] {
+    for case in ["epoch", "mark", "records behind"] {
         let world = World::new();
         let (mut first, memory) = world.enrolled().await;
         let older = first.identity_doc().unwrap().unwrap();
@@ -1725,6 +1774,13 @@ async fn test_key_recovery_over_unusable_records_keeps_their_floors_and_marks() 
                     state["epoch_through"] = (newer.data_epoch() + 2).into();
                 });
                 (newer.version(), newer.version())
+            }
+            "records behind" => {
+                let seen = newer.version() + 1;
+                edit_state(&world, &memory, |state| {
+                    state["records_behind"] = seen.into();
+                });
+                (newer.version(), seen)
             }
             _ => {
                 world.switch.deliver_identity(&older).unwrap();

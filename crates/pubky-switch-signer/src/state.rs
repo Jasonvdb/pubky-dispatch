@@ -655,8 +655,18 @@ impl SignerState {
             .collect()
     }
 
+    /// Check state read from the store. A failed binding here describes the stored value.
+    pub(crate) fn check_stored_copies(&self) -> Result<()> {
+        self.check_copies().map_err(|error| match error {
+            SignerError::Records(RecordsFault::Invariant(binding)) => {
+                RecordsFault::Damaged(binding).into()
+            }
+            other => other,
+        })
+    }
+
     /// Check the signed copies independently of the service and of caller-supplied keys.
-    pub(crate) fn check_copies(&self) -> Result<()> {
+    fn check_copies(&self) -> Result<()> {
         for service in self
             .service
             .iter()
@@ -1134,7 +1144,7 @@ pub(crate) async fn load(
         return Ok(None);
     };
     let flow = records.flow?;
-    state.check_copies()?;
+    state.check_stored_copies()?;
     if let Some(flow) = &flow {
         flow.check_state(&state)?;
     }

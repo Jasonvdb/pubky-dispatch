@@ -10,6 +10,8 @@ The client's public API for protocols and hosts is in place: record answers that
 
 A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
+Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
+
 **Caller changes already on main**
 
 - When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
@@ -73,7 +75,7 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 - [keys] **A hand-over can strand the only sealed copy of the identity key.** The receiving device installs the key in its vault only after the service confirms that the device has taken over. Retain an independent copy of the key until the receiving vault has confirmed possession.
 - [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
-- [keys] **Some damaged signer stores cannot be restored in place.** Certain invalid stored values fall outside the damage the restore call accepts, and a surviving operation or alarm can also block replacement. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
+- [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
 - [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A changed binding, a permanent refusal other than expiry, or an existing identity document or backup requires the appropriate restore or confirmed provider-loss procedure.
 - [availability] **Changing answers can prevent key recovery from finishing.** If a read changes what the user confirmed, recovery at a serving account returns `SurveyChanged`. Survey again when the sources are stable. A provider loss declared with the key can proceed when a source shows less than before, but new evidence still requires confirmation.
 - [availability] **An interrupted key recovery has no ordinary cancel operation.** Persistent storage or communication errors can leave recovery pending and block other signing operations on that installation. Preserve the pending state so recovery can resume when the dependency is available.

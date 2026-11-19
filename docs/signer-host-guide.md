@@ -1,6 +1,6 @@
 # Signer host guide
 
-For the developers of a host app, for example a wallet app acting as signer, that embeds the `pubky-switch-signer` crate. It lists every case the signer can put in front of the host, how the host learns of it, what the user must see and do, and then every screen the host needs, as a checklist. The rules behind it are in the Switch spec (`spec/spec.md`) and wire format (`spec/wire-format.md`); the crate's design is in `docs/signer-design.md`.
+For the developers of a host app, for example a wallet app acting as signer, that embeds the `pubky-switch-signer` crate. It lists every case the signer can put in front of the host, how the host learns of it, what the user needs to know and which decisions require confirmation. Section 3 gives a checklist for integrating these flows. The rules behind it are in the Switch spec (`spec/spec.md`) and wire format (`spec/wire-format.md`); the crate's design is in `docs/signer-design.md`.
 
 ## 1. What the signer does, and what the host supplies
 
@@ -17,7 +17,7 @@ The host supplies, once per identity:
 
 **One `Signer` per identity, one call at a time.** Open one `Signer` per identity at a time, and never run two of its calls at once, for example from two threads through a binding's wrapper (the Rust methods take `&mut self`; a binding must keep that). The signer enforces the first through the store: every constructor acquires the identity's `signer/<identity>` namespace before it loads records or signs anything, and every commit is a conditional write (`commit_if`) under that ownership. A second instance, in another process (an app or push extension, a widget, a scheduled task) or as a second object in the same one, fails at its constructor with `SignerError::Store(StoreError::InUse)` and signs nothing: it gives up or tries again later, and never deletes or replaces records in answer (2.4). That holds only if the host's store implements the ownership contract of section 2.4 for every handle and process that shares it; a store that doesn't would let two instances each sign the next version from the same `signed_through` mark, two different documents at one version, which is the signer equivocating against itself. Work the host schedules, such as `Signer::run_due`, runs on the one open `Signer`. Dropping it doesn't always free the namespace at once: a canceled save keeps its lease until its worker finishes (2.4).
 
-The identity secret itself is the host's to back up for the user, for example as a seed phrase. The signer backs up its own records, without the key, on the Homeserver. Each alert carries the facts to show; the wording is the host's. `UserConfirmed::shown_and_confirmed()` is made by the host only after the user has seen the consequence of the call and confirmed it.
+The identity secret itself is the host's to back up for the user, for example as a seed phrase. The signer backs up its own records, without the key, on the Homeserver. Each alert carries the facts the host needs. The host chooses wording, controls and layout, including how to present alerts. Quoted messages are examples. `UserConfirmed::shown_and_confirmed()` is made by the host only after the user has seen the consequence of the call and confirmed it.
 
 Types the signer takes or returns that come from the other crates of this repository: `IdentityDoc`, `AppCert`, `SignedDoc`, `ConnectRequests`, `AuthRequest` and `AppKeys` from `pubky-switch-core`, and the store, the clock, the transport and `ClientError` (inside `SignerError::Switch`) from `pubky-switch-client`.
 
@@ -27,7 +27,7 @@ Every error a call returns is a `SignerError`; a refusal a rule made is `SignerE
 
 ### 2.1 First set-up and enrollment
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | A new identity is set up | `IdentityKeyring::create(vault)` returns a keyring; `Signer::create(env, keyring, origin)` returns the signer; `Signer::status()` is `SignerStatus::Enrolling` | the chosen switch, "setting up" | call `Signer::resume`; on success the status is `SignerStatus::Signing` | do not show the identity as ready while `SignerStatus::Enrolling` |
 | The enrollment couldn't be sent yet | `Signer::resume` returns `SignerError::Switch` or `SignerError::Homeserver`; status stays `SignerStatus::Enrolling` | "not reached yet, will retry" | call `resume` again later, or let `run_due` do it; split `SignerError::Switch` as 2.4 does | do not call `Signer::create` again: the flow is kept and resent unchanged, and `create` returns `Refusal::AlreadySetUp` |
@@ -39,7 +39,7 @@ Every error a call returns is a `SignerError`; a refusal a rule made is `SignerE
 
 ### 2.2 The key vault
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | `add` stored the secret | the host's `SecretVault::add` returns `AddOutcome::Stored` | nothing | `load` must return it from then on, also after a crash | do not return `Stored` before the write is durable |
 | `add` found a secret already there | the host's `add` returns `AddOutcome::Occupied`; the signer then returns `KeyError::Occupied` | "this device already holds an identity" | keep the held secret; open it with `IdentityKeyring::open` | do not overwrite, update, or delete-then-add the held secret |
@@ -53,7 +53,7 @@ Every error a call returns is a `SignerError`; a refusal a rule made is `SignerE
 
 ### 2.3 Protocols
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | No protocol registered | `Protocols::new` returns `ProtocolError::NoProtocols` | nothing to the user: a fault of the host's set-up | register at least one protocol | do not ship a build that fails here |
 | A protocol name that isn't 1 to 32 of `a-z` and `0-9` starting with a letter | `ProtocolError::BadName` | as above | fix the protocol's name | do not rename it per device: every install must judge the same way |
@@ -67,7 +67,7 @@ Every error a call returns is a `SignerError`; a refusal a rule made is `SignerE
 
 ### 2.4 The Homeserver and the store
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The Homeserver can't be read or written | `SignerError::Homeserver` | "can't reach your storage, will retry" | retry with `resume` or `run_due`; check the session's capabilities cover the backup path | do not drop the backup capability: without it every delivery stops |
 | The host's store failed | `SignerError::Store` | a device storage fault | retry; the signer reads its records again after an unsure commit | do not edit the signer's namespace by hand |
@@ -99,16 +99,16 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.5 Adding an app (approval)
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
-| An app asks to be approved | the host receives an app request and its auth request; `Signer::review(request, auth)` returns an `AppReview` | the App ID, its scopes, its switch permissions, the keyed scopes, each grant path with its purpose and a decline toggle, and "renews" when `AppReview::renews` is true; for a request that renews, that a decline keeps the path out of this request's grant only, since a grant an earlier approval made still covers it until it expires or the app is revoked | let the user decline paths with `AppReview::decline`; before calling `Signer::approve`, persist in the host's device-bound store, until the claim is delivered, the app request and the auth request as received, `AppReview::request_hash()` and `AppReview::declined()`: `AppReview` is `Clone` but isn't stored, so a clone doesn't outlive the process; keep a clone for retries within the process | do not grant `AppReview::asked_caps`: show it, never grant it; at a renewing request, do not tell the user a declined path was taken away |
+| An app asks to be approved | the host receives an app request and its auth request; `Signer::review(request, auth)` returns an `AppReview` | the App ID, its scopes, its switch permissions, the keyed scopes, the purpose of each grant path and which paths the user can decline, and "renews" when `AppReview::renews` is true; for a request that renews, that a decline keeps the path out of this request's grant only, since a grant an earlier approval made still covers it until it expires or the app is revoked | let the user decline paths with `AppReview::decline`; before calling `Signer::approve`, persist in the host's device-bound store, until the claim is delivered, the app request and the auth request as received, `AppReview::request_hash()` and `AppReview::declined()`: `AppReview` is `Clone` but isn't stored, so a clone doesn't outlive the process; keep a clone for retries within the process | do not grant `AppReview::asked_caps`: show it, never grant it; at a renewing request, do not tell the user a declined path was taken away |
 | The scopes break the Switch's scope rule | `Refusal::Scopes` | the rule that failed, as its reason names it | turn the request down | do not approve a trimmed set the app didn't ask for |
 | Scopes no registered protocol owns | `Refusal::UnknownScopes` | which scopes, and that this app version lacks support for them | turn the request down, or update the host app | do not register a placeholder protocol for them |
 | A protocol's own rule refused the scopes or the paths left | `Refusal::ProtocolRule` | the protocol's name and reason | change the declines, or turn the request down | do not hide the protocol's reason |
-| A decline of a path that can't be declined | `AppReview::decline` returns `Refusal::NotDeclinable` | that path stays granted | offer only `AppReview::grant_paths` as toggles; the set stays as it was | do not offer the app's record or backup paths as toggles |
+| A decline of a path that can't be declined | `AppReview::decline` returns `Refusal::NotDeclinable` | that path stays granted | let the user decline only paths in `AppReview::grant_paths`; the set stays as it was | do not offer to exclude the app's record or backup paths |
 | The request fails a check | `Refusal::AppRequest`, its reason naming the step | "this request isn't valid" | turn it down | do not retry the same request |
 | The App ID was revoked or is being revoked | `Refusal::AppRequest` at `Signer::review`; `Refusal::CutOff` at a renewal | "this app was removed for good" | the app asks again with new keys, as a new app | do not approve the old App ID again |
-| The device clock is off the switch's time | `Signer::approve` or `Signer::renew` returns `Refusal::ClockOff` with `device_ms` and `switch_ms` | both times, and "set the device clock" | approve again once the clock is right | do not approve with the clock off |
+| The device clock is off the switch's time | `Signer::approve` or `Signer::renew` returns `Refusal::ClockOff` with `device_ms` and `switch_ms` | that the device clock needs correcting; the two times are available for diagnostics | approve again once the clock is right | do not approve with the clock off |
 | The approval is delivered and its claim released | `Signer::approve` returns an `ApprovedRequest`, or later `Signer::approved(&hash)` returns one, `hash` being the persisted `AppReview::request_hash()` | "approved" | deliver `ApprovedRequest::claim` to the auth request's relay, approve the Homeserver grant for exactly `ApprovedRequest::caps` with `approve_auth_with_capabilities`, then call `Signer::claim_delivered(&approved.request)` with its `ApprovedRequest::request`, the same 32 bytes | do not call `approve_auth` or grant the auth request's own capabilities |
 | The approval's version is delivered but the claim is held | `Signer::approve` returns `Refusal::ClaimHeld`, naming the alarm's alert when still held | "approved, waiting for the service to be confirmed" | clear the alarm (2.15), then poll `Signer::approved(&hash)` with the persisted hash | do not send any claim or grant until `approved` returns one |
 | The delivery didn't finish, or `approve` failed before it committed, or the host app restarted in between | `approve` returns a switch or Homeserver error, or the process ended; `approve` reads the switch before it commits, so an error there leaves no claim | "approval pending" | call `resume`; then `Signer::approved(&hash)` with the persisted hash; if it returns `None` after a `resume` that succeeded, approve again: with the kept clone in the same process, or after a restart by calling `Signer::review(request, auth)` again with the persisted requests, then `AppReview::decline` with the persisted declined set, then `Signer::approve` | do not ask the user for a new approval of the same request; do not approve a fresh `AppReview` without declining the persisted set again: a fresh `AppReview` declines nothing |
@@ -117,7 +117,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.6 Renewal and reductions
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user changes an app's scopes or expiry | `Signer::renew(app_id, CertChange)` returns the renewing version | the new scopes, permissions and expiry; that removing a scope with keys rotates the identity's keys | confirm the change with the user first | do not add a grant path here: that needs a new request from the app |
 | The app isn't listed | `Refusal::NotListed` | "this app isn't connected" | refresh the app list | do not retry with the same App ID |
@@ -135,7 +135,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.7 Revocation
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user revokes an app | `Signer::open_attempts(app_id)` gives the count; `Signer::revoke(app_id, distrust_from, confirmed)` returns the version that removes it | the app; that it is cut off for good; the count of its open and `unknown` attempts (or "unknown" when the switch can't be reached); after a compromise, the earlier time from which its messages are distrusted | confirm, then revoke; once the revocation is kept, revoke its Homeserver grants at once (the row "The app is removed"): when `revoke` returned `Ok`, `Refusal::Recovering`, `SignerError::Alarm`, `Refusal::SwitchUnconfirmed`, or a switch or Homeserver error, and after any other error when `Signer::apps()` shows the app `AppStanding::Revoking` or `AppStanding::Removed`. `SignerError::NotNamed` and `Refusal::RecordsBehind` can come before the commit or after it, from the step that sends the revocation: after either, read `Signer::apps()`, and `AppStanding::Revoking` means the revocation is kept (revoke the grants; a restore in place sends it later), `AppStanding::Listed` that nothing was kept | do not let a failed `open_attempts` block the revocation; do not revoke the grants after a refusal that commits nothing (`Refusal::NotListed`, `Refusal::HandingOver`, `Refusal::TakingOver`, `Refusal::FlowInProgress`, `Refusal::NotSetUp`, `Refusal::Erased`): the app stays listed |
 | The revocation is asked but no version removes the app yet | `Alert::RevocationPending` (`at_switch`); `Signer::apps()` shows `AppStanding::Revoking` | "being removed"; with `at_switch` true, "no longer served" | let `run_due` finish it | do not offer approve, renew or hand-over to it |
@@ -149,7 +149,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.8 An app leaving, and removals at the switch
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The switch shows an app revoked or departed that this signer didn't ask for | `Alert::RemovedAtSwitch` (`left` true when it left by itself) | the app, and that it is gone for good | the user checks it was meant to go; `run_due` removes it in the next version | do not re-approve that App ID |
 | An app that left is still listed | `apps()` shows `AppStanding::Listed` with the alert above | "leaving" | let `run_due` complete the removal | do not offer renew for it |
@@ -157,10 +157,10 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.9 Provider loss and recovery
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user declares the provider lost | `Signer::declare_provider_loss(origin, confirmed)` returns the new generation's version | the new service, and that apps rebuild their state there | confirm, then declare; it is allowed while an alarm is held, on an erased account, and during an erasure, which it ends | do not declare on a passing outage |
-| The user declares the provider lost with the key alone: no install holds usable records, or the one that does is stopped (not named, records behind, handing over, taking over, a first version stuck at a dead service), or the recovery at the service was refused (`Refusal::KeyRecovery`) | the user says so; offer it whenever the key is held, beside the recovery at the service | the survey: `Signer::survey_provider_loss_with_key(env, keyring, origin)` with the service the user picks (drop any open `Signer` for the identity first; give the transport a request timeout, since every service a copy names is read); show `kind` (`KeyRecoveryKind::ProviderLoss`, with `lost`, where the recovery at the service shows `KeyRecoveryKind::AtService`; with no copy anywhere `lost` is `None`, `version` and `generation` 0, and the generation declared comes from the time), the `service_key` the picked service signs with, the copy it builds on (`version`, `generation`, `signer`), each app's `AppFate`, `revoked`, `backup`, and that apps rebuild their state at the new service | `Signer::declare_provider_loss_with_key(env, keyring, KeyRecoveryConfirmed::shown_and_confirmed(&survey, &dropped))`. On `KeyRecoveryStop::SurveyChanged` survey again: it is refused only for something the survey didn't show (a newer copy, a revocation or earlier time, another key or account at the service picked), never for a source that shows less, so a service that answers only now and then can't hold it back. On `KeyRecoveryStop::NotServing`, or a switch error at every service, check the device clock, then pick another service. Afterwards the rows below apply: `resume`, or declare again with this call (or `declare_provider_loss`, but not after a declaration with no copy anywhere). Over a take-over at a dead service, the vault must hold the identity key: from the user's own copy, or, failing that, the receiving app opens the hand-over its store holds with its bundle key (wire 3.12) and puts the key in the vault; this signer doesn't do that for it yet | do not build the confirmation from another survey; do not use it to leave a service that merely answers slowly |
+| The user declares the provider lost with the key alone: no install holds usable records, or the one that does is stopped (not named, records behind, handing over, taking over, a first version stuck at a dead service), or the recovery at the service was refused (`Refusal::KeyRecovery`) | the user says so; offer it whenever the key is held, as well as recovery at the service | the survey: `Signer::survey_provider_loss_with_key(env, keyring, origin)` with the service the user picks (drop any open `Signer` for the identity first; give the transport a request timeout, since every service a copy names is read); show `kind` (`KeyRecoveryKind::ProviderLoss`, with `lost`, where the recovery at the service shows `KeyRecoveryKind::AtService`; with no copy anywhere `lost` is `None`, `version` and `generation` 0, and the generation declared comes from the time), the `service_key` the picked service signs with, the copy it builds on (`version`, `generation`, `signer`), each app's `AppFate`, `revoked`, `backup`, and that apps rebuild their state at the new service | `Signer::declare_provider_loss_with_key(env, keyring, KeyRecoveryConfirmed::shown_and_confirmed(&survey, &dropped))`. On `KeyRecoveryStop::SurveyChanged` survey again: it is refused only for something the survey didn't show (a newer copy, a revocation or earlier time, another key or account at the service picked), never for a source that shows less, so a service that answers only now and then can't hold it back. On `KeyRecoveryStop::NotServing`, or a switch error at every service, check the device clock, then pick another service. Afterwards the rows below apply: `resume`, or declare again with this call (or `declare_provider_loss`, but not after a declaration with no copy anywhere). Over a take-over at a dead service, the vault must hold the identity key: from the user's own copy, or, failing that, the receiving app opens the hand-over its store holds with its bundle key (wire 3.12) and puts the key in the vault; this signer doesn't do that for it yet | do not build the confirmation from another survey; do not use it to leave a service that merely answers slowly |
 | The recovery is not complete | `SignerStatus::Recovering` with `origin`; other calls return `Refusal::Recovering` | "moving to the new service" | `resume` preserves the current enrollment or delivery; revoke stays offered, kept for the new service with `Alert::RevocationPending` | do not offer other changes meanwhile |
 | An enrollment cannot complete | an enrollment error with `SignerStatus::Recovering`; its original signed action remains pending | that an earlier send may have committed, even after expiry or loss of its receipt | resume the same action, or explicitly authorize a distinct recovery at this or another service; that authorization ends only the old enrollment continuation with its outcome still unknown | do not replace its intent automatically or reuse a late answer for the replacement |
 | The recovery delivery was refused for good | `SignerStatus::RecoveryRefused` with `origin` | that this service refused the version | the user declares again, at that service or another | do not resend the refused version |
@@ -174,7 +174,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.10 Moving to another provider
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user wants another provider | no move call exists in this signer | the provider-loss path (2.9) | declare a provider loss at the new service | do not offer a cooperative move |
 | The version is near the size an enrollment at another service may carry | `Alert::IdentityNearLimit` (`bytes`, `limit`) | the size and cap | remove or purge apps; renewals' entries grow it | do not ignore it: past the cap nothing can be delivered |
@@ -182,7 +182,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.11 Erasure
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user closes the account | `Signer::close_account(confirmed)` | that for the apps this is a provider loss and lookups fail closed; that `identity.json` and the app records leave the Homeserver; that each app's grant is the user's to revoke | confirm, then call; the erasure raises `Alert::GrantRevocationOwed` for each app still listed: revoke those grants once the status is `SignerStatus::Erased`, not before | do not erase without the confirmation; do not revoke a listed app's grants while the erasure can still be aborted or refused |
 | The erasure is in progress | `SignerStatus::Erasing` | "closing the account" | `resume`; `Signer::abort_erasure()` ends it on the user's word; a provider loss declared meanwhile (2.9) ends it too | do not offer revocations meanwhile |
@@ -194,7 +194,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 ### 2.12 Hand-over to another signer install, and take-over
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | The user hands the identity over | `Signer::hand_over_to(to_app, confirmed)`; status `SignerStatus::HandingOver` | the app taking over; that this install then stops and deletes its key; for a key derived from a wallet seed, that deletion can't make it unrecoverable | confirm, then call; tell the user to open the new app | do not offer other changes: they return `Refusal::HandingOver` |
 | A reduction's closing is owed | `Refusal::ClosingOwed` | "finish the pending change first" | a closing that waits only for an alarm to be cleared is delivered once the user clears it (2.15); one that waits for a service time (`Alert::ReductionNotClosed` while no alarm is held) may never close by `run_due`, since the switch gave none: the user makes a change, or revokes the app, as 2.6 says | do not offer the hand-over until it is closed |
@@ -218,7 +218,7 @@ A canceled blocking save retains its lease until the worker actually finishes. T
 
 A backup carries the original account creation with its exact identity document. Restore and hand-over requests keep that target, including a first-document replay and a recovery already in progress. A signed conflict reporting a different creation does not authorize using the replacement account or prove that an earlier request failed. Keep the pending action and use the explicit recovery flow when the user authorizes a distinct action (account-binding Sections 1, 3 and 4).
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | A new device of the same identity | `Signer::restore_new(env, keyring, confirmed)` with the key from the user's backup | whether the device the backup came from is still the user's; that the backup's records replace this install's | confirm, then call | do not use it while the old device still signs unless the user wants this one to take over |
 | Records behind a newer own version | `SignerStatus::RecordsBehind`; `Alert::RecordsBehind` (`source`, `version`); `Refusal::RecordsBehind` | that this install's records are behind | `Signer::restore(confirmed)` | do not clear the alert as a fix: it stays until the restore |
@@ -236,7 +236,7 @@ A backup carries the original account creation with its exact identity document.
 
 ### 2.14 Periodic work
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | A run left work | `Signer::run_due` returns a `RunDue` whose `more_due()` is true | nothing | run again soon, a minute later say | do not call it in a tight loop |
 | A run met an error | `run_due` returns an error. When its first step, `Signer::resume`, fails with a flow in progress, or with any error but a Homeserver error, the run sends only the pending revocations and returns that error at once. Otherwise it returns the first error after the other steps ran | the error's case above | carry on; a later step that failed goes last next time; a `resume` that keeps failing holds the later steps back until it passes, so handle its case | do not stop scheduling runs |
@@ -244,16 +244,16 @@ A backup carries the original account creation with its exact identity document.
 
 ### 2.15 Alarms
 
-| The case | How the host learns of it | What the UI must show | What to do | What not to do |
+| The case | How the host learns of it | What the user needs to know | What to do | What not to do |
 |---|---|---|---|---|
 | A rollback | `Alert::Rollback` (`source`: `Source::Switch`, `Source::Homeserver` or `Source::Backup`), `SignerError::Alarm`, `SignerStatus::Alarm` | where it was seen, its version and the high-water version | the user clears it with `clear_alert`; the signer then delivers its newest version again | do not hide the alarm or work past it |
 | An equivocation | `Alert::Equivocation` (`source`, `version`) | as above | as above | as above |
 | A rollback where the switch held no copy at all (`version` is `None`) | `Alert::Rollback` with `Source::Switch` | that the service lost the account's state | clear it; the signer reads the switch's copy, and if none, raises it again: declare a provider loss (2.9) | do not expect a retry to fix it |
 | Cleared, but the switch not confirmed yet | `Refusal::SwitchUnconfirmed` | "checking the service" | `resume`; if the alarm returns, consider a provider loss | do not clear the alert again in a loop |
 
-## 3. The screens
+## 3. Host integration checklist
 
-Every screen that changes something reads `Signer::status()` and `Signer::alerts()` again once its call returns, whether it succeeded or failed, and refreshes the status banner and the alerts inbox. Every screen handles the general failures of 2.4 as its rows say. A switch that can't be reached or an answer that can't be checked (`SignerError::Switch`), `SignerError::Homeserver`, `SignerError::Store`, `SignerError::Key` and `SignerError::InvalidData` from the network: show that the step will be retried, and leave the retry to `Signer::resume` or `Signer::run_due`, after `retry_after` on a `429`. A signed refusal for good, a `ClientError::Usage` or `ClientError::Unpinned`, and `SignerError::InvalidData` from the call's own input: never "will retry". `SignerError::Records` and `SignerError::StoredData`: follow the separate cases in 2.4; a refused write or invariant never authorizes discarding records.
+After a call that changes state, read `Signer::status()` and `Signer::alerts()` again on success or failure. Use the current state for the actions offered to the user. Handle general failures as described in 2.4. A switch that can't be reached or an answer that can't be checked (`SignerError::Switch`), `SignerError::Homeserver`, `SignerError::Store`, `SignerError::Key` and `SignerError::InvalidData` from the network: show that the step will be retried, and leave the retry to `Signer::resume` or `Signer::run_due`, after `retry_after` on a `429`. A signed refusal for good, a `ClientError::Usage` or `ClientError::Unpinned`, and `SignerError::InvalidData` from the call's own input: never "will retry". `SignerError::Records` and `SignerError::StoredData`: follow the separate cases in 2.4; a refused write or invariant never authorizes discarding records.
 
 ### 3.1 Set-up
 
@@ -263,30 +263,30 @@ Every screen that changes something reads `Signer::status()` and `Signer::alerts
 - [ ] Calls `Signer::resume`; shows "setting up" while `SignerStatus::Enrolling`, done at `SignerStatus::Signing`; an enrollment the switch keeps refusing is shown as refused, with its unconfirmed status, not as "will retry" (2.1).
 - [ ] Handles `Refusal::UnreadableBackup` with `Alert::UnreadableBackupBeforeEnrollment`: shows that another install may sign for this identity, and offers the restore on that install, or the removal of the backup by the user.
 - [ ] Asks the user to back up the identity key itself, and says the signer's backup on the Homeserver doesn't hold it.
-- [ ] At every later start: `IdentityKeyring::open`; on `KeyError::Missing` when this install received a hand-over, `Signer::resume_take_over(env, identity, keys, vault)` (3.9) in place of the next two steps, and the set-up choice otherwise; `Signer::open` (handles `Refusal::NotSetUp`; `SignerError::Records` or `SignerError::StoredData` as 2.4 says, distinguishing persistent local read failures from a refused write or invariant; and `SignerError::HandedOver`: a hand-over from this install took effect and its key and records are deleted, so it shows that the identity is with another install and closes this identity's screens); `Signer::resume`; `Signer::run_due`.
+- [ ] At every later start: `IdentityKeyring::open`; on `KeyError::Missing` when this install received a hand-over, `Signer::resume_take_over(env, identity, keys, vault)` (3.9) in place of the next two steps, and the set-up choice otherwise; `Signer::open` (handles `Refusal::NotSetUp`; `SignerError::Records` or `SignerError::StoredData` as 2.4 says, distinguishing persistent local read failures from a refused write or invariant; and `SignerError::HandedOver`: a hand-over from this install took effect and its key and records are deleted, so it shows that the identity is with another install and stops offering signer actions for it); `Signer::resume`; `Signer::run_due`.
 - [ ] Confirmed by the user: nothing beyond the choice and the origin.
 
 ### 3.2 Approve an app
 
-- [ ] Calls `Signer::review(request, auth)` and shows the `AppReview`: the App ID, the scopes, the switch permissions, the scopes with keys, each grant path with its purpose and a decline toggle, and "renews this app" when `AppReview::renews` is true; for a renewing request, says that a decline keeps the path out of this request's grant only, and that an earlier approval's grant still covers it until it expires or the app is revoked.
+- [ ] Calls `Signer::review(request, auth)` and shows the `AppReview`: the App ID, the scopes, the switch permissions, the scopes with keys, the purpose of each grant path and which paths the user can decline, and "renews this app" when `AppReview::renews` is true; for a renewing request, says that a decline keeps the path out of this request's grant only, and that an earlier approval's grant still covers it until it expires or the app is revoked.
 - [ ] Shows `AppReview::asked_caps` for information only.
 - [ ] Handles at `Signer::review`: `Refusal::Scopes`, `Refusal::UnknownScopes` (name the missing protocol support), `Refusal::ProtocolRule`, `Refusal::AppRequest`, `Refusal::NotSetUp`, `SignerError::Protocol`.
-- [ ] On each toggle calls `AppReview::decline(paths)`; handles `Refusal::NotDeclinable` and `Refusal::ProtocolRule` by putting the toggle back.
+- [ ] When the user changes their selection, calls `AppReview::decline(paths)`. If it returns `Refusal::NotDeclinable` or `Refusal::ProtocolRule`, keeps the previous selection.
 - [ ] Confirmed by the user: the approval, with the declines shown.
-- [ ] Before calling `Signer::approve`, persists until the claim is delivered, in the host's device-bound store and never in logs: the app request and the auth request as received, `AppReview::request_hash()` and `AppReview::declined()`, since an `AppReview` doesn't outlive the process; keeps a clone for retries in the same process. Then calls `Signer::approve` with the `AppReview`; handles `Refusal::ClockOff` (show both times), `Refusal::ClaimHeld` (wait for the alarm, 3.11), `Refusal::NotJoined`, `Refusal::CutOff`, `Refusal::IdentityTooLarge`, `Refusal::FlowInProgress`, `Refusal::Recovering`, `Refusal::HandingOver`, `Refusal::TakingOver`, `Refusal::SwitchUnconfirmed`, `Refusal::Erased`, `Refusal::RecordsBehind`, `SignerError::NotNamed`, `SignerError::Alarm`.
+- [ ] Before calling `Signer::approve`, persists until the claim is delivered, in the host's device-bound store and never in logs: the app request and the auth request as received, `AppReview::request_hash()` and `AppReview::declined()`, since an `AppReview` doesn't outlive the process; keeps a clone for retries in the same process. Then calls `Signer::approve` with the `AppReview`; handles `Refusal::ClockOff` (ask the user to correct the clock), `Refusal::ClaimHeld` (wait for the alarm, 3.11), `Refusal::NotJoined`, `Refusal::CutOff`, `Refusal::IdentityTooLarge`, `Refusal::FlowInProgress`, `Refusal::Recovering`, `Refusal::HandingOver`, `Refusal::TakingOver`, `Refusal::SwitchUnconfirmed`, `Refusal::Erased`, `Refusal::RecordsBehind`, `SignerError::NotNamed`, `SignerError::Alarm`.
 - [ ] After a switch or Homeserver error from `approve`, and at the next start after a restart with an approval persisted: calls `Signer::resume`, then `Signer::approved(&hash)` with the persisted hash; when it returns `None` after a `resume` that succeeded, nothing was committed, so it approves again: with the kept clone, or after a restart with `Signer::review(request, auth)` on the persisted requests, then `AppReview::decline` with the persisted declined set, then `Signer::approve`. It never asks the user for a new approval of the same request, and never approves a fresh `AppReview` without declining that set again.
 - [ ] With the `ApprovedRequest` (from `approve`, or later from `Signer::approved(&hash)`): delivers `ApprovedRequest::claim` to the auth request's relay, approves the Homeserver grant for exactly `ApprovedRequest::caps` with `approve_auth_with_capabilities`, then calls `Signer::claim_delivered(&approved.request)`, `ApprovedRequest::request` being the same 32 bytes as `AppReview::request_hash()`.
 - [ ] Never grants with `approve_auth`, never `AppReview::asked_caps`, never before a claim is returned.
 
 ### 3.3 App list and app detail
 
-- [ ] Calls `Signer::apps()` and lists each `AppSummary`, the listed apps first, then the removed ones.
+- [ ] Calls `Signer::apps()` and lists each `AppSummary` with its current standing.
 - [ ] Shows the standing: `AppStanding::Listed`, `AppStanding::Revoking` (with "no longer served" when `at_switch` is true), `AppStanding::Removed`.
 - [ ] Detail: the certificate's scopes, switch permissions, `issued_at` and `expires_at`; whether a renewal is open; the protocols that own its scopes and any scope none owns; `distrust_from`; the automatic renewals no record took up; the alerts that name it (`AppSummary::alerts`).
 - [ ] For a listed app whose `cert` is `None` (a version adopted from another install), shows its scopes as unknown here.
 - [ ] Offers renew, reduce and revoke on a listed app only; offers `Signer::purge_removed` on a removed one; handles `Refusal::NotRemoved`.
 - [ ] Read-only while the status isn't `SignerStatus::Signing`, but for revoke on a listed app, which stays offered at `SignerStatus::Alarm` (the app is revoked at the switch, its version waits for the alarm) and at `SignerStatus::Recovering` (kept for the new service with `Alert::RevocationPending`).
-- [ ] Confirmed by the user: nothing; the actions open their own screens.
+- [ ] Viewing app details requires no confirmation. Each action below has its own confirmation rules.
 
 ### 3.4 Renew / reduce
 
@@ -313,13 +313,13 @@ Every screen that changes something reads `Signer::status()` and `Signer::alerts
 - [ ] Confirmed by the user: the declaration.
 - [ ] Calls `Signer::declare_provider_loss(origin, confirmed)`; handles `Refusal::HomeserverCopyMissing` and `Refusal::HomeserverCopyUnreadable` by asking the user to confirm also that no other install signs, then calls `Signer::declare_provider_loss_confirming_records(origin, confirmed)`.
 - [ ] Handles `Refusal::NotSetUp`, `SignerError::NotNamed`, `Refusal::RecordsBehind`, `Refusal::HandingOver`, `Refusal::TakingOver`, `Refusal::FlowInProgress`, `Refusal::IdentityTooLarge`, `SignerError::InvalidData` (origin not valid).
-- [ ] Shows `SignerStatus::Recovering` while the version waits, and `SignerStatus::RecoveryRefused` with a button to declare again.
+- [ ] Shows `SignerStatus::Recovering` while the version waits, and `SignerStatus::RecoveryRefused` with the option to declare again.
 - [ ] Once the recovery's version is delivered, while `Signer::apps()` lists an app whose `cert` grants `lists.manage` or whose `cert` is `None` (the wait the signer leaves to the user, 2.9), offers `Signer::end_staged_admission()` for when the user says the waiting contacts may come in; handles `Refusal::Recovering` and `Refusal::FlowInProgress`.
 - [ ] Shows `Alert::AdmissionNotEnded` with no action: `run_due` sends the owed end again.
 
 ### 3.7 Move
 
-- [ ] Says that this signer has no cooperative move, and opens 3.6 for the new provider.
+- [ ] Says that this signer has no cooperative move, and offers the provider-loss flow in 3.6 for the new provider.
 - [ ] Shows `Alert::IdentityNearLimit` and `Refusal::IdentityTooLarge` with `SizedBody::Enrollment`, and offers to remove or purge apps first.
 
 ### 3.8 Erase the account
@@ -340,7 +340,7 @@ Every screen that changes something reads `Signer::status()` and `Signer::alerts
 - [ ] Shows `SignerStatus::HandingOver` and `Alert::HandOverRefused`; tells the user to open the new app.
 - [ ] Offers abort, confirmed by the user: `Signer::abort_hand_over(confirmed)`; handles `AbortOutcome::Aborted`, `AbortOutcome::SucceededBy`, `Refusal::HandingOver` (the abort is sent but hasn't won yet: shown as calling off, sent again by `resume` and `run_due`), `Refusal::SuccessorUnproven`, `Refusal::NotHandingOver`.
 - [ ] On `Refusal::SuccessorUnproven`, from `abort_hand_over`, `resume` or `run_due`, offers take-back, confirmed by the user that the new signer is lost: `Signer::take_back(confirmed)`; handles `Refusal::NothingToTakeBack`, `SignerError::HandedOver`, and shows `Alert::TakenBack`.
-- [ ] On `SignerError::HandedOver` from any call: shows that the identity is with another install now, and closes this identity's screens.
+- [ ] On `SignerError::HandedOver` from any call: shows that the identity is with another install now, and stops offering signer actions for it.
 - [ ] New signer: calls `Signer::receive_hand_over(env, app, vault)` with an empty vault; shows `SignerStatus::TakingOver`; handles `Refusal::AlreadySetUp`, `KeyError::Occupied`, `SignerError::InvalidData`, `Refusal::StaleHandOver`, `Refusal::TakeOverCancelled`; keeps the identity's public key and the `ReceivingApp::keys`; after a restart, with the vault still empty until the take-over wins, calls `Signer::resume_take_over(env, identity, keys, vault)` and handles `Refusal::NotTakingOver` and `Refusal::NotSetUp`; shows `Alert::TakeOverRefused` and `Alert::KeyNotInstalled`.
 
 ### 3.10 Restore
@@ -354,15 +354,15 @@ Every screen that changes something reads `Signer::status()` and `Signer::alerts
 - [ ] At `Refusal::NoBackup`, `Refusal::UnreadableBackup` or `Refusal::StaleBackup`, offers the recovery with the key alone: shows the survey (`KeyRecoverySurvey`): the service (`origin`), and, with `origin_supplied`, that it is the one the user gave, the version it builds on and its `generation`, the install that version names (`signer`), which stops signing, and every other install with it; each listed app with its `AppFate`: `AppFate::Stays` with a choice to drop it, `AppFate::RemovedAtSwitch` with its `distrust_from`, `AppFate::RevocationPending` with its `distrust_from`, `AppFate::CertificateNotFound` (revoked, approved again under a new key); `renewals_dropped`; how many App IDs stay `revoked`; the `backup` found: `BackupFound::Missing`, `BackupFound::Unreadable`, `BackupFound::Stale` (its certificates and revoked App IDs still count), or `BackupFound::Matches` (the restore takes it, losing nothing); and what a recovery loses (spec 12.8). Confirmed by the user, calls the restore again with `KeyRecoveryConfirmed::shown_and_confirmed(&survey, &dropped)`.
 - [ ] Handles `Refusal::KeyRecovery` with each `KeyRecoveryStop`, as 2.13 lists, and shows `Alert::ServiceKeyNotFollowed`.
 
-### 3.11 Alerts inbox
+### 3.11 Alerts
 
-- [ ] Lists `Signer::alerts()`, oldest first, each with its facts.
+- [ ] Makes each alert from `Signer::alerts()` available with its facts.
 - [ ] On dismissal calls `Signer::clear_alert(alert)`; for `Alert::Rollback` and `Alert::Equivocation`, handles the alarm coming back (`SignerError::Alarm`) and `Refusal::SwitchUnconfirmed`.
 - [ ] Keeps showing `Alert::ReductionNotClosed` and `Alert::RecordsBehind` after a dismissal, since the signer keeps them until their cause is gone.
 - [ ] For `Alert::GrantRevocationOwed`, dismisses only after the grants are revoked.
 - [ ] Never dismisses an alert the user hasn't seen.
 
-### 3.12 Status banner
+### 3.12 Signer status
 
-- [ ] Shows `Signer::status()` after every call: `SignerStatus::Enrolling`, `SignerStatus::Signing` (no banner), `SignerStatus::ManagedBy` (offer restore), `SignerStatus::RecordsBehind` (offer restore), `SignerStatus::HandingOver` (offer abort), `SignerStatus::TakingOver`, `SignerStatus::Alarm` (open the alerts inbox), `SignerStatus::Erasing` (offer abort), `SignerStatus::ErasedUnconfirmed`, `SignerStatus::Erased`, `SignerStatus::Recovering`, `SignerStatus::RecoveryRefused` (offer to declare again).
+- [ ] Reads `Signer::status()` after every call and uses it to decide what the user can do: `SignerStatus::Enrolling`, `SignerStatus::Signing`, `SignerStatus::ManagedBy` (offer restore), `SignerStatus::RecordsBehind` (offer restore), `SignerStatus::HandingOver` (offer abort), `SignerStatus::TakingOver`, `SignerStatus::Alarm` (show the active alarm), `SignerStatus::Erasing` (offer abort), `SignerStatus::ErasedUnconfirmed`, `SignerStatus::Erased`, `SignerStatus::Recovering`, `SignerStatus::RecoveryRefused` (offer to declare again).
 - [ ] Turns the app list read-only whenever the status isn't `SignerStatus::Signing`, but for revoke, which stays offered at `SignerStatus::Alarm` and `SignerStatus::Recovering` (3.3).

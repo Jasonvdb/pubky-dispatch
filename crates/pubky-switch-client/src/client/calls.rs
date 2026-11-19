@@ -59,10 +59,7 @@ impl SwitchClient {
             &self.path(rest),
             Vec::new(),
             Body::Empty,
-            Auth {
-                timeout,
-                ..Auth::default()
-            },
+            Auth::new(timeout),
         )
         .await
     }
@@ -73,7 +70,7 @@ impl SwitchClient {
             &self.path(rest),
             Vec::new(),
             Body::Empty,
-            Auth::default(),
+            Auth::new(TimeoutClass::Ordinary),
         )
         .await
     }
@@ -85,10 +82,7 @@ impl SwitchClient {
         body: Vec<u8>,
         timeout: TimeoutClass,
     ) -> Result<CheckedResponse, ClientError> {
-        let auth = Auth {
-            timeout,
-            ..Auth::default()
-        };
+        let auth = Auth::new(timeout);
         self.call(method, &self.path(rest), body, Body::Json, auth)
             .await
     }
@@ -188,10 +182,7 @@ impl SwitchClient {
             ));
         }
         let body = enrollment.to_request_json()?;
-        let auth = Auth {
-            timeout: TimeoutClass::Bulk,
-            ..Auth::default()
-        };
+        let auth = Auth::new(TimeoutClass::Bulk);
         let signed = self.build("POST", "/v1/enroll", body.clone(), Body::Json, auth)?;
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
@@ -261,7 +252,13 @@ impl SwitchClient {
         self.signer_only()?;
         self.forget_latest();
         let path = self.path("account");
-        let signed = self.build("GET", &path, Vec::new(), Body::Empty, Auth::default())?;
+        let signed = self.build(
+            "GET",
+            &path,
+            Vec::new(),
+            Body::Empty,
+            Auth::new(TimeoutClass::Ordinary),
+        )?;
         let response = self.send_response(signed.request.clone()).await?;
         let checked = self.account_observation(&signed.request, &response);
         let Some(at) = stale_timestamp_hint(checked.as_ref().err()) else {
@@ -274,7 +271,7 @@ impl SwitchClient {
             Body::Empty,
             Auth {
                 timestamp_ms: Some(at),
-                ..Auth::default()
+                ..Auth::new(TimeoutClass::Ordinary)
             },
         )?;
         let response = self.send_response(signed.request.clone()).await?;
@@ -360,7 +357,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     success_key: new_key,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -406,8 +403,7 @@ impl SwitchClient {
                 Body::Octets,
                 Auth {
                     invite_code,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
                 &mut None,
             )
@@ -470,7 +466,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     invite_code,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -509,7 +505,7 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn connect_requests(&self) -> Result<ConnectList, ClientError> {
-        let checked = self.get("connect", TimeoutClass::Ordinary).await?;
+        let checked = self.get("connect", TimeoutClass::Bulk).await?;
         let (value, what) = Self::json_answer(
             &checked,
             Doc::Plain,
@@ -527,7 +523,13 @@ impl SwitchClient {
     pub async fn decline_connect(&self, pubky: &[u8; 32]) -> Result<[u8; 32], ClientError> {
         let path = self.path(&format!("connect/{}", pubky_id(pubky)));
         let checked = self
-            .call("DELETE", &path, Vec::new(), Body::Empty, Auth::default())
+            .call(
+                "DELETE",
+                &path,
+                Vec::new(),
+                Body::Empty,
+                Auth::new(TimeoutClass::Ordinary),
+            )
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.7: a decline answer")?;
@@ -568,10 +570,7 @@ impl SwitchClient {
                 &self.path(&format!("records/{}", b64(key))),
                 Vec::new(),
                 Body::Empty,
-                Auth {
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
-                },
+                Auth::new(TimeoutClass::Bulk),
             )
             .await?;
         let (value, what) =
@@ -622,8 +621,7 @@ impl SwitchClient {
                 Body::Empty,
                 Auth {
                     invite_code,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -940,8 +938,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     with_cert: staged,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -998,7 +995,7 @@ impl SwitchClient {
                 Body::Empty,
                 Auth {
                     public: true,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
                 public_time,
             )
@@ -1036,7 +1033,7 @@ impl SwitchClient {
         self.signer_only()?;
         let body = erase_body(created, identity_hash.as_ref());
         let checked = self
-            .send_json("POST", "erase", body, TimeoutClass::Ordinary)
+            .send_json("POST", "erase", body, TimeoutClass::Bulk)
             .await?;
         let (value, what) = Self::json_answer(
             &checked,

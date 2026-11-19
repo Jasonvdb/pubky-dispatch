@@ -3230,9 +3230,8 @@ impl App {
         // certificate: the app reads its directory for the writer's listed certificate, once
         // for each the directory answers for while it runs. If that doesn't settle it, a
         // failure of steps 4 and 5 is the service's word, and the write is ignored, naming no
-        // app. A read that fails marks nothing: a later write's judging reads again, once
-        // `SENDER_REREAD_MS` has passed, so a failing directory costs at most one request a
-        // minute.
+        // app. A failed directory read marks nothing. A later write can trigger another
+        // lookup once `SENDER_REREAD_MS` has passed.
         let mut unheld = !own && !counts && self.unheld_in_force(&writer, &certs, time);
         let now = self.now();
         let paced = self
@@ -4660,17 +4659,13 @@ impl App {
     /// instead of calling `change` with `None`, and the caller decides again from what the
     /// app now holds (Switch spec 10.3).
     ///
-    /// **Worst case.** At most four tries, a further one only while the call's time budget
-    /// isn't spent ([`super::AppConfig::call_budget_ms`], 20 s by default). The call reads
-    /// the service time at most once and sends at most one kept batch again in all
-    /// ([`App::submit_batch`]): the first try sends at most four requests, those two, its
-    /// own batch and, after a conflict, a read of the record; a further try two, its batch
-    /// and that read. A batch that writes a record and a read of a record have the long
-    /// timeout (40 s by default, [`crate::transport::HttpConfig`]), since a record's view
-    /// can near a mebibyte: on a switch that answers nothing in time the call ends within
-    /// about 130 s at the default timeouts, the first try's four requests, and within
-    /// about 100 s when a further try began just inside the budget; the cases
-    /// [`App::submit_batch`] names add their requests.
+    /// The app makes at most four update tries. Each further try must begin within
+    /// [`super::AppConfig::call_budget_ms`] (20 s by default). Across these tries the
+    /// app can read the service time once and resubmit one kept batch. Each try can
+    /// submit its own batch and read the held record after a conflict. Record writes
+    /// and reads use the bulk timeout because they can return a full record view.
+    /// Each HTTP send has its own deadline. A timestamp correction or the recovery
+    /// cases described by [`App::submit_batch`] can add sends.
     ///
     /// # Errors
     ///

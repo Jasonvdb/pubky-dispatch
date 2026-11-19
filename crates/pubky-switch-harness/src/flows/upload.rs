@@ -8,6 +8,7 @@ use pubky_switch_client::app::{App, ClaimOp, ObligationDeadline, RecordTarget};
 use pubky_switch_client::client::{Credentials, SwitchClient};
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_client::transport::TimeoutClass;
 use pubky_switch_core::claims::{Basis, ClaimView};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::json;
@@ -792,8 +793,13 @@ async fn upload(
         "/v1/{}/recovery/upload",
         pubky_switch_core::enc::pubky_id(&client.account())
     );
-    let mut signed = client.sign_request("POST", &path, body.as_bytes().to_vec(), None)?;
-    signed.request.timeout = pubky_switch_client::transport::TimeoutClass::Bulk;
+    let signed = client.sign_request(
+        "POST",
+        &path,
+        body.as_bytes().to_vec(),
+        None,
+        TimeoutClass::Bulk,
+    )?;
     let answered = client.send(signed).await;
     world.outcome(
         name,

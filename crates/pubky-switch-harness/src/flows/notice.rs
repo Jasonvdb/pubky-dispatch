@@ -330,6 +330,9 @@ pub async fn notice_retired(world: &World) -> FlowResult {
 }
 
 #[cfg(test)]
+mod two_wallets;
+
+#[cfg(test)]
 mod tests {
     use pubky_switch_client::ClientError;
     use pubky_switch_core::http::ErrorCode;

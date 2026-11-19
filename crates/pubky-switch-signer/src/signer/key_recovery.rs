@@ -578,7 +578,7 @@ impl Signer {
             fresh,
         };
         self.commit(self.state.clone(), Some(flow)).await?;
-        self.finish_key_recovery().await
+        Box::pin(self.finish_key_recovery()).await
     }
 
     /// Start a recovery with the key alone from `found`, under `confirmed`: the survey read
@@ -661,7 +661,7 @@ impl Signer {
             };
             self.commit(kept, Some(flow)).await?;
         }
-        self.finish_key_recovery().await
+        Box::pin(self.finish_key_recovery()).await
     }
 
     /// Run the recovery to its version's delivery, its owed backup and publication, and the

@@ -164,14 +164,14 @@ impl OwnReads {
                     }
                     return;
                 }
-                if let Some((held_order, old)) = s.notice {
-                    if old.permanent || !permanent {
-                        // A repeated temporary notice still requires a success from a later request.
-                        if !old.permanent {
-                            s.notice = Some((held_order.max(order), old));
-                        }
-                        return;
+                if let Some((held_order, old)) = s.notice
+                    && (old.permanent || !permanent)
+                {
+                    // A repeated temporary notice still requires a success from a later request.
+                    if !old.permanent {
+                        s.notice = Some((held_order.max(order), old));
                     }
+                    return;
                 }
                 let n = RecoveryNotice {
                     generation: self.generation,

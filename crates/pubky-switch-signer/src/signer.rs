@@ -44,7 +44,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use serde_json::Value;
 
-use crate::alert::{Alert, Source};
+use crate::alert::{Alert, FirstEnrollmentStop, Source};
 use crate::error::{RecordsFault, Refusal, Result, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
 use crate::key::{BackupView, IdentityKeyring, SigningKey};
@@ -138,6 +138,9 @@ pub enum SignerStatus {
     /// Set up, but no switch has accepted a first `identity.json` yet: [`Signer::resume`]
     /// finishes the enrollment.
     Enrolling,
+    /// Setup waits at the original step. Show [`Alert::FirstEnrollmentHeld`] before
+    /// offering a retry or the applicable same-service recovery (Switch account binding 3).
+    FirstEnrollmentHeld,
     /// The selected service already held an account or its mark before this install signed
     /// a creation. Offer a confirmed [`Signer::restore`] (Switch spec 12.8).
     FirstAccountPresent,
@@ -473,10 +476,7 @@ impl Signer {
                     nonce,
                     enrollment,
                     policy,
-                } => match enrollment {
-                    Some(enrollment) => self.enroll(&origin, &enrollment, policy).await?,
-                    None => self.observe_first_account(&origin, nonce, policy).await?,
-                },
+                } => Box::pin(self.finish_first_setup(&origin, nonce, policy, enrollment)).await?,
                 Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
@@ -535,6 +535,9 @@ impl Signer {
     pub fn status(&self) -> SignerStatus {
         match &self.flow {
             Some(Flow::FirstAccountPresent { .. }) => return SignerStatus::FirstAccountPresent,
+            Some(Flow::Enroll { .. }) if self.first_enrollment_stop().is_some() => {
+                return SignerStatus::FirstEnrollmentHeld;
+            }
             Some(Flow::Erase {
                 first_404_ms: Some(since_ms),
                 ..
@@ -1031,6 +1034,11 @@ impl Signer {
         mut state: SignerState,
         flow: Option<Flow>,
     ) -> Result<()> {
+        if matches!(self.flow, Some(Flow::Enroll { .. })) && self.flow != flow {
+            state
+                .alerts
+                .retain(|a| !matches!(a, Alert::FirstEnrollmentHeld { .. }));
+        }
         if flow.is_none() {
             // A flow that ended without its version delivered leaves no certificate or claim.
             state.prune_unreferenced()?;
@@ -1228,6 +1236,39 @@ impl Signer {
         })
     }
 
+    fn first_enrollment_stop(&self) -> Option<FirstEnrollmentStop> {
+        self.state.alerts.iter().find_map(|alert| match alert {
+            Alert::FirstEnrollmentHeld { reason } => Some(*reason),
+            _ => None,
+        })
+    }
+
+    /// Keep the first step's exact operands with the reason it needs the host. Only a fresh
+    /// service answer can authorize a confirmed restart or restore (Switch account binding 3).
+    async fn finish_first_setup(
+        &mut self,
+        origin: &str,
+        nonce: [u8; 16],
+        policy: IdentityPolicy,
+        enrollment: Option<SignedDoc>,
+    ) -> Result<()> {
+        if self.first_enrollment_stop().is_some() {
+            return Err(Refusal::FirstEnrollmentHeld.into());
+        }
+        let result = match enrollment {
+            Some(signed) => self.enroll(origin, &signed, policy).await,
+            None => self.observe_first_account(origin, nonce, policy).await,
+        };
+        if let Err(SignerError::Switch(error)) = &result
+            && let Some(reason) = FirstEnrollmentStop::from_error(error)
+        {
+            let mut state = self.state.clone();
+            state.alert(Alert::FirstEnrollmentHeld { reason });
+            self.commit(state, self.flow.clone()).await?;
+        }
+        result
+    }
+
     /// The signed first creation this install can still continue at the selected service.
     fn pending_first_creation(&self, origin: &str) -> Result<Enrollment> {
         let Some(Flow::Enroll {
@@ -1269,11 +1310,9 @@ impl Signer {
             .body();
         match Box::pin(self.enroll(origin, original.signed(), policy)).await {
             Ok(()) => return Box::pin(self.resume()).await,
-            Err(SignerError::Switch(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            })) if current == serde_json::json!({ "binding": "expired" }) => {}
+            Err(SignerError::Switch(error))
+                if FirstEnrollmentStop::from_error(&error)
+                    == Some(FirstEnrollmentStop::Expired) => {}
             Err(error) => return Err(error),
         }
         let target = Target {

@@ -121,6 +121,27 @@ pub struct RecordDeletion<'a> {
     pub base: WriteBase,
 }
 
+/// The physical key and policy of a value the collection owner is asked to mark.
+#[non_exhaustive]
+pub struct RecordMarkContext<'a> {
+    /// The physical key at which the app will write or observed the value.
+    pub key: [u8; 32],
+    /// The registered collection with the concrete policy of this write.
+    pub collection: &'a super::Collection,
+    pub(crate) naming: &'a pubky_switch_core::ident::NamingKey,
+}
+
+impl RecordMarkContext<'_> {
+    /// Derive a target's physical key with this app's naming key (Switch spec 13.3).
+    ///
+    /// # Errors
+    ///
+    /// A policy whose write scopes are not sorted and unique.
+    pub fn record_key(&self, target: &super::RecordTarget) -> Result<[u8; 32], super::AppError> {
+        target.key_with(self.naming)
+    }
+}
+
 /// How a protocol answers a record deletion (Switch spec 8.2, 10.3).
 #[non_exhaustive]
 pub enum PutBack {
@@ -1156,6 +1177,23 @@ pub trait Protocol: Send + Sync {
         value: Option<&[u8]>,
     ) -> Option<Vec<u8>> {
         let _ = (collection, seen, value);
+        None
+    }
+
+    /// Qualify a readable value at its actual record key before writing it or
+    /// replacing the previously qualified mark (Switch spec 8.2, 10.3).
+    /// Return `None` for collections using the ordinary seen and regression rules.
+    /// For a participating collection return its new mark, or a content-free
+    /// refusal when its signed contents belong elsewhere or drop a known role.
+    /// This check is pure and can run again on the same value. It applies to
+    /// other installations of this app as well as to other apps.
+    fn qualify_record_mark(
+        &self,
+        input: &RecordMarkContext<'_>,
+        seen: Option<&[u8]>,
+        value: &[u8],
+    ) -> Option<Result<Vec<u8>, String>> {
+        let _ = (input, seen, value);
         None
     }
 

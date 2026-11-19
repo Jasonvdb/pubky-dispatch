@@ -48,6 +48,8 @@ pub(crate) struct ItemsProtocol {
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
+    qualify_items: std::sync::atomic::AtomicBool,
+    append_item_on_note: std::sync::atomic::AtomicBool,
     observe_deletes: std::sync::atomic::AtomicBool,
     end_mark_at_delete: std::sync::atomic::AtomicBool,
     observation_unavailable: std::sync::atomic::AtomicBool,
@@ -120,6 +122,29 @@ impl Protocol for ItemsProtocol {
         message: &ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> Outcome {
+        if self
+            .append_item_on_note
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let target = RecordTarget::new(items(), b"n1");
+            let key = cx.record_key(&target).unwrap();
+            let held = cx.record(&target).unwrap().unwrap();
+            let seen = cx.record_seen(&key).unwrap().unwrap();
+            assert_eq!(held.content.value(), Some(seen.as_slice()));
+            assert!(!held.flagged && !held.not_taken && !held.divergent);
+            assert!(matches!(
+                cx.put_record(&target, &value(&["n1", "first"]), vec![]),
+                Err(AppError::Refused(Refusal::Usage(_)))
+            ));
+            let condition = cx.record_condition(&key).unwrap();
+            cx.put_record(
+                &target,
+                &value(&["n1", "first", "second", "third"]),
+                vec![condition],
+            )
+            .unwrap();
+            return Outcome::Apply(Effect::default());
+        }
         self.sample.receive(message, cx)
     }
 
@@ -144,6 +169,34 @@ impl Protocol for ItemsProtocol {
             .unwrap()
             .clone()
             .unwrap_or_else(|| vec![items()])
+    }
+
+    fn qualify_record_mark(
+        &self,
+        input: &crate::app::RecordMarkContext<'_>,
+        seen: Option<&[u8]>,
+        value: &[u8],
+    ) -> Option<Result<Vec<u8>, String>> {
+        if !self
+            .qualify_items
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        let items_seen = ids(Some(value));
+        let result = match items_seen.first() {
+            Some(name)
+                if input
+                    .record_key(&RecordTarget::new(items(), name.as_bytes()))
+                    .ok()
+                    == Some(input.key)
+                    && items_seen.starts_with(&ids(seen)) =>
+            {
+                Ok(value.to_vec())
+            }
+            _ => Err("item names differ from the target or previously listed items".to_owned()),
+        };
+        Some(result)
     }
 
     fn mark_ends_at_delete(&self, collection: &str) -> bool {
@@ -12221,6 +12274,130 @@ async fn test_records_second_device_write_is_the_apps_own() {
     assert!(!held.flagged);
     let mark = a.record_seen(&key).await.unwrap().unwrap();
     assert_eq!(ids(Some(&mark)), ["a"]);
+}
+
+/// A message following a record in one feed page checks the new mark and
+/// signs its effect against the application that established it.
+#[tokio::test]
+async fn test_records_receive_checks_the_mark_of_the_preceding_write() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    s.protocol.qualify_items.store(true, Relaxed);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    phone.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["n1", "first"]), vec![])
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    phone
+        .put_record(&target, &value(&["n1", "first", "second"]), vec![])
+        .await
+        .unwrap();
+    s.protocol.append_item_on_note.store(true, Relaxed);
+    {
+        let bob = s.peer.lock();
+        let shop = &bob.apps[0];
+        s.w.switch
+            .send(
+                bob.identity.key(),
+                &shop.keys,
+                &shop.cert,
+                "sample.note",
+                json!({ "text": "another item" }),
+                &[wallet.app_id()],
+            )
+            .unwrap();
+    }
+    let report = wallet.receive(None).await.unwrap();
+    let expected = value(&["n1", "first", "second", "third"]);
+    let RecordRead::Fresh(current) = wallet.read_record_fresh(&target).await.unwrap() else {
+        panic!("the message added its item");
+    };
+    assert_eq!(current.writer, wallet.app_id(), "{:?}", report.events);
+    assert_eq!(current.content.value(), Some(expected.as_slice()));
+    assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(expected));
+}
+
+/// A second installation reports an incomplete list. Keep the qualified list and
+/// the service's new revision until a write at that revision restores all its items.
+#[tokio::test]
+async fn test_records_qualified_mark_holds_an_incomplete_own_write_across_load() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = Setup::new();
+    s.protocol.qualify_items.store(true, Relaxed);
+    s.protocol.end_mark_at_delete.store(true, Relaxed);
+    let mut wallet = s.join("wallet").await;
+    let id = wallet.app_id();
+    wallet.set_multi_device(true).await.unwrap();
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    let original = value(&["n1", "first", "second"]);
+    let short = value(&["n1", "first"]);
+    wallet.put_record(&target, &original, vec![]).await.unwrap();
+    let applied = s.w.switch.applied().len();
+    assert!(matches!(
+        wallet.put_record(&s.target("n2"), &original, vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(matches!(
+        wallet.put_record(&target, &short, vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert_eq!(s.w.switch.applied().len(), applied);
+    let mut other = App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        Arc::new(ItemsProtocol::default()),
+        World::config(),
+        &wallet.backup().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    other.receive(None).await.unwrap();
+    other
+        .end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    assert_eq!(other.app_id(), id);
+    other.put_record(&target, &short, vec![]).await.unwrap();
+    let report = wallet.receive(None).await.unwrap();
+    assert!(!flagged_by(&report.events, &key, id));
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert!(held.not_taken);
+    assert_eq!(held.content.value(), Some(original.as_slice()));
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().unwrap().not_taken);
+    assert_eq!(
+        wallet.record_seen(&key).await.unwrap().as_deref(),
+        Some(original.as_slice())
+    );
+    wallet.read_record_fresh(&target).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().unwrap().not_taken);
+    let complete = value(&["n1", "first", "second", "third"]);
+    wallet.put_record(&target, &complete, vec![]).await.unwrap();
+    let RecordRead::Fresh(held) = wallet.read_record_fresh(&target).await.unwrap() else {
+        panic!("the completed list is current");
+    };
+    assert!(!held.not_taken && !held.flagged);
+    assert_eq!(held.content.value(), Some(complete.as_slice()));
+    assert_eq!(
+        wallet.record_seen(&key).await.unwrap().as_deref(),
+        Some(complete.as_slice())
+    );
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    assert!(wallet.record_seen(&key).await.unwrap().is_none());
+    wallet.put_record(&target, &short, vec![]).await.unwrap();
+    assert_eq!(
+        wallet.record_seen(&key).await.unwrap().as_deref(),
+        Some(short.as_slice())
+    );
 }
 
 /// Device A of the wallet has seen `["a", "x"]`, the phone's; device B, restored from A's

@@ -8,7 +8,7 @@
 //! public `identity.json` call, holds every answer to the notice Table 1 gives, and
 //! recovers in place.
 
-use pubky_switch_client::app::App;
+use pubky_switch_client::app::{App, AppError, ProviderStatus, Refusal};
 use pubky_switch_core::http::header;
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::json;
@@ -84,7 +84,7 @@ async fn public_read(world: &World, step: &str) -> Result<u16, Box<dyn std::erro
     Ok(answer.status)
 }
 
-/// Every caller asks the account in turn: the wallet reads its feed and adds a contact, the
+/// The wallet reads its feed and holds an attempted contact addition locally. The
 /// signer reads the apps, and a reader reads `identity.json`. Each call's end goes into the
 /// trace: the notice is a signed `503`, which no party can mistake for the switch's
 /// answer to its call.
@@ -95,8 +95,18 @@ async fn every_caller_asks(
     step: &str,
 ) -> FlowResult {
     let bob = world.identity("bob")?;
+    if wallet.recovery_required().is_some() {
+        let followed = wallet.follow_provider().await?;
+        if !matches!(followed, ProviderStatus::RecoveryRequired { .. }) {
+            return Err("the explicit provider check lost the held notice".into());
+        }
+    }
     let read = wallet.receive(None).await;
+    let calls = world.requests_sent();
     let added = wallet.add_contact(&bob.public()).await;
+    if world.requests_sent() != calls {
+        return Err("a held wallet sent an own write".into());
+    }
     world.outcome(
         &format!("the wallet's calls, {step}"),
         &json!({
@@ -112,7 +122,13 @@ async fn every_caller_asks(
     );
     public_read(world, step).await?;
     world.advance_ms(STEP_MS);
-    if read.is_ok() || added.is_ok() || attempts.is_ok() {
+    if !read.as_ref().is_ok_and(|report| report.stopped)
+        || !matches!(
+            added,
+            Err(AppError::Refused(Refusal::RecoveryRequired { .. }))
+        )
+        || attempts.is_ok()
+    {
         return Err(format!("a call went through {step}").into());
     }
     Ok(())
@@ -193,7 +209,7 @@ pub async fn notice_behind(world: &World) -> FlowResult {
         reason: "behind",
         permanent: false,
     };
-    expect_notices(world, from, notice, 5)?;
+    expect_notices(world, from, notice, 4)?;
     recover_in_place(world, &mut signer, &mut wallet).await
 }
 
@@ -217,7 +233,7 @@ pub async fn notice_mark_lost(world: &World) -> FlowResult {
         reason: "mark_lost",
         permanent: false,
     };
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
     recover_in_place(world, &mut signer, &mut wallet).await
 }
 
@@ -240,7 +256,7 @@ pub async fn notice_fork(world: &World) -> FlowResult {
         reason: "fork",
         permanent: false,
     };
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
     recover_in_place(world, &mut signer, &mut wallet).await
 }
 
@@ -268,7 +284,7 @@ pub async fn notice_account_lost(world: &World) -> FlowResult {
     };
     let from = world.trace().lines.len();
     every_caller_asks(world, &mut signer, &mut wallet, "the account lost").await?;
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
 
     // The enrollment goes through; the start that follows never arrives.
     world.unreachable("PUT", "/identity");
@@ -290,7 +306,7 @@ pub async fn notice_account_lost(world: &World) -> FlowResult {
     }
     let from = world.trace().lines.len();
     every_caller_asks(world, &mut signer, &mut wallet, "the mark taken over").await?;
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
 
     signer.resume().await?;
     world.outcome("the signer sent its start again", &status(&signer)?);
@@ -319,13 +335,13 @@ pub async fn notice_retired(world: &World) -> FlowResult {
     };
     let from = world.trace().lines.len();
     every_caller_asks(world, &mut signer, &mut wallet, "behind its mark").await?;
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
 
     world.retire(ORIGIN, &alice, 1).await?;
     notice.permanent = true;
     let from = world.trace().lines.len();
     every_caller_asks(world, &mut signer, &mut wallet, "retired").await?;
-    expect_notices(world, from, notice, 4)?;
+    expect_notices(world, from, notice, 3)?;
     recover_in_place(world, &mut signer, &mut wallet).await
 }
 

@@ -1278,9 +1278,11 @@ impl App {
         batch: &Batch,
         first: &BatchFirstSend,
     ) -> Result<Submitted, AppError> {
+        let bounded = self.bound_service_cursor(batch)?;
+        let batch = bounded.as_ref().unwrap_or(batch);
         let hash = pubky_switch_core::enc::hash(batch.body());
         if first.confirmed_body == Some(hash) {
-            return self.submit(batch).await;
+            return self.submit_body(batch, None).await;
         }
         // Only a verified earlier handoff permits submitting old-generation bytes to
         // another provider. Newly signed bytes need their own current time check.
@@ -1300,7 +1302,7 @@ impl App {
             offset,
             first.before_ms,
         );
-        let result = self.submit_before(batch, Some(&gate)).await;
+        let result = self.submit_body(batch, Some(&gate)).await;
         if gate.confirmed() && result.is_err() {
             let mut held = pending.clone();
             if let Some(first) = &mut held.first_send {

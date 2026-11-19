@@ -14638,6 +14638,93 @@ async fn test_record_publication_waits_for_the_owner_before_changing_divergence(
     .await;
 }
 
+/// A new service cursor changes a kept request even when every signed operation is
+/// unchanged. After reload only the request that already reached the service may go late.
+#[tokio::test]
+async fn test_record_publication_kept_batch_rechecks_its_cursor_after_reload() {
+    use crate::app::KeptBatchStatus;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    for covered in [false, true] {
+        let s = Setup::new();
+        let mut writer = s.join("wallet").await;
+        let mut app = s.join("phone").await;
+        let app_id = app.app_id();
+        let target = s.target("protected");
+        read_on(&mut app).await;
+        writer
+            .put_record(&target, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+        app.receive(None).await.unwrap();
+        let cursor = app.cursor().seq;
+        assert!(app.service_cursor().seq < cursor);
+        let before = s.w.clock.now_ms() + 600_000;
+        let unavailable = || {
+            s.w.switch.fail_next(Fault::Error {
+                path: "ops".into(),
+                code: ErrorCode::Unavailable,
+                current: json!(null),
+            })
+        };
+        unavailable();
+        let id = app
+            .submit_batch(super::moves::contact_batch(s.w.bob.public()).first_send_before(before))
+            .await
+            .unwrap_err()
+            .kept_batch()
+            .unwrap();
+
+        s.protocol.hold_deletes.store(true, SeqCst);
+        let deleted = writer
+            .delete_record(&target, vec![])
+            .await
+            .unwrap()
+            .version
+            .version;
+        unavailable();
+        app.receive(None).await.unwrap();
+        let key = app.record_key(&target).unwrap();
+        assert_eq!(replacement_at(&app, &key).unwrap().observation.seq, deleted);
+        assert!(cursor < deleted);
+        if covered {
+            writer
+                .put_record(&target, &value(&["trusted", "next"]), vec![])
+                .await
+                .unwrap();
+            unavailable();
+            app.receive(None).await.unwrap();
+            assert!(replacement_at(&app, &key).is_none());
+            app.flush_cursor().await.unwrap();
+            assert!(app.service_cursor().seq > cursor);
+        }
+        drop(app);
+        let mut app = App::load(s.env(), s.protocol.clone(), World::config(), app_id)
+            .await
+            .unwrap();
+        s.w.clock.set_ms(before);
+        let start = s.router.log().len();
+        if covered {
+            assert!(app.resume_batches().await.is_err());
+            assert!(matches!(
+                app.kept_batch(id).await.unwrap(),
+                Some(KeptBatchStatus::Kept { .. })
+            ));
+        } else {
+            app.resume_batches().await.unwrap();
+            assert!(matches!(
+                app.kept_batch(id).await.unwrap(),
+                Some(KeptBatchStatus::Applied { .. })
+            ));
+        }
+        let posts = s.router.log()[start..]
+            .iter()
+            .filter(|request| request.starts_with("POST ") && request.ends_with("/ops"))
+            .count();
+        assert_eq!(posts, usize::from(!covered));
+    }
+}
+
 #[tokio::test]
 async fn test_record_publication_shared_store_handoff_keeps_the_real_service_cursor() {
     let s = Setup::new();

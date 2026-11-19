@@ -3000,7 +3000,7 @@ impl App {
     /// ([`App::reread_after_unverified`]); an answer that still doesn't verify is queued as
     /// any other.
     ///
-    /// The round rereads the peer identity at most once. Its elapsed time budget controls
+    /// An unverified answer allows one peer identity reread for retry. The round's budget controls
     /// that reread, resealing after `409 stale_key` and delivery of the own identity after
     /// `409 identity_needed`. A timestamp correction inside a switch call is a separate
     /// HTTP send. The append checks delivery holds before its timestamp retry.

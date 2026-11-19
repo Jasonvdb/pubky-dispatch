@@ -230,7 +230,7 @@ pub struct AppConfig {
     /// Each in-flight HTTP send has its own timeout. [`App::submit_batch`] bounds its
     /// work by the calls it makes. One message's delivery round ([`App::send`],
     /// [`App::resend`], [`App::flush_message`]) checks elapsed time before retrying a
-    /// stale key, delivering a needed identity or rereading the peer identity. A signed
+    /// stale key, delivering a needed identity or rereading after an unverified answer. A signed
     /// timestamp correction can add an HTTP send within a call. The message's record
     /// job uses the separate budget of [`App::update_record`].
     pub call_budget_ms: u64,

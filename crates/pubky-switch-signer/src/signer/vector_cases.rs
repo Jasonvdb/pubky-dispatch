@@ -696,6 +696,30 @@ async fn test_vectors_old_signer_abort_is_the_vectors_version_5() {
     );
 }
 
+#[test]
+fn test_verified_cutoff_requires_the_original_document_and_its_generation() {
+    let doc =
+        IdentityDoc::verify_named(&document("alice identity.json, wallet renewal in progress"))
+            .unwrap();
+    let mut read = super::SwitchRead {
+        answer: super::AppsAnswer {
+            apps: Vec::new(),
+            recovery: None,
+            proof_generations: Vec::new(),
+            identity: Some(doc.signed().clone()),
+            server_time: VECTOR_START_MS,
+        },
+        device_ms: VECTOR_START_MS + 60_000,
+        head_generation: Some(doc.generation()),
+    };
+    assert_eq!(read.cutoff_for(&doc), Some(VECTOR_START_MS));
+    read.head_generation = Some(doc.generation() + 1);
+    assert_eq!(read.cutoff_for(&doc), None);
+    read.head_generation = Some(doc.generation());
+    read.answer.identity = Some(document("alice identity.json, wallet renewal closed"));
+    assert_eq!(read.cutoff_for(&doc), None);
+}
+
 /// `documents.json`'s wallet renewal (Switch spec 3.2; Switch wire 3.8 Reductions): alice's
 /// signer renews the wallet without `tasks_people_admin`, a scope with keys, and expiring earlier,
 /// at 00:02. The switch takes the renewing version at 00:03. The renewed certificate, the

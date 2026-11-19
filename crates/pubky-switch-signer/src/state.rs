@@ -232,9 +232,8 @@ pub(crate) struct Newest {
     pub(crate) prev: Option<[u8; 32]>,
     /// Whether it is published on the Homeserver.
     pub(crate) published: bool,
-    /// The service time at which the switch took it, from its delivery's transition proof;
-    /// `None` for an adopted copy. A reduction's cutoff is this time plus the clock tolerance
-    /// (Switch wire 3.8).
+    /// The original service time from the delivery's verified transition proof when available
+    /// (Switch wire 3.8). A later verified read supplies only a cutoff for an owed reduction.
     pub(crate) delivered_at: Option<u64>,
 }
 
@@ -340,10 +339,6 @@ pub(crate) struct SignerState {
     /// is owed and the delivery's answer was lost: its retry's answer must carry that time
     /// (Switch wire 7.4.2). It concerns only that version.
     pub(crate) time_asked: Option<u64>,
-    /// The version whose retry gave no service time either: the closing stays owed, with
-    /// [`Alert::ReductionNotClosed`] shown, until a later version's delivery carries a service
-    /// time to close at.
-    pub(crate) closing_unavailable: Option<u64>,
     /// The identity's account at its switch is erased (Switch spec 12.7): the records stay,
     /// and nothing more is signed for that account.
     pub(crate) erased: bool,
@@ -614,7 +609,6 @@ impl SignerState {
             switch_unconfirmed: false,
             epoch_through: 0,
             time_asked: None,
-            closing_unavailable: None,
             erased: false,
             recovering: false,
             recovery_base: None,

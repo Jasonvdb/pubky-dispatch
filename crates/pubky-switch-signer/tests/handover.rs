@@ -1158,7 +1158,7 @@ async fn test_hand_over_decided_before_a_failed_publication() {
 }
 #[tokio::test]
 async fn test_hand_over_refused_while_a_closing_is_owed() {
-    // A reduction's closing waits for a service time the switch didn't give: still owed.
+    // A reduction stays owed while the signer cannot verify its account read.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
@@ -1173,17 +1173,36 @@ async fn test_hand_over_refused_while_a_closing_is_owed() {
     };
     signer.renew(id, reduce).await.unwrap_err();
     world.switch.forget_delivery_proof();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
     signer.resume().await.unwrap_err();
     assert!(
         signer
             .alerts()
             .contains(&Alert::ReductionNotClosed { apps: vec![id] })
     );
-    assert_eq!(
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    assert!(matches!(
         signer.hand_over_to(id, confirmed()).await.unwrap_err(),
-        SignerError::Refused(Refusal::ClosingOwed)
-    );
+        SignerError::Switch(pubky_switch_client::ClientError::Transport(_))
+    ));
     assert_eq!(world.switch.stored_handover(), None);
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::ReductionNotClosed { apps: vec![id] })
+    );
+    signer.resume().await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::ReductionNotClosed { apps: vec![id] })
+    );
 }
 
 #[tokio::test]

@@ -715,11 +715,22 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn apps(&self) -> Result<AppsAnswer, ClientError> {
+        self.apps_with_head().await.map(|(answer, _)| answer)
+    }
+
+    /// Read the apps and the verified account head on that same response (Switch wire
+    /// 6.7, 7.4.12). A response without a head returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apps`].
+    pub async fn apps_with_head(&self) -> Result<(AppsAnswer, Option<SignedHead>), ClientError> {
         self.signer_only()?;
         let checked = self.get("apps", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.12: an apps answer")?;
-        AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)
+        let answer = AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)?;
+        Ok((answer, checked.head))
     }
 
     /// `POST /v1/{id}/apps/{app_id}/revoke` (signer, Switch wire 7.4.12), answered with the

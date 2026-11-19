@@ -2170,16 +2170,13 @@ impl App {
         Ok(true)
     }
 
-    /// Whether the certificate lacks, at the current data epoch, the key of a scope it
-    /// holds that reads one of `collections` (Switch spec 3.5).
+    /// Whether a readable collection member lacks its current scope key (Switch spec 3.5).
     fn listing_lacks_keys(&self, collections: &[Collection]) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        self.state.cert.scopes().iter().any(|scope| {
-            self.protocols.has_keys(scope)
-                && self.state.scope_keys.get(epoch, scope).is_none()
-                && collections
-                    .iter()
-                    .any(|c| c.read_by_scopes(std::slice::from_ref(scope)))
+        collections.iter().any(|collection| {
+            collection.any_read_scope(&self.state.cert, |scope| {
+                self.protocols.has_keys(scope) && self.state.scope_keys.get(epoch, scope).is_none()
+            })
         })
     }
 

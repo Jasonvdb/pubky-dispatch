@@ -152,22 +152,25 @@ impl Collection {
         self.member(policy).is_some()
     }
 
-    /// Whether these grants read a member of the collection (Switch spec 3.3, 10.3).
-    /// A parent grant covers a fixed child scope. A child grant also reads its own
-    /// member of a sub-scope family.
-    pub(crate) fn read_by_scopes(&self, scopes: &[String]) -> bool {
+    /// Whether a read scope accessible to `cert` matches `check` (Switch spec 3.3, 10.3).
+    /// Fixed scopes include any child opened with its parent key. A child-only holder
+    /// reads only that member of a sub-scope family.
+    pub(crate) fn any_read_scope(&self, cert: &AppCert, check: impl Fn(&str) -> bool) -> bool {
         let read = self.policy.read_scope.as_str();
-        pubky_switch_core::scopes::holds(scopes, read)
-            || (self.family == PolicyFamily::SubScopes
-                && scopes
-                    .iter()
-                    .any(|s| pubky_switch_core::scopes::parent(s) == Some(read)))
+        if cert.holds_scope(read) {
+            return check(read);
+        }
+        self.family == PolicyFamily::SubScopes
+            && cert
+                .scopes()
+                .iter()
+                .any(|scope| pubky_switch_core::scopes::parent(scope) == Some(read) && check(scope))
     }
 
     /// Whether a certificate holds the read scope of any member, so its app lists the
     /// collection (Switch spec 8.3).
     pub fn readable_by(&self, cert: &AppCert) -> bool {
-        self.read_by_scopes(cert.scopes())
+        self.any_read_scope(cert, |_| true)
     }
 }
 

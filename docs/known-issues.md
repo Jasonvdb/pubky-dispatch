@@ -4,7 +4,7 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
-Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the record’s generation to read or write an individual record.
+Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.
 
 A protocol can use `Protocol::qualify_record_mark` to bind a readable value and its mark to the actual record key. A local write that fails this check is refused before signing. After another installation has written the record, the client retains its service revision and the last qualified mark across restart. Hosts must check the shared record's `flagged` and `not_taken` fields before using its contents. A later qualifying write can make the record usable again. A message handler sees the record, mark and application established by earlier entries in the same receive call.
 

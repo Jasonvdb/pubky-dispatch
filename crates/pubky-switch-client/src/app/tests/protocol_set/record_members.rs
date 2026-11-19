@@ -242,6 +242,19 @@ async fn test_record_members_invalid_owner_member_and_policy_leave_pair_unchange
 
 #[tokio::test]
 async fn test_record_members_conflict_signature_applies_pending_removal() {
+    let (other, current, applied) = finish_pending_removal(3).await;
+    assert!(current.updated_at() > other.updated_at());
+    assert_eq!(applied, 1);
+}
+
+#[tokio::test]
+async fn test_record_members_identical_removal_keeps_the_applied_record() {
+    let (other, current, applied) = finish_pending_removal(2).await;
+    assert_eq!(current.signed(), other.signed());
+    assert_eq!(applied, 0);
+}
+
+async fn finish_pending_removal(other_chat: u64) -> (AppRecord, AppRecord, u64) {
     let p = Pair::new();
     let mut app = Box::pin(p.join()).await;
     let until = p.w.clock.now_ms() + DAY_MS;
@@ -258,12 +271,15 @@ async fn test_record_members_conflict_signature_applies_pending_removal() {
     assert!(app.renew_record("tasks", Some(until)).await.is_err());
     p.w.clock.advance_ms(2 * DAY_MS);
     usage(app.set_protocol_member("tasks", None, None).await, "chat");
-    // Another device supplies a later record. Its missing member must not discard the
-    // local pending owner's policy before the new signature is built.
+    // Both devices remove tasks. A different chat value makes their signed records
+    // distinct even when they use the same clock and expiry.
     let mut later = record(&app).body().clone();
     later.updated_at = p.w.clock.now_ms();
     later.expires_at = None;
     later.protocols.remove("tasks");
+    later
+        .protocols
+        .insert("chat".into(), member(other_chat).unwrap());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     p.w.switch
         .app_op(
@@ -275,13 +291,24 @@ async fn test_record_members_conflict_signature_applies_pending_removal() {
         .unwrap();
     usage(app.publish_record().await, "chat");
     assert!(app.protocol_record("tasks").await.unwrap().pending);
+    let before_renewal = p.w.switch.seq();
     app.renew_record("chat", None).await.unwrap();
-    assert!(record(&app).body().protocol("tasks").is_none());
-    assert!(record(&app).updated_at() > later.updated_at());
+    let current = record(&app);
+    assert!(current.body().protocol("tasks").is_none());
+    assert_eq!(current.body().protocol("chat"), member(other_chat).as_ref());
     assert_eq!(
-        app.protocol_record("tasks").await.unwrap().expiry,
-        RecordExpiry::Never
+        p.w.switch.app(&app.app_id()).record.as_ref(),
+        Some(current.signed())
     );
+    assert_eq!(
+        app.protocol_record("tasks").await.unwrap(),
+        ProtocolRecord {
+            member: None,
+            expiry: RecordExpiry::Never,
+            pending: false
+        }
+    );
+    (later, current, p.w.switch.seq() - before_renewal)
 }
 
 #[tokio::test]

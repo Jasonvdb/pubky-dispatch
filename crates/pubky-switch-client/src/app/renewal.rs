@@ -272,13 +272,10 @@ impl App {
             .renewal
             .as_ref()
             .is_some_and(|held| is_renewal(&cert, held));
-        // Member by member: a scope of the new certificate that reads a collection's member,
-        // its fixed read scope or a sub-scope of its family, and that the one before doesn't
-        // hold (Switch spec 3.3).
-        let collections = self.protocols.collections();
-        let widened = cert.scopes().iter().any(|scope| {
-            !self.state.cert.holds_scope(scope)
-                && collections.iter().any(|c| c.read_by_scope(scope))
+        // Only newly accessible collection members need the renewal listing
+        // (Switch spec 3.3, 8.3).
+        let widened = self.protocols.collections().iter().any(|collection| {
+            collection.any_read_scope(&cert, |scope| !self.state.cert.holds_scope(scope))
         });
         // A certificate that adds `lists.read`: the feed showed the deny list's changes
         // before it as stubs, so neither the copy of the lists nor the protocol follows

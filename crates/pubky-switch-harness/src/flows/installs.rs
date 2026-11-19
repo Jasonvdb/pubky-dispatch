@@ -12,6 +12,9 @@
 //! switch answers as the delivery it already took. Only [`signer_two_installs_race`] has
 //! the switch refuse a delivery.
 
+#[cfg(test)]
+mod cancel_key_recovery;
+
 use std::sync::Arc;
 
 use pubky_switch_client::store::MemoryStore;
@@ -1022,3 +1025,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod pending_delivery;

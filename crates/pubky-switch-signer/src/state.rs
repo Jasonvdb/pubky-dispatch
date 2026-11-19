@@ -15,9 +15,9 @@ use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AccountAssociation, AppCert, CarriedAccountObservation, DEFAULT_CERT_LIFETIME_MS, Enrollment,
-    EnrollmentIntent, IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover,
-    StoredPart,
+    AccountAssociation, AccountObservation, AppCert, CarriedAccountObservation,
+    DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentAnswer, EnrollmentIntent, IdentityDoc,
+    IdentityPolicy, Limits, SignerBackup, SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
@@ -738,6 +738,17 @@ pub(crate) enum DeliverStep {
     BackupWritten,
 }
 
+/// Local progress of the exact existing enrollment for a key-only recovery (Switch spec 12.8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum KeyEnrollmentStep {
+    /// No send can start until this step has been durably replaced.
+    Unsent,
+    /// The original request may have reached the service.
+    Sending,
+    /// An authenticated success from the selected service key and creation.
+    Applied(Box<EnrollmentAnswer>),
+}
+
 /// A distinct recovery's enrollment, before discovery or retained for exact retries
 /// (Switch account binding 2-3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,6 +768,34 @@ pub(crate) enum RecoveryEnrollment {
 }
 
 impl RecoveryEnrollment {
+    /// Verify the ordinary recovery's selected serving account and its signed existing intent.
+    pub(crate) fn existing(
+        &self,
+        identity: &[u8; 32],
+        origin: &str,
+    ) -> Result<(AccountObservation, Enrollment)> {
+        let Self::Ready {
+            observation,
+            enrollment,
+        } = self
+        else {
+            return Err(RecordsFault::Invariant("a key recovery without its enrollment").into());
+        };
+        let observed = observation
+            .verify(identity, origin)
+            .map_err(SignerError::StoredData)?;
+        let signed =
+            Enrollment::verify(enrollment, identity, origin).map_err(SignerError::StoredData)?;
+        if observed.body().association != AccountAssociation::Account
+            || signed.body().intent != observed.enrollment_intent()?
+            || signed.body().identity_doc.is_some()
+            || !signed.revoked_apps().is_empty()
+        {
+            return Err(RecordsFault::Invariant("another key recovery enrollment").into());
+        }
+        Ok((observed, signed))
+    }
+
     /// Permanent exclusions are the retained tombstones outside the verified recovery base
     /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
     /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
@@ -889,6 +928,8 @@ pub(crate) enum Flow {
         origin: String,
         /// The observation and the signed `existing` enrollment selected from it.
         enrollment: RecoveryEnrollment,
+        /// Whether the selected enrollment can already be stopped before signing its version.
+        step: KeyEnrollmentStep,
         /// The digest of the survey the user confirmed.
         digest: [u8; 32],
         /// The listed apps the user chose to drop.
@@ -973,28 +1014,22 @@ impl Flow {
                 }
             }
             Self::KeyRecover {
-                origin, enrollment, ..
+                origin,
+                enrollment,
+                step,
+                ..
             } => {
-                let RecoveryEnrollment::Ready {
-                    observation,
-                    enrollment,
-                } = enrollment
-                else {
-                    return Err(
-                        RecordsFault::Invariant("a key recovery without its enrollment").into(),
-                    );
-                };
-                let observed = observation
-                    .verify(identity, origin)
-                    .map_err(SignerError::StoredData)?;
-                let signed = Enrollment::verify(enrollment, identity, origin)
-                    .map_err(SignerError::StoredData)?;
-                // The observation is of a serving account, so its intent is `existing`.
-                if signed.body().intent != observed.enrollment_intent()?
-                    || signed.body().identity_doc.is_some()
-                    || !signed.revoked_apps().is_empty()
-                {
-                    return Err(RecordsFault::Invariant("another key recovery enrollment").into());
+                let (observed, signed) = enrollment.existing(identity, origin)?;
+                if let KeyEnrollmentStep::Applied(answer) = step {
+                    answer.check(&signed).map_err(SignerError::StoredData)?;
+                    if answer.service_key != observed.body().service_key
+                        || Some(answer.created) != signed.body().intent.created()
+                    {
+                        return Err(RecordsFault::Invariant(
+                            "another key recovery enrollment result",
+                        )
+                        .into());
+                    }
                 }
             }
             Self::Recover { origin, enrollment } => {

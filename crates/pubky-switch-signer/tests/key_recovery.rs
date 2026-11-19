@@ -1422,6 +1422,166 @@ async fn test_key_recovery_refused_after_its_commit_leaves_nothing() {
 }
 
 #[tokio::test]
+async fn test_key_recovery_at_a_rotated_enrollment_key_keeps_an_unfinished_survey() {
+    use pubky_switch_client::client::SentRequest;
+    use pubky_switch_client::transport::MockTransport;
+    use pubky_switch_client::transport::{Header, Response};
+    use pubky_switch_core::enc::b64;
+    use pubky_switch_core::http::{ResponseParts, header, sign_response};
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::EnrollmentAnswer;
+
+    let world = World::new();
+    let (first, _) = world.enrolled().await;
+    let service_key = first.identity_doc().unwrap().unwrap().inbox().service_key;
+    drop(first);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let store = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &store).await.unwrap();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    assert!(
+        Signer::restore_new(
+            world.env(store.clone()),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[])
+        )
+        .await
+        .is_err()
+    );
+    let ns = signer_namespace(&world.key.public());
+    let pending = store.get(&ns, b"flow").unwrap().unwrap();
+
+    // The operator's new current key answers successful enrollments while this account
+    // remains served under the previous key (Switch spec 12.5, Switch wire 3.7).
+    let switch = world.switch.clone();
+    let current = IdentityKey::from_secret([82; 32]);
+    let mut env = world.env(store.clone());
+    env.transport = Arc::new(MockTransport::with_handler(move |request| {
+        let response = switch.handle(request)?;
+        if request.path_and_query != "/v1/enroll" || response.status != 200 {
+            return Ok(response);
+        }
+        let mut answer = EnrollmentAnswer::from_json(&response.body).unwrap();
+        answer.service_key = current.public();
+        let body = answer.to_json().unwrap();
+        let time = response.header(header::SERVER_TIME).unwrap();
+        let signature = sign_response(
+            &current,
+            &ResponseParts {
+                status: 200,
+                request: SentRequest::of(request).received(true),
+                server_time: time,
+                head: None,
+                body: &body,
+            },
+        );
+        Ok(Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVER_TIME, time),
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            ],
+            body,
+        })
+    }));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    assert_eq!(
+        signer.cancel_key_recovery(confirmed()).await.unwrap_err(),
+        refused(KeyRecoveryStop::NotServing)
+    );
+    assert_eq!(store.get(&ns, b"flow").unwrap().as_ref(), Some(&pending));
+
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/account".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        refused(KeyRecoveryStop::NotServing)
+    );
+    assert!(
+        store.get(&ns, b"flow").unwrap().as_ref() == Some(&pending),
+        "unresolved enrollment was discarded when the original account could not complete its survey"
+    );
+    signer.resume().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.inbox().service_key, service_key);
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::ServiceKeyNotFollowed { .. }))
+    );
+    signs_on(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_key_recovery_saved_enrollment_cannot_move_to_a_recreated_account() {
+    use pubky_switch_client::store::{Fault, FaultStore};
+
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let memory = Arc::new(MemoryStore::new());
+    let shown = survey(&world, &memory).await.unwrap();
+    // The original existing enrollment succeeded; the answer is durable before the
+    // signer starts reading the survey again. Its commit acknowledgement is lost.
+    let cut = Arc::new(FaultStore::new(memory.clone(), Fault::FailAfter(3)));
+    let result = Signer::restore_new(
+        world.env(cut),
+        world.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(SignerError::Store(pubky_switch_client::StoreError::Unknown))
+    ));
+    let created = world.switch.created();
+    old.close_account(confirmed()).await.unwrap();
+    world.clock.advance_ms(2000);
+    let (mut current, _) = world.enrolled().await;
+    assert!(world.switch.created() > created);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let current_survey = survey(&world, &memory).await.unwrap();
+    assert_ne!(current_survey, shown);
+    let before = current.identity_doc().unwrap().unwrap();
+    assert_eq!(
+        Signer::restore_new(
+            world.env(memory),
+            world.keyring(),
+            KeyRecoveryConfirmed::shown_and_confirmed(&current_survey, &[])
+        )
+        .await
+        .unwrap_err(),
+        refused(KeyRecoveryStop::SurveyChanged)
+    );
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        before.signed()
+    );
+    signs_on(&world, &mut current).await;
+}
+
+#[tokio::test]
 async fn test_key_recovery_in_place_goes_on_under_a_new_confirmation() {
     // In place, the recovery's enrollment doesn't arrive; the user surveys again and
     // confirms, and the recovery goes on from its flow.

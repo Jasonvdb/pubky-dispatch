@@ -40,6 +40,8 @@ If your protocol holds the cursor while it waits for another app to replace a de
 
 While a protected deletion awaits publication, the service cursor stays before it until an observation of the following write covers any pending recovery upload and the collection accepts the value, or the duty is released.
 
+Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
+
 **Additions still to come**
 
 - **Client.** Automatic conditional publication over a deleted record or a competing live write still needs durable signed retry state.

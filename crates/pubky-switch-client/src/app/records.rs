@@ -275,6 +275,13 @@ pub(super) struct ObservedView {
     at_known_tip: bool,
 }
 
+/// A key read or conflict can establish that even a tombstone is absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingFrom {
+    Key,
+    LiveListing,
+}
+
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
 pub(super) enum RecordAnswer {
     /// The record's view, with what it is current at.
@@ -1814,7 +1821,7 @@ impl App {
             return Ok(RecordAnswer::Inconclusive);
         }
         let mut tx = self.tx()?;
-        let current = self.note_absent(key, at, &mut tx).await?;
+        let current = self.note_absent(key, at, MissingFrom::Key, &mut tx).await?;
         if !tx.is_empty() {
             self.commit(tx).await?;
         }
@@ -1898,7 +1905,8 @@ impl App {
                 }
             }
             Some(RecordConflict::Absent(key)) => {
-                self.note_absent(&key, at, &mut tx).await?;
+                self.note_absent(&key, at, MissingFrom::Key, &mut tx)
+                    .await?;
             }
             // The service's position identifies neither the operation nor its writer. A
             // caller that needs the value reads it through the ordinary record endpoint.
@@ -4177,17 +4185,18 @@ impl App {
         Some(held.map_or(now, |held| held.max(now)))
     }
 
-    /// A signed answer shows the key absent (a `404`, or a listing page that covers the key
-    /// without it): the rollback alarm when the app holds a permanent record there live
-    /// (Switch spec 10.3.1 "Absence", [`absence_is_rollback`]).
+    /// Apply a signed absence according to what the request could return. A listing
+    /// covers live records. Only a key answer also covers a retained deletion
+    /// (Switch spec 10.3.1 "Absence", Switch wire 7.4.9).
     ///
     /// # Errors
     ///
     /// The alarm; a store failure.
-    pub(super) async fn note_absent(
+    async fn note_absent(
         &mut self,
         key: &[u8; 32],
         current: CurrentAt,
+        from: MissingFrom,
         tx: &mut Tx,
     ) -> Result<bool, AppError> {
         let CurrentAt::Answer(v) = current else {
@@ -4213,7 +4222,8 @@ impl App {
         // A protected delete must still exist throughout its protected interval,
         // including before a later observation of the same key (Switch spec 10.3).
         let can_report_absence = v.generation == self.state.meta.generation
-            && self.put_back_absence_is_current(key, at).await?;
+            && (from == MissingFrom::LiveListing
+                || self.put_back_absence_is_current(key, at).await?);
         let current = can_report_absence
             && held.as_ref().is_none_or(|held| {
                 let (_, applied, _) = held.base_write();
@@ -4224,13 +4234,18 @@ impl App {
             });
         if let Some(mut held) = held.filter(|_| current) {
             self.check_absent(&held, at.generation).await?;
-            if held.delete_base().is_some() && (!held.gone || held.observed != at) {
+            if from == MissingFrom::Key
+                && held.delete_base().is_some()
+                && (!held.gone || held.observed != at)
+            {
                 held.gone = true;
                 held.observed = at;
                 put_held(tx, key, &held)?;
             }
         }
-        self.retire_absent_receipts(*key, at, tx)?;
+        if from == MissingFrom::Key {
+            self.retire_absent_receipts(*key, at, tx)?;
+        }
         Ok(current)
     }
 
@@ -4261,8 +4276,8 @@ impl App {
     /// listing page covered, after `after` and through `last` (to the end for `None`), and
     /// that the page didn't list.
     ///
-    /// Check the index of permanent records held live (`recp/`) and the outstanding
-    /// protected deletions. Each omitted key is judged once at this page's position.
+    /// Check the index of permanent records held live (`recp/`). Deleted keys are
+    /// normally absent from these pages (Switch wire 7.4.9).
     async fn note_unlisted(
         &mut self,
         collection: &str,
@@ -4273,20 +4288,7 @@ impl App {
         upload_at: FeedPosition,
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
-        let permanent = self.reader().scan::<String>(PERMANENT_PREFIX).await?;
-        let protected = self
-            .state
-            .put_backs
-            .values()
-            .filter(|hold| hold.protects)
-            .map(|hold| {
-                (
-                    b64(&hold.observation.key),
-                    hold.observation.collection.clone(),
-                )
-            });
-        let known: std::collections::BTreeSet<_> = permanent.into_iter().chain(protected).collect();
-        for (rest, of) in known {
+        for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
             if of != collection
                 || after.as_ref().is_some_and(|after| rest <= *after)
                 || last.as_ref().is_some_and(|last| rest > *last)
@@ -4301,7 +4303,7 @@ impl App {
                     .is_none_or(|upload| self.covers_upload(upload_at, upload))
             {
                 let mut tx = self.tx()?;
-                Box::pin(self.note_absent(&key, at, &mut tx)).await?;
+                Box::pin(self.note_absent(&key, at, MissingFrom::LiveListing, &mut tx)).await?;
                 if !tx.is_empty() {
                     self.commit(tx).await?;
                 }

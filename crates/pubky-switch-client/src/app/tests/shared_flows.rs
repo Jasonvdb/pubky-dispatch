@@ -14638,6 +14638,44 @@ async fn test_record_publication_waits_for_the_owner_before_changing_divergence(
     .await;
 }
 
+/// Collection pages list only live records. A held deletion stays available by key
+/// through a completed listing and a restart, until a later publication covers it.
+#[tokio::test]
+async fn test_record_publication_listing_preserves_the_deletion_returned_by_key() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, deleted) = delete_for_put_back(&s).await;
+    let key = reader.record_key(&target).unwrap();
+    let id = reader.app_id();
+    read_on(&mut reader).await;
+    let page = reader.list_collection(&target.collection).await.unwrap();
+    assert_eq!(page.records, 0);
+    assert!(!page.more);
+    drop(reader);
+
+    let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    let read = reader.read_record_fresh(&target).await.unwrap();
+    assert!(
+        matches!(&read, RecordRead::Fresh(record) if record.content == RecordContent::Deleted
+        && record.version.version == deleted),
+        "{read:?}"
+    );
+    assert_eq!(
+        replacement_at(&reader, &key).unwrap().observation.seq,
+        deleted
+    );
+    reader.flush_cursor().await.unwrap();
+    assert!(s.w.switch.app(&id).cursor < deleted);
+    writer
+        .put_record(&target, &value(&["trusted", "next"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut reader).await;
+    assert!(replacement_at(&reader, &key).is_none());
+    assert!(s.w.switch.app(&id).cursor >= deleted);
+}
+
 /// A new service cursor changes a kept request even when every signed operation is
 /// unchanged. After reload only the request that already reached the service may go late.
 #[tokio::test]

@@ -268,6 +268,7 @@ mod tests {
         ServiceCopyOnly,
         MarkOnly,
         DamagedStateWithBackup,
+        DamagedStateWithServiceCopy,
     }
 
     async fn check_existing_first_account(backend: Backend) {
@@ -276,6 +277,7 @@ mod tests {
             FirstAccount::ServiceCopyOnly,
             FirstAccount::MarkOnly,
             FirstAccount::DamagedStateWithBackup,
+            FirstAccount::DamagedStateWithServiceCopy,
         ] {
             let result = Box::pin(crate::run_here(backend, async |world: &World| {
                 Box::pin(existing_first_account(world, account)).await
@@ -368,7 +370,9 @@ mod tests {
         drop(original);
         if matches!(
             account,
-            FirstAccount::ServiceCopyOnly | FirstAccount::MarkOnly
+            FirstAccount::ServiceCopyOnly
+                | FirstAccount::MarkOnly
+                | FirstAccount::DamagedStateWithServiceCopy
         ) {
             world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
             world.files().remove(alice.public(), IDENTITY_PATH);
@@ -413,14 +417,29 @@ mod tests {
         );
         assert_eq!(world.requests_sent(), requests);
 
+        let confirm = |survey: &pubky_switch_signer::KeyRecoverySurvey| {
+            assert!(survey.origin_supplied);
+            assert_eq!(survey.origin, ORIGIN);
+            assert_eq!(survey.version, previous.version());
+            KeyRecoveryConfirmed::shown_and_confirmed(survey, &[])
+        };
         let restored = match account {
-            FirstAccount::DamagedStateWithBackup => {
+            FirstAccount::DamagedStateWithBackup | FirstAccount::DamagedStateWithServiceCopy => {
                 drop(signer);
                 damage_first_state(&store, &alice)?;
+                let mut discard = pubky_switch_signer::RecordsDiscarded::shown_and_confirmed();
+                if account == FirstAccount::DamagedStateWithServiceCopy {
+                    let survey = Box::pin(Signer::survey_key_recovery_new(
+                        env.clone(),
+                        world.keyring(&alice)?,
+                    ))
+                    .await?;
+                    discard = discard.and_key_recovery(confirm(&survey));
+                }
                 signer = Box::pin(Signer::restore_over_unusable(
                     env,
                     world.keyring(&alice)?,
-                    pubky_switch_signer::RecordsDiscarded::shown_and_confirmed(),
+                    discard,
                 ))
                 .await?;
                 signer.identity_doc()?.ok_or("missing restored document")?
@@ -430,12 +449,7 @@ mod tests {
             }
             FirstAccount::ServiceCopyOnly => {
                 let survey = signer.survey_key_recovery().await?;
-                assert!(survey.origin_supplied);
-                assert_eq!(survey.origin, ORIGIN);
-                assert_eq!(survey.version, previous.version());
-                signer
-                    .restore(KeyRecoveryConfirmed::shown_and_confirmed(&survey, &[]))
-                    .await?
+                signer.restore(confirm(&survey)).await?
             }
             FirstAccount::MarkOnly => {
                 assert!(matches!(
@@ -455,7 +469,10 @@ mod tests {
             (previous.version() + 1, previous.generation())
         );
         assert_eq!(restored.body().signer, signer.install_id());
-        if account != FirstAccount::DamagedStateWithBackup {
+        if !matches!(
+            account,
+            FirstAccount::DamagedStateWithBackup | FirstAccount::DamagedStateWithServiceCopy
+        ) {
             assert_eq!(signer.install_id(), install);
         }
         assert_eq!(restored.inbox(), previous.inbox());

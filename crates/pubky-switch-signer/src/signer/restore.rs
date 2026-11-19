@@ -103,6 +103,8 @@ impl KeptCopy {
 pub(super) struct RestoreLocal {
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
+    /// A verified first discovery can locate a service when no signed copy names one.
+    pub(super) first_account_origin: Option<String>,
     pub(super) signed_through: Option<u64>,
     pub(super) epoch_through: Option<u64>,
 }
@@ -121,6 +123,7 @@ impl RestoreLocal {
             epoch_through: state.as_ref().map(|state| state.epoch_through),
             state,
             copies,
+            first_account_origin: None,
         };
         for copy in &local.copies {
             if let KeptCopy::Verified(doc) = copy {
@@ -188,12 +191,17 @@ impl RestoreLocal {
             }
             .into());
         }
+        let verified_flow = flow.as_ref().filter(|_| intact_flow);
+        let pending = verified_flow.is_some_and(Flow::blocks_restore);
         if let Some(state) = &state {
-            check_local_restore(state, intact_flow)?;
-        } else if intact_flow {
+            check_local_restore(state, pending)?;
+        } else if pending {
             return Err(Refusal::FlowInProgress.into());
         }
         let mut local = Self::from_state(state, identity);
+        local.first_account_origin = verified_flow
+            .and_then(Flow::first_account_origin)
+            .map(str::to_owned);
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
         let signed = match &flow {

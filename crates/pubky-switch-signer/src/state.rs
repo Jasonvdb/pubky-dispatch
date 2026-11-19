@@ -903,9 +903,17 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    /// The chosen service where first setup stopped before signing any enrollment.
+    pub(crate) fn first_account_origin(&self) -> Option<&str> {
+        match self {
+            Self::FirstAccountPresent { origin, .. } => Some(origin),
+            _ => None,
+        }
+    }
+
     /// A first setup stopped before signing has no pending action for a restore to displace.
     pub(crate) fn blocks_restore(&self) -> bool {
-        !matches!(self, Self::FirstAccountPresent { .. })
+        self.first_account_origin().is_none()
     }
 
     pub(crate) fn check_state(&self, state: &SignerState) -> Result<()> {

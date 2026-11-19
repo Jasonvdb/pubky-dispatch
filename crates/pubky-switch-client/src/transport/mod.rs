@@ -24,7 +24,7 @@ pub use crate::error::TransportError;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One header of a request or a response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     /// The name, in lower case as the switch sends them; names are case-insensitive (Switch
     /// wire 7.1).
@@ -114,7 +114,7 @@ impl Request {
 }
 
 /// A response of the switch, not yet checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Response {
     /// The HTTP status.
     pub status: u16,

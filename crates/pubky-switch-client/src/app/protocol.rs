@@ -1515,9 +1515,11 @@ pub trait Protocol: Send + Sync {
             .collect())
     }
 
-    /// The shared record write of a sent message (Switch spec 8.2): the record's next value
-    /// from its current one (`None` for none, deleted or unreadable), or `None` when the
-    /// record already reflects the message. Nothing by default.
+    /// Build the shared record's next value for a sent message (Switch spec 8.2).
+    /// `current` is `None` for an absent, deleted or unreadable record. The client can call
+    /// this hook again for the same message after a write conflict or when the outcome of
+    /// an earlier write is unknown. Make the update idempotent by returning `None` when
+    /// the current value already reflects the message. The default returns `None`.
     fn sent_record(
         &self,
         job: &RecordJob,

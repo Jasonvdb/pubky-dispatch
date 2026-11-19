@@ -589,7 +589,7 @@ impl Signer {
         });
         let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
-        match self.finish_flow().await {
+        match Box::pin(self.finish_flow()).await {
             Ok(()) => {}
             // The recovery's version wasn't taken: the restore is done, the recovery in
             // progress, resumed or declared again at another service from here.
@@ -598,7 +598,7 @@ impl Signer {
         }
 
         let next = self.sign_own_version().await?;
-        self.resume().await?;
+        Box::pin(self.resume()).await?;
         Ok(next)
     }
 

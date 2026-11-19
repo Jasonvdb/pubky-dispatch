@@ -919,6 +919,8 @@ async fn assert_confirmed_refusal(
 
 #[tokio::test]
 async fn test_records_confirmed_restore_preserves_an_intact_flow() {
+    use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
@@ -930,6 +932,13 @@ async fn test_records_confirmed_restore_preserves_an_intact_flow() {
     signer.set_record_max_age(Some(60)).await.unwrap_err();
     drop(signer);
     let original = snapshot(&world, &store);
+    let saved_backup = world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH)
+        .unwrap();
     for damaged in [
         damaged_certificate(&original),
         unreadable_state(&original),
@@ -945,11 +954,12 @@ async fn test_records_confirmed_restore_preserves_an_intact_flow() {
         )
         .await;
     }
-    replace(&world, &store, &original);
-    let mut signer = Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
-    signer.resume().await.unwrap();
+    world.homeserver.set(SIGNER_BACKUP_PATH, saved_backup);
+    replace(&world, &store, &unreadable_state(&original));
+    let signer =
+        Signer::restore_over_unusable(world.env(store), world.keyring(), discard_confirmed())
+            .await
+            .unwrap();
     assert_eq!(
         signer
             .identity_doc()

@@ -6507,6 +6507,151 @@ async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
 }
 
 #[tokio::test]
+async fn test_records_listing_named_generations_waits_for_the_new_child_or_parent_key() {
+    for grant in ["sample-a:shop", "sample-a"] {
+        let s = Setup::new();
+        let family = Collection::with_permanent_generations(
+            "sample.items",
+            "sample-a:shop",
+            &["sample-a:shop"],
+        );
+        *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+        let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+        let target = RecordTarget::new(
+            Collection::new(&family.name, family.policy.clone().permanent(Some(1))),
+            b"shop",
+        );
+        writer
+            .put_record(&target, &value(&["issued"]), vec![])
+            .await
+            .unwrap();
+        let key = writer.record_key(&target).unwrap();
+        let mut reader = join_scoped(&s, "wallet", &["sample-a:other"]).await;
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        s.w.clock.advance_ms(HOUR);
+        let earlier = reader.cert().clone();
+        let renewed = renewed_cert(&s, "wallet", &[grant]);
+        s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+        reader.receive(None).await.unwrap();
+        assert_eq!(reader.cert().hash(), renewed.hash());
+        assert!(family.readable_by(reader.cert()));
+        assert!(reader.listing_owed().await.unwrap(), "{grant}");
+        let before = s.w.switch.lock().shared.listings;
+        reader.receive(None).await.unwrap();
+        assert_eq!(s.w.switch.lock().shared.listings, before, "{grant}");
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        store_parts_for(&s, &renewed);
+        reader.receive(None).await.unwrap();
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        let held = reader.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), ["issued"], "{grant}");
+    }
+}
+
+#[tokio::test]
+async fn test_records_retained_child_key_reads_the_same_collection_after_a_parent_grant() {
+    let s = Setup::new();
+    let family =
+        Collection::with_permanent_generations("sample.items", "sample-a:shop", &["sample-a:shop"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let member = Collection::new(&family.name, family.policy.clone().permanent(Some(1)));
+    let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+    let first = RecordTarget::new(member.clone(), b"first");
+    writer
+        .put_record(&first, &value(&["one"]), vec![])
+        .await
+        .unwrap();
+    let mut reader = join_scoped(&s, "wallet", &["sample-a:shop"]).await;
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&first).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["one"]);
+    s.w.clock.advance_ms(HOUR);
+    let old = reader.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &old, &renewed, None));
+    reader.receive(None).await.unwrap();
+    assert_eq!(reader.cert().hash(), renewed.hash());
+    assert!(!reader.listing_owed().await.unwrap());
+
+    let second = RecordTarget::new(member, b"second");
+    writer
+        .put_record(&second, &value(&["two"]), vec![])
+        .await
+        .unwrap();
+    reader.receive(None).await.unwrap();
+    let key = reader.record_key(&second).unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["two"]);
+
+    // An independent gap still needs its listing. Its records use the child key the
+    // reader already holds even though the wider bundle has not arrived.
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now - 1, now);
+    let before = s.w.switch.lock().shared.listings;
+    let report = reader.receive(None).await.unwrap();
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey))
+    );
+    assert!(s.w.switch.lock().shared.listings > before);
+    assert!(!reader.listing_owed().await.unwrap());
+}
+
+#[tokio::test]
+async fn test_records_listing_named_permanent_generations_restarts_a_narrow_scan() {
+    let s = Setup::new();
+    let family = Collection::with_permanent_generations("sample.items", "sample-a", &["sample-a"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut reader = s.join("wallet").await;
+    let mut writer = s.join("phone").await;
+    let named = |g| Collection::new(&family.name, family.policy.clone().permanent(Some(g)));
+    for n in 0..6 {
+        let key = format!("recipient-{n}");
+        writer
+            .put_record(
+                &RecordTarget::new(named(1), key.as_bytes()),
+                &value(&["issued"]),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let first = reader.list_collection(&named(2)).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    assert!(reader.records_of(&family.name).await.unwrap().is_empty());
+
+    let first = reader.list_collection(&family).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    let second = reader.list_collection(&family).await.unwrap();
+    assert!(!second.more);
+    assert_eq!(second.records, 2);
+    let found = reader.records_of(&family.name).await.unwrap();
+    assert_eq!(found.len(), 6);
+    assert!(
+        found
+            .iter()
+            .all(|r| r.policy == named(1).policy && r.content.value().is_some())
+    );
+    let template = RecordTarget::new(family, b"recipient-7");
+    assert!(reader.record_key(&template).is_err());
+    assert!(
+        reader
+            .record_op(&template, Some(&value(&["issued"])), vec![])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_records_list_collections_reads_at_most_its_page_budget_and_goes_on() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;

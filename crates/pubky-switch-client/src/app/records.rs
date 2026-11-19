@@ -282,6 +282,41 @@ pub(super) enum MissingFrom {
     LiveListing,
 }
 
+/// Local cursor identity for the set of policies this pass can admit. An older
+/// cursor for the collection ID alone cannot establish coverage of additional generations.
+fn listing_scope(
+    id: &[u8; 32],
+    collection: &Collection,
+    members: Option<&[Collection]>,
+) -> Result<[u8; 32], AppError> {
+    let members = members.unwrap_or_else(|| std::slice::from_ref(collection));
+    if !members.iter().any(|member| {
+        member.name == collection.name && member.family == PolicyFamily::PermanentGenerations
+    }) {
+        return Ok(*id);
+    }
+    let mut policies = Vec::new();
+    for member in members
+        .iter()
+        .filter(|member| member.name == collection.name)
+    {
+        let kind = match member.family {
+            PolicyFamily::Fixed => 0,
+            PolicyFamily::SubScopes => 1,
+            PolicyFamily::PermanentGenerations => 2,
+        };
+        policies.push((kind, member.policy.hash()?));
+    }
+    policies.sort_unstable();
+    policies.dedup();
+    let mut bytes = id.to_vec();
+    for (kind, policy) in policies {
+        bytes.push(kind);
+        bytes.extend_from_slice(&policy);
+    }
+    Ok(pubky_switch_core::enc::hash(&bytes))
+}
+
 /// The switch's answer to a read of one record key ([`App::record_answer`]).
 pub(super) enum RecordAnswer {
     /// The record's view, with what it is current at.
@@ -1966,7 +2001,7 @@ impl App {
             let id = collection.id(&self.state.meta.identity);
             let key = listc_key(&id);
             let mut progress: ListProgress = self.reader().get(&key).await?.unwrap_or_default();
-            let after = progress.after(&id)?;
+            let after = progress.after(&listing_scope(&id, collection, None)?)?;
             let mut pages = LISTING_PAGES_PER_READ;
             let listed = self
                 .list_from(
@@ -2011,6 +2046,7 @@ impl App {
     ) -> Result<Listed, AppError> {
         let id = collection.id(&self.state.meta.identity);
         let upload = self.listing_upload(&collection.name).await?;
+        let scope = listing_scope(&id, collection, members)?;
         let mut listed = 0u64;
         loop {
             // Past a read's time budget, once it asked for one page, it pauses as on its
@@ -2080,7 +2116,7 @@ impl App {
                 .next
                 .filter(|next| after.is_none_or(|after| b64(next) > b64(&after)));
             if let Some((progress, key)) = progress.as_mut() {
-                progress.reached(&id, next.as_ref());
+                progress.reached(&scope, next.as_ref());
                 tx.put(key, &**progress)?;
             }
             self.commit(tx).await?;
@@ -2225,10 +2261,11 @@ impl App {
             let collections = self.readable_collections(name);
             for collection in &collections {
                 let id = collection.id(&self.state.meta.identity);
-                if progress.done.contains(&b64(&id)) {
+                let scope = listing_scope(&id, collection, Some(&collections))?;
+                if progress.done.contains(&b64(&scope)) {
                     continue;
                 }
-                let after = progress.after(&id)?;
+                let after = progress.after(&scope)?;
                 if let Listed::Paused(_) = self
                     .list_from(
                         collection,
@@ -2376,10 +2413,11 @@ impl App {
             .collect();
         for collection in &collections {
             let id = collection.id(&self.state.meta.identity);
-            if progress.done.contains(&b64(&id)) {
+            let scope = listing_scope(&id, collection, Some(&collections))?;
+            if progress.done.contains(&b64(&scope)) {
                 continue;
             }
-            let after = progress.after(&id)?;
+            let after = progress.after(&scope)?;
             if let Listed::Paused(_) = self
                 .list_from(
                     collection,
@@ -2401,14 +2439,13 @@ impl App {
         Ok(true)
     }
 
-    /// Whether the certificate lacks, at the current data epoch, the key of a scope it
-    /// holds that reads one of `collections` (Switch spec 3.5).
+    /// Whether a readable collection member lacks its current scope key (Switch spec 3.5).
     fn listing_lacks_keys(&self, collections: &[Collection]) -> bool {
         let epoch = self.state.own_doc.data_epoch();
-        self.state.cert.scopes().iter().any(|scope| {
-            self.protocols.has_keys(scope)
-                && self.state.scope_keys.get(epoch, scope).is_none()
-                && collections.iter().any(|c| c.read_by_scope(scope))
+        collections.iter().any(|collection| {
+            collection.any_read_scope(&self.state.cert, |scope| {
+                self.protocols.has_keys(scope) && self.state.scope_keys.get(epoch, scope).is_none()
+            })
         })
     }
 
@@ -4837,7 +4874,7 @@ pub(crate) fn record_put(
     held: Option<&HeldRecord>,
 ) -> Result<(RecordPut, Option<Condition>), AppError> {
     refuse_non_json(value)?;
-    let policy = &target.collection.policy;
+    let policy = target.concrete_policy()?;
     if !policy
         .write_scopes
         .iter()

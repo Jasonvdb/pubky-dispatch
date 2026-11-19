@@ -93,6 +93,25 @@ struct RecordReread {
 }
 
 impl App {
+    /// An outstanding upload read may still need the owner to judge the record.
+    pub(super) async fn owes_record_reread(&self, protocol: &str) -> Result<bool, AppError> {
+        for (key, _) in self
+            .reader()
+            .scan::<RecordReread>(RECORD_REREAD_PREFIX)
+            .await?
+        {
+            let key = unb64_array(&key).map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            if self
+                .record_protocol(&key)
+                .await?
+                .is_none_or(|owner| owner == protocol)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) async fn record_upload(
         &self,
         key: &[u8; 32],

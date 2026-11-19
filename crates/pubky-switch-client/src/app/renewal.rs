@@ -316,7 +316,9 @@ impl App {
         let collections = self.protocols.collections();
         let widened = cert.scopes().iter().any(|scope| {
             !self.state.cert.holds_scope(scope)
-                && collections.iter().any(|c| c.read_by_scope(scope))
+                && collections
+                    .iter()
+                    .any(|c| c.read_by_scopes(std::slice::from_ref(scope)))
         });
         // A certificate that adds `lists.read`: the feed showed the deny list's changes
         // before it as stubs, so neither the copy of the lists nor the protocol follows

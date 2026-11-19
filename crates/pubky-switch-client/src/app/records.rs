@@ -2281,7 +2281,9 @@ impl App {
         self.state.cert.scopes().iter().any(|scope| {
             self.protocols.has_keys(scope)
                 && self.state.scope_keys.get(epoch, scope).is_none()
-                && collections.iter().any(|c| c.read_by_scope(scope))
+                && collections
+                    .iter()
+                    .any(|c| c.read_by_scopes(std::slice::from_ref(scope)))
         })
     }
 

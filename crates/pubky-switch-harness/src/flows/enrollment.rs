@@ -148,6 +148,8 @@ pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::
 
 #[cfg(test)]
 mod changed_creation;
+#[cfg(test)]
+mod first_answer;
 
 #[cfg(test)]
 mod tests {

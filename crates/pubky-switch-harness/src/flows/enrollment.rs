@@ -445,11 +445,11 @@ mod tests {
                 signer.identity_doc()?.ok_or("missing restored document")?
             }
             FirstAccount::WithBackup => {
-                signer.restore(UserConfirmed::shown_and_confirmed()).await?
+                Box::pin(signer.restore(UserConfirmed::shown_and_confirmed())).await?
             }
             FirstAccount::ServiceCopyOnly => {
                 let survey = signer.survey_key_recovery().await?;
-                signer.restore(confirm(&survey)).await?
+                Box::pin(signer.restore(confirm(&survey))).await?
             }
             FirstAccount::MarkOnly => {
                 assert!(matches!(

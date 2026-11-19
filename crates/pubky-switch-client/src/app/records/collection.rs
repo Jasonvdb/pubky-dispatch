@@ -169,6 +169,17 @@ impl std::fmt::Debug for RecordTarget {
 }
 
 impl RecordTarget {
+    pub(crate) fn key_with(
+        &self,
+        naming: &pubky_switch_core::ident::NamingKey,
+    ) -> Result<[u8; 32], AppError> {
+        Ok(naming.record_key(
+            &self.collection.name,
+            &self.natural_key,
+            &self.collection.policy.hash()?,
+        ))
+    }
+
     /// The record of `natural_key` in `collection`.
     pub fn new(collection: Collection, natural_key: &[u8]) -> Self {
         Self {

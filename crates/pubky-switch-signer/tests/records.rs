@@ -402,11 +402,12 @@ async fn test_records_renewal_operation_authentication_precedes_retry() {
 
 #[tokio::test]
 async fn test_records_erasure_requires_the_accepted_documents_account() {
-    let world = World::new();
-    let (signer, store) = world.enrolled().await;
-    drop(signer);
-    let original = snapshot(&world, &store);
     for missing in [true, false] {
+        let world = World::new();
+        let (signer, store) = world.enrolled().await;
+        let original_version = signer.high_water().unwrap().unwrap().version;
+        drop(signer);
+        let original = snapshot(&world, &store);
         let damaged = change(&original, b"state", |state| {
             assert!(state["service"].is_object());
             let account = &mut state["newest"]["account"];
@@ -429,11 +430,28 @@ async fn test_records_erasure_requires_the_accepted_documents_account() {
         };
         assert_eq!(
             error,
-            SignerError::Records(RecordsFault::Invariant(invariant))
+            SignerError::Records(RecordsFault::Damaged(invariant))
         );
         assert_eq!(snapshot(&world, &store), damaged);
         assert_eq!(world.transport.requests().len(), sent);
         assert!(world.homeserver.deletes.lock().unwrap().is_empty());
+        let restored = Signer::restore_over_unusable(
+            world.env(store.clone()),
+            world.keyring(),
+            discard_confirmed(),
+        )
+        .await
+        .unwrap();
+        let doc = restored.identity_doc().unwrap().unwrap();
+        assert_eq!(doc.version(), original_version + 1);
+        assert_eq!(world.backup().identity_doc().hash(), doc.hash());
+        drop(restored);
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        let next = signer.set_record_max_age(Some(60)).await.unwrap();
+        assert_eq!(next.version(), doc.version() + 1);
+        world.assert_no_version_sent_twice();
     }
 }
 
@@ -912,7 +930,13 @@ async fn test_records_confirmed_restore_preserves_an_intact_flow() {
     signer.set_record_max_age(Some(60)).await.unwrap_err();
     drop(signer);
     let original = snapshot(&world, &store);
-    for damaged in [damaged_certificate(&original), unreadable_state(&original)] {
+    for damaged in [
+        damaged_certificate(&original),
+        unreadable_state(&original),
+        change(&original, b"state", |state| {
+            state["newest"]["account"] = Value::Null
+        }),
+    ] {
         assert_confirmed_refusal(
             &world,
             &store,

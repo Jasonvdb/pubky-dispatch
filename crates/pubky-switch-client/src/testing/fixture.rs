@@ -345,6 +345,7 @@ impl TestSigner {
 #[derive(Debug, Default)]
 pub struct TestProtocol {
     observes_deletes: bool,
+    observes_records: bool,
     spec: ProtocolSpec,
     /// It keeps each message it receives in its local state.
     keeps: bool,
@@ -354,6 +355,12 @@ pub struct TestProtocol {
 }
 
 impl TestProtocol {
+    /// Keep each current, readable record value under its signed operation hash.
+    pub fn observing_records(mut self) -> Self {
+        self.observes_records = true;
+        self
+    }
+
     /// Retain each observed deletion's authenticated predecessor under its signed hash.
     pub fn observing_deletions(mut self) -> Self {
         self.observes_deletes = true;
@@ -463,6 +470,24 @@ impl Protocol for TestProtocol {
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         lock(&self.missed).push(missed.clone());
+        Ok(Vec::new())
+    }
+
+    fn observe_record(
+        &self,
+        observed: &crate::app::RecordObservation<'_>,
+        _: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        if self.observes_records
+            && observed.current
+            && !observed.record.divergent
+            && let Some(value) = observed.record.content.value()
+        {
+            return Ok(vec![LocalWrite::Put {
+                key: observed.application.item_hash.to_vec(),
+                value: value.to_vec(),
+            }]);
+        }
         Ok(Vec::new())
     }
 

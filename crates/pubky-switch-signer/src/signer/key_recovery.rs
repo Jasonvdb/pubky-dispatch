@@ -416,10 +416,33 @@ impl Signer {
         check_local_restore(&self.state, pending.is_some_and(Flow::blocks_restore))?;
         let marks = marks_of(&self.state)?;
         let first = self.flow.as_ref().and_then(Flow::first_account_origin);
+        let selected = self.first_key_selection()?;
+        let origin = selected
+            .as_ref()
+            .map(|observation| observation.body().origin.as_str());
         Ok(self
-            .key_plan(&self.state, &marks, None, first)
+            .key_plan(&self.state, &marks, origin, first, selected.as_ref())
             .await?
             .survey)
+    }
+
+    /// Until an in-place first restore holds a document, its selected existing enrollment
+    /// supplies the original account for a fresh survey (Switch account binding 3).
+    fn first_key_selection(&self) -> Result<Option<AccountObservation>> {
+        if self.state.before_first_version()
+            && let Some(Flow::KeyRecover {
+                origin,
+                enrollment: RecoveryEnrollment::Ready { observation, .. },
+                fresh: false,
+                ..
+            }) = &self.flow
+        {
+            return observation
+                .verify(&self.state.identity, origin)
+                .map(Some)
+                .map_err(SignerError::StoredData);
+        }
+        Ok(None)
     }
 
     /// Survey a recovery with the identity key alone for a store that holds no records for
@@ -496,7 +519,13 @@ impl Signer {
         let signer = Self::restore_target(env, keyring, store)?;
         let kept = kept.unwrap_or_else(|| signer.state.clone());
         Ok(signer
-            .key_plan(&kept, &marks, asked.or(origin.as_deref()), first.as_deref())
+            .key_plan(
+                &kept,
+                &marks,
+                asked.or(origin.as_deref()),
+                first.as_deref(),
+                None,
+            )
             .await?
             .survey)
     }
@@ -567,7 +596,7 @@ impl Signer {
             ),
         };
         let plan = self
-            .key_plan(&kept, &marks, confirmed.asked.as_deref(), None)
+            .key_plan(&kept, &marks, confirmed.asked.as_deref(), None, None)
             .await?;
         self.start_key_recovery(kept, &marks, held, plan, confirmed)
             .await
@@ -685,7 +714,11 @@ impl Signer {
                     .await);
             }
         };
-        let planned = self.key_plan(&self.state, marks, Some(origin), None).await;
+        let selected =
+            (held == Held::InPlace && self.state.before_first_version()).then_some(&observed);
+        let planned = self
+            .key_plan(&self.state, marks, Some(origin), None, selected)
+            .await;
         let built = match planned {
             Ok(plan) if plan.survey.digest == digest => {
                 self.recovered_records(origin, plan, &answer, dropped)
@@ -765,14 +798,18 @@ impl Signer {
 
     /// End a recovery with the key alone refused before its version was signed, with
     /// `refused`: records made for it on a store that held none are deleted, and this signer
-    /// reads as not set up from then on; in place, the flow ends and the records stay as they
-    /// were; over unusable records, nothing was written, and they stay as found.
+    /// reads as not set up from then on. In place the records stay as they were. Until this
+    /// install has its first version, it retains the selected enrollment for another survey.
+    /// Over unusable records, nothing was written.
     async fn end_key_recovery(&mut self, held: Held, refused: SignerError) -> SignerError {
         let ended = match held {
             Held::Fresh => self.delete_records().await.map(|()| {
                 self.flow = None;
                 self.unsure = true;
             }),
+            // Its first document was never committed. Keep the chosen account and existing
+            // enrollment through a refusal so the holder can survey that same account again.
+            Held::InPlace if self.state.before_first_version() => Ok(()),
             Held::InPlace => self.commit(self.state.clone(), None).await,
             Held::Unusable => Ok(()),
         };
@@ -789,12 +826,13 @@ impl Signer {
         marks: &[IdentityDoc],
         asked: Option<&str>,
         first_account_origin: Option<&str>,
+        selected: Option<&AccountObservation>,
     ) -> Result<KeyPlan> {
         if let Some(alarm) = gate::held_alarm(kept) {
             return Err(SignerError::Alarm(alarm.clone()));
         }
         let sources = self.read_published().await?;
-        self.key_plan_from(kept, marks, asked, first_account_origin, &sources, None)
+        self.key_plan_from(kept, marks, asked, first_account_origin, &sources, selected)
             .await
     }
 
@@ -849,8 +887,12 @@ impl Signer {
         };
         if let Some(original) = original {
             let old = original.body();
-            if body.store_id != old.store_id || old.erased_at.is_some() || body.erased_at.is_some()
-            {
+            let matches = match old.association {
+                AccountAssociation::Absent => old.erased_at.is_none(),
+                AccountAssociation::Account => old.created == body.created,
+                AccountAssociation::Mark => false,
+            };
+            if !matches || body.store_id != old.store_id || body.erased_at != old.erased_at {
                 return Err(Refusal::FirstEnrollmentUnavailable.into());
             }
         }

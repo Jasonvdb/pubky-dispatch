@@ -106,7 +106,7 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
     );
     assert_eq!(store.scan(&ns, b"", None, 64)?, selected);
     drop(first);
-    let mut first = Signer::open(env, world.keyring(&alice)?).await?;
+    let mut first = Signer::open(env.clone(), world.keyring(&alice)?).await?;
     if backup {
         Box::pin(first.resume()).await?;
     } else {
@@ -118,6 +118,9 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
             Box::pin(first.resume()).await,
             Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into())
         );
+        assert_eq!(store.scan(&ns, b"", None, 64)?, selected);
+        drop(first);
+        first = Signer::open(env, world.keyring(&alice)?).await?;
         let updated = first.survey_key_recovery().await?;
         assert_eq!(updated.version, predecessor.version());
         let accepted =

@@ -140,6 +140,25 @@ impl TestDatabase {
         if !SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
             sweep_stale(&admin).await;
         }
+        Self::create_on(admin, config, None)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Copy this test's stopped database and reopen its store with the given pool settings.
+    /// Both databases are independently owned and removed by their usual cleanup.
+    pub async fn snapshot(&mut self, config: &DatabaseConfig) -> Result<Self, StoreError> {
+        self.store.close().await;
+        let copy = Self::create_on(self.admin.clone(), config, Some(&self.name)).await;
+        self.store = Store::connect_with(self.store_options(), config).await?;
+        copy
+    }
+
+    async fn create_on(
+        admin: PgConnectOptions,
+        config: &DatabaseConfig,
+        template: Option<&str>,
+    ) -> Result<Self, StoreError> {
         let mut suffix = [0u8; 8];
         getrandom::fill(&mut suffix)
             .map_err(|_| StoreError::Corrupt("no randomness for a database name"))?;
@@ -150,7 +169,13 @@ impl TestDatabase {
         let mut conn = PgConnection::connect_with(&admin)
             .await
             .map_err(StoreError::Database)?;
-        conn.execute(format!("CREATE DATABASE {name}").as_str())
+        let mut create = format!("CREATE DATABASE {name}");
+        if let Some(template) = template {
+            // Both names were generated above for a test database.
+            create.push_str(" TEMPLATE ");
+            create.push_str(template);
+        }
+        conn.execute(create.as_str())
             .await
             .map_err(StoreError::Database)?;
         conn.close().await.map_err(StoreError::Database)?;

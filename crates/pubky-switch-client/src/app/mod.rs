@@ -227,12 +227,12 @@ pub struct AppConfig {
     /// - [`App::list_collection`] and [`App::list_collections`] ask for no further page
     ///   after their first, and [`App::peek`] reads no further page.
     ///
-    /// It bounds when those steps stop, not the call's whole time: each call's docs state
-    /// what it may still send after the budget ran out. A write ([`App::submit_batch`])
-    /// doesn't take it: its bound is the requests it sends. One message's try
-    /// ([`App::send`], [`App::resend`], [`App::flush_message`]) starts no retry of its
-    /// delivery once the budget has passed since the delivery began, and its record job is
-    /// an [`App::update_record`], with a budget of its own.
+    /// Each in-flight HTTP send has its own timeout. [`App::submit_batch`] bounds its
+    /// work by the calls it makes. One message's delivery round ([`App::send`],
+    /// [`App::resend`], [`App::flush_message`]) checks elapsed time before retrying a
+    /// stale key, delivering a needed identity or rereading after an unverified answer. A signed
+    /// timestamp correction can add an HTTP send within a call. The message's record
+    /// job uses the separate budget of [`App::update_record`].
     pub call_budget_ms: u64,
 }
 

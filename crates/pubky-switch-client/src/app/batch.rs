@@ -392,19 +392,19 @@ impl App {
     /// send), and is then dropped and reported; the write fails meanwhile with
     /// [`AppError::Ahead`], keeping nothing of its own.
     ///
-    /// So a write sends at most three requests to the switch: a read of the service time,
-    /// the kept batch and its own batch. The read is of a feed page with no items, and is
-    /// made only when a batch is kept to send again, or when the app holds no recent
-    /// service time of the current key, under a day old, to stamp its own batch with: most
-    /// writes send their batch alone. The read has the
-    /// short timeout (10 s by default), a batch that writes no shared record the short
-    /// timeout and a share of the long one in proportion to its body, and one that writes
-    /// a shared record the long one (40 s), since its refusal can carry the record's view
-    /// ([`crate::transport::HttpConfig`]): a write of small batches without a record ends
-    /// within about 30 s at the default timeouts, one of record writes within about 90 s. A
-    /// kept batch signed for a generation before a move and answered `409 stale_generation`
-    /// is signed again and sent once more, a fourth request; a `409 stale_epoch` of the own
-    /// batch adds the newer `identity.json`, the key bundle and one more send.
+    /// A write can read the service time, resubmit one kept batch and submit its own
+    /// batch. The time read is an empty feed page with the ordinary timeout. It is
+    /// needed for a kept batch or when the app lacks a service time from the current
+    /// key less than a day old. Most writes just submit their own batch.
+    ///
+    /// A batch that can return claim proofs, a signed record, a shared record view or
+    /// a claim view uses the bulk timeout, including on resubmission. An unconditional
+    /// list update uses the ordinary timeout, which scales with its outgoing body.
+    /// Each HTTP send has its own deadline ([`crate::transport::HttpConfig`]). A
+    /// verified `401 stale_timestamp` can repeat a call once with the corrected time.
+    /// A kept batch from before a move can be signed again after `409 stale_generation`.
+    /// A `409 stale_epoch` of the app's own batch adds the newer `identity.json`, the
+    /// key bundle and another submission.
     ///
     /// # Errors
     ///

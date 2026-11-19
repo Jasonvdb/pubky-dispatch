@@ -57,6 +57,7 @@ mod push;
 mod put_back;
 mod recovery;
 mod renewal;
+mod retirement;
 mod rotation;
 mod state;
 mod unverified;

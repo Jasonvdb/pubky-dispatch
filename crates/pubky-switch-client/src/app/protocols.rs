@@ -171,6 +171,13 @@ impl ProtocolSet {
         self.protocols.iter()
     }
 
+    pub(super) fn without(&self, name: &str) -> Result<Self, AppError> {
+        let mut remaining = self.clone();
+        remaining.protocols.retain(|r| r.name != name);
+        remaining.validate()?;
+        Ok(remaining)
+    }
+
     /// The protocol owning `kind`'s prefix.
     pub(crate) fn of_kind(&self, kind: &str) -> Option<&Registered> {
         let root = kind_root(kind);

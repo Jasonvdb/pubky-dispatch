@@ -75,6 +75,11 @@ pub(crate) mod keys {
     /// The identity document at the opening of the latest loss.
     pub(super) const OPENING: &str = "loss/opening";
 
+    /// The local key a protocol registered for future loss inventories.
+    pub(crate) fn checkpoint(protocol: &str) -> String {
+        format!("loss-checkpoint/{protocol}")
+    }
+
     /// A kept operation, by its document hash.
     pub(crate) fn op(hash: &[u8; 32]) -> String {
         format!("ev/op/{}", b64(hash))

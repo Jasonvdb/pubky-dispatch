@@ -48,6 +48,7 @@
 //! it builds on the highest copy the key signed that any source shows, and starts the next
 //! generation there (Switch spec 12.6, 12.8).
 
+mod cancellation;
 mod first_enrollment;
 pub use first_enrollment::FirstEnrollmentRestore;
 
@@ -69,7 +70,9 @@ use super::{CAP_HEADROOM, Room, Signer, SignerEnv, enrollment_limit, gate};
 use crate::alert::Alert;
 use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
-use crate::state::{self, DeliverStep, Flow, Newest, RecoveryEnrollment, Service, SignerState};
+use crate::state::{
+    self, DeliverStep, Flow, KeyEnrollmentStep, Newest, RecoveryEnrollment, Service, SignerState,
+};
 
 /// What a recovery with the identity key alone would do, read before the user confirms it
 /// (Switch spec 12.8). Reading it writes nothing.
@@ -560,6 +563,7 @@ impl Signer {
             origin,
             enrollment,
             fresh,
+            step,
             ..
         }) = self.flow.clone()
         else {
@@ -568,6 +572,7 @@ impl Signer {
         let flow = Flow::KeyRecover {
             origin,
             enrollment,
+            step,
             digest: confirmed.digest,
             dropped: confirmed.dropped,
             fresh,
@@ -649,6 +654,7 @@ impl Signer {
             let flow = Flow::KeyRecover {
                 origin,
                 enrollment,
+                step: KeyEnrollmentStep::Unsent,
                 digest: confirmed.digest,
                 dropped: confirmed.dropped,
                 fresh: held == Held::Fresh,
@@ -683,36 +689,37 @@ impl Signer {
         held: Held,
         marks: &[IdentityDoc],
     ) -> Result<()> {
-        let identity = self.state.identity;
-        let RecoveryEnrollment::Ready {
-            observation,
-            enrollment,
-        } = enrollment
-        else {
-            return Err(RecordsFault::Invariant("a key recovery without its enrollment").into());
-        };
-        let observed = observation
-            .verify(&identity, origin)
-            .map_err(SignerError::StoredData)?;
-        let signed =
-            Enrollment::verify(enrollment, &identity, origin).map_err(SignerError::StoredData)?;
-        let target = Target {
-            origin,
-            pinned: Some(observed.body().service_key),
-            created: signed.body().intent.created(),
-            identity,
-        };
-        let sent = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
-            .enroll(&signed)
-            .await;
-        let answer = match sent {
+        let (observed, signed) = enrollment.existing(&self.state.identity, origin)?;
+        let answer = match self.key_enrollment_answer(&observed, &signed, held).await {
             Ok(answer) => answer,
-            Err(error @ ClientError::Transport(_)) => return Err(error.into()),
-            Err(_) => {
-                return Err(self
-                    .end_key_recovery(held, stop(KeyRecoveryStop::NotServing))
-                    .await);
+            Err(SignerError::Switch(error))
+                if held == Held::Unusable && !matches!(error, ClientError::Transport(_)) =>
+            {
+                return Err(stop(KeyRecoveryStop::NotServing));
             }
+            Err(SignerError::Switch(error)) if error.is_not_hosted() => {
+                let target = Target {
+                    origin,
+                    pinned: Some(observed.body().service_key),
+                    created: None,
+                    identity: self.state.identity,
+                };
+                let current = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
+                    .observe_account()
+                    .await?;
+                // A zero mark can also answer not hosted. Only a later completed erasure
+                // of the selected lifetime ends its pending retry (Switch account binding 2–3).
+                let ended = current.body().store_id == observed.body().store_id
+                    && current.body().erased_at > observed.body().erased_at
+                    && current.body().erased_at >= observed.body().created;
+                let refused = stop(KeyRecoveryStop::NotServing);
+                return Err(if ended {
+                    self.end_key_recovery(held, refused).await
+                } else {
+                    refused
+                });
+            }
+            Err(error) => return Err(error),
         };
         let selected =
             (held == Held::InPlace && self.state.before_first_version()).then_some(&observed);
@@ -802,17 +809,11 @@ impl Signer {
     /// install has its first version, it retains the selected enrollment for another survey.
     /// Over unusable records, nothing was written.
     async fn end_key_recovery(&mut self, held: Held, refused: SignerError) -> SignerError {
-        let ended = match held {
-            Held::Fresh => self.delete_records().await.map(|()| {
-                self.flow = None;
-                self.unsure = true;
-            }),
-            // Its first document was never committed. Keep the chosen account and existing
-            // enrollment through a refusal so the holder can survey that same account again.
-            Held::InPlace if self.state.before_first_version() => Ok(()),
-            Held::InPlace => self.commit(self.state.clone(), None).await,
-            Held::Unusable => Ok(()),
-        };
+        // Until the first version, retain the original selection for another survey.
+        if held == Held::InPlace && self.state.before_first_version() {
+            return refused;
+        }
+        let ended = self.clear_key_recovery(held).await;
         ended.err().unwrap_or(refused)
     }
 

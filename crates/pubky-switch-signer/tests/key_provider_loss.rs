@@ -287,6 +287,71 @@ async fn test_key_provider_loss_receiving_install_mid_take_over_at_a_dead_servic
 }
 
 #[tokio::test]
+async fn test_receiving_install_resumes_with_its_sealed_key_when_the_service_returns() {
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (app, cert) = joined(&world, &mut old, 42).await;
+    old.hand_over_to(app.keys.app_id_bytes(), confirmed())
+        .await
+        .unwrap();
+    drop(old);
+    let target = ReceivingApp {
+        keys: app.keys.clone(),
+        cert,
+        origin: SWITCH_ORIGIN.to_owned(),
+        service_key: world.switch.service_key(),
+    };
+    let store = Arc::new(MemoryStore::new());
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    let empty = Arc::new(Vault(Mutex::new(None)));
+    Signer::receive_hand_over(world.env(store.clone()), &target, empty.clone())
+        .await
+        .unwrap_err();
+    let (_, router) = picked_service(&world);
+    let identity = target.cert.identity();
+    let remaining = || {
+        store
+            .scan(&signer_namespace(&identity), b"", None, 10)
+            .unwrap()
+    };
+    let before = remaining();
+    assert!(!before.is_empty());
+    let error = Signer::resume_take_over(
+        env_on(&world, &store, &router),
+        identity,
+        &target.keys,
+        empty.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
+    assert_eq!(before, remaining());
+    assert!(matches!(
+        pubky_switch_signer::IdentityKeyring::open(empty.clone()),
+        Err(pubky_switch_signer::KeyError::Missing)
+    ));
+
+    let mut signer =
+        Signer::resume_take_over(world.env(store), identity, &target.keys, empty.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        pubky_switch_signer::IdentityKeyring::open(empty)
+            .unwrap()
+            .public_key(),
+        identity
+    );
+    let later = signer.set_record_max_age(Some(3_600)).await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        later.signed()
+    );
+}
+
+#[tokio::test]
 async fn test_key_provider_loss_service_behind_the_homeserver() {
     // The service was rolled back below the version the Homeserver publishes: the recovery at
     // the service is refused, and the provider loss builds on the Homeserver's copy, so the

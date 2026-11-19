@@ -4850,7 +4850,18 @@ impl App {
                 .map(|()| false),
             OpKind::AppPut { record } => {
                 self.feed_app_record(record, tx)?;
-                Box::pin(self.take_own_later(record, tx)).await
+                if record == &self.state.record {
+                    // The verified feed can establish delivery lost before a backup.
+                    // A matching Homeserver copy alone does not establish acceptance.
+                    if self.record_is_newer_than_accepted()? {
+                        self.note_accepted(record, tx)?;
+                        self.took_accepted(record.clone());
+                        self.published_check = None;
+                    }
+                    Ok(false)
+                } else {
+                    Box::pin(self.take_own_later(record, tx)).await
+                }
             }
             _ => self.feed_list_change(item, tx).map(|()| false),
         }

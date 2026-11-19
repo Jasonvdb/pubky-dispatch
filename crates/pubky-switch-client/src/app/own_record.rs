@@ -104,6 +104,10 @@ pub enum Publication {
     NothingAccepted,
     /// The Homeserver holds the newest record the switch accepted: nothing is owed.
     Published,
+    /// A newer local record choice is unresolved. An unsigned owner change must be
+    /// signed and delivered, or the held newer record accepted or verifiably superseded,
+    /// before repairing the older accepted copy. Reads can still complete.
+    AwaitingRecord,
     /// The Homeserver holds a record of the app with a later `updated_at` than the newest
     /// the switch accepted, as after a restore from an older backup: nothing is written over
     /// it (Switch spec 4.2).
@@ -498,7 +502,8 @@ impl App {
 
     /// Send what is owed of the app's record: its delivery, then its Homeserver write. The
     /// Homeserver copy is read and, when it differs from the newest record the switch
-    /// accepted, that record is written again, unless the copy is later. A read
+    /// accepted, that record is written again, unless the copy is later or a newer local
+    /// record choice is unresolved ([`Publication::AwaitingRecord`]). A read
     /// ([`App::receive`]) does the same, reading the copy at most once per
     /// [`PUBLISHED_CHECK_MS`] while nothing is owed.
     ///
@@ -700,7 +705,9 @@ impl App {
     /// copy differs from it (Switch spec 4.2, wire 3.2 "Deliver, then publish"). The copy
     /// is read first: one that is the record already settles what is owed, and one with a
     /// later `updated_at`, as after a restore from an older backup, is never written over
-    /// ([`Publication::Superseded`]). With nothing owed the copy is read at most once per
+    /// ([`Publication::Superseded`]). A newer unresolved local choice defers the older
+    /// accepted copy ([`Publication::AwaitingRecord`]), without failing the read that can
+    /// settle that choice. With nothing owed the copy is read at most once per
     /// [`PUBLISHED_CHECK_MS`], unless `check`. Nothing is published once the app has begun
     /// to leave, from the commit before it deletes its Homeserver record (Switch spec
     /// 12.3): every call that leads here refuses a leaving app first.
@@ -724,6 +731,7 @@ impl App {
         let Some(record) = self.state.accepted.clone() else {
             return Ok(Publication::NothingAccepted);
         };
+        let awaiting_record = self.publication_waits_for_record().await?;
         let owed = self.state.pending_publish.is_some();
         let now = self.now();
         let checked_lately = self
@@ -735,7 +743,7 @@ impl App {
                         .checked_sub(*at)
                         .is_some_and(|age| age < PUBLISHED_CHECK_MS)
             });
-        if !owed && !check && checked_lately {
+        if !awaiting_record && !owed && !check && checked_lately {
             return Ok(Publication::Published);
         }
         self.published_check = None;
@@ -750,7 +758,6 @@ impl App {
             Err(error) => return Ok(Publication::Unchecked { error }),
         };
         let outcome = match copy {
-            Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => {
                 if let Ok(copy) = serde_json::from_slice::<SignedDoc>(&held) {
                     let mut tx = self.tx()?;
@@ -758,8 +765,13 @@ impl App {
                         self.commit(tx).await?;
                     }
                 }
+                if self.publication_waits_for_record().await? {
+                    return Ok(Publication::AwaitingRecord);
+                }
                 Publication::Superseded
             }
+            _ if awaiting_record => return Ok(Publication::AwaitingRecord),
+            Some(held) if held == bytes => Publication::Published,
             None if self.state.device.multi_device && !current => {
                 self.owe_publication(&record).await?;
                 return Ok(Publication::AwaitingRead);
@@ -788,6 +800,29 @@ impl App {
         Ok(outcome)
     }
 
+    /// Current unsigned owner edits and strictly newer signed intent take precedence over
+    /// repairing an older accepted copy (Switch spec 4.2). Equal or older signed bytes
+    /// do not keep repair waiting after the current choice has been superseded.
+    async fn publication_waits_for_record(&self) -> Result<bool, AppError> {
+        if !self.record_members().await?.is_empty() {
+            return Ok(true);
+        }
+        self.record_is_newer_than_accepted()
+    }
+
+    /// Signed ordering, shared by publication and an exact held record seen in the feed.
+    pub(super) fn record_is_newer_than_accepted(&self) -> Result<bool, AppError> {
+        let identity = self.state.meta.identity;
+        let held = AppRecord::verify(&self.state.record, &identity)?;
+        let accepted = self
+            .state
+            .accepted
+            .as_ref()
+            .map(|accepted| AppRecord::verify(accepted, &identity))
+            .transpose()?;
+        Ok(accepted.is_none_or(|accepted| held.updated_at() > accepted.updated_at()))
+    }
+
     /// Owe the publication of `record`, the newest accepted, from a check that found the
     /// Homeserver copy missing or different (`pending/publish`).
     async fn owe_publication(&mut self, record: &SignedDoc) -> Result<(), AppError> {
@@ -810,7 +845,8 @@ impl App {
     }
 
     /// Whether the Homeserver copy `held` is a record of this app with an `updated_at`
-    /// later than `record`'s. A copy that doesn't read as one is written over.
+    /// later than `record`'s. A copy ahead of the reader's clock does not participate in
+    /// comparison or adoption (Switch spec 4.2, wire 3.2).
     fn later_copy(&self, held: &[u8], record: &SignedDoc) -> bool {
         let identity = self.state.meta.identity;
         let Ok(held) = serde_json::from_slice::<SignedDoc>(held) else {
@@ -822,7 +858,9 @@ impl App {
         ) else {
             return false;
         };
-        held.cert().app_id() == self.state.meta.app_id && held.updated_at() > record.updated_at()
+        held.cert().app_id() == self.state.meta.app_id
+            && !held.is_ahead(self.now())
+            && held.updated_at() > record.updated_at()
     }
 
     /// The first step of a publishing app's leave (Switch spec 12.3): delete its Homeserver

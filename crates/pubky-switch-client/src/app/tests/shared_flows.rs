@@ -2387,6 +2387,155 @@ async fn test_records_followed_proof_upgrades_and_survives_a_proofless_read() {
 }
 
 #[tokio::test]
+async fn test_current_collection_uses_completed_pages_and_subsequent_writes() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("item-{n}");
+        writer
+            .put_record(&s.target(&name), &value(&[&name]), vec![])
+            .await
+            .unwrap();
+    }
+    let page_bytes = s.w.switch.lock().max_page_bytes;
+    s.w.switch.lock().max_page_bytes = 1;
+    let mut reader = s.join("phone").await;
+    let partial = reader.receive(None).await.unwrap();
+    assert!(
+        reader
+            .current_collection(&items(), &partial)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    s.w.switch.lock().max_page_bytes = page_bytes;
+    let report = reader.receive(None).await.unwrap();
+    let listed = s.w.switch.lock().shared.listings;
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.identity, reader.identity());
+    assert_eq!(current.live.len(), 6);
+    assert!(current.uncertain_keys.is_empty());
+    assert!(
+        writer
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let local = s.target("new-local");
+    reader
+        .put_record(&local, &value(&["placed"]), vec![])
+        .await
+        .unwrap();
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 7);
+    assert!(current.uncertain_keys.is_empty());
+    reader.delete_record(&local, vec![]).await.unwrap();
+    assert_eq!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .unwrap()
+            .live
+            .len(),
+        6
+    );
+    assert_eq!(s.w.switch.lock().shared.listings, listed);
+
+    writer
+        .delete_record(&s.target("item-3"), vec![])
+        .await
+        .unwrap();
+    let later = reader.receive(None).await.unwrap();
+    assert!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = reader
+        .current_collection(&items(), &later)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 5);
+    assert!(current.uncertain_keys.is_empty());
+}
+
+#[tokio::test]
+async fn test_current_collection_keeps_an_unaccepted_member_and_excludes_a_listed_absence() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let accepted = s.target("accepted");
+    let paused = s.target("paused");
+    for (target, item) in [(&accepted, "a"), (&paused, "b")] {
+        writer
+            .put_record(target, &value(&[item]), vec![])
+            .await
+            .unwrap();
+    }
+    *s.protocol.forbidden.lock().unwrap() = Some("b".into());
+    let mut reader = s.join("phone").await;
+    let report = reader.receive(None).await.unwrap();
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = reader.record_key(&accepted).unwrap();
+    assert_eq!(
+        current.live.iter().map(|r| r.key).collect::<Vec<_>>(),
+        [key]
+    );
+    assert_eq!(
+        current.uncertain_keys,
+        [reader.record_key(&paused).unwrap()]
+    );
+
+    writer.delete_record(&accepted, vec![]).await.unwrap();
+    assert!(!reader.list_collections().await.unwrap());
+    assert_eq!(
+        ids(reader
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["a"]
+    );
+    assert!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let latest = reader.receive(None).await.unwrap();
+    let current = reader
+        .current_collection(&items(), &latest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.live.is_empty());
+    assert_eq!(
+        current.uncertain_keys,
+        [reader.record_key(&paused).unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn test_records_listed_at_join_and_other_collections_left_alone() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;

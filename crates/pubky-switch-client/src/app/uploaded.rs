@@ -93,6 +93,29 @@ struct RecordReread {
 }
 
 impl App {
+    /// An upload's mark on a key whose collection is unknown can belong to any
+    /// readable collection until its current view arrives.
+    pub(super) async fn collection_reread_pending(
+        &self,
+        collection: &super::Collection,
+    ) -> Result<bool, AppError> {
+        for (key, _) in self
+            .reader()
+            .scan::<RecordReread>(RECORD_REREAD_PREFIX)
+            .await?
+        {
+            let key = unb64_array::<32>(&key).map_err(|_| AppError::Store(StoreError::Corrupt))?;
+            if self
+                .held_collection(&key)
+                .await?
+                .is_none_or(|held| held.name == collection.name)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) async fn record_upload(
         &self,
         key: &[u8; 32],

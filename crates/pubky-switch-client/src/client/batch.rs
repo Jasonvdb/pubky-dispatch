@@ -94,16 +94,18 @@ impl Batch {
         self.cursor
     }
 
-    /// How long the batch's call may take: a batch that writes a shared record may be
-    /// answered `409 conflict` with the record's view, up to about a mebibyte (Switch wire
-    /// 7.6, 7.1 "Answer sizes"), on its first send and on every resend of the same bytes;
-    /// any other batch's answer is small.
+    /// A conflict can return a held app record or a full shared record view, even for a
+    /// small write. An exact current-record condition can return the same view on any
+    /// operation (Switch wire 6.3, 7.6).
     pub(crate) fn timeout(&self) -> TimeoutClass {
-        let writes_a_record = self
-            .ops
-            .iter()
-            .any(|op| matches!(op.body().kind, OpKind::RecordPut(_)));
-        if writes_a_record {
+        if self.ops.iter().any(|op| {
+            let body = op.body();
+            matches!(body.kind, OpKind::RecordPut(_) | OpKind::AppPut { .. })
+                || body
+                    .conditions
+                    .iter()
+                    .any(|c| matches!(c, Condition::RecordCurrent { .. }))
+        }) {
             TimeoutClass::Bulk
         } else {
             TimeoutClass::Ordinary
@@ -238,8 +240,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     first_send: first,
-                    timeout: batch.timeout(),
-                    ..Auth::default()
+                    ..Auth::new(batch.timeout())
                 },
             )
             .await?;

@@ -23,7 +23,7 @@ async fn test_http_response_unreadable_protected_headers_fail() {
             path_and_query: "/v1/x/connect".into(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: TimeoutClass::default(),
+            timeout: TimeoutClass::Ordinary,
         };
         let sent = SentRequest::of(&request);
         let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);

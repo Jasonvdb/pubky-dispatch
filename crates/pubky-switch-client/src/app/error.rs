@@ -582,7 +582,7 @@ mod tests {
             path_and_query: path.into(),
             headers: vec![Header::new(header::SIGNATURE, "c2ln")],
             body: b"{}".to_vec(),
-            timeout: Default::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         let body = serde_json::json!({ "code": code.as_str(), "message": "m" })
             .to_string()

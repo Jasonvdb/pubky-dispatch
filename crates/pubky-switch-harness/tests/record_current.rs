@@ -1,14 +1,16 @@
-//! Exact current-record conditions through signed requests (Switch wire 6.1 and 6.5).
+//! Shared and app record writes and conflicts through signed requests (Switch wire 6.1 and 7.6).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use pubky_switch_client::TransportError;
 use pubky_switch_client::app::{App, AppConfig};
-use pubky_switch_client::client::{CheckedResponse, Credentials, SwitchClient};
+use pubky_switch_client::client::{Batch, CheckedResponse, Credentials, SwitchClient};
 use pubky_switch_client::error::ClientError;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_client::transport::{BoxFuture, Request, Response, TimeoutClass, Transport};
 use pubky_switch_core::chain::{TransitionProof, bind_answer};
 use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
@@ -16,6 +18,7 @@ use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{
     Condition, IdInputs, OpKind, OpsRequest, RecordPut, RecordVersion, SignedOp, sign_batch,
 };
+use pubky_switch_core::records::{AppRecord, AppRecordBody};
 use pubky_switch_core::sealed::SealedValue;
 use pubky_switch_core::shared::ApplicationRef;
 use pubky_switch_core::sig::SignedDoc;
@@ -136,7 +139,13 @@ impl Writer {
         let path = format!("/v1/{}/ops", pubky_id(&self.who.public()));
         let request = self
             .client
-            .sign_request("POST", &path, OpsRequest::new(ops, None).to_json(), None)
+            .sign_request(
+                "POST",
+                &path,
+                OpsRequest::new(ops, None).to_json(),
+                None,
+                TimeoutClass::Bulk,
+            )
             .unwrap();
         self.client.send(request).await
     }
@@ -146,7 +155,7 @@ impl Writer {
         self.client
             .send(
                 self.client
-                    .sign_request("GET", &path, Vec::new(), None)
+                    .sign_request("GET", &path, Vec::new(), None, TimeoutClass::Bulk)
                     .unwrap(),
             )
             .await
@@ -383,6 +392,7 @@ async fn upload(world: &World) {
                 &path,
                 serde_json::to_vec(&json!({"lost_identity": lost, "records": [record]})).unwrap(),
                 None,
+                TimeoutClass::Bulk,
             )
             .unwrap()
     };
@@ -461,6 +471,90 @@ async fn upload(world: &World) {
     assert_ne!(current(&own).item_hash, current(&made_exact).item_hash);
 }
 
+/// Capture what reaches the transport while the selected switch handles and signs the answer.
+struct BatchTransport {
+    inner: Arc<dyn Transport>,
+    sent: Mutex<Vec<(TimeoutClass, Vec<u8>)>>,
+}
+
+impl Transport for BatchTransport {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((request.timeout, request.body.clone()));
+        self.inner.send(request)
+    }
+}
+
+async fn app_record_timeouts(world: &World) {
+    let w = Box::pin(writer(world)).await;
+    let transport = Arc::new(BatchTransport {
+        inner: world.transport(),
+        sent: Mutex::default(),
+    });
+    let client = SwitchClient::new(
+        ORIGIN,
+        w.who.public(),
+        Credentials::App {
+            identity: w.who.public(),
+            keys: w.keys.clone(),
+            cert: w.app.cert().clone(),
+        },
+        Some(w.service_key),
+        transport.clone(),
+        world.clock().clone(),
+    )
+    .unwrap();
+    let record =
+        |time| AppRecord::sign(&w.keys, AppRecordBody::new(w.app.cert(), vec![], time)).unwrap();
+    let put = |record: &AppRecord| {
+        (
+            vec![],
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+    };
+    let stale = record(world.now_ms());
+    world.advance_ms(1000);
+    let held = record(world.now_ms());
+    let publish = client
+        .sign_batch(w.generation, vec![put(&held)], None)
+        .unwrap();
+    client.submit(&publish).await.unwrap();
+
+    let list = (vec![], OpKind::DenyPut { pubky: [7; 32] });
+    let small = client
+        .sign_batch(w.generation, vec![list.clone()], None)
+        .unwrap();
+    client.submit(&small).await.unwrap();
+    let mut expected = vec![
+        (TimeoutClass::Bulk, publish.body().to_vec()),
+        (TimeoutClass::Ordinary, small.body().to_vec()),
+    ];
+    for entries in [vec![put(&stale)], vec![list, put(&stale)]] {
+        let batch = client.sign_batch(w.generation, entries, None).unwrap();
+        let saved = batch.body().to_vec();
+        let retry = Batch::from_body(saved.clone()).unwrap();
+        for send in [&batch, &retry] {
+            let error = client.submit(send).await.unwrap_err();
+            let ClientError::Switch {
+                status: 409,
+                code: pubky_switch_core::http::ErrorCode::Conflict,
+                current,
+                ..
+            } = error
+            else {
+                panic!("expected a signed app-record conflict, got {error:?}");
+            };
+            assert_eq!(current, json!({"record": held.signed()}));
+            expected.push((TimeoutClass::Bulk, saved.clone()));
+        }
+    }
+    assert_eq!(*transport.sent.lock().unwrap(), expected);
+}
+
 macro_rules! backend_test {
     ($name:ident, $backend:expr, $flow:ident) => {
         #[tokio::test]
@@ -521,4 +615,15 @@ backend_test!(
     test_record_current_upload_scripted,
     Backend::Scripted,
     upload
+);
+
+backend_test!(
+    test_app_record_conflict_timeout_service,
+    Backend::Service,
+    app_record_timeouts
+);
+backend_test!(
+    test_app_record_conflict_timeout_scripted,
+    Backend::Scripted,
+    app_record_timeouts
 );

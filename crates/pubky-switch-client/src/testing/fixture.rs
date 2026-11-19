@@ -346,6 +346,7 @@ impl TestSigner {
 pub struct TestProtocol {
     observes_deletes: bool,
     observes_records: bool,
+    waits_for_record: bool,
     spec: ProtocolSpec,
     /// It keeps each message it receives in its local state.
     keeps: bool,
@@ -364,6 +365,12 @@ impl TestProtocol {
     /// Retain each observed deletion's authenticated predecessor under its signed hash.
     pub fn observing_deletions(mut self) -> Self {
         self.observes_deletes = true;
+        self
+    }
+
+    /// Wait for a complete list after a deletion, preserving the notes a later writer added.
+    pub fn waiting_for_records(mut self) -> Self {
+        self.waits_for_record = true;
         self
     }
 
@@ -491,11 +498,86 @@ impl Protocol for TestProtocol {
         Ok(Vec::new())
     }
 
+    fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
+        value
+            .or(seen)
+            .filter(|_| self.waits_for_record)
+            .map(<[u8]>::to_vec)
+    }
+
+    fn record_regression(
+        &self,
+        _: &str,
+        seen: Option<&[u8]>,
+        value: Option<&[u8]>,
+        base: crate::app::WriteBase,
+    ) -> Option<String> {
+        let current = serde_json::from_slice::<serde_json::Value>(value?).ok()?;
+        let previous = serde_json::from_slice::<serde_json::Value>(seen?).ok()?;
+        if !self.waits_for_record || previous["hold"] != true || current["hold"] == true {
+            return None;
+        }
+        let proved = base.repair.is_some_and(|repair| {
+            preserves_list(&current, &repair.prior_value)
+                && preserves_list(&current, &repair.held_value)
+        });
+        (!proved).then(|| "list restriction removed without both records".into())
+    }
+
+    fn record_put_back_successor(
+        &self,
+        deletion: &crate::app::RecordDeletion<'_>,
+        successor: &crate::app::RecordSuccessor<'_>,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<crate::app::PutBackSuccessor, crate::app::StoreFailure> {
+        let complete = serde_json::from_slice::<serde_json::Value>(successor.value)
+            .ok()
+            .is_some_and(|current| {
+                let bound = current["list"].as_str().is_some_and(|name| {
+                    let collection = Collection::new(deletion.collection, successor.policy.clone());
+                    let target = crate::app::RecordTarget::new(collection, name.as_bytes());
+                    cx.record_key(&target).is_ok_and(|key| key == *deletion.key)
+                });
+                let approved = current["approval"] != true
+                    || cx
+                        .local_get(&deletion.item_hash)
+                        .is_ok_and(|saved| saved.as_deref() == Some(b"approved".as_slice()));
+                bound
+                    && approved
+                    && current["hold"] != true
+                    && successor
+                        .repair
+                        .is_some_and(|repair| preserves_list(&current, &repair.held_value))
+                    && deletion
+                        .exact_value
+                        .is_some_and(|source| preserves_list(&current, source))
+            });
+        Ok(
+            if self.waits_for_record && deletion.original_in_current_generation && complete {
+                crate::app::PutBackSuccessor::Covered
+            } else {
+                crate::app::PutBackSuccessor::Wait
+            },
+        )
+    }
+
     fn record_put_back(
         &self,
         deletion: &crate::app::RecordDeletion<'_>,
         _: &crate::app::ReceiveContext<'_>,
     ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
+        if self.waits_for_record
+            && deletion.original_in_current_generation
+            && deletion.exact_version_authenticated
+            && let Some(value) = deletion.exact_value
+        {
+            return Ok(Some(crate::app::PutBack::Prepare {
+                observed: vec![LocalWrite::Put {
+                    key: deletion.item_hash.to_vec(),
+                    value: value.to_vec(),
+                }],
+            }));
+        }
         Ok(deletion
             .exact_value
             .filter(|_| self.observes_deletes)
@@ -510,4 +592,17 @@ impl Protocol for TestProtocol {
     fn collections(&self) -> Vec<Collection> {
         self.spec.collections.clone()
     }
+}
+
+fn preserves_list(current: &serde_json::Value, bytes: &[u8]) -> bool {
+    let Ok(source) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    current["list"] == source["list"]
+        && current["items"] == source["items"]
+        && source["notes"].as_object().is_some_and(|notes| {
+            notes
+                .iter()
+                .all(|(k, v)| current["notes"].get(k) == Some(v))
+        })
 }

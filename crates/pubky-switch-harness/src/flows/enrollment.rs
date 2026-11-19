@@ -253,6 +253,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_first_setup_with_an_existing_account_scripted() {
+        check_existing_first_account(Backend::Scripted).await;
+    }
+
+    #[tokio::test]
+    async fn test_first_setup_with_an_existing_account_service() {
+        check_existing_first_account(Backend::Service).await;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FirstAccount {
+        WithBackup,
+        ServiceCopyOnly,
+        MarkOnly,
+    }
+
+    async fn check_existing_first_account(backend: Backend) {
+        for account in [
+            FirstAccount::WithBackup,
+            FirstAccount::ServiceCopyOnly,
+            FirstAccount::MarkOnly,
+        ] {
+            let result = Box::pin(crate::run_here(backend, async |world: &World| {
+                Box::pin(existing_first_account(world, account)).await
+            }))
+            .await;
+            assert!(matches!(result, Ok(Some(_))), "{account:?}: {result:?}");
+        }
+    }
+
+    async fn existing_first_account(world: &World, account: FirstAccount) -> FlowResult {
+        use pubky_switch_client::ClientError;
+        use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+        use pubky_switch_signer::{
+            KeyRecoveryConfirmed, KeyRecoveryStop, Refusal, SignerError, SignerStatus,
+            UserConfirmed,
+        };
+
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut original = enroll(world, &alice, ORIGIN).await?;
+        let previous = original.set_record_max_age(Some(3600)).await?;
+        drop(original);
+        if account != FirstAccount::WithBackup {
+            world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
+            world.files().remove(alice.public(), IDENTITY_PATH);
+        }
+        if account == FirstAccount::MarkOnly {
+            world.lose_account(ORIGIN, &alice).await?;
+        }
+
+        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        let mut signer = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;
+        let install = signer.install_id();
+        let original_enrollments = world.enrollments_sent();
+        world.lose_answer("GET", "/account");
+        assert!(matches!(
+            signer.resume().await,
+            Err(SignerError::Switch(ClientError::Transport(_)))
+        ));
+        assert_eq!(signer.status(), SignerStatus::Enrolling);
+        drop(signer);
+        let mut signer = Signer::open(env.clone(), world.keyring(&alice)?).await?;
+        assert_eq!(
+            signer.resume().await,
+            Err(Refusal::FirstAccountPresent.into())
+        );
+        assert_eq!(signer.status(), SignerStatus::FirstAccountPresent);
+        assert!(signer.identity_doc()?.is_none());
+        assert_eq!(world.enrollments_sent(), original_enrollments);
+        let requests = world.requests_sent();
+        drop(signer);
+        let mut signer = Signer::open(env, world.keyring(&alice)?).await?;
+        assert_eq!(signer.first_enrollment_origin()?, Some(ORIGIN));
+        assert_eq!(
+            signer.resume().await,
+            Err(Refusal::FirstAccountPresent.into())
+        );
+        assert_eq!(world.requests_sent(), requests);
+
+        let restored = match account {
+            FirstAccount::WithBackup => {
+                signer.restore(UserConfirmed::shown_and_confirmed()).await?
+            }
+            FirstAccount::ServiceCopyOnly => {
+                let survey = signer.survey_key_recovery().await?;
+                assert!(survey.origin_supplied);
+                assert_eq!(survey.origin, ORIGIN);
+                assert_eq!(survey.version, previous.version());
+                signer
+                    .restore(KeyRecoveryConfirmed::shown_and_confirmed(&survey, &[]))
+                    .await?
+            }
+            FirstAccount::MarkOnly => {
+                assert!(matches!(
+                    signer.survey_key_recovery().await,
+                    Err(SignerError::Refused(Refusal::KeyRecovery(
+                        KeyRecoveryStop::NotServing
+                    )))
+                ));
+                assert_eq!(signer.status(), SignerStatus::FirstAccountPresent);
+                assert_eq!(world.enrollments_sent(), original_enrollments);
+                return Ok(());
+            }
+        };
+        assert_eq!(signer.status(), SignerStatus::Signing);
+        assert_eq!(
+            (restored.version(), restored.generation()),
+            (previous.version() + 1, previous.generation())
+        );
+        assert_eq!(restored.body().signer, install);
+        assert_eq!(restored.inbox(), previous.inbox());
+        assert_eq!(
+            world
+                .files()
+                .identity_doc(&alice.public())
+                .as_ref()
+                .map(IdentityDoc::hash),
+            Some(restored.hash())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_public_identity_headers_scripted() {
         check_public_headers(Backend::Scripted, false).await;
     }

@@ -399,8 +399,11 @@ impl Signer {
     /// [`SignerError::Alarm`] while an alarm is held; the switch's or the Homeserver's error.
     pub async fn survey_key_recovery(&mut self) -> Result<KeyRecoverySurvey> {
         self.refresh().await?;
-        let recovering = matches!(self.flow, Some(Flow::KeyRecover { .. }));
-        check_local_restore(&self.state, self.flow.is_some() && !recovering)?;
+        let pending = self
+            .flow
+            .as_ref()
+            .filter(|flow| !matches!(flow, Flow::KeyRecover { .. }));
+        check_local_restore(&self.state, pending.is_some_and(Flow::blocks_restore))?;
         let marks = marks_of(&self.state)?;
         Ok(self.key_plan(&self.state, &marks, None).await?.survey)
     }
@@ -770,15 +773,16 @@ impl Signer {
             .chain(backed_up.map(|view| &view.identity_doc))
             .chain(marks)
             .collect();
-        let origin = match asked {
-            Some(origin) => origin.to_owned(),
-            None => seen
-                .iter()
-                .max_by_key(|doc| (doc.generation(), doc.version()))
-                .ok_or_else(|| stop(KeyRecoveryStop::NoCopy))?
-                .inbox()
-                .url
-                .clone(),
+        let newest = seen
+            .iter()
+            .max_by_key(|doc| (doc.generation(), doc.version()));
+        let (origin, from_setup) = match (asked, newest, &self.flow) {
+            (Some(origin), _, _) => (origin.to_owned(), false),
+            (None, Some(doc), _) => (doc.inbox().url.clone(), false),
+            // The user gave this origin for setup. As for any supplied origin, the
+            // service must show the identity's signed history before confirmation.
+            (None, None, Some(Flow::FirstAccountPresent { origin, .. })) => (origin.clone(), true),
+            _ => return Err(stop(KeyRecoveryStop::NoCopy)),
         };
         let target = Target {
             origin: &origin,
@@ -871,7 +875,7 @@ impl Signer {
         let fates = self
             .fates(&copy, &docs, backed_up, kept, &answer, kind)
             .await?;
-        let survey = KeyRecoverySurvey::of(
+        let mut survey = KeyRecoverySurvey::of(
             origin,
             &copy,
             &fates,
@@ -880,6 +884,7 @@ impl Signer {
             &observation,
             copy.version(),
         );
+        survey.origin_supplied = from_setup;
         let view = fates.view(&copy, created, Limits::default());
         Ok(KeyPlan {
             survey,

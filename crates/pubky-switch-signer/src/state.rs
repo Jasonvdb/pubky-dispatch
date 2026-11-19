@@ -15,8 +15,9 @@ use pubky_switch_client::store::{OwnedStoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::ops::SignedOp;
 use pubky_switch_core::records::{
-    AppCert, CarriedAccountObservation, DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentIntent,
-    IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover, StoredPart,
+    AccountAssociation, AppCert, CarriedAccountObservation, DEFAULT_CERT_LIFETIME_MS, Enrollment,
+    EnrollmentIntent, IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover,
+    StoredPart,
 };
 use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
@@ -634,6 +635,11 @@ impl SignerState {
         }
     }
 
+    /// This installation has neither selected an account nor spent a document version.
+    pub(crate) fn before_first_version(&self) -> bool {
+        self.service.is_none() && self.newest.is_none() && self.signed_through == 0
+    }
+
     /// The newest document, verified.
     pub(crate) fn newest_doc(&self) -> Result<Option<IdentityDoc>> {
         self.newest
@@ -796,6 +802,13 @@ pub(crate) enum Flow {
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
     },
+    /// First setup found an account or surviving mark before signing a creation.
+    FirstAccountPresent {
+        /// The origin the user selected for setup.
+        origin: String,
+        /// The original authenticated discovery (Switch account binding 2.1).
+        observation: CarriedAccountObservation,
+    },
     /// Recovering from a provider loss (Switch spec 12.6 step 1): enrolling at the service
     /// at `origin`, then signing the next generation's `identity.json` with `recovery_from`,
     /// which a delivery then takes there.
@@ -890,8 +903,16 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    /// A first setup stopped before signing has no pending action for a restore to displace.
+    pub(crate) fn blocks_restore(&self) -> bool {
+        !matches!(self, Self::FirstAccountPresent { .. })
+    }
+
     pub(crate) fn check_state(&self, state: &SignerState) -> Result<()> {
         self.check_copies(&state.identity)?;
+        if matches!(self, Self::FirstAccountPresent { .. }) && !state.before_first_version() {
+            return Err(RecordsFault::Invariant("first setup already selected an account").into());
+        }
         if let Self::Recover { origin, enrollment } = self {
             enrollment.check_exclusions(state, origin)?;
         }
@@ -918,6 +939,19 @@ impl Flow {
                     {
                         return Err(RecordsFault::Invariant("another initial enrollment").into());
                     }
+                }
+            }
+            Self::FirstAccountPresent {
+                origin,
+                observation,
+            } => {
+                let observed = observation
+                    .verify(identity, origin)
+                    .map_err(SignerError::StoredData)?;
+                if observed.body().association == AccountAssociation::Absent {
+                    return Err(
+                        RecordsFault::Invariant("first setup recorded an absent account").into(),
+                    );
                 }
             }
             Self::KeyRecover {

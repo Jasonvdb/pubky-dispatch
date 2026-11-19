@@ -429,7 +429,10 @@ impl Signer {
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
             return Box::pin(self.continue_key_recovery(key.clone())).await;
         }
-        check_local_restore(&self.state, self.flow.is_some())?;
+        check_local_restore(
+            &self.state,
+            self.flow.as_ref().is_some_and(Flow::blocks_restore),
+        )?;
         let local = RestoreLocal::intact(self.state.clone())?;
         match (self.restore_records(Some(local), key.is_some()).await, key) {
             (Err(error), Some(key)) if backup_refused(&error) => {

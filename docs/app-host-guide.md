@@ -334,6 +334,9 @@ A freeze, a new provider and a lost provider require different user messages. Us
 
 | Case | What happened and what to do |
 |---|---|
+| `AppEvent::RecoveryRequired` | Tell the user the followed service requires recovery and acknowledge the event after displaying or storing it. Show the verified notice from `App::recovery_required` on reopen. Reads and sends to other identities remain available. |
+| `AppEvent::RecoveryNoticeCleared` | A later signed read confirmed service at the same generation. Ask the normal attempt gate before resuming work. |
+| `ProviderHealth::Unreachable` | Show when unanswered own requests began. A host can set its reporting interval with `set_unreachable_after_ms`. |
 | `AppEvent::ProviderChanged` | The newest own identity document points to another generation. Follow it and update the provider display when the change completes. |
 | `AppEvent::Moved` | A verified freeze suspends writes at the old service. Show the move in progress and keep pending writes. |
 | `ProviderStatus::AwaitingMove` | The client is waiting for the next generation to be published. Poll later. Avoid creating new copies of pending work. |
@@ -533,3 +536,11 @@ The optional `test-support` feature exposes a scripted service and store. The fo
 | `ErasureOutcome::UnresolvedAbsent` | Simulate an absent account without outcome evidence. Exercise the missing-evidence path. |
 | `ErasureOutcome::Committed` | Deletion committed before its external completion record was published. Exercise resumption from durable deletion. |
 | `ErasureOutcome::Rejected` | Erasure did not apply and the pending attempt has yet to be withdrawn. Exercise cleanup after a definite rejection. |
+
+### A display read across process exit
+
+A display extension can use `App::peek` through its live foreground owner. An app using a detached `FeedWait` keeps that same owner alive until it has accepted the verified response. A verified recovery notice holds own writes and attempts before foreground processing resumes.
+
+When the display process may exit independently, let the owner reserve one signed page with `App::begin_display_read`. The host transport must retain the original request's identifier and its exact terminal response, together with the device time it arrived, until the owner acknowledges it. It must also distinguish requests never sent or conclusively timed out from an unresolved original reply. The display process can call `App::display_preview` on the retained receipt without writing app state. Show a generic notification for an unchecked remainder or an unverified page.
+
+On reopen, match `App::pending_display_read` against the durable transport outcome. `App::finish_display_read` verifies the reply against the retained request and commits the decision. Redelivering the same receipt after acknowledgement loss has no further effect. An unresolved read holds own requests and attempts. A conclusive transport failure counts toward unavailability. Only a verified recovery response starts a recovery notice. Do not issue the pending read again to reconstruct its original answer. The platform host supplies the transport and its durable delivery across process exit.

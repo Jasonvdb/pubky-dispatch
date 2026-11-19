@@ -10,7 +10,8 @@
 //! processed shows nothing; anything else, or every message after the app found itself
 //! compromised, shows a generic notification.
 //!
-//! A peek commits nothing and changes nothing in memory: it doesn't move the cursor, write
+//! A peek commits nothing. It forwards a verified own recovery observation to the owning
+//! app before its next action. It doesn't move the cursor, write
 //! records, change the chain view or count towards the receive key's rotation (Switch spec
 //! 3.6). The app processes the messages when it next reads.
 
@@ -28,7 +29,7 @@ use super::identity;
 use super::protocol::ReceivedMessage;
 use super::protocols::Rules;
 use super::state::{Processed, key};
-use crate::client::answers::{EntryItem, FeedItem, FeedQuery};
+use crate::client::answers::{EntryItem, FeedItem, FeedPage, FeedQuery};
 
 /// The most feed pages one peek reads ([`PeekReport::more`]).
 pub const PEEK_PAGES: usize = 2;
@@ -84,8 +85,9 @@ pub struct PeekReport {
 
 impl App {
     /// Peek at the feed for a push (Switch spec 9 step 5): the receive checks on each entry
-    /// after the cursor, read-only. Nothing is committed or changed, and nothing but the
-    /// feed is fetched.
+    /// after the cursor, read-only. Only the feed is fetched. For a display process that
+    /// can exit independently, use the owner's [`App::begin_display_read`], the transport's
+    /// durable receipt and [`App::display_preview`].
     ///
     /// The call is bounded: it reads at most [`PEEK_PAGES`] pages, and no page after the
     /// first past the call's time budget ([`super::AppConfig::call_budget_ms`]); what it
@@ -103,10 +105,21 @@ impl App {
             if self.state.gone.is_some() {
                 return Err(Refusal::Gone.into());
             }
+            if self
+                .client
+                .own_reads
+                .as_ref()
+                .is_some_and(|reads| reads.first().is_some())
+            {
+                return Err(Refusal::NotNow(
+                    "the foreground must retain the service response".into(),
+                )
+                .into());
+            }
             let Some(mut chain) = self.state.chain.clone() else {
                 return Err(Refusal::NotNow("the app isn't registered".into()).into());
             };
-            let compromised = self.state.alarm.is_some();
+            let client = self.own_read_client()?;
             let cursor = self.state.cursor;
             let now = self.now();
             let multi = self.state.device.multi_device;
@@ -130,29 +143,10 @@ impl App {
                     limit: Some(self.config.page()),
                     wait: None,
                 };
-                let page = self.client.feed(query).await?;
-                if report.chain_verified && chain.feed_page(&page, now, multi).is_err() {
-                    report.chain_verified = false;
-                }
-                let trusted = report.chain_verified && !compromised && page.freeze.is_none();
-                for item in &page.items {
-                    if let FeedItem::Entry(entry) = item
-                        && entry.seq > cursor.seq
-                        && let Some(peeked) = self
-                            .peek_entry(
-                                entry,
-                                trusted,
-                                super::protocol::EntryReceipt {
-                                    entry_id: entry.entry_id,
-                                    service_key: page.service_key,
-                                    read_at_ms: page.server_time_ms,
-                                },
-                            )
-                            .await?
-                    {
-                        report.items.push(peeked);
-                    }
-                }
+                let page = client.feed(query).await?;
+                report.chain_verified =
+                    report.chain_verified && chain.feed_page(&page, now, multi).is_ok();
+                self.display_entries(&page, cursor.seq, &mut report).await?;
                 if !page.more || page.scanned_through <= after {
                     break;
                 }
@@ -162,6 +156,34 @@ impl App {
             Ok(report)
         })
         .await
+    }
+
+    pub(super) async fn display_entries(
+        &self,
+        page: &FeedPage,
+        cursor_seq: u64,
+        report: &mut PeekReport,
+    ) -> Result<(), AppError> {
+        let trusted = report.chain_verified && self.state.alarm.is_none() && page.freeze.is_none();
+        for item in &page.items {
+            if let FeedItem::Entry(entry) = item
+                && entry.seq > cursor_seq
+                && let Some(peeked) = self
+                    .peek_entry(
+                        entry,
+                        trusted,
+                        super::protocol::EntryReceipt {
+                            entry_id: entry.entry_id,
+                            service_key: page.service_key,
+                            read_at_ms: page.server_time_ms,
+                        },
+                    )
+                    .await?
+            {
+                report.items.push(peeked);
+            }
+        }
+        Ok(())
     }
 
     /// The checks on one entry; `None` for a message already processed.

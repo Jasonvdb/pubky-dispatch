@@ -639,6 +639,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             self.need(Permission::ConversationAdd)?;
             let result = self.client.decline_connect(pubky).await;
             self.take(result).await?;

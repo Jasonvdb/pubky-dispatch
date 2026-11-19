@@ -38,7 +38,7 @@ use super::kept::{Ended, KeptBatchDrop, index_kept};
 use super::protocol::{
     LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
 };
-use super::recovery::LossStep;
+use super::recovery::RecoveryStep;
 use super::send::{OutboxItem, SignedMessage};
 use super::state::{Tx, key};
 use super::{App, AppError};
@@ -449,6 +449,7 @@ impl App {
     ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
         let fresh = self.time_fresh_at;
         self.ready_local().await?;
+        self.may_write_own()?;
         if again {
             self.time_fresh_at = fresh;
         }
@@ -622,6 +623,7 @@ impl App {
         behind: Option<AppError>,
         replace: Option<[u8; 16]>,
     ) -> Result<Submitted, AppError> {
+        self.may_write_own()?;
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
                 Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
@@ -883,7 +885,7 @@ impl App {
         batch: Option<&Batch>,
     ) -> Result<(), AppError> {
         if let Some(loss) = self.loss_record().await?
-            && loss.step <= LossStep::Upload
+            && loss.step <= RecoveryStep::Upload
             && batch.is_none_or(|batch| batch.body() != loss.batch.as_slice())
         {
             return Err(Refusal::NotNow(

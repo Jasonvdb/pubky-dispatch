@@ -37,10 +37,12 @@
 
 mod chain;
 mod deletion;
+mod display;
 mod error;
 mod events;
 mod feed;
 mod forget;
+mod health;
 mod held_cursor;
 mod identity;
 mod kept;
@@ -76,12 +78,14 @@ mod send;
 mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
+pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
     EventIdError, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
+pub use health::{ProviderHealth, RecoveryNotice};
 pub use held_cursor::HeldCursor;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
@@ -103,7 +107,9 @@ pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, Pus
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
-pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
+pub use recovery::{
+    Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo, RecoveryStep,
+};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 pub use unverified::{
     MAX_UNVERIFIED_AGE_MS, MAX_UNVERIFIED_PER_SENDER, MAX_UNVERIFIED_TOTAL,
@@ -654,6 +660,8 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    pub(crate) health: health::ServiceHealth,
+    display_read: Option<DisplayRead>,
     /// The ID the next duty event takes (`dutyn`).
     pub(crate) next_duty: u64,
     /// The store's event epoch (`dutye`).
@@ -677,6 +685,10 @@ pub struct App {
     service_time_dirty: bool,
     /// The held alarm still needs a confirmed durable commit.
     alarm_dirty: bool,
+    /// A verified health change awaiting its durable state and duty commit.
+    pending_health: Option<health::ServiceHealth>,
+    /// Device-clock interval for reporting a sustained outage (Switch spec 12.6).
+    unreachable_after_ms: u64,
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     /// The listed certificates the own directory answered a read for, to judge a record
@@ -1001,7 +1013,8 @@ impl App {
             let record =
                 next_body::CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
                     .sign(&keys, now, None)?;
-            let client = Self::client_for(&env, &meta, &keys, &cert)?;
+            let mut client = Self::client_for(&env, &meta, &keys, &cert)?;
+            client.follow_own_reads(meta.generation, None, None);
             let batch = client.sign_batch(
                 meta.generation,
                 vec![
@@ -1074,6 +1087,8 @@ impl App {
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
+                health: health::ServiceHealth::default(),
+                display_read: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
@@ -1090,6 +1105,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1249,7 +1266,9 @@ impl App {
             check_protocol_names(&names, &protocols)?;
             protocols.check_cert(&state.cert)?;
             protocols.check_own_certificate(&state.cert)?;
-            let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
+            let mut client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
+            client.follow_own_reads(state.meta.generation, state.health.notice, None);
+            display::restore(&client, &state)?;
             let mut app = App {
                 env,
                 clock,
@@ -1261,6 +1280,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1347,6 +1368,8 @@ impl App {
         }
         let parked: BTreeMap<u64, ParkedEntry> = reader.scan_numbered("parked/").await?;
         let next_stored_id = next_stored_id(reader.get::<u64>(key::STORED_NEXT).await?, &parked);
+        let health = health::ServiceHealth::read(reader, meta.generation).await?;
+        let display_read = display::load(reader, &meta, health.display_id).await?;
         Ok(AppState {
             keys,
             cert,
@@ -1386,6 +1409,8 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            health,
+            display_read,
             next_duty: Self::next_duty(reader).await?,
             duty_epoch: reader.get(key::DUTY_EPOCH).await?.ok_or_else(missing)?,
             erasing: reader.get(provider::keys::ERASING).await?,
@@ -2122,10 +2147,11 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let same_installation = old
+            let installation = old
                 .get::<Meta>(key::META)
                 .await?
-                .is_some_and(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+                .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+            let same_installation = installation.is_some();
             let mut deletions = deletion::restore(
                 &old,
                 &backup.deletions,
@@ -2136,6 +2162,15 @@ impl App {
             .await?;
             let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let previous = same_installation.then_some(&old);
+            let previous_health = if installation.is_some_and(|live| {
+                live.generation == meta.generation
+                    && live.service_key == meta.service_key
+                    && live.origin == meta.origin
+            }) {
+                health::ServiceHealth::read(&old, meta.generation).await?
+            } else {
+                health::ServiceHealth::default()
+            };
             let put_backs = put_back::restore(
                 previous,
                 &backup.put_backs,
@@ -2290,6 +2325,12 @@ impl App {
                 }),
                 leave: None,
                 service_time: None,
+                health: previous_health,
+                display_read: if previous_health.display_id.is_some() {
+                    display::load(&old, &meta, previous_health.display_id).await?
+                } else {
+                    None
+                },
                 gone: None,
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
@@ -2367,8 +2408,10 @@ impl App {
                 next_stored_id,
                 ..state
             };
-            let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            let mut client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            client.follow_own_reads(meta.generation, state.health.notice, None);
             let protocols_names = protocols.names();
+            display::restore(&client, &state)?;
             let mut app = App {
                 env,
                 clock,
@@ -2380,6 +2423,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -2586,6 +2631,10 @@ impl App {
     async fn write_all(&mut self, tx: &mut Tx) -> Result<(), AppError> {
         let s = &mut self.state;
         tx.put(key::META, &s.meta)?;
+        s.health.write(tx)?;
+        if let Some(read) = &s.display_read {
+            tx.put(display::PENDING, read)?;
+        }
         tx.put(key::KEYS, &s.keys)?;
         tx.put(key::CERT, s.cert.signed())?;
         tx.put(key::RECORD, &s.record)?;
@@ -2779,6 +2828,7 @@ impl App {
     ///
     /// The [`Refusal`] that holds the attempt back.
     pub fn may_attempt(&self, automatic: bool) -> Result<(), Refusal> {
+        self.may_write_own()?;
         if self.state.alarm.is_some() {
             return Err(Refusal::Stopped);
         }
@@ -3849,6 +3899,21 @@ impl App {
         )?)
     }
 
+    fn own_read_client(&self) -> Result<SwitchClient, AppError> {
+        let mut client = Self::client_for(
+            &self.env,
+            &self.state.meta,
+            &self.state.keys,
+            &self.state.cert,
+        )?;
+        client.follow_own_reads(
+            self.state.meta.generation,
+            self.state.health.notice,
+            Some(&self.client),
+        );
+        Ok(client)
+    }
+
     /// The app's device clock. A host checking an action against the app's own
     /// identity uses this clock so both observe the same backwards adjustments.
     pub fn clock(&self) -> Arc<dyn Clock> {
@@ -3939,18 +4004,17 @@ impl App {
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.validate_waiting_state()?;
-            self.client = Self::client_for(
-                &self.env,
-                &self.state.meta,
-                &self.state.keys,
-                &self.state.cert,
-            )?;
+            self.client = self.own_read_client()?;
+            display::restore(&self.client, &self.state)?;
             self.service_time_dirty = false;
             // The reload is done only once the kept duty events it may owe the host are
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
         }
+        self.keep_read_decisions().await?;
+        self.client
+            .hold_own_writes(self.recovery_required().map(|n| n.generation));
         if told {
             self.load_told().await?;
         }
@@ -4045,6 +4109,9 @@ impl App {
         result: Result<T, ClientError>,
         bound: bool,
     ) -> Result<T, AppError> {
+        if bound && let Some(observed) = self.client.take_own_answer() {
+            Box::pin(self.observe_own_answer(observed)).await?;
+        }
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
         }
@@ -4248,12 +4315,9 @@ impl App {
         // A time an answer of the client before brought may be of another service: the
         // next stamp or window reads one from this client's service.
         self.time_fresh_at = None;
-        self.client = Self::client_for(
-            &self.env,
-            &self.state.meta,
-            &self.state.keys,
-            &self.state.cert,
-        )?;
+        self.client = self.own_read_client()?;
+        self.client
+            .hold_own_writes(self.recovery_required().map(|n| n.generation));
         Ok(())
     }
 }

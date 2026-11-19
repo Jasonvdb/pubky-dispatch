@@ -3235,6 +3235,9 @@ impl App {
     /// [`App::flush_outbox`]) goes through `try_item`, which asks this, so no call passes
     /// any of the holds.
     async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
+        if item.to == self.state.meta.identity && self.recovery_required().is_some() {
+            return Ok(true);
+        }
         Ok(item.delivery_owed() && self.delivery_holds(item).await?.any())
     }
 

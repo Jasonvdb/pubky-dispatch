@@ -4,6 +4,15 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+An app can receive a stopped read with a durable recovery notice. Hosts can show
+`App::recovery_required` and `App::provider_health`, and keep an attempt held
+on `Refusal::RecoveryRequired` until the app verifies service again or follows
+a later generation. A host displaying recovery progress can use `RecoveryInfo::step`.
+A separate display process that can exit during a peek needs a durable original
+transport reply. Reserve the signed page with `App::begin_display_read`, render
+with `App::display_preview` and pass the retained receipt to the state owner on
+reopen using `App::finish_display_read`.
+
 - The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.

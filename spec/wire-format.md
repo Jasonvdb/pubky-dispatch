@@ -1199,7 +1199,7 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
   2. A feed item matches its stub (6.6); a stub the app verified in its chain dates the write and gives its version, including the stubs of the page just read whose hashes the page's checkpoint prunes. A transition proof whose stub is of the generation the newest own `identity.json` names, and that verifies with that document's `inbox.service_key`, must have a stub whose `item_hash` is the operation's and whose generation is the operation's `generation`, an `object` that is `key`, a `state` whose `generation` and `version` are the stub's, and must not contradict a chain hash the app verified; it then gives the version if no stub did. A proof of an earlier generation, as a switch keeps it with a record after a key change or carries it after a move, gives no version, but dates the write for step 4 when it verifies with the key the newest own `identity.json` lists for the generation its stub names in `service_keys` (3.3), and its stub's `item_hash` and generation are the operation's. A generation the list doesn't name dates nothing, whatever key its proof verifies with; an honest signer lists every generation a current record's proof names (3.3).
   3. `key` is the one read; `collection` is a collection of the reading app's protocol, and the policy one that protocol fixes for it; `value_sealed.scope` is `read_scope`; `collection` and `key` derive from the signed `id_inputs` and policy (1.5); a write at a permanent policy keeps its rule (Permanent policies, above), judged by the operation's own `generation`.
   4. Standing: in the newest own `identity.json` the app holds, the certificate is listed; or it is an earlier certificate of a listed app in `renewed`, with `until` `null` or after the write's time; or the app is in `removed` and the write's time is at or before `distrust_from`. Only a proof (step 2) or a verified stub gives the write's time. An earlier certificate whose `until` is set counts only when one does and puts the write before `until`. Without one it doesn't count, and since the service keeps the proof of every current write (7.4.9), the missing date is the service's word: a write that no other certificate counts for (step 1) is ignored, naming no app. A removed app's write without a time counts as doubtful (spec 12.2 step 3). A certificate expired at the write's time doesn't count.
-  5. The certificate holds the scope required by the signed `expected_version` under the rule above.
+  5. The certificate holds the scope required by the signed `expected_version` under the rule above. When the policy names a create scope, the applicable role must be established for the original write. A later grant alone cannot establish it for an undated or earlier write.
   6. The version: from step 2 when a proof or a verified stub gives it (authenticated); otherwise the record view's (unauthenticated). Either way its generation is the operation's `generation` and it is after `expected_version`.
   7. The content: `value_sealed` opened with the scope key of its `data_epoch` (1.5, spec 13.4), and its padding removed (above). An empty plaintext is a delete, and nothing else is: a `deleted` flag or a 16-byte `ct` alone proves nothing. Without that epoch's key the value is unreadable; a value that doesn't open with the key, whose length or padding is wrong, or that isn't JSON, fails.
 
@@ -1343,8 +1343,8 @@ A failed condition is `409 conflict`, with the current value the caller may read
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
+    "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
   }
 }
 ```
@@ -1519,11 +1519,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+  "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+  "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
 }
 ```
 
@@ -2002,12 +2002,12 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "L0v5_hmltlaZgDMwk4pDQeO0KqqDwXeRvtBGVY5z0Q4"
+        "chain_hash": "hmoUYsmVJfFs_P5k1-9LaZvv4a2T6OzpxXs8BnkD7C0"
       },
       "item_type": "op",
       "item": {
         "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "MJnPcjmxKygWKsQud4bULoc8pwfT6ISIr1kM6O_O4H_PnGkhcvoR5Wl2_sEB20B3-XEkueQS-p-ZKqi58HHRBg"
+        "sig": "T-NlzS4MOYVXPR-RxKkWcG76bIxOoYeWirNrSRFnJGuLQRiG_wYiipa6IVn0sfYBlWY-3rL3gfTSuamtvi8DCA"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
@@ -2019,7 +2019,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA"
+        "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4"
       },
       "item_type": "service",
       "item": {
@@ -2036,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "OBvFmm31EK6JGMWD0IHtEfEohrnSuy_2uZTI51dqTU4",
+    "sig": "WPcnWs86LNGf7rYwiDZyHm67uQlJGeqCb3DXPUbStQUBYhGZfwXOeYVRHsAAZs4Ik5tu3Glo820ntgMJMfIBCQ"
   }
 }
 ```

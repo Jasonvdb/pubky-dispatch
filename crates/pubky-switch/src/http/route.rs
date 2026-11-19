@@ -281,8 +281,50 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+/// One request per call of Switch wire 7.4: the method, and the path with `{id}` for the
+/// account, `{app}` for an App ID and `{key}` for any other parameter.
+#[cfg(any(test, feature = "test-util"))]
+pub const CALLS: &[(&str, &str)] = &[
+    ("POST", "/v1/enroll"),
+    ("GET", "/v1/{id}/account"),
+    ("PUT", "/v1/{id}/identity"),
+    ("GET", "/v1/{id}/identity"),
+    ("POST", "/v1/{id}/inbox"),
+    ("GET", "/v1/{id}/feed"),
+    ("PUT", "/v1/{id}/peers"),
+    ("GET", "/v1/{id}/allow"),
+    ("POST", "/v1/{id}/connect"),
+    ("GET", "/v1/{id}/connect"),
+    ("DELETE", "/v1/{id}/connect/{key}"),
+    ("POST", "/v1/{id}/ops"),
+    ("GET", "/v1/{id}/claims/{key}"),
+    ("GET", "/v1/{id}/records/{key}"),
+    ("GET", "/v1/{id}/records"),
+    ("GET", "/v1/{id}/directory"),
+    ("GET", "/v1/{id}/apps/{app}/keys"),
+    ("POST", "/v1/{id}/apps/{app}/keys"),
+    ("PUT", "/v1/{id}/push"),
+    ("POST", "/v1/{id}/apps/{app}/leave"),
+    ("GET", "/v1/{id}/apps"),
+    ("POST", "/v1/{id}/apps/{app}/revoke"),
+    ("POST", "/v1/{id}/freeze"),
+    ("POST", "/v1/{id}/unfreeze"),
+    ("GET", "/v1/{id}/export"),
+    ("GET", "/v1/{id}/export/chunks/{key}"),
+    ("POST", "/v1/{id}/import"),
+    ("PUT", "/v1/{id}/import/chunks/{key}"),
+    ("POST", "/v1/{id}/import/activate"),
+    ("POST", "/v1/{id}/recovery/admission"),
+    ("POST", "/v1/{id}/recovery/upload"),
+    ("POST", "/v1/{id}/erase"),
+    ("PUT", "/v1/{id}/handover"),
+    ("GET", "/v1/{id}/handover"),
+];
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     const ID: &str = "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy";
@@ -295,6 +337,7 @@ mod tests {
     fn test_route_every_endpoint() {
         let cases: Vec<(&str, String, Call)> = vec![
             ("POST", "/v1/enroll".into(), Call::Enroll),
+            ("GET", format!("/v1/{ID}/account"), Call::GetAccount),
             ("PUT", format!("/v1/{ID}/identity"), Call::PutIdentity),
             ("GET", format!("/v1/{ID}/identity"), Call::GetIdentity),
             (
@@ -388,13 +431,22 @@ mod tests {
             ("PUT", format!("/v1/{ID}/handover"), Call::PutHandover),
             ("GET", format!("/v1/{ID}/handover"), Call::GetHandover),
         ];
-        assert_eq!(cases.len(), 33, "every route of Switch wire 7.4");
+        assert_eq!(cases.len(), 34, "every route of Switch wire 7.4");
+        let mut listed: BTreeSet<_> = CALLS
+            .iter()
+            .map(|(method, path)| call(method, path).expect("listed route").name())
+            .collect();
         for (method, path, expected) in cases {
             let routed = route(method, &path).unwrap_or_else(|| panic!("{method} {path}"));
             assert_eq!(routed.call, expected, "{method} {path}");
+            assert!(
+                listed.remove(expected.name()),
+                "missing or repeated {method} {path}"
+            );
             let account = (expected != Call::Enroll).then(|| ID.to_string());
             assert_eq!(routed.account, account);
         }
+        assert!(listed.is_empty(), "unexpected routes: {listed:?}");
     }
 
     #[test]
@@ -509,41 +561,7 @@ mod tests {
 
     #[test]
     fn test_route_every_routed_call_is_in_the_cap_table() {
-        for (method, path) in [
-            ("POST", "/v1/enroll"),
-            ("PUT", "/v1/x/identity"),
-            ("GET", "/v1/x/identity"),
-            ("POST", "/v1/x/inbox"),
-            ("GET", "/v1/x/feed"),
-            ("PUT", "/v1/x/peers"),
-            ("GET", "/v1/x/allow"),
-            ("POST", "/v1/x/connect"),
-            ("GET", "/v1/x/connect"),
-            ("DELETE", "/v1/x/connect/p"),
-            ("POST", "/v1/x/ops"),
-            ("GET", "/v1/x/claims/k"),
-            ("GET", "/v1/x/records/r"),
-            ("GET", "/v1/x/records"),
-            ("GET", "/v1/x/directory"),
-            ("GET", "/v1/x/apps/a/keys"),
-            ("POST", "/v1/x/apps/a/keys"),
-            ("PUT", "/v1/x/push"),
-            ("POST", "/v1/x/apps/a/leave"),
-            ("GET", "/v1/x/apps"),
-            ("POST", "/v1/x/apps/a/revoke"),
-            ("POST", "/v1/x/freeze"),
-            ("POST", "/v1/x/unfreeze"),
-            ("GET", "/v1/x/export"),
-            ("GET", "/v1/x/export/chunks/c"),
-            ("POST", "/v1/x/import"),
-            ("PUT", "/v1/x/import/chunks/c"),
-            ("POST", "/v1/x/import/activate"),
-            ("POST", "/v1/x/recovery/admission"),
-            ("POST", "/v1/x/recovery/upload"),
-            ("POST", "/v1/x/erase"),
-            ("PUT", "/v1/x/handover"),
-            ("GET", "/v1/x/handover"),
-        ] {
+        for &(method, path) in CALLS {
             assert!(route(method, path).is_some(), "{method} {path}");
             assert!(
                 pubky_switch_core::http::body_cap(method, path).is_some(),

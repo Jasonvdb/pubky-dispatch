@@ -281,6 +281,53 @@ mod tests {
             .await;
             assert!(matches!(result, Ok(Some(_))), "{account:?}: {result:?}");
         }
+        let result = Box::pin(crate::run_here(backend, signed_first_creation_changed)).await;
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "changed signed creation: {result:?}"
+        );
+    }
+
+    async fn signed_first_creation_changed(world: &World) -> FlowResult {
+        use pubky_switch_client::ClientError;
+        use pubky_switch_core::http::ErrorCode;
+        use pubky_switch_signer::{Refusal, SignerError, SignerStatus, UserConfirmed};
+
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        let mut first = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;
+        world.unreachable("POST", "/v1/enroll");
+        assert!(matches!(
+            first.resume().await,
+            Err(SignerError::Switch(ClientError::Transport(_)))
+        ));
+        drop(first);
+        let other = enroll(world, &alice, ORIGIN).await?;
+        let original = other.identity_doc()?.ok_or("missing current document")?;
+        let mut first = Signer::open(env, world.keyring(&alice)?).await?;
+        assert!(
+            matches!(first.resume().await, Err(SignerError::Switch(ClientError::Switch {
+            code: ErrorCode::Conflict, current, ..
+        })) if current == json!({ "binding": "changed" }))
+        );
+        assert_eq!(first.status(), SignerStatus::Enrolling);
+        assert_eq!(
+            first
+                .restore(UserConfirmed::shown_and_confirmed())
+                .await
+                .unwrap_err(),
+            Refusal::FlowInProgress.into()
+        );
+        assert_eq!(
+            world
+                .files()
+                .identity_doc(&alice.public())
+                .as_ref()
+                .map(IdentityDoc::hash),
+            Some(original.hash())
+        );
+        Ok(())
     }
 
     async fn existing_first_account(world: &World, account: FirstAccount) -> FlowResult {

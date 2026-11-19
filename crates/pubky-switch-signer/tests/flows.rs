@@ -50,6 +50,135 @@ async fn test_signer_enrollment_delivers_then_publishes_the_first_version() {
     assert!(signer.alerts().is_empty());
 }
 
+async fn expired_first_enrollment(world: &World, store: Arc<MemoryStore>) -> Signer {
+    use pubky_switch_client::testing::Fault as SwitchFault;
+    use pubky_switch_core::records::ACCOUNT_OBSERVATION_VALIDITY_MS;
+
+    let mut signer = Signer::create(world.env(store), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    world.switch.fail_next(SwitchFault::Unanswered {
+        path: "/v1/enroll".into(),
+        after: 0,
+    });
+    assert!(signer.resume().await.is_err());
+    world.clock.advance_ms(ACCOUNT_OBSERVATION_VALIDITY_MS);
+    signer
+}
+
+#[tokio::test]
+async fn test_first_enrollment_restart_survives_interruption_at_selection() {
+    use pubky_switch_signer::UserConfirmed;
+
+    for fault in [Fault::StopBefore(1), Fault::StopAfter(1)] {
+        let world = World::new();
+        let store = Arc::new(MemoryStore::new());
+        drop(expired_first_enrollment(&world, store.clone()).await);
+        let faulty = Arc::new(FaultStore::new(store.clone(), fault));
+        let mut signer = Signer::open(world.env(faulty), world.keyring())
+            .await
+            .unwrap();
+        let confirm = UserConfirmed::shown_and_confirmed;
+        assert!(
+            signer
+                .restart_first_enrollment(SWITCH_ORIGIN, confirm())
+                .await
+                .is_err()
+        );
+        assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
+        drop(signer);
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        let resumed = signer.resume().await;
+        if fault == Fault::StopBefore(1) {
+            assert!(
+                matches!(resumed, Err(SignerError::Switch(ClientError::Switch { current, .. }))
+                if current == serde_json::json!({ "binding": "expired" }))
+            );
+            assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
+            signer
+                .restart_first_enrollment(SWITCH_ORIGIN, confirm())
+                .await
+                .unwrap();
+        } else {
+            resumed.unwrap();
+        }
+        assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 2);
+        assert_eq!(world.published().unwrap().version(), 1);
+        assert_eq!(signer.status(), SignerStatus::Signing);
+    }
+}
+
+#[tokio::test]
+async fn test_first_enrollment_restart_keeps_another_installations_account() {
+    let world = World::new();
+    let mut signer = expired_first_enrollment(&world, Arc::new(MemoryStore::new())).await;
+    let (other, _) = world.enrolled().await;
+    let document = other.identity_doc().unwrap().unwrap();
+    let kept = world.distinct_requests("POST", "/v1/enroll");
+    let result = signer
+        .restart_first_enrollment(
+            SWITCH_ORIGIN,
+            pubky_switch_signer::UserConfirmed::shown_and_confirmed(),
+        )
+        .await;
+    // A changed binding can be returned by the exact retry itself or established by the
+    // fresh discovery after an authenticated expiry (Switch account binding 3).
+    assert!(
+        matches!(
+            result,
+            Err(SignerError::Refused(Refusal::FirstEnrollmentUnavailable))
+        ) || matches!(result, Err(SignerError::Switch(ClientError::Switch { ref current, .. })) if *current == serde_json::json!({ "binding": "changed" }))
+    );
+    assert_eq!(world.distinct_requests("POST", "/v1/enroll"), kept);
+    assert_eq!(signer.status(), SignerStatus::Enrolling);
+    assert_eq!(world.switch.identity_doc().unwrap().hash(), document.hash());
+    assert_eq!(world.published().unwrap().hash(), document.hash());
+}
+
+#[tokio::test]
+async fn test_first_enrollment_restart_preserves_the_request_when_an_identity_file_exists() {
+    use pubky_switch_core::records::IDENTITY_PATH;
+    use pubky_switch_signer::UserConfirmed;
+
+    let earlier = World::new();
+    let (_signer, _) = earlier.enrolled().await;
+    for path in [IDENTITY_PATH, SIGNER_BACKUP_PATH] {
+        let world = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let mut signer = expired_first_enrollment(&world, store.clone()).await;
+        let before = world.transport.requests().len();
+        let confirm = UserConfirmed::shown_and_confirmed;
+        assert_eq!(
+            signer
+                .restart_first_enrollment("https://another.example", confirm())
+                .await,
+            Err(Refusal::FirstEnrollmentUnavailable.into())
+        );
+        assert_eq!(world.transport.requests().len(), before);
+        let kept = earlier.homeserver.file(path).unwrap();
+        world.homeserver.set(path, kept.clone());
+        assert_eq!(
+            signer
+                .restart_first_enrollment(SWITCH_ORIGIN, confirm())
+                .await,
+            Err(Refusal::FirstEnrollmentUnavailable.into())
+        );
+        drop(signer);
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        assert!(
+            matches!(signer.resume().await, Err(SignerError::Switch(ClientError::Switch { current, .. }))
+            if current == serde_json::json!({ "binding": "expired" }))
+        );
+        assert_eq!(signer.status(), SignerStatus::Enrolling);
+        assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
+        assert_eq!(world.homeserver.file(path), Some(kept));
+    }
+}
+
 #[tokio::test]
 async fn test_signer_create_refuses_an_identity_already_set_up() {
     let world = World::new();

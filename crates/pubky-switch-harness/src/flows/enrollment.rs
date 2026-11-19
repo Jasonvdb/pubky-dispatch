@@ -156,6 +156,97 @@ mod tests {
     use pubky_switch_core::keys::IdentityKey;
 
     #[tokio::test]
+    async fn test_expired_first_enrollment_restart_scripted() {
+        check_first_enrollment_restart(Backend::Scripted).await;
+    }
+
+    #[tokio::test]
+    async fn test_expired_first_enrollment_restart_service() {
+        check_first_enrollment_restart(Backend::Service).await;
+    }
+
+    async fn check_first_enrollment_restart(backend: Backend) {
+        for applied in [false, true] {
+            let result = Box::pin(crate::run_here(backend, async |world: &World| {
+                Box::pin(first_enrollment_restart(world, applied)).await
+            }))
+            .await;
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "applied {applied}: {result:?}"
+            );
+        }
+    }
+
+    async fn first_enrollment_restart(world: &World, applied: bool) -> FlowResult {
+        use pubky_switch_client::ClientError;
+        use pubky_switch_core::http::ErrorCode;
+        use pubky_switch_signer::{SignerError, SignerStatus, UserConfirmed};
+
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        let mut signer = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;
+        let install = signer.install_id();
+        if applied {
+            world.lose_answer("POST", "/v1/enroll");
+        } else {
+            world.unreachable("POST", "/v1/enroll");
+        }
+        assert!(signer.resume().await.is_err());
+        assert_eq!(signer.status(), SignerStatus::Enrolling);
+        drop(signer);
+        world.advance_ms(301_000);
+        let mut signer = Signer::open(env.clone(), world.keyring(&alice)?).await?;
+        if !applied {
+            assert!(
+                matches!(signer.resume().await, Err(SignerError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict, current, ..
+            })) if current == json!({ "binding": "expired" }))
+            );
+            assert_eq!(world.enrollments_sent(), 1);
+            // Let the exact retry reach the service, then interrupt the newly authorized
+            // creation before its first send completes (Switch account binding 3).
+            world.unreachable_after("POST", "/v1/enroll", 1);
+        }
+        let restarted = signer
+            .restart_first_enrollment(ORIGIN, UserConfirmed::shown_and_confirmed())
+            .await;
+        if applied {
+            restarted?;
+        } else {
+            assert!(matches!(
+                restarted,
+                Err(SignerError::Switch(ClientError::Transport(_)))
+            ));
+            assert_eq!(world.enrollments_sent(), 2);
+            drop(signer);
+            signer = Signer::open(env, world.keyring(&alice)?).await?;
+            signer.resume().await?;
+        }
+        let doc = signer
+            .identity_doc()?
+            .ok_or("the first document is missing")?;
+        assert_eq!(signer.status(), SignerStatus::Signing);
+        assert_eq!(
+            (doc.version(), doc.generation(), doc.body().signer),
+            (1, 1, install)
+        );
+        assert_eq!(doc.inbox().url, ORIGIN);
+        assert_eq!(
+            world
+                .files()
+                .identity_doc(&alice.public())
+                .as_ref()
+                .map(IdentityDoc::hash),
+            Some(doc.hash())
+        );
+        assert_eq!(world.enrollments_sent(), if applied { 1 } else { 2 });
+        assert_eq!(world.faults_left(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_public_identity_headers_scripted() {
         check_public_headers(Backend::Scripted, false).await;
     }

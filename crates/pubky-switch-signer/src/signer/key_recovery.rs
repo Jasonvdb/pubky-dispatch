@@ -739,7 +739,11 @@ impl Signer {
         };
         match built {
             Ok((state, flow)) => self.commit(state, Some(flow)).await,
-            Err(error @ (SignerError::Refused(_) | SignerError::Alarm(_))) => {
+            // A rotated enrollment key can announce its result while the old key still
+            // serves the account. Until the survey succeeds it cannot release this retry.
+            Err(error @ (SignerError::Refused(_) | SignerError::Alarm(_)))
+                if answer.service_key == observed.body().service_key =>
+            {
                 Err(self.end_key_recovery(held, error).await)
             }
             Err(error) => Err(error),

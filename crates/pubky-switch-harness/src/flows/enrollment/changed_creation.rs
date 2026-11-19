@@ -9,6 +9,37 @@ use pubky_switch_signer::{
     BackupFound, KeyRecoveryStop, Refusal, SignerError, SignerStatus, UserConfirmed,
 };
 
+/// The selected recovery has gained only its bound enrollment answer. A changed survey
+/// cannot replace the local state, signed original, selected creation or confirmation.
+fn checked_enrollment_progress(
+    before: &[u8],
+    after: &[u8],
+    identity: &[u8; 32],
+    key: &[u8; 32],
+) -> FlowResult {
+    use pubky_switch_core::records::{Enrollment, EnrollmentAnswer};
+    use serde_json::Value;
+    let before: Value = serde_json::from_slice(before)?;
+    let mut after: Value = serde_json::from_slice(after)?;
+    let step = before
+        .pointer("/KeyRecover/step")
+        .ok_or("missing saved enrollment step")?;
+    assert_eq!(step, "Sending");
+    let progress = after
+        .pointer_mut("/KeyRecover/step")
+        .ok_or("missing resumed enrollment")?;
+    let result: EnrollmentAnswer = serde_json::from_value(progress["Applied"].clone())?;
+    let original =
+        serde_json::from_value(before["KeyRecover"]["enrollment"]["Ready"]["enrollment"].clone())?;
+    let signed = Enrollment::verify(&original, identity, ORIGIN)?;
+    result.check(&signed)?;
+    assert_eq!(&result.service_key, key);
+    assert_eq!(Some(result.created), signed.body().intent.created());
+    *progress = step.clone();
+    assert_eq!(after, before);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_restore_changed_first_creation_scripted() {
     check_changed_creation(Backend::Scripted).await;
@@ -120,7 +151,21 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
             Box::pin(first.resume()).await,
             Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into())
         );
-        assert_eq!(store.scan(&ns, b"", None, 64)?, selected);
+        let current = store.scan(&ns, b"", None, 64)?;
+        assert_eq!(current.len(), selected.len());
+        for ((name, before), (after_name, after)) in selected.iter().zip(&current) {
+            assert_eq!(name, after_name);
+            if name == b"flow" {
+                checked_enrollment_progress(
+                    before,
+                    after,
+                    &alice.public(),
+                    &predecessor.inbox().service_key,
+                )?;
+            } else {
+                assert_eq!(before, after);
+            }
+        }
         drop(first);
         first = Signer::open(env, world.keyring(&alice)?).await?;
         let updated = first.survey_key_recovery().await?;

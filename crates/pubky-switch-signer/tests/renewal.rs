@@ -833,6 +833,25 @@ async fn test_renewal_removing_a_scope_no_protocol_owns_rotates() {
     assert!(holds(&world, &opened(&world, &chatter), 2, "chat"));
 }
 
+/// Advance the account's committed time with the app's ordinary renewed record.
+fn write_after_renewal(world: &World, app: &App) -> u64 {
+    world.clock.advance_ms(3_600_000);
+    let record_at = world.clock.now_ms();
+    let cert = world.switch.app(&app.keys.app_id_bytes()).renewed.unwrap();
+    let record =
+        AppRecord::sign(&app.keys, AppRecordBody::new(&cert, Vec::new(), record_at)).unwrap();
+    world
+        .switch
+        .app_op(
+            &app.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    record_at
+}
+
 #[tokio::test]
 async fn test_renewal_a_lost_renewing_answer_closes_at_the_switchs_time_for_it() {
     // The switch takes the renewing version and its answer is lost. A day later the signer
@@ -848,7 +867,17 @@ async fn test_renewal_a_lost_renewing_answer_closes_at_the_switchs_time_for_it()
         path: "/identity".into(),
     });
     signer.renew(id, reduce(&["notes"])).await.unwrap_err();
-    world.clock.advance_ms(DAY_MS);
+    let read_at = write_after_renewal(&world, &app);
+    assert!(read_at > START_MS + DAY_MS);
+    assert_eq!(
+        world
+            .signer_client(Some(START_MS))
+            .apps()
+            .await
+            .unwrap()
+            .server_time,
+        read_at
+    );
     signer.resume().await.unwrap();
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(
@@ -875,21 +904,7 @@ async fn test_renewal_proofless_retry_closes_at_the_verified_account_read_after_
     assert_eq!(renewals(&renewing, &id), [None]);
     world.switch.forget_delivery_proof();
 
-    // A later ordinary write advances the account's committed time.
-    world.clock.advance_ms(3_600_000);
-    let record_at = world.clock.now_ms();
-    let cert = world.switch.app(&id).renewed.unwrap();
-    let record =
-        AppRecord::sign(&app.keys, AppRecordBody::new(&cert, Vec::new(), record_at)).unwrap();
-    world
-        .switch
-        .app_op(
-            &app.keys,
-            OpKind::AppPut {
-                record: record.signed().clone(),
-            },
-        )
-        .unwrap();
+    let record_at = write_after_renewal(&world, &app);
     let answer = world.signer_client(Some(START_MS)).apps().await.unwrap();
     assert_eq!(answer.identity.as_ref(), Some(renewing.signed()));
     assert_eq!(answer.server_time, record_at);

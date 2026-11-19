@@ -6,6 +6,7 @@ mod callback_batches;
 mod current_inputs;
 mod gap_completion;
 mod ownership;
+mod record_members;
 mod renewal_member;
 mod retained_authority;
 mod retirement;

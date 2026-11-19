@@ -90,6 +90,8 @@ pub(crate) mod key {
     /// The expiry each protocol asked of the app's record (`rexp`), by name, `None` for none:
     /// the record's `expires_at` is the earliest.
     pub(crate) const RECORD_EXPIRIES: &str = "rexp";
+    /// Unsigned member edits, committed together with their owners' expiry asks.
+    pub(crate) const RECORD_MEMBERS: &str = "rmem";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";

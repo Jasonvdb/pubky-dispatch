@@ -52,7 +52,14 @@ impl App {
             }
             self.check_retirement_work(name).await?;
 
+            let members = self.record_members().await?;
+            if members.contains_key(name) {
+                return Err(busy(name, "finish signing its pending record member"));
+            }
             let mut body = NextBody::held(&self.state)?;
+            for (owner, member) in &members {
+                body.set_member(owner.clone(), member.clone());
+            }
             if body.body().protocols.contains_key(name) {
                 return Err(busy(name, "remove its published protocol member"));
             }
@@ -74,7 +81,10 @@ impl App {
                 .filter(|kind| self.protocols.of_kind(kind).is_none_or(|r| r.name != name))
                 .cloned()
                 .collect();
-            let record = if accepts != body.body().accepts || self.record_needs_new_delivery() {
+            let record = if accepts != body.body().accepts
+                || self.record_needs_new_delivery()
+                || !members.is_empty()
+            {
                 body.set_accepts(accepts);
                 let at = self.next_record_time(body.body().updated_at).await?;
                 Some(self.sign_record_at(body, &expiries, at)?)
@@ -84,6 +94,7 @@ impl App {
             let mut tx = self.tx()?;
             if let Some(record) = record {
                 self.stage_own_record(&record, &mut tx)?;
+                tx.delete(key::RECORD_MEMBERS)?;
             }
             if had_expiry {
                 tx.put(key::RECORD_EXPIRIES, &expiries)?;

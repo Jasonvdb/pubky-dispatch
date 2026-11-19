@@ -409,7 +409,8 @@ pub struct AppBackup {
     /// The record the app presents, which may be one the switch hasn't accepted yet.
     record: SignedDoc,
     /// The newest record the switch accepted from the app (`record/accepted`), apart from
-    /// `record`: a restore publishes this one, never `record` (Switch spec 4.2). Absent from
+    /// `record`: a restore publishes only accepted bytes, deferring repair while a newer
+    /// local record choice is unresolved (Switch spec 4.2). Absent from
     /// a backup of an app the switch accepted no record from that it knows of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted: Option<SignedDoc>,
@@ -2364,8 +2365,9 @@ impl App {
                 pending_publish: None,
                 // The newest record the switch accepted, as the backup carries it apart from
                 // the record held, which may be one whose `app.put` was refused or never
-                // answered: only the accepted one is published, and never over a later
-                // Homeserver copy (Switch spec 4.2). The record held goes to the switch again
+                // answered: repair of the accepted one waits for newer local intent to
+                // settle, and never overwrites a later Homeserver copy (Switch spec 4.2).
+                // The record held goes to the switch again
                 // only with the next change the protocol makes (`own_record.rs`).
                 accepted: backup.accepted.clone(),
                 alarm: None,

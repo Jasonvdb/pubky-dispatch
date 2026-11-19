@@ -545,3 +545,75 @@ async fn test_record_members_size_uses_actual_null_or_finite_expiry() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_record_members_pending_withdrawal_defers_accepted_repair_until_signed() {
+    use crate::app::Publication;
+    use pubky_switch_core::records::app_record_path;
+
+    for owed in [false, true] {
+        let p = Pair::new();
+        let config = AppConfig {
+            publishes_record: true,
+            ..World::config()
+        };
+        let mut app = App::join(p.env(), p.set(), config.clone(), p.approve("wallet", &[]))
+            .await
+            .unwrap();
+        let now = p.w.clock.now_ms();
+        app.set_protocol_member("tasks", member(1), Some(now + 5 * DAY_MS))
+            .await
+            .unwrap();
+        if owed {
+            p.w.homeserver.fail_writes(1, false);
+        }
+        let publication = app
+            .set_protocol_member("chat", member(2), Some(now + DAY_MS))
+            .await
+            .unwrap();
+        assert_eq!(matches!(publication, Publication::Owed { .. }), owed);
+        let held = app.record().clone();
+        let pending_publish = app.state.pending_publish.clone();
+        p.w.clock.advance_ms(2 * DAY_MS);
+        usage(app.set_protocol_member("tasks", None, None).await, "chat");
+        let id = app.app_id();
+        let path = app_record_path(&id);
+        let writes = p.w.homeserver.writes(&p.w.alice.public(), &path);
+        assert_eq!(
+            app.publish_record().await.unwrap(),
+            Publication::AwaitingRecord
+        );
+        assert_eq!(app.state.pending_publish, pending_publish);
+        assert_eq!(p.w.homeserver.writes(&p.w.alice.public(), &path), writes);
+        let backup = app.backup().await.unwrap();
+        drop(app);
+        p.w.homeserver.remove(p.w.alice.public(), &path);
+        let mut restored = App::restore(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            p.set(),
+            config,
+            &backup,
+        )
+        .await
+        .unwrap();
+        assert!(!restored.receive(None).await.unwrap().stopped);
+        assert_eq!(p.w.homeserver.writes(&p.w.alice.public(), &path), writes);
+        assert!(p.w.homeserver.file(p.w.alice.public(), &path).is_none());
+        assert_eq!(restored.record(), &held);
+        assert!(restored.protocol_record("tasks").await.unwrap().pending);
+        assert_eq!(
+            restored.renew_record("chat", None).await.unwrap(),
+            Publication::Published
+        );
+        assert!(record(&restored).body().protocol("tasks").is_none());
+        assert!(!restored.protocol_record("tasks").await.unwrap().pending);
+        assert_eq!(
+            p.w.homeserver.writes(&p.w.alice.public(), &path),
+            writes + 1
+        );
+        assert_eq!(
+            p.w.homeserver.file(p.w.alice.public(), &path),
+            Some(serde_json::to_vec(restored.record()).unwrap())
+        );
+    }
+}

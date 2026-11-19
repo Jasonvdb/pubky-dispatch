@@ -3,6 +3,8 @@
 //! 4.2, 12.1 step 2; Switch wire 2.1, 3.2, 6.2), and signing under a protocol's own label
 //! (Switch spec 13.2).
 
+mod restore_publication;
+
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::labels;
 use pubky_switch_core::records::{AppRecord, AppRecordBody, app_record_path};
@@ -1015,8 +1017,8 @@ async fn restored_publishing(w: &World, backup: &crate::app::AppBackup) -> App {
 }
 
 /// Switch spec 4.2: a backup taken while a record's `app.put` was refused carries the
-/// accepted record apart. The restored app publishes only that one, never the refused
-/// record it holds; the protocol's next change delivers the record held again, signed
+/// accepted record apart. Repair waits for the newer local choice, never publishing
+/// refused bytes. The protocol's next change delivers the record held again, signed
 /// anew, and publishes it once the switch accepts it.
 #[tokio::test]
 async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
@@ -1041,7 +1043,7 @@ async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
     restored.receive(None).await.unwrap();
     assert_eq!(
         restored.publish_record().await.unwrap(),
-        Publication::Published
+        Publication::AwaitingRecord
     );
     assert_eq!(w.held(id), accepted);
     assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
@@ -1061,7 +1063,7 @@ async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
 }
 
 /// As above, the `app.put` never answered when the backup was taken: a restored read
-/// publishes the accepted record, never the one held.
+/// neither repairs the older accepted record nor publishes the unaccepted one held.
 #[tokio::test]
 async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
     let w = World::new();
@@ -1086,7 +1088,7 @@ async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
     restored.receive(None).await.unwrap();
     assert_eq!(w.held(id), accepted);
     assert_ne!(w.published(id), Some(bytes_of(&undelivered)));
-    assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
+    assert!(w.published(id).is_none());
 }
 
 /// A backup carrying no accepted record publishes nothing once restored, until the switch

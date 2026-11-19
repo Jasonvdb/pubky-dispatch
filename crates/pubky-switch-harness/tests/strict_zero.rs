@@ -65,7 +65,18 @@ async fn joined(
     name: &str,
     origin: &str,
 ) -> Writer {
-    let asking = Asking::new(world.app_keys(who, name).unwrap()).unwrap();
+    joined_with_scopes(world, who, signer, name, origin, &[NOTES]).await
+}
+
+async fn joined_with_scopes(
+    world: &World,
+    who: &TestIdentity,
+    signer: &mut Signer,
+    name: &str,
+    origin: &str,
+    scopes: &[&str],
+) -> Writer {
+    let asking = Asking::for_scopes(world.app_keys(who, name).unwrap(), scopes).unwrap();
     let checked = signer
         .review(asking.request.signed(), &asking.auth)
         .unwrap();
@@ -115,10 +126,19 @@ fn client_at(
 
 impl Writer {
     fn put(&self, natural: &[u8], expected: RecordVersion, value: &[u8]) -> RecordPut {
+        self.put_at(natural, expected, value, Policy::new(NOTES, &[NOTES]))
+    }
+
+    fn put_at(
+        &self,
+        natural: &[u8],
+        expected: RecordVersion,
+        value: &[u8],
+        policy: Policy,
+    ) -> RecordPut {
         let identity = self.who.key();
         let naming = NamingKey::from_root(&identity.switch_root());
         let blinded_key = naming.blind(natural);
-        let policy = Policy::new(NOTES, &[NOTES]);
         let key = record_key_from_blinded(COLLECTION, &blinded_key, &policy.hash().unwrap());
         RecordPut {
             key,
@@ -134,10 +154,10 @@ impl Writer {
                 value,
             )
             .unwrap(),
-            id_inputs: expected.is_none().then(|| IdInputs {
+            id_inputs: IdInputs {
                 collection: COLLECTION.into(),
                 blinded_key,
-            }),
+            },
         }
     }
 
@@ -406,6 +426,67 @@ async fn two_uploads_at_one_version(world: &World) {
     assert_eq!(put.expected_version, a.version);
 }
 
+async fn record_create_scope(world: &World) {
+    let (who, mut signer) = enrolled(world).await;
+    let creator = Box::pin(joined_with_scopes(
+        world,
+        &who,
+        &mut signer,
+        "creator",
+        ORIGIN,
+        &[NOTES, "notes_create"],
+    ))
+    .await;
+    let editor = Box::pin(joined_with_scopes(
+        world,
+        &who,
+        &mut signer,
+        "editor",
+        ORIGIN,
+        &[NOTES, "notes_update"],
+    ))
+    .await;
+    let policy = Policy::new(NOTES, &["notes_update"])
+        .with_create_scope("notes_create")
+        .permanent(None);
+    let put = |writer: &Writer, expected, value: &[u8]| {
+        writer.put_at(b"roles", expected, value, policy.clone())
+    };
+    let create = put(&creator, RecordVersion::NONE, b"{}");
+    let key = create.key;
+    let denied = editor
+        .post(1, vec![], put(&editor, RecordVersion::NONE, b"{}"))
+        .await;
+    assert!(matches!(
+        denied,
+        Err(ClientError::Switch { status: 403, .. })
+    ));
+    creator.post(2, vec![], create).await.unwrap();
+    let original = creator.get(&key).await;
+    let base = version(&original);
+    let denied = creator.post(3, vec![], put(&creator, base, b"{}")).await;
+    assert!(matches!(
+        denied,
+        Err(ClientError::Switch { status: 403, .. })
+    ));
+    assert_eq!(editor.get(&key).await, original);
+    editor
+        .post(4, vec![], put(&editor, base, br#"{"done":true}"#))
+        .await
+        .unwrap();
+    let updated = creator.get(&key).await;
+    assert!(version(&updated) > base);
+    assert_eq!(updated["key"], original["key"]);
+    let deleted = editor
+        .post(5, vec![], put(&editor, version(&updated), b""))
+        .await;
+    assert!(matches!(
+        deleted,
+        Err(ClientError::Switch { status: 400, .. })
+    ));
+    assert_eq!(creator.get(&key).await, updated);
+}
+
 macro_rules! backend_test {
     ($name:ident, $backend:expr, $flow:ident) => {
         #[tokio::test]
@@ -458,4 +539,15 @@ backend_test!(
     test_strict_zero_two_uploads_at_one_version_scripted,
     Backend::Scripted,
     two_uploads_at_one_version
+);
+
+backend_test!(
+    test_record_create_scope_service,
+    Backend::Service,
+    record_create_scope
+);
+backend_test!(
+    test_record_create_scope_scripted,
+    Backend::Scripted,
+    record_create_scope
 );

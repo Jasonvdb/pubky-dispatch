@@ -202,7 +202,7 @@ impl App {
                     // feed position before retiring the search, so a failed
                     // adoption can replay the same ordered grant after a restart.
                     self.events.push(crate::app::AppEvent::RenewalSeen);
-                    self.take_listed_renewal(renewal, Some((generation, item.seq)))
+                    self.take_listed_renewal(renewal, (generation, item.seq))
                         .await?;
                 }
                 tx.delete(READER_RENEWAL)?;

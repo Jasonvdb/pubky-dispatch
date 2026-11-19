@@ -4037,7 +4037,7 @@ impl App {
                         target_app_id,
                         cert,
                     } if *target_app_id == me && body.app_id.is_none() => {
-                        self.note_renewal(cert, &mut read.tx)?;
+                        self.note_renewal(cert, (envelope.generation, item.seq), &mut read.tx)?;
                         Ok(Step::Pass)
                     }
                     // A record write is judged and marked for the protocol of its collection:
@@ -4176,12 +4176,18 @@ impl App {
             });
             return Ok(Step::Stop);
         }
-        if self
+        if let Some(renewal) = self
             .state
             .renewal
-            .as_ref()
-            .is_some_and(|r| doc.listed_cert(&me) == Some(r.hash()))
+            .as_mut()
+            .filter(|renewal| doc.listed_cert(&me) == Some(renewal.cert.hash()))
         {
+            // If taking the certificate fails after the document is committed, a
+            // reopened app owes the widened listing at the same position.
+            if let Some(at) = at {
+                renewal.at = at;
+                renewal.keep(&mut read.tx)?;
+            }
             // Everything read so far first, so the delivery is in the store.
             read.tx.put(key::CURSOR, &self.state.cursor)?;
             self.put_told(&mut read.tx)?;

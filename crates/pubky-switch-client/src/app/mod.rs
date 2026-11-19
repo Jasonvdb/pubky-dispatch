@@ -601,7 +601,7 @@ pub(crate) struct AppState {
     pub(crate) meta: Meta,
     pub(crate) keys: AppKeys,
     pub(crate) cert: AppCert,
-    pub(crate) renewal: Option<AppCert>,
+    pub(crate) renewal: Option<renewal::KeptRenewal<AppCert>>,
     pub(crate) record: SignedDoc,
     pub(crate) naming: NamingKey,
     pub(crate) scope_keys: ScopeKeys,
@@ -1318,9 +1318,15 @@ impl App {
         let cert_doc: SignedDoc = reader.get(key::CERT).await?.ok_or_else(missing)?;
         let cert = AppCert::verify(&cert_doc, &meta.identity).map_err(|_| corrupt())?;
         send::validate_outbox(reader, &meta, &cert).await?;
-        let renewal = match reader.get::<SignedDoc>(key::CERT_RENEWAL).await? {
+        let renewal = match reader
+            .get::<renewal::KeptRenewal<SignedDoc>>(key::CERT_RENEWAL)
+            .await?
+        {
             None => None,
-            Some(doc) => Some(AppCert::verify(&doc, &meta.identity).map_err(|_| corrupt())?),
+            Some(kept) => Some(renewal::KeptRenewal {
+                cert: AppCert::verify(&kept.cert, &meta.identity).map_err(|_| corrupt())?,
+                at: kept.at,
+            }),
         };
         let mut scope_keys = ScopeKeys::default();
         for (_, scope_key) in reader.scan::<ScopeKey>("scope/").await? {

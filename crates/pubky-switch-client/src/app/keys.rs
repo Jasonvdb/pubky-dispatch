@@ -28,9 +28,7 @@
 //! in memory only: a restart may ask once more.
 
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::records::{
-    AppCert, BundlePart, PartReader, SkipReason, missing_keys, reader_certs,
-};
+use pubky_switch_core::records::{BundlePart, PartReader, SkipReason, missing_keys, reader_certs};
 
 use super::events::AppEvent;
 use super::state::key;
@@ -90,8 +88,8 @@ impl App {
                         last_epoch: stored.last_epoch,
                     })
                     .collect();
-                let renewals: Vec<AppCert> = self.state.renewal.iter().cloned().collect();
-                let certs = reader_certs(&self.state.cert, &renewals, &self.state.own_doc);
+                let renewals = self.kept_renewal().map_or(&[][..], std::slice::from_ref);
+                let certs = reader_certs(&self.state.cert, renewals, &self.state.own_doc);
                 let secret = self.state.keys.bundle_secret();
                 let protocols = self.protocols.clone();
                 let has_keys = |scope: &str| protocols.has_keys(scope);

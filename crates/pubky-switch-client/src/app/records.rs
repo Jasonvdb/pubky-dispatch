@@ -3090,7 +3090,7 @@ impl App {
             .and_then(|signed| AppCert::verify(signed, &identity).ok())
             .and_then(verify);
         let mut candidates: Vec<AppCert> = vec![self.state.cert.clone()];
-        candidates.extend(self.state.renewal.iter().cloned());
+        candidates.extend(self.kept_renewal().cloned());
         candidates.extend(self.kept_certs(writer).await?);
         candidates.extend(self.pending_certs(tx, writer));
         let mut known: Vec<(AppCert, SignedOp)> =

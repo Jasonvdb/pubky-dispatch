@@ -40,6 +40,8 @@ If your protocol holds the cursor while it waits for another app to replace a de
 
 A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
 
+Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
+
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
 ## Known issues

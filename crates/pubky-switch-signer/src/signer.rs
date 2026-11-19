@@ -138,6 +138,9 @@ pub enum SignerStatus {
     /// Set up, but no switch has accepted a first `identity.json` yet: [`Signer::resume`]
     /// finishes the enrollment.
     Enrolling,
+    /// The selected service already held an account or its mark before this install signed
+    /// a creation. Offer a confirmed [`Signer::restore`] (Switch spec 12.8).
+    FirstAccountPresent,
     /// This install signs for the identity.
     Signing,
     /// Another install is the identity's signer; this one signs nothing until the user has it
@@ -474,6 +477,7 @@ impl Signer {
                     Some(enrollment) => self.enroll(&origin, &enrollment, policy).await?,
                     None => self.observe_first_account(&origin, nonce, policy).await?,
                 },
+                Flow::FirstAccountPresent { .. } => return Err(Refusal::FirstAccountPresent.into()),
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
                 Flow::KeyRecover {
@@ -530,6 +534,7 @@ impl Signer {
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
         match &self.flow {
+            Some(Flow::FirstAccountPresent { .. }) => return SignerStatus::FirstAccountPresent,
             Some(Flow::Erase {
                 first_404_ms: Some(since_ms),
                 ..
@@ -1207,7 +1212,8 @@ impl Signer {
     }
 
     /// The original service to show when asking about a first enrollment that is still
-    /// pending (Switch account binding 3). Read it again after reopening the signer.
+    /// pending or found an existing account or mark (Switch account binding 3). Read it
+    /// again after reopening the signer.
     ///
     /// # Errors
     ///
@@ -1215,7 +1221,9 @@ impl Signer {
     pub fn first_enrollment_origin(&self) -> Result<Option<&str>> {
         self.check_owned_state()?;
         Ok(match &self.flow {
-            Some(Flow::Enroll { origin, .. }) => Some(origin),
+            Some(Flow::Enroll { origin, .. } | Flow::FirstAccountPresent { origin, .. }) => {
+                Some(origin)
+            }
             _ => None,
         })
     }
@@ -1246,11 +1254,7 @@ impl Signer {
         else {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         };
-        if origin != pending_origin
-            || self.state.signed_through != 0
-            || self.state.service.is_some()
-            || self.state.newest.is_some()
-        {
+        if origin != pending_origin || !self.state.before_first_version() {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         }
         let original = Enrollment::verify(&signed, &self.state.identity, origin)
@@ -1319,6 +1323,13 @@ impl Signer {
         let observation = RequestClient::new(&self.env, &target, &self.keyring, &self.store)?
             .observe_account()
             .await?;
+        if observation.body().association != AccountAssociation::Absent {
+            let flow = Flow::FirstAccountPresent {
+                origin: origin.to_owned(),
+                observation: observation.carried().clone(),
+            };
+            return self.commit(self.state.clone(), Some(flow)).await;
+        }
         self.keep_first_enrollment(origin, nonce, policy, &observation)
             .await
     }

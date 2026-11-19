@@ -94,6 +94,8 @@ pub(crate) struct LossProtocol {
     pub(crate) name: Option<&'static str>,
     pub(crate) sample: SampleProtocol,
     pub(crate) losses: Mutex<Vec<ProviderLoss>>,
+    /// Current coverage and divergence for the record reads a test follows.
+    pub(crate) observed_records: Mutex<Option<Vec<(bool, bool)>>>,
     pub(crate) counterparties: Vec<[u8; 32]>,
     /// How many of the next loss calls fail, as when the protocol can't read its state.
     pub(crate) failing: Mutex<u32>,
@@ -104,6 +106,17 @@ pub(crate) struct LossProtocol {
 }
 
 impl Protocol for LossProtocol {
+    fn observe_record(
+        &self,
+        observed: &crate::app::RecordObservation<'_>,
+        _: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        if let Some(reads) = self.observed_records.lock().unwrap().as_mut() {
+            reads.push((observed.current, observed.record.divergent));
+        }
+        Ok(Vec::new())
+    }
+
     fn name(&self) -> String {
         self.name.unwrap_or("sample").into()
     }

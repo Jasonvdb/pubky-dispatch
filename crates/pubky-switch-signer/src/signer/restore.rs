@@ -103,6 +103,8 @@ impl KeptCopy {
 pub(super) struct RestoreLocal {
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
+    /// A verified first discovery can locate a service when no signed copy names one.
+    pub(super) first_account_origin: Option<String>,
     pub(super) signed_through: Option<u64>,
     pub(super) epoch_through: Option<u64>,
 }
@@ -121,6 +123,7 @@ impl RestoreLocal {
             epoch_through: state.as_ref().map(|state| state.epoch_through),
             state,
             copies,
+            first_account_origin: None,
         };
         for copy in &local.copies {
             if let KeptCopy::Verified(doc) = copy {
@@ -188,12 +191,17 @@ impl RestoreLocal {
             }
             .into());
         }
+        let verified_flow = flow.as_ref().filter(|_| intact_flow);
+        let pending = verified_flow.is_some_and(Flow::blocks_restore);
         if let Some(state) = &state {
-            check_local_restore(state, intact_flow)?;
-        } else if intact_flow {
+            check_local_restore(state, pending)?;
+        } else if pending {
             return Err(Refusal::FlowInProgress.into());
         }
         let mut local = Self::from_state(state, identity);
+        local.first_account_origin = verified_flow
+            .and_then(Flow::first_account_origin)
+            .map(str::to_owned);
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
         let signed = match &flow {
@@ -430,7 +438,10 @@ impl Signer {
         if let (Some(key), Some(Flow::KeyRecover { .. })) = (&key, &self.flow) {
             return Box::pin(self.continue_key_recovery(key.clone())).await;
         }
-        check_local_restore(&self.state, self.flow.is_some())?;
+        check_local_restore(
+            &self.state,
+            self.flow.as_ref().is_some_and(Flow::blocks_restore),
+        )?;
         let local = RestoreLocal::intact(self.state.clone())?;
         match (self.restore_records(Some(local), key.is_some()).await, key) {
             (Err(error), Some(key)) if backup_refused(&error) => {
@@ -578,7 +589,7 @@ impl Signer {
         });
         let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
-        match self.finish_flow().await {
+        match Box::pin(self.finish_flow()).await {
             Ok(()) => {}
             // The recovery's version wasn't taken: the restore is done, the recovery in
             // progress, resumed or declared again at another service from here.
@@ -587,7 +598,7 @@ impl Signer {
         }
 
         let next = self.sign_own_version().await?;
-        self.resume().await?;
+        Box::pin(self.resume()).await?;
         Ok(next)
     }
 

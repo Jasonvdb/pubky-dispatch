@@ -243,6 +243,72 @@ mod tests {
         Ok(())
     }
 
+    async fn observe_record_values(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+        let spec = notes_protocol_with_records().spec().clone();
+        let protocol = std::sync::Arc::new(
+            pubky_switch_client::testing::TestProtocol::new(spec).observing_records(),
+        );
+        let (mut writer, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            Asking::new(world.app_keys(&alice, "wallet")?)?,
+            protocol.clone(),
+        ))
+        .await?;
+        let (mut reader, _) = Box::pin(joined_as(
+            world,
+            &alice,
+            &mut signer,
+            Asking::new(world.app_keys(&alice, "phone")?)?,
+            protocol,
+        ))
+        .await?;
+        let target = RecordTarget::new(notes_collection(), b"shopping list");
+        let values = [
+            br#"{"items":["milk"]}"#.as_slice(),
+            br#"{"items":["eggs"]}"#,
+        ];
+        for value in values {
+            let written = Box::pin(writer.put_record(&target, value, vec![])).await?;
+            let evidence = writer.shared_evidence().await?;
+            let [write] = evidence.ops.as_slice() else {
+                return Err("expected the current record operation".into());
+            };
+            let hash = SignedOp::peek(&write.op)?.item_hash()?;
+            assert_eq!(
+                writer
+                    .protocol_get(crate::parties::NOTES, &hash)
+                    .await?
+                    .as_deref(),
+                Some(value)
+            );
+            Box::pin(reader.receive(None)).await?;
+            assert_eq!(
+                reader
+                    .protocol_get(crate::parties::NOTES, &hash)
+                    .await?
+                    .as_deref(),
+                Some(value)
+            );
+            Box::pin(reader.flush_cursor()).await?;
+            assert!(reader.service_cursor().seq >= written.version.version);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_observations_for_both_apps_at_both_switches() {
+        for backend in [Backend::Service, Backend::Scripted] {
+            Box::pin(run_here(backend, observe_record_values))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn observe_deleted_record(world: &World) -> FlowResult {
         let alice = world.identity("alice")?;
         world.add_switch(ORIGIN, &[&alice]).await?;

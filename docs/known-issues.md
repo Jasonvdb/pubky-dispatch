@@ -8,11 +8,15 @@ A protocol can use `Protocol::qualify_record_mark` to bind a readable value and 
 
 The client's public API for protocols and hosts is in place: record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, record reads and collection pages used to discover uploaded records must cover the relevant upload. An earlier or unordered answer keeps the read or page outstanding across restart. A direct fresh lookup reports an inconclusive result when its answer predates an outstanding upload. A replay can learn the signed write from that earlier view and keep the divergence flag until a covering observation settles it. The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks. Upcoming client additions are listed below.
 
+A protocol that needs evidence from successive verified record writes can implement `Protocol::observe_record`. Its local writes commit with the record and can be included in its selected backup layer. The observation carries the signed operation, the accepted and previously held records, and whether the source covers pending uploads. The host receives an error if the protocol cannot store its observation. The read or outstanding batch can then be retried.
+
 A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
 Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
 
 **Caller changes already on main**
+
+- When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
 
 - A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 

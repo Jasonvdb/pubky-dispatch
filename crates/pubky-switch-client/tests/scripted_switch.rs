@@ -385,7 +385,12 @@ fn waiting_read(s: &Setup, app: &App, wait: &str) -> Request {
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: match wait.parse() {
+            Ok(wait_s @ 1..=25) => {
+                pubky_switch_client::transport::TimeoutClass::LongPoll { wait_s }
+            }
+            _ => pubky_switch_client::transport::TimeoutClass::Bulk,
+        },
     }
 }
 
@@ -580,7 +585,7 @@ async fn feed_past(s: &Setup, app: &App, after: u64) -> (Vec<String>, serde_json
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     let answer = s.alice.switch().transport().send(request).await.unwrap();
     assert_eq!(answer.status, 200);
@@ -728,7 +733,7 @@ async fn test_testing_upload_in_neither_stage_is_404() {
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: b"not json".to_vec(),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     // Before the body is read.
     let answer = s.alice.switch().handle(&request).unwrap();
@@ -807,7 +812,7 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
             Some(switch.created()),
             switch.identity_doc().map(|doc| doc.hash()).as_ref(),
         ),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     sign_signer_request(&s, &mut erase);
     let erased = switch.transport().send(erase).await.unwrap();
@@ -963,7 +968,7 @@ async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once(
             Some(switch.created()),
             switch.identity_doc().map(|doc| doc.hash()).as_ref(),
         ),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     sign_signer_request(&s, &mut erase);
     assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
@@ -1109,7 +1114,7 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         path_and_query: format!("/v1/{id}/inbox?apps_version=1"),
         headers: Vec::new(),
         body: vec![0; 65_537],
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     let answer = switch.transport().send(over.clone()).await.unwrap();
     assert_eq!(
@@ -1128,7 +1133,7 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
             Header::new("switch-app", "a"),
         ],
         body: Vec::new(),
-        timeout: pubky_switch_client::transport::TimeoutClass::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     };
     let answer = switch.transport().send(repeated.clone()).await.unwrap();
     assert_eq!(

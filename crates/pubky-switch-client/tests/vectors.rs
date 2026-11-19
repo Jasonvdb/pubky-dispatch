@@ -201,7 +201,7 @@ fn request_answered(v: &Value, r: &Value) -> Request {
                 .map(|(name, value)| Header::new(name, value.as_str().unwrap()))
                 .collect(),
             body: b64(st(case, "body_b64")),
-            timeout: Default::default(),
+            timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
         };
     }
     let field = |at: usize| {
@@ -214,7 +214,7 @@ fn request_answered(v: &Value, r: &Value) -> Request {
         path_and_query: field(1),
         headers: Vec::new(),
         body: Vec::new(),
-        timeout: Default::default(),
+        timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
     }
 }
 

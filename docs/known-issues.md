@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Pass an explicit `TimeoutClass` as the final argument to `SwitchClient::sign_request`. Replace `TimeoutClass::default()` with the class appropriate for the call when constructing a transport `Request`. Use `Bulk` for claim, app-record, receive-key or shared-record writes and for batches with `record_current` or `claim_step` conditions. A small batch can return a claim view for each successful claim or a held record or claim view in a conflict.
+
 - The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.

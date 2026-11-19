@@ -454,14 +454,14 @@ Implement `StateStore::get`, `scan`, `commit`, `acquire` and `commit_if` with th
 | `BatchError::BatchTooLarge` | The aggregate write size exceeds the cap. Reduce it or separate work that can safely commit independently. |
 | `BatchError::Namespace` | The batch contains a write outside the checked namespace. Fix the caller's namespace before committing. |
 
-The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
+The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. When signing a raw request with `SwitchClient::sign_request`, choose the class for both the request and its largest valid answer. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
 
 For a batch with `OpBatch::first_send_before`, the HTTPS transport checks the exclusive deadline at the nonblocking socket write, after waiting for writability. A custom transport implements `Transport::send_before` at its own last cancellable handoff. Its default leaves the batch pending. Only report `FirstSendExpired` if no request bytes left. A partial write has an uncertain outcome. Network transit and service scheduling take additional time, so use a `server_time_in` condition to bound application as well.
 
 | Case | What happened and what to do |
 |---|---|
 | `TimeoutClass::Ordinary` | Use a deadline for a small call, such as a setting or service-time read. |
-| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or record-writing batch with a potentially large answer. |
+| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or batch that can return signed claim proofs, a held record or a claim view. |
 | `TimeoutClass::LongPoll` | Allow the requested `wait_s` at the service plus time to return a bulk page. |
 | `TransportError::Refused` | Local origin or address policy prevented sending. Return this only when zero request bytes left. Correct the destination. |
 | `TransportError::Connect` | A connection could not be made and zero request bytes left. Retry connection later. |

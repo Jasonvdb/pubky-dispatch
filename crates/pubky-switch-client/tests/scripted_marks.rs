@@ -888,7 +888,7 @@ async fn test_scripted_erasure_pending_retry_checks_signature_creation_and_docum
                 ),
             ],
             body: pubky_switch_core::http::erase_body(Some(created), Some(&hash)),
-            timeout: pubky_switch_client::transport::TimeoutClass::default(),
+            timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
         };
         let answer = switch.handle(&bad).unwrap();
         // The unresolved outcome has Table 2 precedence over failed authentication.

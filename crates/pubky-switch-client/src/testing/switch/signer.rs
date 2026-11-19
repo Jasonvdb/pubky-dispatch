@@ -1317,7 +1317,7 @@ mod tests {
                                       "identity_hash": b64(&held) })
                         .to_string()
                         .into_bytes(),
-                        timeout: crate::transport::TimeoutClass::default(),
+                        timeout: crate::transport::TimeoutClass::Bulk,
                     };
                     let (status, body) = inner.erase_answer(&request);
                     if mark_generation == Some(2) {
@@ -1387,7 +1387,7 @@ mod tests {
             path_and_query: path.into(),
             headers,
             body,
-            timeout: Default::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         }
     }
 
@@ -1542,7 +1542,7 @@ mod tests {
                 path_and_query: "/v1/x/erase".into(),
                 headers: Vec::new(),
                 body: pubky_switch_core::http::erase_body(Some(inner.creation_time()), Some(&hash)),
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             };
             assert_eq!(inner.erase_answer(&erasure).0, 200);
         }
@@ -1783,7 +1783,7 @@ mod tests {
             path_and_query: "/v1/x/erase".into(),
             headers: Vec::new(),
             body: erase_body(created, hash),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         assert!(inner.doc.is_none());
         let (status, body) = inner.erase_answer(&erasure(Some(&[9; 32])));
@@ -1977,7 +1977,7 @@ mod tests {
                 path_and_query: "/v1/alice/identity".into(),
                 headers: Vec::new(),
                 body,
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             };
             let answer = inner.step_two(&request).expect("recovery notice");
             let body: Value = serde_json::from_slice(&answer.body).unwrap();
@@ -2020,7 +2020,7 @@ mod tests {
             path_and_query: "/v1/alice/identity".into(),
             headers: Vec::new(),
             body: body.clone(),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         assert!(inner.step_two(&request).is_none());
         assert_eq!(inner.put_identity(&body).unwrap().0, 200);

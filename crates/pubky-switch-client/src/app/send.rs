@@ -2289,20 +2289,15 @@ impl App {
     ///   again. A unit once begun goes whole. The call starts no unit once its time budget
     ///   ([`super::AppConfig::call_budget_ms`]) is spent, but its first. So its worst case is
     ///   the budget and one unit begun within it.
-    /// - One unit is bounded on its own. A delivery of the own `identity.json` is one
-    ///   request. A message's try is, at the default timeouts with every request waiting to
-    ///   the end of its timeout:
-    ///   - the service-time fetch of a message with a replay deadline, about 10 s;
-    ///   - its conversation entry, a write that may send a kept batch first under the long
-    ///     timeout, about 60 s;
-    ///   - one delivery round: its first attempt, at most four requests with the directory
-    ///     under the long timeout, and no retry once the budget has passed since the round
-    ///     began, about 90 s;
-    ///   - the own `identity.json` delivered after the acceptance asks for it, about 10 s;
-    ///   - its record job ([`super::App::update_record`], bounded the same way), about 130 s
-    ///     on a switch that answers nothing in time.
-    ///
-    ///   So about 5 minutes. A try against switches that answer takes seconds.
+    /// - Delivering the own `identity.json` uses a bulk call. A message's try can also
+    ///   read the service time for its replay deadline, write its conversation entry,
+    ///   fetch the recipient's identity and directory, append its envelope and run its
+    ///   record job ([`super::App::update_record`]). A switch call can repeat once
+    ///   after a verified timestamp correction. Each HTTP send has its own deadline
+    ///   ([`crate::transport::HttpConfig`]). Before retrying an append with a corrected
+    ///   timestamp, the app checks whether the delivery is held. The round's time budget
+    ///   governs a reseal after `stale_key`, identity delivery after `identity_needed`
+    ///   and a reread of the peer identity after an unverified answer.
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
@@ -3017,17 +3012,12 @@ impl App {
     /// ([`App::reread_after_unverified`]); an answer that still doesn't verify is queued as
     /// any other.
     ///
-    /// The round is bounded: it reads the newest copy at most once, and it starts no retry,
-    /// that reread, a reseal after `409 stale_key` or the own `identity.json` delivered again
-    /// after `409 identity_needed`, once the call's time budget
-    /// ([`super::AppConfig::call_budget_ms`]) has passed since the round began. Its worst case
-    /// is the budget and the attempt under way when it ran out: an attempt is at most the
-    /// recipient's `identity.json` from the Homeserver, the own one delivered, the
-    /// directory, and the append, each under its timeout. A retry left so is recorded, the
-    /// new keys taken and the envelope dropped, or the switch's copy of the own
-    /// `identity.json` taken as unknown, so the next try's first attempt makes it.
+    /// An unverified answer allows one peer identity reread for retry. The round's budget controls
+    /// that reread, resealing after `409 stale_key` and delivery of the own identity after
+    /// `409 identity_needed`. A timestamp correction inside a switch call is a separate
+    /// HTTP send. The append checks delivery holds before its timestamp retry.
     async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
-        // The time of this round: it starts no retry once the call's budget has passed.
+        // The outer delivery retries share the time budget of this round.
         let round = self.begin_budget();
         let mut reread = false;
         loop {

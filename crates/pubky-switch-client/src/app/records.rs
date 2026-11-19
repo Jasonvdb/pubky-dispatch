@@ -277,7 +277,7 @@ pub(super) struct ObservedView {
 
 /// A key read or conflict can establish that even a tombstone is absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MissingFrom {
+pub(super) enum MissingFrom {
     Key,
     LiveListing,
 }
@@ -4192,7 +4192,7 @@ impl App {
     /// # Errors
     ///
     /// The alarm; a store failure.
-    async fn note_absent(
+    pub(super) async fn note_absent(
         &mut self,
         key: &[u8; 32],
         current: CurrentAt,

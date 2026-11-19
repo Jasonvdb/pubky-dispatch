@@ -2706,6 +2706,55 @@ async fn test_own_record_lifetime_rollback_samples_current_time_before_signing()
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
 }
 
+/// The default protocol hook carries the signed member and the local expiry ask
+/// independently when the app takes a renewed certificate (Switch spec 3.2 step 3).
+#[tokio::test]
+async fn test_renewal_member_default_carries_members_and_asks() {
+    for (has_member, has_ask) in [(false, false), (false, true), (true, false), (true, true)] {
+        let w = World::new();
+        let mut app = w.join_publishing("wallet").await;
+        let expected = if has_member {
+            member(json!({ "room": 1 }))
+        } else {
+            None
+        };
+        let deadline = has_ask.then(|| w.clock.now_ms() + pubky_switch_core::records::DAY_MS);
+        if has_member {
+            // The other device's member arrives with no expiry ask in this store.
+            app.set_multi_device(true).await.unwrap();
+            let backup = app.backup().await.unwrap();
+            let mut other = restored_publishing(&w, &backup).await;
+            other
+                .set_protocol_member(PROTO, expected.clone(), None)
+                .await
+                .unwrap();
+            app.receive(None).await.unwrap();
+        }
+        if let Some(at) = deadline {
+            app.renew_record(PROTO, Some(at)).await.unwrap();
+        }
+        let ask = deadline.map(crate::app::RecordExpiry::At);
+        assert_eq!(record_of(&app).body().protocol(PROTO), expected.as_ref());
+        assert_eq!(
+            app.record_expiries().await.unwrap().get(PROTO),
+            ask.as_ref()
+        );
+
+        w.clock.advance_ms(1_000);
+        let renewed = super::flows::renew_listed(&w, &app);
+        app.receive(None).await.unwrap();
+        let record = record_of(&app);
+        assert_eq!(record.cert().hash(), renewed.hash());
+        assert_eq!(record.body().protocol(PROTO), expected.as_ref());
+        assert_eq!(
+            app.record_expiries().await.unwrap().get(PROTO),
+            ask.as_ref()
+        );
+        assert_eq!(record.expires_at(), deadline);
+        assert_eq!(w.held(app.app_id()).as_ref(), Some(app.record()));
+    }
+}
+
 #[tokio::test]
 async fn test_own_record_lifetime_certificate_adoption_resolves_new_expiry() {
     let w = World::new();

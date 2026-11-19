@@ -469,7 +469,7 @@ impl Protocol for Named {
     ) {
         match *self.member_for.lock().unwrap() {
             Some(member_for) => member_for(member, ask, cert),
-            None => (member.cloned(), ask),
+            None => SampleProtocol::default().member_for(member, ask, cert),
         }
     }
 

@@ -618,7 +618,7 @@ impl Signer {
         &mut self,
         view: BackupView,
         answer: AppsAnswer,
-        local: Option<RestoreLocal>,
+        mut local: Option<RestoreLocal>,
         serving: Option<[u8; 32]>,
     ) -> Result<IdentityDoc> {
         let identity = self.state.identity;
@@ -679,7 +679,10 @@ impl Signer {
             account: service,
             doc: doc.signed().clone(),
             prev,
-            backup: None,
+            backup: local
+                .as_mut()
+                .and_then(|local| local.pending_delivery.take())
+                .map(|delivery| delivery.backup),
             step: DeliverStep::BackupWritten,
         });
         let recovering = state.recovering;

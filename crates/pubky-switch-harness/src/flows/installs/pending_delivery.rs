@@ -120,9 +120,10 @@ async fn pending_delivery(world: &World, applied: bool) -> FlowResult {
         );
     } else {
         let restored: Value = serde_json::from_slice(&saved.ok_or("missing original delivery")?)?;
-        for field in ["doc", "prev", "account"] {
-            assert_eq!(restored["Deliver"][field], held["Deliver"][field]);
-        }
+        assert_eq!(
+            restored, held,
+            "the complete original operation survives restart"
+        );
     }
     Box::pin(signer.resume()).await?;
     let next = signer.identity_doc()?.ok_or("missing restored settings")?;

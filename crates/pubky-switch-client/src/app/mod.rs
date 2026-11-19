@@ -123,9 +123,9 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord,
-    ShownWrite, Unopened,
+    Collection, CollectionListed, CurrentCollection, FlaggedWrite, KeptOp, KeptReason,
+    LISTING_PAGES_PER_READ, PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence,
+    SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
     Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,
@@ -601,7 +601,7 @@ pub(crate) struct AppState {
     pub(crate) meta: Meta,
     pub(crate) keys: AppKeys,
     pub(crate) cert: AppCert,
-    pub(crate) renewal: Option<AppCert>,
+    pub(crate) renewal: Option<renewal::KeptRenewal<AppCert>>,
     pub(crate) record: SignedDoc,
     pub(crate) naming: NamingKey,
     pub(crate) scope_keys: ScopeKeys,
@@ -746,6 +746,9 @@ pub struct App {
     /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
+    last_collection_read: Option<Arc<feed::ReadCoverage>>,
+    /// Which local certificate a checked own directory establishes at one signed service head.
+    record_page_reader: Option<records::PageReader>,
     /// The sequence and highest held cursor reported ahead with
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
@@ -1109,6 +1112,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1280,6 +1285,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1311,9 +1318,15 @@ impl App {
         let cert_doc: SignedDoc = reader.get(key::CERT).await?.ok_or_else(missing)?;
         let cert = AppCert::verify(&cert_doc, &meta.identity).map_err(|_| corrupt())?;
         send::validate_outbox(reader, &meta, &cert).await?;
-        let renewal = match reader.get::<SignedDoc>(key::CERT_RENEWAL).await? {
+        let renewal = match reader
+            .get::<renewal::KeptRenewal<SignedDoc>>(key::CERT_RENEWAL)
+            .await?
+        {
             None => None,
-            Some(doc) => Some(AppCert::verify(&doc, &meta.identity).map_err(|_| corrupt())?),
+            Some(kept) => Some(renewal::KeptRenewal {
+                cert: AppCert::verify(&kept.cert, &meta.identity).map_err(|_| corrupt())?,
+                at: kept.at,
+            }),
         };
         let mut scope_keys = ScopeKeys::default();
         for (_, scope_key) in reader.scan::<ScopeKey>("scope/").await? {
@@ -2363,6 +2376,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,

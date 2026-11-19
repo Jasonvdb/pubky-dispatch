@@ -2446,6 +2446,155 @@ async fn test_records_followed_proof_upgrades_and_survives_a_proofless_read() {
 }
 
 #[tokio::test]
+async fn test_current_collection_uses_completed_pages_and_subsequent_writes() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    for n in 0..6 {
+        let name = format!("item-{n}");
+        writer
+            .put_record(&s.target(&name), &value(&[&name]), vec![])
+            .await
+            .unwrap();
+    }
+    let page_bytes = s.w.switch.lock().max_page_bytes;
+    s.w.switch.lock().max_page_bytes = 1;
+    let mut reader = s.join("phone").await;
+    let partial = reader.receive(None).await.unwrap();
+    assert!(
+        reader
+            .current_collection(&items(), &partial)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    s.w.switch.lock().max_page_bytes = page_bytes;
+    let report = reader.receive(None).await.unwrap();
+    let listed = s.w.switch.lock().shared.listings;
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.identity, reader.identity());
+    assert_eq!(current.live.len(), 6);
+    assert!(current.uncertain_keys.is_empty());
+    assert!(
+        writer
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let local = s.target("new-local");
+    reader
+        .put_record(&local, &value(&["placed"]), vec![])
+        .await
+        .unwrap();
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 7);
+    assert!(current.uncertain_keys.is_empty());
+    reader.delete_record(&local, vec![]).await.unwrap();
+    assert_eq!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .unwrap()
+            .live
+            .len(),
+        6
+    );
+    assert_eq!(s.w.switch.lock().shared.listings, listed);
+
+    writer
+        .delete_record(&s.target("item-3"), vec![])
+        .await
+        .unwrap();
+    let later = reader.receive(None).await.unwrap();
+    assert!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = reader
+        .current_collection(&items(), &later)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.live.len(), 5);
+    assert!(current.uncertain_keys.is_empty());
+}
+
+#[tokio::test]
+async fn test_current_collection_keeps_an_unaccepted_member_and_excludes_a_listed_absence() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let accepted = s.target("accepted");
+    let paused = s.target("paused");
+    for (target, item) in [(&accepted, "a"), (&paused, "b")] {
+        writer
+            .put_record(target, &value(&[item]), vec![])
+            .await
+            .unwrap();
+    }
+    *s.protocol.forbidden.lock().unwrap() = Some("b".into());
+    let mut reader = s.join("phone").await;
+    let report = reader.receive(None).await.unwrap();
+    let current = reader
+        .current_collection(&items(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = reader.record_key(&accepted).unwrap();
+    assert_eq!(
+        current.live.iter().map(|r| r.key).collect::<Vec<_>>(),
+        [key]
+    );
+    assert_eq!(
+        current.uncertain_keys,
+        [reader.record_key(&paused).unwrap()]
+    );
+
+    writer.delete_record(&accepted, vec![]).await.unwrap();
+    assert!(!reader.list_collections().await.unwrap());
+    assert_eq!(
+        ids(reader
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["a"]
+    );
+    assert!(
+        reader
+            .current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let latest = reader.receive(None).await.unwrap();
+    let current = reader
+        .current_collection(&items(), &latest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.live.is_empty());
+    assert_eq!(
+        current.uncertain_keys,
+        [reader.record_key(&paused).unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn test_records_listed_at_join_and_other_collections_left_alone() {
     let s = Setup::new();
     let mut wallet = s.join("wallet").await;
@@ -13956,6 +14105,278 @@ async fn test_permanent_listing_across_pages_judges_each_page_by_its_range() {
         "{:?}",
         phone.alarm()
     );
+}
+
+/// A signer can narrow the reader before its next feed call. The filtered page
+/// keeps the held key, and the pending listing can discover the renewal even
+/// when an earlier inbox item belongs to the protocol that owes the listing.
+#[tokio::test]
+async fn test_permanent_listing_waits_for_the_service_reader_across_load() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes(
+        "sample.kept",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    );
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["first"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_some());
+    let id = wallet.app_id();
+    let at = wallet.cursor();
+    let earlier = wallet.cert().clone();
+    s.w.clock.advance_ms(HOUR);
+    s.peer
+        .send_to(
+            &s.w.switch,
+            s.peer.apps()[0].cert.app_id(),
+            "sample.note",
+            json!({ "text": "before renewal" }),
+            &[id],
+        )
+        .unwrap();
+    let renewed = renewed_cert(&s, "wallet", &["sample-a:kiosk"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.config.page_size = 1;
+    let page = wallet.list_collection(&family).await.unwrap();
+    assert!(page.more);
+    assert_eq!(wallet.cursor(), at);
+    assert!(wallet.alarm().is_none());
+    let config = wallet.config.clone();
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), config, id)
+        .await
+        .unwrap();
+    let mut done = false;
+    for _ in 0..12 {
+        if !wallet.list_collection(&family).await.unwrap().more {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert_eq!(wallet.cursor(), at);
+    assert!(wallet.alarm().is_none());
+    assert_eq!(
+        ids(wallet
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["first"]
+    );
+}
+
+/// The narrow reader has never seen the till record. Its old empty range cannot
+/// complete the wider inventory or let the owner pass the pending listing.
+#[tokio::test]
+async fn test_wider_record_reader_lists_from_the_start_before_delivering_after_load() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes(
+        "sample.items",
+        Policy::new("sample-a", &["sample-a"]).permanent(None),
+    );
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["sample-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let till = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&till, &value(&["sale"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&till).unwrap();
+    let empty = wallet.list_collection(&family).await.unwrap();
+    assert_eq!(empty.records, 0);
+    assert!(!empty.more);
+    let calls = s.log().len();
+    assert!(!wallet.list_collection(&family).await.unwrap().more);
+    assert_eq!(
+        s.log()[calls..]
+            .iter()
+            .filter(|call| call.contains("/directory"))
+            .count(),
+        0
+    );
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    assert!(wallet.listing_owed().await.unwrap());
+    let id = wallet.app_id();
+    let at = wallet.cursor();
+    let owner_at = wallet.told("sample");
+    let earlier = wallet.cert().clone();
+    s.w.clock.advance_ms(HOUR);
+    let missed = s.w.switch.push_missed(1, START, START);
+    let renewed = renewed_cert(&s, "wallet", &["sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.config.page_size = 1;
+    let config = wallet.config.clone();
+    drop(wallet);
+    let mut wallet = App::load(s.env(), s.protocol.clone(), config, id)
+        .await
+        .unwrap();
+    assert!(wallet.list_collection(&family).await.unwrap().more);
+    let blocked = wallet.receive(None).await.unwrap();
+    assert!(blocked.more);
+    assert_eq!(wallet.cursor(), at);
+    assert_eq!(wallet.told("sample"), owner_at);
+    assert!(
+        wallet
+            .current_collection(&family, &blocked)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    for _ in 0..16 {
+        if wallet.cert().hash() == renewed.hash() {
+            break;
+        }
+        assert!(wallet.list_collection(&family).await.unwrap().more);
+    }
+    let published = s.w.switch.app(&id).record.unwrap();
+    let reader = AppRecord::verify(&published, &s.w.alice.public()).unwrap();
+    assert_eq!(reader.cert().hash(), renewed.hash());
+    assert!(reader.accepts("sample.note"));
+    assert_eq!(wallet.cursor(), at);
+    assert_eq!(wallet.told("sample"), owner_at);
+    assert!(s.protocol.sample.missed.lock().unwrap().is_empty());
+    let (_, note) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            s.peer.apps()[0].cert.app_id(),
+            "sample.note",
+            json!({ "text": "after the miss" }),
+            &[id],
+        )
+        .unwrap();
+    let mut current = None;
+    for _ in 0..32 {
+        let report = wallet.receive(None).await.unwrap();
+        current = wallet.current_collection(&family, &report).await.unwrap();
+        if current.is_some() && wallet.cursor().seq >= missed && handed(&s, &note.msg_id) == 1 {
+            break;
+        }
+    }
+    let current = current.expect("the wider inventory reached the end");
+    assert_eq!(
+        current.live.iter().map(|r| r.key).collect::<Vec<_>>(),
+        [key]
+    );
+    assert!(current.uncertain_keys.is_empty());
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert_eq!(
+        s.protocol
+            .sample
+            .missed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.seq == missed)
+            .count(),
+        1
+    );
+    assert_eq!(handed(&s, &note.msg_id), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(handed(&s, &note.msg_id), 1);
+}
+
+/// A restored installation can gain its first readable collection before its
+/// initial listing. Neither path may settle that listing under its old grant.
+#[tokio::test]
+async fn test_restored_receive_waits_for_the_first_readable_collection() {
+    restored_first_readable_collection(false).await;
+}
+
+#[tokio::test]
+async fn test_host_list_all_waits_for_the_first_readable_collection() {
+    restored_first_readable_collection(true).await;
+}
+
+async fn restored_first_readable_collection(host: bool) {
+    let s = Setup::new();
+    let mut original = join_scoped(&s, "wallet", &["sample-c"]).await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("sale");
+    let key = phone
+        .put_record(&target, &value(&["sale"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    assert!(!original.list_collections().await.unwrap());
+    assert!(original.shared_record(&key).await.unwrap().is_none());
+    let backup = original.backup().await.unwrap();
+    let earlier = original.cert().clone();
+    let store = Arc::new(MemoryStore::new());
+    let config = AppConfig {
+        page_size: 1,
+        ..World::config()
+    };
+    let mut restored = Box::pin(App::restore(
+        s.env_on(store.clone()),
+        s.protocol.clone(),
+        config.clone(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    let at = restored.cursor();
+    let owner_at = restored.told("sample");
+    s.w.clock.advance_ms(HOUR);
+    let renewed = renewed_cert(&s, "wallet", &["sample-c", "sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    assert!(restored.listing_owed().await.unwrap());
+    if host {
+        assert!(restored.list_collections().await.unwrap());
+    } else {
+        let held = restored.receive(None).await.unwrap();
+        assert!(held.more);
+        assert!(
+            restored
+                .current_collection(&items(), &held)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(restored.listing_owed().await.unwrap());
+    assert_eq!(restored.cursor(), at);
+    assert_eq!(restored.told("sample"), owner_at);
+    let id = restored.app_id();
+    drop(restored);
+    let mut restored = App::load(s.env_on(store), s.protocol.clone(), config, id)
+        .await
+        .unwrap();
+    assert!(restored.listing_owed().await.unwrap());
+    store_parts_for(&s, &renewed);
+    let mut current = None;
+    for _ in 0..32 {
+        let report = restored.receive(None).await.unwrap();
+        current = restored
+            .current_collection(&items(), &report)
+            .await
+            .unwrap();
+        if current.as_ref().is_some_and(|range| !range.live.is_empty()) {
+            break;
+        }
+    }
+    let current = current.expect("the newly readable collection reached its end");
+    assert_eq!(
+        current.live.iter().map(|r| r.key).collect::<Vec<_>>(),
+        [key]
+    );
+    assert!(current.uncertain_keys.is_empty());
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(!restored.listing_owed().await.unwrap());
+    assert!(!restored.list_collections().await.unwrap());
 }
 
 #[tokio::test]

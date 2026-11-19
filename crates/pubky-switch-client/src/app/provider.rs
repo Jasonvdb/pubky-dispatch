@@ -1855,7 +1855,7 @@ impl App {
             .collect();
         // `gone` and its duty events go with the copy, in its commit: a copy that fails
         // leaves them.
-        self.take_own_copy_with(doc, |tx| {
+        self.take_own_copy_with(doc, None, |tx| {
             tx.delete(keys::GONE)?;
             for n in gone_duties {
                 tx.delete(&key::duty(n))?;

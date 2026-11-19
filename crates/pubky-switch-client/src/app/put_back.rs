@@ -769,7 +769,11 @@ impl App {
             None
         };
         let batch = Batch::new(body.ops().to_vec(), cursor)?;
-        match self.submit_before(&batch, None, Some(&id)).await {
+        let bounded = self.bound_service_cursor(&batch, Some(&id))?;
+        match self
+            .submit_body(bounded.as_ref().unwrap_or(&batch), None)
+            .await
+        {
             Ok(answer) => {
                 let proof = answer.proofs.first().ok_or_else(super::corrupt)?;
                 let mut tx = self.tx()?;

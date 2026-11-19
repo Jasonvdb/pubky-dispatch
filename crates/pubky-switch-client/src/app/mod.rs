@@ -4141,21 +4141,18 @@ impl App {
     /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
     /// step 3). A kept batch signed for an earlier generation has its proofs checked with
     /// that generation's key (Switch wire 6.4 step 6).
-    pub(crate) fn submit<'a>(
-        &'a mut self,
-        batch: &'a Batch,
-    ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
-        self.submit_before(batch, None, None)
+    pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
+        let bounded = self.bound_service_cursor(batch, None)?;
+        self.submit_body(bounded.as_ref().unwrap_or(batch), None)
+            .await
     }
 
-    async fn submit_before(
+    /// Submit these exact bytes, including the selected service cursor.
+    async fn submit_body(
         &mut self,
         batch: &Batch,
         first: Option<&crate::transport::FirstSend>,
-        applying: Option<&deletion::Id>,
     ) -> Result<Submitted, AppError> {
-        let bounded = self.bound_service_cursor(batch, applying)?;
-        let batch = bounded.as_ref().unwrap_or(batch);
         self.refuse_before_upload_of(Some(batch)).await?;
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);

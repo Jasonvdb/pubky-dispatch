@@ -344,6 +344,10 @@ pub enum Refusal {
     /// ([`crate::Signer::resume`] sends it).
     #[error("refused: the switch isn't confirmed since an alarm")]
     SwitchUnconfirmed,
+    /// There is no ordinary recovery that the holder can stop before its version is signed
+    /// (Switch spec 12.8). A signed delivery or other pending work resumes normally.
+    #[error("refused: no ordinary key recovery is pending before its signed version")]
+    NoPendingKeyRecovery,
     /// The original first creation cannot be restarted under the same absent account
     /// binding (Switch account binding 3). Resume the pending action or use recovery.
     #[error("refused: first enrollment cannot be restarted at this service")]

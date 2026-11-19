@@ -74,8 +74,8 @@ pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;
 pub use key_recovery::{
-    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoveryKind, KeyRecoverySurvey,
-    RestoreConfirmed,
+    AppFate, BackupFound, FirstEnrollmentRestore, KeyRecoveryConfirmed, KeyRecoveryKind,
+    KeyRecoverySurvey, RestoreConfirmed,
 };
 pub use renewal::{CertChange, RunDue};
 pub use restore::RecordsDiscarded;
@@ -1228,6 +1228,22 @@ impl Signer {
         })
     }
 
+    /// The signed first creation this install can still continue at the selected service.
+    fn pending_first_creation(&self, origin: &str) -> Result<Enrollment> {
+        let Some(Flow::Enroll {
+            origin: selected,
+            enrollment: Some(signed),
+            ..
+        }) = &self.flow
+        else {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        };
+        if origin != selected || !self.state.before_first_version() {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        }
+        Enrollment::verify(signed, &self.state.identity, origin).map_err(SignerError::StoredData)
+    }
+
     /// Restart setup at the original `origin` after the user accepts that the earlier
     /// enrollment may have committed (Switch account binding 3). First retries the saved
     /// enrollment. An exact receipt continues setup at the creation it names. Only an
@@ -1245,25 +1261,13 @@ impl Signer {
         _confirmed: UserConfirmed,
     ) -> Result<()> {
         self.refresh().await?;
-        let Some(Flow::Enroll {
-            origin: pending_origin,
-            policy,
-            enrollment: Some(signed),
-            ..
-        }) = self.flow.clone()
-        else {
-            return Err(Refusal::FirstEnrollmentUnavailable.into());
-        };
-        if origin != pending_origin || !self.state.before_first_version() {
-            return Err(Refusal::FirstEnrollmentUnavailable.into());
-        }
-        let original = Enrollment::verify(&signed, &self.state.identity, origin)
-            .map_err(SignerError::StoredData)?;
+        let original = self.pending_first_creation(origin)?;
+        let policy = original.body().policy;
         let old = original
             .observation()
             .ok_or(Refusal::FirstEnrollmentUnavailable)?
             .body();
-        match Box::pin(self.enroll(origin, &signed, policy)).await {
+        match Box::pin(self.enroll(origin, original.signed(), policy)).await {
             Ok(()) => return Box::pin(self.resume()).await,
             Err(SignerError::Switch(ClientError::Switch {
                 code: ErrorCode::Conflict,

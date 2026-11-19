@@ -48,6 +48,9 @@
 //! it builds on the highest copy the key signed that any source shows, and starts the next
 //! generation there (Switch spec 12.6, 12.8).
 
+mod first_enrollment;
+pub use first_enrollment::FirstEnrollmentRestore;
+
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
@@ -265,6 +268,13 @@ pub(super) enum Held {
     Fresh,
     InPlace,
     Unusable,
+}
+
+/// The identity's two published files. A valid backup's exact bytes can bind a user's choice.
+struct PublishedCopies {
+    opened: Option<Option<BackupView>>,
+    backup_hash: Option<[u8; 32]>,
+    published: Option<IdentityDoc>,
 }
 
 /// A survey, with what the recovery signs on.
@@ -547,7 +557,6 @@ impl Signer {
         found: Found,
         confirmed: KeyRecoveryConfirmed,
     ) -> Result<IdentityDoc> {
-        let identity = self.state.identity;
         let (kept, marks, held) = match found {
             Found::InPlace => (self.state.clone(), marks_of(&self.state)?, Held::InPlace),
             Found::Fresh(None) => (self.state.clone(), Vec::new(), Held::Fresh),
@@ -560,9 +569,22 @@ impl Signer {
         let plan = self
             .key_plan(&kept, &marks, confirmed.asked.as_deref(), None)
             .await?;
+        self.start_key_recovery(kept, &marks, held, plan, confirmed)
+            .await
+    }
+
+    async fn start_key_recovery(
+        &mut self,
+        kept: SignerState,
+        marks: &[IdentityDoc],
+        held: Held,
+        plan: KeyPlan,
+        confirmed: KeyRecoveryConfirmed,
+    ) -> Result<IdentityDoc> {
         if plan.survey.digest != confirmed.digest {
             return Err(stop(KeyRecoveryStop::SurveyChanged));
         }
+        let identity = self.state.identity;
         let origin = plan.survey.origin;
         let signed = {
             let key = gate::key_recovery_key(&self.keyring, &self.store)?;
@@ -591,7 +613,7 @@ impl Signer {
                 confirmed.digest,
                 &confirmed.dropped,
                 held,
-                &marks,
+                marks,
             ))
             .await?;
         } else {
@@ -768,12 +790,27 @@ impl Signer {
         asked: Option<&str>,
         first_account_origin: Option<&str>,
     ) -> Result<KeyPlan> {
-        let identity = self.state.identity;
-        // An alarm is cleared, or ended by a provider loss: the recovery never builds past it.
         if let Some(alarm) = gate::held_alarm(kept) {
             return Err(SignerError::Alarm(alarm.clone()));
         }
-        let (opened, published) = self.read_published().await?;
+        let sources = self.read_published().await?;
+        self.key_plan_from(kept, marks, asked, first_account_origin, &sources, None)
+            .await
+    }
+
+    async fn key_plan_from(
+        &self,
+        kept: &SignerState,
+        marks: &[IdentityDoc],
+        asked: Option<&str>,
+        first_account_origin: Option<&str>,
+        sources: &PublishedCopies,
+        original: Option<&AccountObservation>,
+    ) -> Result<KeyPlan> {
+        let identity = self.state.identity;
+        let PublishedCopies {
+            opened, published, ..
+        } = sources;
         let backed_up = opened.as_ref().and_then(Option::as_ref);
         // Rule 1: the service the newest copy names, which must serve the account.
         let seen: Vec<&IdentityDoc> = published
@@ -794,7 +831,7 @@ impl Signer {
         };
         let target = Target {
             origin: &origin,
-            pinned: None,
+            pinned: original.map(|old| old.body().service_key),
             created: None,
             identity,
         };
@@ -810,6 +847,13 @@ impl Signer {
         let (AccountAssociation::Account, Some(created)) = (body.association, body.created) else {
             return Err(stop(KeyRecoveryStop::NotServing));
         };
+        if let Some(original) = original {
+            let old = original.body();
+            if body.store_id != old.store_id || old.erased_at.is_some() || body.erased_at.is_some()
+            {
+                return Err(Refusal::FirstEnrollmentUnavailable.into());
+            }
+        }
         let key = body.service_key;
         let target = Target {
             origin: &origin,
@@ -838,7 +882,7 @@ impl Signer {
         if carries_unknown_members(&copy)? {
             return Err(stop(KeyRecoveryStop::UnknownMembers));
         }
-        let backup = match &opened {
+        let backup = match opened {
             None => BackupFound::Missing,
             Some(None) => BackupFound::Unreadable,
             Some(Some(view))
@@ -906,16 +950,20 @@ impl Signer {
 
     /// The signer backup on the Homeserver, `Some(None)` for one that doesn't open, and the
     /// Homeserver's `identity.json` where the identity key signed it.
-    async fn read_published(&self) -> Result<(Option<Option<BackupView>>, Option<IdentityDoc>)> {
+    async fn read_published(&self) -> Result<PublishedCopies> {
         let identity = self.state.identity;
         let homeserver = &self.env.homeserver;
-        let opened = match homeserver
+        let (opened, backup_hash) = match homeserver
             .get(SIGNER_BACKUP_PATH)
             .await
             .map_err(SignerError::Homeserver)?
         {
-            None => None,
-            Some(bytes) => Some(self.open_backup(&bytes)?),
+            None => (None, None),
+            Some(bytes) => {
+                let view = self.open_backup(&bytes)?;
+                let digest = view.as_ref().map(|_| hash(&bytes));
+                (Some(view), digest)
+            }
         };
         let published = homeserver
             .get(IDENTITY_PATH)
@@ -923,7 +971,11 @@ impl Signer {
             .map_err(SignerError::Homeserver)?
             .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
             .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok());
-        Ok((opened, published))
+        Ok(PublishedCopies {
+            opened,
+            backup_hash,
+            published,
+        })
     }
 
     /// What becomes of each app `copy` lists, and what the recovery takes, with `docs` every
@@ -1526,7 +1578,9 @@ impl Signer {
                 "Switch wire 3.7: invalid recovery origin".into(),
             )));
         }
-        let (opened, published) = self.read_published().await?;
+        let PublishedCopies {
+            opened, published, ..
+        } = self.read_published().await?;
         let sealed = match &found.sealed {
             Some(bytes) => self.open_backup(bytes)?,
             None => None,

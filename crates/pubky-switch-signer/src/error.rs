@@ -348,6 +348,9 @@ pub enum Refusal {
     /// binding (Switch account binding 3). Resume the pending action or use recovery.
     #[error("refused: first enrollment cannot be restarted at this service")]
     FirstEnrollmentUnavailable,
+    /// Setup waits at the saved first step until the user addresses its alert.
+    #[error("refused: first enrollment is waiting for the user")]
+    FirstEnrollmentHeld,
     /// First discovery found an account or its mark before this install signed a creation.
     /// The user can restore the signer (Switch account binding 3 and spec 12.8).
     #[error("refused: the service already has this identity's account or its mark")]

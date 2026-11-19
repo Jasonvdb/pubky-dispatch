@@ -3795,7 +3795,7 @@ async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
 #[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
-    let app = w.join("wallet").await;
+    let mut app = w.join("wallet").await;
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3807,9 +3807,10 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
         AppBackup::from_bytes(&other),
         Err(AppError::InvalidData(_))
     ));
-    value["layers"] = json!([{ "name": "sample", "data": "" }]);
-    value["beyond_cursor"] =
-        json!({ "protocols": ["sample"], "seen": [], "parked": [], "processed": [] });
+    let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&layered).unwrap();
+    assert!(value["beyond_cursor"].is_object());
+    value["v"] = json!(9);
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),

@@ -10,6 +10,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
 
+Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.
+
 - First setup can wait with `SignerStatus::FirstEnrollmentHeld`. Show the reason in `Alert::FirstEnrollmentHeld` after reopening. Keep the original request and let the user choose the applicable recovery or clear the alert to retry that step. Both `resume` and `run_due` return `Refusal::FirstEnrollmentHeld` while the alert is held. Signer stores can now contain this alert.
 
 A protocol can use `Protocol::qualify_record_mark` to bind a readable value and its mark to the actual record key. A local write that fails this check is refused before signing. After another installation has written the record, the client retains its service revision and the last qualified mark across restart. Hosts must check the shared record's `flagged` and `not_taken` fields before using its contents. A later qualifying write can make the record usable again. A message handler sees the record, mark and application established by earlier entries in the same receive call.
@@ -23,6 +25,8 @@ A collection page can end at an inbox entry after the last chain operation. An e
 Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
 
 **Caller changes already on main**
+
+- Register the protocol that owns an outgoing kind if its messages should open a conversation for replies. A kind without a registered owner adds no conversation entry.
 
 - When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
 
@@ -40,9 +44,13 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 - **Client.** A pending collection listing records its upload position. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
-**Additions still to come**
+- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs`, `put_back_notices` and `record_settlements`, even when both lists are empty.
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events).
+If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
+
+A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
+
+Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
@@ -60,7 +68,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 ### Client
 
-- [data] **A deleted record can be forgotten before its repair applies.** The client can durably deliver a deletion to its collection owner. The service cursor can still advance past the delete before a replacement write succeeds, including across restart or restore. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
+- [data] **Installations sharing an App ID share its service cursor.** Use one authoritative store or an exclusive synchronized handoff of pending observations and signed publications. An independent copy can advance that shared cursor before the other copy has restored the record. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
 - [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.
 - [wrong result] **A restored backup can deliver a message the app already gave up on.** A backup taken before a message was withdrawn still holds it for delivery. Restoring that backup onto another store, after the protocol was told `MessageUndelivered` and acknowledged it, can deliver the original. Keep the original message ID, and do not issue a replacement the recipient would act on twice while an older backup can still be restored.
 - [data] **A device clock change can reopen a batch's retry window.** After a long suspension, a clock set back close to its earlier value can make an old service-time sample look recent, allowing a retry after the service forgot the batch ID. Reconcile the original effect before repeating work that could apply twice.
@@ -85,7 +93,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 ### Signer
 
-- [keys] **A hand-over can strand the only sealed copy of the identity key.** The receiving device installs the key in its vault only after the service confirms that the device has taken over. Retain an independent copy of the key until the receiving vault has confirmed possession.
+- [keys] **A hand-over can strand the only sealed copy of the identity key.** If the receiver recorded that its take-over won, it can finish installing the key in its original vault after the service disappears, then use confirmed recovery at another provider. If the receiver has only an offer and could still have lost to a withdrawal, it needs the original service's decision or an independent copy of the identity key. Retain that copy until the receiving vault has confirmed possession.
 - [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
 - [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
 - [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A signed changed binding can lead to confirmed same-service restore when the original service now serves a verified identity document for the current account. Other permanent refusals and a surviving mark retain the applicable recovery options.

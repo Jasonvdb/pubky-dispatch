@@ -897,6 +897,38 @@ pub enum AppEvent {
         /// The batch an earlier try left kept that may have applied, if one did.
         batch_id: Option<[u8; 16]>,
     },
+    /// The replacement of a deleted record is waiting. Its protocol can retry on the
+    /// next read or the host can release it. A duty kept once for this delete.
+    #[non_exhaustive]
+    PutBackWaits {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The generation of the signed delete.
+        generation: u64,
+        /// The version of the signed delete.
+        version: u64,
+        /// The item hash of the signed delete.
+        item_hash: [u8; 32],
+    },
+    /// The replacement of a deleted record was permanently refused. Its protocol
+    /// decides how to recover. A duty kept with the release of the feed position.
+    #[non_exhaustive]
+    PutBackRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The generation of the signed delete.
+        generation: u64,
+        /// The version of the signed delete.
+        version: u64,
+        /// The item hash of the signed delete.
+        item_hash: [u8; 32],
+        /// Why the replacement could not be written.
+        reason: String,
+    },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
     /// again, since the same answer would come. The read went on. The protocol acts on what
@@ -1063,6 +1095,8 @@ impl AppEvent {
             | Self::MessageUndelivered { id, .. }
             | Self::DeliveryUnknown { id, .. }
             | Self::RecordJobDropped { id, .. }
+            | Self::PutBackWaits { id, .. }
+            | Self::PutBackRefused { id, .. }
             | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
             | Self::RecordDivergent { id, .. }
@@ -1286,6 +1320,17 @@ pub(crate) enum Duty {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch_id: Option<String>,
     },
+    PutBackWaits {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        delete: super::records::DeleteBase,
+    },
+    PutBackRefused {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        delete: super::records::DeleteBase,
+        reason: String,
+    },
     RecordJobStopped {
         msg_id: String,
         #[serde(with = "serde_b64")]
@@ -1454,6 +1499,25 @@ impl Duty {
                 msg_id,
                 batch_id: batch_id
                     .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
+            },
+            Self::PutBackWaits { key, delete } => AppEvent::PutBackWaits {
+                id,
+                key,
+                generation: delete.version.generation,
+                version: delete.version.version,
+                item_hash: delete.item_hash,
+            },
+            Self::PutBackRefused {
+                key,
+                delete,
+                reason,
+            } => AppEvent::PutBackRefused {
+                id,
+                key,
+                generation: delete.version.generation,
+                version: delete.version.version,
+                item_hash: delete.item_hash,
+                reason,
             },
             Self::RecordJobStopped {
                 msg_id,

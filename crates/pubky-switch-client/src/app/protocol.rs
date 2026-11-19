@@ -1242,6 +1242,22 @@ pub trait Protocol: Send + Sync {
         false
     }
 
+    /// Update this collection owner's local state when a verified current deletion ends
+    /// the record's mark lifetime (Switch spec 8.2). The deletion may be this app's own.
+    /// A later read may first establish coverage or confirm the same deletion again.
+    /// Return idempotent writes bound to this key and deletion version. They commit with
+    /// the native mark change, including when the app holds no mark for this key.
+    /// A failure or writes exceeding [`MAX_STEP_LOCAL_BYTES`] hold the change for retry.
+    fn record_lifetime_ended(
+        &self,
+        record: &RecordMarkContext<'_>,
+        version: RecordVersion,
+        context: &ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = (record, version, context);
+        Ok(Vec::new())
+    }
+
     /// Observe another app's verified deletion of a record in this collection. The
     /// callback follows the regression check and sees the evidence from before the
     /// delete. Its bounded local writes commit under this protocol's namespace.

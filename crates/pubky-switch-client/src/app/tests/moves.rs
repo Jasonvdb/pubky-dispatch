@@ -584,7 +584,7 @@ fn public_read_now(w: &World) -> crate::transport::Response {
             ),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         })
         .unwrap()
 }
@@ -2281,7 +2281,7 @@ fn upload_request(lost: &Lost, body: &str) -> crate::transport::Request {
             &pubky_switch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
         )],
         body: body.as_bytes().to_vec(),
-        timeout: crate::transport::TimeoutClass::default(),
+        timeout: crate::transport::TimeoutClass::Bulk,
     }
 }
 
@@ -5618,7 +5618,7 @@ fn signer_call(
                 Header::new(header::SIGNATURE, &pubky_switch_core::enc::b64(&signature)),
             ],
             body,
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         })
         .unwrap();
     (

@@ -44,6 +44,12 @@ pub enum Backend {
     Scripted,
 }
 
+#[cfg(test)]
+pub(crate) enum AccountSnapshot {
+    Database(Box<pubky_switch::store::testing::TestDatabase>),
+    Scripted(u64),
+}
+
 /// One run's world.
 pub struct World {
     backend: Backend,
@@ -270,11 +276,11 @@ impl World {
 
     /// The service at `origin`, out of the world's list while a change is made to it, and
     /// put back after `change`, whatever it returned.
-    async fn change_service(
+    async fn change_service<T>(
         &self,
         origin: &str,
-        change: impl AsyncFnOnce(&mut RealSwitch) -> Result<(), HarnessError>,
-    ) -> Result<(), HarnessError> {
+        change: impl AsyncFnOnce(&mut RealSwitch) -> Result<T, HarnessError>,
+    ) -> Result<T, HarnessError> {
         let mut switch = {
             let mut services = lock(&self.services);
             let at = services
@@ -301,6 +307,44 @@ impl World {
             .ok_or_else(|| {
                 HarnessError::Setup(format!("no scripted account of the identity at {origin}"))
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn snapshot_account(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+    ) -> Result<AccountSnapshot, HarnessError> {
+        match self.backend {
+            Backend::Service => self
+                .change_service(origin, RealSwitch::snapshot_database)
+                .await
+                .map(|db| AccountSnapshot::Database(Box::new(db))),
+            Backend::Scripted => self
+                .scripted_switch(origin, identity)?
+                .mark()
+                .map(|(_, seq, _)| AccountSnapshot::Scripted(seq))
+                .ok_or_else(|| HarnessError::Setup("no mark for the account snapshot".into())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn restore_account(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        snapshot: AccountSnapshot,
+    ) -> Result<(), HarnessError> {
+        match snapshot {
+            AccountSnapshot::Database(db) => {
+                self.change_service(origin, async |switch| switch.restore_database(*db).await)
+                    .await
+            }
+            AccountSnapshot::Scripted(seq) => {
+                self.scripted_switch(origin, identity)?.restore_to(seq);
+                Ok(())
+            }
+        }
     }
 
     /// A restore of `identity`'s account at `origin` to a state one write behind its mark
@@ -785,7 +829,7 @@ impl World {
                 path_and_query: path.to_owned(),
                 headers: Vec::new(),
                 body: Vec::new(),
-                timeout: pubky_switch_client::transport::TimeoutClass::default(),
+                timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
             })
             .await
     }

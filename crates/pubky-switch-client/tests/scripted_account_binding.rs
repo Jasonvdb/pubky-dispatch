@@ -80,7 +80,7 @@ impl Account {
             path_and_query: path.into(),
             headers,
             body,
-            timeout: Default::default(),
+            timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
         }
     }
 

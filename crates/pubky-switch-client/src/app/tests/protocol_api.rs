@@ -4,6 +4,7 @@
 //! service time, collections with a policy per sub-scope, and two identities messaging each
 //! other, each on its own scripted switch.
 
+mod append_records;
 mod delivery_inventory;
 mod delivery_lifecycle;
 
@@ -99,6 +100,7 @@ struct ApiProtocol {
     send_origins: Mutex<Vec<(String, crate::app::DeliveryOrigin)>>,
     require_send_fact: std::sync::atomic::AtomicBool,
     delivery_check: Mutex<Option<Arc<DeliveryCheck>>>,
+    append_gate: Mutex<Option<Arc<append_records::Gate>>>,
 }
 
 impl ApiProtocol {
@@ -114,6 +116,7 @@ impl ApiProtocol {
             send_origins: Mutex::new(Vec::new()),
             require_send_fact: std::sync::atomic::AtomicBool::new(false),
             delivery_check: Mutex::new(None),
+            append_gate: Mutex::new(None),
         })
     }
 
@@ -153,6 +156,34 @@ impl Protocol for ApiProtocol {
             return Ok(false);
         }
         Ok(*self.blocked_origin.lock().unwrap() != Some(delivery.origin()))
+    }
+
+    fn append_records(
+        &self,
+        delivery: &crate::app::DeliveryView<'_>,
+    ) -> Result<Vec<RecordTarget>, crate::app::StoreFailure> {
+        Ok(self
+            .append_gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(Vec::new, |g| {
+                g.targets(delivery.message().msg_id.as_bytes())
+            }))
+    }
+
+    fn judge_append(
+        &self,
+        delivery: &crate::app::DeliveryView<'_>,
+        records: &[(RecordTarget, crate::app::RecordRead)],
+    ) -> Result<crate::app::AppendDecision, crate::app::StoreFailure> {
+        Ok(self
+            .append_gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .decide(delivery, records))
     }
 
     fn name(&self) -> String {

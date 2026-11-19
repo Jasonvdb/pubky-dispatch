@@ -509,15 +509,20 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// [`AppError::InvalidData`] for a policy whose write scopes aren't sorted and unique.
     pub fn record_key(&self, target: &RecordTarget) -> Result<[u8; 32], AppError> {
-        Ok(self.state.naming.record_key(
-            &target.collection.name,
-            &target.natural_key,
-            &target.collection.policy.hash()?,
-        ))
+        target.key_with(&self.state.naming)
+    }
+
+    // A preceding record in this read may already have updated its value, mark and
+    // application. Build the message's effect from the same state it can inspect.
+    fn record_data<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, AppError> {
+        self.app_get(key)?.map(|bytes| decode(&bytes)).transpose()
     }
 
     fn held(&self, key: &[u8; 32]) -> Result<Option<HeldRecord>, AppError> {
-        self.get(&record_key_of(key))
+        self.record_data(&record_key_of(key))
     }
 
     /// The record the app holds at `target`: the newest write it accepted, its version and
@@ -544,9 +549,7 @@ impl<'a> ReceiveContext<'a> {
             return Ok(None);
         };
         let divergent = self
-            .store
-            .get(self.ns, super::uploaded::divergent_key(key).as_bytes())
-            .map_err(store_error)?
+            .app_get(&super::uploaded::divergent_key(key))?
             .is_some();
         Ok(Some(held.shared(key, divergent)))
     }
@@ -557,7 +560,9 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn record_seen(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>, AppError> {
-        Ok(self.get::<SeenMark>(&seen_key(key))?.map(|mark| mark.mark))
+        Ok(self
+            .record_data::<SeenMark>(&seen_key(key))?
+            .map(|mark| mark.mark))
     }
 
     /// The condition on record `key` a write depending on it carries, as
@@ -764,8 +769,18 @@ impl<'a> ReceiveContext<'a> {
         // A value that isn't JSON is refused before the protocol marks it, as `record_op`
         // does: nothing is handed on first.
         super::records::refuse_non_json(value)?;
-        super::records::refuse_unmarkable(self.protocols, target, value)?;
         let key = self.record_key(target)?;
+        if let Some(value) = value {
+            let seen = self.record_seen(&key)?;
+            super::records::refuse_unmarkable(
+                self.protocols,
+                &self.state.naming,
+                key,
+                target,
+                value,
+                seen.as_deref(),
+            )?;
+        }
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(
                 Refusal::Usage("Switch wire 6.2: one write per record per batch".into()).into(),

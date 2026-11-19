@@ -121,6 +121,27 @@ pub struct RecordDeletion<'a> {
     pub base: WriteBase,
 }
 
+/// The physical key and policy of a value the collection owner is asked to mark.
+#[non_exhaustive]
+pub struct RecordMarkContext<'a> {
+    /// The physical key at which the app will write or observed the value.
+    pub key: [u8; 32],
+    /// The registered collection with the concrete policy of this write.
+    pub collection: &'a super::Collection,
+    pub(crate) naming: &'a pubky_switch_core::ident::NamingKey,
+}
+
+impl RecordMarkContext<'_> {
+    /// Derive a target's physical key with this app's naming key (Switch spec 13.3).
+    ///
+    /// # Errors
+    ///
+    /// A policy whose write scopes are not sorted and unique.
+    pub fn record_key(&self, target: &super::RecordTarget) -> Result<[u8; 32], super::AppError> {
+        target.key_with(self.naming)
+    }
+}
+
 /// A readable record application verified by the client (Switch spec 8.2, 10.3).
 /// The protocol can keep what it learned in its own backup layer.
 #[non_exhaustive]
@@ -1147,8 +1168,8 @@ pub trait Protocol: Send + Sync {
     /// What the app has seen of a record, its high water (Switch spec 8.2): the protocol's
     /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
     /// what it trusts), or `None` to keep no mark. None by default. It isn't called for the
-    /// app's own delete, which leaves the mark held as it is: what the app saw stays seen,
-    /// and a later write by another app is checked against it.
+    /// app's own delete. The previous mark is kept by default. A collection whose
+    /// record lifetime ends at a delete can select [`Self::mark_ends_at_delete`].
     ///
     /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 64 KiB. Past it, nothing is silent:
     ///
@@ -1176,6 +1197,23 @@ pub trait Protocol: Send + Sync {
         None
     }
 
+    /// Qualify a readable value at its actual record key before writing it or
+    /// replacing the previously qualified mark (Switch spec 8.2, 10.3).
+    /// Return `None` for collections using the ordinary seen and regression rules.
+    /// For a participating collection return its new mark, or a content-free
+    /// refusal when its signed contents belong elsewhere or drop a known role.
+    /// This check is pure and can run again on the same value. It applies to
+    /// other installations of this app as well as to other apps.
+    fn qualify_record_mark(
+        &self,
+        input: &RecordMarkContext<'_>,
+        seen: Option<&[u8]>,
+        value: &[u8],
+    ) -> Option<Result<Vec<u8>, String>> {
+        let _ = (input, seen, value);
+        None
+    }
+
     /// Observe an authenticated, readable write in one of the protocol's collections,
     /// including one made by another installation of this app. An equal read can
     /// confirm a previously uncertain application. The protocol returns idempotent
@@ -1194,6 +1232,14 @@ pub trait Protocol: Send + Sync {
     ) -> Result<Vec<LocalWrite>, StoreFailure> {
         let _ = (observation, context);
         Ok(Vec::new())
+    }
+
+    /// Whether the seen mark of records in this collection lasts until a verified
+    /// current deletion (Switch spec 8.2). The client clears it in the same commit
+    /// that takes the deletion. A live unreadable value keeps its previous mark.
+    fn mark_ends_at_delete(&self, collection: &str) -> bool {
+        let _ = collection;
+        false
     }
 
     /// Observe another app's verified deletion of a record in this collection. The

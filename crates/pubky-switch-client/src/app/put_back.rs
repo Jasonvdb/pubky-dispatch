@@ -123,13 +123,12 @@ pub(super) async fn restore(
         for (key, mut hold) in local_holds {
             hold.observation.check(protocols, &meta.identity)?;
             let same = holds.get(&key);
-            if let Some(backup) = same {
-                if hold.observation.page_time_ms.is_none()
-                    && backup.observation.page_time_ms.is_some()
-                {
-                    hold.observation.page_time_ms = backup.observation.page_time_ms;
-                    hold.protects = backup.protects;
-                }
+            if let Some(backup) = same
+                && hold.observation.page_time_ms.is_none()
+                && backup.observation.page_time_ms.is_some()
+            {
+                hold.observation.page_time_ms = backup.observation.page_time_ms;
+                hold.protects = backup.protects;
             }
             hold.observing = same.is_none_or(|backup| {
                 backup.observing || backup.observation.page_time_ms != hold.observation.page_time_ms

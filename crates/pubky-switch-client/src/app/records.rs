@@ -124,6 +124,7 @@ impl ListDue {
                     seq,
                     names: vec![name.clone()],
                     call: false,
+                    held_gap: None,
                     deny: false,
                 })
             })
@@ -2196,6 +2197,7 @@ impl App {
                     generation,
                     seq,
                     deny: owed.call.is_deny(),
+                    held_gap: owed.call.held_gap(seq),
                     names: owed.to,
                     call: true,
                 })

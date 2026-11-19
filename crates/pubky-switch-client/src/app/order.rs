@@ -106,6 +106,8 @@ pub(crate) struct Kept {
     pub(crate) names: Vec<String>,
     /// A call, whose item the walk doesn't handle again; not a listing.
     pub(crate) call: bool,
+    /// A higher held cursor reported at this position, distinct from its ordinary item.
+    pub(crate) held_gap: Option<u64>,
     /// A deny list change, which no protocol is handed anything past while it is kept.
     pub(crate) deny: bool,
 }
@@ -217,8 +219,9 @@ impl App {
     /// A new retained call becomes a prerequisite before the read can hand over the
     /// next item, including a call kept at sequence zero (Switch spec 8.3).
     pub(crate) fn note_pending_call(&mut self, call: Kept) {
-        self.pending_calls
-            .retain(|kept| (kept.generation, kept.seq) != (call.generation, call.seq));
+        self.pending_calls.retain(|kept| {
+            (kept.generation, kept.seq, kept.held_gap) != (call.generation, call.seq, call.held_gap)
+        });
         self.pending_calls.push(call);
     }
 

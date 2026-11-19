@@ -497,6 +497,10 @@ struct LayerOut {
 struct BeyondCursor {
     /// The registered protocols whose layers and feed progress were taken together.
     protocols: Vec<String>,
+    /// Missed items already handed beyond the committed cursor.
+    missed: Vec<u64>,
+    /// The sequence and highest held cursor already handed to these layers.
+    held_gap: Option<(u64, u64)>,
     seen: Vec<u64>,
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
@@ -1788,6 +1792,14 @@ impl App {
             }
             backup.beyond_cursor = Some(BeyondCursor {
                 protocols: self.protocols.names(),
+                missed: reader
+                    .scan::<bool>("asked/")
+                    .await?
+                    .into_iter()
+                    .filter(|(_, missed)| *missed)
+                    .map(|(rest, _)| state::parse_num(&rest))
+                    .collect::<Result<_, _>>()?,
+                held_gap: reader.get(held_cursor::GAP_HANDED).await?,
                 seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
@@ -2216,7 +2228,11 @@ impl App {
                 next_stored_id: next_stored_id(None, &parked),
                 parked_round: backup.waiting.round,
                 seen,
-                asked: BTreeSet::new(),
+                asked: backup
+                    .beyond_cursor
+                    .iter()
+                    .flat_map(|layer| layer.missed.iter().copied())
+                    .collect(),
                 parked,
                 departed,
                 join: JoinStep::Done,
@@ -2258,8 +2274,8 @@ impl App {
             // protocol's local state with its layer, or with nothing, so a call the store
             // made after the backup is owed again: its writes are gone with that state. A
             // restore in place also carries the store's own calls; for a key both hold, the
-            // owners are both values' (`to`), the rest of the value the store's
-            // ([`union_owners`]).
+            // missed notices follow the layer's completed effects and each recipient's
+            // original read. Other calls keep the union of the two owner sets.
             let from_backup = Self::owed_of_backup(backup, &protocols);
             let mut waiting_notices = Vec::new();
             for notice in &backup.waiting.notices {
@@ -2386,6 +2402,10 @@ impl App {
                 let change = app.waiting_change(None, None, &drops)?;
                 change.stage(&mut app, &mut tx)?;
                 app.write_all(&mut tx).await?;
+                let mut held_gap = backup
+                    .beyond_cursor
+                    .as_ref()
+                    .and_then(|layer| layer.held_gap);
                 for notice in &waiting_notices {
                     app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
                 }
@@ -2443,7 +2463,24 @@ impl App {
                 }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                let current_sequence = app.state.own_doc.body().recovery_from.unwrap_or(0);
+                let mut retain_gap = |generation: u64, held: Option<u64>| {
+                    if generation > current_sequence
+                        && let Some(held) = held
+                    {
+                        let previous = held_gap
+                            .filter(|(sequence, _)| *sequence == current_sequence)
+                            .map_or(0, |(_, seq)| seq);
+                        held_gap = Some((current_sequence, previous.max(held)));
+                    }
+                };
                 for (stored, value) in &from_backup.0 {
+                    let (generation, seq) = feed::owed_place(
+                        stored.strip_prefix(key::OWED_PREFIX).ok_or_else(corrupt)?,
+                    )?;
+                    let owed: feed::Owed =
+                        serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                    retain_gap(generation, owed.call.held_gap(seq));
                     tx.put(stored, value)?;
                 }
                 carrying = true;
@@ -2453,6 +2490,25 @@ impl App {
                         .0
                         .iter()
                         .find_map(|(key, kept)| (key == stored).then_some(kept));
+                    if let Some(rest) = stored.strip_prefix(key::OWED_PREFIX) {
+                        let live: feed::Owed =
+                            serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                        if matches!(live.call, feed::OwedCall::Missed { .. }) {
+                            let place = live.check_place(rest)?;
+                            let original = in_backup
+                                .cloned()
+                                .map(serde_json::from_value::<feed::Owed>)
+                                .transpose()
+                                .map_err(|_| corrupt())?;
+                            if let Some(owed) =
+                                app.restore_missed(backup, place, original.as_ref(), &live)
+                            {
+                                retain_gap(place.0, owed.call.held_gap(place.1));
+                                tx.put(stored, &owed)?;
+                            }
+                            continue;
+                        }
+                    }
                     match in_backup {
                         Some(kept) if kept == value => {}
                         Some(kept) => {
@@ -2467,6 +2523,9 @@ impl App {
                         }
                         None => tx.put(stored, value)?,
                     }
+                }
+                if let Some(gap) = held_gap {
+                    tx.put(held_cursor::GAP_HANDED, &gap)?;
                 }
                 // What didn't read is left behind, and the protocol told how much.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
@@ -2552,6 +2611,9 @@ impl App {
         tx.put(key::CURSOR, &s.cursor)?;
         for (app, at) in &s.departed {
             tx.put(&key::departed(app), at)?;
+        }
+        for seq in &s.asked {
+            tx.put(&key::asked(*seq), &true)?;
         }
         for seq in &s.seen {
             tx.put(&key::seen(*seq), &())?;
@@ -3351,10 +3413,14 @@ impl App {
             // left behind, and counted.
             let read = feed::owed_place(&rest)
                 .and_then(|_| state::decode::<feed::Owed>(&bytes))
-                .and_then(|owed| owed.call.kept_op_body().map(|_| owed));
+                .and_then(|owed| {
+                    owed.check_place(&rest)?;
+                    owed.call.kept_op_body().map(|_| owed)
+                });
             match read {
                 Ok(mut owed) => {
                     owed.to.retain(|name| protocols.contains(name));
+                    owed.call.retain_owners(&owed.to);
                     if owed.check_owners(protocols).is_err() {
                         carried.lost_owed = carried.lost_owed.saturating_add(1);
                         continue;
@@ -3375,6 +3441,51 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// A missed call follows the installed layer. A live call supplies the original
+    /// observation for an owner whose installed state has yet to see the occurrence.
+    fn restore_missed(
+        &self,
+        backup: &AppBackup,
+        place: (u64, u64),
+        original: Option<&feed::Owed>,
+        live: &feed::Owed,
+    ) -> Option<feed::Owed> {
+        let (generation, seq) = place;
+        let after_cursor = self.feed_order(generation, seq)
+            > self.feed_order(backup.cursor.generation, backup.cursor.seq);
+        let gap = live.call.held_gap(seq);
+        let sequence = self.state.own_doc.body().recovery_from.unwrap_or(0);
+        let seen = |layer: &BeyondCursor| match gap {
+            Some(held) => layer.held_gap.is_some_and(|(s, last)| {
+                s == sequence && self.current_sequence(generation) && last >= held
+            }),
+            None => {
+                !after_cursor
+                    || (generation == backup.cursor.generation && layer.missed.contains(&seq))
+            }
+        };
+        let mut reads = Vec::new();
+        for name in self.protocols.names() {
+            if let Some(from_backup) = original.filter(|owed| owed.to.contains(&name)) {
+                reads.push((name.clone(), from_backup.call.missed_for(&name)?.clone()));
+                continue;
+            }
+            let installed = backup
+                .beyond_cursor
+                .as_ref()
+                .filter(|layer| layer.protocols.contains(&name));
+            if installed.is_some_and(|layer| original.is_some() || seen(layer)) {
+                continue;
+            }
+            let later =
+                original.is_none() && (after_cursor || (gap.is_some() && installed.is_some()));
+            if live.to.contains(&name) || later {
+                reads.push((name.clone(), live.call.missed_for(&name)?.clone()));
+            }
+        }
+        feed::Owed::missed_owners(reads)
     }
 
     /// The owed calls a backup carries, by stored key, each whole as a carried one must be
@@ -3406,7 +3517,12 @@ impl App {
                     continue;
                 }
             };
+            if owed.check_place(rest).is_err() {
+                lost = lost.saturating_add(1);
+                continue;
+            }
             owed.to.retain(|name| protocols.contains(name));
+            owed.call.retain_owners(&owed.to);
             if owed.check_owners(protocols).is_err() {
                 lost = lost.saturating_add(1);
                 continue;

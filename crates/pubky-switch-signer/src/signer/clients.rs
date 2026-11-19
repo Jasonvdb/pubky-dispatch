@@ -132,6 +132,14 @@ impl RequestClient {
         self.0.apps().await
     }
 
+    /// The verified generation and service time used together for a reduction cutoff.
+    pub(crate) async fn apps_with_head(
+        &self,
+    ) -> std::result::Result<(AppsAnswer, Option<pubky_switch_core::chain::SignedHead>), ClientError>
+    {
+        self.0.apps_with_head().await
+    }
+
     /// `PUT /identity` (Switch wire 7.4.2): a version signed already.
     pub(crate) async fn put_identity(
         &self,

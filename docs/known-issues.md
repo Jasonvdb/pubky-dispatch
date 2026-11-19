@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Surface `Alert::ReductionNotClosed` while a reduction still owes its closing delivery. Call `Signer::resume` or `Signer::run_due` when the account is reachable and any signing alarm is cleared. After one exact retry for the original proof, the signer can use the service time of a verified read of the same document. Development signer stores now retain the version of the proof retry without permanently disabling its closing.
+
 - `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.
 
 - When an upgrade drops a registered protocol, call `App::retire_protocol` with that protocol still registered. Load the same App ID with the reduced set after it succeeds. A backup made before retirement can still require the former registration. The [app host guide](app-host-guide.md#running-several-protocols) describes how to finish outstanding work and take a backup for the new set.
@@ -97,7 +99,6 @@ Collection listings show live records. A protected deletion can therefore be abs
 ### Signer
 
 - [keys] **A hand-over can strand the only sealed copy of the identity key.** If the receiver recorded that its take-over won, it can finish installing the key in its original vault after the service disappears, then use confirmed recovery at another provider. If the receiver has only an offer and could still have lost to a withdrawal, it needs the original service's decision or an independent copy of the identity key. Retain that copy until the receiving vault has confirmed possession.
-- [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
 - [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
 - [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A signed changed binding can lead to confirmed same-service restore when the original service now serves a verified identity document for the current account. Other permanent refusals and a surviving mark retain the applicable recovery options.
 - [availability] **Changing answers can prevent key recovery from finishing.** If a read changes what the user confirmed, recovery at a serving account returns `SurveyChanged`. Survey again when the sources are stable. A provider loss declared with the key can proceed when a source shows less than before, but new evidence still requires confirmation.

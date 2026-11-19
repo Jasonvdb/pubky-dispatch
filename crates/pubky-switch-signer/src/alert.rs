@@ -199,15 +199,11 @@ pub enum Alert {
         /// The newest version this signer's records hold.
         high_water_version: u64,
     },
-    /// A reduction's closing is owed and can't be delivered now, so the earlier certificates
-    /// of these apps aren't cut off yet. Either an alarm blocks every signing step: the
-    /// closing is delivered once the user has cleared the alarm and the switch is confirmed
-    /// again. Or the switch gave no service time for the renewing delivery, even on a retry:
-    /// a reduction's cutoff is the service's time, never the signer's own (Switch wire 3.8). The signer closes them at
-    /// the service time of the next version the user signs, and the alert stays until then.
-    /// Nothing is delivered on its own to get a time: to force the cut-off, the user makes a
-    /// change, or revokes the app, which cuts it off at once. A switch that keeps doing this
-    /// is faulty, and the user moves to another provider.
+    /// A reduction still owes its closing delivery. Earlier certificates remain open
+    /// until the service accepts it. Clear any signing alarm and let `resume` or
+    /// `run_due` retry. If the renewing delivery's exact retry supplied no proof,
+    /// the signer needs a verified read of the same document at that account to
+    /// establish the service-time cutoff (Switch wire 3.8).
     ReductionNotClosed {
         /// The apps whose reduction stays open.
         apps: Vec<[u8; 16]>,

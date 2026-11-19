@@ -858,41 +858,110 @@ async fn test_renewal_a_lost_renewing_answer_closes_at_the_switchs_time_for_it()
 }
 
 #[tokio::test]
-async fn test_renewal_a_closing_without_a_service_time_waits_for_the_next_delivery() {
+async fn test_renewal_proofless_retry_closes_at_the_verified_account_read_after_reopen() {
     let world = World::new();
-    let (mut signer, _) = world.enrolled().await;
+    let (mut signer, memory) = world.enrolled().await;
     let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
-    world.approve(&mut signer, &app).await;
+    let prior = world.approve(&mut signer, &app).await;
     let id = app.keys.app_id_bytes();
-    // The renewing delivery's answer is lost, and the switch then forgets its proof, so every
-    // retry answers without one (Switch wire 7.4.2).
+    let old = prior.listed_cert(&id).unwrap();
+    world.clock.advance_ms(DAY_MS);
+    let renewing_at = world.clock.now_ms();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/identity".into(),
     });
     signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    let renewing = world.switch.identity_doc().unwrap();
+    assert_eq!(renewals(&renewing, &id), [None]);
     world.switch.forget_delivery_proof();
+
+    // A later ordinary write advances the account's committed time.
+    world.clock.advance_ms(3_600_000);
+    let record_at = world.clock.now_ms();
+    let cert = world.switch.app(&id).renewed.unwrap();
+    let record =
+        AppRecord::sign(&app.keys, AppRecordBody::new(&cert, Vec::new(), record_at)).unwrap();
+    world
+        .switch
+        .app_op(
+            &app.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    let answer = world.signer_client(Some(START_MS)).apps().await.unwrap();
+    assert_eq!(answer.identity.as_ref(), Some(renewing.signed()));
+    assert_eq!(answer.server_time, record_at);
+    let device = Arc::new(pubky_switch_client::clock::TestClock::new(
+        record_at + 60_000,
+    ));
+    assert!(renewing_at < record_at && record_at < device.now_ms());
+
+    // Lose the first account read. Both exact delivery retries (the pending send
+    // and its one proof retry) finish; a later run retries only the read.
     let before = world.sent_docs().len();
-    let error = signer.resume().await.unwrap_err();
-    assert!(matches!(error, SignerError::InvalidData(_)), "{error:?}");
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    signer.resume().await.unwrap_err();
+    let retried = world.sent_docs();
+    assert_eq!(retried.len(), before + 2);
+    assert!(
+        retried[before..]
+            .iter()
+            .all(|doc| doc.signed() == renewing.signed())
+    );
     let alert = Alert::ReductionNotClosed { apps: vec![id] };
     assert!(signer.alerts().contains(&alert));
-    // A bounded number of deliveries, and later calls go on.
-    assert!(world.sent_docs().len() - before <= 2);
-    signer.resume().await.unwrap();
-    assert!(world.sent_docs().len() - before <= 2);
-    // The alert stays while the reduction is open.
-    signer.clear_alert(&alert).await.unwrap();
-    assert!(signer.alerts().contains(&alert));
-    // The next delivery carries a service time, a day later: the reduction closes at it,
-    // and the alert goes.
-    world.clock.advance_ms(DAY_MS);
-    signer.set_record_max_age(Some(86_400)).await.unwrap();
-    let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(
-        renewals(&doc, &id),
-        [Some(START_MS + DAY_MS + CLOCK_TOLERANCE_MS)]
+        world.switch.identity_doc().unwrap().signed(),
+        renewing.signed()
     );
+    world.switch.fail_next(SwitchFault::Head {
+        path: "/apps".into(),
+        at: None,
+        forked: false,
+    });
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::InvalidData(_)
+    ));
+    assert_eq!(world.sent_docs().len(), retried.len());
+    assert!(signer.alerts().contains(&alert));
+    drop(signer);
+
+    let mut env = world.env(memory.clone());
+    env.clock = device;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer.resume().await.unwrap_err();
+    let closing = world.switch.identity_doc().unwrap();
+    let until = record_at + CLOCK_TOLERANCE_MS;
+    assert_eq!(closing.version(), renewing.version() + 1);
+    assert_eq!(renewals(&closing, &id), [Some(until)]);
+    let sent = world.sent_docs();
+    assert_eq!(sent.len(), retried.len() + 1);
+    assert_eq!(sent.last().unwrap().signed(), closing.signed());
+    drop(signer);
+
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        closing.signed()
+    );
+    assert_eq!(world.published().unwrap().signed(), closing.signed());
+    assert_eq!(world.sent_docs().last().unwrap().signed(), closing.signed());
     assert!(!signer.alerts().contains(&alert));
+    assert!(closing.counts_at(&id, &old, record_at - 1));
+    assert!(!closing.counts_at(&id, &old, record_at));
+    world.assert_no_version_sent_twice();
 }
 
 #[tokio::test]

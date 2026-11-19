@@ -1206,6 +1206,20 @@ impl Signer {
         gate::signing_key(&self.keyring, &self.state, &self.store)
     }
 
+    /// The original service to show when asking about a first enrollment that is still
+    /// pending (Switch account binding 3). Read it again after reopening the signer.
+    ///
+    /// # Errors
+    ///
+    /// A lost store lease or an uncertain commit that must first be reloaded.
+    pub fn first_enrollment_origin(&self) -> Result<Option<&str>> {
+        self.check_owned_state()?;
+        Ok(match &self.flow {
+            Some(Flow::Enroll { origin, .. }) => Some(origin),
+            _ => None,
+        })
+    }
+
     /// Restart setup at the original `origin` after the user accepts that the earlier
     /// enrollment may have committed (Switch account binding 3). First retries the saved
     /// enrollment. An exact receipt continues setup at the creation it names. Only an

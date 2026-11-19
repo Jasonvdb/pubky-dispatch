@@ -10,7 +10,7 @@ A collection page can end at an inbox entry after the last chain operation. An e
 
 **Caller changes already on main**
 
-- A signer host offering a same-service restart after first enrollment expires must show the original origin and explain that creation may have committed. Pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
+- A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 
 - Custom transports used with `OpBatch::first_send_before` must implement `Transport::send_before`. Forward the supplied `FirstSend` through queues and wrappers. Check it with `FirstSend::check` after waiting for readiness, immediately before releasing the first request bytes. If bytes may already have been sent, report an uncertain transport failure. The default implementation returns `FirstSendUnavailable` without sending. The native HTTPS transport implements the check.
 

@@ -209,8 +209,13 @@ mod tests {
             // creation before its first send completes (Switch account binding 3).
             world.unreachable_after("POST", "/v1/enroll", 1);
         }
+        let origin = signer
+            .first_enrollment_origin()?
+            .ok_or("the original service is missing after restart")?
+            .to_owned();
+        assert_eq!(origin, ORIGIN);
         let restarted = signer
-            .restart_first_enrollment(ORIGIN, UserConfirmed::shown_and_confirmed())
+            .restart_first_enrollment(&origin, UserConfirmed::shown_and_confirmed())
             .await;
         if applied {
             restarted?;
@@ -228,6 +233,7 @@ mod tests {
             .identity_doc()?
             .ok_or("the first document is missing")?;
         assert_eq!(signer.status(), SignerStatus::Signing);
+        assert_eq!(signer.first_enrollment_origin()?, None);
         assert_eq!(
             (doc.version(), doc.generation(), doc.body().signer),
             (1, 1, install)

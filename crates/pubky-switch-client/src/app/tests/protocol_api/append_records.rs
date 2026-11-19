@@ -5,7 +5,7 @@ use crate::app::{AppendDecision, DeliveryView, KeptReason, RecordRead};
 
 pub(super) struct Gate {
     collections: Vec<Collection>,
-    observed: Mutex<Vec<[u8; 32]>>,
+    observed: Mutex<Vec<([u8; 32], Option<u64>)>>,
 }
 
 impl Gate {
@@ -33,7 +33,10 @@ impl Gate {
         d: &DeliveryView<'_>,
         records: &[(RecordTarget, RecordRead)],
     ) -> AppendDecision {
-        self.observed.lock().unwrap().push(d.hash());
+        self.observed
+            .lock()
+            .unwrap()
+            .push((d.hash(), d.recovery_from()));
         let id = d.message().msg_id.as_str();
         let targets = self.targets(id.as_bytes());
         let [(pending, first), (completed, second)] = records else {
@@ -164,8 +167,59 @@ async fn test_append_records_are_local_during_enumeration_and_read_for_each_time
         assert_eq!(requests(&setup.pair, from), [round.clone(), round].concat());
         assert_eq!(
             *setup.gate.observed.lock().unwrap(),
-            [setup.signed.plaintext().hash(); 2]
+            [(setup.signed.plaintext().hash(), None); 2]
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_delivery_view_tracks_the_signed_recovery_cutoff_after_reload() {
+    Box::pin(async {
+        let mut setup = Sending::new().await;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        *setup.protocol.delivery_check.lock().unwrap() = Some(Arc::new(move |delivery| {
+            captured.lock().unwrap().push(delivery.recovery_from());
+            Ok(false)
+        }));
+        let app_id = setup.wallet.app_id();
+        for (lost, origin) in [(1, "https://second.example"), (2, "https://third.example")] {
+            let next = ScriptedSwitch::recovering(
+                setup.pair.alice.identity().key(),
+                [lost as u8; 32],
+                setup.pair.clock.clone(),
+                lost + 1,
+                lost,
+            )
+            .unwrap();
+            let doc = setup
+                .pair
+                .alice
+                .sign_next(|body| {
+                    body.generation = lost + 1;
+                    body.recovery_from = Some(lost);
+                    body.inbox = Inbox::new(origin, next.service_key());
+                })
+                .unwrap();
+            next.deliver_identity(&doc).unwrap();
+            setup.pair.router.add_switch(origin, &next);
+            setup.wallet.refresh_identity().await.unwrap();
+            setup.wallet.receive(None).await.unwrap();
+            drop(setup.wallet);
+            setup.wallet = App::load(
+                setup.pair.env(&setup.pair.alice, setup.store.clone()),
+                setup.protocol.clone(),
+                config(),
+                app_id,
+            )
+            .await
+            .unwrap();
+            observed.lock().unwrap().clear();
+            let queued = setup.wallet.queued_messages("sample").await.unwrap();
+            assert!(queued.iter().any(|m| m.msg_id == setup.signed.msg_id()));
+            assert_eq!(*observed.lock().unwrap(), [Some(lost)]);
+        }
     })
     .await;
 }

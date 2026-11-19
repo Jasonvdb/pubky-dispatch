@@ -276,6 +276,7 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 |---|---|
 | `Publication::NotPublishing` | Public record publication is off. The app uses its service record. No homeserver write is due. |
 | `Publication::NothingAccepted` | The client knows of no service-accepted record to publish yet. Finish registration or delivery first. |
+| `Publication::AwaitingRecord` | A newer local choice is not settled. Finish the owner's member/expiry choice and delivery, or read its verified acceptance or supersession. No older accepted record is repaired meanwhile; the read itself can complete. |
 | `Publication::Published` | The public copy is up to date with the accepted record. Show publication complete. |
 | `Publication::Superseded` | The homeserver has a valid later record, for example from another device. Leave that newer copy in place. |
 | `Publication::Owed` | A required read or put failed. Show that the service accepted the record but publication is pending. The client retries on reads or changes. |

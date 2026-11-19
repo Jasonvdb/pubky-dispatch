@@ -4,6 +4,12 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
+  A newer retained signed record or unsigned owner edit defers repair of the older
+  accepted record, including after restore. Finish the owner's choice and delivery or
+  read its verified acceptance or supersession. An accepted-only restore still repairs
+  a missing public copy. No record is published before its acceptance is established.
+
 - App-record writers can use `App::set_protocol_member_with_expiry` with `RecordExpiry`
   and read their registered owner's desired state with `App::protocol_record`. Existing
   member setters now retain a blocked member change together with its expiry. A refusal

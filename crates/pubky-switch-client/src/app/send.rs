@@ -262,6 +262,7 @@ pub struct DeliveryView<'a> {
     resend: bool,
     local: super::LocalView<'a>,
     cert: &'a AppCert,
+    recovery_from: Option<u64>,
     naming: &'a NamingKey,
     store: &'a dyn crate::store::StateStore,
     ns: &'a str,
@@ -311,6 +312,12 @@ impl<'a> DeliveryView<'a> {
     /// The app's current certificate, as [`App::cert`] gives it.
     pub fn cert(&self) -> &AppCert {
         self.cert
+    }
+
+    /// The lost generation named by the app's current signed identity document
+    /// (Switch wire 3.3), or `None` when no provider loss is recorded.
+    pub fn recovery_from(&self) -> Option<u64> {
+        self.recovery_from
     }
 
     /// `blind(input)` under the app's naming key (Switch wire 1.5), as [`App::blind`]
@@ -3314,6 +3321,7 @@ impl App {
             resend: item.is_resend(),
             local,
             cert: &self.state.cert,
+            recovery_from: self.state.own_doc.body().recovery_from,
             naming: &self.state.naming,
             store: self.env.store.store().as_ref(),
             ns: &self.ns,

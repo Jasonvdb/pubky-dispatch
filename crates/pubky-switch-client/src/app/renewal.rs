@@ -289,9 +289,10 @@ impl App {
     }
 
     /// Present `cert` from now on, with the record `taken`: one signed here is kept with its
-    /// `app.put` and asks, each member it dropped told ([`AppEvent::MemberDropped`]). A certificate that reads a member of a collection of the protocol
-    /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
-    /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
+    /// `app.put` and asks, each member it dropped told ([`AppEvent::MemberDropped`]).
+    /// If the certificate can read a collection member the earlier certificate couldn't,
+    /// the same commit schedules a listing for the next read. Earlier writes to that
+    /// member appeared as stubs in the feed (Switch spec 8.3, Switch wire 7.4.9).
     ///
     /// With `accepted`, a record the switch holds that carries `cert`, that record is noted
     /// as the newest the switch accepted, in the same commit, and the published copy is

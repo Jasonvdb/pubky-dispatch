@@ -735,8 +735,8 @@ pub enum Outcome {
     /// [`MAX_STEP_LOCAL_BYTES`] bound as an [`Outcome::Apply`], and an over-bound step is
     /// stored and passed as too large without committing any of its local changes.
     Consume,
-    /// This input has not been admitted because the protocol's ordinary retained-state
-    /// rule cannot remove its required victim (Switch spec 8.2). All operations, local
+    /// The protocol cannot admit this input within its retained-state bound without
+    /// discarding protected state (Switch spec 8.2). All operations, local
     /// writes and processed-pair forgets staged by this callback are discarded. No pair
     /// is added. Before its cursor passes, the input or its payload-free drop notice is
     /// kept in the same transaction as the shared waiting-pool selection.

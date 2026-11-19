@@ -206,6 +206,32 @@ impl Protocol for ItemsProtocol {
                 .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn record_lifetime_ended(
+        &self,
+        record: &crate::app::RecordMarkContext<'_>,
+        version: RecordVersion,
+        cx: &crate::app::ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(record.collection.name, items().name);
+        if self.observation_unavailable.load(SeqCst) {
+            return Err(crate::app::StoreFailure::unavailable(
+                crate::error::StoreError::Unavailable,
+            ));
+        }
+        let mut value = lifetime_version(version);
+        if self.large_receipt.load(SeqCst) {
+            value.resize(crate::app::MAX_STEP_LOCAL_BYTES + 1, 0);
+        }
+        if cx.local_get(&record.key).unwrap().as_ref() == Some(&value) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![LocalWrite::Put {
+            key: record.key.to_vec(),
+            value,
+        }])
+    }
+
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
         let mut all = ids(seen);
         for id in ids(value) {
@@ -11645,6 +11671,10 @@ async fn seen_then_deleted(s: &Setup) -> (App, App, RecordTarget, [u8; 32]) {
     (wallet, phone, target, key)
 }
 
+fn lifetime_version(version: RecordVersion) -> Vec<u8> {
+    serde_json::to_vec(&[version.generation, version.version]).unwrap()
+}
+
 /// Both the author and an app reading a verified deletion accept a new first value
 /// after reloading. A live write that drops a seen item still fails its ordinary check.
 #[tokio::test]
@@ -11659,6 +11689,15 @@ async fn test_record_lifetime_ends_for_the_deleting_app_and_its_reader() {
     assert!(matches!(phone.read_record_fresh(&target).await.unwrap(),
         RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
     assert_eq!(phone.record_seen(&key).await.unwrap(), None);
+    let ended = lifetime_version(phone.shared_record(&key).await.unwrap().unwrap().version);
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(ended.clone())
+    );
+    assert_eq!(
+        phone.protocol_get("sample", &key).await.unwrap(),
+        Some(ended.clone())
+    );
     drop(wallet);
     let mut wallet = App::load(s.env(), s.protocol.clone(), World::config(), wallet_id)
         .await
@@ -11683,6 +11722,10 @@ async fn test_record_lifetime_ends_for_the_deleting_app_and_its_reader() {
     assert_eq!(
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["b"]
+    );
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(ended)
     );
 }
 
@@ -11713,6 +11756,7 @@ async fn test_record_lifetime_keeps_its_mark_through_an_unreadable_value_and_rel
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["a", "x", "y"]
     );
+    assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -11787,9 +11831,15 @@ async fn test_record_lifetime_waits_for_a_delete_view_covering_the_upload() {
         });
         let listed = wallet.list_collection(&target.collection).await.unwrap();
         assert_eq!(listed.records, 0);
+        assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
         assert_eq!(wallet.record_seen(&key).await.unwrap(), Some(mark));
         assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
             RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+        let version = wallet.shared_record(&key).await.unwrap().unwrap().version;
+        assert_eq!(
+            wallet.protocol_get("sample", &key).await.unwrap(),
+            Some(lifetime_version(version))
+        );
         assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
     })
     .await;
@@ -11844,9 +11894,51 @@ async fn test_record_lifetime_commits_the_deleted_value_and_mark_together() {
         ids(wallet.record_seen(&key).await.unwrap().as_deref()),
         ["a"]
     );
+    assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
     assert!(matches!(wallet.read_record_fresh(&target).await.unwrap(),
         RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
     assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    let version = wallet.shared_record(&key).await.unwrap().unwrap().version;
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(lifetime_version(version))
+    );
+}
+
+/// An installation that has not read the original value can still observe its
+/// verified deletion. A callback failure or oversized local write leaves it for retry.
+#[tokio::test]
+async fn test_record_lifetime_owner_can_retry_a_deletion_without_a_native_mark() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    s.protocol.end_mark_at_delete.store(true, SeqCst);
+    let mut phone = s.join("phone").await;
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("shared");
+    let key = wallet.record_key(&target).unwrap();
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.delete_record(&target, vec![]).await.unwrap();
+    assert_eq!(wallet.record_seen(&key).await.unwrap(), None);
+    for setting in [
+        &s.protocol.observation_unavailable,
+        &s.protocol.large_receipt,
+    ] {
+        setting.store(true, SeqCst);
+        assert!(wallet.read_record_fresh(&target).await.is_err());
+        setting.store(false, SeqCst);
+        assert_eq!(wallet.protocol_get("sample", &key).await.unwrap(), None);
+    }
+    let RecordRead::Fresh(deleted) = wallet.read_record_fresh(&target).await.unwrap() else {
+        panic!("the read covers the deletion");
+    };
+    assert_eq!(deleted.content, RecordContent::Deleted);
+    assert_eq!(
+        wallet.protocol_get("sample", &key).await.unwrap(),
+        Some(lifetime_version(deleted.version))
+    );
 }
 
 /// The mark after an own delete is the one before it, not a mark of nothing.

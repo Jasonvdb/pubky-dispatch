@@ -1301,6 +1301,51 @@ impl App {
             .map(|mark| mark.mark))
     }
 
+    /// Apply the collection owner's changes at the same verified boundary as its
+    /// native mark, including a later covering view of the delete (Switch spec 8.2).
+    fn end_record_lifetime(
+        &self,
+        key: [u8; 32],
+        collection: &Collection,
+        version: RecordVersion,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let owner = self
+            .protocols
+            .of_collection(&collection.name)
+            .ok_or_else(store_corrupt)?;
+        let record = super::RecordMarkContext {
+            key,
+            collection,
+            naming: &self.state.naming,
+        };
+        let context = super::ReceiveContext::new(
+            &self.state,
+            &self.protocols,
+            &owner.name,
+            self.env.store.store().as_ref(),
+            &self.ns,
+            false,
+            &[],
+            tx.pending_local(),
+            tx.pending_writes(),
+        );
+        let local = owner
+            .protocol
+            .record_lifetime_ended(&record, version, &context)
+            .map_err(AppError::Protocol)?;
+        let bytes = super::local_writes_bytes(&local);
+        if bytes > super::MAX_STEP_LOCAL_BYTES {
+            return Err(crate::error::StoreError::TooLarge {
+                size: u64::try_from(bytes).unwrap_or(u64::MAX),
+                cap: super::MAX_STEP_LOCAL_BYTES as u64,
+            }
+            .into());
+        }
+        tx.local(&super::protocols::qualify(&owner.name, local))?;
+        tx.delete(&seen_key(&key))
+    }
+
     // ---------------------------------------------------------------------------------
     // Reads from the switch
 
@@ -3246,7 +3291,7 @@ impl App {
         page_time_ms: Option<u64>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
-        Box::pin(async move {
+        let result = Box::pin(async {
             let key = accepted.key;
             // The application proof settles an own submission even while a foreign
             // observation is owed. Foreign handovers still follow the owner's feed order.
@@ -3341,7 +3386,7 @@ impl App {
                     }
                     // A fresh proof may be the first evidence that a held delete was current.
                     if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
-                        tx.delete(&seen_key(&key))?;
+                        self.end_record_lifetime(key, &accepted.collection, upgraded.version, tx)?;
                     }
                     if upgraded != *held {
                         put_held(tx, &key, &upgraded)?;
@@ -3534,7 +3579,8 @@ impl App {
                     )?;
                 }
                 Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
-                None if ends_mark || (own && !keeps_mark) => tx.delete(&seen_key(&key))?,
+                None if ends_mark => self.end_record_lifetime(key, &accepted.collection, accepted.write.version.version, tx)?,
+                None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
                 None => {}
             }
             let live_in = self.live_in(
@@ -3572,7 +3618,11 @@ impl App {
                 Taken::New
             })
         })
-        .await
+        .await;
+        if result.is_err() {
+            self.reload = true;
+        }
+        result
     }
 
     async fn record_source_current(

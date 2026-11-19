@@ -48,7 +48,10 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
     ));
     let ns = pubky_switch_signer::state::signer_namespace(&alice.public());
     let pending = store.scan(&ns, b"", None, 64)?;
-    assert!(first.survey_first_enrollment_restore(ORIGIN).await.is_err());
+    assert_eq!(
+        first.survey_first_enrollment_restore(ORIGIN).await,
+        Err(Refusal::KeyRecovery(KeyRecoveryStop::NotServing).into())
+    );
     assert_eq!(store.scan(&ns, b"", None, 64)?, pending);
     drop(first);
 
@@ -96,7 +99,13 @@ async fn restore_changed_creation(world: &World, backup: bool) -> FlowResult {
         Box::pin(first.restore_first_enrollment(&shown, &[], confirm())).await,
         Err(SignerError::Switch(ClientError::Transport(_)))
     ));
-    assert_ne!(store.scan(&ns, b"", None, 64)?, pending);
+    let selected = store.scan(&ns, b"", None, 64)?;
+    assert_ne!(selected, pending);
+    assert_eq!(
+        Box::pin(first.restore_first_enrollment(&shown, &[], confirm())).await,
+        Err(Refusal::FirstEnrollmentUnavailable.into())
+    );
+    assert_eq!(store.scan(&ns, b"", None, 64)?, selected);
     drop(first);
     let mut first = Signer::open(env, world.keyring(&alice)?).await?;
     Box::pin(first.resume()).await?;

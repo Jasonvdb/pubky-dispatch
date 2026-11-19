@@ -1,13 +1,15 @@
 //! An app's own record as its protocol changes it, delivered with `app.put` and published
 //! on the Homeserver (Switch spec 4.2, 12.1 step 2; Switch wire 3.2, 6.2).
 
+use pubky_switch_client::SwitchClient;
 use pubky_switch_client::app::{App, AppConfig, AppError, Publication};
 use pubky_switch_core::records::{AppRecord, app_record_path};
 use serde_json::{Map, Value, json};
 
 use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
-use super::messaging::joined_with;
+use super::messaging::{joined, joined_with};
+use super::upload::client_of;
 use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, notes_protocol};
 use crate::{FlowResult, World};
@@ -27,16 +29,27 @@ const DAY_MS: u64 = 24 * 3_600_000;
 /// apps with it.
 ///
 /// Calls, beyond the join's: the app's `POST /v1/{id}/ops` (`app.put` of a newer record,
-/// and the same batch again after a lost answer), `GET /v1/{id}/apps`.
+/// and the same batch again after a lost answer), the sibling app's `GET /v1/{id}/directory`
+/// after the join and first update, and the signer's `GET /v1/{id}/apps`.
 ///
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, or the Homeserver holds
-/// another record than the app's after a step that published it.
+/// another record than the app's after a step that published it, or a sibling app reads
+/// different record bytes in the directory.
 pub async fn own_record(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (reader, _) = Box::pin(joined(world, &alice, &mut signer, "phone")).await?;
+    let client = client_of(
+        world,
+        &alice,
+        "phone",
+        &reader,
+        ORIGIN,
+        reader.own_identity().inbox().service_key,
+    )?;
     let config = AppConfig {
         publishes_record: true,
         ..AppConfig::default()
@@ -46,15 +59,24 @@ pub async fn own_record(world: &World) -> FlowResult {
         joined_with(world, &alice, &mut signer, asking, notes_protocol(), config).await?;
     world.outcome("joined, published", &published(world, &wallet));
     on_the_homeserver(world, &wallet, true, "the join")?;
+    check_directory_record(&client, &wallet, None).await?;
+    let joined_record = wallet.record().clone();
 
     let expires = world.now_ms() + 30 * DAY_MS;
     let mut member = Map::new();
     member.insert("endpoints".into(), json!({ "sample": "payload" }));
     let set = wallet
         .set_protocol_member(NOTES, Some(member.clone()), Some(expires))
-        .await;
-    world.outcome("member set", &changed(world, &mut wallet, set));
+        .await?;
+    if set != Publication::Published {
+        return Err(format!("the member update returned {set:?}").into());
+    }
+    if wallet.record() == &joined_record {
+        return Err("the member update retained the signed join record".into());
+    }
+    world.outcome("member set", &changed(world, &mut wallet, Ok(set)));
     on_the_homeserver(world, &wallet, true, "the member set")?;
+    check_directory_record(&client, &wallet, Some(&member)).await?;
     world.advance_ms(STEP_MS);
 
     member.insert("more".into(), json!(1));
@@ -91,6 +113,32 @@ pub async fn own_record(world: &World) -> FlowResult {
     );
     signer.run_due().await?;
     world.outcome("signer ran what is due", &status(&signer)?);
+    Ok(())
+}
+
+/// The directory reader verifies the signed record the wallet just published (Switch wire 3.2).
+async fn check_directory_record(
+    reader: &SwitchClient,
+    writer: &App,
+    expected_member: Option<&Map<String, Value>>,
+) -> FlowResult {
+    let listed = reader
+        .directory(None)
+        .await?
+        .apps
+        .into_iter()
+        .find(|app| app.app_id == writer.app_id())
+        .ok_or("the directory omitted the publishing app")?;
+    if listed.record.signed() != writer.record() {
+        return Err("the directory returned a different signed app record".into());
+    }
+    if listed.record.body().protocol(NOTES) != expected_member {
+        return Err("the directory record holds a different notes member".into());
+    }
+    let body: Value = listed.record.signed().peek()?;
+    if body.get("label").is_some() {
+        return Err("the signed app record contains a display label".into());
+    }
     Ok(())
 }
 

@@ -107,10 +107,8 @@ pub(super) struct Judging {
 
 impl CertBody {
     /// The first record of an app joining under `cert`: no protocol has a member yet.
-    pub(super) fn first(cert: &AppCert, accepts: Vec<String>, label: Option<String>) -> Self {
-        let mut body = AppRecordBody::new(cert, accepts, 0);
-        body.label = label;
-        Self(body)
+    pub(super) fn first(cert: &AppCert, accepts: Vec<String>) -> Self {
+        Self(AppRecordBody::new(cert, accepts, 0))
     }
 
     /// `held` under `cert`, a renewal of the certificate its members were given for: `accepts` and each

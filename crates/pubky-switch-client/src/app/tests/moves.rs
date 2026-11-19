@@ -6329,7 +6329,9 @@ async fn test_loss_record_the_new_service_refuses_is_never_published() {
             .body()
             .clone();
     later.updated_at += 60_000;
-    later.label = Some("the other device".into());
+    later
+        .protocols
+        .insert("calendar".into(), Default::default());
     let later = pubky_switch_core::records::AppRecord::sign(&app_keys("wallet"), later).unwrap();
     let keys = app_keys("wallet");
     lost.next

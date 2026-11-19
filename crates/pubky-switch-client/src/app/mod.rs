@@ -203,8 +203,6 @@ pub const SERVICE_TIME_AHEAD_MS: u64 = DAY_MS;
 /// The integrator's choices for one app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
-    /// The display label in the app record.
-    pub label: Option<String>,
     /// The receive key rotation interval, at least [`MIN_ROTATION_MS`].
     pub rotation_interval_ms: u64,
     /// The bounded wait before an entry whose sender can't be checked is stored locally.
@@ -259,7 +257,6 @@ impl CallBudget {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            label: None,
             rotation_interval_ms: DEFAULT_ROTATION_MS,
             park_after_ms: DEFAULT_PARK_AFTER_MS,
             cursor_defer_ms: DEFAULT_CURSOR_DEFER_MS,
@@ -1006,9 +1003,8 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let record =
-                next_body::CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
-                    .sign(&keys, now, None)?;
+            let record = next_body::CertBody::first(&cert, protocols.accepts(&cert))
+                .sign(&keys, now, None)?;
             let client = Self::client_for(&env, &meta, &keys, &cert)?;
             let batch = client.sign_batch(
                 meta.generation,

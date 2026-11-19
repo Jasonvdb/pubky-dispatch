@@ -6453,6 +6453,54 @@ async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
 }
 
 #[tokio::test]
+async fn test_records_listing_named_permanent_generations_restarts_a_narrow_scan() {
+    let s = Setup::new();
+    let family = Collection::with_permanent_generations("sample.items", "sample-a", &["sample-a"]);
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut reader = s.join("wallet").await;
+    let mut writer = s.join("phone").await;
+    let named = |g| Collection::new(&family.name, family.policy.clone().permanent(Some(g)));
+    for n in 0..6 {
+        let key = format!("recipient-{n}");
+        writer
+            .put_record(
+                &RecordTarget::new(named(1), key.as_bytes()),
+                &value(&["issued"]),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+    s.w.switch.lock().max_page_bytes = 1;
+    let first = reader.list_collection(&named(2)).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    assert!(reader.records_of(&family.name).await.unwrap().is_empty());
+
+    let first = reader.list_collection(&family).await.unwrap();
+    assert!(first.more);
+    assert_eq!(first.records, 4);
+    let second = reader.list_collection(&family).await.unwrap();
+    assert!(!second.more);
+    assert_eq!(second.records, 2);
+    let found = reader.records_of(&family.name).await.unwrap();
+    assert_eq!(found.len(), 6);
+    assert!(
+        found
+            .iter()
+            .all(|r| r.policy == named(1).policy && r.content.value().is_some())
+    );
+    let template = RecordTarget::new(family, b"recipient-7");
+    assert!(reader.record_key(&template).is_err());
+    assert!(
+        reader
+            .record_op(&template, Some(&value(&["issued"])), vec![])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_records_list_collections_reads_at_most_its_page_budget_and_goes_on() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;

@@ -17,6 +17,9 @@ pub enum PolicyFamily {
     /// narrowed to `<name>:<sub>` and the others kept. An app holding `<name>` reads every
     /// member, one holding only `<name>:<sub>` its own (Switch spec 3.3, 8.2).
     SubScopes,
+    /// Records with the same read and write scopes and a permanent policy naming
+    /// their generation (Switch spec 10.3.1). Each record carries its own generation.
+    PermanentGenerations,
 }
 
 /// A collection of a protocol and its fixed policy (Switch spec 10.3). The collection name
@@ -51,6 +54,16 @@ impl Collection {
             name: name.to_owned(),
             policy,
             family: PolicyFamily::SubScopes,
+        }
+    }
+
+    /// Read permanent records naming any generation with exactly these scopes. For a
+    /// particular record, use a fixed collection naming its generation.
+    pub fn with_permanent_generations(name: &str, read_scope: &str, write_scopes: &[&str]) -> Self {
+        Self {
+            name: name.to_owned(),
+            policy: Policy::new(read_scope, write_scopes),
+            family: PolicyFamily::PermanentGenerations,
         }
     }
 
@@ -106,9 +119,19 @@ impl Collection {
     }
 
     /// Which member of the family `policy` is: `Some(None)` for the fixed policy,
-    /// `Some(Some(sub))` for the policy of sub-scope `sub`, `None` for a policy the
+    /// or a named permanent generation, `Some(Some(sub))` for the policy of sub-scope
+    /// `sub`, `None` for a policy the
     /// collection doesn't have.
     pub fn member(&self, policy: &Policy) -> Option<Option<String>> {
+        if self.family == PolicyFamily::PermanentGenerations {
+            return (policy.read_scope == self.policy.read_scope
+                && policy.write_scopes == self.policy.write_scopes
+                && policy
+                    .permanent
+                    .and_then(|p| p.generation)
+                    .is_some_and(|g| (1..=pubky_switch_core::json::MAX_INT).contains(&g)))
+            .then_some(None);
+        }
         if *policy == self.policy {
             return Some(None);
         }
@@ -176,8 +199,18 @@ impl RecordTarget {
         Ok(naming.record_key(
             &self.collection.name,
             &self.natural_key,
-            &self.collection.policy.hash()?,
+            &self.concrete_policy()?.hash()?,
         ))
+    }
+
+    pub(crate) fn concrete_policy(&self) -> Result<&Policy, AppError> {
+        if self.collection.family == PolicyFamily::PermanentGenerations {
+            return Err(Refusal::Usage(
+                "Switch spec 10.3.1: a record target must name its permanent generation".into(),
+            )
+            .into());
+        }
+        Ok(&self.collection.policy)
     }
 
     /// The record of `natural_key` in `collection`.

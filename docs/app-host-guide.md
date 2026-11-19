@@ -176,6 +176,7 @@ A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, an
 |---|---|
 | `PolicyFamily::Fixed` | Only the collection's declared policy is a member. Use that policy for its records. |
 | `PolicyFamily::SubScopes` | The collection admits the declared family of policies with sub-scopes. Derive and check the member with the collection's methods before reading or writing. |
+| `PolicyFamily::PermanentGenerations` | `Collection::with_permanent_generations` reads permanent records naming a positive generation and carrying exactly the declared read and write scopes. For a record key or write, use `Collection::new` with its concrete generation policy. |
 | `RecordRead::Fresh` | A read verified the service's current write as the one held. Use its content and flags. |
 | `RecordRead::Kept` | The lookup did not replace or confirm the held copy as current. Show the reason and the optional local record. |
 | `KeptReason::NotFound` | The current service reports no record here at a signed head covering the app's observations of this key. Preserve any earlier trusted value and show its age. |

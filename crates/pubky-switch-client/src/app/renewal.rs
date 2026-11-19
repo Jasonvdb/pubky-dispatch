@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::events::{AppEvent, Duty};
 use super::next_body::{CertBody, NextBody};
 use super::own_record::RecordExpiries;
+use super::record_members::RecordMembers;
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
@@ -148,13 +149,14 @@ impl App {
             return Ok(false);
         }
         let taken = later.signed().clone();
-        let record = if self.state.pending_record.is_some() {
-            let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-            let previous = old.updated_at().max(later.updated_at());
-            Taken::Judged(self.judge_for_cert(&cert, previous, Some(&later)).await?)
-        } else {
-            Taken::AsIs(taken.clone())
-        };
+        let record =
+            if self.state.pending_record.is_some() || !self.record_members().await?.is_empty() {
+                let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+                let previous = old.updated_at().max(later.updated_at());
+                Taken::Judged(self.judge_for_cert(&cert, previous, Some(&later)).await?)
+            } else {
+                Taken::AsIs(taken.clone())
+            };
         self.take_cert(cert, record, Some(taken), at).await
     }
 
@@ -171,6 +173,7 @@ impl App {
         over: Option<&AppRecord>,
     ) -> Result<Judged, AppError> {
         let asks = self.record_expiries().await?;
+        let members = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
@@ -179,16 +182,19 @@ impl App {
             None => None,
         };
         let mut asks = asks;
-        let (held, changed) = match over {
+        let (mut held, changed) = match over {
             Some(later) => {
                 let accepted = accepted.as_ref().map(AppRecord::body);
                 let before = held.body().clone();
                 let (built, changed) = held.over(accepted, later, &self.protocols);
-                keep_asks(&mut asks, &before, built.body());
+                keep_asks(&mut asks, &before, built.body(), &members);
                 (built, changed)
             }
             None => (held, Vec::new()),
         };
+        for (name, member) in members {
+            held.set_member(name, member);
+        }
         let judging = CertBody::judged(held, cert, &self.protocols, &asks, |ask| {
             ask.at(updated_at, max_age).is_some()
         });
@@ -218,7 +224,8 @@ impl App {
         let held = AppRecord::verify(&self.state.record, &identity)?;
         let taken = AppRecord::verify(taken, &identity)?;
         let mut asks = self.record_expiries().await?;
-        if keep_asks(&mut asks, held.body(), taken.body()) {
+        let members = self.record_members().await?;
+        if keep_asks(&mut asks, held.body(), taken.body(), &members) {
             tx.put(key::RECORD_EXPIRIES, &asks)?;
         }
         let changed = self.changed_from(held.body(), taken.body());
@@ -250,6 +257,7 @@ impl App {
             return Ok(false);
         };
         if self.state.pending_record.is_some()
+            || !self.record_members().await?.is_empty()
             || record.cert().hash() != self.state.cert.hash()
             || record.updated_at() <= held.updated_at()
         {
@@ -368,6 +376,7 @@ impl App {
             Some(judged) => {
                 tx.put(key::PENDING_RECORD, &judged.pending)?;
                 tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
+                tx.delete(key::RECORD_MEMBERS)?;
                 self.state.pending_record = Some(judged.pending);
                 dropped = judged.dropped;
                 self.tell_changed(&mut tx, judged.changed)?;
@@ -527,7 +536,11 @@ impl App {
             }
             // The asks of members gone from it go before it is signed.
             let mut asks = Box::pin(self.record_expiries()).await?;
-            let cleared = keep_asks(&mut asks, mine.body(), body.body());
+            let members = Box::pin(self.record_members()).await?;
+            let cleared = keep_asks(&mut asks, mine.body(), body.body(), &members);
+            for (name, member) in members {
+                body.set_member(name, member);
+            }
             let previous = held.updated_at().max(mine.updated_at());
             let updated_at = Box::pin(self.next_record_time(previous)).await?;
             let record = self.sign_record_at(body, &asks, updated_at)?;
@@ -537,6 +550,7 @@ impl App {
                 tx.put(key::RECORD_EXPIRIES, &asks)?;
             }
             self.tell_changed(&mut tx, changed)?;
+            tx.delete(key::RECORD_MEMBERS)?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
                 body: batch.body().to_vec(),
@@ -593,6 +607,15 @@ impl App {
             && cert.bundle_key() == self.state.keys.bundle_public()
             && is_renewal(&self.state.cert, cert)
         {
+            if !self.record_members().await?.is_empty() {
+                // Unsigned edits still belong to the certificate they were given for.
+                // Judge them for this renewal before any signature can carry them.
+                self.take_later(cert.clone(), later, None).await?;
+                if newer {
+                    self.take_own_copy(identity).await?;
+                }
+                return Ok(());
+            }
             // Before the newer document is taken, which would sign a renewal the app holds
             // into the dropped body; and before the drop, so a crash between the two leaves
             // the kept record, whose re-send then finds the later record under the
@@ -821,9 +844,18 @@ struct Judged {
 }
 
 /// Keep in `asks` only those of members `built` carries, and those whose member `held`
-/// lacked already; returns whether any went.
-fn keep_asks(asks: &mut RecordExpiries, held: &AppRecordBody, built: &AppRecordBody) -> bool {
+/// lacked already, plus the asks paired with unsigned edits; returns whether any went.
+fn keep_asks(
+    asks: &mut RecordExpiries,
+    held: &AppRecordBody,
+    built: &AppRecordBody,
+    members: &RecordMembers,
+) -> bool {
     let before = asks.len();
-    asks.retain(|name, _| built.protocols.contains_key(name) || !held.protocols.contains_key(name));
+    asks.retain(|name, _| {
+        members.contains_key(name)
+            || built.protocols.contains_key(name)
+            || !held.protocols.contains_key(name)
+    });
     asks.len() != before
 }

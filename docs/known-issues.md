@@ -4,6 +4,20 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- App-record writers can use `App::set_protocol_member_with_expiry` with `RecordExpiry`
+  and read their registered owner's desired state with `App::protocol_record`. Existing
+  member setters now retain a blocked member change together with its expiry. A refusal
+  still means the change has not been signed or published; `ProtocolRecord::pending`
+  reports that local intent. Use `App::record` and the publication result separately.
+  Explicit policy-only renewals retain their existing meaning. Regenerate development
+  backups: the current format requires `record_members`, even when empty. An in-place
+  restore refuses to replace a different pending member choice or import an unsigned
+  edit whose signed basis predates a newer local record. Finish the current choice and
+  take a backup carrying it before restoring. A newer local signature protects the
+  intent even while its delivery is pending; it is not proof of publication.
+
+- Keep an app display name in the host's local settings. Callers that set `AppConfig::label` or construct `AppRecordBody` with a `label` field must remove that assignment.
+
 - Surface `Alert::ReductionNotClosed` while a reduction still owes its closing delivery. Call `Signer::resume` or `Signer::run_due` when the account is reachable and any signing alarm is cleared. After one exact retry for the original proof, the signer can use the service time of a verified read of the same document. Development signer stores now retain the version of the proof retry without permanently disabling its closing.
 
 - `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.

@@ -743,8 +743,7 @@ pub(super) async fn expect_lists(
 pub(super) const CAROLS_FIRST_CALL: &str = "{carol/stall} PUT /v1/{alice}/peers";
 
 /// A client that sends requests as alice's app `name`, signed with the app's key, to the
-/// service `origin` whose key for her account is `service_key`: for an upload no app of
-/// the client crate would send.
+/// service `origin` whose key for her account is `service_key`.
 pub(super) fn client_of(
     world: &World,
     alice: &TestIdentity,

@@ -55,6 +55,7 @@ mod protocols;
 mod provider;
 mod push;
 mod put_back;
+mod record_members;
 mod recovery;
 mod renewal;
 mod retirement;
@@ -101,6 +102,7 @@ pub use protocol::{
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
+pub use record_members::ProtocolRecord;
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
@@ -203,8 +205,6 @@ pub const SERVICE_TIME_AHEAD_MS: u64 = DAY_MS;
 /// The integrator's choices for one app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
-    /// The display label in the app record.
-    pub label: Option<String>,
     /// The receive key rotation interval, at least [`MIN_ROTATION_MS`].
     pub rotation_interval_ms: u64,
     /// The bounded wait before an entry whose sender can't be checked is stored locally.
@@ -259,7 +259,6 @@ impl CallBudget {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            label: None,
             rotation_interval_ms: DEFAULT_ROTATION_MS,
             park_after_ms: DEFAULT_PARK_AFTER_MS,
             cursor_defer_ms: DEFAULT_CURSOR_DEFER_MS,
@@ -467,6 +466,8 @@ pub struct AppBackup {
     /// finite policy is the record's expiry. Empty while no protocol asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     record_expiries: Vec<(String, own_record::RecordExpiry)>,
+    /// Unsigned member edits, paired with their owners' expiry choices above.
+    record_members: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1006,9 +1007,8 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let record =
-                next_body::CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
-                    .sign(&keys, now, None)?;
+            let record = next_body::CertBody::first(&cert, protocols.accepts(&cert))
+                .sign(&keys, now, None)?;
             let client = Self::client_for(&env, &meta, &keys, &cert)?;
             let batch = client.sign_batch(
                 meta.generation,
@@ -1529,6 +1529,7 @@ impl App {
             held_counterparties: Vec::new(),
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
+            record_members: Vec::new(),
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
@@ -1671,6 +1672,7 @@ impl App {
             .map(|(rest, _)| rest)
             .collect();
         backup.record_expiries = self.record_expiries().await?.into_iter().collect();
+        backup.record_members = self.record_members().await?.into_iter().collect();
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -2112,6 +2114,19 @@ impl App {
                     "its record expiry policies are invalid or repeated",
                 ));
             }
+            let pending_members: record_members::RecordMembers =
+                backup.record_members.iter().cloned().collect();
+            if pending_members.len() != backup.record_members.len()
+                || pending_members
+                    .keys()
+                    .any(|name| !expiry_owners.contains(name))
+            {
+                return Err(invalid(
+                    "its pending record members are repeated or lack an expiry",
+                ));
+            }
+            record_members::check_members(&pending_members, &protocols)
+                .map_err(|_| invalid("its pending record members are invalid or too large"))?;
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
@@ -2152,6 +2167,57 @@ impl App {
                 .get::<Meta>(key::META)
                 .await?
                 .is_some_and(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+            if same_installation {
+                let live_members: record_members::RecordMembers =
+                    old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
+                record_members::check_members(&live_members, &protocols).map_err(|_| corrupt())?;
+                let live_expiries: own_record::RecordExpiries =
+                    old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
+                for (name, member) in &live_members {
+                    let expiry = live_expiries
+                        .get(name)
+                        .filter(|expiry| expiry.valid())
+                        .ok_or_else(corrupt)?;
+                    if pending_members.get(name) != Some(member)
+                        || !backup
+                            .record_expiries
+                            .iter()
+                            .any(|(owner, ask)| owner == name && ask == expiry)
+                    {
+                        return Err(Refusal::NotNow(
+                            "finish the pending record member before replacing its local state"
+                                .into(),
+                        )
+                        .into());
+                    }
+                }
+                if pending_members
+                    .keys()
+                    .any(|name| !live_members.contains_key(name))
+                {
+                    // The store can have completed a newer choice since this backup.
+                    // A local signature protects that intent even before acceptance;
+                    // accepted bytes protect it when only that copy survives locally.
+                    for key in [key::RECORD, key::ACCEPTED_RECORD] {
+                        let Some(signed) = old.get::<SignedDoc>(key).await? else {
+                            continue;
+                        };
+                        let current =
+                            AppRecord::verify(&signed, &meta.identity).map_err(|_| corrupt())?;
+                        if current.cert().app_id() != meta.app_id
+                            || current.cert().signing_key() != backup.keys.signing_public()
+                        {
+                            return Err(corrupt());
+                        }
+                        if current.updated_at() > record.updated_at() {
+                            return Err(Refusal::NotNow(
+                                "the backup's unsigned member predates a newer local record".into(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
             let mut deletions = deletion::restore(
                 &old,
                 &backup.deletions,
@@ -2325,6 +2391,15 @@ impl App {
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
+            let mut candidate = next_body::NextBody::held(&state)?;
+            for (name, member) in &pending_members {
+                candidate.set_member(name.clone(), member.clone());
+            }
+            if !pending_members.is_empty() {
+                candidate
+                    .check_writable(state.meta.generation, record.updated_at(), None)
+                    .map_err(|_| invalid("its pending record cannot be written"))?;
+            }
             // Every restore takes the backup's owed calls, each checked as a carried one is
             // and keeping only the protocols registered here; one that isn't whole, or is
             // owed to none of them, is left behind and counted. The restore replaces each
@@ -2536,6 +2611,9 @@ impl App {
                     let expiries: std::collections::BTreeMap<String, own_record::RecordExpiry> =
                         backup.record_expiries.iter().cloned().collect();
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                }
+                if !pending_members.is_empty() {
+                    tx.put(key::RECORD_MEMBERS, &pending_members)?;
                 }
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup

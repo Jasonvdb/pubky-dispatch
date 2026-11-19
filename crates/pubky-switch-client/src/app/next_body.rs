@@ -7,8 +7,10 @@
 
 use pubky_switch_core::json::check_json;
 use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::ops::{BatchRef, MAX_OP_BYTES, OpBody, OpKind, carrying_len};
 use pubky_switch_core::records::{AppCert, AppRecord, AppRecordBody};
 use pubky_switch_core::scopes::holds;
+use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Map, Value};
 
 use super::AppState;
@@ -83,6 +85,41 @@ impl NextBody {
         self.0.expires_at = expires_at;
     }
 
+    /// Check the candidate's exact form and carrying size without signing it. Empty
+    /// signature bytes are only size placeholders, never retained or sent.
+    pub(super) fn check_writable(
+        &self,
+        generation: u64,
+        updated_at: u64,
+        expires_at: Option<u64>,
+    ) -> pubky_switch_core::Result<()> {
+        let mut body = self.0.clone();
+        body.updated_at = updated_at;
+        body.expires_at = expires_at;
+        body.check(&body.identity)?;
+        let bytes = body.to_json()?;
+        check_json(&bytes)?;
+        let record = SignedDoc::from_parts(&bytes, &[0; 64]);
+        let operation = OpBody {
+            identity: body.identity,
+            app_id: Some(body.app_id),
+            generation,
+            batch: BatchRef {
+                id: [0; 16],
+                count: 1,
+            },
+            conditions: Vec::new(),
+            kind: OpKind::AppPut { record },
+        };
+        let operation = SignedDoc::from_parts(&operation.to_json()?, &[0; 64]);
+        if carrying_len(&operation.body, &operation.sig) > MAX_OP_BYTES {
+            return Err(pubky_switch_core::Error::Invalid(
+                "Switch wire 6.1: the app record exceeds the operation size".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn sign(
         self,
         keys: &AppKeys,
@@ -107,10 +144,8 @@ pub(super) struct Judging {
 
 impl CertBody {
     /// The first record of an app joining under `cert`: no protocol has a member yet.
-    pub(super) fn first(cert: &AppCert, accepts: Vec<String>, label: Option<String>) -> Self {
-        let mut body = AppRecordBody::new(cert, accepts, 0);
-        body.label = label;
-        Self(body)
+    pub(super) fn first(cert: &AppCert, accepts: Vec<String>) -> Self {
+        Self(AppRecordBody::new(cert, accepts, 0))
     }
 
     /// `held` under `cert`, a renewal of the certificate its members were given for: `accepts` and each

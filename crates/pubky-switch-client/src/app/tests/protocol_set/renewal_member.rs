@@ -932,3 +932,38 @@ async fn test_renewal_member_ask_without_member_survives_a_take() {
         Some(&RecordExpiry::At(deadline))
     );
 }
+
+#[tokio::test]
+async fn test_renewal_member_uses_pending_choice_under_the_new_certificate() {
+    let p = Pair::new();
+    let (mut app, store) = Box::pin(join(&p)).await;
+    let until = p.w.clock.now_ms() + HOUR;
+    app.renew_record("tasks", Some(until)).await.unwrap();
+    app.renew_record("chat", Some(until)).await.unwrap();
+    p.w.clock.advance_ms(2 * HOUR);
+    let desired = object(json!({ "list": "next", "assign": "team2" }));
+    usage(
+        app.set_protocol_member("tasks", Some(desired), None).await,
+        "chat",
+    );
+    *p.tasks.member_for.lock().unwrap() = Some(drop_assign);
+    *p.chat.member_for.lock().unwrap() = Some(|_, _, _| (None, RecordExpiry::Never));
+    let renewed = renew(&p, &app);
+    for _ in 0..3 {
+        p.w.clock.advance_ms(1000);
+        let _ = app.receive(None).await;
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    let desired = object(json!({ "list": "next" }));
+    let mut matched = 0;
+    for signed in store.records.lock().unwrap().iter() {
+        let record = AppRecord::verify(signed, &app.identity()).unwrap();
+        if record.cert().hash() == renewed.hash() {
+            matched += 1;
+            assert_eq!(record.body().protocol("tasks"), Some(&desired));
+            assert!(record.body().protocol("chat").is_none());
+        }
+    }
+    assert!(matched > 0);
+    assert!(!app.protocol_record("tasks").await.unwrap().pending);
+}

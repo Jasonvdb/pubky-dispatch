@@ -195,10 +195,10 @@ impl App {
     /// expiry asked (this protocol's or another's) at or before the next signed timestamp, naming the protocol
     /// that asked for it, a member the switch would refuse, or a record over the operation
     /// cap, before anything is signed. When another protocol's expiry has lapsed, this
-    /// protocol's `expires_at`, if later than that timestamp or `None`, is kept for the next signing,
-    /// and its `member` is not: the next record signed, at any protocol's change, carries
-    /// the expiry with the member the record held. [`Refusal::Stopped`], [`Refusal::Left`] or
-    /// [`Refusal::Gone`]; a store failure;
+    /// valid member change and expiry are kept together for the next signing. The call
+    /// still fails: nothing new has been signed or published. Every later signature
+    /// applies the pending members or waits for their owners' valid expiry choices.
+    /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`]; a store failure;
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
     pub async fn set_protocol_member(
@@ -251,6 +251,25 @@ impl App {
         .await
     }
 
+    /// Set a registered protocol's member and its explicit expiry policy together
+    /// (Switch spec 4.2). Unlike the lifetime convenience setter, an unchanged member
+    /// also adopts the supplied policy. Use [`App::protocol_record`] to read the desired
+    /// member and policy, including an unsigned edit held by another protocol's expiry.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::set_protocol_member`]. A refused signing can retain the pair locally;
+    /// it never reports publication of that unsigned edit.
+    pub async fn set_protocol_member_with_expiry(
+        &mut self,
+        protocol: &str,
+        member: Option<Map<String, Value>>,
+        expiry: RecordExpiry,
+    ) -> Result<Publication, AppError> {
+        self.set_member_expiry(protocol, member, expiry, false)
+            .await
+    }
+
     async fn set_member_expiry(
         &mut self,
         protocol: &str,
@@ -270,7 +289,10 @@ impl App {
                     return self.put_own_record(body, false, None).await;
                 }
                 let policies = self.record_expiries().await?;
-                if policies.get(&protocol) == Some(&expiry) && !self.record_needs_new_delivery() {
+                if policies.get(&protocol) == Some(&expiry)
+                    && !self.record_needs_new_delivery()
+                    && self.record_members().await?.is_empty()
+                {
                     let now = self.now().max(self.highest_service_time().unwrap_or(0));
                     for (name, policy) in &policies {
                         if matches!(policy, RecordExpiry::At(at) if *at <= now) {
@@ -285,9 +307,34 @@ impl App {
             } else {
                 expiry
             };
-            let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
+            let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+            let updated_at = self.next_record_time(held.updated_at()).await?;
+            expiry
+                .at(updated_at, self.state.own_doc.record_max_age_ms())
+                .ok_or_else(|| expiry_refused(&protocol))?;
+            let mut expiries = self.record_expiries().await?;
+            expiries.insert(protocol.clone(), expiry);
+            let mut members = self.record_members().await?;
+            members.insert(protocol.clone(), member.clone());
+            self.check_record_members(&members)?;
             body.set_member(protocol, member);
-            body.set_expires_at(self.resolve_record_expiries(&expiries, updated_at)?);
+            let expires_at = match self.resolve_record_expiries(&expiries, updated_at) {
+                Ok(expires_at) => expires_at,
+                Err(error) => {
+                    // The sibling's eventual ask is unknown. Check the minimum form
+                    // here and the exact resolved form before a later signature.
+                    body.check_writable(self.state.meta.generation, updated_at, None)
+                        .map_err(refused)?;
+                    // The unsigned member and its ask are one choice. Another owner's
+                    // later signature must apply both (Switch spec 4.2).
+                    let mut tx = self.tx()?;
+                    tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                    tx.put(key::RECORD_MEMBERS, &members)?;
+                    self.commit(tx).await?;
+                    return Err(error);
+                }
+            };
+            body.set_expires_at(expires_at);
             self.put_own_record(body, false, Some((&expiries, updated_at)))
                 .await
         })
@@ -498,7 +545,9 @@ impl App {
     async fn own_record_body(&mut self) -> Result<NextBody, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        Ok(NextBody::held(&self.state)?)
+        let mut body = NextBody::held(&self.state)?;
+        self.apply_record_members(&mut body).await?;
+        Ok(body)
     }
 
     /// Sign `body` as the app's next record, unless it is the record held and `renew` is
@@ -517,7 +566,8 @@ impl App {
         // goes again with this change, signed anew: the backup carries the accepted record
         // apart, and only that one is published (Switch spec 4.2).
         let unaccepted = self.record_needs_new_delivery();
-        if renew || unaccepted || body.body() != held.body() {
+        let pending_members = !self.record_members().await?.is_empty();
+        if renew || unaccepted || pending_members || body.body() != held.body() {
             let record = match expiries {
                 Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
                 None => self.sign_next_record(body, held.updated_at()).await?,
@@ -527,6 +577,7 @@ impl App {
             if let Some((expiries, _)) = expiries {
                 tx.put(key::RECORD_EXPIRIES, expiries)?;
             }
+            tx.delete(key::RECORD_MEMBERS)?;
             self.commit(tx).await?;
             self.state.record = record.signed().clone();
             self.state.pending_record = Some(pending);
@@ -580,6 +631,8 @@ impl App {
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
+        body.check_writable(self.state.meta.generation, updated_at, expires_at)
+            .map_err(refused)?;
         let record = body
             .sign(&self.state.keys, updated_at, expires_at)
             .map_err(refused)?;

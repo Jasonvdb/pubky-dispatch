@@ -298,7 +298,6 @@ Signed by the app's signing key (label `pubky-switch/v1/app-record`). Delivered 
 | `cert` | `signed<AppCert>` | yes | carrying form, signed by `identity` | |
 | `accepts` | `array<string>` | yes | full kind strings of the app's protocol, such as `tasks.assignment` or an extension kind such as `tasks-cap.offer` | may narrow the certificate's scopes, never widen them (spec 3.4). The app signs its record, so it adds a kind under a scope it holds, such as an extension kind, without a new certificate |
 | `protocols` | object | no | each member named by a protocol, with the syntax of a scope `name` (3.1); each value an object | default empty, and written as `{}` when the app's protocols add nothing. The members the app's protocols add to its record, each defined by its protocol, such as `tasks` for the `tasks` protocol. The switch checks only their form (Protocols' members, below) |
-| `label` | `string \| null` | no | | display only |
 | `updated_at` | time | yes | | the later `updated_at` wins between two copies; two different bodies with one `updated_at` are a conflict (Equal times, below; spec 4.2) |
 | `expires_at` | `time \| null` | yes, always written | | chosen by the app; `null` means the record doesn't expire. A protocol may require one |
 
@@ -346,7 +345,6 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
       }
     }
   },
-  "label": "bob shop",
   "updated_at": "2025-12-31T00:00:00.000Z",
   "expires_at": "2026-01-30T00:00:00.000Z"
 }
@@ -1334,19 +1332,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
+      "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
+      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
+    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
   }
 }
 ```
@@ -1363,7 +1361,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
   "ops": [
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "_yTDzcX99n7F-4c5R39619aNnDuSEZMTMCYtQ_RdfbUPBfE04MGc9FIiHqYGd5kPDUnJWpn4-nKgGEnPElmsDw"
+      "sig": "nmioOfbKIcvRzKA8d-PcgIkjqMGZ8Ld-005cEm2kyDIKdPJbDVx2h7S0ex3Y81eaCHSMBhwPoejCoMrbg5ZeCg"
     },
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
@@ -1435,7 +1433,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
+    "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
   },
   "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
@@ -1495,7 +1493,7 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw",
+  "prev_chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
   "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
@@ -1521,11 +1519,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+  "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+  "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
 }
 ```
 
@@ -1979,7 +1977,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw"
+        "chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q"
       }
     },
     {
@@ -1987,7 +1985,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
+        "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
       },
       "item_type": "op",
       "item": {
@@ -1996,7 +1994,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
+        "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
       }
     },
     {
@@ -2004,7 +2002,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "L0v5_hmltlaZgDMwk4pDQeO0KqqDwXeRvtBGVY5z0Q4"
+        "chain_hash": "FUO2jAt4Utmo_VDYg-Xj_2dx4sYVafF_zT41AbQA3jI"
       },
       "item_type": "op",
       "item": {
@@ -2013,7 +2011,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
+        "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
       }
     },
     {
@@ -2021,7 +2019,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA"
+        "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE"
       },
       "item_type": "service",
       "item": {
@@ -2038,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
+    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
   }
 }
 ```
@@ -2148,7 +2146,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbrcoWMIYkueFEF0uL1L2P7uViYpyru26Lkipx-i1t02MneCQ"
+        "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk5kI3A1XBsBqD5HDaHZHqzd2LwtqS3ManDz5P2wKDVrtfCg"
       }
     },
     {
@@ -2159,7 +2157,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
+        "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
       }
     },
     {
@@ -2170,7 +2168,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "cZqYi_BOCmqHIY80XwzbE2L5DPdsie1e5Zv6Il2EvKhavdUXmup0lG01pmVdc4Tap7I-WaNL_DXmLDbQQbRbAg"
+        "sig": "OQZs0jtgT_O6ypCGAtgzycQZvHM4zCYU2di6nd2adg_y8zESH8L8nl-RItHdINXbHd4o1-EnwLVZaZJ2l0GyDw"
       }
     }
   ],
@@ -2436,7 +2434,7 @@ Example (`409 stale_key`, records cut short):
         "app_id": "c1utah9jitjs43etzdkj6cqdwr",
         "app_record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
+          "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
         },
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
@@ -2931,17 +2929,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "HDiFHOlPNQId9KGGr1CcEfpCfks1oxSkDba9uRxfO58",
-    "sig": "AxFJFQnl71N8EFGYMpWPkFBwQdAJOK_IJz2nWZsS..."
+    "chain_hash": "iHbOghlbHysr_-JXzT77EybQD1PuuuzturKanqf6YFg",
+    "sig": "gi1IwXy4tJh7ozhLclnPGed17QgayBNQ4zZJtvKD..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 28982,
+  "bytes": 29038,
   "chunks": [
     {
       "id": "00000",
-      "len": 28982,
-      "hash": "dG2Xe-sx30GQlHT3YT6ennfz_Q5-2pL7199woRB_vbo",
+      "len": 29038,
+      "hash": "bcxYROF7FzGEgvT-Nxo4wf0ti2wExdwgTgixDWh1cXU",
       "first": 0,
       "last": 18
     }
@@ -3034,7 +3032,7 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRy..."
+    "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5..."
   },
   "cert": null
 }
@@ -3055,7 +3053,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBb..."
+      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjU..."
     },
     "read_scope": "tasks",
     "seq": 8,
@@ -3078,7 +3076,7 @@ The wallet's `app` part:
   "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "record": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbr..."
+    "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
@@ -3112,7 +3110,7 @@ The first `batch` part:
   "id": "43lMSHQ8vKwdwxES7T9SUw",
   "record": {
     "at_ms": 1767225601000,
-    "ops_hash": "piV-jr-g2YX_JlSqnH26awNUBwM1TpMuhq6DnsJ1gPE",
+    "ops_hash": "ny26f78GClxEQ7P6maDnoueX0NvFubeZ2sCTy5a16-I",
     "proofs": []
   }
 }

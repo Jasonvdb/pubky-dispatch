@@ -590,8 +590,13 @@ impl World {
     ///
     /// When the keyring doesn't open.
     pub fn keyring(&self, identity: &TestIdentity) -> Result<IdentityKeyring, HarnessError> {
-        let vault = Arc::new(MemoryVault(Mutex::new(Some(identity.key().secret_bytes()))));
-        IdentityKeyring::open(vault).map_err(|error| HarnessError::Setup(error.to_string()))
+        IdentityKeyring::open(self.identity_vault(identity))
+            .map_err(|error| HarnessError::Setup(error.to_string()))
+    }
+
+    /// A populated identity vault that a restarted signer can reopen.
+    pub(crate) fn identity_vault(&self, identity: &TestIdentity) -> Arc<dyn SecretVault> {
+        Arc::new(MemoryVault(Mutex::new(Some(identity.key().secret_bytes()))))
     }
 
     /// An empty vault, as on an install that doesn't hold the identity's key yet: a signer

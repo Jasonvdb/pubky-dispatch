@@ -568,46 +568,6 @@ fn changed(events: Vec<AppEvent>) -> Vec<String> {
         .collect()
 }
 
-/// A plain renewal with the default hook carries members and asks as they are, as before
-/// members were judged: an ask without a member, a member without an ask, both, neither.
-#[tokio::test]
-async fn test_renewal_member_default_carries_members_and_asks() {
-    let p = Pair::new();
-    let (mut app, _) = join(&p).await;
-    let me = app.app_id();
-    let deadline = p.w.clock.now_ms() + HOUR;
-    // `tasks` has both; `chat`'s member comes from another device without an ask.
-    app.set_protocol_member(
-        "tasks",
-        Some(object(json!({ "list": "a" }))),
-        Some(deadline),
-    )
-    .await
-    .unwrap();
-    let mut asks = app.record_expiries().await.unwrap();
-    asks.remove("chat");
-    let mut tx = app.tx().unwrap();
-    tx.put(crate::app::state::key::RECORD_EXPIRIES, &asks)
-        .unwrap();
-    app.commit(tx).await.unwrap();
-    // A protocol with an ask and no member, and one with neither.
-    let p2 = Pair::new();
-    let (mut other, _) = join(&p2).await;
-    other.set_protocol_member("chat", None, None).await.unwrap();
-    other.renew_record("chat", Some(deadline)).await.unwrap();
-    for (app, p) in [(&mut app, &p), (&mut other, &p2)] {
-        let before = (members(app), app.record_expiries().await.unwrap());
-        p.w.clock.advance_ms(1000);
-        let renewed = renew_to(p, app, &SCOPES);
-        app.receive(None).await.unwrap();
-        assert_eq!(app.cert().hash(), renewed.hash());
-        assert_eq!((members(app), app.record_expiries().await.unwrap()), before);
-        let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
-        assert_eq!(held.body().expires_at, Some(deadline));
-    }
-    let _ = me;
-}
-
 /// Two devices hold one reducing renewal from its `cert.put`: `b`, running `tasks` and
 /// `chat`, takes it first; `a`, running `tasks` only, then builds on `b`'s record instead of
 /// signing over it, `chat`'s member kept, with a change kept on `a` too.

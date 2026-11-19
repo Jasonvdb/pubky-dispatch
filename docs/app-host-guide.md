@@ -336,7 +336,11 @@ A freeze, a new provider and a lost provider require different user messages. Us
 |---|---|
 | `AppEvent::RecoveryRequired` | Tell the user the followed service requires recovery and acknowledge the event after displaying or storing it. Show the verified notice from `App::recovery_required` on reopen. Reads and sends to other identities remain available. |
 | `AppEvent::RecoveryNoticeCleared` | A later signed read confirmed service at the same generation. Ask the normal attempt gate before resuming work. |
+| `ProviderHealth::Ok` | The app has no verified recovery notice or established outage. Use the usual attempt checks before starting new work. |
 | `ProviderHealth::Unreachable` | Show when unanswered own requests began. A host can set its reporting interval with `set_unreachable_after_ms`. |
+| `ProviderHealth::RecoveryRequired` | Show the verified reason, generation and time from the notice. A permanent notice requires following the signed recovery at a later generation. |
+| `ProviderStatus::RecoveryRequired` | Following the provider found an active recovery notice. Continue checking the signed identity for the service to follow, and keep outstanding work for reconciliation. |
+| `Refusal::RecoveryRequired` | The attempt or own-account write is held for the named generation. Show the recovery notice and retain any outstanding operation. |
 | `AppEvent::ProviderChanged` | The newest own identity document points to another generation. Follow it and update the provider display when the change completes. |
 | `AppEvent::Moved` | A verified freeze suspends writes at the old service. Show the move in progress and keep pending writes. |
 | `ProviderStatus::AwaitingMove` | The client is waiting for the next generation to be published. Poll later. Avoid creating new copies of pending work. |
@@ -351,6 +355,12 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::EvidenceUploaded` | The service answered the evidence upload. The reported counts (zero if absent) can help diagnose what was uploaded. This answer alone does not settle every missing record or claim. |
 | `AppEvent::EvidenceRefused` | The upload received a service refusal, or was too large to send. The client reports the code and goes on. Keep the evidence and involve the signer for import conflicts. Other transport failures can be retried. |
 | `AppEvent::ProviderLost` | The identity declared the old generation lost. Suspend new attempts. Show that old inbox entries and unbacked records may be unavailable, and that an unanswered action may already have run. |
+| `RecoveryStep::Register` | The app is registering this installation at the replacement service. Keep its recovery record and let the client resume. |
+| `RecoveryStep::Upload` | The app is submitting the signed evidence it retained. Show the upload result and any omitted items when available. |
+| `RecoveryStep::Lists` | The app is restoring the contact and deny lists its certificate lets it manage. |
+| `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
+| `RecoveryStep::Conversations` | The app is restoring conversation entries at the replacement service. |
+| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and payment evidence before ending reconciliation. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
 | `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |
@@ -476,6 +486,8 @@ Only `TransportError::Refused` and `TransportError::Connect` allow the client to
 
 | Case | What happened and what to do |
 |---|---|
+| `ClientError::OwnRecoveryRequired` | The app holds a verified recovery notice for this service generation. Keep the original own-account write for reconciliation and let the app follow its provider. |
+| `ClientError::DisplayReadPending` | The foreground owner is waiting for the original signed display read to finish. Deliver its retained transport outcome through `App::finish_display_read` before starting another own request. |
 | `ClientError::Switch` | The pinned key authenticated a refusal bound to the request. Use `code()`, `retry()`, the current value and any retry interval. Honour backoff and conditions. A caller-level refusal may leave a batch pending. |
 | `ClientError::BodyUnread` | A signed size, rate or not-found answer binds the request without its body. It cannot settle that body's fate. Honour any retry delay and keep the original batch. |
 | `ClientError::BadServiceSignature` | The response signature is missing, unreadable or fails under the pin. Even the status is untrusted. Keep any pending write and check the provider through the signed identity. |

@@ -6453,6 +6453,51 @@ async fn test_records_listing_reads_at_most_its_page_budget_and_goes_on() {
 }
 
 #[tokio::test]
+async fn test_records_listing_named_generations_waits_for_the_new_child_or_parent_key() {
+    for grant in ["sample-a:shop", "sample-a"] {
+        let s = Setup::new();
+        let family = Collection::with_permanent_generations(
+            "sample.items",
+            "sample-a:shop",
+            &["sample-a:shop"],
+        );
+        *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+        let mut writer = join_scoped(&s, "phone", &["sample-a"]).await;
+        let target = RecordTarget::new(
+            Collection::new(&family.name, family.policy.clone().permanent(Some(1))),
+            b"shop",
+        );
+        writer
+            .put_record(&target, &value(&["issued"]), vec![])
+            .await
+            .unwrap();
+        let key = writer.record_key(&target).unwrap();
+        let mut reader = join_scoped(&s, "wallet", &["sample-a:other"]).await;
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        s.w.clock.advance_ms(HOUR);
+        let earlier = reader.cert().clone();
+        let renewed = renewed_cert(&s, "wallet", &[grant]);
+        s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+        reader.receive(None).await.unwrap();
+        assert_eq!(reader.cert().hash(), renewed.hash());
+        assert!(family.readable_by(reader.cert()));
+        assert!(reader.listing_owed().await.unwrap(), "{grant}");
+        let before = s.w.switch.lock().shared.listings;
+        reader.receive(None).await.unwrap();
+        assert_eq!(s.w.switch.lock().shared.listings, before, "{grant}");
+        assert!(reader.shared_record(&key).await.unwrap().is_none());
+        store_parts_for(&s, &renewed);
+        reader.receive(None).await.unwrap();
+        reader.receive(None).await.unwrap();
+        assert!(!reader.listing_owed().await.unwrap());
+        let held = reader.shared_record(&key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), ["issued"], "{grant}");
+    }
+}
+
+#[tokio::test]
 async fn test_records_listing_named_permanent_generations_restarts_a_narrow_scan() {
     let s = Setup::new();
     let family = Collection::with_permanent_generations("sample.items", "sample-a", &["sample-a"]);

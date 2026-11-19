@@ -4,7 +4,7 @@
 
 **Named record authority.** Sections 1.5 and 6.2 specify the next record format. Until the client and service implement it and the corresponding vectors and examples are updated together, the executable examples use one set of write scopes and carry the address inputs on creation. A deployment adopts the new format as a whole.
 
-**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
+**Test vectors.** `spec/vectors/` holds the executable vectors for the current encodings, signatures, derivations, envelopes and state transitions. Its `README.md` lists the files. The runtime that adopts separate creation authority adds the corresponding record vectors. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
 
 **Conventions.**
 
@@ -123,7 +123,7 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 
 - **Whose naming key.** Record keys, and a protocol's claim keys, are blinded with the naming key of the identity whose Pubky Switch holds them. Equal inputs give equal outputs within one identity, so all its apps find the same record and claim, and the stored keys name neither the counterparty nor the other inputs. That protects stored state and exports, not against a live operator, which links records and claims to senders through batches and timing (spec 15).
 
-Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` `blinded_inputs` and every value of the table, with the blinded inputs of each record key; the record keys use the collections and natural keys of `tasks`.
+Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` contains the current policy hashes and record keys with their blinded inputs, using the collections and natural keys of `tasks`. The new hashes and record keys for policies with a `create_scope` arrive with the runtime that implements them.
 
 ### 1.6 Times
 

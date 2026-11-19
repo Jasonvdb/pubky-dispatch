@@ -215,6 +215,13 @@ pub enum PutBack {
         /// view when its first verified feed page supplies the time.
         observed: Vec<LocalWrite>,
     },
+    /// Publish the complete value over this exact signed deletion (Switch spec 10.3).
+    Write {
+        /// Local writes committed when the owner first observes the deletion.
+        observed: Vec<LocalWrite>,
+        /// Complete replacement as strict JSON.
+        value: Vec<u8>,
+    },
 }
 
 /// A readable, authenticated live application after a deletion of the same record.
@@ -247,6 +254,11 @@ pub enum PutBackSuccessor {
     Wait,
     /// This applied value already contains everything required for this deletion.
     Covered,
+    /// Publish the combined value, conditional on this exact live application.
+    Merge {
+        /// Complete strict JSON, including the successor's additional members.
+        value: Vec<u8>,
+    },
 }
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
@@ -1355,7 +1367,8 @@ pub trait Protocol: Send + Sync {
     /// delete. Its bounded local writes commit under this protocol's namespace.
     /// A store failure leaves the observation owed before later handovers to its owner.
     /// Return [`PutBack::Prepare`] to keep the service cursor before this deletion
-    /// while another writer publishes an acceptable record.
+    /// while another writer publishes an acceptable record, or return [`PutBack::Write`]
+    /// to condition the owner's complete value on this exact deletion.
     fn record_put_back(
         &self,
         deletion: &RecordDeletion<'_>,

@@ -290,8 +290,8 @@ impl Signer {
     async fn restore(&mut self, ok: UserConfirmed) -> Result<IdentityDoc>;   // in place: records behind, or taking over from another install
 
     async fn run_due(&mut self) -> Result<RunDue>;
-    fn status(&self) -> SignerStatus;   // Signing | ManagedBy { install } | HandingOver { to_app } | Succeeded { by_app }
-    fn alerts(&self) -> Vec<Alert>;
+    fn status(&self) -> SignerStatus;
+    fn alerts(&self) -> &[Alert];
     fn apps(&self) -> Result<Vec<AppSummary>>;  // per app: standing, certificate, open renewal, protocols, distrust_from, untaken renewals, its alerts
     async fn open_attempts(&mut self, app_id: [u8; 16]) -> Result<u64>;  // before a revocation: its open and unknown attempts
 
@@ -355,31 +355,7 @@ async fn resume_take_over(env: SignerEnv, identity: [u8; 32], keys: &AppKeys, va
 
 ### 5.1 Alerts
 
-```text
-Alert = Equivocation { version, ours, theirs }      // stop, show
-      | Rollback { source, seen, high_water }
-      | Refused { action, reason }                  // e.g. service_keys over 256, import limit too low
-      | ImportConflict { conflicts }
-      | ManagedByOtherInstall { install }           // offer take-over
-      | HandOverPending { to_app, since } | HandOverTookEffect { by_app } | HandOverRefused { reason }
-      | BackupWriteFailed                           // after a racing delivery won
-      | RotationSkipped { app, scopes }             // no registered protocol owns them
-      | RenewalsStopped { app, expires_at }        // two automatic renewals untaken: not renewed by itself, lapses at expires_at
-      | RenewalRefused { app, reduction, by_user }  // the renewal didn't happen: the app keeps its listed certificate; a reduction didn't reduce
-      | RenewalSkipped { app, reason }              // past half its lifetime, not renewed by itself: unowned or refused scopes, or other permissions now
-      | ClockOff                                    // the device clock is off the switch's time: nothing issued or renewed
-      | AccountNotHosted                            // GET /apps got an unsigned 404, no erasure in progress: nothing deleted, cleared by any signed answer to GET /apps, an error included
-      | ServiceHoldsNoAccount                       // GET /apps got the signed not-hosted 404, no erasure in progress: the service's word, nothing deleted, cleared by any other signed answer
-      | ServiceKeyTaken { origin, pinned, service_key } // a declaration's enrollment named another key than the pinned one: taken, and shown
-      | IdentityNearLimit { bytes, limit }          // identity.json past 3/4 of the 256 KiB cap of a delivery or a move's enrollment
-      | AppIdle { app, last_seen }                  // suggest removal after 90 days
-      | LapsingWithOpenAttempts { app, expires_at, open_attempts }   // renewals stopped, attempts it would orphan at its expiry
-      | RevokedWithOpenAttempts { app, open_attempts }               // revoked, attempts left orphaned
-      | GrantRevocationOwed { app }
-      | PreviousServiceErasable { origin }
-```
-
-Each alert carries the facts to show. The wording is the host's.
+`Signer::alerts()` returns a borrowed slice. The [`Alert` enum](../crates/pubky-switch-signer/src/alert.rs) defines the variants and their fields. The [signer host guide](signer-host-guide.md) describes what to show the user and which actions to offer for each flow.
 
 ### 5.2 Errors
 

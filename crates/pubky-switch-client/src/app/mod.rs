@@ -747,6 +747,8 @@ pub struct App {
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
     last_collection_read: Option<Arc<feed::ReadCoverage>>,
+    /// Which local certificate a checked own directory establishes at one signed service head.
+    record_page_reader: Option<records::PageReader>,
     /// The sequence and highest held cursor reported ahead with
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
@@ -1111,6 +1113,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1283,6 +1286,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -2367,6 +2371,7 @@ impl App {
                 reads_begun: 0,
                 held_cursor_read: None,
                 last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,

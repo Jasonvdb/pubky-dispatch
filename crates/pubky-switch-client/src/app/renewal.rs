@@ -685,9 +685,16 @@ impl App {
     /// registers nothing at this switch. Otherwise it returns the own receive key record the
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
     pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
-        let me = self.state.meta.app_id;
         let result = self.client.directory(None).await;
         let directory = self.take(result).await?;
+        self.take_directory_cert(directory).await
+    }
+
+    pub(super) async fn take_directory_cert(
+        &mut self,
+        directory: crate::client::answers::Directory,
+    ) -> Result<Listed, AppError> {
+        let me = self.state.meta.app_id;
         if directory.identity.version() > self.state.own_doc.version() {
             self.take_own_copy(directory.identity.clone()).await?;
         }

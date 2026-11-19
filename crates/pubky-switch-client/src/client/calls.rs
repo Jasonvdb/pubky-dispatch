@@ -614,6 +614,16 @@ impl SwitchClient {
     ///
     /// As every call; [`ClientError::Core`] for a document that doesn't verify.
     pub async fn directory(&self, invite_code: Option<&str>) -> Result<Directory, ClientError> {
+        self.directory_with_head(invite_code)
+            .await
+            .map(|(directory, _)| directory)
+    }
+
+    /// The verified directory and the head the service signs for its own app.
+    pub(crate) async fn directory_with_head(
+        &self,
+        invite_code: Option<&str>,
+    ) -> Result<(Directory, Option<SignedHead>), ClientError> {
         let checked = self
             .call(
                 "GET",
@@ -629,7 +639,10 @@ impl SwitchClient {
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.10: a directory")?;
-        Directory::read(Obj::of(&value, what)?, &self.account())
+        Ok((
+            Directory::read(Obj::of(&value, what)?, &self.account())?,
+            checked.head,
+        ))
     }
 
     /// `GET /v1/{id}/apps/{app_id}/keys` for the calling app (Switch wire 7.4.11).

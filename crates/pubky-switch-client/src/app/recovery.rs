@@ -514,6 +514,15 @@ impl App {
         self.state.known_kids.insert(fresh.kid, n);
         self.state.registrations.clear();
         self.state.held.clear();
+        // An in-place restore can have kept a later installation's hold in the new
+        // sequence. A loss retires only replacements belonging to the sequence it lost.
+        self.state
+            .put_backs
+            .retain(|_, hold| hold.observation.generation > lost);
+        tx.delete_prefix(super::put_back::PREFIX)?;
+        for hold in self.state.put_backs.values() {
+            tx.put(&hold.store_key(), hold)?;
+        }
         self.state.seen.clear();
         self.state.asked.clear();
         self.state.retries.clear();

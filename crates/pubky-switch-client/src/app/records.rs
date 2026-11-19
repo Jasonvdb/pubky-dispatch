@@ -275,6 +275,13 @@ pub(super) struct ObservedView {
     at_known_tip: bool,
 }
 
+/// A key read or conflict can establish that even a tombstone is absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingFrom {
+    Key,
+    LiveListing,
+}
+
 /// Local cursor identity for the set of policies this pass can admit. An older
 /// cursor for the collection ID alone cannot establish coverage of additional generations.
 fn listing_scope(
@@ -996,7 +1003,7 @@ struct WriteDate<'a> {
 }
 
 /// A write that passed the checks.
-struct Accepted {
+pub(super) struct Accepted {
     key: [u8; 32],
     collection: Collection,
     op: SignedDoc,
@@ -1008,8 +1015,83 @@ struct Accepted {
     /// The verified head or listing position at which a view showed this write.
     current_at: CurrentAt,
     observation: ObservationSource,
+    /// The observation reaches every upload due for this key and collection.
+    covers_uploads: bool,
     content: RecordContent,
     doubtful: bool,
+}
+
+impl Accepted {
+    pub(super) fn revision(&self) -> ApplicationRef {
+        self.write.applied
+    }
+
+    fn current_for_publication(&self) -> bool {
+        self.write.version.authenticated
+            && self.placement.at.is_some()
+            && self.placement.historical.is_none()
+            && matches!(self.placement.base, Order::Newer | Order::Equal)
+            && matches!(self.placement.content, Order::Newer | Order::Equal)
+    }
+
+    pub(super) fn confirm_deletion(&self, observed: &mut super::deletion::Observation) -> bool {
+        if !self.write.version.authenticated || self.doubtful {
+            return false;
+        }
+        let changed =
+            !observed.authenticated || (observed.proof.is_none() && self.write.proof.is_some());
+        observed.authenticated = true;
+        if observed.proof.is_none() {
+            observed.proof.clone_from(&self.write.proof);
+        }
+        changed
+    }
+
+    pub(super) fn value(&self) -> Option<&[u8]> {
+        self.content.value()
+    }
+
+    pub(super) fn check_publication(
+        &self,
+        app: &App,
+        deletion: &super::deletion::Observation,
+        repair: Option<&super::RecordRepair>,
+        tx: &Tx,
+    ) -> Result<super::PutBackSuccessor, AppError> {
+        let Some(value) = self.content.value() else {
+            return Ok(super::PutBackSuccessor::Wait);
+        };
+        let version = self.write.version.version;
+        if !self.covers_uploads
+            || self.doubtful
+            || !self.write.version.authenticated
+            || self.write.applied.generation != deletion.generation
+            || version != RecordVersion::new(self.write.applied.generation, self.write.applied.seq)
+        {
+            return Ok(super::PutBackSuccessor::Wait);
+        }
+        let op = SignedOp::peek(&self.op).map_err(|_| super::corrupt())?;
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(super::corrupt());
+        };
+        if put.policy != deletion.put()?.policy || op.body().generation != deletion.generation {
+            return Ok(super::PutBackSuccessor::Wait);
+        }
+        let successor = super::RecordSuccessor {
+            repair: repair.filter(|r| r.deletion == deletion.revision()),
+            value,
+            version,
+            revision: self.write.applied,
+            writer: self.writer,
+            expected_version: put.expected_version,
+            conditions: &op.body().conditions,
+            policy: &put.policy,
+        };
+        let signed = SignedOp::peek(&deletion.operation).map_err(|_| super::corrupt())?;
+        app.with_deletion(deletion, &signed, tx, |owner, original, cx| {
+            owner.record_put_back_successor(original, &successor, cx)
+        })
+    }
 }
 
 /// Why a write wasn't taken.
@@ -1097,9 +1179,10 @@ pub(crate) enum WriteRead {
 
 impl WriteRead {
     /// Whether the answer that showed the write says anything of the record now: one
-    /// overtaken by the write held doesn't (Switch spec 10.3).
+    /// overtaken by the write held or waiting for its owner cannot establish the current
+    /// view (Switch spec 10.3).
     fn says_of_now(self) -> bool {
-        !matches!(self, Self::Overtaken(..) | Self::Unordered)
+        !matches!(self, Self::Overtaken(..) | Self::Unordered | Self::Waits)
     }
 }
 
@@ -1676,6 +1759,60 @@ impl App {
             && self.is_divergent(&view.key).await? == view.divergent)
     }
 
+    /// Read a held delete's current signed operation without delivering it ahead of the
+    /// feed. Only a verified later application can overtake the held replacement.
+    pub(super) async fn current_put_back_write(
+        &mut self,
+        deletion: &super::deletion::Observation,
+    ) -> Result<Option<Accepted>, AppError> {
+        let collection = Collection::new(&deletion.collection, deletion.put()?.policy);
+        let Some(observed) = self.record_view(&deletion.key, &collection).await? else {
+            return Ok(None);
+        };
+        if !observed.covers_uploads {
+            return Ok(None);
+        }
+        let ObservedView { view, at, .. } = *observed;
+        let evidence = Evidence {
+            op: &view.op,
+            cert: Some(&view.cert),
+            proof: view.proof.as_ref(),
+            stub: None,
+            view_version: Some(RecordVersion::new(view.generation, view.version)),
+            view_revision: Some(view.revision),
+            current_at: at,
+            observation: at.observation(view.divergent),
+        };
+        let tx = self.tx()?;
+        match self
+            .accept_write(&evidence, Some((&deletion.key, &collection)), &tx)
+            .await?
+        {
+            Ok(accepted) if accepted.current_for_publication() => {
+                let at = self.feed_order(
+                    accepted.write.applied.generation,
+                    accepted.write.applied.seq,
+                );
+                let original = self.feed_order(deletion.generation, deletion.seq);
+                if at > original && accepted.write.applied.item_hash != deletion.delete.item_hash
+                    || at == original
+                        && accepted.write.applied.item_hash == deletion.delete.item_hash
+                        && accepted.write.version.version == deletion.delete.version
+                {
+                    return Ok(Some(accepted));
+                }
+            }
+            Err(Refused::Misbehaviour(reason)) => {
+                return Err(self.raise(Alarm::Rollback { reason }).await);
+            }
+            _ => {}
+        }
+        Err(Refusal::NotNow(
+            "the current record does not establish this delete or its successor".into(),
+        )
+        .into())
+    }
+
     /// The switch's answer to `GET /records/{key}` (Switch wire 7.4.9), telling a key it
     /// doesn't hold from an identity it doesn't host.
     pub(super) async fn record_answer(
@@ -1719,7 +1856,7 @@ impl App {
             return Ok(RecordAnswer::Inconclusive);
         }
         let mut tx = self.tx()?;
-        let current = self.note_absent(key, at, &mut tx).await?;
+        let current = self.note_absent(key, at, MissingFrom::Key, &mut tx).await?;
         if !tx.is_empty() {
             self.commit(tx).await?;
         }
@@ -1803,7 +1940,8 @@ impl App {
                 }
             }
             Some(RecordConflict::Absent(key)) => {
-                self.note_absent(&key, at, &mut tx).await?;
+                self.note_absent(&key, at, MissingFrom::Key, &mut tx)
+                    .await?;
             }
             // The service's position identifies neither the operation nor its writer. A
             // caller that needs the value reads it through the ordinary record endpoint.
@@ -2621,6 +2759,7 @@ impl App {
                             accepted,
                             false,
                             page_time_ms.filter(|_| evidence.stub.is_some()),
+                            None,
                             tx,
                         )
                         .await?
@@ -3125,6 +3264,28 @@ impl App {
                 )));
             }
         };
+        // A signed successor can be learned at an earlier position, but only an
+        // observation covering the upload can release its deletion's service cursor
+        // (Switch spec 10.3, Switch wire 7.4.14).
+        let covers_uploads = match evidence.observation {
+            ObservationSource::View { at, .. } => at.is_some(),
+            ObservationSource::Applied
+                if super::put_back::at_key(&self.state.put_backs, &put.key)
+                    .next()
+                    .is_some() =>
+            {
+                self.record_source_current(
+                    &put.key,
+                    &collection.name,
+                    evidence.observation,
+                    write.applied,
+                    position(write.applied.generation, write.applied.seq),
+                    tx,
+                )
+                .await?
+            }
+            _ => false,
+        };
         Ok(Ok(Accepted {
             key: put.key,
             collection,
@@ -3136,6 +3297,7 @@ impl App {
             writer,
             current_at: evidence.current_at,
             observation: evidence.observation,
+            covers_uploads,
             content,
             doubtful,
         }))
@@ -3400,6 +3562,147 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Taking a write
 
+    /// A repair may refer to an earlier complete value only when this reader can verify
+    /// the two exact record applications in its own collection (Switch spec 8.2).
+    fn record_repair(
+        &self,
+        candidate: &Accepted,
+        held: Option<&HeldRecord>,
+        tx: &Tx,
+    ) -> Result<Option<super::RecordRepair>, AppError> {
+        let key = candidate.key;
+        let generation = self.state.meta.generation;
+        let Some(held) = held.filter(|h| {
+            h.authenticated
+                && !h.doubtful
+                && !h.gone
+                && h.follow
+                    .as_ref()
+                    .is_none_or(|followed| followed.applied == candidate.write.applied)
+                && h.content.value().is_some()
+                && h.applied == applied_at(h.version, h.item_hash)
+                && h.version.generation == generation
+                && h.policy == candidate.collection.policy
+        }) else {
+            return Ok(None);
+        };
+        if super::put_back::at_key(&self.state.put_backs, &key)
+            .next()
+            .is_none()
+            || !candidate.write.version.authenticated
+            || candidate.doubtful
+            || candidate.content.value().is_none()
+            || candidate.write.version.expected_version != held.version
+            || candidate.write.applied
+                != applied_at(
+                    candidate.write.version.version,
+                    candidate.write.applied.item_hash,
+                )
+            || candidate.write.applied.generation != generation
+            || candidate.write.applied.seq <= held.applied.seq
+            || !self.state.cert.holds_scope(&held.policy.read_scope)
+        {
+            return Ok(None);
+        }
+        let proposed = SignedOp::peek(&candidate.op).map_err(|_| store_corrupt())?;
+        if proposed.body().generation != generation
+            || !proposed
+                .body()
+                .conditions
+                .contains(&Condition::RecordCurrent {
+                    key,
+                    revision: held.applied,
+                    deleted: false,
+                })
+        {
+            return Ok(None);
+        }
+        let identity = &self.state.meta.identity;
+        let cert = AppCert::verify(&held.cert, identity).map_err(|_| store_corrupt())?;
+        let previous = SignedOp::verify(
+            &held.op,
+            &cert.signing_key(),
+            identity,
+            Some(&cert.app_id()),
+        )
+        .map_err(|_| store_corrupt())?;
+        let OpKind::RecordPut(put) = &previous.body().kind else {
+            return Err(store_corrupt());
+        };
+        if previous.item_hash()? != held.item_hash
+            || put.key != key
+            || put.collection != candidate.collection.id(identity)
+            || put.policy != held.policy
+            || previous.body().generation != generation
+        {
+            return Ok(None);
+        }
+        let Some(deletion) = previous.body().conditions.iter().find_map(|c| match c {
+            Condition::RecordCurrent {
+                key: k,
+                revision,
+                deleted: true,
+            } if *k == key
+                && revision.generation == generation
+                && put.expected_version == RecordVersion::new(generation, revision.seq) =>
+            {
+                Some(*revision)
+            }
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let id = (key, put.expected_version, deletion.item_hash);
+        let Some(hold) = self
+            .state
+            .put_backs
+            .get(&id)
+            .filter(|h| !h.observing && h.observation.revision() == deletion)
+        else {
+            return Ok(None);
+        };
+        let original = SignedOp::peek(&hold.observation.operation).map_err(|_| store_corrupt())?;
+        self.with_deletion(&hold.observation, &original, tx, |_, d, _| {
+            let Some(prior) = d.exact_value.filter(|_| {
+                d.original_in_current_generation
+                    && d.exact_version_authenticated
+                    && d.base.expected_version.generation == generation
+                    && d.policy == Some(&held.policy)
+            }) else {
+                return Ok(None);
+            };
+            let Ok(RecordValue::Json(value)) =
+                put.value_sealed
+                    .open_with(&self.state.scope_keys, identity, &key)
+            else {
+                return Ok(None);
+            };
+            Ok(
+                (held.content.value() == Some(&value)).then(|| super::RecordRepair {
+                    key,
+                    deletion,
+                    policy: held.policy.clone(),
+                    prior_value: prior.to_vec(),
+                    held_value: value,
+                }),
+            )
+        })
+    }
+
+    pub(super) async fn take_publication_candidate(
+        &mut self,
+        write: Accepted,
+        due: &super::deletion::Id,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some(owner) = self.protocols.of_collection(&write.collection.name)
+            && self.may_tell(&owner.name)
+        {
+            self.take_write(write, false, None, Some(due), tx).await?;
+        }
+        Ok(())
+    }
+
     /// Take an accepted write if it is newer than the one held and the protocol finds it
     /// goes back on nothing the app has seen.
     ///
@@ -3413,6 +3716,7 @@ impl App {
         mut accepted: Accepted,
         settling_own: bool,
         page_time_ms: Option<u64>,
+        due: Option<&super::deletion::Id>,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         let result = Box::pin(async {
@@ -3421,7 +3725,7 @@ impl App {
             // observation is owed. Foreign handovers still follow the owner's feed order.
             let owner = self.protocols.of_collection(&accepted.collection.name);
             let at = self.feed_order(accepted.write.applied.generation, accepted.write.applied.seq);
-            if !settling_own && self.state.deletions.values().any(|d| {
+            if !settling_own && self.owed_deletions().any(|d| {
                 (d.key == key || owner.is_some_and(|owner| owner.name == d.owner))
                     && self.feed_order(d.generation, d.seq) < at
             }) {
@@ -3461,6 +3765,35 @@ impl App {
             } else {
                 false
             };
+            let mut repair = None;
+            if accepted.current_for_publication()
+                && qualified.as_ref().is_none_or(|result| qualifiable
+                    && result.as_ref().is_ok_and(|mark| mark.len() <= MAX_SEEN_MARK_BYTES))
+            {
+                use super::put_back::Publication;
+                let evidence = self.record_repair(&accepted, held.as_ref(), tx)?;
+                let original = evidence.as_ref().map(|r| {
+                    let version = RecordVersion::new(r.deletion.generation, r.deletion.seq);
+                    (key, version, r.deletion.item_hash)
+                });
+                let decision = self.saw_put_back_write(
+                    &key,
+                    due.or(original.as_ref()),
+                    accepted.write.applied,
+                    Some((&accepted, evidence.as_ref())),
+                    page_time_ms,
+                    tx,
+                )?;
+                // A retry for a different deletion checks only that duty. The feed or
+                // the matching duty takes the repair with its own owner's decision.
+                let other_delete = due.zip(original.as_ref()).is_some_and(|(due, original)| due != original);
+                if !settling_own && (matches!(decision, Publication::PendingObservation) || other_delete) {
+                    return Ok(Taken::Waits);
+                }
+                if let Publication::Covered(deletion) = decision {
+                    repair = evidence.filter(|r| r.deletion == deletion);
+                }
+            }
             let ends_mark = lifetime_mark && selects_base && qualifiable && accepted.content == RecordContent::Deleted;
             if selects_base && let Some(at) = current {
                 self.retire_deletion_receipts(key, Some((accepted.write.applied.item_hash, RecordVersion::new(at.generation, at.seq))), tx)?;
@@ -3559,6 +3892,7 @@ impl App {
                 .map(|op| op.body().conditions.clone())
                 .unwrap_or_default();
             let base = WriteBase {
+                repair: None,
                 expected_version,
                 held: match &held {
                     // A create applies only where the service holds nothing: over a delete
@@ -3586,7 +3920,7 @@ impl App {
                 Some(Ok(mark)) => (Some(mark), None, false),
                 Some(Err(reason)) => (None, Some(reason), !own),
                 None => (None, (!own).then(|| self.protocols.record_regression(
-                    &accepted.collection.name, prior_mark, new_value, base.clone(),
+                    &accepted.collection.name, prior_mark, new_value, WriteBase { repair, ..base.clone() },
                 )).flatten(), true),
             };
             if !own && accepted.content == RecordContent::Deleted
@@ -3596,6 +3930,7 @@ impl App {
                     && h.policy == accepted.collection.policy && h.content.value().is_some())
                     .map(|h| super::deletion::Predecessor {
                         source: KeptOp { op: h.op.clone(), cert: h.cert.clone(), proof: h.proof.clone() },
+                        dated_at_expected: !h.doubtful && h.version == expected_version,
                         exact: h.version == expected_version && h.follow.is_none() && !h.gone
                             && needed.as_ref().is_none_or(|c| base.conditions.contains(c))
                             && base.conditions.iter().all(|c| !matches!(c, Condition::RecordCurrent {
@@ -3605,13 +3940,14 @@ impl App {
                     key, owner: owner.name.clone(), collection: accepted.collection.name.clone(),
                     delete: DeleteBase { version: accepted.write.version.version, item_hash: accepted.write.applied.item_hash },
                     operation: accepted.op.clone(), cert: accepted.cert.signed().clone(),
+                    authenticated: accepted.write.version.authenticated && !accepted.doubtful, proof: accepted.write.proof.clone(),
                     generation: accepted.write.applied.generation, seq: accepted.write.applied.seq,
                     page_time_ms,
                     seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
                 };
                 if held.as_ref().and_then(HeldRecord::delete_base) != Some(hold.delete) && !self.state.deletions.contains_key(&hold.id())
-                    && !self.state.deletion_receipts.contains_key(&hold.id()) {
-                    self.observe_deletion(hold, tx)?;
+                    && !self.state.deletion_receipts.contains_key(&hold.id()) && !self.state.put_backs.contains_key(&hold.id()) {
+                    self.take_put_back_observation(self.deletion_hold(hold), tx)?;
                 }
             }
             if let Some(reason) = regression {
@@ -3886,17 +4222,18 @@ impl App {
         Some(held.map_or(now, |held| held.max(now)))
     }
 
-    /// A signed answer shows the key absent (a `404`, or a listing page that covers the key
-    /// without it): the rollback alarm when the app holds a permanent record there live
-    /// (Switch spec 10.3.1 "Absence", [`absence_is_rollback`]).
+    /// Apply a signed absence according to what the request could return. A listing
+    /// covers live records. Only a key answer also covers a retained deletion
+    /// (Switch spec 10.3.1 "Absence", Switch wire 7.4.9).
     ///
     /// # Errors
     ///
     /// The alarm; a store failure.
-    async fn note_absent(
+    pub(super) async fn note_absent(
         &mut self,
         key: &[u8; 32],
         current: CurrentAt,
+        from: MissingFrom,
         tx: &mut Tx,
     ) -> Result<bool, AppError> {
         let CurrentAt::Answer(v) = current else {
@@ -3919,7 +4256,12 @@ impl App {
         {
             return Ok(false);
         }
-        let current = v.generation == self.state.meta.generation
+        // A protected delete must still exist throughout its protected interval,
+        // including before a later observation of the same key (Switch spec 10.3).
+        let can_report_absence = v.generation == self.state.meta.generation
+            && (from == MissingFrom::LiveListing
+                || self.put_back_absence_is_current(key, at).await?);
+        let current = can_report_absence
             && held.as_ref().is_none_or(|held| {
                 let (_, applied, _) = held.base_write();
                 self.state.cert.holds_scope(&held.policy.read_scope)
@@ -3929,13 +4271,18 @@ impl App {
             });
         if let Some(mut held) = held.filter(|_| current) {
             self.check_absent(&held, at.generation).await?;
-            if held.delete_base().is_some() && (!held.gone || held.observed != at) {
+            if from == MissingFrom::Key
+                && held.delete_base().is_some()
+                && (!held.gone || held.observed != at)
+            {
                 held.gone = true;
                 held.observed = at;
                 put_held(tx, key, &held)?;
             }
         }
-        self.retire_absent_receipts(*key, at, tx)?;
+        if from == MissingFrom::Key {
+            self.retire_absent_receipts(*key, at, tx)?;
+        }
         Ok(current)
     }
 
@@ -3966,10 +4313,8 @@ impl App {
     /// listing page covered, after `after` and through `last` (to the end for `None`), and
     /// that the page didn't list.
     ///
-    /// It reads only the index of permanent records held live (`recp/`), a key and a
-    /// collection name each, so a page costs one scan of that index, whatever the
-    /// collection, and one held record read for each permanent record of this collection
-    /// the page left out; ordinary records are never read.
+    /// Check the index of permanent records held live (`recp/`). Deleted keys are
+    /// normally absent from these pages (Switch wire 7.4.9).
     async fn note_unlisted(
         &mut self,
         collection: &str,
@@ -3995,7 +4340,7 @@ impl App {
                     .is_none_or(|upload| self.covers_upload(upload_at, upload))
             {
                 let mut tx = self.tx()?;
-                Box::pin(self.note_absent(&key, at, &mut tx)).await?;
+                Box::pin(self.note_absent(&key, at, MissingFrom::LiveListing, &mut tx)).await?;
                 if !tx.is_empty() {
                     self.commit(tx).await?;
                 }
@@ -4055,7 +4400,7 @@ impl App {
             Ok(accepted) => {
                 // The app's own write at this service clears the record's divergent
                 // uploads there (Switch wire 7.4.14).
-                if self.take_write(accepted, true, None, tx).await? == Taken::New {
+                if self.take_write(accepted, true, None, None, tx).await? == Taken::New {
                     self.note_divergent(&key, false, tx).await?;
                 }
             }

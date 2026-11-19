@@ -201,7 +201,7 @@ impl App {
         {
             return false;
         }
-        if self.state.deletions.values().any(|d| {
+        if self.owed_deletions().any(|d| {
             let order = self.feed_order(d.generation, d.seq);
             d.owner == name && (order < at || (order == at && handover == Handover::Through))
         }) {

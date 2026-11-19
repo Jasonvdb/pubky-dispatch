@@ -42,9 +42,17 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 - **Client.** A pending collection listing records its upload position. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
+- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs` and `put_back_notices`, even when both lists are empty.
+
+If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
+
+While a protected deletion awaits publication, the service cursor stays before it until an observation of the following write covers any pending recovery upload and the collection accepts the value, or the duty is released.
+
+Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
+
 **Additions still to come**
 
-- **Client.** A protocol will be able to hold the service feed position at a deleted record until its replacement write has applied (a new optional `Protocol` method and two events).
+- **Client.** Automatic conditional publication over a deleted record or a competing live write still needs durable signed retry state.
 
 **Deferred features.** Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
@@ -62,7 +70,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 ### Client
 
-- [data] **A deleted record can be forgotten before its repair applies.** The client can durably deliver a deletion to its collection owner. The service cursor can still advance past the delete before a replacement write succeeds, including across restart or restore. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
+- [data] **A waiting collection relies on another authorized writer to publish.** A collection owner can hold this app's service cursor at a feed deletion and release it after checking the applied successor. The client has no automatic conditional replacement from that callback. Installations sharing an App ID require one authoritative synchronized state to protect their shared cursor. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
 - [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.
 - [wrong result] **A restored backup can deliver a message the app already gave up on.** A backup taken before a message was withdrawn still holds it for delivery. Restoring that backup onto another store, after the protocol was told `MessageUndelivered` and acknowledged it, can deliver the original. Keep the original message ID, and do not issue a replacement the recipient would act on twice while an older backup can still be restored.
 - [data] **A device clock change can reopen a batch's retry window.** After a long suspension, a clock set back close to its earlier value can make an old service-time sample look recent, allowing a retry after the service forgot the batch ID. Reconcile the original effect before repeating work that could apply twice.

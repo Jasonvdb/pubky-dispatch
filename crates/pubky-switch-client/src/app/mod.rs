@@ -54,6 +54,7 @@ mod protocol;
 mod protocols;
 mod provider;
 mod push;
+mod put_back;
 mod recovery;
 mod renewal;
 mod rotation;
@@ -91,9 +92,10 @@ pub use protocol::{
     DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
     LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
     MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, RETRY_EVENT_READS, ReceivedMessage,
-    RecordDeletion, RecordMarkContext, RecordObservation, ResendNeeded, ResendReason, StoreFailure,
-    WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, PutBackSuccessor, RETRY_EVENT_READS,
+    ReceivedMessage, RecordDeletion, RecordMarkContext, RecordObservation, RecordRepair,
+    RecordSuccessor, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
+    encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
@@ -431,6 +433,8 @@ pub struct AppBackup {
     waiting: unverified::WaitingOut,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deletions: Vec<deletion::Observation>,
+    put_backs: Vec<put_back::RecordHold>,
+    put_back_notices: Vec<events::KeptDuty>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -620,6 +624,7 @@ pub(crate) struct AppState {
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     deletions: deletion::Observations,
     deletion_receipts: deletion::Receipts,
+    put_backs: put_back::Holds,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
     /// The counts of the store's retries at entries stored locally, by local ID.
     pub(crate) stored_retries: BTreeMap<u64, RetryEntry>,
@@ -1047,6 +1052,7 @@ impl App {
                 held: BTreeMap::new(),
                 deletions: BTreeMap::new(),
                 deletion_receipts: BTreeMap::new(),
+                put_backs: BTreeMap::new(),
                 retries: BTreeMap::new(),
                 stored_retries: BTreeMap::new(),
                 next_stored_id: FIRST_STORED_ID,
@@ -1293,6 +1299,10 @@ impl App {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
             }
             app.validate_waiting_state()?;
+            for hold in app.state.put_backs.values() {
+                hold.observation
+                    .check(&app.protocols, &app.state.meta.identity)?;
+            }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
@@ -1356,6 +1366,7 @@ impl App {
             held: reader.scan_numbered("held/").await?,
             deletions: deletion::load(reader).await?,
             deletion_receipts: deletion::load_receipts(reader).await?,
+            put_backs: put_back::load(reader).await?,
             retries: reader.scan_numbered("retry/").await?,
             stored_retries: reader.scan_numbered("sretry/").await?,
             next_stored_id,
@@ -1489,6 +1500,8 @@ impl App {
             stored_next: state.next_stored_id,
             waiting: unverified::WaitingOut::of(state),
             deletions: state.deletions.values().cloned().collect(),
+            put_backs: state.put_backs.values().cloned().collect(),
+            put_back_notices: Vec::new(),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
@@ -1605,6 +1618,22 @@ impl App {
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
+        for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
+            if let Ok(notice) = state::decode::<events::KeptDuty>(&value)
+                && matches!(
+                    notice.duty,
+                    events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
+                )
+            {
+                backup.put_back_notices.push(notice);
+            } else if std::str::from_utf8(&value).is_ok_and(|bytes| {
+                bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
+            }) {
+                return Err(AppError::InvalidData(format!(
+                    "unreadable record replacement notice {key}"
+                )));
+            }
+        }
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -2104,6 +2133,16 @@ impl App {
             )
             .await?;
             let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
+            let previous = same_installation.then_some(&old);
+            let put_backs = put_back::restore(
+                previous,
+                &backup.put_backs,
+                &protocols,
+                &backup.meta,
+                &own_doc,
+                &layers,
+            )
+            .await?;
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();
@@ -2211,6 +2250,7 @@ impl App {
                 held: backup.waiting.held.iter().copied().collect(),
                 deletions,
                 deletion_receipts,
+                put_backs,
                 retries: backup.waiting.feed_retries.iter().copied().collect(),
                 stored_retries: backup.waiting.retries.iter().copied().collect(),
                 next_stored_id: next_stored_id(None, &parked),
@@ -2386,6 +2426,39 @@ impl App {
                 let change = app.waiting_change(None, None, &drops)?;
                 change.stage(&mut app, &mut tx)?;
                 app.write_all(&mut tx).await?;
+                let mut put_back_notices = backup.put_back_notices.clone();
+                for hold in app.state.put_backs.values().filter(|h| h.waited) {
+                    // The protocol's local preparation may have been acknowledged after
+                    // this backup, or left behind with a layer. Reoffer the same delete.
+                    let notice = events::KeptDuty {
+                        to: vec![hold.observation.owner.clone()],
+                        duty: events::Duty::PutBackWaits {
+                            key: hold.observation.key,
+                            delete: hold.observation.delete,
+                        },
+                    };
+                    if !put_back_notices.contains(&notice) {
+                        put_back_notices.push(notice);
+                    }
+                }
+                for notice in &put_back_notices {
+                    notice.check_owners(&app.protocols)?;
+                    if !matches!(
+                        notice.duty,
+                        events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
+                    ) || notice.to.len() != 1
+                    {
+                        return Err(corrupt());
+                    }
+                    let local = carried.values.iter().any(|(key, value)| {
+                        key.starts_with(key::DUTY_PREFIX)
+                            && serde_json::from_value::<events::KeptDuty>(value.clone())
+                                .is_ok_and(|held| held == *notice)
+                    });
+                    if !local {
+                        app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                    }
+                }
                 for notice in &waiting_notices {
                     app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
                 }
@@ -2564,6 +2637,9 @@ impl App {
         }
         for receipt in s.deletion_receipts.values() {
             tx.put(&receipt.store_key(), receipt)?;
+        }
+        for hold in s.put_backs.values() {
+            tx.put(&hold.store_key(), hold)?;
         }
         for (seq, held) in &s.held {
             tx.put(&key::held(*seq), held)?;
@@ -3684,6 +3760,7 @@ impl App {
             Err(error) => return Err(error),
         };
         if answered {
+            self.release_put_backs_on_leave().await?;
             let now = self.now();
             let mut tx = self.tx()?;
             let leave = self.state.leave.get_or_insert_with(LeaveState::default);
@@ -4059,14 +4136,14 @@ impl App {
     /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
     /// step 3). A kept batch signed for an earlier generation has its proofs checked with
     /// that generation's key (Switch wire 6.4 step 6).
-    pub(crate) fn submit<'a>(
-        &'a mut self,
-        batch: &'a Batch,
-    ) -> impl Future<Output = Result<Submitted, AppError>> + 'a {
-        self.submit_before(batch, None)
+    pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
+        let bounded = self.bound_service_cursor(batch)?;
+        self.submit_body(bounded.as_ref().unwrap_or(batch), None)
+            .await
     }
 
-    async fn submit_before(
+    /// Submit these exact bytes, including the selected service cursor.
+    async fn submit_body(
         &mut self,
         batch: &Batch,
         first: Option<&crate::transport::FirstSend>,
@@ -4151,6 +4228,7 @@ impl App {
     ) -> Result<Batch, AppError> {
         let cursor = cursor_to
             .filter(|seq| *seq > self.state.cursor.at_service)
+            .map(|seq| seq.min(self.put_back_limit()))
             .map(|seq| Position {
                 generation: self.state.cursor.generation,
                 seq,

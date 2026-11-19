@@ -149,7 +149,18 @@ impl TestDatabase {
     /// Both databases are independently owned and removed by their usual cleanup.
     pub async fn snapshot(&mut self, config: &DatabaseConfig) -> Result<Self, StoreError> {
         self.store.close().await;
-        let copy = Self::create_on(self.admin.clone(), config, Some(&self.name)).await;
+        let copy = async {
+            // A stopped listener returns its connection to its private pool asynchronously.
+            // Disconnect the sessions of this isolated test database before using it as a template.
+            sqlx::query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+            )
+            .bind(&self.name)
+            .execute(&mut self.admin().await?)
+            .await?;
+            Self::create_on(self.admin.clone(), config, Some(&self.name)).await
+        }
+        .await;
         self.store = Store::connect_with(self.store_options(), config).await?;
         copy
     }

@@ -92,8 +92,8 @@ pub struct KeyRecoverySurvey {
     pub backup: BackupFound,
     /// What the recovery does: at the service, or a provider loss.
     pub kind: KeyRecoveryKind,
-    /// Whether `origin` is the one the user gave
-    /// ([`Signer::survey_key_recovery_new_at`]), not the one the newest copy names.
+    /// Whether the user supplied the origin for this survey or for first setup when
+    /// discovery found an account and no other copy named a service (Switch spec 12.8).
     pub origin_supplied: bool,
     /// The key the service at `origin` signs with: for a provider loss, the one its account
     /// discovery showed, which every answer there must be signed with; at the service, the

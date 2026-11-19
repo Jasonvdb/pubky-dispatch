@@ -14002,3 +14002,101 @@ async fn test_record_publication_commits_the_acknowledged_cursor_with_the_signed
     })
     .await;
 }
+
+#[tokio::test]
+async fn test_record_publication_restoring_an_earlier_merge_keeps_only_its_original_result() {
+    Box::pin(async {
+        let s = Setup::new();
+        let (mut writer, mut reader, first, _) = delete_for_put_back(&s).await;
+        read_on(&mut reader).await;
+        let first_key = reader.record_key(&first).unwrap();
+        *s.protocol.pending_publication.lock().unwrap() = Some(
+            replacement_at(&reader, &first_key)
+                .unwrap()
+                .observation
+                .delete
+                .version,
+        );
+        writer
+            .put_record(&first, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+        read_on(&mut reader).await;
+        let target = s.target("other watched record");
+        let key = reader.record_key(&target).unwrap();
+        writer
+            .put_record(&target, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+        read_on(&mut reader).await;
+        reader.read_record(&target).await.unwrap().unwrap();
+        let deleted = writer
+            .delete_record(&target, vec![])
+            .await
+            .unwrap()
+            .version
+            .version;
+        read_on(&mut reader).await;
+        assert_eq!(reader.state.put_backs.len(), 2);
+        let successor = writer
+            .put_record(&target, &value(&["next"]), vec![])
+            .await
+            .unwrap();
+        s.protocol
+            .publish_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.w.switch.fail_next(Fault::Unanswered {
+            path: "ops".into(),
+            after: 0,
+        });
+        reader.receive(None).await.unwrap();
+        let duty = replacement_at(&reader, &key).unwrap();
+        let original_delete = duty.observation.delete;
+        let original = duty.pending.clone().unwrap();
+        let batch = crate::client::Batch::from_body(original.body.clone()).unwrap();
+        let expected_seq = successor.version.version;
+        assert!(matches!(
+            batch.ops()[0].body().conditions.as_slice(),
+            [Condition::RecordCurrent { deleted: false, revision, .. }]
+                if revision.seq == expected_seq
+        ));
+        let backup = reader.backup_layered().await.unwrap();
+        writer
+            .put_record(&target, &value(&["next", "trusted"]), vec![])
+            .await
+            .unwrap();
+        reader.read_record_fresh(&target).await.unwrap();
+        assert!(replacement_at(&reader, &key).is_none());
+        assert!(reader.service_cursor().seq < deleted);
+        assert_eq!(
+            reader.kept_batches().await.unwrap()[0].1.body,
+            original.body
+        );
+        drop(reader);
+        let mut restored = Box::pin(App::restore(
+            s.env(),
+            s.protocol.clone(),
+            World::config(),
+            &backup,
+        ))
+        .await
+        .unwrap();
+        let queued = restored.kept_batches().await.unwrap();
+        assert!(replacement_at(&restored, &key).is_none());
+        assert!(replacement_at(&restored, &first_key).is_some());
+        assert_eq!(queued.len(), 1);
+        assert_eq!(Some(queued[0].0), batch.id());
+        assert_eq!(queued[0].1.body, original.body);
+        assert_eq!(queued[0].1.kept_ms, original.kept_ms);
+        assert_eq!(queued[0].1.record_deletion, Some(original_delete));
+        read_on(&mut restored).await;
+        assert!(matches!(
+            restored.kept_batch(queued[0].0).await.unwrap(),
+            Some(crate::app::KeptBatchStatus::Dropped {
+                reason: crate::app::KeptBatchDrop::Refused { .. },
+                ..
+            })
+        ));
+    })
+    .await;
+}

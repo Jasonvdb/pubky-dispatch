@@ -325,14 +325,21 @@ impl App {
             let OpKind::RecordPut(put) = &op.body().kind else {
                 return Err(super::corrupt());
             };
-            let (target, _, _) = RecordHold::target(op)?;
+            let (target, at, deleted) = RecordHold::target(op)?;
+            let target_matches = op.body().generation == at.generation
+                && target.version == RecordVersion::new(at.generation, at.seq)
+                && if deleted {
+                    target == delete
+                } else {
+                    at.generation == delete.version.generation && at.seq > delete.version.version
+                };
+
             let owns_record = protocol.collections().iter().any(|collection| {
                 collection.id(identity) == put.collection && collection.admits(&put.policy)
             });
             if pending.kept_ms.is_none()
                 || delete.version.is_none()
-                || put.expected_version != delete.version
-                || target != delete
+                || !target_matches
                 || !owns_record
             {
                 return Err(super::corrupt());
@@ -527,13 +534,13 @@ impl App {
         if current.is_some_and(|at| at.generation == op.body().generation && at.item_hash == hash) {
             return self.end_kept_batch(&id, &pending, super::kept::Ended::Applied, tx);
         }
-        let (target, base, _) = RecordHold::target(op)?;
+        let (_, base, _) = RecordHold::target(op)?;
         if current.is_none_or(|at| at == base) || !self.answer_decides(pending.kept_ms) {
             // An original-result retry is safe only if its old comparison cannot still
             // apply. A released or expired submission with no proof remains uncertain.
             return self.kept_batch_dropped(&id, &pending, &batch, tx).await;
         }
-        pending.record_deletion = Some(target);
+        pending.record_deletion = Some(hold.observation.delete);
         self.stage_kept_batch(&id, &mut pending, &batch, tx).await
     }
 

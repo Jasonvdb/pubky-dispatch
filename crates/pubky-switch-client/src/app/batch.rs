@@ -278,7 +278,8 @@ impl OpBatch {
 pub(crate) struct PendingBatch {
     #[serde(with = "serde_b64_vec")]
     pub(crate) body: Vec<u8>,
-    /// The exact base of an already-sent publication whose original result is still due.
+    /// The original deletion whose publication is complete or superseded, while this
+    /// signed operation still awaits its own result. Its conditions carry its exact target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) record_deletion: Option<super::records::DeleteBase>,
     pub(crate) invites: Vec<InviteNote>,

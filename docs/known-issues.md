@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
+
 - First setup can wait with `SignerStatus::FirstEnrollmentHeld`. Show the reason in `Alert::FirstEnrollmentHeld` after reopening. Keep the original request and let the user choose the applicable recovery or clear the alert to retry that step. Both `resume` and `run_due` return `Refusal::FirstEnrollmentHeld` while the alert is held. Signer stores can now contain this alert.
 
 A protocol can use `Protocol::qualify_record_mark` to bind a readable value and its mark to the actual record key. A local write that fails this check is refused before signing. After another installation has written the record, the client retains its service revision and the last qualified mark across restart. Hosts must check the shared record's `flagged` and `not_taken` fields before using its contents. A later qualifying write can make the record usable again. A message handler sees the record, mark and application established by earlier entries in the same receive call.

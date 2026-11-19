@@ -5,11 +5,11 @@ use crate::Backend;
 use crate::flows::recovery::RECOVERY_ORIGIN;
 use pubky_switch_client::store::StateStore;
 use pubky_switch_client::testing::Router;
-use pubky_switch_core::records::{IDENTITY_PATH, SIGNER_BACKUP_PATH};
+use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH};
 use pubky_switch_signer::state::signer_namespace;
 use pubky_switch_signer::{
     AddOutcome, IdentityKeyring, IdentitySecret, KeyError, KeyRecoveryConfirmed, SecretVault,
-    VaultError,
+    SignerEnv, VaultError,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,20 +47,29 @@ async fn test_receiving_wallet_recovers_after_its_takeover_won_service() {
 }
 
 async fn check_winning_receiver(backend: Backend) {
-    let result = Box::pin(crate::run_here(backend, winning_receiver)).await;
+    let result = Box::pin(crate::run_here(backend, async |world: &World| {
+        Box::pin(winning_receiver(world)).await
+    }))
+    .await;
     assert!(matches!(result, Ok(Some(_))), "{result:?}");
 }
 
-async fn winning_receiver(world: &World) -> FlowResult {
+async fn offer(
+    world: &World,
+) -> Result<(TestIdentity, Signer, ReceivingApp), Box<dyn std::error::Error>> {
     let alice = world.identity("alice")?;
-    let identity = alice.public();
     world.add_switch(ORIGIN, &[&alice]).await?;
-    world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
     let mut old = Box::pin(enroll(world, &alice, ORIGIN)).await?;
     let (wallet, _) = Box::pin(joined(world, &alice, &mut old, "wallet")).await?;
     let recipient = receiving(world, &alice, "wallet", &wallet)?;
-    let original = old.identity_doc()?.ok_or("missing original document")?;
     Box::pin(old.hand_over_to(wallet.app_id(), UserConfirmed::shown_and_confirmed())).await?;
+    Ok((alice, old, recipient))
+}
+
+async fn winning_receiver(world: &World) -> FlowResult {
+    let (alice, old, recipient) = Box::pin(offer(world)).await?;
+    let identity = alice.public();
+    let original = old.identity_doc()?.ok_or("missing original document")?;
     drop(old);
     let vault = Arc::new(LockedOnce {
         vault: world.empty_vault(),
@@ -91,6 +100,7 @@ async fn winning_receiver(world: &World) -> FlowResult {
         Some(original.hash())
     );
 
+    world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
     let replacement = Arc::new(Router::new());
     replacement.add(RECOVERY_ORIGIN, world.transport());
     env.transport = replacement;
@@ -120,6 +130,24 @@ async fn winning_receiver(world: &World) -> FlowResult {
     assert_ne!(won.body().signer, original.body().signer);
     drop(receiver);
     assert_eq!(keyring()?.public_key(), identity);
+    Box::pin(recover_and_sign(
+        world,
+        env,
+        vault,
+        &won,
+        recipient.cert.app_id(),
+    ))
+    .await
+}
+
+async fn recover_and_sign(
+    world: &World,
+    env: SignerEnv,
+    vault: Arc<dyn SecretVault>,
+    won: &IdentityDoc,
+    app_id: [u8; 16],
+) -> FlowResult {
+    let keyring = || IdentityKeyring::open(vault.clone());
     let survey = Box::pin(Signer::survey_provider_loss_with_key(
         env.clone(),
         keyring()?,
@@ -139,17 +167,14 @@ async fn winning_receiver(world: &World) -> FlowResult {
     assert_eq!(restored.generation(), won.generation() + 1);
     assert_eq!(restored.body().signer, won.body().signer);
     assert!(restored.version() > won.version());
-    assert_eq!(
-        restored.listed_cert(&wallet.app_id()),
-        won.listed_cert(&wallet.app_id())
-    );
+    assert_eq!(restored.listed_cert(&app_id), won.listed_cert(&app_id));
     let next = Box::pin(recovered.set_record_max_age(Some(3600))).await?;
     assert_eq!(next.version(), restored.version() + 1);
     assert_eq!(next.body().record_max_age, Some(3600));
     assert_eq!(
         world
             .files()
-            .identity_doc(&identity)
+            .identity_doc(&won.identity())
             .map(|copy| copy.hash()),
         Some(next.hash())
     );
@@ -180,13 +205,8 @@ async fn check_undecided_receiver(backend: Backend) {
 }
 
 async fn undecided_receiver(world: &World, aborted: bool) -> FlowResult {
-    let alice = world.identity("alice")?;
+    let (alice, mut old, recipient) = Box::pin(offer(world)).await?;
     let identity = alice.public();
-    world.add_switch(ORIGIN, &[&alice]).await?;
-    let mut old = Box::pin(enroll(world, &alice, ORIGIN)).await?;
-    let (wallet, _) = Box::pin(joined(world, &alice, &mut old, "wallet")).await?;
-    let recipient = receiving(world, &alice, "wallet", &wallet)?;
-    Box::pin(old.hand_over_to(wallet.app_id(), UserConfirmed::shown_and_confirmed())).await?;
     let store = Arc::new(MemoryStore::new());
     let mut env = world.signer_env(&alice, store.clone())?;
     let vault = world.empty_vault();

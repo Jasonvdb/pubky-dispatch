@@ -142,6 +142,23 @@ impl RecordMarkContext<'_> {
     }
 }
 
+/// A readable record application verified by the client (Switch spec 8.2, 10.3).
+/// The protocol can keep what it learned in its own backup layer.
+#[non_exhaustive]
+pub struct RecordObservation<'a> {
+    /// The accepted record, including the key, policy, signer and content.
+    pub record: &'a super::SharedRecord,
+    /// The record held immediately before this observation, if any.
+    pub previous: Option<&'a super::SharedRecord>,
+    /// The verified signed operation carrying this value.
+    pub operation: &'a pubky_switch_core::sig::SignedDoc,
+    /// The service application of the operation.
+    pub application: pubky_switch_core::shared::ApplicationRef,
+    /// Whether this observation covers the record's pending uploads in the current
+    /// generation. The record itself also reports its divergence and content status.
+    pub current: bool,
+}
+
 /// How a protocol answers a record deletion (Switch spec 8.2, 10.3).
 #[non_exhaustive]
 pub enum PutBack {
@@ -1195,6 +1212,26 @@ pub trait Protocol: Send + Sync {
     ) -> Option<Result<Vec<u8>, String>> {
         let _ = (input, seen, value);
         None
+    }
+
+    /// Observe an authenticated, readable write in one of the protocol's collections,
+    /// including one made by another installation of this app. An equal read can
+    /// confirm a previously uncertain application. The protocol returns idempotent
+    /// changes to its own local state, committed with the record and the read's progress.
+    /// Earlier local changes in this transaction are visible through `context`.
+    /// No changes by default. An absence, delete or unopened value makes no call.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`] leaves the observation pending. Changes exceeding
+    /// [`MAX_STEP_LOCAL_BYTES`] also hold the read before its progress commits.
+    fn observe_record(
+        &self,
+        observation: &RecordObservation<'_>,
+        context: &ReceiveContext<'_>,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        let _ = (observation, context);
+        Ok(Vec::new())
     }
 
     /// Whether the seen mark of records in this collection lasts until a verified

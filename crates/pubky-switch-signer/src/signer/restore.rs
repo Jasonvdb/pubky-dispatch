@@ -162,6 +162,7 @@ impl PendingDelivery {
 // current state for the requested identity contributes its scalar and collection members.
 pub(super) struct RestoreLocal {
     pending_delivery: Option<Box<PendingDelivery>>,
+    pending_renewal: Option<Box<Flow>>,
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
     /// A verified first discovery can locate a service when no signed copy names one.
@@ -185,6 +186,7 @@ impl RestoreLocal {
             state,
             copies,
             pending_delivery: None,
+            pending_renewal: None,
             first_account_origin: None,
         };
         for copy in &local.copies {
@@ -204,7 +206,7 @@ impl RestoreLocal {
 
     pub(super) fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let local = Self::unusable_for_backup(records, identity)?;
-        if local.pending_delivery.is_some() {
+        if local.pending_delivery.is_some() || local.pending_renewal.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
         Ok(local)
@@ -288,9 +290,21 @@ impl RestoreLocal {
                     && gate::held_alarm(state).is_none()
             })
         {
-            local.pending_delivery = flow.and_then(PendingDelivery::from_flow);
+            match flow {
+                Some(renewal @ Flow::Renew { .. })
+                    if local.state.as_ref().is_some_and(|state| {
+                        state.handed_over_to.is_none()
+                            && gate::refusal(state).is_none()
+                            && state.newest.as_ref().is_some_and(|n| n.account.is_none())
+                    }) =>
+                {
+                    local.pending_renewal = Some(Box::new(renewal));
+                }
+                other => local.pending_delivery = other.and_then(PendingDelivery::from_flow),
+            }
         }
-        let blocked = pending && local.pending_delivery.is_none();
+        let blocked =
+            pending && local.pending_delivery.is_none() && local.pending_renewal.is_none();
         if let Some(state) = &local.state {
             check_local_restore(state, blocked)?;
         } else if blocked {
@@ -437,22 +451,8 @@ impl Signer {
         {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
-        let records = match state::read(&store, &identity).await? {
-            state::ReadRecords {
-                state: Ok(Some(state)),
-                flow: Ok(Some(flow @ Flow::Renew { .. })),
-            } if state.handed_over_to.is_none()
-                && gate::refusal(&state).is_none()
-                && state.newest.as_ref().is_some_and(|n| n.account.is_none())
-                && flow.check_state(&state).is_ok() =>
-            {
-                let signer = Self::restore_target(env, keyring, store)?;
-                return Box::pin(signer.restore_renewal(state, flow)).await;
-            }
-            records => records,
-        };
-        let local = match (
-            RestoreLocal::unusable_for_backup(records, &identity),
+        let mut local = match (
+            RestoreLocal::unusable_for_backup(state::read(&store, &identity).await?, &identity),
             confirmed.0.clone(),
         ) {
             (Err(SignerError::Refused(Refusal::AlreadySetUp)), Some(key)) => {
@@ -461,10 +461,12 @@ impl Signer {
             (local, _) => local?,
         };
         let mut signer = Self::restore_target(env, keyring, store)?;
+        if let Some(flow) = local.pending_renewal.take() {
+            let state = local.state.take().ok_or(Refusal::FlowInProgress)?;
+            return Box::pin(signer.restore_renewal(state, *flow)).await;
+        }
         match (
-            signer
-                .restore_records(Some(local), confirmed.0.is_some())
-                .await,
+            Box::pin(signer.restore_records(Some(local), confirmed.0.is_some())).await,
             confirmed.0,
         ) {
             (Err(error), Some(key)) if backup_refused(&error) => {

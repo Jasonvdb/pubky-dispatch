@@ -366,6 +366,7 @@ pub struct SwitchAnswer {
     version: u64,
     outcome: SwitchCopy,
     copies: Vec<(IdentityDoc, u64)>,
+    terminal_read: bool,
 }
 
 impl SwitchAnswer {
@@ -378,6 +379,23 @@ impl SwitchAnswer {
     /// successor lookup to retain a verified copy from the preceding service.
     pub fn read(&self) -> bool {
         self.outcome == SwitchCopy::Read
+    }
+
+    /// Whether the successful terminal service response supplied this exact signed
+    /// document. A staged successor can complete [`Self::read`] without confirming any
+    /// document. A failed, stale or frozen successor confirms none either.
+    ///
+    /// Check the already authorized document before passing this answer to
+    /// [`App::finish_identity_lookup`]. Before acting, require its returned document to
+    /// still match and apply [`PeerIdentity::may_act`] and the current-app checks. This
+    /// observation does not replace the version floor, equivocation or freshness checks.
+    pub fn confirms(&self, expected: &IdentityDoc) -> bool {
+        self.read()
+            && self.terminal_read
+            && self
+                .copies
+                .last()
+                .is_some_and(|(doc, _)| doc.signed() == expected.signed())
     }
 
     /// The lookup start, capped by the signed time of each service needed to complete it.
@@ -701,6 +719,7 @@ impl App {
                 read_ms: started,
                 outcome: SwitchCopy::Unavailable,
                 copies: Vec::new(),
+                terminal_read: false,
             };
             let Some(first) = first else { return answer };
             let public = match first.public_identity().await {
@@ -714,6 +733,7 @@ impl App {
             answer.read_ms = observed;
             answer.version = answer.version.max(public.identity.version());
             answer.copies.push((public.identity, observed));
+            answer.terminal_read = public.freeze.is_none();
             if let Some(freeze) = public.freeze {
                 let Ok(next) = SwitchClient::new(
                     &freeze.next().url,
@@ -737,6 +757,7 @@ impl App {
                         if public.freeze.is_some() {
                             return answer;
                         }
+                        answer.terminal_read = true;
                     }
                     Err(ClientError::Switch {
                         code: ErrorCode::Staged,

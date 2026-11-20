@@ -901,7 +901,17 @@ async fn test_identity_lookup_reports_each_source_and_its_time() {
         .await;
     let bob = p.bob.identity().public();
     let start = p.clock.now_ms();
-    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(answer.read());
+    assert!(answer.confirms(&lookup.identity.doc));
+    let mut different = lookup.identity.doc.body().clone();
+    different.policy.connect_requests.push = !different.policy.connect_requests.push;
+    let different = IdentityDoc::sign(p.bob.identity().key(), different).unwrap();
+    assert_eq!(different.version(), lookup.identity.doc.version());
+    assert!(!answer.confirms(&different));
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(found.doc.signed(), lookup.identity.doc.signed());
     assert_eq!(found.homeserver, HomeserverCopy::Read);
     assert_eq!(found.switch_copy, SwitchCopy::Read);
     assert_eq!(found.read_at_ms, Some(start));
@@ -1083,6 +1093,8 @@ async fn test_peer_lookup_reports_successor_service_observation_after_a_move() {
         let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
         let switch = lookup.switch.unwrap().await;
         assert!(switch.read());
+        assert!(!switch.confirms(&lookup.identity.doc));
+        assert!(switch.confirms(&moved));
         p.bob.homeserver().publish(&moved).unwrap();
         if homeserver_before_finish {
             let routed = wallet.peer_identity(&bob, true).await.unwrap();
@@ -1148,7 +1160,11 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     .unwrap();
     p.bob.switch().freeze(&freeze).unwrap();
     let first = p.clock.now_ms();
-    let unavailable = wallet.identity_of(&bob, true).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(!answer.read());
+    assert!(!answer.confirms(&newer));
+    let unavailable = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(unavailable.switch_copy, SwitchCopy::Unavailable);
     assert_eq!(unavailable.doc.version(), newer.version());
     assert_eq!(unavailable.read_at_ms, Some(first));
@@ -1159,14 +1175,22 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     next.lock().clock = Arc::new(crate::clock::TestClock::new(staged_time));
     p.clock.advance_ms(4 * MINUTE);
     let predecessor_time = p.clock.now_ms();
-    let staged = wallet.identity_of(&bob, true).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(answer.read());
+    assert!(!answer.confirms(&newer));
+    let staged = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(staged.switch_copy, SwitchCopy::Read);
     assert_eq!(staged.read_at_ms, Some(predecessor_time));
     assert_eq!(staged.switch_read_ms, Some(predecessor_time));
     assert_eq!(staged.switch_lookup_ms, staged_time);
     assert_eq!(staged.fresh_until_ms(), staged_time + DOC_CACHE_MS);
     next.lock().clock = Arc::new(crate::clock::TestClock::new(first + 20 * MINUTE));
-    let refused = wallet.identity_of(&bob, true).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(!answer.read());
+    assert!(!answer.confirms(&newer));
+    let refused = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(refused.switch_copy, SwitchCopy::Stale);
     assert_eq!(refused.switch_read_ms, Some(predecessor_time));
     assert_eq!(
@@ -1175,6 +1199,39 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     );
     let kept = wallet.identity_of(&bob, false).await.unwrap();
     assert_eq!(kept.switch_copy, SwitchCopy::Stale);
+
+    p.clock.set_ms(first + 20 * MINUTE);
+    next.lock().clock = p.clock.clone();
+    let mut body = newer.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox = freeze.next().clone();
+    let moved = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    next.deliver_identity(&moved).unwrap();
+    let third_key = ed25519_dalek::SigningKey::from_bytes(&[24; 32]);
+    let frozen_again = Freeze::sign(
+        p.bob.identity().key(),
+        FreezeBody {
+            identity: bob,
+            inbox: Inbox::new(
+                "https://third.example",
+                third_key.verifying_key().to_bytes(),
+            ),
+            next_generation: moved.generation() + 1,
+            issued_at: p.clock.now_ms(),
+            nonce: [18; 16],
+        },
+    )
+    .unwrap();
+    next.freeze(&frozen_again).unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(!answer.read());
+    assert!(!answer.confirms(&newer));
+    assert!(!answer.confirms(&moved));
+    let refused = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(refused.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(refused.doc.signed(), moved.signed());
 }
 
 #[tokio::test]
@@ -1237,12 +1294,18 @@ async fn test_identity_lookup_older_switch_copy_asks_to_look_up_again() {
         .await;
     // The Homeserver publishes a version the switch doesn't hold.
     let mut body = p.bob.body();
+    let older = IdentityDoc::sign(p.bob.identity().key(), body.clone()).unwrap();
     body.version += 1;
     let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
     p.alice.homeserver().publish(&newer).unwrap();
     let bob = p.bob.identity().public();
     let start = p.clock.now_ms();
-    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    assert!(answer.read());
+    assert!(answer.confirms(&older));
+    assert!(!answer.confirms(&newer));
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(found.doc.version(), newer.version());
     assert_eq!(found.read_at_ms, Some(start));
     // Twenty minutes on, only the switch answers, with the older copy.
@@ -1444,6 +1507,7 @@ async fn test_identity_lookup_split_failed_switch_needs_the_user() {
     p.router.remove(BOB_ORIGIN);
     let answer = lookup.switch.unwrap().await;
     assert!(!answer.read());
+    assert!(!answer.confirms(&lookup.identity.doc));
     let found = wallet.finish_identity_lookup(answer).await.unwrap();
     let now = p.clock.now_ms();
     assert_eq!(found.switch_copy, SwitchCopy::Unavailable);

@@ -519,6 +519,14 @@ the app clears the old baseline and attempts to save the list from the same answ
 
 ### What a backup and restore carry
 
+Once list recovery has finished, both backups carry the original loss window,
+the protocol answers already committed and the remaining conversation entries.
+A pending conversation batch keeps its signed bytes. After restore the client
+asks only the remaining protocols and submits the remaining conversations.
+The layered backup carries each protocol's local writes beside these answers.
+An oversized answer keeps its unacknowledged refusal for that protocol. A restore
+in place refuses a backup that would roll back this installation's answers.
+
 Both `App::backup` and `App::backup_layered` include outstanding resend and missed-entries
 calls in `AppBackup::owed`, keyed by the suffix after `owed/` and with their remaining
 owners. A backup omits deny list calls and `dgap`. Every restore with `lists.read`

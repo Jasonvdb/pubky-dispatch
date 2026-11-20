@@ -444,8 +444,9 @@ pub struct AppBackup {
     put_backs: Vec<put_back::RecordHold>,
     record_settlements: Vec<batch::PendingBatch>,
     loss_lists: Option<recovery::lists::SavedLists>,
+    loss_answers: Option<recovery::answers::SavedAnswers>,
     finished_list_upload: Option<u64>,
-    put_back_notices: Vec<events::KeptDuty>,
+    protocol_notices: Vec<events::KeptDuty>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -1446,6 +1447,10 @@ impl App {
     /// ([`AppBackup`]). The app should take one at every rotation, replacing the previous
     /// one (Switch spec 3.6).
     ///
+    /// During provider-loss recovery it keeps the answers committed after the list step,
+    /// the protocols that still owe an answer and any pending batch of conversations.
+    /// Use [`App::backup_layered`] to keep the protocols' local writes with their answers.
+    ///
     /// The backup takes outbox items oldest first within [`MAX_CARRIED_OUTBOX_BYTES`]
     /// (8 MiB), including messages refused for good. Restore reports each omitted message
     /// ID, as [`AppEvent::DeliveryUnknown`] since the source device may still deliver it,
@@ -1550,8 +1555,9 @@ impl App {
             put_backs: state.put_backs.values().cloned().collect(),
             record_settlements: Vec::new(),
             loss_lists: None,
+            loss_answers: None,
             finished_list_upload: None,
-            put_back_notices: Vec::new(),
+            protocol_notices: Vec::new(),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
             outbox: Vec::new(),
@@ -1671,24 +1677,25 @@ impl App {
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
         backup.loss_lists = recovery::lists::SavedLists::read(reader).await?;
+        backup.loss_answers = reader
+            .get(recovery::keys::LOSS)
+            .await?
+            .and_then(|loss| recovery::answers::SavedAnswers::capture(loss, &self.protocols));
         backup.finished_list_upload = reader.get(recovery::lists::FINISHED).await?;
         for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
             match state::decode::<events::KeptDuty>(&value) {
-                Ok(notice)
-                    if matches!(
-                        notice.duty,
-                        events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
-                    ) =>
-                {
-                    backup.put_back_notices.push(notice)
+                Ok(notice) if notice.duty.carried_for_protocol() => {
+                    backup.protocol_notices.push(notice)
                 }
                 Err(_)
                     if std::str::from_utf8(&value).is_ok_and(|bytes| {
-                        bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
+                        bytes.contains("PutBackWaits")
+                            || bytes.contains("PutBackRefused")
+                            || (bytes.contains("LocalWritesRefused") && bytes.contains("Loss"))
                     }) =>
                 {
                     return Err(AppError::InvalidData(format!(
-                        "unreadable record replacement notice {key}"
+                        "unreadable protocol notice {key}"
                     )));
                 }
                 _ => {}
@@ -1952,9 +1959,10 @@ impl App {
     /// restore's included, for the protocols it registers: the duty events not
     /// acknowledged, with their IDs, delivered again as after [`App::load`], and the
     /// protocol calls they couldn't answer, made again by the next read. One owed to none
-    /// of them is left behind and counted in [`AppEvent::RestoreLeftBehind`]. A backup
-    /// carries no duty event, so a restore onto a store without an epoch, on another device
-    /// or wiped, starts a new event epoch ([`EventId`]). Every restore takes the re-send
+    /// of them is left behind and counted in [`AppEvent::RestoreLeftBehind`]. Carried
+    /// notices, including a refused provider-loss callback's local writes, get new IDs
+    /// on a store without an epoch, which starts a fresh event epoch ([`EventId`]).
+    /// Every restore takes the re-send
     /// and missed-entries calls the backup carries ([`App::backup`]), each checked as a
     /// carried call is and kept for the protocols it registers, one that isn't whole or is
     /// owed to none of them left behind and counted in [`AppEvent::RestoreLeftBehind`]. A
@@ -2082,6 +2090,9 @@ impl App {
             }
             if let Some(saved) = &backup.loss_lists {
                 saved.check(backup, &own_doc)?;
+            }
+            if let Some(answers) = &backup.loss_answers {
+                answers.check(backup, &own_doc, &cert, &protocols)?;
             }
             let mut at = BTreeMap::new();
             for (seq, hash) in &backup.chain_at {
@@ -2218,6 +2229,9 @@ impl App {
             let same_installation = installation.is_some();
             let mut finished_list_upload = backup.finished_list_upload;
             if same_installation {
+                if let Some(live) = old.get(recovery::keys::LOSS).await? {
+                    recovery::answers::SavedAnswers::check_destination(&live, backup, &own_doc)?;
+                }
                 finished_list_upload = recovery::lists::SavedLists::check_destination(
                     &old,
                     backup.loss_lists.as_ref(),
@@ -2613,6 +2627,9 @@ impl App {
                 if let Some(saved) = &backup.loss_lists {
                     saved.restore(&mut tx)?;
                 }
+                if let Some(answers) = &backup.loss_answers {
+                    tx.put(recovery::keys::LOSS, answers.loss())?;
+                }
                 // Age and capacity selection use the backup's verified observation, never
                 // the restoring device's clock. Selection joins the installation commit.
                 let drops = app.waiting_drops_at(None, backup.taken_service_ms);
@@ -2625,7 +2642,7 @@ impl App {
                     .beyond_cursor
                     .as_ref()
                     .and_then(|layer| layer.held_gap);
-                let mut put_back_notices = backup.put_back_notices.clone();
+                let mut protocol_notices = backup.protocol_notices.clone();
                 for hold in app.state.put_backs.values().filter(|h| h.waited) {
                     // The protocol's local preparation may have been acknowledged after
                     // this backup, or left behind with a layer. Reoffer the same delete.
@@ -2636,17 +2653,13 @@ impl App {
                             delete: hold.observation.delete,
                         },
                     };
-                    if !put_back_notices.contains(&notice) {
-                        put_back_notices.push(notice);
+                    if !protocol_notices.contains(&notice) {
+                        protocol_notices.push(notice);
                     }
                 }
-                for notice in &put_back_notices {
+                for notice in &protocol_notices {
                     notice.check_owners(&app.protocols)?;
-                    if !matches!(
-                        notice.duty,
-                        events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
-                    ) || notice.to.len() != 1
-                    {
+                    if !notice.duty.carried_for_protocol() || notice.to.len() != 1 {
                         return Err(corrupt());
                     }
                     let local = carried.values.iter().any(|(key, value)| {

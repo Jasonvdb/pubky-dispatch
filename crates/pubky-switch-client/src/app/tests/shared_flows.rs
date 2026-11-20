@@ -15265,7 +15265,7 @@ async fn test_backup_identifies_record_replacement_notices_by_duty() {
         reader.backup().await.unwrap(),
         reader.backup_layered().await.unwrap(),
     ] {
-        assert!(matches!(backup.put_back_notices.as_slice(),
+        assert!(matches!(backup.protocol_notices.as_slice(),
             [notice] if matches!(notice.duty, Duty::PutBackWaits { key, .. } if key == record_key)));
     }
 

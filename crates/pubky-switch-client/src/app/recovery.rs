@@ -27,6 +27,7 @@
 //! 12.6 steps 5 and 6, 12.4): the obligations from before the loss are uncertain, which is
 //! the protocol's to judge with the declaration time and the residual window.
 
+pub(super) mod answers;
 pub(super) mod inventory;
 pub(super) mod lists;
 mod roster;

@@ -21,6 +21,8 @@ use crate::parties::{Asking, CHAT, TASKS, sample_protocol};
 use crate::{FlowResult, World};
 
 #[cfg(test)]
+mod loss_answers;
+#[cfg(test)]
 mod retained_authority;
 #[cfg(test)]
 mod zero_listing;
@@ -30,6 +32,8 @@ enum WaitFor {
     MissedCallback,
     Store,
     ProtocolData,
+    #[cfg(test)]
+    Loss([u8; 32]),
 }
 
 struct OrderedProtocol {
@@ -112,6 +116,8 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
                     ));
                 }
                 WaitFor::MissedCallback => {}
+                #[cfg(test)]
+                WaitFor::Loss(_) => {}
             }
         }
         match cx.sender_disposition(&message.sender) {
@@ -145,6 +151,31 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
             ));
         }
         self.inner.missed(missed)
+    }
+
+    #[cfg(test)]
+    fn provider_lost(
+        &self,
+        loss: &pubky_switch_client::app::ProviderLoss,
+        view: &pubky_switch_client::app::LocalView<'_>,
+    ) -> Result<pubky_switch_client::app::LossActions, pubky_switch_client::app::StoreFailure> {
+        use pubky_switch_client::app::{LocalWrite, LossActions, StoreFailure};
+        let WaitFor::Loss(peer) = self.wait else {
+            return Ok(LossActions::default());
+        };
+        if self.held.load(Ordering::Relaxed) {
+            return Err(StoreFailure::unavailable(
+                pubky_switch_client::error::StoreError::Unavailable,
+            ));
+        }
+        assert!(view.local_get(b"resend").unwrap().is_none());
+        Ok(LossActions {
+            local: vec![LocalWrite::Put {
+                key: b"resend".to_vec(),
+                value: loss_answers::evidence(loss),
+            }],
+            conversations: vec![peer],
+        })
     }
 
     fn deny_list_changed(

@@ -2075,12 +2075,10 @@ impl Signer {
                     && copy.version() <= self.state.signed_through))
     }
 
-    /// The service holds `copy`, a version this signer signed for the recovery in progress:
-    /// naming that service and the key pinned for it, the one its
-    /// answer verified with, it is the recovery's version delivered, as its answer would have
-    /// said. Naming another, it was taken elsewhere and this delivery is over: the recovery
-    /// waits to be declared again. Never records behind: this install signed it for this
-    /// recovery.
+    /// The service holds a version recognized for this recovery, including the exact base
+    /// carried by a restored backup. When the document names this service and its pinned
+    /// key, the signer records delivery. A document naming another service leaves the
+    /// recovery waiting for a new declaration.
     pub(super) async fn own_recovery_held(&mut self, copy: IdentityDoc) -> Result<()> {
         let names_it = self.state.service.as_ref().is_some_and(|service| {
             service.origin == copy.inbox().url && service.service_key == copy.inbox().service_key

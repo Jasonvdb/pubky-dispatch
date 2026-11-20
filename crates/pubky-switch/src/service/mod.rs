@@ -1999,7 +1999,8 @@ impl Service {
     }
 
     /// Decode the caller and verify signer requests with the identity key (Switch wire 7.2).
-    /// App signature checks use the caller's certificate in the surrounding authentication path.
+    /// Own-app requests use the signing key in the stored or first-call app record.
+    /// Requests from another identity's app use the key in its supplied certificate.
     fn authenticate(
         &self,
         account: &[u8; 32],

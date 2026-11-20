@@ -2,15 +2,14 @@
 //! 7.4.15).
 
 use pubky_switch_core::{
-    chain::{
-        ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, TransitionProof, item_hash,
-    },
+    chain::{ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, item_hash},
     enc::b64,
     http::IdentityDelivery,
     records::{
         AccountActivation, AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc,
         KeptProofs, check_delivery, recovery_apps_version,
     },
+    sig::SignedDoc,
 };
 use serde_json::{Value, json};
 
@@ -39,10 +38,7 @@ pub fn stale_identity_current(held: Option<&IdentityDoc>) -> Value {
 }
 
 /// A write answer's body: `{ "proofs": [...], "head": signed head }` (Switch wire 7.1).
-pub(super) fn write_answer(
-    proofs: &[&pubky_switch_core::sig::SignedDoc],
-    head: &[u8],
-) -> Result<Vec<u8>, ApiError> {
+pub(super) fn write_answer(proofs: &[&SignedDoc], head: &[u8]) -> Result<Vec<u8>, ApiError> {
     let mut body = b"{\"proofs\":[".to_vec();
     for (index, proof) in proofs.iter().enumerate() {
         if index > 0 {
@@ -60,13 +56,13 @@ pub(super) fn write_answer(
 
 /// The proof and head produced when a new identity document is chained (Switch wire 7.4.2).
 struct AppliedIdentity {
-    proof: TransitionProof,
+    proof: SignedDoc,
     head: SignedHead,
 }
 
 impl AppliedIdentity {
     fn into_answer(self) -> Result<Answer, ApiError> {
-        let body = write_answer(&[self.proof.signed()], &self.head.to_json())?;
+        let body = write_answer(&[&self.proof], &self.head.to_json())?;
         Ok(Answer::ok(body).with_head(Some(self.head)))
     }
 
@@ -464,8 +460,9 @@ impl Service {
             generation: doc.generation(),
             data_epoch: doc.data_epoch(),
         };
-        let proof =
-            self.sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?;
+        let proof = self
+            .sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?
+            .into_signed();
         // An app it no longer makes current stops holding entries at once (Switch wire
         // 7.4.2, 9.1). Read the old app set before retaining the new document's exclusions.
         let release = self.release(trusted);
@@ -474,7 +471,7 @@ impl Service {
             .map_err(|e| store_error(&e))?;
         txn.set_identity(&HeldIdentity {
             doc: doc.signed().clone(),
-            proof: Some(proof.signed().clone()),
+            proof: Some(proof.clone()),
         })
         .await
         .map_err(|e| store_error(&e))?;

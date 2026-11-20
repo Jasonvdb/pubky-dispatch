@@ -2511,10 +2511,11 @@ async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
 async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore() {
     let w = World::new();
     let router = Router::of(&w);
+    let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
     let mut app = join_on(
         &w,
         &router,
-        w.store.clone(),
+        store.clone(),
         w.protocol.clone(),
         &[Permission::ListsRead, Permission::ListsManage],
     )
@@ -2575,21 +2576,62 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
         service.max_contacts = 1;
         service.max_deny = 1;
     }
-    // The evidence POST and first list page are answered. The service commits
-    // the second page, then the client loses its answer.
+    // One raw page reaches the inactive bank, but the next page cannot be
+    // stored. The last committed generation and its original duty survive.
+    store.fail_put_once(b"loss-list-parts/0/loss/list-input/0/1");
+    app.refresh_identity().await.unwrap();
+    assert!(matches!(
+        app.follow_provider().await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    assert!(third.uploads().is_empty());
+    drop(app);
+    let reopen = || {
+        App::load(
+            router.env(&w, store.clone()),
+            w.protocol.clone(),
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+    };
+    let mut app = reopen().await.unwrap();
+    let prior = app.recovery_info().await.unwrap().unwrap();
+    assert_eq!(
+        (prior.loss.generation, prior.step),
+        (2, crate::app::RecoveryStep::Lists)
+    );
+    // Capture a backup before any list page is accepted. Then accept the
+    // first page and lose the second page's answer after it is committed.
+    third.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    assert!(app.follow_provider().await.is_err());
+    drop(app);
+    let mut app = reopen().await.unwrap();
+    let before_page = app.backup().await.unwrap();
     third.fail_next(Fault::LoseAnswerAfter {
         path: "recovery/upload".into(),
-        after: 2,
+        after: 1,
     });
-    app.refresh_identity().await.unwrap();
     assert!(app.follow_provider().await.is_err());
     assert_eq!(
         app.recovery_info().await.unwrap().unwrap().step,
         crate::app::RecoveryStep::Lists
     );
     assert!(!third.lock().admission_staged);
+    drop(app);
+    let app = reopen().await.unwrap();
     let backup = app.backup().await.unwrap();
     drop(app);
+    let stale = App::restore(
+        router.env(&w, store),
+        w.protocol.clone(),
+        World::config(),
+        &before_page,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(_)))));
     let mut restored = App::restore(
         router.env(&w, Arc::new(MemoryStore::new())),
         w.protocol.clone(),
@@ -2655,6 +2697,8 @@ async fn test_refused_list_upload_remains_owed_after_reopen() {
             .iter()
             .all(|(body, _)| body.get("lists").is_none())
     );
+    drop(app);
+    let app = load_loss(&lost, store.clone()).await.unwrap();
     let backup = app.backup().await.unwrap();
     drop(app);
     let mut app = App::restore(

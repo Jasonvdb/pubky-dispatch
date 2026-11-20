@@ -312,7 +312,9 @@ async fn test_erasure_aborted_after_a_signed_refusal() {
     // can abort. `identity.json` is published again, and the grant
     // reminder the erasure raised for the app, still listed, is withdrawn.
     let world = World::new();
-    let (mut signer, _, _) = with_an_app(&world).await;
+    let (mut signer, app, store) = with_an_app(&world).await;
+    let enrolled: serde_json::Value =
+        serde_json::from_slice(&persisted_observations(&store, &world).0).unwrap();
     let newest = signer.identity_doc().unwrap().unwrap();
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
@@ -320,6 +322,22 @@ async fn test_erasure_aborted_after_a_signed_refusal() {
         current: serde_json::Value::Null,
     });
     signer.close_account(confirmed()).await.unwrap_err();
+    let (_, flow) = persisted_observations(&store, &world);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&flow.unwrap()).unwrap(),
+        serde_json::json!({ "Erase": {
+            "account": enrolled["service"],
+            "unpublished": true,
+            "reminded": [app],
+            "unanswered": false,
+            "first_404_ms": null,
+            "shown": null
+        } })
+    );
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
     signer.abort_erasure().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Signing);
     assert_eq!(world.published().unwrap().signed(), newest.signed());
@@ -2526,6 +2544,7 @@ async fn test_signer_erase_keeps_its_creation_after_conflict() {
         after: 0,
     });
     assert!(signer.close_account(confirmed()).await.is_err());
+    let unanswered = persisted_observations(&store, &world).1.unwrap();
     world.switch.fail_next(SwitchFault::Error {
         path: "/erase".into(),
         code: ErrorCode::Conflict,
@@ -2544,6 +2563,10 @@ async fn test_signer_erase_keeps_its_creation_after_conflict() {
     );
     assert_eq!(named_created(&world), [Some(created), Some(created)]);
     assert!(!world.switch.erased());
+    assert_eq!(
+        persisted_observations(&store, &world).1.unwrap(),
+        unanswered
+    );
     assert_eq!(
         signer.abort_erasure().await.unwrap_err(),
         SignerError::Refused(Refusal::ErasureUnanswered)

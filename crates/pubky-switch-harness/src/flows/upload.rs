@@ -716,9 +716,15 @@ pub(super) async fn expect_lists(
     deny: &[&TestIdentity],
 ) -> FlowResult {
     let list = app.allow_list().await?;
+    let kept: Vec<_> = list
+        .peers
+        .iter()
+        .filter(|peer| peer.kept)
+        .map(|peer| peer.pubky)
+        .collect();
     world.outcome(
         name,
-        &json!({ "contacts": list.contacts.len(), "deny": list.deny.len() }),
+        &json!({ "contacts": kept.len(), "deny": list.deny.len() }),
     );
     world.advance_ms(STEP_MS);
     let same = |held: &[[u8; 32]], expected: &[&TestIdentity]| {
@@ -727,12 +733,12 @@ pub(super) async fn expect_lists(
                 .iter()
                 .all(|identity| held.contains(&identity.public()))
     };
-    if same(&list.contacts, contacts) && same(&list.deny, deny) {
+    if same(&kept, contacts) && same(&list.deny, deny) {
         Ok(())
     } else {
         Err(format!(
             "{name}: {} contacts and {} denied, not the {} and {} expected",
-            list.contacts.len(),
+            kept.len(),
             list.deny.len(),
             contacts.len(),
             deny.len()

@@ -5,7 +5,8 @@
 use serde_json::json;
 
 use super::Refusal;
-use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut, carrying};
+use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut};
+use crate::enc::carrying;
 use crate::error::{Error, Result};
 use crate::http::ErrorCode;
 use crate::ident::{collection_id, record_key_from_blinded};

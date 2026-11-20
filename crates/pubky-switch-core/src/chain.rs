@@ -13,10 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value, json};
 
-use crate::enc::{b64, hash, lp, pubky_id, u64be, unb64, zbase32_encode};
+use crate::enc::{Obj, b64, hash, lp, pubky_id, quote, u64be, unb64, zbase32_encode};
 use crate::error::{Error, Result, invalid};
 use crate::labels;
-use crate::ops::body::{Obj, quote};
 use crate::ops::read::{opt, req, req_app_id, req_b64n, req_int, req_pubky, req_str, req_time};
 use crate::ops::{BatchRef, RecordVersion, SignedOp};
 use crate::records::Inbox;

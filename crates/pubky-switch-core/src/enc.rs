@@ -1,10 +1,103 @@
-//! Byte encodings (Switch wire 1.2 to 1.5): `lp()`, integers, BLAKE3 and `derive()`,
-//! base64url, z-base-32, Pubky IDs, App IDs and kids.
+//! Wire encodings (Switch wire 1.1 to 1.5): compact JSON, `lp()`, integers, BLAKE3 and
+//! `derive()`, base64url, z-base-32, Pubky IDs, App IDs and kids.
 
 use base64::Engine as _;
+use serde_json::Value;
 
 use crate::error::{Error, Result, invalid};
 use crate::labels;
+use crate::sig::SignedDoc;
+
+/// A compact JSON object written member by member, in the order the writer gives, so that
+/// the bytes follow the wire format's tables (Switch wire 1.1).
+pub(crate) struct Obj {
+    out: Vec<u8>,
+    first: bool,
+}
+
+/// A JSON string, escaped as JSON escapes it.
+pub(crate) fn quote(text: &str) -> String {
+    Value::String(text.to_owned()).to_string()
+}
+
+impl Obj {
+    /// An empty object.
+    pub(crate) fn new() -> Self {
+        Self {
+            out: vec![b'{'],
+            first: true,
+        }
+    }
+
+    fn key(&mut self, name: &str) {
+        if !self.first {
+            self.out.push(b',');
+        }
+        self.first = false;
+        self.out.extend_from_slice(quote(name).as_bytes());
+        self.out.push(b':');
+    }
+
+    /// A string member.
+    pub(crate) fn str(&mut self, name: &str, value: &str) -> &mut Self {
+        self.key(name);
+        self.out.extend_from_slice(quote(value).as_bytes());
+        self
+    }
+
+    /// An integer member.
+    pub(crate) fn int(&mut self, name: &str, value: u64) -> &mut Self {
+        self.key(name);
+        self.out.extend_from_slice(value.to_string().as_bytes());
+        self
+    }
+
+    /// A `null` member.
+    pub(crate) fn null(&mut self, name: &str) -> &mut Self {
+        self.key(name);
+        self.out.extend_from_slice(b"null");
+        self
+    }
+
+    /// A member whose value is JSON text already written.
+    pub(crate) fn raw(&mut self, name: &str, json: &[u8]) -> &mut Self {
+        self.key(name);
+        self.out.extend_from_slice(json);
+        self
+    }
+
+    /// The object's bytes.
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        self.out.push(b'}');
+        self.out
+    }
+}
+
+/// A JSON array of values already written.
+pub(crate) fn array(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![b'['];
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(item);
+    }
+    out.push(b']');
+    out
+}
+
+/// A JSON array of strings.
+pub(crate) fn string_array(items: &[String]) -> Vec<u8> {
+    let quoted: Vec<Vec<u8>> = items.iter().map(|s| quote(s).into_bytes()).collect();
+    array(&quoted)
+}
+
+/// A signed document's carrying form `{"body":...,"sig":...}` (Switch wire 2.2).
+pub(crate) fn carrying(doc: &SignedDoc) -> Vec<u8> {
+    let mut o = Obj::new();
+    o.str("body", &doc.body).str("sig", &doc.sig);
+    o.finish()
+}
 
 /// `lp(x1, ..., xn) = u32_be(len(x1)) || x1 || ... || u32_be(len(xn)) || xn` (Switch wire 1.4).
 ///

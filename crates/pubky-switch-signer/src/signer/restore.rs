@@ -404,6 +404,8 @@ impl Signer {
 
     /// Restore over records this call itself proves unusable, after the user accepts the
     /// losses (Switch spec 12.8, Switch wire 3.13). Readable local restrictions remain binding.
+    /// A renewal whose predecessor lost only its account binding resumes on the original
+    /// install when its backup and serving account verify the predecessor.
     /// The same namespace owner is retained through the first atomic replacement and retry.
     /// No record is deleted before the verified replacement is committed.
     ///
@@ -434,8 +436,23 @@ impl Signer {
         {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
+        let records = match state::read(&store, &identity).await? {
+            state::ReadRecords {
+                state: Ok(Some(mut state)),
+                flow: Ok(Some(flow @ Flow::Renew { .. })),
+            } if state.managed_by.is_none()
+                && state.newest.as_ref().is_some_and(|n| n.account.is_none()) =>
+            {
+                let mut signer = Self::restore_target(env, keyring, store)?;
+                Box::pin(signer.bind_renewal_predecessor(&mut state, &flow)).await?;
+                signer.commit(state, Some(flow)).await?;
+                Box::pin(signer.resume()).await?;
+                return Ok(signer);
+            }
+            records => records,
+        };
         let local = match (
-            RestoreLocal::unusable_for_backup(state::read(&store, &identity).await?, &identity),
+            RestoreLocal::unusable_for_backup(records, &identity),
             confirmed.0.clone(),
         ) {
             (Err(SignerError::Refused(Refusal::AlreadySetUp)), Some(key)) => {
@@ -461,6 +478,60 @@ impl Signer {
             (result, _) => drop(result?),
         }
         Ok(signer)
+    }
+
+    /// Recover the binding of the exact predecessor from its sealed backup. The original
+    /// install still owns the renewal and retries the batches it signed (Switch spec 3.2,
+    /// 12.8, Switch account-binding 2).
+    async fn bind_renewal_predecessor(&self, state: &mut SignerState, flow: &Flow) -> Result<()> {
+        let Flow::Renew {
+            account,
+            prev: Some(prev),
+            doc,
+            batches,
+            sent,
+        } = flow
+        else {
+            return Err(Refusal::FlowInProgress.into());
+        };
+        check_local_restore(state, false)?;
+        if let Some(error) = gate::refusal(state) {
+            return Err(error);
+        }
+        flow.check_state(state)?;
+        let successor = state::stored_identity(doc, &state.identity)?;
+        let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
+        let newest = state.newest.as_mut().ok_or(Refusal::FlowInProgress)?;
+        let bytes = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .ok_or(Refusal::FlowInProgress)?;
+        let view = self.open_backup(&bytes)?.ok_or(Refusal::FlowInProgress)?;
+        let predecessor = &view.identity_doc;
+        if predecessor.signed() != &newest.doc
+            || predecessor.hash() != *prev
+            || predecessor.body().signer != state.install
+            || view.service() != *account
+            || state.service.as_ref() != Some(account)
+            || successor.body().signer != state.install
+            || successor.generation() != predecessor.generation()
+            || successor.version() <= predecessor.version()
+            || successor.version() != state.signed_through
+            || *sent > batches.len()
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let answer = self.account_client(account)?.apps().await?;
+        if answer.identity.as_ref() != Some(&newest.doc) {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        self.check_restore(&view, answer.identity.as_ref(), Some(&local))
+            .await?;
+        newest.account = Some(view.service());
+        state.check_stored_copies()
     }
 
     pub(super) fn restore_target(

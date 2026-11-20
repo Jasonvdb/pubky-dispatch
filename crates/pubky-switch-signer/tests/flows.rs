@@ -335,17 +335,18 @@ async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
     let (mut signer, _) = world.enrolled().await;
     // Reads still answer, so the backup check passes and only the write fails.
     *world.homeserver.failing_puts.lock().unwrap() = true;
+    let requests = world.transport.requests().len();
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
     // Nothing reached the switch: the backup comes first (Switch wire 3.13).
     assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
-    assert_eq!(world.distinct_requests("PUT", "/identity"), 1);
+    world.assert_request_attempts(requests, "PUT", "/identity", 0);
     assert_eq!(signer.high_water().unwrap().unwrap().version, 1);
     // Once the Homeserver takes writes again, the same version goes out.
     *world.homeserver.failing_puts.lock().unwrap() = false;
     signer.resume().await.unwrap();
     assert_eq!(world.switch.identity_doc().unwrap().version(), 2);
-    assert_eq!(world.distinct_requests("PUT", "/identity"), 2);
+    world.assert_request_attempts(requests, "PUT", "/identity", 1);
 }
 
 #[tokio::test]
@@ -504,8 +505,8 @@ async fn test_signer_a_lost_answer_is_resent_with_the_same_bytes() {
     signer.resume().await.unwrap();
     // The enrollment and the delivery each went out twice, the same bytes both times, and
     // the switch took the retry (Switch wire 2.1, 7.4.2).
-    assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
-    assert_eq!(world.distinct_requests("PUT", "/identity"), 1);
+    world.assert_request_attempts(0, "POST", "/v1/enroll", 2);
+    world.assert_request_attempts(0, "PUT", "/identity", 2);
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
 }

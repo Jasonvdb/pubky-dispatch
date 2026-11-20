@@ -58,7 +58,7 @@ fn certificates(identity: &[u8; 32]) -> HashMap<[u8; 16], AppCert> {
 }
 
 #[test]
-fn test_vectors_operations() {
+pub(super) fn test_vectors_operations() {
     let keys = keys();
     let v = load("operations.json");
     let operations = arr(&v, "operations");
@@ -351,13 +351,9 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         based_on,
         &[(&old_key, &new_key), (&scopes, &made_permanent("2"))],
     ));
-    let section = json!({
-        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2); a record.put at a permanent policy, its permanent member written after write_scopes, deletes only in a generation above the one the policy names, never when it names none, and creates only in the generation it names (wire 6.2 \"Permanent policies\", spec 10.3.1).",
-        "cases": cases,
-    });
     generated(
         "operations.json",
-        &[(Place::Member("/shape_rejections"), section)],
+        &[(Place::Member("/shape_rejections/cases"), json!(cases))],
     );
     let file = load("operations.json");
     for c in arr(&file["shape_rejections"], "cases") {
@@ -498,14 +494,15 @@ fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp)
             })
         })
         .collect();
-    let section = json!({
-        "description": "Wire 6.2, spec 10.3.1: a record.put at a permanent policy. cases are the record.put create of operations at its policy made permanent, its permanent member written after write_scopes as { \"generation\": g }, naming no generation and naming generation 1, the account's: each key derived again for its policy (wire 1.5), its value sealed again for that key, each a batch of its own, signed again by the wallet, which the service takes. rejections are the case naming generation 1 with its permanent member written as permanent gives, signed again by the wallet, so its signature verifies and only the member's form refuses it, 400 bad_request, as the operation is read: generation is required, an int (wire 1.1) or null, and the only member, and permanent is an object.",
-        "cases": cases,
-        "rejections": rejections,
-    });
     generated(
         "operations.json",
-        &[(Place::Member("/permanent_policies"), section)],
+        &[
+            (Place::Member("/permanent_policies/cases"), json!(cases)),
+            (
+                Place::Member("/permanent_policies/rejections"),
+                json!(rejections),
+            ),
+        ],
     );
     let file = load("operations.json");
     let section = &file["permanent_policies"];

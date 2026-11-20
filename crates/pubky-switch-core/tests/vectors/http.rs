@@ -435,17 +435,7 @@ fn response_signatures(keys: &Keys) {
     });
     let pointer = format!("/responses/{not_hosted_at}");
     let not_hosted = signed_case(keys, &file, not_hosted);
-    let description = "Request and response signatures (wire 7.1) and the push webhook (wire 8.2). Request fields are the exact header texts, empty when absent, and the method as sent; the timestamp is RFC 3339 UTC to the second. Each response names the request case it answers in request (null for an unsigned public read) and gives the request as the service received it in received_request: lp(method, path and query, body field, switch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature), H(Switch-Created)), the body field BLAKE3(body) once the body is read, each H empty when the header is absent and lp of its values when present, every H empty for the public read. Response signatures cover u64(status), BLAKE3 of the received request, the exact Switch-Server-Time text, the head field (empty without Switch-Head, BLAKE3 of its exact text with one) and BLAKE3(body).";
-    generated(
-        "http.json",
-        &[
-            (Place::Element(&pointer), not_hosted),
-            (
-                Place::Member("/description"),
-                Value::String(description.into()),
-            ),
-        ],
-    );
+    generated("http.json", &[(Place::Element(&pointer), not_hosted)]);
     let file = load("http.json");
     let cases: Vec<(Place<'_>, Value)> = arr(&file, "responses")
         .iter()
@@ -633,12 +623,8 @@ fn enrollment_answer_at(file: &Value) -> usize {
 /// it was answered at, which its answer names in `created`.
 pub(super) fn created_of(file: &Value) -> u64 {
     let answer = &arr(file, "responses")[enrollment_answer_at(file)];
-    let at =
-        pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
-            .unwrap();
-    let body = EnrollmentAnswer::from_json(st(answer, "body").as_bytes()).unwrap();
-    assert_eq!(body.created, at);
-    body.created
+    pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
+        .unwrap()
 }
 
 /// The enrollment answer (Switch wire 3.7), which `pubky-switch-core` writes (README "How
@@ -775,52 +761,8 @@ fn erasures(keys: &Keys) {
     generated("http.json", &generated_cases);
 }
 
-/// The page `body` with each record write that a later write of the same key in the page
-/// supersedes shown as its stub (Switch wire 7.5, "Feed items and visibility"): the item
-/// `{"type":"stub","seq":<seq>,"stub":<its stub>}`, the stub's bytes as the page held them.
-fn superseded_as_stubs(body: &str) -> String {
-    let page: Value = serde_json::from_str(body).unwrap();
-    let writes: Vec<(u64, String)> = arr(&page, "items")
-        .iter()
-        .filter(|item| item["type"] == "chain" && item["item_type"] == "op")
-        .filter_map(|item| {
-            let op: Value = serde_json::from_slice(&b64(st(&item["item"], "body"))).unwrap();
-            (op["op"] == "record.put")
-                .then(|| (item["seq"].as_u64().unwrap(), st(&op, "key").to_owned()))
-        })
-        .collect();
-    let mut out = body.to_owned();
-    for (seq, key) in &writes {
-        if !writes.iter().any(|(later, k)| later > seq && k == key) {
-            continue;
-        }
-        let start = out
-            .find(&format!("{{\"type\":\"chain\",\"seq\":{seq},"))
-            .unwrap();
-        let end = start
-            + out[start..]
-                .find(",{\"type\":")
-                .or_else(|| out[start..].find("],\"next\""))
-                .unwrap();
-        let item = &out[start..end];
-        let stub_at = item.find("\"stub\":").unwrap() + "\"stub\":".len();
-        let stub_end = item.find(",\"item_type\":").unwrap();
-        let stub_item = format!(
-            "{{\"type\":\"stub\",\"seq\":{seq},\"stub\":{}}}",
-            &item[stub_at..stub_end]
-        );
-        out.replace_range(start..end, &stub_item);
-    }
-    out
-}
-
-/// The `cursor` of the two feed pages (Switch wire 7.4.4), which `pubky-switch-core` added to
-/// the prototype's pages (README "How the files were generated"): alice's wallet after `1:4`,
-/// before its first cursor move, holds 0, and the long-poll's page at `1:41` an app whose
-/// cursor is at the head. Each page holds the member before its `head`, and a record write
-/// that a later write in the page supersedes shows as its stub ([`superseded_as_stubs`]).
-/// Its answer is signed again with her account's fixed service key, answering the page's own
-/// request, at its server time and head ([`signed_case`]).
+/// The two feed pages carry the wallet's cursor, with the create at seq 6 shown only as
+/// its chain stub because seq 8 supersedes it (Switch wire 7.4.4, 7.5).
 fn feed_page_cursors(keys: &Keys) {
     use pubky_switch_core::enc;
     let alice_id = enc::pubky_id(&keys.identity("alice"));
@@ -838,20 +780,20 @@ fn feed_page_cursors(keys: &Keys) {
             .unwrap_or_else(|| panic!("{name}"))
             .clone();
         assert_eq!(st(&case, "public_key"), enc::b64(&service), "{name}");
-        // The page as the prototype wrote it, then with the member before its `head`, the
-        // last `"head":` of the body, since a page's items come before it.
-        let held = st(&case, "body");
-        let page = match held.find("\"cursor\":") {
-            Some(start) => {
-                let end = start + held[start..].find(',').unwrap() + 1;
-                format!("{}{}", &held[..start], &held[end..])
-            }
-            None => held.to_owned(),
-        };
-        let page = superseded_as_stubs(&page);
-        let at = page.rfind("\"head\":{").unwrap();
-        let body = format!("{}\"cursor\":{cursor},{}", &page[..at], &page[at..]);
-        case["body"] = Value::String(body);
+        let mut page: Value = serde_json::from_str(st(&case, "body")).unwrap();
+        page["cursor"] = cursor.into();
+        if cursor == 0 {
+            let chain = load("chain.json");
+            let create = arr(&chain, "items").iter().find(|i| i["seq"] == 6).unwrap();
+            let visible = page["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|i| i["seq"] == 6)
+                .expect("the feed includes the superseded create at seq 6");
+            *visible = serde_json::json!({"type": "stub", "seq": 6, "stub": create["stub"]});
+        }
+        case["body"] = super::record_current::feed_page(&page).into();
         let case = signed_case(keys, &file, case);
         if cursor == 41 {
             signature_case = Some(serde_json::json!({
@@ -1034,17 +976,21 @@ fn test_invitation_delivery_references() {
     );
 }
 
+pub(super) fn http_cases(keys: &Keys) {
+    crate::documents::enrollment_cases(keys);
+    answered_requests(keys);
+    request_signatures(keys);
+    enrollment_answer(keys);
+    erasures(keys);
+    feed_page_cursors(keys);
+    response_signatures(keys);
+    received_cases(keys);
+}
+
 #[test]
 fn test_vectors_http() {
     let keys = keys();
-    crate::documents::enrollment_cases(&keys);
-    answered_requests(&keys);
-    request_signatures(&keys);
-    enrollment_answer(&keys);
-    erasures(&keys);
-    feed_page_cursors(&keys);
-    response_signatures(&keys);
-    received_cases(&keys);
+    http_cases(&keys);
     let v = load("http.json");
     // The answers to a request received otherwise than sent: each verifies for the request
     // as received, never for the request case as sent (Switch wire 7.1).

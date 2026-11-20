@@ -211,12 +211,16 @@ Run the `trace` example to see what the two switches answered, and list each dif
 
 ## Run time and databases
 
-Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
-of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
+The all-flows test walks `FLOWS` in order. A focused test asks for only the flows it
+needs. Tests in the same binary share each flow's comparison, so tests asking for the
+same flow wait for its result and different flows can run at the same time. Each service
+in a flow uses its own test database and drops it even if the test panics.
+
+Each backend run for a comparison has its own thread with 16 MiB of stack
+(`FLOW_STACK_BYTES`, `on_flow_stack`). In a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Eighty-eight flows take about three minutes in a
-debug build. If that grows too long, the service's halves could share one service and one
+that ran the flows had less left. A debug run of 88 flows took about three minutes.
+If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
 
 The test server is shared with whatever else uses it, and the service answers every failure

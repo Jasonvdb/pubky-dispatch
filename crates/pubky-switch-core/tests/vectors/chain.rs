@@ -24,7 +24,6 @@ use pubky_switch_core::ops::{
 use pubky_switch_core::records::{AppRecord, IdentityDoc, ReceiveKeyRecord};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
 use crate::common::*;
@@ -99,7 +98,7 @@ fn transition_of(signed: &SignedDoc) -> ServiceTransition {
 }
 
 #[test]
-fn test_vectors_chain() {
+pub(super) fn test_vectors_chain() {
     let keys = keys();
     let v = load("chain.json");
     let generation = int(&v, "generation");
@@ -587,24 +586,21 @@ fn check_record_delete(
     let body = ProofBody::new(stub.clone(), object, &state);
     let proof = TransitionProof::sign(service, identity, body).unwrap();
     let body_text = String::from_utf8(proof.signed().body_bytes().unwrap()).unwrap();
-    let section = json!({
-        "description": format!(
-            "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, \
-             expected_version (1, 8), in a batch of one chained after seq 9 at {}. Its \
-             value_sealed.ct is the tag alone, so the switch takes it as a delete without \
-             opening it, and its transition proof's state shows deleted true (wire 6.5). No \
-             other file continues the chain this way: export.json freezes the account after \
-             seq 9, and operations.json's done batch takes seqs 10 and 11.",
-            rfc3339(at)
-        ),
-        "item": item,
-        "transition_proof": {
-            "body": body_text,
-            "name": format!("record.put delete (seq {seq}): deleted at version (1, {seq})"),
-            "signed": proof.signed(),
-        },
+    let transition_proof = json!({
+        "body": body_text,
+        "name": format!("record.put delete (seq {seq}): deleted at version (1, {seq})"),
+        "signed": proof.signed(),
     });
-    generated("chain.json", &[(Place::Member("/record_delete"), section)]);
+    generated(
+        "chain.json",
+        &[
+            (Place::Member("/record_delete/item"), item),
+            (
+                Place::Member("/record_delete/transition_proof"),
+                transition_proof,
+            ),
+        ],
+    );
 
     // The case as the file holds it: the item reads and links to the chain, the delete opens
     // as one, and the proof verifies, binds the operation and shows the delete.

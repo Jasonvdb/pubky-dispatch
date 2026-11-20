@@ -161,7 +161,14 @@ A reference prototype, shared separately, generated every file but the cases `pu
 
 Its vector tests build each of these cases again and compare it with the file, value for value, and check that it is refused, or taken, by the rule it names; the generator lives in the crate's tests, with the fixed sealing randomness of its test-only `test-vectors` feature, which no production build enables. Adding the cases changed no other value of any file: in `documents.json`, `operations.json` and `chain.json` they are new members, in `export.json` new entries of `claim_rejections`, in `http.json` the enrollment answer's body, the first erasure request and its answer, and the not-hosted `404`'s key, body and name in their places, five requests and two responses after the others, the four new `received_cases`, and in every response the members its signature decides, with `request` and `received_request` new, and in `envelopes.json` the whole `signer_backup` member, with the backup label's case in `signatures.json`. The feed pages' `cursor` and the stub at `seq` 6 changed only those two pages: each body, its `BLAKE3(body)` field, the signed bytes and the response signature, in the answer and its `switch-service-signature` header, and the same values of `signatures.json`'s response signature case.
 
-After an intended wire change, the vectors are generated again, by the prototype or, for the cases above, by `pubky-switch-core`'s vector tests with `PUBKY_SWITCH_WRITE_VECTORS` set, and the diff is reviewed.
+After an intended wire change, regenerate the prototype's cases with the prototype. For the cases above, run the core's single writer, verify the published files with the ordinary vector tests, and review the diff:
+
+```sh
+PUBKY_SWITCH_WRITE_VECTORS=1 cargo test -p pubky-switch-core --test vectors -- --ignored --exact generation::regenerate_vectors
+cargo test -p pubky-switch-core --test vectors
+```
+
+The writer rebuilds related cases together and replaces each changed file with complete JSON. Fixture descriptions are edited in the JSON files.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
 

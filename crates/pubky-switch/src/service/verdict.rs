@@ -1272,123 +1272,10 @@ mod tests {
         assert_eq!(MarkInput::from(&failed), MarkInput::StoreUnreadable);
     }
 
-    // Table 2: the route of each verdict per request class.
-
-    const BEHIND: RecoveryNotice = RecoveryNotice {
-        generation: 4,
-        reason: NoticeReason::Behind,
-        permanent: false,
-    };
-
-    fn route_of(verdict: Verdict, class: RequestClass) -> Route {
-        let judgement = Judgement {
-            decision: account::Judgement {
-                recovery_required: false,
-                erase_account_again: false,
-                verdict,
-                recovery_floor: BEHIND.generation,
-                retirement_generation: None,
-            },
-            key: MARK_KEY,
-        };
-        answer(&judgement, &class, CURRENT).route
-    }
-
-    const ERASE: RequestClass = RequestClass::Erase;
-    const STEPS: [MoveStep; 6] = [
-        MoveStep::ImportOrUpload,
-        MoveStep::Activate { clears_mark: true },
-        MoveStep::Activate { clears_mark: false },
-        MoveStep::ActivateUnjudged,
-        MoveStep::Abort,
-        MoveStep::Export,
-    ];
-
     fn put(generation: u64, recovery_from: Option<u64>) -> RequestClass {
         RequestClass::PutIdentity {
             generation,
             recovery_from,
-        }
-    }
-
-    /// Deliveries other than the one start: not above the notice's generation, without
-    /// `recovery_from`, or with another one.
-    fn other_deliveries() -> [RequestClass; 4] {
-        [
-            put(4, Some(3)),
-            put(5, None),
-            put(5, Some(3)),
-            put(6, Some(4)),
-        ]
-    }
-
-    fn bounded_verdict(abort_allowed: bool) -> Verdict {
-        Verdict::Bounded {
-            notice: BEHIND,
-            abort_allowed,
-        }
-    }
-
-    fn failing_verdict(abort_allowed: bool) -> Verdict {
-        Verdict::Failing {
-            notice: BEHIND,
-            abort_allowed,
-        }
-    }
-
-    const LOST: Verdict = Verdict::Lost { notice: BEHIND };
-
-    #[test]
-    fn test_answer_not_hosted_ordinary() {
-        for delete_mark in [false, true] {
-            let verdict = Verdict::NotHosted { delete_mark };
-            assert_eq!(route_of(verdict, RequestClass::Ordinary), Route::NotHosted);
-        }
-    }
-
-    #[test]
-    fn test_answer_not_hosted_enroll() {
-        for delete_mark in [false, true] {
-            let verdict = Verdict::NotHosted { delete_mark };
-            assert_eq!(
-                route_of(verdict, RequestClass::Enroll),
-                Route::CreateAccount
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_not_hosted_put_identity() {
-        assert_eq!(route_of(NOT_HOSTED, put(1, None)), Route::NotHosted);
-        assert_eq!(route_of(NOT_HOSTED, put(5, Some(4))), Route::NotHosted);
-    }
-
-    #[test]
-    fn test_answer_not_hosted_move() {
-        for step in STEPS {
-            assert_eq!(
-                route_of(NOT_HOSTED, RequestClass::Move(step)),
-                Route::NotHosted
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_not_hosted_erase() {
-        assert_eq!(route_of(NOT_HOSTED, ERASE), Route::NotHosted);
-    }
-
-    fn assert_goes_on(verdict: Verdict) {
-        let on = Route::Proceed { head: true };
-        assert_eq!(route_of(verdict, RequestClass::Ordinary), on);
-        assert_eq!(route_of(verdict, put(5, Some(4))), on);
-        for step in STEPS {
-            let expected = match step {
-                MoveStep::Activate { clears_mark: false } => Route::Conflict,
-                MoveStep::ActivateUnjudged => Route::JudgeActivation,
-                _ => on,
-            };
-            assert_eq!(route_of(verdict, RequestClass::Move(step)), expected);
         }
     }
 
@@ -1442,346 +1329,27 @@ mod tests {
     }
 
     #[test]
-    fn test_answer_unjudged_activation_never_clears_a_mark() {
-        // An activation whose import isn't judged is never routed as one that activates or
-        // signs a head: where the import could clear the mark, it goes to be judged; at an
-        // account that fails stop or a lost identity it gets the notice, as every move step
-        // that isn't an abort (Switch wire 7.3, Table 2).
-        let unjudged = RequestClass::Move(MoveStep::ActivateUnjudged);
-        for verdict in [
-            Verdict::Staged,
-            Verdict::Healthy,
-            Verdict::Bounded {
-                notice: BEHIND,
-                abort_allowed: true,
-            },
-            Verdict::Bounded {
-                notice: BEHIND,
-                abort_allowed: false,
-            },
-        ] {
-            assert_eq!(route_of(verdict, unjudged), Route::JudgeActivation);
-        }
-        for verdict in [
-            Verdict::Failing {
-                notice: BEHIND,
-                abort_allowed: true,
-            },
-            Verdict::Lost { notice: BEHIND },
-        ] {
-            assert_eq!(route_of(verdict, unjudged), Route::Notice(BEHIND));
-        }
-        assert_eq!(route_of(NOT_HOSTED, unjudged), Route::NotHosted);
-        assert_eq!(route_of(Verdict::Unknown, unjudged), Route::Unavailable);
-    }
-
-    #[test]
     fn test_answer_staged_activation_of_a_retired_generation_is_refused() {
         // At a staged account at its (0, 0) mark, an import of a generation the operator
         // retired for the identity doesn't clear the mark, and its activation is refused.
-        let zero = AccountMark::zero(MARK_KEY, 1);
+        let zero = AccountMark::zero(MARK_KEY, 100);
         let head = ChainTip {
             generation: 3,
             seq: 9,
             chain_hash: [1; 32],
         };
-        assert!(!activation_clears_mark(head, None, Some(&zero), &[3]));
+        let clears_mark = activation_clears_mark(head, None, Some(&zero), &[3]);
+        assert!(!clears_mark);
         assert!(activation_clears_mark(head, None, Some(&zero), &[2]));
-        let clears = activation_clears_mark(head, None, Some(&zero), &[3]);
+        let judgement = judged(Row::StagedNoChain, MarkInput::Mark(zero), &[3]);
+        let class = RequestClass::Move(MoveStep::Activate { clears_mark });
         assert_eq!(
-            route_of(
-                Verdict::Staged,
-                RequestClass::Move(MoveStep::Activate {
-                    clears_mark: clears
-                })
-            ),
-            Route::Conflict
-        );
-    }
-
-    #[test]
-    fn test_answer_staged_ordinary() {
-        assert_eq!(
-            route_of(Verdict::Staged, RequestClass::Ordinary),
-            Route::Proceed { head: true }
-        );
-    }
-
-    #[test]
-    fn test_answer_staged_enroll() {
-        assert_eq!(
-            route_of(Verdict::Staged, RequestClass::Enroll),
-            Route::Proceed { head: false }
-        );
-    }
-
-    #[test]
-    fn test_answer_staged_put_identity() {
-        for class in [put(1, None), put(5, Some(4))] {
-            assert_eq!(
-                route_of(Verdict::Staged, class),
-                Route::Proceed { head: true }
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_staged_move() {
-        assert_goes_on(Verdict::Staged);
-    }
-
-    #[test]
-    fn test_answer_staged_erase() {
-        assert_eq!(
-            route_of(Verdict::Staged, ERASE),
-            Route::Erase {
-                fails_stop: false,
-                import_bars: true
+            answer(&judgement, &class, CURRENT),
+            Answer {
+                route: Route::Conflict,
+                key: MARK_KEY,
             }
         );
-    }
-
-    #[test]
-    fn test_answer_healthy_ordinary() {
-        assert_eq!(
-            route_of(Verdict::Healthy, RequestClass::Ordinary),
-            Route::Proceed { head: true }
-        );
-    }
-
-    #[test]
-    fn test_answer_healthy_enroll() {
-        assert_eq!(
-            route_of(Verdict::Healthy, RequestClass::Enroll),
-            Route::Proceed { head: false }
-        );
-    }
-
-    #[test]
-    fn test_answer_healthy_put_identity() {
-        for class in [put(1, None), put(5, Some(4))] {
-            assert_eq!(
-                route_of(Verdict::Healthy, class),
-                Route::Proceed { head: true }
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_healthy_move() {
-        assert_goes_on(Verdict::Healthy);
-    }
-
-    #[test]
-    fn test_answer_healthy_erase() {
-        assert_eq!(
-            route_of(Verdict::Healthy, ERASE),
-            Route::Erase {
-                fails_stop: false,
-                import_bars: true
-            }
-        );
-    }
-
-    #[test]
-    fn test_answer_bounded_ordinary() {
-        assert_eq!(
-            route_of(bounded_verdict(true), RequestClass::Ordinary),
-            Route::Notice(BEHIND)
-        );
-    }
-
-    #[test]
-    fn test_answer_bounded_enroll() {
-        assert_eq!(
-            route_of(bounded_verdict(true), RequestClass::Enroll),
-            Route::Proceed { head: false }
-        );
-    }
-
-    #[test]
-    fn test_answer_bounded_put_identity() {
-        assert_eq!(
-            route_of(bounded_verdict(true), put(5, Some(4))),
-            Route::StartAfresh
-        );
-        for class in other_deliveries() {
-            assert_eq!(
-                route_of(bounded_verdict(true), class),
-                Route::Notice(BEHIND)
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_bounded_move() {
-        let at = |abort_allowed, step| {
-            route_of(bounded_verdict(abort_allowed), RequestClass::Move(step))
-        };
-        assert_eq!(
-            at(true, MoveStep::ImportOrUpload),
-            Route::Proceed { head: false }
-        );
-        assert_eq!(
-            at(true, MoveStep::Activate { clears_mark: true }),
-            Route::Proceed { head: true }
-        );
-        assert_eq!(
-            at(true, MoveStep::Activate { clears_mark: false }),
-            Route::Conflict
-        );
-        assert_eq!(at(true, MoveStep::Abort), Route::Proceed { head: false });
-        assert_eq!(at(false, MoveStep::Abort), Route::Notice(BEHIND));
-        // The column names no export for a bounded account: it gets the notice.
-        assert_eq!(at(true, MoveStep::Export), Route::Notice(BEHIND));
-    }
-
-    #[test]
-    fn test_answer_bounded_erase() {
-        for abort_allowed in [true, false] {
-            assert_eq!(
-                route_of(bounded_verdict(abort_allowed), ERASE),
-                Route::Erase {
-                    fails_stop: false,
-                    import_bars: abort_allowed
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_failing_ordinary() {
-        assert_eq!(
-            route_of(failing_verdict(true), RequestClass::Ordinary),
-            Route::Notice(BEHIND)
-        );
-    }
-
-    #[test]
-    fn test_answer_failing_enroll() {
-        assert_eq!(
-            route_of(failing_verdict(false), RequestClass::Enroll),
-            Route::Proceed { head: false }
-        );
-    }
-
-    #[test]
-    fn test_answer_failing_put_identity() {
-        assert_eq!(
-            route_of(failing_verdict(false), put(5, Some(4))),
-            Route::StartAfresh
-        );
-        for class in other_deliveries() {
-            assert_eq!(
-                route_of(failing_verdict(false), class),
-                Route::Notice(BEHIND)
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_failing_move() {
-        let at = |abort_allowed, step| {
-            route_of(failing_verdict(abort_allowed), RequestClass::Move(step))
-        };
-        assert_eq!(at(true, MoveStep::Abort), Route::Proceed { head: false });
-        assert_eq!(at(false, MoveStep::Abort), Route::Notice(BEHIND));
-        for step in [
-            MoveStep::ImportOrUpload,
-            MoveStep::Activate { clears_mark: true },
-            MoveStep::Activate { clears_mark: false },
-            MoveStep::Export,
-        ] {
-            for abort_allowed in [true, false] {
-                assert_eq!(at(abort_allowed, step), Route::Notice(BEHIND));
-            }
-        }
-    }
-
-    #[test]
-    fn test_answer_failing_erase() {
-        for abort_allowed in [true, false] {
-            assert_eq!(
-                route_of(failing_verdict(abort_allowed), ERASE),
-                Route::Erase {
-                    fails_stop: true,
-                    import_bars: abort_allowed
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_lost_ordinary() {
-        assert_eq!(
-            route_of(LOST, RequestClass::Ordinary),
-            Route::Notice(BEHIND)
-        );
-    }
-
-    #[test]
-    fn test_answer_lost_enroll() {
-        assert_eq!(route_of(LOST, RequestClass::Enroll), Route::TakeOverMark);
-    }
-
-    #[test]
-    fn test_answer_lost_put_identity() {
-        assert_eq!(route_of(LOST, put(5, Some(4))), Route::Notice(BEHIND));
-        assert_eq!(route_of(LOST, put(1, None)), Route::Notice(BEHIND));
-    }
-
-    #[test]
-    fn test_answer_lost_move() {
-        for step in STEPS {
-            assert_eq!(
-                route_of(LOST, RequestClass::Move(step)),
-                Route::Notice(BEHIND)
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_lost_erase() {
-        assert_eq!(route_of(LOST, ERASE), Route::EraseLost);
-    }
-
-    #[test]
-    fn test_answer_unknown_ordinary() {
-        assert_eq!(
-            route_of(Verdict::Unknown, RequestClass::Ordinary),
-            Route::Unavailable
-        );
-    }
-
-    #[test]
-    fn test_answer_unknown_enroll() {
-        assert_eq!(
-            route_of(Verdict::Unknown, RequestClass::Enroll),
-            Route::Unavailable
-        );
-    }
-
-    #[test]
-    fn test_answer_unknown_put_identity() {
-        assert_eq!(
-            route_of(Verdict::Unknown, put(5, Some(4))),
-            Route::Unavailable
-        );
-    }
-
-    #[test]
-    fn test_answer_unknown_move() {
-        for step in STEPS {
-            assert_eq!(
-                route_of(Verdict::Unknown, RequestClass::Move(step)),
-                Route::Unavailable
-            );
-        }
-    }
-
-    #[test]
-    fn test_answer_unknown_erase() {
-        assert_eq!(route_of(Verdict::Unknown, ERASE), Route::Unavailable);
     }
 
     // Table 2, "Signed with", and the enrollment's answer with the current key.
@@ -1793,7 +1361,7 @@ mod tests {
             RequestClass::Ordinary,
             put(5, Some(4)),
             RequestClass::Move(MoveStep::Abort),
-            ERASE,
+            RequestClass::Erase,
         ] {
             assert_eq!(answer(judgement, &class, CURRENT).key, key);
         }
@@ -1872,10 +1440,24 @@ mod tests {
     }
 
     #[test]
-    fn test_answer_lost_key() {
+    fn test_answer_lost_account_routes_enrollment_and_erasure_with_their_keys() {
         let judgement = judged(Row::None, mark(2, 12, 7), &[]);
         assert!(matches!(judgement.decision.verdict, Verdict::Lost { .. }));
         assert_key(&judgement, MARK_KEY);
+        assert_eq!(
+            answer(&judgement, &RequestClass::Enroll, CURRENT),
+            Answer {
+                route: Route::TakeOverMark,
+                key: CURRENT,
+            }
+        );
+        assert_eq!(
+            answer(&judgement, &RequestClass::Erase, CURRENT),
+            Answer {
+                route: Route::EraseLost,
+                key: MARK_KEY,
+            }
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ fn app_of<'a>(keys: &'a Keys, app_id: &[u8; 16]) -> &'a AppKeys {
 }
 
 #[test]
-fn test_vectors_envelopes() {
+pub(super) fn test_vectors_envelopes() {
     let keys = keys();
     signer_handover_case(&keys);
     signer_backup_case(&keys);
@@ -912,7 +912,7 @@ fn signer_backup_case(keys: &Keys) {
     let backup = SignerBackup::seal_parts_with(&key, &[json.as_slice()], &[randomness]).unwrap();
     let envelope = &backup.envelopes()[0];
     let (sk_e, _) = envelope::ephemeral_key(&randomness.ikm_e);
-    let case = serde_json::json!({
+    let mut case = serde_json::json!({
         "backup": serde_json::to_value(&backup).unwrap(),
         "backup_kid": enc::b64(&kid(&key.backup_public())),
         "backup_secret_hex": hex::encode(key.backup_secret()),
@@ -920,11 +920,16 @@ fn signer_backup_case(keys: &Keys) {
         "envelope_len": envelope.len(),
         "ikm_e_hex": hex::encode(randomness.ikm_e),
         "nonce_hex": hex::encode(randomness.nonce),
-        "note": "Wire 3.13: alice's signer backup, as her signer writes it on her Homeserver at path, under /priv, which the Homeserver serves only to her sessions whose capabilities cover it. Its JSON, plaintext_json, is a backup's plaintext: signer_handover's records with kind pubky-switch.signer_backup, without identity_secret, and with prev, the document hash of her version 1, which version 3 builds on. It is in one part, in an envelope to her backup key (keys.json backup_public, derived from her identity secret), sealed with the seed envelopes/signer_backup, notify off, HPKE info naming alice and that key's kid, plaintext u32_be(len) | JSON | zeros; alice's identity key signs lp(\"pubky-switch/v1/signer-backup\", identity, u32_be(1), envelope bytes) (signatures.json). It opens only with her backup secret, which only the identity key derives.",
         "path": records::SIGNER_BACKUP_PATH,
         "plaintext_json": std::str::from_utf8(&json).unwrap(),
         "sk_e_hex": hex::encode(sk_e),
     });
+    if let Some(note) = file["signer_backup"].get("note") {
+        case["note"] = note
+            .as_str()
+            .expect("signer backup note must be a string")
+            .into();
+    }
     generated("envelopes.json", &[(Place::Member("/signer_backup"), case)]);
     let count = 1u32.to_be_bytes();
     let fields: [&[u8]; 3] = [&alice, &count, envelope];

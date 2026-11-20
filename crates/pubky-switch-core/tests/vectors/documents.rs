@@ -71,7 +71,7 @@ fn body_value(signed: &SignedDoc) -> Value {
 }
 
 #[test]
-fn test_vectors_documents() {
+pub(super) fn test_vectors_documents() {
     let keys = keys();
     enrollment_cases(&keys);
     let v = load("documents.json");
@@ -1334,16 +1334,16 @@ fn check_approval(
     let refused = read(&serde_json::to_vec(&past).unwrap(), &wallet.bundle_secret).unwrap_err();
     let reason = refused.to_string();
     let reason = &reason[reason.find("Switch ").unwrap()..];
-    let cases = json!([{
+    let cases = vec![json!({
         "name": "a part through data epoch 3, at data epoch 2",
-        "rule": "an approval's key bundle parts cover every data epoch from 1 to its identity.json's data_epoch and none goes past it, since at approval there is no next epoch (wire 3.5, 3.10 step 4)",
         "approval": past,
         "step": 4,
         "error": quoted(reason),
-    }]);
+    })];
+    let cases = with_published_rules(cases, &v["approval"]["rejections"]);
     generated(
         "documents.json",
-        &[(Place::Member("/approval/rejections"), cases)],
+        &[(Place::Member("/approval/rejections"), Value::Array(cases))],
     );
     let file = load("documents.json");
     for case in arr(&file["approval"], "rejections") {
@@ -1385,7 +1385,7 @@ fn check_identity_rejections(keys: &Keys, docs: &HashMap<String, Doc>) {
     let text = String::from_utf8(v3.body_bytes().unwrap()).unwrap();
     let connect = r#""connect_requests":{"enabled":false,"max_pending":50,"push":false}"#;
     assert!(text.contains(connect));
-    let case = |name: &str, rule: &str, replacement: &str| {
+    let case = |name: &str, replacement: &str| {
         let body = text.replace(connect, replacement);
         let signed = key.sign_doc(labels::sig::IDENTITY, &[], body.clone().into_bytes());
         let Error::Invalid(error) = IdentityDoc::verify(&signed, &alice).unwrap_err() else {
@@ -1394,30 +1394,31 @@ fn check_identity_rejections(keys: &Keys, docs: &HashMap<String, Doc>) {
         let error = error.trim_end_matches(" at line 0 column 0");
         json!({
             "name": name,
-            "rule": rule,
             "body": body,
             "signed": signed,
             "error": error.strip_prefix("json: ").unwrap_or(error),
         })
     };
-    let section = json!({
-        "description": "Wire 3.3: identity.json documents every reader refuses, the switch included. Each is alice's identity.json version 3 with one member of its body text changed, signed again by her identity key, so its signature verifies and only the document's rules refuse it. error is the core's wording.",
-        "cases": [
-            case(
-                "connect_requests without its members",
-                "every member of connect_requests is required, and none is null (wire 3.3)",
-                r#""connect_requests":{}"#,
-            ),
-            case(
-                "connect_requests with push null",
-                "every member of connect_requests is required, and none is null (wire 3.3)",
-                r#""connect_requests":{"enabled":false,"max_pending":50,"push":null}"#,
-            ),
-        ],
-    });
+    let cases = vec![
+        case(
+            "connect_requests without its members",
+            r#""connect_requests":{}"#,
+        ),
+        case(
+            "connect_requests with push null",
+            r#""connect_requests":{"enabled":false,"max_pending":50,"push":null}"#,
+        ),
+    ];
+    let cases = with_published_rules(
+        cases,
+        &load("documents.json")["identity_rejections"]["cases"],
+    );
     generated(
         "documents.json",
-        &[(Place::Member("/identity_rejections"), section)],
+        &[(
+            Place::Member("/identity_rejections/cases"),
+            Value::Array(cases),
+        )],
     );
     let file = load("documents.json");
     let cases = arr(&file["identity_rejections"], "cases");

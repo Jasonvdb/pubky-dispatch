@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::common::*;
 
 #[test]
-fn test_vectors_identifiers() {
+pub(super) fn test_vectors_identifiers() {
     let keys = keys();
     generated("identifiers.json", &permanent_cases(&keys));
     let v = load("identifiers.json");

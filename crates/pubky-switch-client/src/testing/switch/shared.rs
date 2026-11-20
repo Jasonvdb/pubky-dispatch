@@ -98,7 +98,7 @@ impl Retained {
         }
     }
 
-    fn record(&self) -> Option<&CheckedRecord> {
+    pub(crate) fn record(&self) -> Option<&CheckedRecord> {
         match self {
             Self::Upload(record) => Some(record),
             Self::Marker(_) => None,
@@ -424,9 +424,7 @@ impl Shared {
             let Some(held) = self.records.get(key) else {
                 continue;
             };
-            let Some(current) = held.recovered()? else {
-                continue;
-            };
+            let current = held.recovered()?;
             let conflicts = self
                 .divergent
                 .get(key)
@@ -434,7 +432,8 @@ impl Shared {
                 .flatten()
                 .filter_map(Retained::record);
             dated.extend(
-                std::iter::once(&current)
+                current
+                    .iter()
                     .chain(conflicts)
                     .filter_map(|r| checked.date_stored_record(r, removed)),
             );

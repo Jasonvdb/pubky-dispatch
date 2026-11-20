@@ -105,6 +105,75 @@ async fn upload_named_record(lost: &Lost, app: &mut App, name: &[u8], batch: [u8
 }
 
 #[tokio::test]
+async fn test_scripted_receipt_dates_retained_write_beside_local_create() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(store.clone(), &Permission::ALL, true, false).await;
+    let old = lost.w.switch.identity_doc().unwrap();
+    let (key, original) = lost
+        .w
+        .switch
+        .lock()
+        .shared
+        .records
+        .iter()
+        .next()
+        .map(|(k, r)| (*k, r.clone()))
+        .unwrap();
+    // Registration succeeds at the replacement, but the first evidence upload must wait.
+    lost.next.set_uploads_per_app_per_hour(0);
+    assert!(Box::pin(follow_loss(&lost, store)).await.is_err());
+    lost.next.set_uploads_per_app_per_hour(60);
+    assert_eq!(upload_at_next(&lost, r#"{"lists":{"contacts":[]}}"#).0, 200);
+    assert!(lost.next.record(&key).is_none());
+    let signed = pubky_switch_core::ops::SignedOp::peek(&original.op).unwrap();
+    let OpKind::RecordPut(mut create) = signed.body().kind.clone() else {
+        unreachable!()
+    };
+    let epoch = lost.next.identity_doc().unwrap().data_epoch();
+    let scope = &create.policy.read_scope;
+    create.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &lost.w.alice.scope_key(epoch, scope),
+        &lost.w.alice.public(),
+        epoch,
+        scope,
+        &key,
+        br#"{"local":true}"#,
+    )
+    .unwrap();
+    lost.next
+        .app_op(&app_keys("wallet"), OpKind::RecordPut(create))
+        .unwrap();
+    let local = lost.next.record(&key).unwrap();
+    let body =
+        json!({"lost_identity":old.signed(), "records":[{"op":original.op,"cert":original.cert}]});
+    assert_eq!(upload_at_next(&lost, &body.to_string()).0, 200);
+    let exact = || {
+        lost.next.lock().shared.divergent[&key][0]
+            .record()
+            .unwrap()
+            .uploaded
+            .version
+    };
+    assert!(!exact().exact);
+    let receipt = json!({"lost_identity":old.signed(),"proofs":[original.proof.unwrap()]});
+    for _ in 0..2 {
+        let (status, answer) = upload_at_next(&lost, &receipt.to_string());
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["result"]["records"], json!([]));
+        assert_eq!(answer["result"]["divergent"], json!([]));
+        assert_eq!(
+            exact(),
+            pubky_switch_core::recovery::UploadVersion::proved(original.state.version)
+        );
+        let current = lost.next.record(&key).unwrap();
+        assert_eq!(
+            (&current.op, current.revision, current.state.version),
+            (&local.op, local.revision, local.state.version)
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_upload_record_taken_is_read_from_the_transition() {
     // A record taken from an upload has no `record.put` at the next switch: the app learns of
     // it from the `upload` transition in its feed, and reads it with `GET /records`.

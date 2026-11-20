@@ -317,6 +317,24 @@ pub fn merge_checked_record<'a>(
         }
         RecordMerge::Unchanged => {}
     }
+    let mut successor = None;
+    let mut multiple = false;
+    if candidate.version.exact {
+        for (slot, r) in retained {
+            if r.uploaded.op_hash == candidate.op_hash {
+                // A retained write can itself gain a receipt while a replacement write stays
+                // current. Keep that stronger evidence through subsequent comparisons.
+                if decision == RecordMerge::Unchanged && !r.uploaded.version.exact {
+                    comparison.keep = Some((slot, Incoming));
+                }
+            } else if r.put.collection == upload.put.collection
+                && r.put.policy == upload.put.policy
+                && r.uploaded.built_on == candidate.version.version
+            {
+                multiple |= successor.replace(slot).is_some();
+            }
+        }
+    }
     let HeldRecord::FromUpload {
         op_hash,
         built_on,
@@ -348,22 +366,6 @@ pub fn merge_checked_record<'a>(
     {
         comparison.parent = Some(candidate.op_hash);
         return comparison;
-    }
-    let mut successor = None;
-    let mut multiple = false;
-    for (slot, r) in retained {
-        if r.uploaded.op_hash == candidate.op_hash {
-            // A retained fork can itself gain a receipt while another proved write stays
-            // current. Keep that stronger evidence through subsequent comparisons.
-            if decision == RecordMerge::Unchanged && !r.uploaded.version.exact {
-                comparison.keep = Some((slot, Incoming));
-            }
-        } else if r.put.collection == upload.put.collection
-            && r.put.policy == upload.put.policy
-            && r.uploaded.built_on == candidate.version.version
-        {
-            multiple |= successor.replace(slot).is_some();
-        }
     }
     if comparison.install == Some(Incoming)
         && !multiple

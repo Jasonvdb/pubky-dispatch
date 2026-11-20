@@ -2824,6 +2824,77 @@ async fn test_upload_claim_changed_last_by_an_upload_lists_a_gap_at_its_end() {
 }
 
 #[tokio::test]
+async fn test_service_receipt_dates_retained_write_beside_local_create() {
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let OpKind::RecordPut(mut create) = vector_op(6).body().kind.clone() else {
+        unreachable!()
+    };
+    let key = create.key;
+    let epoch = held(&replay).await.data_epoch();
+    let scope = &create.policy.read_scope;
+    let identity = alice_key();
+    create.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &identity.scope_key(epoch, scope),
+        &identity.public(),
+        epoch,
+        scope,
+        &key,
+        br#"{"local":true}"#,
+    )
+    .expect("seal the local value");
+    let written = wallet_ops(
+        &replay,
+        &wallet_batch(99, 2, vec![(vec![], OpKind::RecordPut(create))]),
+        at,
+    )
+    .await;
+    assert_eq!(written.status, 200, "{}", json_of(&written));
+    let path = format!("records/{}", pubky_switch_core::enc::b64(&key));
+    let local = wallet_get(&replay, &path, at).await;
+    let conflict = upload(&replay, &json!({"records":[uploaded_op(8,None)]}), at).await;
+    assert_eq!(conflict.status, 200);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("open the database");
+    let query = "SELECT proved_version FROM divergent_uploads WHERE account_id=$1 AND key=$2";
+    let version = || {
+        sqlx::query_scalar::<_, Option<i64>>(query)
+            .bind(alice_id())
+            .bind(key.to_vec())
+    };
+    assert_eq!(
+        version()
+            .fetch_one(&mut conn)
+            .await
+            .expect("retained version"),
+        None
+    );
+    let receipt = json!({"lost_identity":lost.signed(),"proofs":[lost_proof(UPDATED)]});
+    for _ in 0..2 {
+        let answer = upload(&replay, &receipt, at).await;
+        assert_eq!(answer.status, 200);
+        let result = &json_of(&answer)["result"];
+        assert_eq!(result["records"], json!([]));
+        assert_eq!(result["divergent"], json!([]));
+        assert_eq!(
+            version()
+                .fetch_one(&mut conn)
+                .await
+                .expect("retained version"),
+            Some(8)
+        );
+        let current = wallet_get(&replay, &path, at).await;
+        for k in ["op", "revision", "generation", "version"] {
+            assert_eq!(current[k], local[k]);
+        }
+        assert_eq!(current["divergent"], true);
+    }
+    drop(conn);
+    replay.db.drop_database().await.expect("drop database");
+}
+
+#[tokio::test]
 async fn test_upload_unconfirmed_version_leaves_the_proved_record_divergent() {
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;

@@ -433,7 +433,7 @@ impl Service {
                 }
                 at.divergent.push(candidate);
             }
-            if at.current.is_some() && checked.record_proofs.contains_key(&key) {
+            if checked.record_proofs.contains_key(&key) {
                 dated.extend(
                     at.current
                         .iter()

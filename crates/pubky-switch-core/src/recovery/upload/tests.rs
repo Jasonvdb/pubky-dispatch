@@ -725,6 +725,37 @@ fn test_recovery_two_ordered_receipts_clear_the_old_conflict_in_either_order() {
 }
 
 #[test]
+fn test_receipt_dates_a_retained_conflict_beside_a_local_write() {
+    use crate::recovery::{HeldRecord, RecordComparison, RecordSource, merge_checked_record};
+    let exact = checked_write(21, Some(50));
+    let bound = CheckedRecord::from_storage(exact.op.clone(), exact.cert.clone(), None).unwrap();
+    let hashes = [bound.uploaded.op_hash];
+    let held = HeldRecord::WrittenHere {
+        upload_base: None,
+        divergent: &hashes,
+    };
+    let state = crate::shared::RecordState::after(&bound.put, LOST + 1, 60);
+    let compare = |stored: &CheckedRecord| {
+        merge_checked_record(
+            &held,
+            Some(&state),
+            None,
+            std::iter::once((0, stored)),
+            &exact,
+            1,
+        )
+    };
+    assert_eq!(
+        compare(&bound),
+        RecordComparison {
+            keep: Some((0, RecordSource::Incoming)),
+            ..RecordComparison::default()
+        }
+    );
+    assert_eq!(compare(&exact), RecordComparison::default());
+}
+
+#[test]
 fn test_recovery_older_replay_uses_only_evidence_still_available() {
     use crate::recovery::RecordSource;
     let old = checked_write(10, Some(30));

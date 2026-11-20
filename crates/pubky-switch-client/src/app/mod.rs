@@ -3348,8 +3348,10 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Usage`] for an ID of another store, such as one from before a restore on
-    /// another device: nothing is acknowledged. A failed store read or commit; nothing is
-    /// acknowledged then either.
+    /// another device. On a refusal or read error the duties stay as they were. If the
+    /// commit returns [`StoreError::Unknown`], it may already have acknowledged every
+    /// handed duty through `up_to`. Read [`App::pending_duty_events`] to see what is
+    /// still owed before retrying. Other commit errors leave the duties unchanged.
     pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -3375,8 +3377,10 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a protocol not registered, or an ID of another store: nothing
-    /// is acknowledged. A failed store read or commit; nothing is acknowledged then either.
+    /// [`Refusal::Usage`] for an unregistered protocol or an ID of another store. The
+    /// store errors are those of [`App::ack_events`]. After [`StoreError::Unknown`],
+    /// read [`App::pending_duty_events`] and its [`PendingDuty::owners`] to see which
+    /// duties are still owed to this protocol. Other owners keep their duties.
     pub async fn ack_events_for(&mut self, protocol: &str, up_to: EventId) -> Result<(), AppError> {
         Box::pin(async move {
             self.check_registered(protocol)?;

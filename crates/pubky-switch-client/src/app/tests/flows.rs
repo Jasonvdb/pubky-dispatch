@@ -5006,6 +5006,32 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
 }
 
 #[tokio::test]
+async fn test_ack_events_after_a_lost_answer_preserves_the_later_duty() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let duties = refuse_next(&w, &mut app).await;
+    let [first, later] = duties.as_slice() else {
+        panic!("{duties:?}");
+    };
+    let id = first.id().unwrap();
+    let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(1)).await;
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+    assert!(matches!(
+        app.ack_events(id).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        std::slice::from_ref(later)
+    );
+    app.ack_events(id).await.unwrap();
+    assert_eq!(
+        app.unacknowledged_events().await.unwrap(),
+        std::slice::from_ref(later)
+    );
+}
+
+#[tokio::test]
 async fn test_pending_duty_events_do_not_extend_prior_delivery() {
     let w = World::new();
     let mut app = w.join("wallet").await;

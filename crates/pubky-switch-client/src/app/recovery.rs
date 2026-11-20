@@ -593,7 +593,7 @@ impl App {
         tx.delete_prefix("loss/")?;
         list_input.install(&mut tx)?;
         if self.state.cert.has_permission(Permission::ListsManage)
-            || self.state.cert.has_permission(Permission::ListsRead)
+            || (self.state.cert.has_permission(Permission::ListsRead) && list_input.has_denies())
         {
             lists::pending(&mut tx)?;
         }
@@ -659,7 +659,7 @@ impl App {
 
     /// One step of a loss, committed as done.
     async fn loss_step(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
-        let submitted_lists = loss.step == RecoveryStep::Lists;
+        let mut finished_lists = false;
         match loss.step {
             RecoveryStep::Register => {
                 self.loss_register(loss).await?;
@@ -670,7 +670,8 @@ impl App {
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
-                self.loss_lists(loss).await?;
+                let submitted = self.loss_lists(loss).await?;
+                finished_lists = submitted || self.reader().exists(lists::PENDING).await?;
                 loss.step = RecoveryStep::Resend;
             }
             RecoveryStep::Resend => {
@@ -762,7 +763,7 @@ impl App {
             RecoveryStep::Done => {}
         }
         let mut tx = self.tx()?;
-        if submitted_lists && self.reader().exists(lists::PENDING).await? {
+        if finished_lists {
             lists::submitted(&mut tx, loss.generation)?;
         }
         tx.put(keys::LOSS, &*loss)?;
@@ -996,24 +997,24 @@ impl App {
 
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
     /// step 2).
-    async fn loss_lists(&mut self, loss: &LossRecord) -> Result<(), AppError> {
+    async fn loss_lists(&mut self, loss: &LossRecord) -> Result<bool, AppError> {
         let manage = self.state.cert.has_permission(Permission::ListsManage);
         let read = self.state.cert.has_permission(Permission::ListsRead);
         if !manage && !read {
-            return Ok(());
+            return Ok(false);
         }
         // The original IDs survive new signed list reads and a retry after a lost
         // answer. Permission is checked on each submission, including an empty
         // management contribution that ends staged admission.
         let lists = self.original_list_input(loss).await?.upload(manage)?;
         if lists.contacts.is_none() && lists.deny.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let upload = RecoveryUpload {
             lists: Some(lists),
             ..RecoveryUpload::default()
         };
-        self.upload_here(upload.to_json()).await.map(|_| ())
+        self.upload_here(upload.to_json()).await.map(|_| true)
     }
 
     /// `POST /recovery/upload` at the service followed; its head goes to the chain view. A

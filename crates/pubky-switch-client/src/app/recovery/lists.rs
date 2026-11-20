@@ -50,6 +50,10 @@ impl ListInput {
         Ok(())
     }
 
+    pub(super) fn has_denies(&self) -> bool {
+        !self.deny.is_empty()
+    }
+
     pub(super) fn upload(
         &self,
         manage: bool,

@@ -2434,6 +2434,31 @@ async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
     );
 }
 
+#[tokio::test]
+async fn test_read_only_recovery_without_denies_keeps_an_earlier_backup_restorable() {
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(store.clone(), &[Permission::ListsRead], false, false).await;
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    app.refresh_identity().await.unwrap();
+    app.follow_provider().await.unwrap();
+    assert!(
+        lost.next
+            .uploads()
+            .iter()
+            .all(|(body, _)| body.get("lists").is_none())
+    );
+    drop(app);
+    App::restore(
+        lost.router.env(&lost.w, store),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+}
+
 /// Resume the original list upload from a real backup taken after registration and
 /// the evidence upload. The replacement's signed empty list was already observed.
 async fn restore_owed_lists(layered: bool) {

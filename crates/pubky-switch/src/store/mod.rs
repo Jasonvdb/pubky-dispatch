@@ -520,17 +520,7 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
-        let chain_seq: Option<i64> = row.try_get("chain_seq")?;
-        let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
-        let chain = match (chain_seq, chain_hash) {
-            (Some(seq), Some(hash)) => Some((
-                from_db(seq, "chain_seq")?,
-                <[u8; 32]>::try_from(hash.as_slice())
-                    .map_err(|_| StoreError::Corrupt("chain_hash"))?,
-            )),
-            (None, None) => None,
-            _ => return Err(StoreError::Corrupt("chain head")),
-        };
+        let chain = chain_head(&row, "chain head")?;
         let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
         Ok(Some(FoundAccount {
             activation: pubky_switch_core::records::AccountActivation::parse(
@@ -902,6 +892,24 @@ pub(crate) fn state_tag(value: Vec<u8>) -> Result<[u8; 16], StoreError> {
     <[u8; 16]>::try_from(value.as_slice()).map_err(|_| StoreError::Corrupt("state_tag"))
 }
 
+/// Read the newest chain item's position and hash, both absent before the first item.
+fn chain_head(
+    row: &sqlx::postgres::PgRow,
+    partial: &'static str,
+) -> Result<Option<(u64, [u8; 32])>, StoreError> {
+    let seq: Option<i64> = row.try_get("chain_seq")?;
+    let hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
+    match (seq, hash) {
+        (None, None) => Ok(None),
+        (Some(seq), Some(hash)) => Ok(Some((
+            from_db(seq, "chain_seq")?,
+            hash.try_into()
+                .map_err(|_| StoreError::Corrupt("chain_hash"))?,
+        ))),
+        _ => Err(StoreError::Corrupt(partial)),
+    }
+}
+
 /// Convert a stored `BIGINT` back to a `u64`.
 pub(crate) fn from_db(value: i64, what: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::Corrupt(what))
@@ -910,6 +918,43 @@ pub(crate) fn from_db(value: i64, what: &'static str) -> Result<u64, StoreError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_store_reads_optional_chain_head_columns() {
+        let Some(db) = testing::test_database().await else {
+            return;
+        };
+        let hash = [0xa7_u8; 32];
+        let seq = Some(17_i64);
+        let bytes = Some(hash.as_slice());
+        for partial in ["chain head", "chain_seq and chain_hash"] {
+            for (seq, bytes, expected) in [
+                (None, None, Ok(None)),
+                (seq, bytes, Ok(Some((17, hash)))),
+                (None, bytes, Err(partial)),
+                (seq, None, Err(partial)),
+                (Some(-1), bytes, Err("chain_seq")),
+                (seq, Some(&hash[..31]), Err("chain_hash")),
+                (Some(-1), Some(&hash[..31]), Err("chain_seq")),
+            ] {
+                let row = sqlx::query("SELECT $1::bigint AS chain_seq, $2::bytea AS chain_hash")
+                    .bind(seq)
+                    .bind(bytes)
+                    .fetch_one(&db.store().pool)
+                    .await
+                    .expect("chain columns");
+                let actual = chain_head(&row, partial);
+                match expected {
+                    Ok(chain) => assert_eq!(actual.expect("valid head"), chain),
+                    Err(field) => assert!(
+                        matches!(actual, Err(StoreError::Corrupt(name)) if name == field),
+                        "expected corrupt {field}, got {actual:?}"
+                    ),
+                }
+            }
+        }
+        db.drop_database().await.expect("drop test database");
+    }
 
     fn settings(fsync: &str, commit: &str, standbys: &str) -> DurabilitySettings {
         DurabilitySettings {

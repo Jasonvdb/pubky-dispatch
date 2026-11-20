@@ -6,6 +6,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 `App::read_record_application` returns a `RecordApplication`. Callers read its named `record`, `installed_version`, `application` and `evidence` fields.
 
+`RecordMerge::ReplaceDivergent` installs the incoming proved or succeeding write and reports the displaced write as divergent. A recovery store keeps the displaced operation at the supplied position when present and reports the record in both change lists.
+
 ### Caller changes already on main
 
 #### App and transport integration

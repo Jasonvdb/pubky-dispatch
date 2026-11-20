@@ -656,6 +656,34 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// Keep the displaced current write in the slot selected by the recovery comparison
+    /// (Switch wire 7.4.14). A promoted upload frees its own slot in the same transaction.
+    pub(crate) async fn put_displaced_upload(
+        &mut self,
+        key: &[u8; 32],
+        position: usize,
+        op: &SignedDoc,
+        hash: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        let position = i16::try_from(position)
+            .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?;
+        sqlx::query(
+            "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (account_id, key, position) \
+             DO UPDATE SET op = EXCLUDED.op, op_hash = EXCLUDED.op_hash",
+        )
+        .bind(id)
+        .bind(key.as_slice())
+        .bind(position)
+        .bind(encode_doc(op)?)
+        .bind(hash.as_slice())
+        .execute(self.conn())
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
     /// The claims at `claim_keys` that the account holds.
     pub async fn claims(
         &mut self,

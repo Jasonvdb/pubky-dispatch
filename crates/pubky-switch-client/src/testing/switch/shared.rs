@@ -420,9 +420,29 @@ impl Shared {
                     divergent: &kept,
                 },
             };
-            match merge_checked_record(&view, held.map(|h| &h.state), record, MAX_DIVERGENT_UPLOADS)
-            {
-                RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
+            let decision =
+                merge_checked_record(&view, held.map(|h| &h.state), record, MAX_DIVERGENT_UPLOADS);
+            match decision {
+                RecordMerge::Fill
+                | RecordMerge::Replace
+                | RecordMerge::MakeExact
+                | RecordMerge::ReplaceDivergent { .. } => {
+                    if let RecordMerge::ReplaceDivergent { position } = decision {
+                        if let Some(slot) = position {
+                            let MergeHeld::FromUpload { op_hash, .. } = view else {
+                                return Err(pubky_switch_core::Error::Invalid(
+                                    "missing displaced record".into(),
+                                ));
+                            };
+                            let entries = self.divergent.entry(key).or_default();
+                            if let Some(entry) = entries.get_mut(slot) {
+                                *entry = op_hash;
+                            } else {
+                                entries.push(op_hash);
+                            }
+                        }
+                        changes.divergent_record(key);
+                    }
                     let put = &record.put;
                     let state = RecordState {
                         version: record.uploaded.version.version,

@@ -1079,7 +1079,7 @@ async fn test_upload_records_past_the_mark_cap_owe_a_listing() {
 
 #[tokio::test]
 async fn test_upload_records_up_to_the_mark_cap_are_marked() {
-    // Up to `MAX_RECORD_MARKS`, the records are marked, and no listing is owed.
+    // A changed record also listed as divergent consumes one mark at the cap.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, false).await;
     let keys: BTreeSet<[u8; 32]> = (0..MAX_RECORD_MARKS)
@@ -1090,6 +1090,7 @@ async fn test_upload_records_up_to_the_mark_cap_are_marked() {
         })
         .collect();
     let changes = UploadChanges {
+        divergent: keys.iter().take(1).copied().collect(),
         records: keys,
         ..UploadChanges::default()
     };

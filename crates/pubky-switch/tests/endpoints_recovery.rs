@@ -2824,10 +2824,7 @@ async fn test_upload_claim_changed_last_by_an_upload_lists_a_gap_at_its_end() {
 }
 
 #[tokio::test]
-async fn test_upload_known_limit_an_inflated_bound_replaces_a_proved_record() {
-    // A known limit (Switch spec 19): a proofless operation built on (1, 1,000,000), never
-    // applied anywhere, replaces the record held at the proved (1, 8), which is kept
-    // nowhere; the proved upload again then changes nothing.
+async fn test_upload_unconfirmed_version_leaves_the_proved_record_divergent() {
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
     let honest = json!({
@@ -2843,12 +2840,12 @@ async fn test_upload_known_limit_an_inflated_bound_replaces_a_proved_record() {
     let result = json_of(&answer)["result"].clone();
     assert_eq!(
         (result["records"].clone(), result["divergent"].clone()),
-        (json!([record]), json!([]))
+        (json!([]), json!([record]))
     );
     let view = wallet_get(&replay, &format!("records/{record}"), at).await;
     assert_eq!(
         (view["version"].clone(), view["divergent"].clone()),
-        (json!(1_000_001), json!(false))
+        (json!(8), json!(true))
     );
     let again = json_of(&upload(&replay, &honest, at).await)["result"].clone();
     assert_eq!(

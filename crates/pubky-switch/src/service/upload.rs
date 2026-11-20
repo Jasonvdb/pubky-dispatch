@@ -431,8 +431,27 @@ impl Service {
                 uploaded: None,
             });
             let state = at.record.as_ref().map(|r| &r.state);
-            match merge_checked_record(&at.view(), state, record, max) {
-                RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
+            let decision = merge_checked_record(&at.view(), state, record, max);
+            match decision {
+                RecordMerge::Fill
+                | RecordMerge::Replace
+                | RecordMerge::MakeExact
+                | RecordMerge::ReplaceDivergent { .. } => {
+                    if let RecordMerge::ReplaceDivergent { position } = decision {
+                        if let Some(slot) = position {
+                            let (hash, _) = at.uploaded.ok_or_else(temporary)?;
+                            let old = at.record.as_ref().ok_or_else(temporary)?;
+                            txn.put_displaced_upload(&key, slot, &old.op, &hash)
+                                .await
+                                .map_err(stored)?;
+                            if let Some(entry) = at.divergent.get_mut(slot) {
+                                *entry = hash;
+                            } else {
+                                at.divergent.push(hash);
+                            }
+                        }
+                        changes.divergent_record(key);
+                    }
                     let new = taken(record, txn.head().generation, seq)?;
                     txn.put_record(&new).await.map_err(stored)?;
                     *at = Held::of(Some(new), std::mem::take(&mut at.divergent))?;

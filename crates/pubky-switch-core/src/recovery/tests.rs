@@ -96,7 +96,7 @@ fn test_recovery_record_fills_in_a_record_the_service_lacks() {
 #[test]
 fn test_recovery_record_newer_upload_replaces_an_uploaded_one() {
     let held = held_upload(OP1, v(3, 5), UploadVersion::proved(v(3, 9)), &[]);
-    // A bound counts as its value: built on (3, 9), (3, 10) is newer than (3, 9).
+    // The signed base names the proved version directly.
     assert_eq!(
         merge_record(&held, &unproved(OP2, v(3, 9)), 8),
         RecordMerge::Replace
@@ -122,10 +122,7 @@ fn test_recovery_record_older_upload_changes_nothing() {
         ),
         RecordMerge::Unchanged
     );
-    assert_eq!(
-        merge_record(&held, &unproved(OP2, v(3, 1)), 8),
-        RecordMerge::Unchanged
-    );
+    assert_eq!(merge_record(&held, &unproved(OP2, v(3, 1)), 8), KEPT);
 }
 
 #[test]
@@ -162,7 +159,7 @@ fn test_recovery_record_an_op_on_the_same_base_is_divergent_whatever_its_proof()
             &upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50))),
             8
         ),
-        KEPT
+        RecordMerge::ReplaceDivergent { position: Some(0) }
     );
     // A forked O: op1 at seq 50 and op2 at seq 51, both on (3, 10), each proved.
     assert_eq!(
@@ -206,15 +203,10 @@ fn test_recovery_record_same_op_with_a_proof_makes_the_version_exact() {
 
 #[test]
 fn test_recovery_record_a_kept_divergent_upload_again_changes_nothing() {
-    // op2 is kept divergent; it comes again with its proof: it never replaces the record.
     let kept = [OP2];
     let held = held_upload(OP1, v(3, 10), bound(3, v(3, 10)), &kept);
     assert_eq!(
-        merge_record(
-            &held,
-            &upload(OP2, v(3, 10), UploadVersion::proved(v(3, 50))),
-            8
-        ),
+        merge_record(&held, &unproved(OP2, v(3, 10)), 8),
         RecordMerge::Unchanged
     );
 }
@@ -929,13 +921,19 @@ fn proved(generation: u64, seq: u64) -> UploadVersion {
 }
 
 #[test]
-fn test_recovery_record_kept_divergent_proved_above_the_record_is_unchanged() {
-    // A kept divergent operation, now with a proof above the current record, is that
-    // operation again: unchanged, also against a record written here.
-    let kept = [OP2];
+fn test_recovery_record_later_proof_reuses_the_divergent_slot_even_at_capacity() {
+    let kept = [OP3, OP2];
     let held = held_upload(OP1, v(3, 10), bound(3, v(3, 10)), &kept);
     let again = upload(OP2, v(3, 10), proved(3, 90));
-    assert_eq!(merge_record(&held, &again, 8), RecordMerge::Unchanged);
+    assert_eq!(
+        merge_record(&held, &again, 2),
+        RecordMerge::ReplaceDivergent { position: Some(1) }
+    );
+    let other = upload([44; 32], v(3, 20), proved(3, 80));
+    assert_eq!(
+        merge_record(&held, &other, 2),
+        RecordMerge::ReplaceDivergent { position: None }
+    );
     let written = written_on(Some((v(3, 11), OP1)), &kept);
     assert_eq!(merge_record(&written, &again, 8), RecordMerge::Unchanged);
 }
@@ -953,20 +951,16 @@ fn test_recovery_record_two_creates_are_on_one_base() {
 fn test_recovery_record_bases_of_two_generations_are_two() {
     // Bases that differ only by generation aren't one base.
     let held = held_upload(OP1, v(3, 10), proved(3, 50), &[]);
-    for version in [proved(2, 11), bound(3, v(2, 10))] {
-        let other = upload(OP2, v(2, 10), version);
-        assert_eq!(merge_record(&held, &other, 8), RecordMerge::Unchanged);
-    }
+    let older = upload(OP2, v(2, 10), proved(2, 11));
+    assert_eq!(merge_record(&held, &older, 8), RecordMerge::Unchanged);
+    assert_eq!(merge_record(&held, &unproved(OP2, v(2, 10)), 8), KEPT);
 }
 
 #[test]
-fn test_recovery_record_a_fork_of_a_replaced_upload_depends_on_the_order() {
-    // Held op3, built on op1's (3, 50): op2, a fork of op1 on (3, 10), is older and not on
-    // op3's base, so unchanged. In the other order, op1 then op2 then op3, op2 is kept
-    // divergent and op3 still replaces op1.
+fn test_recovery_record_a_fork_of_a_replaced_upload_stays_divergent() {
     let held = held_upload(OP3, v(3, 50), proved(3, 60), &[]);
-    let fork = upload(OP2, v(3, 10), bound(3, v(3, 10)));
-    assert_eq!(merge_record(&held, &fork, 8), RecordMerge::Unchanged);
+    let fork = unproved(OP2, v(3, 10));
+    assert_eq!(merge_record(&held, &fork, 8), KEPT);
     let first = held_upload(OP1, v(3, 10), proved(3, 50), &[]);
     assert_eq!(merge_record(&first, &fork, 8), KEPT);
     let kept = [OP2];
@@ -976,25 +970,30 @@ fn test_recovery_record_a_fork_of_a_replaced_upload_depends_on_the_order() {
 }
 
 #[test]
-fn test_recovery_record_a_linear_history_is_never_divergent() {
-    // op1 on (3, 10) at seq 50, op3 on (3, 50) at seq 60, each with or without its proof,
-    // in any order.
-    let ops = [
-        (OP1, v(3, 10), proved(3, 50)),
-        (OP1, v(3, 10), bound(3, v(3, 10))),
-        (OP3, v(3, 50), proved(3, 60)),
-        (OP3, v(3, 50), bound(3, v(3, 50))),
-    ];
-    for (held_op, held_on, held_version) in ops {
-        for (op, on, version) in ops {
-            let held = held_upload(held_op, held_on, held_version, &[]);
-            let merge = merge_record(&held, &upload(op, on, version), 8);
-            assert!(
-                !matches!(merge, RecordMerge::Divergent { .. }),
-                "{held_op:?}/{held_version:?} vs {op:?}/{version:?}: {merge:?}"
-            );
-        }
-    }
+fn test_recovery_record_direct_successor_in_both_upload_orders() {
+    let base = v(3, 10);
+    let applied = v(3, 50);
+    let first = held_upload(OP1, base, UploadVersion::proved(applied), &[]);
+    let next = unproved(OP2, applied);
+    assert_eq!(merge_record(&first, &next, 8), RecordMerge::Replace);
+    let held = held_upload(OP2, applied, next.version, &[]);
+    let earlier = upload(OP1, base, UploadVersion::proved(applied));
+    assert_eq!(merge_record(&held, &earlier, 8), RecordMerge::Unchanged);
+    let unproved_first = held_upload(OP1, base, bound(3, base), &[]);
+    assert_eq!(merge_record(&unproved_first, &next, 8), KEPT);
+}
+
+#[test]
+fn test_recovery_record_unordered_uploads_keep_the_proved_write_in_both_orders() {
+    let first = upload(OP1, v(3, 5), proved(3, 9));
+    let later = unproved(OP2, v(3, 15));
+    let held = held_upload(OP1, first.built_on, first.version, &[]);
+    assert_eq!(merge_record(&held, &later, 8), KEPT);
+    let held = held_upload(OP2, later.built_on, later.version, &[]);
+    assert_eq!(
+        merge_record(&held, &first, 8),
+        RecordMerge::ReplaceDivergent { position: Some(0) }
+    );
 }
 
 #[test]

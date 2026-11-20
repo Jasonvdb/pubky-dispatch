@@ -11,6 +11,7 @@
 //! certificate, each transition proof with the lost generation's service key, and judges a
 //! removed app's operations ([`removed_app_counts`]); it passes in only what counted.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
@@ -117,8 +118,14 @@ pub enum HeldRecord<'a> {
 pub enum RecordMerge {
     /// It becomes the record: the service lacked one.
     Fill,
-    /// It replaces a record held only from uploads, at a lower version.
+    /// It succeeds a record held only from uploads.
     Replace,
+    /// It becomes current, with the displaced operation reported as divergent.
+    ReplaceDivergent {
+        /// Where to keep the displaced operation: the incoming operation's former slot,
+        /// else the next free slot, or `None` if all slots are occupied.
+        position: Option<usize>,
+    },
     /// The same operation, now with a proof where the record held a lower bound: the
     /// record's version becomes the proof's.
     MakeExact,
@@ -134,21 +141,9 @@ pub enum RecordMerge {
 }
 
 /// Merge `upload` into the record at its key (Switch wire 7.4.14 "Records", Switch spec 12.6
-/// step 3), in this order:
-///
-/// 1. the same operation again, as the record's, as a kept divergent upload, or as the one
-///    the writes here built on, changes nothing; with a proof where the record held a lower
-///    bound, it makes the record's version the proof's;
-/// 2. a record the service lacks is filled in;
-/// 3. against a record held only from uploads, another operation at the same version, or one
-///    that built on the same version, is divergent; otherwise a strictly newer upload
-///    replaces it and an older one changes nothing, a lower bound counting as its value;
-/// 4. against a record written here, an upload newer than the uploaded version the writes
-///    here built on, or any upload when they built on none, is divergent: writes here are
-///    never superseded.
-///
-/// Past `max_divergent` uploads kept for the record, a new divergent one is dropped and still
-/// divergent.
+/// step 3). Among uploads, only proved versions and a signed base equal to a proved version
+/// establish order. If their order is unresolved, the proved operation is current and the
+/// record is divergent. Writes made at the replacement service stay current.
 pub fn merge_record(
     held: &HeldRecord<'_>,
     upload: &UploadedRecord,
@@ -172,15 +167,24 @@ pub fn merge_record(
                     RecordMerge::Unchanged
                 };
             }
-            if kept.contains(&upload.op_hash) {
-                return RecordMerge::Unchanged;
-            }
-            if upload.version.version == version.version || upload.built_on == built_on {
-                divergent(kept)
-            } else if upload.version.version > version.version {
-                RecordMerge::Replace
-            } else {
-                RecordMerge::Unchanged
+            let previous = kept.iter().position(|hash| *hash == upload.op_hash);
+            let order = match (upload.version.exact, version.exact) {
+                (true, true) if upload.built_on != built_on => {
+                    Some(upload.version.version.cmp(&version.version))
+                }
+                (false, true) if upload.built_on == version.version => Some(Ordering::Greater),
+                (true, false) if built_on == upload.version.version => Some(Ordering::Less),
+                _ => None,
+            };
+            match order {
+                Some(Ordering::Greater) if previous.is_none() => RecordMerge::Replace,
+                Some(Ordering::Less) => RecordMerge::Unchanged,
+                Some(Ordering::Greater) => RecordMerge::ReplaceDivergent { position: previous },
+                _ if upload.version.exact && !version.exact => RecordMerge::ReplaceDivergent {
+                    position: previous.or((kept.len() < max_divergent).then_some(kept.len())),
+                },
+                _ if previous.is_some() => RecordMerge::Unchanged,
+                _ => divergent(kept),
             }
         }
         HeldRecord::WrittenHere {

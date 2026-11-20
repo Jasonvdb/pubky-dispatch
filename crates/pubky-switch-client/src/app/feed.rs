@@ -4254,7 +4254,11 @@ impl App {
                             // protocol that is with the read (`App::reread_records`, Switch
                             // spec 8.3). Claims are told to no protocol.
                             // Owned keys: the read's future stays `Send` across the awaits.
-                            let records = changes.records.iter().chain(&changes.divergent);
+                            // A proved upload that displaces a conflicting record appears in both lists.
+                            let records = changes
+                                .records
+                                .iter()
+                                .chain(changes.divergent.difference(&changes.records));
                             let claims = changes.claims.iter().chain(&changes.divergent_claims);
                             let upload = FeedPosition {
                                 generation: envelope.generation,

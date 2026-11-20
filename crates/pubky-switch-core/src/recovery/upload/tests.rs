@@ -600,13 +600,13 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
         key: [30; 32],
         collection: [31; 32],
         policy: Policy::new(SCOPE, &[SCOPE]),
-        version: RecordVersion::new(3, 5),
+        version: RecordVersion::new(3, 10),
         deleted: false,
     };
     let held = |divergent: &'static [[u8; 32]]| HeldRecord::FromUpload {
         op_hash: [1; 32],
         built_on: RecordVersion::new(3, 4),
-        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        version: UploadVersion::proved(RecordVersion::new(3, 10)),
         divergent,
     };
     assert_eq!(
@@ -634,7 +634,7 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
         let holding = HeldRecord::FromUpload {
             op_hash: [1; 32],
             built_on: RecordVersion::new(3, 4),
-            version: UploadVersion::proved(RecordVersion::new(3, 5)),
+            version: UploadVersion::proved(RecordVersion::new(3, 10)),
             divergent: &kept,
         };
         assert_eq!(
@@ -655,7 +655,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
     let held = HeldRecord::FromUpload {
         op_hash: [1; 32],
         built_on: RecordVersion::new(3, 4),
-        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        version: UploadVersion::proved(RecordVersion::new(3, 10)),
         divergent: &[],
     };
     let ordinary = Policy::new(SCOPE, &[SCOPE]);
@@ -674,7 +674,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
             key: [30; 32],
             collection: [31; 32],
             policy: policy.clone(),
-            version: RecordVersion::new(3, 5),
+            version: RecordVersion::new(3, 10),
             deleted: false,
         };
         assert_eq!(

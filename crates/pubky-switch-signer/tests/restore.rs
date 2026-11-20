@@ -4,7 +4,6 @@
 //! unreadable backups refused; and what the backup doesn't carry rebuilt: the epoch floor, and
 //! a removed app's record deletion with its grant reminder.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

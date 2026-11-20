@@ -4,7 +4,6 @@
 //! record deleted and the App ID kept for good, a revocation or a departure completed at the
 //! next run, and the parts a full-bundle request lacks.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

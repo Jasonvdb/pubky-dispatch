@@ -1,7 +1,6 @@
 //! The routine run's bounds against a step that keeps failing, a restart, a crash between
 //! two commits and a run dropped part way (design note, section 4.5).
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

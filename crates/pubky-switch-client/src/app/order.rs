@@ -1,69 +1,48 @@
-//! The order each protocol is told things in (Switch spec 8.3).
+//! The app delivers feed items in order to each protocol (Switch spec 8.3). If one
+//! protocol falls behind, the others can continue. A deny list change or gap stops
+//! delivery to all protocols at that position.
 //!
-//! Every notice a protocol can't take yet is kept in feed order, and the app tells that
-//! protocol nothing later until it takes it. With several protocols the rule holds per
-//! protocol. Its feed position (`told/<name>`, [`Told`]) and outstanding listing
-//! prerequisites determine what it may be told. Retained calls remain explicit
-//! prerequisites too, including at zero, which has no earlier numeric position. A protocol
-//! is told an item only when its position has reached the item: everything the read covered before it was told
-//! to it. One that doesn't take an item stays right before it, and is told nothing later,
-//! while the read goes on for the others. [`App::may_tell`] checks the position and its
-//! listing prerequisites, and every way the read tells a protocol something asks it:
+//! # What waits for a protocol
 //!
-//! - a message entry, before anything is done with it, its checks included
-//!   (`check_and_apply`): held, the cursor staying before it, for a protocol whose position
-//!   is behind it. So no entry is stored locally, dropped or found a duplicate for a
-//!   protocol that is behind;
-//! - a re-send, missed-entries or deny list call (`hand_call`): kept for the protocol
-//!   (`owed/`, naming it) when it is behind the item or fails the call. A deny list change
-//!   kept for a protocol stops the read there for every protocol, at that read and at each
-//!   later one that reaches its item, so the cursor never passes a deny list change a
-//!   protocol wasn't handed;
-//! - a deny list gap (`tell_deny_gap_if_owed`): told once every protocol is told through
-//!   its position and has completed every prerequisite there; the read holds meanwhile;
-//! - a record write the feed shows (`judge_write`), for the protocol of its collection, or
-//!   for every protocol when the app can't place it: held like an entry;
-//! - a listing a feed item owes (`list_due`): made for a protocol once it is told through
-//!   everything before that item;
-//! - what isn't in feed order: an entry stored locally and tried again, a record an upload
-//!   marked and read again at a read's end, a record opened once its key comes. These reach
-//!   only a protocol that is with the read, told through everything it covered.
+//! `told/<name>` ([`Told`]) records how far the protocol has processed the feed.
+//! [`App::may_tell`] checks that position and outstanding work before delivery.
 //!
-//! What the cursor passes without a protocol taking it is kept with the protocols it is
-//! still for: a call (`owed/`), a listing (`list_due`), the deny list gap (`dgap`). Those
-//! hold the content; the position holds the order. At the start of each read they are told
-//! in feed order ([`App::settle_told`], `retry_owed`), a protocol's listing before a call at
-//! the same item: the listing an item owes is not held by that item's own call, with one
-//! protocol or several. A kept call or listing past the cursor waits for the read to reach
-//! its item: the protocols it names stay right before it, and are told what is kept at the
-//! start of the read after, whether or not the cursor got there. The item itself tells them
-//! nothing new: a kept call's item is passed whole, and an item a listing is kept at was
-//! handled for them when the read first met it (`asked/`, `seen/`, record versions).
-//! A protocol a listing is still owed to is told nothing that isn't in feed order either.
+//! - Messages wait before validation, duplicate detection, local storage or disposal.
+//!   A record write waits for the owner of its collection, or for all protocols if the
+//!   app cannot identify the owner.
+//! - A resend, missed-entries or deny list callback that fails or cannot run stays in
+//!   `owed/` with its remaining owners. A listing due at a feed item stays in `list_due`.
+//!   On retry, each protocol completes its listing before a call at the same position,
+//!   including position zero. A deny list gap (`dgap`) waits for every owner's
+//!   prerequisites.
+//! - Retrying a locally stored entry, rereading a record marked by an upload, or opening
+//!   a record with a newly available key waits until the owner has caught up with the
+//!   read and completed its outstanding listing.
 //!
-//! A read that stopped on its pages goes on from where it got (`feed_at`), unless a
-//! protocol is behind that with a feed item next: then it starts at that protocol's
-//! position, never before the cursor, so a protocol catches up in order before it is told
-//! anything further on. What the read meets again on the way is not handled twice: an entry
-//! by `seen/` and its processed pair, a call by `asked/` and the protocols its kept form
-//! names, a record write by its version.
+//! # Resuming a read
 //!
-//! The position is written in the commit of what moves it: a page's, a kept call's, a
-//! listing's. One that lags behind what was committed, as after a crash between an effect's
-//! commit and its page's, only starts the next read further back.
+//! At the start of a read the app reconstructs each protocol's position
+//! ([`App::settle_told`]) and retries eligible work in feed order. A retained call or
+//! listing ahead of the cursor waits for the read to deliver earlier items to its owners.
+//! A subsequent read can then retry the work even if the shared cursor still lags.
 //!
-//! A view read for a listing, or read again after an upload, shows the record as it stands
-//! then, which may be later than the item that owed the read.
+//! A page walk resumes at `feed_at`, or at an earlier protocol position if that protocol
+//! has a feed item to process. The walk starts no earlier than the cursor. A page,
+//! callback or listing commits the position it advances. After a crash, the walk may
+//! revisit an item whose effects already committed. `seen/` and the processed pair
+//! identify a handled message, `asked/` and the remaining owners identify a handled
+//! call, and the stored version identifies a handled record write.
 //!
-//! Not in feed order, and told at once: what the host or a protocol asks for with a call
-//! of its own (a read of a record, a listing it asks for, an own write's answer, a message
-//! it sends), what the outbox, a kept batch, a provider change or a restore reports, the
-//! listing a join, a restore or a certificate taken owes (made for every protocol before a
-//! read hands anything), and a duty event about an entry stored locally: such an entry was
-//! stored when its protocol's position had reached it, so it lies in that protocol's past.
-//! A receive step and a protocol's batch write only that protocol's own records
-//! (`refuse_foreign_target`). A step may read another protocol's record as a current view,
-//! which establishes no order with that protocol's notifications (`Protocol`).
+//! # Work outside feed order
+//!
+//! Explicit record reads and listings, replies to the app's own writes, outgoing messages,
+//! and outbox, kept-batch, provider-change and restore reports follow their own calls.
+//! A join, restore or new certificate requires listings before feed delivery begins.
+//! A duty about a locally stored entry concerns an entry the owner already reached.
+//!
+//! A listing or post-upload read returns the record as it stands at read time. A receive
+//! step can read another protocol's current record independently of that owner's
+//! notifications. Receive steps and protocol batches can write only their owner's records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -171,18 +150,10 @@ impl App {
         }
     }
 
-    /// Whether the app may tell protocol `name` something now (Switch spec 8.3): it has
-    /// been told everything the read covered before it. Inside a page that is the item the
-    /// walk handles; outside one, something that isn't in feed order, which reaches only a
-    /// protocol that is with the read. "Not yet" means the caller holds or keeps the thing
-    /// for it.
-    ///
-    /// A listing the read could not make is a prerequisite at its position, including
-    /// zero, which has no earlier numeric position. Nothing outside feed order reaches
-    /// that protocol either until its listing completes.
-    ///
-    /// With one protocol this is false only once that protocol didn't take an item, and
-    /// the read stops there.
+    /// May the app deliver to `name` at the current point in the read? On a page,
+    /// check the position the walk has covered. Outside a page, require the protocol
+    /// to have reached the front of the read and finished its outstanding listing.
+    /// If the protocol is behind, the caller must hold the item or retain the call.
     pub(crate) fn may_tell(&self, name: &str) -> bool {
         if self.walk.is_none() && self.listing_due.at(name).is_some() {
             return false;
@@ -190,9 +161,11 @@ impl App {
         self.ready_at(name, self.walked(), Handover::Through)
     }
 
-    /// One readiness rule for a listing, a retained call, or a handover after a
-    /// position. Pending prerequisites remain explicit: position zero has no earlier
-    /// numeric position with which to represent them (Switch spec 8.3).
+    /// A listing or retained call requires progress through the preceding item.
+    /// A call also waits for a listing due at or before its position. A handover
+    /// through `at` requires progress through `at` and completion of calls and record
+    /// deletions there. Earlier calls and deletions block all three. Check pending
+    /// work explicitly even at zero, where there is no preceding position (Switch spec 8.3).
     pub(crate) fn ready_at(&self, name: &str, at: FeedOrder, handover: Handover) -> bool {
         let through = match handover {
             Handover::Listing | Handover::Call => (at.0, at.1, at.2.saturating_sub(1)),

@@ -2,7 +2,6 @@
 //! 3.10): the review's checks, the certificate and the version that lists it, and the
 //! companion claim as the app reads it.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

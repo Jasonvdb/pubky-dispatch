@@ -1,6 +1,6 @@
 # `pubky-switch-signer`: design note
 
-Status: for review, before any code. Scope: identity management on the Pubky Switch (spec Sections 2, 3, 4.3 and 12, decision 24; wire Sections 2, 3 and 7). Section numbers below are the Switch spec's (`spec/spec.md`) and wire format's (`spec/wire-format.md`).
+This note records the design of signer identity management. It refers to [Switch spec](../spec/spec.md) sections 2, 3, 4.3 and 12 and decision 24, and [Switch wire format](../spec/wire-format.md) sections 2, 3 and 7. For current host procedures, use the [signer host guide](signer-host-guide.md).
 
 ## 1. What the crate is
 
@@ -279,7 +279,7 @@ pub enum Write {
 
 ## 5. Public API (sketch)
 
-Async at the edges, plain types, and no lifetimes in public structs, so it binds cleanly.
+This original sketch kept I/O asynchronous and public structs free of lifetimes for host bindings. See the [signer crate](../crates/pubky-switch-signer/src/lib.rs) for the implemented API.
 
 ```rust
 impl Signer {
@@ -407,21 +407,11 @@ There are no panics on network input, and all arithmetic is checked.
 
   The fixed randomness sits behind a test-only feature.
 - **Crash tests:** a fault-injecting store and client stop at every step of every flow. On reopen the flow finishes and nothing is signed twice.
-- **Ported flow tests:** approval, renewal, revocation, departure, moves and abort, recovery, erasure, the hand-over both ways, and backup and restore, including the end-to-end ones. They run against the Switch service in this workspace. Until it serves these calls, they are marked so that CI skips them.
+- **Flow tests.** The signer tests exercise approval, renewal, revocation, recovery, hand-over and restore against the scripted switch. The [harness](../crates/pubky-switch-harness/README.md) compares selected signer flows against the service.
 
-## 8. PR order (into `main`)
+## 8. Implementation
 
-1. This note.
-2. Errors, the key interface and `Protocols`, on the types of `pubky-switch-core`.
-3. Records and store, `identity.json` versioning (sign once, compare-and-swap, the high-water mark, publish), the install ID, the backup write and check, and enrollment.
-4. Approval: review, certificates, bundles and parts, the companion claim and the grant.
-5. Renewals, reductions, owed closings and `run_due`.
-6. Revocations, departures, epoch rotation and full-bundle requests.
-7. Service key change, moves and abort, provider loss, and erasure.
-8. The hand-over sending and receiving, restore, and take-over.
-9. Alerts, end-to-end tests against the service and a Homeserver, and a signer host integration guide for any app that hosts the signer.
-
-PR 2 starts once `pubky-switch-core` has the types it needs, and the network flows build on `pubky-switch-client`.
+The [signer modules](../crates/pubky-switch-signer/src/signer) contain the lifecycle flows. Their [integration tests](../crates/pubky-switch-signer/tests) cover refusals, retries and recovery.
 
 ## 9. Settled in the spec
 

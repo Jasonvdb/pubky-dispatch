@@ -301,7 +301,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `parkn` | where the retries of entries stored locally stand in their round: its number and the next local ID. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in; each read tries at most `PARKED_RETRIES_PER_READ`, in local ID order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
 | `parkid` | the local ID the next entry stored locally takes: it only goes up, and is never below one past the highest `parked/` key, so no ID is used twice in one store. A backup carries it; a restore starts past the backup's, the one of the store it restores in place (past that store's `parked/` and `sretry/` keys when its counter doesn't read), and every ID a carried duty event names | |
 | `retell` | after a restore that brought back entries stored for good: the next local ID to tell the protocol of again and the end of the restored IDs (Switch spec 12.4). Each step after the restore's commit keeps a `Parked` duty event for at most 64 of them not already named by a kept duty event, and moves the next ID past them in the same commit; the last step deletes it. A read finishes what a crash left | |
-| `owed/<generation>/<seq>` | a re-send, missed-entries or deny list change call about this item, kept with the protocols it is still for (`to`, written by every writer): initially all protocols before any callback runs, then each that has not committed its response, answered with an error, or whose position (`told/<name>`) was behind the item when it came, since a protocol is told things in feed order; a protocol that answers is taken out in the commit of its writes and of its position, so no protocol is handed a call twice. A protocol a call is kept for stays right before its item, and is told nothing later until it takes it, while the read goes on for the other protocols: its later entries and the writes of its collections' records are held, its later calls kept, the listing a later item owes waits for it, and its records an upload marked stay unread (`rcread/`); a deny list gap waits behind it, and the read holds for every protocol meanwhile. `App::may_tell` decides it from the protocol's position and outstanding listing prerequisites compared with where the read stands (`order.rs`). When no protocol is in step with the read, as with one protocol once it fails a call, the page stops after the item and the read holds. A deny list change kept for any protocol stops the read for every protocol, there and at every later read that reaches its item, as below. With the times it names, or a deny list change whose writer's certificate couldn't be looked up yet (`DenyUnverified`, with its operation, owed to every protocol, checked again: handed, refused with an event, or a gap): retained before the first callback, with `asked/<seq>` and any listing or held-cursor obligation the item owes; each successful response commits separately with its remaining owners and position, before the cursor passes the item; made again at the start of each read before anything else, in feed order, for each protocol it names whose position has reached it (told through everything before its item, and owed no listing at or before it); one that fails again holds every later one of that protocol back, of any kind. One ahead of the cursor in its sequence waits while the feed hands the protocols it names what comes before its item, up to that item, which the feed passes unhanded, the call being its notice, and they are handed it at the start of the read after; taken by every protocol while the cursor is still before its item, it leaves `asked/<seq>`, so the read passes the item without handing it again. A deny list change ahead of the cursor goes to no protocol until the read has brought every protocol it names to its item, and the read stops at that item for every protocol meanwhile. One keyed at a generation not followed yet waits while the feed is read on. A restore in place carries every whole one owed to a protocol it registers, each keeping only those protocols, and one only the store holds past the backup's cursor owed to every registered protocol, since every layer is put back to before it: one past the cursor waits for the feed to reach its item, which the feed doesn't hand again, so it goes in feed order, once; a re-send or missed-entries call behind the cursor, as from a newer backup, is made when the next read begins, before those at and after the cursor, though the feed handed later items before it. Each is gone in the commit of the last answer's writes, or, for an answer whose writes are over `MAX_STEP_LOCAL_BYTES`, in the commit of the duty event that refuses them; `App::owed_protocol_calls` counts them. The key names the generation the item was read at; feed order is by sequence, not by key: a cooperative move and a key change in place continue the sequence, so the calls of the current sequence go by `seq` whatever generation their keys name, those of a sequence a provider loss ended go before them, among themselves by (generation, `seq`), and one keyed at a generation past the newest own `identity.json` the app holds waits until the app follows it (`App::feed_order`); the deny list gap the loss leaves is told after them, with the full list. A key that names no feed position, a call owed to no protocol, to one not registered, or to one twice, or a `DenyUnverified` whose operation doesn't parse or isn't the change kept beside it, is a corrupt store: the read fails, nothing is made or dropped; a restore in place doesn't carry such an entry, nor one owed to no protocol it registers, and counts it in `RestoreLeftBehind`. An owed deny list change at the cursor is applied to the copy of the lists (`lc/deny/`) in the commit that completes its last owner; partial local effects may persist across a crash, but the shared barrier remains until all owners complete; without `lists.read`, as after a renewal removed it, it is applied to the copy and gone, handed to no protocol. One behind the cursor (`Deny` or `DenyUnverified`), as a restore in place from a newer backup carries, or one of a lost sequence once the cursor follows the next, is neither handed nor applied: in one commit it is gone and a deny list gap is noted at the cursor (`dgap`), told with the full list; a `DenyUnverified` one is checked first, and one that isn't genuine is refused with `DenyListChangeRefused` and gone, one that can't be checked yet stays owed and holds the rest. A backup carries the re-send and missed-entries calls (`AppBackup::owed`), each with its `to`, and every restore takes them, checked as above and kept for the protocols it registers, a restore in place adding the store's own (see "What the app owes its protocol"); a backup carries no deny list call nor `dgap`: every restore notes its own deny list gap at the restored cursor instead (`dgap`) | |
+| `owed/<generation>/<seq>` | A pending resend, missed-entries or deny list change callback. `to` lists the protocols whose responses still need to commit. The last owner's commit removes the entry. See [callback delivery, restore and provider changes](#what-the-app-owes-its-protocol-restores-and-provider-changes). | |
 | `dgap` | a gap in the deny list's history not told to every protocol yet (after a checkpoint past the cursor, a provider loss, a change whose writer the directory no longer lists, a restore, which notes one at the restored cursor in its own commit, whatever the backup held, after the namespace's delete takes the store's `dgap`, or a copy of the lists not known complete, as after a join, a renewal that added `lists.read` or a gap told without the list (`App::refresh_lists_if_owed`), or `App::allow_list`, which commits it on its own before it replaces the copy): the position the history is complete through, the earliest owed, and the protocols it is owed to (`to`), always every registered protocol, written with `lc/lists_at` deleted, by a restore with the namespace's delete, by every other writer in the same commit (`App::note_deny_gap`). Every protocol takes deny list changes and gaps, so a gap noted is owed to every registered protocol, also to one that took a gap still owed to another. Told after the owed calls, with one list answer for the whole pass, each protocol response in its own commit (`Protocol::deny_list_gap`); the gap remains owed to all throughout intermediate commits, so an interrupted pass starts again for all from a fresh answer; one that fails keeps it owed to every one of them, those told too, and the read holds, so the tell that takes the copy hands each protocol the list the copy is taken from; the final successful callback commit deletes it and invalidates `lc/lists_at`, and the copy of the lists is then taken from the same answer, best effort. Only that replacement can mark the baseline complete; a failed replacement leaves it unknown after reload. A gap owed to no protocol, or to one not registered, is a corrupt store. Whenever the copy is taken whole from a list read, every protocol gets that list as a gap: `App::allow_list`'s copy is followed by its gap's tell, which takes the copy again from the list it tells. An answer that verifies but can't be read tells it without the list (`list_read` false): the commit in which every protocol takes it deletes `lc/lists_at` as well, so the next read owes a gap again: such a protocol is told `list_read` false at each read for as long as the answer can't be read. While it is owed the read hands nothing. It waits, and the read holds, while a protocol it is owed to isn't told through its position (`told/<name>`), a call or a listing from at or before it being kept for that protocol. Every gap noted is told, also at a position a gap was told at before, whose list may predate what the new one covers; a gap told again hands each protocol the full list again, which sets the same state | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
@@ -459,67 +459,115 @@ uploads carry (`App::shared_evidence`).
 
 ## What the app owes its protocol: restores and provider changes
 
-`duty/<id>`, `dutyn`, `dutye`, `owed/<generation>/<seq>` and `dgap` hold what the app still
-has to tell its protocols, each with the protocols it is for, so neither a restore nor a
-provider change drops them.
+### Delivering and retrying a call
 
-- **A backup carries the owed re-send and missed-entries calls, and nothing else of
-  them** (`AppBackup::owed`, by key after `owed/`, with each value as stored, its `to`
-  among it, set by both `App::backup` and `App::backup_layered`). Most are at or behind
-  the backup's cursor, which the restored feed never shows again; one may be ahead of it,
-  carried ahead by an earlier restore in place, and waits for the feed to reach its item.
-  Deny list calls are left out: the restore's own gap (below) covers them. The duty events
-  are the store's, not the app's keys or position.
-- **Every restore owes every protocol one deny list gap** (`dgap` at the restored cursor,
-  its `to` every registered protocol, written in the restore's one commit, for an app
-  holding `lists.read`), whatever the backup held: a deny list change or gap owed when the
-  backup was taken isn't in it, and the feed doesn't hand again what the backup's cursor
-  passed. Each protocol is told the full list after the carried calls up to the cursor,
-  and the copy of the lists is taken from the same answer once the last is told.
-- A missed notice keeps the authenticated time of its original feed page, including zero. On an in-place restore, the installed protocol layer determines which calls still lack their effects. A notice present in both snapshots uses the backup's receipt for each owner it names. An independently retained owner's notice keeps that owner's time. A fresh, higher held cursor beyond the installed layer can incur a new notice.
+Before the first callback, the app saves the call under `owed/` with every registered
+protocol in `to`. For an ordinary feed-item callback, `hand_call` also writes
+`asked/<seq>` and any listing or held-cursor obligation in that commit. A missed notice about a higher held cursor uses
+`owed/<generation>/<seq>/<held>` so separate reports at one position can each complete.
 
-- **A restore in place** (into a store that holds an epoch) keeps `dutye`, sets `dutyn` to
-  the higher of the store's counter and the highest kept counter plus one, and carries
-  `duty/` and `owed/` across the namespace's replacement, all in its one commit: the duty
-  events keep their IDs and are delivered again, and the owed calls are made by the next
-  read. Each keeps only the protocols the restore registers; one for none of them is left
-  behind and counted (`RestoreLeftBehind`). The restored cursor may meet the same items
-  again; the protocol then hears of them twice, which it tolerates.
-- **A restore in place carries the store's unacknowledged duty events and owed calls in its
-  one commit, beside the backup;** past the 32 MiB batch size with them, the restore is
-  refused (`Refusal::CarriedTooLarge`, with how many of each it would carry) and nothing
-  is written. The host acknowledges the duty events it has acted on (`App::ack_events`),
-  lets the protocol answer the owed calls, or restores onto an empty store, then restores
-  again. A backup too large on its own is refused as `StoreError::TooLarge` instead, and
-  `App::backup_layered` refuses only that one: what a store would carry at a restore in
-  place doesn't refuse the backup.
-- **A restore in place is the way out of a damaged store.** A store that can't be read
-  now fails it, to be tried again. A duty event or owed call whose value reads but
-  doesn't decode is left behind, and the protocol told how many with `RestoreLeftBehind`,
-  a duty event in the restore's commit. A damaged `dutye` or `dutyn` starts a new epoch,
-  the readable duty events kept under it.
-- **A restore on another device, or onto a wiped store** (one without an epoch), starts a new random epoch at the first counter, with no duty event:
-  their facts stayed with the lost store. Its IDs can't equal any the host acknowledged
-  before, whatever the counters or the clock, since an ID is its epoch and its counter.
-- **Every restore takes the backup's owed calls**, each checked as a carried one is
-  (`owed_place`, decode, a re-send or missed-entries call), in the restore's commit, each keeping only the
-  protocols the restore registers; one that isn't whole, or is owed to none of them, is
-  left behind and counted in `RestoreLeftBehind`. The restore replaces each protocol's
-  local state with its layer, or with nothing, so a call the store made after the backup
-  is made again: its writes went with that state. A restore in place adds the store's own
-  calls; for a key both hold, the value is the store's, owed to every protocol either
-  names: a protocol the backup names that took the call since gets it again, its writes
-  gone with its layer. A backup's deny list change isn't whole (no backup writes one):
-  it is left behind and counted. A call at or behind the
-  restored cursor is made by the next read before the restore's deny list gap is told;
-  one ahead of it, as one an earlier restore in place carried ahead, waits for the feed to
-  reach its item, after the gap.
-- **IDs compare only within one store.** `App::ack_events` refuses an ID of another epoch
-  and acknowledges nothing.
-- **A provider change keeps them** (a move, a key change in place, a provider loss). The
-  duty events report facts that stay true. An owed call is still made at the generation
-  followed: a re-send call names a sender and acceptance times, which the counterparty
-  answers wherever the app reads now, and a missed-entries call names the item's `seq` at
-  the generation in its key, which the protocol takes as information only. After a loss
-  the protocol is also asked for the loss's re-sends; a request twice is answered once,
-  since re-sends are deduplicated by `msg_id` (Switch spec 11).
+Each owner commits its local writes, its position (`told/<name>`) and its removal from
+`to` together. The last owner's commit removes the call. If an owner returns more than
+`MAX_STEP_LOCAL_BYTES`, the app saves a `LocalWritesRefused` duty for that owner and
+completes its part without applying its writes. An owner that returns an error or cannot
+yet take the call stays in `to`. `App::owed_protocol_calls` counts the retained calls.
+
+At the start of a read the app retries eligible calls in feed order. A protocol must
+have reached the preceding item and completed listings due at or before the call.
+Its later messages and collection writes wait, later calls stay queued, and records
+marked by an upload stay in `rcread/`. Other owners can continue. If all owners are
+waiting, the page stops. See `App::may_tell` in [order.rs](order.rs).
+
+A resend or missed-entries call behind the cursor runs before those at the cursor,
+even if a restored layer previously saw later items. For a call ahead in the current
+sequence, the read delivers intervening items to its owners first. It skips the
+retained item's original notification and retries the call on a subsequent read. If all
+owners finish an ordinary feed item's call before the shared cursor catches up,
+`asked/<seq>` prevents a duplicate callback. Synthetic higher-held-cursor notices
+leave this marker available for the ordinary item.
+
+### Deny list changes and gaps
+
+A retained deny list change stops the feed for all protocols at its item.
+All remaining owners must be ready before the app starts or resumes their callbacks.
+Individual owners' local writes can survive a crash. The shared copy in `lc/deny/`
+changes in the last owner's commit. If the app has lost `lists.read`, it applies a
+verified change to its copy without invoking the callbacks.
+
+If the writer's certificate lookup is temporarily unavailable, `DenyUnverified` keeps
+the signed operation with the change. A later read retries the check. A temporary
+failure keeps the barrier in place. A change proved invalid is removed and reported
+as `DenyListChangeRefused`. If earlier history prevents verification, the app
+discards the change. If it still holds `lists.read`, it records a deny list gap
+(`dgap`) so owners can use the full list.
+
+A retained change behind the cursor, including one from a sequence a provider loss
+ended, could overwrite newer state. The app removes the change. If it still holds
+`lists.read`, the same commit records a gap at the cursor. It first checks any
+`DenyUnverified` operation as above. A
+gap waits for every owner's outstanding work through its position. All owners receive
+the same full list in a successful pass. If an owner fails, all receive the gap again.
+A verified but unreadable answer gives them `list_read = false`. After a complete pass
+the app clears the old baseline and attempts to save the list from the same answer.
+
+### What a backup and restore carry
+
+Both `App::backup` and `App::backup_layered` include outstanding resend and missed-entries
+calls in `AppBackup::owed`, keyed by the suffix after `owed/` and with their remaining
+owners. A backup omits deny list calls and `dgap`. Every restore with `lists.read`
+records a new gap for all registered protocols at the restored cursor. Retained calls
+through the cursor run before that gap. Calls ahead wait for their feed items.
+
+Restore installs each protocol's layer, or clears its state if there is no layer.
+It keeps valid backed-up calls for the registered owners they still name. An in-place
+restore also carries the store's unacknowledged duties and retained calls in the same
+commit that replaces the namespace.
+
+- A resend present in both snapshots uses the store's value and the union of the
+  remaining owners. An owner that answered after backup must answer again if restore
+  replaced those writes. A store-only resend or deny list call past the backup cursor
+  is owed to every registered protocol.
+- A missed notice keeps the authenticated time of the original page, including zero.
+  Restore uses the installed layer's progress to decide which owners still need the
+  notice. An owner named by the backup gets its backed-up notice. An independently
+  retained owner keeps its own time. A higher held cursor can require a new notice.
+- An in-place restore preserves the store's duty epoch (`dutye`) and redelivers
+  unacknowledged duties (`duty/<id>`) with their existing IDs to their remaining
+  registered owners. The next counter (`dutyn`) is at least the stored counter and one
+  past the highest carried duty counter. A wipe or a restore to another empty store
+  starts a fresh random epoch at the first counter. `App::ack_events` rejects an ID
+  from another epoch without acknowledging any duties.
+
+### Invalid entries and size limits
+
+A read validates the complete retained-call set before invoking callbacks. A bad
+position, an invalid call for that position, an empty owner list, an unknown or
+repeated owner, or a `DenyUnverified` operation that fails to parse or differs from the stored change
+returns `StoreError::Corrupt`. The read leaves the calls in place.
+
+Restore filters owners to its registered roster. It skips malformed retained calls,
+calls or duties with no remaining owner, and a deny list call supplied in
+`AppBackup::owed`. `RestoreLeftBehind` reports the counts of discarded calls and duties.
+An in-place restore can count an ordinary duty whose value cannot be decoded. If
+the epoch or counter is damaged, restore keeps readable duties under a new epoch. Retry
+a transient store read failure.
+
+If the backup fits the 32 MiB commit limit but carrying the store's work exceeds it,
+`Refusal::CarriedTooLarge` reports how many duties and calls the store would add.
+The store stays intact. Acknowledge duties already handled or let protocols answer
+pending calls, then retry. Restoring to an empty store uses only the backup. A backup
+that exceeds the limit on its own returns `StoreError::TooLarge`. `App::backup_layered`
+checks that the backup itself fits.
+
+### Across provider changes
+
+Moves, key changes and provider loss preserve outstanding duties and calls.
+`App::feed_order` orders the current sequence by `seq` even across generations.
+Calls from a sequence ended by loss come first, ordered by `(generation, seq)`. The
+loss's deny list gap follows them. A call from a generation beyond the newest own
+`identity.json` waits until the app follows it.
+
+A resend call identifies the sender and acceptance interval. The counterparty can
+answer at the current service. A missed-entries call identifies the original feed
+position even after loss. A loss can also request resends that were already pending.
+The receiver deduplicates them by `msg_id` (Switch spec 11).

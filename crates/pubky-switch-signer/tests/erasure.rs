@@ -3,7 +3,6 @@
 //! erases the account; a lost answer, a failure and a refusal; and what the signer keeps and
 //! refuses afterwards.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

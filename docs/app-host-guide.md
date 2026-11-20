@@ -425,7 +425,23 @@ To retire a protocol during an upgrade, open the store with its current roster a
 
 Finish work that needs the outgoing protocol's certificate scopes before asking the signer to narrow them. If the current or pending certificate still grants one of those scopes, let the app receive a compatible certificate before retirement. On `Refusal::NotNow`, reopen with the original roster and finish the work named in the refusal. Handle and acknowledge events for this owner, let its feed callbacks complete, and finish pending deliveries. Let the app read any outstanding feed entry or marked record whose owner it cannot yet identify. A sent copy can need its original protocol for a resend until normal retention expires. Let the outgoing protocol export or settle its local state and clear the keys it owns. Remove its published member with `set_protocol_member(name, None, None)` and clear a remaining finite expiry with `renew_record(name, None)`. Once it retires, other protocols keep their local state, positions and outstanding work.
 
-Route a kind by the root before its first dot. The owning protocol supplies `check_scopes`, `check_body`, `receives`, `sends_to`, `adds_conversation`, `message_adds_conversation` and `may_send`. The kind and the signed message must both permit adding the recipient to the sender's conversation list. Use `plaintext.json()` for rules on exact signed bytes. Its `accepts` and `opaque_members` describe the messages it accepts, `has_keys` identifies keyed scopes, and `sent_between_own_apps` identifies traffic within the identity. Use a protocol-specific label in inputs to `blind`. `collections`, `record_seen`, `record_regression` and `sent_record` govern its records. `record_regression` checks every write of another app that the client would take, the first of a record too, with `seen` `None`; its `WriteBase` carries the service time the write's stub or proof dates it at. A failed resend or missed-entries callback can hold back its owner while other owners receive. A deny-list change or gap is a barrier for all owners. Use `queued_messages(protocol)` to inspect outstanding copies, including those in saved batches. A message waits if held individually, its recipient is held, or the current `may_send` callback withholds it. That callback sees the signed bytes, origin, resend flag, durable local state and current cert. Its failure must preserve the delivery for a later try.
+### Message routing
+
+Route a message kind to the protocol that owns the root before its first dot. The owner supplies `check_scopes`, `check_body`, `receives` and `sends_to`. Its `accepts` lists the kinds the app record advertises under the current certificate. Declare opaque body members with `opaque_members`, keyed scopes with `has_keys`, and traffic between apps of the same identity with `sent_between_own_apps`. Use a protocol-specific label in inputs to `blind`.
+
+To add a recipient to the sender's conversation list, both `adds_conversation` for the kind and `message_adds_conversation` for the signed message must permit it. Use `plaintext.json()` when the rule depends on the exact signed JSON.
+
+### Record callbacks and feed order
+
+Register record policies with `collections`. Use `record_seen`, `record_regression` and `sent_record` for the owner's records. The client calls `record_regression` for every write from another app it would accept, including the first, when `seen` is `None`. Its `WriteBase` includes the service time when a stub or proof dates the write.
+
+If a resend or missed-entries callback fails, its owner waits while other protocols can continue. A deny-list change or gap holds every protocol.
+
+### Queued sends
+
+Use `queued_messages(protocol)` to inspect outstanding copies, including messages in saved batches. A message hold, a recipient hold or the owning protocol's `may_send` can delay delivery. Decide in `may_send` using the signed bytes, origin, resend flag, committed local state and current certificate. Returning an error leaves the message queued for another try.
+
+### Local state and duties
 
 Use `protocol_get`, `protocol_scan` and `protocol_commit` with the registered name. Local callbacks see their own namespace. Return bounded writes from resend, missed, deny-list and loss callbacks. `backup_layer` and `restore_layer` handle one protocol's state. Restore validates the layers against the backup identity, certificate and naming key before committing them. Use `AppBackup::layers` to inspect the named layers. `encode_local_state` and `decode_local_state` encode and read key/value layers. Use `local_writes_bytes` to check the 4 MiB callback budget.
 

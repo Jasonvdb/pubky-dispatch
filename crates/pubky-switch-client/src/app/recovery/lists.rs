@@ -76,6 +76,16 @@ impl ListInput {
 // only with the loss transaction that installs their descriptor.
 const PARTS: &str = "loss-list-parts/";
 const PART_BYTES: usize = 1 << 20;
+const STAGING: &str = "loss/list-staging";
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+struct Staging {
+    source: u64,
+    target: u64,
+    bank: bool,
+    contacts: [u8; 32],
+    deny: [u8; 32],
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredList {
@@ -284,13 +294,27 @@ impl App {
         let bank = old.as_ref().is_none_or(|stored| !stored.bank);
         let new = StoredList::of(input, bank);
         let inactive = StoredList::prefix(INPUT, bank);
-        // The active descriptor and its bytes stay untouched throughout staging.
-        // Clearing the inactive bank bounds abandoned stages across a new attempt.
+        // An interrupted write must leave the active bank readable. Resume
+        // only the exact contribution; the source can change before a retry.
         if input.contacts.len().saturating_add(input.deny.len()) > PART_BYTES {
-            let mut clear = Tx::new(&self.ns);
-            clear.delete_prefix(&inactive)?;
-            clear.commit(&self.env.store).await?;
+            let staging = Staging {
+                source: input.source,
+                target: input.target,
+                bank,
+                contacts: pubky_switch_core::enc::hash(&input.contacts),
+                deny: pubky_switch_core::enc::hash(&input.deny),
+            };
+            let resume = reader.get::<Staging>(STAGING).await?.as_ref() == Some(&staging);
+            if !resume {
+                let mut clear = Tx::new(&self.ns);
+                clear.delete_prefix(&inactive)?;
+                clear.put(STAGING, &staging)?;
+                clear.commit(&self.env.store).await?;
+            }
             for (key, bytes) in new.pages(INPUT, input) {
+                if resume && reader.get_raw(key.as_bytes()).await?.as_deref() == Some(bytes) {
+                    continue;
+                }
                 let mut page = Tx::new(&self.ns);
                 page.put_raw(&key, bytes.to_vec())?;
                 page.commit(&self.env.store).await?;
@@ -749,6 +773,7 @@ pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(PENDING)?;
     tx.delete(OBSERVED)?;
     tx.delete(FINISHED)?;
+    tx.delete(STAGING)?;
     tx.delete_prefix(PARTS)?;
     tx.delete_prefix(REMOVED)
 }

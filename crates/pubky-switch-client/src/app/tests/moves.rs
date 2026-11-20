@@ -2600,6 +2600,9 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
         (prior.loss.generation, prior.step),
         (2, crate::app::RecoveryStep::Lists)
     );
+    // Rewriting the already stored first page would now fail. An unchanged
+    // contribution resumes staging from its checked bytes.
+    store.fail_put_once(b"loss-list-parts/0/loss/list-input/0/0");
     // Capture a backup before any list page is accepted. Then accept the
     // first page and lose the second page's answer after it is committed.
     third.fail_next(Fault::Unanswered {

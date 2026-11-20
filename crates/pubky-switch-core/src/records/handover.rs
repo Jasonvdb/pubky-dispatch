@@ -646,8 +646,8 @@ impl SignerHandover {
     /// # Errors
     ///
     /// [`Error::Invalid`] when `records` or `new_signer` are of another identity, the
-    /// records' `identity_doc` doesn't list `new_signer`, or the JSON needs more than 64
-    /// parts; [`Error::Crypto`] as [`envelope::seal`].
+    /// records' `identity_doc` doesn't list `new_signer`, or the JSON needs more than [`MAX_HANDOVER_ENVELOPES`]
+    /// envelopes; [`Error::Crypto`] as [`envelope::seal`].
     pub fn seal(key: &IdentityKey, new_signer: &AppCert, records: &SignerRecords) -> Result<Self> {
         let identity = key.public();
         if records.key.public() != identity || new_signer.identity() != identity {
@@ -913,8 +913,8 @@ impl SignerBackup {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when `records` are of another identity or need more than 64
-    /// parts; [`Error::Crypto`] as [`envelope::seal`].
+    /// [`Error::Invalid`] when `records` are of another identity or need more than [`MAX_HANDOVER_ENVELOPES`]
+    /// envelopes; [`Error::Crypto`] as [`envelope::seal`].
     pub fn seal(key: &IdentityKey, records: &SignerRecords) -> Result<Self> {
         if records.key.public() != key.public() {
             return invalid("Switch wire 3.13: the records are of another identity");

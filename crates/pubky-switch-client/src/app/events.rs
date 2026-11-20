@@ -1634,8 +1634,8 @@ pub enum DropReason {
     /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
     /// entries, and it was that sender's accepted earliest.
     PerSender,
-    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries, of both reasons, were stored,
-    /// and it was the one accepted earliest of the sender identity that held the most.
+    /// The total passed [`super::MAX_UNVERIFIED_TOTAL`] across all bounded reasons.
+    /// This entry was accepted earliest from the sender identity that held the most.
     Total,
     /// Tried again, it failed recipient check `check` (Switch wire 5.1) under the rules
     /// current then, such as a body its protocol's opaque members no longer allow.
@@ -1753,8 +1753,8 @@ impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
     /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
     /// store kept from finishing, that waits for admission or a scope key (once the key is held), or that
-    /// the host released. The others stay stored until the protocol or the host acts on
-    /// them ([`super::App::forget_parked`]).
+    /// the protocol deferred or the host released. Other entries stay stored until the
+    /// protocol or the host acts on them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,

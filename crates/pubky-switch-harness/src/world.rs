@@ -169,9 +169,7 @@ impl World {
     }
 
     /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
-    /// place of its defaults, as an operator may configure it. The scripted switch takes the
-    /// inbox quota, the app limit and the hourly limit of recovery uploads of them, the
-    /// three it has a setting for.
+    /// place of its defaults. The scripted backend applies the limits it models.
     ///
     /// # Errors
     ///
@@ -457,7 +455,7 @@ impl World {
     }
 
     /// Temporarily withhold an enrolled account or reattach it on the same generation.
-    /// The independent mark stays in place. The wallet sees a signed temporary `behind`
+    /// The independent mark stays in place. The client sees a signed temporary `behind`
     /// notice while the account is missing (Switch wire 7.3).
     /// Use a dedicated test origin. The real service uses a disposable copy of that
     /// origin's database until the original database is reattached.

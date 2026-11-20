@@ -54,8 +54,7 @@ enum Command {
     Retire {
         /// The identity's Pubky ID.
         identity: String,
-        /// The generation to retire: the one the account's verdict reads its retirement
-        /// of.
+        /// Generation to retire for this identity. Use the generation selected by the account verdict.
         generation: u64,
     },
 }

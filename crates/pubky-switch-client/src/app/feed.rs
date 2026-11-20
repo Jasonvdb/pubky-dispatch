@@ -52,8 +52,9 @@
 //! again. What a budget leaves goes at the next read, in the same order. The report says
 //! when that is now for the kept batches and the listing ([`ReceiveReport::more`]); the
 //! entries stored locally and the records and claims read again go on at the next read,
-//! which a quiet feed brings within [`super::UPKEEP_READ_MS`]. The feed's pages have no
-//! budget: a read follows the feed to its end. A host that waits for the feed between reads
+//! which a quiet feed brings within [`super::UPKEEP_READ_MS`]. A read stops between feed
+//! pages at its page or time limit. When [`ReceiveReport::more`] is set, call receive again.
+//! A host that waits for the feed between reads
 //! does so with a handle that doesn't hold the app ([`App::feed_wait`]), paced with
 //! [`super::WaitPace`].
 //!

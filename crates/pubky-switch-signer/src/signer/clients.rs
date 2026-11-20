@@ -1,10 +1,10 @@
-//! The signer's two kinds of switch client, which the compiler keeps apart (Switch spec 4.3).
+//! The signer uses a separate client for each role (Switch spec 4.3).
 //!
 //! A [`RequestClient`] signs nothing but its requests' `Switch-Signature`: it reads, and
 //! delivers what the signing gate let sign already, a version, a batch or the enrollment. A
 //! [`SigningClient`] is made from the gated key ([`crate::key::SigningKey`]): only it signs
-//! operations, and a mutating signer-only call that signs nothing in its body, such as a
-//! freeze, an unfreeze, an erasure or a hand-over, belongs on it. Each has only the calls its
+//! operations, and a mutating signer-only call that signs nothing in its body, such as
+//! erasure or storing a hand-over, belongs on it. Each has only the calls its
 //! kind may make. An [`AppClient`] is a new signer's, before it holds the identity key: it
 //! fetches the hand-over and nothing else (Switch wire 7.4.17).
 

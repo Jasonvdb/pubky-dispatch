@@ -1489,7 +1489,20 @@ impl Signer {
     ) -> Result<()> {
         self.check_named()?;
         let backup = match backup {
-            Some(backup) => backup,
+            Some(backup) => {
+                // Before repeating the write, check the sealed records against the delivery
+                // they were kept for (Switch wire 3.13).
+                if !self
+                    .keyring
+                    .open_backup(&backup)?
+                    .is_some_and(|view| view.holds_delivery(doc, prev, &account))
+                {
+                    return Err(
+                        RecordsFault::Damaged("backup differs from pending delivery").into(),
+                    );
+                }
+                backup
+            }
             None => {
                 // Sealed once and kept, so a retry writes the same bytes. Sealed and committed
                 // before the check, so only the check's read comes before the write.
@@ -2731,6 +2744,57 @@ mod tests {
         ] {
             assert!(!delivery_refused_for_good(&error), "{error:?}");
         }
+    }
+
+    #[test]
+    fn test_sealed_backup_holds_the_signed_delivery_and_its_original_account() {
+        use pubky_switch_core::keys::IdentityKey;
+        use pubky_switch_core::records::{Limits, SignerRecords};
+
+        let key = IdentityKey::from_secret([31; 32]);
+        let mut body = IdentityBody::first(
+            key.public(),
+            [1; 16],
+            Inbox::new("https://switch.example", [32; 32]),
+            IdentityPolicy::default(),
+        );
+        let first = IdentityDoc::sign(&key, body.clone()).unwrap();
+        let prev = Some(first.hash());
+        body.version += 1;
+        let doc = IdentityDoc::sign(&key, body.clone()).unwrap();
+        let account = Service {
+            origin: doc.inbox().url.clone(),
+            service_key: doc.inbox().service_key,
+            created: 23,
+            limits: Limits::default(),
+        };
+        let records = SignerRecords::new(
+            key.clone(),
+            doc.clone(),
+            account.created,
+            &[],
+            &[],
+            account.limits,
+            &[],
+            prev,
+        )
+        .unwrap();
+        let sealed = SignerBackup::seal(&key, &records).unwrap();
+        let view = BackupView::of(&sealed.open(&key).unwrap());
+        assert!(view.holds_delivery(doc.signed(), prev, &account));
+        body.record_max_age = Some(60);
+        let other = IdentityDoc::sign(&key, body).unwrap();
+        assert!(!view.holds_delivery(other.signed(), prev, &account));
+        assert!(!view.holds_delivery(doc.signed(), None, &account));
+        assert!(!view.holds_delivery(doc.signed(), Some([0; 32]), &account));
+        assert!(!view.holds_delivery(
+            doc.signed(),
+            prev,
+            &Service {
+                created: 24,
+                ..account
+            }
+        ));
     }
 
     #[test]

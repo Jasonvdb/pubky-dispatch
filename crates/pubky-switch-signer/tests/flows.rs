@@ -332,20 +332,43 @@ async fn test_signer_new_version_builds_on_the_newest() {
 #[tokio::test]
 async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
     let world = World::new();
-    let (mut signer, _) = world.enrolled().await;
+    let (mut signer, store) = world.enrolled().await;
+    let predecessor = world.switch.identity_doc().unwrap();
+    let original = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
     // Reads still answer, so the backup check passes and only the write fails.
     *world.homeserver.failing_puts.lock().unwrap() = true;
     let requests = world.transport.requests().len();
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
     // Nothing reached the switch: the backup comes first (Switch wire 3.13).
-    assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), original);
+    assert_eq!(world.switch.identity_doc().unwrap(), predecessor);
     world.assert_request_attempts(requests, "PUT", "/identity", 0);
     assert_eq!(signer.high_water().unwrap().unwrap().version, 1);
-    // Once the Homeserver takes writes again, the same version goes out.
+    // The Homeserver takes the retry but loses its answer. The switch still holds the
+    // predecessor until the signer can confirm the write of these exact sealed bytes.
     *world.homeserver.failing_puts.lock().unwrap() = false;
+    *world.homeserver.losing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    assert!(matches!(
+        signer.resume().await,
+        Err(SignerError::Homeserver(_))
+    ));
+    let sealed = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+    let candidate = world.backup();
+    assert_eq!(candidate.prev(), Some(predecessor.hash()));
+    assert_eq!(candidate.identity_doc().body().record_max_age, Some(86_400));
+    world.assert_request_attempts(requests, "PUT", "/identity", 0);
+    drop(signer);
+    *world.homeserver.losing_path.lock().unwrap() = None;
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
     signer.resume().await.unwrap();
-    assert_eq!(world.switch.identity_doc().unwrap().version(), 2);
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), sealed);
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        candidate.identity_doc().signed()
+    );
     world.assert_request_attempts(requests, "PUT", "/identity", 1);
 }
 

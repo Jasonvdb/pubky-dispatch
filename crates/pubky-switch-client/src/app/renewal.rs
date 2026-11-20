@@ -766,8 +766,13 @@ impl App {
         let at = (head.generation == directory.identity.generation())
             .then_some((head.generation, head.seq));
         if directory.identity.version() > self.state.own_doc.version() {
-            self.take_own_copy_with(directory.identity.clone(), at, |_| Ok(()))
-                .await?;
+            self.take_own_copy_with(
+                directory.identity.clone(),
+                at,
+                Some(head.generation),
+                |_| Ok(()),
+            )
+            .await?;
         }
         if self.not_current_here().is_some() {
             return Ok(Listed::NotCurrentHere);

@@ -2775,6 +2775,15 @@ fn tasks_list() -> crate::app::Collection {
 
 #[tokio::test]
 async fn test_collection_directory_stops_at_a_newer_generation() {
+    collection_directory_stops(false).await;
+}
+
+#[tokio::test]
+async fn test_collection_directory_stops_when_the_homeserver_also_has_the_new_generation() {
+    collection_directory_stops(true).await;
+}
+
+async fn collection_directory_stops(published: bool) {
     let p = Pair::with(
         named("tasks"),
         Named {
@@ -2792,6 +2801,13 @@ async fn test_collection_directory_stops_at_a_newer_generation() {
     body.data_epoch += 1;
     let doc = IdentityDoc::sign(&p.w.alice, body).unwrap();
     p.w.switch.deliver_identity(&doc).unwrap();
+    if published {
+        p.w.homeserver.publish(&doc).unwrap();
+    }
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/keys".into(),
+        after: 0,
+    });
     let applied = p.w.switch.applied().len();
     assert!(
         app.list_collections().await.unwrap(),
@@ -2800,6 +2816,13 @@ async fn test_collection_directory_stops_at_a_newer_generation() {
     assert_eq!(app.own_identity().generation(), 2);
     assert!(app.listing_owed().await.unwrap());
     assert_eq!(p.w.switch.applied().len(), applied);
+    assert!(
+        p.w.switch
+            .lock()
+            .faults
+            .iter()
+            .any(|fault| matches!(fault, Fault::Unreachable { path, .. } if path == "/keys"))
+    );
 }
 
 /// The scopes of the app's certificate, `extra` added, with its permissions in the fixed

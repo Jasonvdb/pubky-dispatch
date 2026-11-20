@@ -234,11 +234,11 @@ impl App {
             _ => None,
         };
         if named_generation.is_some_and(|seen| seen > generation) {
-            Box::pin(self.read_provider_document()).await?;
+            Box::pin(self.read_provider_document(named_generation)).await?;
             return Ok(next);
         }
         if matches!(answer, OwnAnswer::NotHosted)
-            && !Box::pin(self.read_provider_document()).await?
+            && !Box::pin(self.read_provider_document(None)).await?
         {
             return Ok(next);
         }

@@ -588,7 +588,7 @@ impl App {
         };
         if matches!(error.unkept(), AppError::Switch(failure) if failure.code() == Some(ErrorCode::RecoveryRequired))
         {
-            self.read_provider_document().await?;
+            self.read_provider_document(None).await?;
             if self.provider_superseded() {
                 return Ok(TakeOver::ReadAgain);
             }
@@ -757,7 +757,7 @@ impl App {
             return Ok(ProviderStatus::Gone);
         }
         if self.recovery_required().is_some() {
-            self.read_provider_document().await?;
+            self.read_provider_document(None).await?;
             if !self.provider_superseded() {
                 // A bounded signed read can establish service again without writing the cursor.
                 let answer = self.service_freeze().await;
@@ -816,10 +816,13 @@ impl App {
             return;
         }
         // An alarm the copy raises is kept; the step's own error is the one returned.
-        let _ = self.read_provider_document().await;
+        let _ = self.read_provider_document(None).await;
     }
 
-    pub(super) async fn read_provider_document(&mut self) -> Result<bool, AppError> {
+    pub(super) async fn read_provider_document(
+        &mut self,
+        serving_generation: Option<u64>,
+    ) -> Result<bool, AppError> {
         let identity = self.state.meta.identity;
         if let Ok(Some(doc)) =
             identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
@@ -827,7 +830,8 @@ impl App {
             let names_service = doc.generation() == self.state.meta.generation
                 && doc.inbox().service_key == self.state.meta.service_key
                 && doc.inbox().url == self.state.meta.origin;
-            self.take_own_copy(doc).await?;
+            self.take_own_copy_with(doc, None, serving_generation, |_| Ok(()))
+                .await?;
             return Ok(names_service && !self.provider_superseded());
         }
         Ok(false)
@@ -1929,7 +1933,7 @@ impl App {
             .collect();
         // `gone` and its duty events go with the copy, in its commit: a copy that fails
         // leaves them.
-        self.take_own_copy_with(doc, None, |tx| {
+        self.take_own_copy_with(doc, None, None, |tx| {
             tx.delete(keys::GONE)?;
             for n in gone_duties {
                 tx.delete(&key::duty(n))?;

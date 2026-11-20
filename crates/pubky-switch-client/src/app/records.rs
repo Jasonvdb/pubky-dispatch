@@ -1138,7 +1138,7 @@ enum Refused {
     /// nobody, but its version is followed, so the app's next write builds on it and puts
     /// back what it trusts, as over a flagged write (Switch spec 8.2). `version` is the one
     /// step 6 checked: a proof's when one gives it, else the view's.
-    Unnamed(Box<(FollowedWrite, Placement)>),
+    Unnamed(Box<(FollowedWrite, Placement, Option<u64>)>),
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
@@ -1148,13 +1148,13 @@ enum Refused {
 
 enum RefusedVersion {
     First(Box<HeldRecord>),
-    Follow(Box<(FollowedWrite, Placement)>),
+    Follow(Box<(FollowedWrite, Placement, Option<u64>)>),
 }
 
 impl RefusedVersion {
-    fn follow((mut write, placement): (FollowedWrite, Placement)) -> Self {
+    fn follow((mut write, placement): (FollowedWrite, Placement), time: Option<u64>) -> Self {
         write.named = true;
-        Self::Follow(Box::new((write, placement)))
+        Self::Follow(Box::new((write, placement, time)))
     }
 
     fn version(&self) -> WriteVersion {
@@ -2986,8 +2986,9 @@ impl App {
                 match checked {
                     Some(RefusedVersion::First(first)) => put_held(tx, &shown_key, &first)?,
                     Some(RefusedVersion::Follow(checked)) => {
-                        let (write, placement) = *checked;
-                        self.follow_write(&shown_key, write, placement, tx).await?;
+                        let (write, placement, time) = *checked;
+                        self.follow_write(&shown_key, write, placement, time, tx)
+                            .await?;
                         if let Some(h) = placement.historical {
                             return Ok(h.read());
                         }
@@ -2996,8 +2997,9 @@ impl App {
                 }
             }
             Err(Refused::Unnamed(checked)) => {
-                let (write, placement) = *checked;
-                self.follow_write(&shown_key, write, placement, tx).await?;
+                let (write, placement, time) = *checked;
+                self.follow_write(&shown_key, write, placement, time, tx)
+                    .await?;
                 if let Some(h) = placement.historical {
                     return Ok(h.read());
                 }
@@ -3079,12 +3081,16 @@ impl App {
         key: &[u8; 32],
         mut write: FollowedWrite,
         placement: Placement,
+        time: Option<u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let Some(mut held) = self.read_in::<HeldRecord>(&record_key_of(key), tx).await? else {
             return Ok(());
         };
         let current = placement.at.filter(|_| placement.historical.is_none());
+        if write.applied.item_hash == held.item_hash {
+            write.retain(held.write_version(), held.proof.as_ref());
+        }
         if let Some(f) = held
             .follow
             .as_mut()
@@ -3102,9 +3108,6 @@ impl App {
                 || (matches!(placement.base, Order::Older(_))
                     && write.version.version == held.base_write().0))
         {
-            if write.applied.item_hash == held.item_hash {
-                write.retain(held.write_version(), held.proof.as_ref());
-            }
             if !write.named {
                 self.events.push(AppEvent::WriteNotTaken { key: *key });
             }
@@ -3113,6 +3116,18 @@ impl App {
             held.gone = false;
         } else {
             return Ok(());
+        }
+        // The same operation's stronger evidence belongs to its held metadata too.
+        // Following another write never changes the content's version or proof.
+        if let Some(f) = held
+            .follow
+            .as_ref()
+            .filter(|f| f.applied.item_hash == held.item_hash)
+        {
+            held.version = f.version.version;
+            held.authenticated = f.version.authenticated;
+            held.proof = f.proof.clone();
+            held.written_at_ms = time.or(held.written_at_ms);
         }
         put_held(tx, key, &held)?;
         Ok(())
@@ -3281,7 +3296,7 @@ impl App {
                     item_hash,
                     reason,
                     false,
-                    checked.map(RefusedVersion::follow),
+                    checked.map(|checked| RefusedVersion::follow(checked, time)),
                 )
             }));
         }
@@ -3294,7 +3309,7 @@ impl App {
                 .at
                 .filter(|_| placement.historical.is_none() && held.is_none())
             else {
-                return Some(RefusedVersion::follow((write.clone(), *placement)));
+                return Some(RefusedVersion::follow((write.clone(), *placement), time));
             };
             let mut followed = write.clone();
             followed.named = true;
@@ -3345,9 +3360,11 @@ impl App {
             }));
         }
         let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(checked.clone().map_or(Refused::Ignored, |w| {
-                Refused::Unnamed(Box::new(w))
-            })))
+            Ok(Err(checked
+                .clone()
+                .map_or(Refused::Ignored, |(write, placement)| {
+                    Refused::Unnamed(Box::new((write, placement, time)))
+                })))
         };
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
@@ -4037,7 +4054,7 @@ impl App {
             // A historical read may supply the operation for a held record. A
             // collection that qualifies its mark still needs a covering read.
             if reopened && qualified.is_some() && let Some(h) = placement.historical {
-                self.follow_write(&key, accepted.write, placement, tx).await?;
+                self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                 return Ok(Taken::Historical(h));
             }
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
@@ -4096,12 +4113,12 @@ impl App {
                 }
                 if let Some(h) = placement.historical {
                     // Even an overtaken view can carry a matching proof for a followed item.
-                    self.follow_write(&key, accepted.write, placement, tx).await?;
+                    self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                     return Ok(Taken::Historical(h));
                 }
                 if let Order::Older(write) = placement.content {
                     if accepted.current_at.viewed() && accepted.write.version.version == held.version {
-                        self.follow_write(&key, accepted.write, placement, tx).await?;
+                        self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                     }
                     return Ok(Taken::Older(write));
                 }
@@ -4225,7 +4242,7 @@ impl App {
                     };
                     put_held(tx, &key, &refused)?;
                 } else {
-                    self.follow_write(&key, accepted.write, placement, tx).await?;
+                    self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                 }
                 if name_writer {
                     self.flag_write(shown, accepted.writer, reason, tx).await?;

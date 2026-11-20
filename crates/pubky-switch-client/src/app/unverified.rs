@@ -403,7 +403,7 @@ impl App {
             accepted_at_ms: stored.accepted_at_ms,
             reason,
             waiting: stored.reason.waiting().ok_or_else(super::corrupt)?,
-            message: self.waiting_identity(stored)?,
+            message: Box::new(self.waiting_identity(stored)?),
             sender_verified: stored.reason != ParkReason::Unverifiable,
             receipt: stored.receipt,
             notice_id,

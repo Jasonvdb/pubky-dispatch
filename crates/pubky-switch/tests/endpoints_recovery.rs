@@ -3349,8 +3349,8 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
             .expect("conn");
         sqlx::query(
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, \
-             expires_at_ms, context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
-             decode(repeat('cd', 16), 'hex'), $2, 'null')",
+             expires_at_ms) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+             decode(repeat('cd', 16), 'hex'), $2)",
         )
         .bind(alice_id())
         .bind(i64::try_from(at).expect("ms"))

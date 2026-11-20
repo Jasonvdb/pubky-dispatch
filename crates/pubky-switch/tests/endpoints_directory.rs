@@ -247,7 +247,6 @@ async fn put_code(replay: &Replay, batch: u8) {
                 code_hash: pubky_switch_core::ident::invite_code_hash(CODE).expect("hash"),
                 expires_at: ms(&setup_time()) + 3_600_000,
                 max_uses: 1,
-                context: pubky_switch_core::ops::InviteContext::new(json!(null)),
             },
         )],
         batch,
@@ -496,7 +495,13 @@ async fn test_directory_admission() {
     assert!(header_text(&answer, "switch-head").is_none());
     assert_eq!(body(&answer)["known_version"], Value::Null);
     assert_eq!(app_ids(&answer).len(), 3);
-    // Denied, though a contact: refused.
+    put_code(&replay, 112).await;
+    let untrusted = replay.without_trusted_time();
+    assert_eq!(
+        untrusted.handle(from_shop(Some(CODE), &at)).await.status,
+        200
+    );
+    // A block also applies while the code's expiry cannot be established.
     app_ops(
         &replay,
         "wallet",
@@ -508,6 +513,11 @@ async fn test_directory_admission() {
     .await;
     let answer = replay.service.handle(from_shop(None, &at)).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    assert_eq!(
+        code_of(&untrusted.handle(from_shop(Some(CODE), &at)).await),
+        (403, json!("not_admitted"))
+    );
+    assert_eq!(untrusted.time_refusals(), 0);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -607,6 +617,19 @@ async fn test_directory_invite_code_admits_without_use_at_its_rate() {
     let answer = untrusted.handle(from_shop(Some(CODE), &at)).await;
     assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert_eq!(untrusted.time_refusals(), 1);
+    let expiry = pubky_switch_core::time::rfc3339(ms(&at) + 3_600_000);
+    set_time(&replay.clock, &expiry);
+    let read = || from_shop(Some(CODE), &expiry);
+    assert_eq!(
+        code_of(&untrusted.handle(read()).await),
+        (503, json!("unavailable"))
+    );
+    assert_eq!(untrusted.time_refusals(), 2);
+    assert_eq!(
+        code_of(&replay.service.handle(read()).await),
+        (403, json!("not_admitted"))
+    );
+
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -59,12 +59,11 @@ impl Service {
                 .await
                 .map_err(|e| store_error(&e))?;
             let standing = self.standing(txn, &sender).await?;
-            let listed =
-                !standing.denied && !removed && (standing.contact || standing.conversation);
-            let invite = if listed {
+            let invite = if standing.denied || standing.listed(removed) {
                 None
             } else {
-                self.live_invite(txn, invite_code, time_ms).await?
+                self.live_invite(txn, invite_code, trusted.then_some(time_ms), "directory")
+                    .await?
             };
             // While admission is staged after a provider loss, a reader it can't otherwise
             // admit, a denied one included, gets `503 staged` and retries, as at the inbox and
@@ -80,12 +79,6 @@ impl Service {
             match admit(standing, removed, invite, false).ok_or_else(refused)? {
                 Admitted::Listed => {}
                 Admitted::InviteCode(hash) => {
-                    if !trusted {
-                        return Err(self.refused_without_trusted_time(
-                            "directory",
-                            "7.3: an invite code's expiry needs trusted time",
-                        ));
-                    }
                     self.invite_rate
                         .take(
                             (account.id.clone(), hash),

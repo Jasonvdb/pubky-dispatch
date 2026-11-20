@@ -1609,7 +1609,34 @@ async fn test_inbox_a_revocation_turns_entries_unread_by_others_unreadable() {
     let Some(replay) = replay().await else { return };
     with_bob(&replay).await;
     register_executor(&replay).await;
-    append_to(&replay, &["executor"], 1).await;
+    let code = pubky_switch_core::enc::b64(&[61; 16]);
+    let code_hash = pubky_switch_core::ident::invite_code_hash(&code).expect("code hash");
+    wallet_op(
+        &replay,
+        OpKind::InviteCodePut(pubky_switch_core::ops::InviteCodePut {
+            code_hash,
+            expires_at: ms(&at()) + 60_000,
+            max_uses: 1,
+        }),
+        94,
+    )
+    .await;
+    let version = apps_version(&replay).await;
+    let accepted = from_shop(
+        &replay,
+        sealed_to(&[receive_public("executor")], 1),
+        Some(version),
+        Some(&code),
+    )
+    .await;
+    assert_eq!(accepted.status, 200);
+    let targeted = feed_of(&replay, "executor", 9).await;
+    let readable = items_of(&targeted, "entry");
+    assert_eq!(readable.len(), 1);
+    assert_eq!(
+        readable[0]["invite_code_hash"],
+        pubky_switch_core::enc::b64(&code_hash)
+    );
     let entry = entry_seq(&replay).await;
     let executor = app(&vectors("keys.json"), "executor")["app_id"]
         .as_str()
@@ -1641,6 +1668,8 @@ async fn test_inbox_a_revocation_turns_entries_unread_by_others_unreadable() {
     let items = items_of(&feed, "unreadable");
     assert_eq!(items.len(), 1, "{feed}");
     assert_eq!(items[0]["seq"], unreadable);
+    assert!(items[0].get("invite_code_hash").is_none());
+    assert_eq!(sql_value(&replay, "SELECT count(*) FROM inbox_entries WHERE account_id = $1 AND kind = 'unreadable' AND invite_code_hash IS NULL").await, 1);
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -221,10 +221,10 @@ impl FeedStop {
 }
 
 /// How an item shows to a reader (Switch wire 7.5).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shown {
-    /// In full, with the conversation entry's context for a service-written one.
-    Full { context: Option<Value> },
+    /// In full.
+    Full,
     /// Its stub only.
     Stub,
 }
@@ -244,8 +244,8 @@ pub(crate) fn shows(
     reader: &AppCert,
     current: &CurrentDocs,
 ) -> Result<Shown, StoreError> {
-    let full = Shown::Full { context: None };
-    let shown_if = |shown: bool| if shown { full.clone() } else { Shown::Stub };
+    let full = Shown::Full;
+    let shown_if = |shown: bool| if shown { full } else { Shown::Stub };
     let Some(item) = &row.item else {
         return Ok(Shown::Stub);
     };
@@ -260,14 +260,8 @@ pub(crate) fn shows(
             match ServiceTransition::from_value(&value)
                 .map_err(|_| corrupt("a service transition"))?
             {
-                ServiceTransition::ConversationAdd { context, .. } => {
-                    if reader.has_permission(Permission::ListsRead) {
-                        Shown::Full {
-                            context: Some(context),
-                        }
-                    } else {
-                        Shown::Stub
-                    }
+                ServiceTransition::ConversationAdd { .. } => {
+                    shown_if(reader.has_permission(Permission::ListsRead))
                 }
                 _ => full,
             }
@@ -326,7 +320,7 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
     let mut out = Vec::new();
     let stub = row.stub.to_json();
     match (shown, &row.item) {
-        (Shown::Full { context }, Some(item)) => {
+        (Shown::Full, Some(item)) => {
             out.extend_from_slice(b"{\"type\":\"chain\",\"seq\":");
             out.extend_from_slice(row.seq.to_string().as_bytes());
             out.extend_from_slice(b",\"stub\":");
@@ -335,10 +329,6 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
             out.extend_from_slice(row.item_type.as_str().as_bytes());
             out.extend_from_slice(b"\",\"item\":");
             out.extend_from_slice(&doc_json(item));
-            if let Some(context) = context {
-                out.extend_from_slice(b",\"context\":");
-                out.extend_from_slice(context.to_string().as_bytes());
-            }
             if let (ItemType::Op, Some(proof)) = (row.item_type, &row.proof) {
                 out.extend_from_slice(b",\"proof\":");
                 out.extend_from_slice(&doc_json(proof));
@@ -392,8 +382,7 @@ fn inbox_item_json(item: &crate::store::InboxItem) -> Vec<u8> {
 }
 
 /// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
-/// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
-/// stored when one admitted the sender, then `envelope`.
+/// (7.4.4). The recipient sees the code redeemed on this append alongside its envelope.
 fn entry_json(entry: &crate::store::StoredEntry) -> Vec<u8> {
     let mut out = b"{\"type\":\"entry\",\"seq\":".to_vec();
     out.extend_from_slice(entry.seq.to_string().as_bytes());
@@ -405,10 +394,13 @@ fn entry_json(entry: &crate::store::StoredEntry) -> Vec<u8> {
     out.extend_from_slice(&doc_json(&entry.cert));
     out.extend_from_slice(b",\"accepted_at\":\"");
     out.extend_from_slice(pubky_switch_core::time::rfc3339(entry.accepted_at_ms).as_bytes());
-    out.push(b'"');
-    if let Some(context) = &entry.context {
-        out.extend_from_slice(b",\"context\":");
-        out.extend_from_slice(context);
+    out.extend_from_slice(b"\",\"invite_code_hash\":");
+    if let Some(hash) = entry.invite_code_hash {
+        out.push(b'"');
+        out.extend_from_slice(pubky_switch_core::enc::b64(&hash).as_bytes());
+        out.push(b'"');
+    } else {
+        out.extend_from_slice(b"null");
     }
     out.extend_from_slice(b",\"envelope\":\"");
     out.extend_from_slice(pubky_switch_core::enc::b64(&entry.envelope).as_bytes());
@@ -1385,7 +1377,7 @@ mod tests {
             .filter(|row| row.seq <= 9)
             .map(|row| {
                 let shown = shows(row, reader, current).expect("shows");
-                (row.seq, matches!(shown, Shown::Full { .. }))
+                (row.seq, matches!(shown, Shown::Full))
             })
             .collect()
     }
@@ -1427,7 +1419,7 @@ mod tests {
         let sub = reader(&["tasks:team1"], &[Permission::ClaimsRead]);
         assert!(!matches!(
             shows(&row(8), &sub, &current).expect("shows"),
-            Shown::Full { .. }
+            Shown::Full
         ));
     }
 
@@ -1441,7 +1433,7 @@ mod tests {
         assert_eq!(shows(&row(8), &all, &current).expect("shows"), Shown::Stub);
         assert!(matches!(
             shows(&row(10), &all, &current).expect("shows"),
-            Shown::Full { .. }
+            Shown::Full
         ));
         // A claim compacted to a tombstone, or deleted: its entries are stubs.
         current.claim_entries.clear();
@@ -1493,15 +1485,12 @@ mod tests {
     }
 
     fn full(row: &FeedRow, reader: &AppCert, current: &CurrentDocs) -> bool {
-        matches!(
-            shows(row, reader, current).expect("shows"),
-            Shown::Full { .. }
-        )
+        matches!(shows(row, reader, current).expect("shows"), Shown::Full)
     }
 
     #[test]
     fn test_feed_visibility_of_the_lists() {
-        use pubky_switch_core::ops::{AllowKind, InviteCodePut, InviteContext};
+        use pubky_switch_core::ops::{AllowKind, InviteCodePut};
         let current = CurrentDocs::default();
         let none = reader(&["tasks"], &[]);
         let lists = reader(&["tasks"], &[Permission::ListsRead]);
@@ -1529,7 +1518,6 @@ mod tests {
                 code_hash: [2; 32],
                 expires_at: 1,
                 max_uses: 1,
-                context: InviteContext::new(serde_json::json!({ "order": 7 })),
             }),
             OpKind::InviteCodeDelete { code_hash: [2; 32] },
         ] {
@@ -1543,11 +1531,9 @@ mod tests {
 
     #[test]
     fn test_feed_visibility_of_conversation_add() {
-        let context = serde_json::json!({ "order": 7 });
         let transition = ServiceTransition::ConversationAdd {
             pubky: [1; 32],
             code_hash: [2; 32],
-            context: context.clone(),
             at: 0,
         };
         let signed = transition
@@ -1565,25 +1551,20 @@ mod tests {
             only_for: None,
         };
         let current = CurrentDocs::default();
-        // lists.read sees it, with the invite code's context; conversation.add alone doesn't.
+        // Only list readers see the service-written grant.
         assert_eq!(
             shows(&row, &reader(&[], &[Permission::ListsRead]), &current).expect("shows"),
-            Shown::Full {
-                context: Some(context)
-            }
+            Shown::Full
         );
         assert_eq!(
             shows(&row, &reader(&[], &[Permission::ConversationAdd]), &current).expect("shows"),
             Shown::Stub
         );
-        let item: Value = serde_json::from_slice(&item_json(
-            &row,
-            Shown::Full {
-                context: Some(serde_json::json!({ "order": 7 })),
-            },
-        ))
-        .expect("json");
-        assert_eq!(item["context"], serde_json::json!({ "order": 7 }));
+        let item: Value = serde_json::from_slice(&item_json(&row, Shown::Full)).expect("json");
+        assert_eq!(
+            item["item"],
+            serde_json::to_value(row.item.as_ref().expect("signed transition")).expect("document")
+        );
     }
 
     #[test]

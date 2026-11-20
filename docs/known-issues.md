@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Register invitations with a code hash, expiry and use count. Keep invitation notes in the host. On receipt, use the nullable `invite_code_hash` to identify the code redeemed for that message. An ordinary follow-up carries `null`.
+
 - Protocols waiting for required data return `Outcome::Defer` with a content-free reason and the custody their receive rule requires. Hosts see `AppEvent::ProtocolDeferred` on the read. Keep `Outcome::Retry` for failures of the store or host.
 
 - Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.

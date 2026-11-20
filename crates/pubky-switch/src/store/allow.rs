@@ -19,13 +19,11 @@ pub struct AllowEntry {
     pub at_ms: u64,
     /// The invite code's hash, on an entry the service wrote.
     pub code_hash: Option<[u8; 32]>,
-    /// The invite code's context as its writer wrote it, on an entry the service wrote.
-    pub context: Option<Vec<u8>>,
     /// The service time of the last append the entry admitted.
     pub last_used_ms: Option<u64>,
 }
 
-/// A live invite code as `GET /allow` shows it, without its context.
+/// A live invite code as `GET /allow` shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllowInvite {
     /// `hash(code bytes)`.
@@ -49,7 +47,7 @@ impl SnapshotRead {
     pub async fn allow_entries(&mut self, list: ListName) -> Result<Vec<AllowEntry>, StoreError> {
         let id = self.id.clone();
         let rows = sqlx::query(
-            "SELECT pubky, written_by, at_ms, code_hash, context, last_used_ms FROM list_entries \
+            "SELECT pubky, written_by, at_ms, code_hash, last_used_ms FROM list_entries \
              WHERE account_id = $1 AND list = $2 ORDER BY pubky",
         )
         .bind(id)
@@ -68,7 +66,6 @@ impl SnapshotRead {
                     written_by: by.map(|by| array(&by, "written_by")).transpose()?,
                     at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
                     code_hash: code.map(|code| array(&code, "code_hash")).transpose()?,
-                    context: row.try_get("context")?,
                     last_used_ms: last.map(|ms| from_db(ms, "last_used_ms")).transpose()?,
                 })
             })

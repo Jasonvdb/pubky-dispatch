@@ -37,6 +37,12 @@ pub(super) enum Appender<'a> {
     OtherApp(&'a AppCert),
 }
 
+#[derive(Clone, Copy)]
+struct Redemption {
+    code_hash: [u8; 32],
+    grants_conversation: bool,
+}
+
 fn temporary() -> ApiError {
     ApiError::unavailable("7.6: a temporary failure")
 }
@@ -131,7 +137,7 @@ impl Service {
             .ok_or_else(|| ApiError::bad_request("7.4.3: apps_version is required"))?;
 
         // Check 2: admission and the listing, for an app of another identity.
-        let mut by_code = None;
+        let mut redemption = None;
         let mut known = None;
         if other {
             // Read from its own column, not the document: a refusal costs the same whether
@@ -141,13 +147,6 @@ impl Service {
                 .await
                 .map_err(|e| store_error(&e))?;
             let standing = self.standing(txn, &sender).await?;
-            let listed =
-                !standing.denied && !removed && (standing.contact || standing.conversation);
-            let invite = if listed {
-                None
-            } else {
-                self.live_invite(txn, invite_code, time_ms).await?
-            };
             // A stranger can't write at all: connect requests admit nobody to the inbox. While
             // admission is staged after a provider loss, a sender it can't otherwise admit,
             // a denied one included, gets `503 staged` and retries (Switch spec 12.6 step 2).
@@ -159,19 +158,20 @@ impl Service {
                     not_admitted()
                 }
             };
-            match admit(standing, removed, invite, false).ok_or_else(refused)? {
-                Admitted::Listed => {}
-                Admitted::InviteCode(code) => {
-                    if !trusted {
-                        return Err(self.refused_without_trusted_time(
-                            "append",
-                            "7.3: an invite code's expiry needs trusted time",
-                        ));
-                    }
-                    by_code = Some(code);
-                }
-                Admitted::ConnectRequests => return Err(refused()),
+            if standing.denied {
+                return Err(refused());
             }
+            let invite = self
+                .live_invite(txn, invite_code, trusted.then_some(time_ms), "append")
+                .await?;
+            if invite_code.is_some() && invite.is_none() {
+                return Err(refused());
+            }
+            let admitted = admit(standing, removed, invite, false).ok_or_else(refused)?;
+            redemption = invite.map(|code_hash| Redemption {
+                code_hash,
+                grants_conversation: matches!(admitted, Admitted::InviteCode(_)),
+            });
             // A removed app is answered like a stranger with no copy held (Switch wire 7.2).
             if removed {
                 return Err(identity_needed(None));
@@ -288,16 +288,23 @@ impl Service {
             ));
         }
 
-        // Check 7: an invite code that admitted the sender is used, atomically with the
-        // append, and the service writes the sender's conversation entry and chains it.
-        let mut context = None;
-        if let Some(code) = by_code {
-            context = Some(
-                self.use_invite(txn, signer, &code, &sender, time_ms)
-                    .await?,
-            );
-        } else if other {
-            txn.note_conversation_used(&sender, time_ms)
+        // Check 7: redemption and delivery commit together (Switch wire 7.4.3).
+        match redemption {
+            Some(Redemption {
+                code_hash,
+                grants_conversation: true,
+            }) => {
+                self.grant_invited_conversation(txn, signer, &code_hash, &sender, time_ms)
+                    .await?;
+            }
+            _ if other => txn
+                .note_conversation_used(&sender, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?,
+            _ => {}
+        }
+        if let Some(invite) = redemption {
+            txn.consume_invite(&invite.code_hash)
                 .await
                 .map_err(|e| store_error(&e))?;
         }
@@ -324,7 +331,7 @@ impl Service {
             envelope,
             envelope_hash,
             targets: &targets,
-            context: context.as_deref(),
+            invite_code_hash: redemption.map(|invite| invite.code_hash),
             answer: &stored,
             quota_bytes,
         })
@@ -474,55 +481,36 @@ impl Service {
         Ok((targets, state.current_app_ids()))
     }
 
-    /// Use the invite code `code`, write the service's conversation entry for `sender` and
-    /// chain its `conversation.add` transition (Switch wire 7.4.3 check 7, 6.5): the code's
-    /// context, as stored. `429 quota_exceeded` (`conversations`) while the list is full.
-    async fn use_invite(
+    /// Create reply admission for a previously unlisted sender (Switch wire 7.4.3).
+    async fn grant_invited_conversation(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         code: &[u8; 32],
         sender: &[u8; 32],
         time_ms: u64,
-    ) -> Result<Vec<u8>, ApiError> {
-        let invite = txn
-            .invites(&[*code])
+    ) -> Result<(), ApiError> {
+        let entries = txn
+            .list_count(ListName::Conversation, &[])
             .await
-            .map_err(|e| store_error(&e))?
-            .into_iter()
-            .next()
-            .ok_or_else(not_admitted)?;
-        let present = !txn
-            .list_entries(ListName::Conversation, &[*sender])
-            .await
-            .map_err(|e| store_error(&e))?
-            .is_empty();
-        if !present {
-            let entries = txn
-                .list_count(ListName::Conversation, &[])
-                .await
-                .map_err(|e| store_error(&e))?;
-            if entries >= self.limits.max_conversations {
-                return Err(ApiError::quota_exceeded(
-                    "conversations",
-                    "6.3: the identity holds its limit of conversation entries",
-                ));
-            }
+            .map_err(|e| store_error(&e))?;
+        if entries >= self.limits.max_conversations {
+            return Err(ApiError::quota_exceeded(
+                "conversations",
+                "6.3: the identity holds its limit of conversation entries",
+            ));
         }
-        // The context as its writer wrote it, which the feed shows with the entry.
-        let context = invite.context_written;
-        txn.use_invite(code, sender, &context, time_ms)
+        txn.grant_invited_conversation(sender, code, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         let transition = ServiceTransition::ConversationAdd {
             pubky: *sender,
             code_hash: *code,
-            context: invite.context,
             at: time_ms,
         };
         self.append_service_transition(txn, signer, &transition, None, time_ms)
             .await?;
-        Ok(context)
+        Ok(())
     }
 }
 

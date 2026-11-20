@@ -411,7 +411,7 @@ In `Protocol::provider_lost`, use the supplied acceptance interval to queue rese
 
 ## Blocking a sender and managing invitations
 
-Use `add_contact`, `remove_contact`, `invite` (add a conversation), `remove_conversation`, `deny` and `undeny` for service admission. `admits` reads the local copy. `allow_list` fetches the service's lists when permitted. Each row in `peers` identifies the peer, whether it was explicitly kept, and its current reply grant when present. The grant identifies the app or invitation that first authorized replies and records its creation time and last use when known. `register_invite_code`, `invite_codes` and `withdraw_invite_code` manage bearer invitations. Share their `uri` only with intended recipients. Keep the invitation's note on the host. A recipient can match the invitation by the hash in its signed feed entry. Use `ask_to_connect`, `connect_requests`, `allow_connect` and `decline_connect` for a request requiring approval.
+Use `add_contact`, `remove_contact`, `invite` (add a conversation), `remove_conversation`, `deny` and `undeny` for service admission. `admits` reads the local copy. `allow_list` fetches the service's lists when permitted. Each row in `peers` identifies the peer, whether it was explicitly kept, and its current reply grant when present. `ReplyOrigin::App` identifies the app that first granted replies. `ReplyOrigin::Invite` carries the hash of the invitation that first granted them. The grant records its creation time and its last use when known. `register_invite_code`, `invite_codes` and `withdraw_invite_code` manage bearer invitations. Share their `uri` only with intended recipients. Keep the invitation's note on the host. A signed feed entry carries the hash of the invitation redeemed for that delivery, if any. Check the signed protocol message for any action it requests. Use `ask_to_connect`, `connect_requests`, `allow_connect` and `decline_connect` for a request requiring approval.
 
 A service deny controls incoming admission. For an immediate outgoing block, call `hold_queued` on the recipient **before** the next delivery call. It holds pending sends, including messages a saved batch may later put in the outbox. Use `held_counterparties` and `release_queued` for a reversible hold. Use `withdraw_queued` to give up outstanding deliveries, including those still in saved batches. Other operations in those batches can still run. For a single message, use the owning protocol's `hold_message`, `held_messages`, `release_message` or `withdraw_message`. None can recall a copy already accepted. Reapply any holds made after a backup before the first post-restore send or flush.
 
@@ -421,8 +421,6 @@ In the receive callback, read `sender_disposition`. A flag records repeated rate
 
 | Case | What happened and what to do |
 |---|---|
-| `WrittenBy::Service` | The service created this conversation on the first append that needed an invitation. Its code hash identifies that original grant. A received message carries the hash redeemed for its own delivery. Check the signed protocol message for any action it requests. |
-| `WrittenBy::App` | The named app wrote this conversation. Use the writer ID for attribution. |
 | `AppEvent::DenyListChangeRefused` | A feed change failed the writer, identity or authority checks. The client ignored it. Keep the previous trusted list and flag that the change was refused. The failed rule and feed position can help diagnose the refusal. |
 
 ## Running several protocols

@@ -287,9 +287,8 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
         Box::pin(sender.send(note(alice.public(), "invited", Some(&invitation.code)))).await?;
     assert!(matches!(first, Delivery::Accepted { .. }));
     let grants = receiver.allow_list().await?.conversations;
-    let [original] = grants.as_slice() else {
-        panic!("expected the guest's conversation grant: {grants:?}")
-    };
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let original = &grants[0];
     assert_eq!(original.pubky, bob.public());
     assert_eq!(original.written_by, WrittenBy::Service);
     assert_eq!(original.code_hash, Some(invitation.code_hash));
@@ -317,9 +316,8 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
     )
     .await?;
     let grants = receiver.allow_list().await?.conversations;
-    let [new] = grants.as_slice() else {
-        panic!("expected one replacement grant: {grants:?}")
-    };
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let new = &grants[0];
     assert_eq!(new.pubky, peer);
     assert_eq!(new.written_by, WrittenBy::App(receiver.app_id()));
     assert_eq!(new.code_hash, None);

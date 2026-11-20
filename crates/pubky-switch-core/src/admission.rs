@@ -67,7 +67,7 @@ impl ReplyGrant {
         let origin = match string(value, "written_by")? {
             "service" => ReplyOrigin::Invite(unb64_array(string(value, "code_hash")?)?),
             app => {
-                if value.get("code_hash").is_some() {
+                if value.get("code_hash").is_some_and(|hash| !hash.is_null()) {
                     return invalid(
                         "Switch wire 7.4.6: an app reply grant cannot carry a code hash",
                     );
@@ -77,7 +77,7 @@ impl ReplyGrant {
         };
         let at = parse_rfc3339(string(value, "at")?)?;
         let last_used = match value.get("last_used") {
-            None => None,
+            None | Some(Value::Null) => None,
             Some(Value::String(time)) => Some(parse_rfc3339(time)?),
             Some(_) => return invalid("Switch wire 7.4.6: expected a last_used time"),
         };

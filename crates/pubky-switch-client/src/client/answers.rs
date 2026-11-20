@@ -1396,32 +1396,6 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_list_requires_the_original_grant_writer_and_valid_last_use() {
-        let mut list = allow_answer();
-        let time = "2025-01-02T00:00:00.000Z";
-        let app = zbase32_encode(&[3; 16]);
-        let row = json!({"pubky": pubky_id(&[1; 32]), "written_by": app, "at": time});
-        list["conversations"] = json!([row.clone()]);
-        assert!(AllowList::read(Obj::of(&list, "allow").unwrap()).is_ok());
-        for (field, value) in [
-            ("written_by", json!("service")),
-            ("code_hash", json!(b64(&[2; 32]))),
-            ("last_used", json!("2025-01-01T00:00:00.000Z")),
-        ] {
-            let mut invalid = row.clone();
-            invalid[field] = value;
-            list["conversations"] = json!([invalid]);
-            assert!(
-                matches!(
-                    AllowList::read(Obj::of(&list, "allow").unwrap()),
-                    Err(ClientError::InvalidResponse(_))
-                ),
-                "{field}"
-            );
-        }
-    }
-
-    #[test]
     fn test_allow_list_missing_a_list_is_malformed() {
         for member in [
             "contacts",

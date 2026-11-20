@@ -358,6 +358,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
 | `push/devices` | the handles of the app's other devices and the push key they are bound to, from the host's device sync, merged into the handles this device sets | the handles |
 | `gone` | the app isn't current any more, or its account is gone, and since when | |
+| `display_read` | one original signed GET reserved for the host display transport, with the account, pinned service, generation, cursor and random receipt ID. The foreground holds own work until this installation receives its terminal outcome. The receipt and its service-health decision are released in the same commit. | |
+| `service_health` | this installation's verified recovery notice and the first time and count of consecutive unanswered own requests. A qualifying notice and its duty commit together. An in-place restore at this service and generation preserves them. A fresh installation reads the service for itself. | |
 | `erasing` | since when every try met an unsigned `404` and no published `identity.json`, the last try counted and how many were | |
 
 - **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed

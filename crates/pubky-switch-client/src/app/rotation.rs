@@ -75,6 +75,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             let current = self
                 .current_n()
                 .ok_or_else(|| AppError::Refused(Refusal::NotNow("no receive key held".into())))?;

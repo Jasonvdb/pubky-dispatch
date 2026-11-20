@@ -783,6 +783,32 @@ impl ScriptedSwitch {
         self.lock().drop_account();
     }
 
+    /// Withhold or reattach the original enrolled account while its mark stays readable.
+    /// The usual account decision and service key answer the wallet in both states.
+    ///
+    /// # Errors
+    ///
+    /// When there is no enrollment to withhold, or another enrollment has since taken its place.
+    pub fn set_account_missing(&self, missing: bool) -> Result<(), crate::testing::ScriptError> {
+        let mut inner = self.lock();
+        if missing && inner.withheld_enrollment.is_none() {
+            let enrollment = inner
+                .enrolled
+                .take()
+                .ok_or_else(|| super::missing("enrolled account"))?;
+            inner.withheld_enrollment = Some(enrollment);
+            inner.wake_held();
+        } else if !missing && inner.withheld_enrollment.is_some() {
+            if inner.enrolled.is_some() {
+                return Err(super::missing(
+                    "original account is no longer the only enrollment",
+                ));
+            }
+            inner.enrolled = inner.withheld_enrollment.take();
+        }
+        Ok(())
+    }
+
     /// The operator retires `generation` for the identity (Switch spec 6.5): one-way.
     pub fn retire(&self, generation: u64) {
         self.lock().marks.retired.insert(generation);

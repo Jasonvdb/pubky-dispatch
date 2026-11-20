@@ -2,8 +2,8 @@
 //!
 //! [`App::feed_wait`] takes a handle with `&self`: an owned [`FeedWait`] with a client of its
 //! own, the position to wait from and the wait's length. Its [`FeedWait::wait`] sends at most
-//! one long-poll read of the feed and says whether there is something to read; it changes
-//! nothing of the app. A host races it against its own events, and calls
+//! one long-poll read of the feed and says whether there is something to read. A verified
+//! own recovery notice goes to the foreground owner before its next action. A host races it against its own events, and calls
 //! [`App::receive`] when it wakes with something to read, so the app stays free for its
 //! other calls while the read is held. [`WaitPace`] paces the host's loop, so a state in
 //! which reads and waits end at once never makes it spin.
@@ -179,9 +179,9 @@ impl FeedWait {
     /// handle taken when no wait can tell anything sends nothing and is
     /// [`Woken::ReadNow`] or [`Woken::ReadLater`] at once ([`App::feed_wait`]).
     ///
-    /// Nothing is parsed into the app's state: no cursor moves, no alarm is raised, no time
-    /// sample is taken and nothing is committed. Dropping the future at any point drops the
-    /// read and leaves nothing behind.
+    /// The handle commits no app state and moves no cursor. The foreground owner receives
+    /// verified recovery evidence in request order before acting. Dropping an unanswered
+    /// future cancels the read.
     pub async fn wait(self) -> Woken {
         Box::pin(async move {
             let held = match self.held {
@@ -277,7 +277,13 @@ impl App {
     }
 
     fn held_wait(&self, seconds: u32) -> Result<Held, Woken> {
-        if self.reload {
+        if self.reload
+            || self
+                .client
+                .own_reads
+                .as_ref()
+                .is_some_and(|reads| reads.first().is_some())
+        {
             return Err(Woken::ReadNow);
         }
         if self.refuse_when_stopped().is_err()
@@ -307,13 +313,7 @@ impl App {
         let upkeep = self
             .read_done_ms
             .is_none_or(|done| ends >= done.saturating_add(UPKEEP_READ_MS));
-        let client = Self::client_for(
-            &self.env,
-            &self.state.meta,
-            &self.state.keys,
-            &self.state.cert,
-        )
-        .map_err(|_| Woken::ReadNow)?;
+        let client = self.own_read_client().map_err(|_| Woken::ReadNow)?;
         Ok(Held {
             client,
             after,

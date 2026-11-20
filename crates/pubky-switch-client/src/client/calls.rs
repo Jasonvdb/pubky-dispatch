@@ -429,8 +429,31 @@ impl SwitchClient {
     /// As every call.
     pub async fn feed(&self, query: FeedQuery) -> Result<FeedPage, ClientError> {
         let checked = self.get(&query.path(), query.timeout()).await?;
+        self.feed_page(&checked)
+    }
+
+    pub(crate) fn display_feed_request(
+        &self,
+        query: &FeedQuery,
+        timestamp_ms: Option<u64>,
+    ) -> Result<Request, ClientError> {
+        Ok(self
+            .build(
+                "GET",
+                &self.path(&query.path()),
+                Vec::new(),
+                Body::Empty,
+                Auth {
+                    timestamp_ms,
+                    ..Auth::new(query.timeout())
+                },
+            )?
+            .request)
+    }
+
+    pub(crate) fn feed_page(&self, checked: &CheckedResponse) -> Result<FeedPage, ClientError> {
         let (value, what) =
-            Self::json_answer(&checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
+            Self::json_answer(checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
         let key = self.key()?;
         let page = FeedPage::read(
             Obj::of(&value, what)?,

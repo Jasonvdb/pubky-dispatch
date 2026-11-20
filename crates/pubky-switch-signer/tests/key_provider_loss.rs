@@ -153,6 +153,8 @@ async fn test_key_provider_loss_new_device_at_a_dead_service() {
     assert_eq!(shown.version, held.version());
     assert_eq!(shown.apps, vec![(app.keys.app_id_bytes(), AppFate::Stays)]);
     assert!(matches!(shown.backup, BackupFound::Stale { .. }));
+    // Re-observe after the first signed observation expired, at the same store and lifetime.
+    world.clock.advance_ms(6 * 60_000);
     let mut signer = Signer::declare_provider_loss_with_key(
         env_on(&world, &store, &router),
         world.keyring(),
@@ -676,6 +678,72 @@ async fn test_key_provider_loss_survey_changed_leaves_the_store_as_found() {
     .unwrap_err();
     assert_eq!(refusal, refused(KeyRecoveryStop::SurveyChanged));
     assert_eq!(stored(&world, &store), found);
+}
+
+async fn rejects_changed_account(store_id: [u8; 16], erased: bool) {
+    // Each service hosts a staged account for the same key, origin and creation.
+    // One has another store ID; the other has a completed erasure in its history.
+    async fn staged(store_id: [u8; 16], erased: bool) -> World {
+        let mut world = World::new();
+        world.switch = ScriptedSwitch::unenrolled_at_in_store(
+            &world.key,
+            SERVICE_SECRET,
+            Arc::clone(&world.clock),
+            SWITCH_ORIGIN,
+            store_id,
+        );
+        world.transport = world.switch.transport();
+        if erased {
+            world.create_staged_account().await;
+            world.create_after_erasure().await;
+        } else {
+            world.clock.advance_ms(1000);
+            world.create_staged_account().await;
+        }
+        world
+    }
+
+    let first = staged([1; 16], false).await;
+    let original = first.signer_client(None).observe_account().await.unwrap();
+    assert_eq!(original.body().created, Some(START_MS + 1000));
+    let host = World::new();
+    host.clock.set_ms(START_MS + 1000);
+    let store = Arc::new(MemoryStore::new());
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &first.switch);
+    let shown = Signer::survey_provider_loss_with_key(
+        env_on(&host, &store, &router),
+        host.keyring(),
+        SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    let next = staged(store_id, erased).await;
+    let observed = next.signer_client(None).observe_account().await.unwrap();
+    let mut expected = original.body().clone();
+    expected.store_id = store_id;
+    expected.erased_at = erased.then_some(START_MS);
+    assert_eq!(observed.body(), &expected);
+    router.add_switch(SWITCH_ORIGIN, &next.switch);
+    let result = Signer::declare_provider_loss_with_key(
+        env_on(&host, &store, &router),
+        host.keyring(),
+        KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), refused(KeyRecoveryStop::SurveyChanged));
+    assert!(router.log().iter().all(|r| !r.ends_with("/enroll")));
+    assert_eq!(stored(&host, &store), (None, None));
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_refuses_a_changed_store() {
+    rejects_changed_account([2; 16], false).await;
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_refuses_a_changed_erasure() {
+    rejects_changed_account([1; 16], true).await;
 }
 
 #[tokio::test]

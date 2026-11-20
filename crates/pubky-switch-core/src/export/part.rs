@@ -2,7 +2,7 @@
 //! members and written in the order the old service writes them.
 //!
 //! Reading follows Switch wire 10.3: every listed member is present, except that one marked
-//! "or `null`" may also be absent, which reads as `null`, and one marked "absent otherwise"
+//! "or `null`" may also be absent unless it is always written. One marked "absent otherwise"
 //! is present only in the case named. Unknown members are ignored, as in every export part
 //! (Switch wire 1.1). Times without a `_ms` or `_s` suffix are
 //! times of Switch wire 1.6. A part that doesn't read is `400 bad_request`; signatures are
@@ -57,7 +57,7 @@ pub struct MetaPart {
 
 /// A `chain` part: one stub the old service keeps, with its document while it keeps that
 /// (Switch wire 10.3).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainPart {
     /// The item's `seq`.
     pub seq: u64,
@@ -67,8 +67,6 @@ pub struct ChainPart {
     pub item_type: ItemType,
     /// The signed document, `None` once the old service dropped it (Switch wire 7.5).
     pub doc: Option<SignedDoc>,
-    /// The invite code context of a service-written conversation entry, else `null`.
-    pub context: Value,
 }
 
 /// A `missed` item's counts (Switch wire 7.5).
@@ -95,7 +93,7 @@ pub struct EntryResult {
 }
 
 /// An `entry` part: one pending inbox entry (Switch wire 10.3).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryPart {
     /// The entry's `seq`.
     pub seq: u64,
@@ -105,8 +103,9 @@ pub struct EntryPart {
     pub cert: SignedDoc,
     /// When the entry was accepted, in Unix milliseconds.
     pub accepted_at_ms: u64,
-    /// The invite code context, or `null`.
-    pub context: Value,
+    /// The hash of the invite code redeemed by this append, if any. Unreadable and missed
+    /// entries carry none.
+    pub invite_code_hash: Option<[u8; 32]>,
     /// The envelope; empty for an unreadable entry.
     pub envelope: Vec<u8>,
     /// The target apps.
@@ -117,6 +116,19 @@ pub struct EntryPart {
     pub unreadable: bool,
     /// The counts of a `missed` item, for one only.
     pub missed: Option<Missed>,
+}
+
+impl EntryPart {
+    fn check_invite_code_hash(&self) -> Result<()> {
+        if self.invite_code_hash.is_some() && (self.unreadable || self.missed.is_some()) {
+            return Err(refuse(
+                "entry",
+                "invite_code_hash",
+                "requires a readable entry",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// An `app` part: one app the service holds, or a purged app's tombstone (Switch wire 10.3,
@@ -323,14 +335,14 @@ pub struct BatchPart {
 }
 
 /// A `conversation` part (Switch wire 10.3).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationPart {
     /// The counterparty's Pubky ID.
     pub pubky: [u8; 32],
     /// Who wrote it.
     pub written_by: Writer,
-    /// When an invite code created it: the code's hash and context.
-    pub invite: Option<([u8; 32], Value)>,
+    /// The hash of the invite code that created the conversation, if any.
+    pub code_hash: Option<[u8; 32]>,
     /// When it was written, in Unix milliseconds.
     pub at: u64,
     /// When the last append it admitted came; absent until one.
@@ -338,7 +350,7 @@ pub struct ConversationPart {
 }
 
 /// An `invite_code` part (Switch wire 10.3).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteCodePart {
     /// The code's hash.
     pub code_hash: [u8; 32],
@@ -349,8 +361,6 @@ pub struct InviteCodePart {
     pub max_uses: u64,
     /// The appends it admitted.
     pub uses: u64,
-    /// Any JSON value, `null` included.
-    pub context: Value,
     /// The App ID that registered it.
     pub written_by: [u8; 16],
 }
@@ -546,8 +556,15 @@ impl<'a> Members<'a> {
             .ok_or_else(|| self.fail(member, "isn't a bool"))
     }
 
+    fn b64n_of<const N: usize>(&self, member: &str, value: &Value) -> Result<[u8; N]> {
+        let text = value
+            .as_str()
+            .ok_or_else(|| self.fail(member, "isn't a string"))?;
+        unb64_array(text).map_err(|_| self.fail(member, "isn't b64 of its size"))
+    }
+
     fn b64n<const N: usize>(&self, member: &str) -> Result<[u8; N]> {
-        unb64_array::<N>(self.str(member)?).map_err(|_| self.fail(member, "isn't b64 of its size"))
+        self.b64n_of(member, self.req(member)?)
     }
 
     fn time(&self, member: &str) -> Result<u64> {
@@ -619,16 +636,6 @@ impl<'a> Members<'a> {
             Some([doc, seq]) => Ok((self.doc_of(member, doc)?, self.int_of(member, seq)?)),
             _ => Err(self.fail(member, "isn't a [document, seq] pair")),
         }
-    }
-
-    /// An opaque member marked "or `null`".
-    fn opaque(&self, member: &str) -> Value {
-        self.value.get(member).cloned().unwrap_or(Value::Null)
-    }
-
-    /// A member that must be present and may hold any JSON value.
-    fn any(&self, member: &str) -> Result<Value> {
-        self.present(member).cloned()
     }
 }
 
@@ -733,7 +740,6 @@ impl Part {
                     .map_err(|_| m.fail("stub", "doesn't read"))?,
                 item_type: item_type(&m)?,
                 doc: m.opt_doc("doc")?,
-                context: m.opaque("context"),
             }),
             "entry" => {
                 let r = m.object("result")?;
@@ -758,12 +764,15 @@ impl Part {
                     Some(text) => unb64(text).map_err(|_| m.fail("envelope", "isn't base64url"))?,
                     None => return Err(m.fail("envelope", "isn't a string")),
                 };
-                Part::Entry(EntryPart {
+                let entry = EntryPart {
                     seq: m.int("seq")?,
                     sender: m.pubky("sender")?,
                     cert: m.doc("cert")?,
                     accepted_at_ms: m.int("accepted_at_ms")?,
-                    context: m.opaque("context"),
+                    invite_code_hash: match m.present("invite_code_hash")? {
+                        Value::Null => None,
+                        v => Some(m.b64n_of("invite_code_hash", v)?),
+                    },
                     envelope,
                     targets,
                     result: EntryResult {
@@ -773,7 +782,9 @@ impl Part {
                     },
                     unreadable: m.bool("unreadable")?,
                     missed,
-                })
+                };
+                entry.check_invite_code_hash()?;
+                Part::Entry(entry)
             }
             "app" => {
                 let receive_keys = m
@@ -920,14 +931,13 @@ impl Part {
                     "service" => Writer::Service,
                     _ => Writer::App(m.app_id("written_by")?),
                 };
-                let invite = match m.nullable("code_hash") {
-                    None => None,
-                    Some(_) => Some((m.b64n::<32>("code_hash")?, m.any("context")?)),
-                };
                 Part::Conversation(ConversationPart {
                     pubky: m.pubky("pubky")?,
                     written_by,
-                    invite,
+                    code_hash: value
+                        .get("code_hash")
+                        .map(|v| m.b64n_of("code_hash", v))
+                        .transpose()?,
                     at: m.time("at")?,
                     last_used: m.opt_time("last_used")?,
                 })
@@ -937,7 +947,6 @@ impl Part {
                 expires_at: m.time("expires_at")?,
                 max_uses: m.int("max_uses")?,
                 uses: m.int("uses")?,
-                context: m.any("context")?,
                 written_by: m.app_id("written_by")?,
             }),
             "connect" => Part::Connect(ConnectPart {
@@ -976,7 +985,7 @@ impl Part {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] if an opaque context can't be written.
+    /// [`Error::Invalid`] if an unreadable or missed entry carries an invite code hash.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let mut o = Obj::new();
         o.str("part", self.kind());
@@ -1004,9 +1013,9 @@ impl Part {
                     .raw("stub", &p.stub.to_json())
                     .str("item_type", p.item_type.as_str());
                 opt_raw(&mut o, "doc", p.doc.as_ref().map(carrying));
-                o.raw("context", &json(&p.context)?);
             }
             Part::Entry(p) => {
+                p.check_invite_code_hash()?;
                 let mut r = Obj::new();
                 r.str("accepted_at", &rfc3339(p.result.accepted_at))
                     .int("directory_version", p.result.directory_version)
@@ -1015,9 +1024,12 @@ impl Part {
                 o.int("seq", p.seq)
                     .str("sender", &pubky_id(&p.sender))
                     .raw("cert", &carrying(&p.cert))
-                    .int("accepted_at_ms", p.accepted_at_ms)
-                    .raw("context", &json(&p.context)?)
-                    .str("envelope", &b64(&p.envelope))
+                    .int("accepted_at_ms", p.accepted_at_ms);
+                match &p.invite_code_hash {
+                    Some(hash) => o.str("invite_code_hash", &b64(hash)),
+                    None => o.null("invite_code_hash"),
+                };
+                o.str("envelope", &b64(&p.envelope))
                     .raw("targets", &string_array(&targets))
                     .raw("result", &r.finish())
                     .raw("unreadable", bool_json(p.unreadable));
@@ -1158,9 +1170,8 @@ impl Part {
                         Writer::Service => "service".to_owned(),
                     },
                 );
-                if let Some((code_hash, context)) = &p.invite {
-                    o.str("code_hash", &b64(code_hash))
-                        .raw("context", &json(context)?);
+                if let Some(code_hash) = &p.code_hash {
+                    o.str("code_hash", &b64(code_hash));
                 }
                 o.str("at", &rfc3339(p.at));
                 if let Some(last_used) = p.last_used {
@@ -1173,7 +1184,6 @@ impl Part {
                     .int("expires_at_ms", p.expires_at)
                     .int("max_uses", p.max_uses)
                     .int("uses", p.uses)
-                    .raw("context", &json(&p.context)?)
                     .str("written_by", &zbase32_encode(&p.written_by));
             }
             Part::Connect(p) => {
@@ -1200,11 +1210,6 @@ impl Part {
         }
         Ok(o.finish())
     }
-}
-
-fn json(value: &Value) -> Result<Vec<u8>> {
-    serde_json::to_vec(value)
-        .map_err(|_| Error::Invalid("Switch wire 10.3: a context can't be written".into()))
 }
 
 fn bool_json(value: bool) -> &'static [u8] {

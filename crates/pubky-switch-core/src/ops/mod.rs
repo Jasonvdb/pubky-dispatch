@@ -41,18 +41,17 @@ pub use batch::{
     sign_batch, unchanged,
 };
 pub use body::{
-    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, InviteContext, KeyBundlePut,
-    MAX_OP_BYTES, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
+    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, KeyBundlePut, MAX_OP_BYTES, OpBody,
+    OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
 };
 pub use bundle_parts::{StoredPart, covers, keys_through, parts_to_drop};
 pub use invite::invite_code_delete;
 pub use limits::{Limits, List, Quota, check_quota};
 pub use proof_state::{StateAfter, proof_state};
 pub use rules::{
-    AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_CONTEXT_BYTES, MAX_INVITE_USES, Need,
-    ReceiveKeyEffect, Writer, check_app_put, check_cert_put, check_invite_code_put,
-    check_key_bundle_put, check_permanent, check_permission, check_receive_key_put, check_shape,
-    is_signer_target,
+    AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_USES, Need, ReceiveKeyEffect, Writer,
+    check_app_put, check_cert_put, check_invite_code_put, check_key_bundle_put, check_permanent,
+    check_permission, check_receive_key_put, check_shape, is_signer_target,
 };
 
 use crate::error::{Error, SizeRefusal};

@@ -14,7 +14,7 @@ use crate::enc::{
 };
 use crate::error::{Error, Result, invalid};
 use crate::ident::{Permanent, Policy};
-use crate::json::{Doc, parse_json_as};
+use crate::json::parse_json;
 use crate::labels;
 use crate::records::KeyBundle;
 use crate::sealed::SealedValue;
@@ -321,54 +321,6 @@ pub struct InviteCodePut {
     pub expires_at: u64,
     /// How many appends the code admits.
     pub max_uses: u64,
-    /// Any JSON: an opaque reference the service stores and shows in the clear, never
-    /// personal data (Switch spec 7, 15).
-    pub context: InviteContext,
-}
-
-/// An invite code's `context` (Switch wire 6.2): any JSON value, with the bytes it takes as
-/// written in the signed body, which its limit measures.
-#[derive(Clone, Debug, PartialEq)]
-pub struct InviteContext {
-    value: Value,
-    written_len: usize,
-    written: Vec<u8>,
-}
-
-impl InviteContext {
-    /// A context as a writer writes it: compact JSON.
-    pub fn new(value: Value) -> Self {
-        let written = serde_json::to_vec(&value).unwrap_or_default();
-        let written_len = if written.is_empty() {
-            usize::MAX
-        } else {
-            written.len()
-        };
-        Self {
-            value,
-            written_len,
-            written,
-        }
-    }
-
-    /// The value.
-    pub fn value(&self) -> &Value {
-        &self.value
-    }
-
-    /// The bytes the value takes within the signed body it was read from, from its first
-    /// byte to its last, whitespace and escapes inside it included; for one made with
-    /// [`InviteContext::new`], its compact form's.
-    pub fn written_len(&self) -> usize {
-        self.written_len
-    }
-
-    /// The bytes the value takes within the signed body it was read from, exactly as
-    /// written, which every reader repeats (Switch wire 1.1); for one made with
-    /// [`InviteContext::new`], its compact form.
-    pub fn written_bytes(&self) -> &[u8] {
-        &self.written
-    }
 }
 
 /// The carrying form of a key bundle inside an operation body (Switch wire 3.5, 6.2):
@@ -489,7 +441,7 @@ fn type_members(op: &str) -> Option<&'static [&'static str]> {
         ],
         "allow.put" | "allow.delete" => &["pubky", "kind"],
         "deny.put" | "deny.delete" => &["pubky"],
-        "invite_code.put" => &["code_hash", "expires_at", "max_uses", "context"],
+        "invite_code.put" => &["code_hash", "expires_at", "max_uses"],
         "invite_code.delete" => &["code_hash"],
         "app.put" | "receive_key.put" => &["record"],
         "key_bundle.put" => &["target_app_id", "bundle", "first_epoch", "last_epoch"],
@@ -562,7 +514,7 @@ impl OpKind {
         )
     }
 
-    fn write(&self, o: &mut Obj) -> Result<()> {
+    fn write(&self, o: &mut Obj) {
         match self {
             OpKind::Claim(fields) => fields.write(o),
             OpKind::RecordPut(put) => {
@@ -600,13 +552,9 @@ impl OpKind {
                 o.str("pubky", &pubky_id(pubky));
             }
             OpKind::InviteCodePut(put) => {
-                let context = serde_json::to_vec(put.context.value()).map_err(|_| {
-                    Error::Invalid("Switch wire 6.2: the invite context can't be written".into())
-                })?;
                 o.str("code_hash", &b64(&put.code_hash))
                     .str("expires_at", &rfc3339(put.expires_at))
-                    .int("max_uses", put.max_uses)
-                    .raw("context", &context);
+                    .int("max_uses", put.max_uses);
             }
             OpKind::InviteCodeDelete { code_hash } => {
                 o.str("code_hash", &b64(code_hash));
@@ -628,7 +576,6 @@ impl OpKind {
                     .raw("cert", &carrying(cert));
             }
         }
-        Ok(())
     }
 
     fn read(op: &str, v: &Value) -> Result<Self> {
@@ -651,17 +598,11 @@ impl OpKind {
             "deny.delete" => OpKind::DenyDelete {
                 pubky: req_pubky(v, "pubky", what)?,
             },
-            "invite_code.put" => {
-                let Some(context) = v.get("context") else {
-                    return invalid("Switch wire 6.2: invite_code.put: context is missing");
-                };
-                OpKind::InviteCodePut(InviteCodePut {
-                    code_hash: req_b64n::<32>(v, "code_hash", what)?,
-                    expires_at: req_time(v, "expires_at", what)?,
-                    max_uses: req_int(v, "max_uses", what)?,
-                    context: InviteContext::new(context.clone()),
-                })
-            }
+            "invite_code.put" => OpKind::InviteCodePut(InviteCodePut {
+                code_hash: req_b64n::<32>(v, "code_hash", what)?,
+                expires_at: req_time(v, "expires_at", what)?,
+                max_uses: req_int(v, "max_uses", what)?,
+            }),
             "invite_code.delete" => OpKind::InviteCodeDelete {
                 code_hash: req_b64n::<32>(v, "code_hash", what)?,
             },
@@ -771,7 +712,7 @@ impl OpBody {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] if the invite context can't be written.
+    /// [`Error::Invalid`] if a condition cannot be written.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let mut o = Obj::new();
         o.str("identity", &pubky_id(&self.identity));
@@ -790,14 +731,13 @@ impl OpBody {
             o.raw("conditions", &array(&conditions));
         }
         o.str("op", self.kind.name());
-        self.kind.write(&mut o)?;
+        self.kind.write(&mut o);
         Ok(o.finish())
     }
 
-    /// Read a body strictly (Switch wire 1.1, 6.1): strict JSON with the integer rule, the
-    /// opaque `context` of `invite_code.put` excepted; no unknown members at any depth; and
-    /// every member of its type decoded. The type's shape rules of Switch wire 6.4 step 9
-    /// come after the caller's permission ([`super::check_shape`]).
+    /// Read a body strictly (Switch wire 1.1, 6.1): strict JSON with the integer rule, no
+    /// unknown members at any depth, and every member of its type decoded. Shape checks
+    /// (Switch wire 6.4 step 9) come after the caller's permission ([`super::check_shape`]).
     ///
     /// # Errors
     ///
@@ -807,7 +747,7 @@ impl OpBody {
     }
 
     fn read(bytes: &[u8]) -> Result<Self> {
-        let v: Value = parse_json_as(bytes, Doc::Op)?;
+        let v: Value = parse_json(bytes)?;
         let what = "an operation";
         let op = req_str(&v, "op", what)?;
         let Some(members) = type_members(op) else {
@@ -833,25 +773,13 @@ impl OpBody {
                 None => return invalid("Switch wire 6.3: conditions isn't an array"),
             },
         };
-        let mut kind = OpKind::read(op, &v)?;
-        // The context's limit counts the bytes as written, never a re-serialization (Switch
-        // wire 6.2).
-        if let OpKind::InviteCodePut(put) = &mut kind {
-            match crate::json::member_span(bytes, "context") {
-                Some(span) => {
-                    put.context.written_len = span.len();
-                    put.context.written = bytes.get(span).unwrap_or_default().to_vec();
-                }
-                None => put.context.written_len = usize::MAX,
-            }
-        }
         Ok(Self {
             identity,
             app_id: app,
             generation,
             batch,
             conditions,
-            kind,
+            kind: OpKind::read(op, &v)?,
         })
     }
 
@@ -1153,7 +1081,6 @@ mod tests {
                 code_hash: [4; 32],
                 expires_at: 1_767_225_600_000,
                 max_uses: 1,
-                context: InviteContext::new(serde_json::json!({"ref": 1.5})),
             }),
             OpKind::InviteCodeDelete { code_hash: [4; 32] },
             OpKind::KeyBundlePut(KeyBundlePut {
@@ -1297,49 +1224,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn test_op_body_invite_context_is_opaque() {
-        let b = body(OpKind::InviteCodePut(InviteCodePut {
-            code_hash: [4; 32],
-            expires_at: 1_767_225_600_000,
-            max_uses: 1,
-            context: InviteContext::new(serde_json::json!({"rate": -2.5, "extra": {"n": 1e30}})),
-        }));
-        assert!(OpBody::parse(&b.to_json().unwrap()).is_ok());
-        // A fraction elsewhere is refused before any field is read.
-        let text = String::from_utf8(body(attempt()).to_json().unwrap())
-            .unwrap()
-            .replace("\"orphan_after\":60", "\"orphan_after\":60.0");
-        assert!(OpBody::parse(text.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn test_op_body_invite_context_keeps_its_written_bytes() {
-        // Opaque numbers that a re-serialization would change come back byte for byte
-        // (Switch wire 1.1), as every reader repeats them.
-        let b = body(OpKind::InviteCodePut(InviteCodePut {
-            code_hash: [4; 32],
-            expires_at: 1_767_225_600_000,
-            max_uses: 1,
-            context: InviteContext::new(serde_json::json!({"rate": -2.5})),
-        }));
-        let written = r#"{"n":12345678901234567890123,"r":1.50}"#;
-        let text = String::from_utf8(b.to_json().unwrap()).unwrap().replace(
-            r#""context":{"rate":-2.5}"#,
-            &format!(r#""context":{written}"#),
-        );
-        assert!(text.contains(written));
-        let parsed = OpBody::parse(text.as_bytes()).unwrap();
-        let OpKind::InviteCodePut(put) = parsed.kind else {
-            panic!("an invite_code.put");
-        };
-        assert_eq!(put.context.written_bytes(), written.as_bytes());
-        assert_eq!(put.context.written_len(), written.len());
-        // One made by a writer holds its compact form.
-        let made = InviteContext::new(serde_json::json!({"a": 1}));
-        assert_eq!(made.written_bytes(), br#"{"a":1}"#);
     }
 
     #[test]

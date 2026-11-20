@@ -470,8 +470,6 @@ pub enum ServiceTransition {
         pubky: [u8; 32],
         /// The code's hash.
         code_hash: [u8; 32],
-        /// The code's opaque context.
-        context: Value,
         /// When.
         at: u64,
     },
@@ -553,12 +551,10 @@ impl ServiceTransition {
             ServiceTransition::ConversationAdd {
                 pubky,
                 code_hash,
-                context,
                 at,
             } => {
                 m.insert("pubky".into(), pubky_id(pubky).into());
                 m.insert("code_hash".into(), b64(code_hash).into());
-                m.insert("context".into(), context.clone());
                 at
             }
         };
@@ -570,7 +566,7 @@ impl ServiceTransition {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] if an opaque member can't be written.
+    /// [`Error::Invalid`] if the transition cannot be serialized.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(&self.to_value())
             .map_err(|_| Error::Invalid("Switch wire 6.5: the transition can't be written".into()))
@@ -628,7 +624,6 @@ impl ServiceTransition {
             "conversation.add" => ServiceTransition::ConversationAdd {
                 pubky: req_pubky(v, "pubky", what)?,
                 code_hash: req_b64n::<32>(v, "code_hash", what)?,
-                context: v.get("context").cloned().unwrap_or(Value::Null),
                 at,
             },
             _ => return invalid("Switch wire 6.5: an unknown service transition type"),
@@ -1959,7 +1954,6 @@ mod tests {
         let add = ServiceTransition::ConversationAdd {
             pubky: identity(),
             code_hash: [2; 32],
-            context: json!({"rate": 1.5}),
             at: START,
         };
         let signed = add.sign(&service(), &identity()).unwrap();

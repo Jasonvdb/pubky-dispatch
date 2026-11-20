@@ -15,7 +15,7 @@ use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::marks::{AccountMark, MarkRead};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
-    chain::{ChainTip, ServiceTransition, SignedHead, ZERO_HASH},
+    chain::{ChainTip, ServiceTransition, SignedHead, TransitionProof, ZERO_HASH},
     claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
@@ -2182,19 +2182,14 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
     let answer = replay.service.handle(request).await;
     assert_eq!(answer.status, 200);
     assert!(signed_by(&answer, &key, &signature));
-    let proof: SignedDoc =
+    let signed: SignedDoc =
         serde_json::from_value(json_of(&answer)["proofs"][0].clone()).expect("proof");
-    let body: Value = serde_json::from_slice(&proof.body_bytes().expect("body")).expect("json");
-    assert_eq!(body["object"], json!("admission"));
-    let expected = assert_service_item(
-        &replay,
-        position.0,
-        position.1 + 1,
-        at,
-        &ServiceTransition::Admission { at },
-    )
-    .await;
-    assert_eq!(body["chain"], expected.to_value());
+    let proof = TransitionProof::verify(&signed, &key, &alice_key().public()).expect("verifies");
+    let transition = ServiceTransition::Admission { at };
+    let expected = assert_service_item(&replay, position.0, position.1 + 1, at, &transition).await;
+    assert_eq!(proof.body().object, "admission");
+    assert_eq!(proof.body().state, transition.to_value());
+    assert_eq!(proof.body().chain, expected);
     replay.db.drop_database().await.expect("drop");
 }
 

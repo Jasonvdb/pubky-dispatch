@@ -393,6 +393,53 @@ async fn test_protocol_inputs_drop_notice_routes_after_payload_deletion() {
 }
 
 #[tokio::test]
+async fn test_ack_events_for_after_a_lost_answer_preserves_the_other_owner() {
+    let inputs = Inputs::new();
+    let mut app = inputs.join().await;
+    let id = inputs.orphan_notice(&mut app).await;
+    let me = app.app_id();
+    drop(app);
+    let store = Arc::new(FaultStore::new(
+        inputs.pair.store.clone(),
+        CommitFault::FailAfter(1),
+    ));
+    let mut app = App::load(
+        inputs.pair.w.env_on(store),
+        inputs.set(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    app.unacknowledged_events().await.unwrap();
+    assert!(matches!(
+        app.ack_events_for("tasks", id).await,
+        Err(AppError::Store(StoreError::Unknown))
+    ));
+    let pending = app.pending_duty_events().await.unwrap();
+    let duty = pending
+        .iter()
+        .find(|duty| duty.event.id() == Some(id))
+        .unwrap();
+    assert_eq!(duty.owners, ["chat"]);
+    app.ack_events_for("tasks", id).await.unwrap();
+    assert!(
+        app.unacknowledged_events_for("tasks")
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.id() != Some(id))
+    );
+    assert!(
+        app.unacknowledged_events_for("chat")
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.id() == Some(id))
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_inputs_exact_ack_commits_only_one_remaining_owner() {
     for after in [false, true] {
         for reload in [false, true] {

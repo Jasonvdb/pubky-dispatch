@@ -4437,6 +4437,49 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
 }
 
 // -------------------------------------------------------------------------------------
+// Protocol-local state
+
+#[tokio::test]
+async fn test_protocol_scan_reads_the_whole_commit_after_its_answer_is_lost() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let (mut app, store) = load_behind(&w, app, StoreFault::FailAfter(1)).await;
+    let rows: Vec<_> = (0..=crate::app::PROTOCOL_SCAN_PAGE)
+        .map(|n| {
+            (
+                format!("entry/{n:03}").into_bytes(),
+                n.to_le_bytes().to_vec(),
+            )
+        })
+        .collect();
+    let writes: Vec<_> = rows
+        .iter()
+        .rev()
+        .map(|(key, value)| LocalWrite::Put {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    assert_eq!(
+        app.protocol_commit("sample", &writes).await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unknown)
+    );
+    assert!(matches!(
+        app.backup().await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+
+    store.fail_scan(b"p/sample/entry/", 1);
+    assert_eq!(
+        app.protocol_scan("sample", b"entry/").await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unavailable)
+    );
+    assert_eq!(app.protocol_scan("sample", b"entry/").await.unwrap(), rows);
+    app.pending_duty_events().await.unwrap();
+    app.backup().await.unwrap();
+}
+
+// -------------------------------------------------------------------------------------
 // Duty events (`events` module, "Duty events")
 
 fn refused_events(events: &[AppEvent], seq: u64) -> Vec<AppEvent> {
@@ -4960,6 +5003,32 @@ async fn test_pending_duty_events_preserve_reports_and_acknowledgement_order() {
             .is_empty()
     );
     assert!(app.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn test_ack_events_after_a_lost_answer_preserves_the_later_duty() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let duties = refuse_next(&w, &mut app).await;
+    let [first, later] = duties.as_slice() else {
+        panic!("{duties:?}");
+    };
+    let id = first.id().unwrap();
+    let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(1)).await;
+    assert_eq!(app.unacknowledged_events().await.unwrap(), duties);
+    assert!(matches!(
+        app.ack_events(id).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+    assert_eq!(
+        crate::app::tests::pending_events(&mut app).await.unwrap(),
+        std::slice::from_ref(later)
+    );
+    app.ack_events(id).await.unwrap();
+    assert_eq!(
+        app.unacknowledged_events().await.unwrap(),
+        std::slice::from_ref(later)
+    );
 }
 
 #[tokio::test]

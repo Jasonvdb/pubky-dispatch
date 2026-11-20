@@ -492,7 +492,7 @@ impl Inner {
         // app stops holding the quota before it is counted (Switch wire 7.4.4).
         self.judge_lagging();
         // A fresh append spends its named code even if admission already existed.
-        let accepted_at = self.now();
+        let accepted_at = self.now().max(self.stamped_ms);
         if let Some(hash) = invite_code_hash {
             if add_conversation {
                 self.service_transition(ServiceTransition::ConversationAdd {
@@ -500,9 +500,11 @@ impl Inner {
                     code_hash: hash,
                     at: accepted_at,
                 })?;
-                self.shared
-                    .service_conversations
-                    .insert(identity, (hash, accepted_at));
+                self.shared.grant_conversation(
+                    identity,
+                    pubky_switch_core::admission::ReplyOrigin::Invite(hash),
+                    accepted_at,
+                );
                 self.shared.connect.retain(|(pubky, _)| *pubky != identity);
             }
             let invite = self.shared.invites.get_mut(&hash).ok_or_else(|| {

@@ -18,7 +18,7 @@ use crate::error::{Error, Result, invalid};
 use crate::labels;
 use crate::ops::read::{opt, req, req_app_id, req_b64n, req_int, req_pubky, req_str, req_time};
 use crate::ops::{BatchRef, RecordVersion, SignedOp};
-use crate::records::Inbox;
+use crate::records::{IdentityDoc, Inbox};
 use crate::shared::ApplicationRef;
 use crate::sig::{self, SignedDoc};
 use crate::signing::Signs;
@@ -913,6 +913,26 @@ impl TransitionProof {
         &self.signed
     }
 
+    /// Whether this verified proof names the delivered document and the identity state
+    /// it establishes (Switch wire 6.5). The caller verifies the service key and account.
+    ///
+    /// # Errors
+    ///
+    /// Returns the decoding error if the signed document's bytes cannot be read.
+    pub fn matches_identity(&self, document: &IdentityDoc) -> Result<bool> {
+        let state = &self.body.state;
+        Ok(self.envelope.item_type == ItemType::Identity
+            && self.envelope.generation == document.generation()
+            && self.envelope.item_hash
+                == item_hash(ItemType::Identity, &document.signed().doc_bytes()?)
+            && self.body.object == "identity"
+            && self.body.step.is_none()
+            && self.body.version == Some(document.version())
+            && state.get("version").and_then(Value::as_u64) == Some(document.version())
+            && state.get("generation").and_then(Value::as_u64) == Some(document.generation())
+            && state.get("data_epoch").and_then(Value::as_u64) == Some(document.data_epoch()))
+    }
+
     /// Read a record proof's exact application and check it against its authenticated stub
     /// and resulting version (Switch wire 6.3, 6.5).
     /// This does not establish a receiving upload's application.
@@ -1575,8 +1595,6 @@ mod tests {
         IdentityKey::from_secret([1; 32]).public()
     }
 
-    /// A chain of items, each a batch of `counts[i]` operations or an identity delivery for
-    /// `None`, at the given times and batch IDs.
     /// A batch's ID and count, or `None` for an identity delivery, and the item's time.
     type Item = (Option<([u8; 16], u64)>, u64);
 
@@ -2106,6 +2124,62 @@ mod tests {
             reloaded.push(&stubs[2]),
             Err(ChainError::Seq { .. })
         ));
+    }
+
+    #[test]
+    fn test_identity_proof_matches_the_delivered_document_state() {
+        use crate::records::{IdentityBody, IdentityPolicy};
+
+        let key = IdentityKey::from_secret([1; 32]);
+        let doc = IdentityDoc::sign(
+            &key,
+            IdentityBody::first(
+                key.public(),
+                [2; 16],
+                Inbox::new(
+                    "https://switch.example",
+                    service().verifying_key().to_bytes(),
+                ),
+                IdentityPolicy::default(),
+            ),
+        )
+        .unwrap();
+        let tip = ChainTip {
+            generation: doc.generation(),
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        };
+        let (stub, _) = tip
+            .append(
+                1,
+                START,
+                ItemType::Identity,
+                item_hash(ItemType::Identity, &doc.signed().doc_bytes().unwrap()),
+                None,
+            )
+            .unwrap();
+        let state = ProofState::Identity {
+            version: doc.version(),
+            generation: doc.generation(),
+            data_epoch: doc.data_epoch(),
+        };
+        let body = ProofBody::new(stub, "identity".into(), &state);
+        let proof = TransitionProof::sign(&service(), &key.public(), body).unwrap();
+        assert!(proof.matches_identity(&doc).unwrap());
+        let mut changed = proof.clone();
+        changed.envelope.generation = doc.generation() + 1;
+        assert!(!changed.matches_identity(&doc).unwrap());
+        for field in ["version", "generation", "data_epoch"] {
+            let mut changed = proof.clone();
+            changed.body.state[field] = Value::Null;
+            assert!(!changed.matches_identity(&doc).unwrap(), "{field}");
+        }
+        let mut changed = proof.clone();
+        changed.body.step = Some(1);
+        assert!(!changed.matches_identity(&doc).unwrap());
+        let mut changed = proof;
+        changed.body.version = Some(doc.version() + 1);
+        assert!(!changed.matches_identity(&doc).unwrap());
     }
 
     #[test]

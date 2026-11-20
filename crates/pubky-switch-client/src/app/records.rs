@@ -451,8 +451,9 @@ pub enum Unopened {
     /// For good: the key is held and the value doesn't open with it. The write was
     /// flagged ([`super::AppEvent::WriteFlagged`]) and isn't tried again.
     DoesNotOpen,
-    /// Not trusted: the protocol's check refused the first write the app read of the
-    /// record, so it holds that write for its version only, flagged
+    /// Not trusted: a check refused the first write the app read of the record,
+    /// but its signature and placement establish a next-write base. It is held for its
+    /// version only, flagged
     /// ([`super::AppEvent::WriteFlagged`]): its next write builds on it (Switch spec 8.2).
     Refused,
 }
@@ -580,6 +581,21 @@ pub struct SharedRecord {
     /// (Switch spec 12.6 step 3). The content is still the current write's, taken by the
     /// usual checks; what to do about the conflict is the protocol's.
     pub divergent: bool,
+}
+
+/// The current record and its application from one checked key read (Switch wire 6.3,
+/// 7.4.9), together with the evidence the app retained for that signed write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordApplication {
+    /// The accepted contents and the version the app established for their signed write.
+    pub record: SharedRecord,
+    /// The record version reported by the current service. After a recovery upload
+    /// this can differ from the version established by the original write's proof.
+    pub installed_version: RecordVersion,
+    /// The exact application of the write at the current service, including its item hash.
+    pub application: ApplicationRef,
+    /// The signed write, its writer certificate and its original proof when held.
+    pub evidence: KeptOp,
 }
 
 /// A signed operation the app keeps as evidence: a `record.put` or a claim entry, its
@@ -1128,7 +1144,7 @@ enum Refused {
         item: [u8; 32],
         reason: String,
         does_not_open: bool,
-        checked: Option<Box<(FollowedWrite, Placement)>>,
+        checked: Option<RefusedVersion>,
     },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
@@ -1137,12 +1153,31 @@ enum Refused {
     /// nobody, but its version is followed, so the app's next write builds on it and puts
     /// back what it trusts, as over a flagged write (Switch spec 8.2). `version` is the one
     /// step 6 checked: a proof's when one gives it, else the view's.
-    Unnamed(Box<(FollowedWrite, Placement)>),
+    Unnamed(Box<(FollowedWrite, Placement, Option<u64>)>),
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
     /// "Accepting a write" step 1). It names the member of the collection.
     Unheld(Collection),
+}
+
+enum RefusedVersion {
+    First(Box<HeldRecord>),
+    Follow(Box<(FollowedWrite, Placement, Option<u64>)>),
+}
+
+impl RefusedVersion {
+    fn follow((mut write, placement): (FollowedWrite, Placement), time: Option<u64>) -> Self {
+        write.named = true;
+        Self::Follow(Box::new((write, placement, time)))
+    }
+
+    fn version(&self) -> WriteVersion {
+        match self {
+            Self::First(held) => held.write_version(),
+            Self::Follow(checked) => checked.0.version,
+        }
+    }
 }
 
 impl Refused {
@@ -1151,17 +1186,14 @@ impl Refused {
         item: [u8; 32],
         reason: &str,
         does_not_open: bool,
-        checked: Option<(FollowedWrite, Placement)>,
+        checked: Option<RefusedVersion>,
     ) -> Self {
         Self::Named {
             writer,
             item,
             reason: reason.to_owned(),
             does_not_open,
-            checked: checked.map(|(mut write, placement)| {
-                write.named = true;
-                Box::new((write, placement))
-            }),
+            checked,
         }
     }
 }
@@ -1329,7 +1361,7 @@ enum Taken {
     Older(ShownWrite),
     /// Older, by an answer current before the write held ([`Order::Overtaken`]).
     Historical(Historical),
-    /// Newer, and refused by the protocol's regression check.
+    /// The current write remains refused by the protocol's regression check.
     Flagged,
 }
 
@@ -1566,7 +1598,7 @@ impl App {
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<(Fetched, Option<ApplicationRef>), AppError> {
+    ) -> Result<(Fetched, Option<(RecordVersion, ApplicationRef)>), AppError> {
         let uploads = self.record_uploads(key, collection).await?;
         let record = match Box::pin(self.record_answer(key, uploads)).await? {
             RecordAnswer::View(record) => record,
@@ -1599,7 +1631,8 @@ impl App {
         let current =
             matches!(record.at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
         Ok(if current && record.covers_uploads {
-            (Fetched::Read(read), Some(record.view.revision))
+            let version = RecordVersion::new(record.view.generation, record.view.version);
+            (Fetched::Read(read), Some((version, record.view.revision)))
         } else {
             (Fetched::Read(WriteRead::Unordered), None)
         })
@@ -1664,8 +1697,8 @@ impl App {
         .await
     }
 
-    /// Read the service's current record and return its accepted contents, exact application
-    /// and signed input together (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
+    /// Read the service's current record, its installed version and its exact application
+    /// alongside the retained signed write (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
     /// read returns no evidence. A divergent or doubtful record keeps its ordinary flags.
     ///
     /// # Errors
@@ -1674,12 +1707,14 @@ impl App {
     pub async fn read_record_application(
         &mut self,
         target: &RecordTarget,
-    ) -> Result<Option<(SharedRecord, ApplicationRef, KeptOp)>, AppError> {
+    ) -> Result<Option<RecordApplication>, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         let key = self.record_key(target)?;
-        let (Fetched::Read(WriteRead::Taken | WriteRead::Equal), Some(application)) =
-            Box::pin(self.fetch_record_application(&key, &target.collection)).await?
+        let (
+            Fetched::Read(WriteRead::Taken | WriteRead::Equal),
+            Some((installed_version, application)),
+        ) = Box::pin(self.fetch_record_application(&key, &target.collection)).await?
         else {
             return Ok(None);
         };
@@ -1690,15 +1725,16 @@ impl App {
             return Ok(None);
         }
         let record = held.shared(&key, self.is_divergent(&key).await?);
-        Ok(Some((
+        Ok(Some(RecordApplication {
             record,
+            installed_version,
             application,
-            KeptOp {
+            evidence: KeptOp {
                 op: held.op,
                 cert: held.cert,
                 proof: held.proof,
             },
-        )))
+        }))
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what
@@ -2949,8 +2985,11 @@ impl App {
                 }
                 let version = checked
                     .as_ref()
-                    .map(|c| c.0.version.version)
+                    .map(RefusedVersion::version)
+                    .filter(|v| v.authenticated)
+                    .map(|v| v.version)
                     .or(evidence.view_version)
+                    .or_else(|| checked.as_ref().map(|c| c.version().version))
                     .unwrap_or(RecordVersion::NONE);
                 self.flag_write(
                     Shown {
@@ -2963,17 +3002,23 @@ impl App {
                     tx,
                 )
                 .await?;
-                if let Some(checked) = checked {
-                    let (write, placement) = *checked;
-                    self.follow_write(&shown_key, write, placement, tx).await?;
-                    if let Some(h) = placement.historical {
-                        return Ok(h.read());
+                match checked {
+                    Some(RefusedVersion::First(first)) => put_held(tx, &shown_key, &first)?,
+                    Some(RefusedVersion::Follow(checked)) => {
+                        let (write, placement, time) = *checked;
+                        self.follow_write(&shown_key, write, placement, time, tx)
+                            .await?;
+                        if let Some(h) = placement.historical {
+                            return Ok(h.read());
+                        }
                     }
+                    None => {}
                 }
             }
             Err(Refused::Unnamed(checked)) => {
-                let (write, placement) = *checked;
-                self.follow_write(&shown_key, write, placement, tx).await?;
+                let (write, placement, time) = *checked;
+                self.follow_write(&shown_key, write, placement, time, tx)
+                    .await?;
                 if let Some(h) = placement.historical {
                     return Ok(h.read());
                 }
@@ -3055,12 +3100,16 @@ impl App {
         key: &[u8; 32],
         mut write: FollowedWrite,
         placement: Placement,
+        time: Option<u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let Some(mut held) = self.read_in::<HeldRecord>(&record_key_of(key), tx).await? else {
             return Ok(());
         };
         let current = placement.at.filter(|_| placement.historical.is_none());
+        if write.applied.item_hash == held.item_hash {
+            write.retain(held.write_version(), held.proof.as_ref());
+        }
         if let Some(f) = held
             .follow
             .as_mut()
@@ -3078,9 +3127,6 @@ impl App {
                 || (matches!(placement.base, Order::Older(_))
                     && write.version.version == held.base_write().0))
         {
-            if write.applied.item_hash == held.item_hash {
-                write.retain(held.write_version(), held.proof.as_ref());
-            }
             if !write.named {
                 self.events.push(AppEvent::WriteNotTaken { key: *key });
             }
@@ -3089,6 +3135,18 @@ impl App {
             held.gone = false;
         } else {
             return Ok(());
+        }
+        // The same operation's stronger evidence belongs to its held metadata too.
+        // Following another write never changes the content's version or proof.
+        if let Some(f) = held
+            .follow
+            .as_ref()
+            .filter(|f| f.applied.item_hash == held.item_hash)
+        {
+            held.version = f.version.version;
+            held.authenticated = f.version.authenticated;
+            held.proof = f.proof.clone();
+            held.written_at_ms = time.or(held.written_at_ms);
         }
         put_held(tx, key, &held)?;
         Ok(())
@@ -3248,16 +3306,71 @@ impl App {
                 };
             checked = Some((write, placement));
         }
-        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(if own {
+        if let Some(reason) = check_shape(put, &collection, &identity) {
+            return Ok(Err(if own {
                 Refused::Ignored
             } else {
-                Refused::named(writer, item_hash, reason, false, checked.clone())
-            }))
-        };
-        if let Some(reason) = check_shape(put, &collection, &identity) {
-            return invalid(reason);
+                Refused::named(
+                    writer,
+                    item_hash,
+                    reason,
+                    false,
+                    checked.map(|checked| RefusedVersion::follow(checked, time)),
+                )
+            }));
         }
+        // Only the signed record at this collection's key and policy can establish a
+        // first next-write base. A named refusal keeps its checked version and signed
+        // evidence, never its value or a seen mark (Switch spec 8.2, 10.3).
+        let refused_version = |cert: &AppCert, does_not_open, doubtful| {
+            let (write, placement) = checked.as_ref()?;
+            let Some(observed) = placement
+                .at
+                .filter(|_| placement.historical.is_none() && held.is_none())
+            else {
+                return Some(RefusedVersion::follow((write.clone(), *placement), time));
+            };
+            let mut followed = write.clone();
+            followed.named = true;
+            Some(RefusedVersion::First(Box::new(HeldRecord {
+                collection: collection.name.clone(),
+                policy: put.policy.clone(),
+                op: evidence.op.clone(),
+                cert: cert.signed().clone(),
+                proof: write.proof.clone(),
+                version: write.version.version,
+                authenticated: write.version.authenticated,
+                expected: write.version.expected_version,
+                written_at_ms: time,
+                writer,
+                item_hash,
+                content: RecordContent::Unreadable(if does_not_open {
+                    Unopened::DoesNotOpen
+                } else {
+                    Unopened::Refused
+                }),
+                doubtful,
+                applied: write.applied,
+                follow: Some(followed),
+                observed,
+                gone: false,
+                live_in: None,
+            })))
+        };
+        let invalid =
+            |reason: &str, cert: &AppCert| -> Result<Result<Accepted, Refused>, AppError> {
+                Ok(Err(if own {
+                    Refused::Ignored
+                } else {
+                    Refused::named(
+                        writer,
+                        item_hash,
+                        reason,
+                        false,
+                        refused_version(cert, false, false),
+                    )
+                }))
+            };
         let collection = Collection::new(&collection.name, put.policy.clone());
         if let Err(refused) = check_permanent(put, body.generation) {
             return Ok(Err(match proven {
@@ -3266,9 +3379,11 @@ impl App {
             }));
         }
         let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(checked.clone().map_or(Refused::Ignored, |w| {
-                Refused::Unnamed(Box::new(w))
-            })))
+            Ok(Err(checked
+                .clone()
+                .map_or(Refused::Ignored, |(write, placement)| {
+                    Refused::Unnamed(Box::new((write, placement, time)))
+                })))
         };
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
@@ -3338,7 +3453,7 @@ impl App {
             if unheld {
                 return unnamed();
             }
-            invalid(reason)
+            invalid(reason, &cert)
         };
         match standing {
             // A removed app's key may be a lost device's (Switch spec 3.1, 12.2 step 3): its
@@ -3383,9 +3498,9 @@ impl App {
         // version is missing or not plausible is ignored, naming no app and followed by
         // nothing. A client loses nothing by it that a service withholding the write couldn't
         // take.
-        let Some((write, placement)) = checked else {
+        if checked.is_none() {
             return Ok(Err(Refused::Ignored));
-        };
+        }
         // Step 7: the content.
         let content = match put
             .value_sealed
@@ -3410,9 +3525,12 @@ impl App {
                     item_hash,
                     "Switch wire 6.2 step 7: the value doesn't open",
                     true,
-                    Some((write, placement)),
+                    refused_version(&cert, true, doubtful),
                 )));
             }
+        };
+        let Some((write, placement)) = checked else {
+            return Ok(Err(Refused::Ignored));
         };
         // A signed successor can be learned at an earlier position, but only an
         // observation covering the upload can release its deletion's service cursor
@@ -3955,7 +4073,7 @@ impl App {
             // A historical read may supply the operation for a held record. A
             // collection that qualifies its mark still needs a covering read.
             if reopened && qualified.is_some() && let Some(h) = placement.historical {
-                self.follow_write(&key, accepted.write, placement, tx).await?;
+                self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                 return Ok(Taken::Historical(h));
             }
             if let Some(held) = held.as_ref().filter(|_| !reopened) {
@@ -4006,16 +4124,20 @@ impl App {
                         return Ok(Taken::Historical(h));
                     }
                     self.observe_readable_record(&key, &upgraded, Some(held), accepted.observation, false, tx).await?;
-                    return Ok(Taken::Equal);
+                    return Ok(if matches!(upgraded.content, RecordContent::Unreadable(Unopened::Refused | Unopened::DoesNotOpen)) {
+                        Taken::Flagged
+                    } else {
+                        Taken::Equal
+                    });
                 }
                 if let Some(h) = placement.historical {
                     // Even an overtaken view can carry a matching proof for a followed item.
-                    self.follow_write(&key, accepted.write, placement, tx).await?;
+                    self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                     return Ok(Taken::Historical(h));
                 }
                 if let Order::Older(write) = placement.content {
                     if accepted.current_at.viewed() && accepted.write.version.version == held.version {
-                        self.follow_write(&key, accepted.write, placement, tx).await?;
+                        self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                     }
                     return Ok(Taken::Older(write));
                 }
@@ -4139,7 +4261,7 @@ impl App {
                     };
                     put_held(tx, &key, &refused)?;
                 } else {
-                    self.follow_write(&key, accepted.write, placement, tx).await?;
+                    self.follow_write(&key, accepted.write, placement, accepted.time, tx).await?;
                 }
                 if name_writer {
                     self.flag_write(shown, accepted.writer, reason, tx).await?;

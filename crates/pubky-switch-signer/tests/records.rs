@@ -307,6 +307,106 @@ async fn test_records_stored_identity_and_certificate_fail_locally() {
 }
 
 #[tokio::test]
+async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned_setup() {
+    use pubky_switch_signer::{Alert, Source};
+
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut first = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    let unsigned = snapshot(&world, &store);
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/v1/enroll".into(),
+        after: 0,
+    });
+    assert!(matches!(first.resume().await, Err(SignerError::Switch(_))));
+    drop(first);
+    let signed = snapshot(&world, &store);
+    let (_serving, _) = world.enrolled().await;
+    let damage_origin =
+        |flow: &mut Value| flow["Enroll"]["origin"] = "https://different.example".into();
+    let damaged = change(&signed, b"flow", damage_origin);
+    let alarm = Alert::Rollback {
+        source: Source::Switch,
+        version: None,
+        generation: None,
+        high_water_version: 1,
+    };
+    for (records, expected) in [
+        (
+            change(&unsigned, b"flow", |flow| {
+                flow["Enroll"]["origin"] = "unreadable".into()
+            }),
+            Refusal::FirstEnrollmentUnavailable.into(),
+        ),
+        (
+            change(&damaged, b"flow", |flow| {
+                flow["Enroll"]["nonce"] = serde_json::to_value([0u8; 16]).unwrap()
+            }),
+            RecordsFault::Damaged("another initial enrollment").into(),
+        ),
+        (
+            change(&damaged, b"state", |state| {
+                state["identity"] = serde_json::to_value([9u8; 32]).unwrap()
+            }),
+            RecordsFault::OtherIdentity.into(),
+        ),
+    ] {
+        assert_confirmed_refusal(&world, &store, &records, expected).await;
+    }
+    let equivocation = Alert::Equivocation {
+        source: Source::Switch,
+        version: 1,
+    };
+    let keep_alarm = |state: &mut Value| {
+        state["alerts"] = serde_json::to_value([&alarm, &equivocation]).unwrap();
+        state["switch_unconfirmed"] = true.into();
+    };
+    replace(&world, &store, &change(&damaged, b"state", keep_alarm));
+    let requests = world.transport.requests().len();
+    let repaired = Box::pin(Signer::restore_over_unusable(
+        world.env(store.clone()),
+        world.keyring(),
+        discard_confirmed(),
+    ))
+    .await
+    .unwrap();
+    assert!(repaired.alerts().contains(&alarm));
+    drop(repaired);
+    let expected = change(&signed, b"state", keep_alarm);
+    for (key, bytes) in expected {
+        let restored = store.get(&namespace(&world), &key).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&restored).unwrap(),
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        );
+    }
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    let before = snapshot(&world, &store);
+    for retained in [&equivocation, &alarm] {
+        assert_eq!(
+            Box::pin(signer.clear_alert(retained)).await,
+            Err(SignerError::Alarm(retained.clone()))
+        );
+    }
+    assert!(before == snapshot(&world, &store));
+    assert_eq!(
+        Box::pin(signer.survey_first_enrollment_restore(SWITCH_ORIGIN))
+            .await
+            .unwrap_err(),
+        SignerError::Alarm(alarm)
+    );
+    assert!(
+        world.transport.requests()[requests..]
+            .iter()
+            .all(|r| r.method == "GET" && r.origin == SWITCH_ORIGIN)
+    );
+}
+
+#[tokio::test]
 async fn test_records_enrollment_and_delivery_copies_fail_before_retry() {
     let world = World::new();
     let store = Arc::new(MemoryStore::new());
@@ -1018,6 +1118,99 @@ async fn test_records_confirmed_restore_preserves_an_intact_flow() {
         Some(60)
     );
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_records_repair_an_alarmed_signers_original_account() {
+    use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+    use pubky_switch_signer::{Alert, SignerStatus, Source};
+
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let request = signer.review(&app.request, &app.auth).unwrap();
+    let approval = signer.approve(request).await.unwrap();
+    let earlier = remote_copies(&world);
+    signer.set_record_max_age(Some(60)).await.unwrap();
+    let current = remote_copies(&world);
+    let install = signer.install_id();
+    world.switch.deliver_identity(&earlier.0).unwrap();
+    let SignerError::Alarm(
+        alarm @ Alert::Rollback {
+            source: Source::Switch,
+            ..
+        },
+    ) = signer.set_record_max_age(Some(61)).await.unwrap_err()
+    else {
+        panic!("expected the signer's switch rollback alarm");
+    };
+    drop(signer);
+
+    let original = snapshot(&world, &store);
+    let damaged = change(&original, b"state", |state| {
+        assert!(state["newest"]["account"].is_object());
+        state["newest"]["account"] = Value::Null;
+    });
+    assert_confirmed_refusal(&world, &store, &damaged, SignerError::Alarm(alarm.clone())).await;
+    world.switch.deliver_identity(&current.0).unwrap();
+    world.homeserver.set(SIGNER_BACKUP_PATH, earlier.1);
+    assert_confirmed_refusal(&world, &store, &damaged, SignerError::Alarm(alarm.clone())).await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    assert_confirmed_refusal(
+        &world,
+        &store,
+        &damaged,
+        SignerError::Refused(Refusal::NoBackup),
+    )
+    .await;
+    world.homeserver.set(SIGNER_BACKUP_PATH, current.1);
+    let other_creation = change(&damaged, b"state", |state| {
+        let created = state["service"]["created"].as_u64().unwrap();
+        state["service"]["created"] = Value::from(created + 1);
+    });
+    assert_confirmed_refusal(
+        &world,
+        &store,
+        &other_creation,
+        SignerError::Alarm(alarm.clone()),
+    )
+    .await;
+    replace(&world, &store, &damaged);
+    let sent = world.transport.requests().len();
+    let signer = Signer::restore_over_unusable(
+        world.env(store.clone()),
+        world.keyring(),
+        discard_confirmed(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot(&world, &store), original);
+    assert!(
+        world.transport.requests()[sent..]
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(signer.install_id(), install);
+    assert_eq!(signer.status(), SignerStatus::Alarm);
+    assert_eq!(
+        signer.set_record_max_age(Some(61)).await.unwrap_err(),
+        SignerError::Alarm(alarm.clone())
+    );
+    signer.clear_alert(&alarm).await.unwrap();
+    assert!(signer.approved(&approval.request).unwrap() == Some(approval));
+    let next = signer.set_record_max_age(Some(61)).await.unwrap();
+    assert_eq!(next.version(), current.0.version() + 1);
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+    assert_eq!(world.backup().identity_doc().signed(), next.signed());
 }
 
 #[tokio::test]

@@ -6,9 +6,10 @@
 //! item's proof, stay signed documents here; documents of the account's own identity that
 //! the client can check alone are verified into the core's types.
 
+use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
 use pubky_switch_core::chain::{ItemType, SignedHead, Stub, TransitionProof};
 use pubky_switch_core::claims::ClaimView;
-use pubky_switch_core::enc::{app_id_decode, b64, pubky_id};
+use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::ops::Position;
 use pubky_switch_core::records::{
     AppRecord, Freeze, IdentityDoc, KeyBundle, ReceiveKeyRecord, SignerHandover,
@@ -372,11 +373,11 @@ pub enum WrittenBy {
 pub struct Conversation {
     /// The counterparty.
     pub pubky: [u8; 32],
-    /// Who wrote it.
+    /// The app or service that first created this uninterrupted conversation entry.
     pub written_by: WrittenBy,
     /// The hash of the invite code that created it.
     pub code_hash: Option<[u8; 32]>,
-    /// When it was written, in Unix milliseconds.
+    /// When the current entry was created, in Unix milliseconds. Repeating a grant preserves it.
     pub at: u64,
     /// The service time of the last append it admitted.
     pub last_used: Option<u64>,
@@ -425,25 +426,21 @@ impl AllowList {
     /// Every list is required (Switch wire 7.4.6): an answer missing one is malformed, so
     /// a missing `flagged` never reads as no flagged sender.
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
-        let conversations = o
-            .required_objects("conversations")?
-            .into_iter()
-            .map(|c| {
-                let written_by = match c.str("written_by")? {
-                    "service" => WrittenBy::Service,
-                    app => WrittenBy::App(app_id_decode(app).map_err(|_| {
-                        bad("Switch wire 7.4.6: a conversation's written_by doesn't read")
-                    })?),
-                };
-                Ok(Conversation {
-                    pubky: c.pubky("pubky")?,
-                    written_by,
-                    code_hash: c.opt_b64n("code_hash")?,
-                    at: c.time("at")?,
-                    last_used: c.opt_time("last_used")?,
-                })
+        let conversations = o.required_each("conversations", |value| {
+            let pubky = read::pubky(value.get("pubky")?)?;
+            let grant = ReplyGrant::from_value(value).ok()?;
+            let (written_by, code_hash) = match grant.origin {
+                ReplyOrigin::App(app) => (WrittenBy::App(app), None),
+                ReplyOrigin::Invite(hash) => (WrittenBy::Service, Some(hash)),
+            };
+            Some(Conversation {
+                pubky,
+                written_by,
+                code_hash,
+                at: grant.at,
+                last_used: grant.last_used,
             })
-            .collect::<Result<_, ClientError>>()?;
+        })?;
         let flagged = o
             .required_objects("flagged")?
             .into_iter()

@@ -1,5 +1,4 @@
-//! `GET /v1/{id}/claims/{claim_key}` (Switch wire 7.4.8), `POST /v1/{id}/apps/{app_id}/revoke`
-//! (7.4.12) and the deletion of claims whose time has passed (7.3 step 4).
+//! Claim reads (Switch wire 7.4.8), app revocation and voluntary departure (7.4.12).
 
 use pubky_switch_core::{
     chain::{ProofBody, ProofState, ServiceTransition},

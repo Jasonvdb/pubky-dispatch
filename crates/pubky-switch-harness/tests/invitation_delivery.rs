@@ -17,6 +17,7 @@ use serde_json::json;
 
 const ORIGIN: &str = "https://switch.example";
 const MANAGE: &str = "notes_manage";
+const PRUNE: &str = "notes_prune";
 const HOUR_MS: u64 = 3_600_000;
 
 struct Invitations;
@@ -27,7 +28,11 @@ impl Protocol for Invitations {
     }
 
     fn scopes(&self) -> Vec<ScopeDef> {
-        vec![ScopeDef::keyed(NOTES), ScopeDef::unkeyed(MANAGE)]
+        vec![
+            ScopeDef::keyed(NOTES),
+            ScopeDef::unkeyed(MANAGE),
+            ScopeDef::unkeyed(PRUNE),
+        ]
     }
 
     fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
@@ -35,7 +40,13 @@ impl Protocol for Invitations {
     }
 
     fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
-        if scopes.contains(&MANAGE) {
+        if scopes.contains(&PRUNE) {
+            vec![
+                Permission::ListsRead,
+                Permission::ListsManage,
+                Permission::ConversationAdd,
+            ]
+        } else if scopes.contains(&MANAGE) {
             vec![Permission::ListsRead, Permission::ConversationAdd]
         } else {
             Vec::new()
@@ -253,4 +264,79 @@ async fn test_invitation_receipts_reach_sibling_and_restored_creator_on_both_bac
             );
         }
     }
+}
+
+async fn conversation_grant_history(world: &World) -> FlowResult {
+    use pubky_switch_client::app::OpBatch;
+    use pubky_switch_client::client::answers::WrittenBy;
+    use pubky_switch_core::ops::{AllowKind, OpKind};
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
+    world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+    let mut owner = Box::pin(enroll(world, &alice)).await;
+    let mut guest = Box::pin(enroll(world, &bob)).await;
+    let (mut receiver, _) =
+        Box::pin(join(world, &alice, &mut owner, "receiver", &[NOTES, PRUNE])).await;
+    let (mut sender, _) = Box::pin(join(world, &bob, &mut guest, "sender", &[NOTES])).await;
+    let invitation = receiver
+        .register_invite_code(world.now_ms() + HOUR_MS, 1)
+        .await?;
+    world.advance_ms(1_000);
+    let granted_at = world.now_ms();
+    let (_, first) =
+        Box::pin(sender.send(note(alice.public(), "invited", Some(&invitation.code)))).await?;
+    assert!(matches!(first, Delivery::Accepted { .. }));
+    let grants = receiver.allow_list().await?.conversations;
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let original = &grants[0];
+    assert_eq!(original.pubky, bob.public());
+    assert_eq!(original.written_by, WrittenBy::Service);
+    assert_eq!(original.code_hash, Some(invitation.code_hash));
+    assert_eq!(original.at, granted_at);
+    assert_eq!(original.last_used, None);
+
+    world.advance_ms(1_000);
+    let (_, second) = Box::pin(sender.send(note(alice.public(), "ordinary", None))).await?;
+    assert!(matches!(second, Delivery::Accepted { .. }));
+    let mut used = original.clone();
+    used.last_used = Some(world.now_ms());
+    assert_eq!(receiver.allow_list().await?.conversations, [used.clone()]);
+    world.advance_ms(1_000);
+    Box::pin(receiver.invite(&bob.public())).await?;
+    assert_eq!(receiver.allow_list().await?.conversations, [used]);
+
+    let peer = bob.public();
+    let kind = AllowKind::Conversation;
+    Box::pin(
+        receiver.submit_batch(
+            OpBatch::new()
+                .op(OpKind::AllowDelete { pubky: peer, kind })
+                .op(OpKind::AllowPut { pubky: peer, kind }),
+        ),
+    )
+    .await?;
+    let grants = receiver.allow_list().await?.conversations;
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let new = &grants[0];
+    assert_eq!(new.pubky, peer);
+    assert_eq!(new.written_by, WrittenBy::App(receiver.app_id()));
+    assert_eq!(new.code_hash, None);
+    assert_eq!(new.at, world.now_ms());
+    assert_eq!(new.last_used, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conversation_grant_history_scripted() {
+    run_here(Backend::Scripted, conversation_grant_history)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_conversation_grant_history_service() {
+    run_here(Backend::Service, conversation_grant_history)
+        .await
+        .unwrap();
 }

@@ -2,6 +2,8 @@
 
 Embed `App` to act for one approved app of an identity. The signer approves the app and can later renew or revoke it. The client holds the app's keys, checks signed documents and service answers, follows the feed and saves work across restarts. The host supplies the user interface, storage, clock, network and the rules of each protocol. It chooses how to present events and which diagnostic details to show. For the other side of approval, see the [signer host guide](signer-host-guide.md).
 
+The [Rust host example](../crates/pubky-switch-client/examples/app_host.rs) joins an approved app, reopens it from its saved App ID and handles one foreground wake. Build it with `cargo build -p pubky-switch-client --example app_host`. Supply your platform's storage, clock, network and registered protocol. On a wake, handle the reported next action and acknowledge each duty after saving the work it requires.
+
 ## Joining an identity
 
 - Supply an `AppEnv` with a `StoreHandle`, a millisecond Unix `Clock`, a `Transport` and a `HomeserverReader`. Return a missing file only for an actual absence. A timeout, denied read or malformed reply is a failure. For a publishing app, set `AppConfig::publishes_record` and supply a `HomeserverWriter`. Report success only once a put took effect or the deleted file is absent.
@@ -185,6 +187,8 @@ When a decision needs every current record of a registered collection, pass the 
 
 A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings. After recovery uploads, an older page leaves the listing at the same continuation. A fresh lookup for an outstanding upload returns `KeptReason::Refused` if the service observation cannot establish its current state.
 
+Use `App::read_record_application` to bind accepted contents and their signed write to one current service read. Its `installed_version` and `application` come from that answer. After a recovery upload, the installed version can differ from `record.version` established by the retained proof, and the application can name the upload at a later generation. Check the record's doubt and divergence flags before acting.
+
 | Case | What happened and what to do |
 |---|---|
 | `PolicyFamily::Fixed` | Only the collection's declared policy is a member. Use that policy for its records. |
@@ -277,6 +281,8 @@ Keep the local batch ID returned in `AppError::Kept`. Look it up with `kept_batc
 ## Publishing the app's own record and rotating keys
 
 Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member and expiry ask under that certificate; the default keeps both, so a protocol whose member depends on its scopes overrides it, and must not panic. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
+
+Use `set_protocol_member_with_expiry` to set a registered protocol's member and explicit expiry together, including an expiry change to an unchanged member. After reopening, `protocol_record` returns that owner's desired member, expiry and whether an unsigned member edit is pending. Use the publication result below when showing the status of the public copy.
 
 | Case | What happened and what to do |
 |---|---|
@@ -374,7 +380,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `RecoveryStep::Lists` | The app is restoring the contact and deny lists its certificate lets it manage. |
 | `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
 | `RecoveryStep::Conversations` | The app is restoring conversation entries at the replacement service. |
-| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and payment evidence before ending reconciliation. |
+| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and the evidence required by the protocol before ending reconciliation. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
 | `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |

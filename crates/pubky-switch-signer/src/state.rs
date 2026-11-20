@@ -948,6 +948,34 @@ pub(crate) enum Flow {
 }
 
 impl Flow {
+    /// Check the complete original creation against an independently selected origin.
+    pub(crate) fn first_creation_at(
+        &self,
+        identity: &[u8; 32],
+        expected_origin: &str,
+    ) -> Result<Option<Enrollment>> {
+        let Self::Enroll {
+            enrollment: Some(signed),
+            nonce,
+            policy,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let enrollment = Enrollment::verify(signed, identity, expected_origin)
+            .map_err(SignerError::StoredData)?;
+        if enrollment.body().nonce != *nonce
+            || enrollment.body().policy != *policy
+            || enrollment.body().identity_doc.is_some()
+            || !enrollment.revoked_apps().is_empty()
+            || !matches!(enrollment.body().intent, EnrollmentIntent::Create { .. })
+        {
+            return Err(RecordsFault::Damaged("another initial enrollment").into());
+        }
+        Ok(Some(enrollment))
+    }
+
     /// The chosen service where first setup stopped before signing any enrollment.
     pub(crate) fn first_account_origin(&self) -> Option<&str> {
         match self {
@@ -974,25 +1002,11 @@ impl Flow {
 
     pub(crate) fn check_copies(&self, identity: &[u8; 32]) -> Result<()> {
         match self {
-            Self::Enroll {
-                origin,
-                nonce,
-                enrollment,
-                policy,
-            } => {
+            Self::Enroll { origin, .. } => {
                 if !pubky_switch_core::records::is_origin(origin) {
-                    return Err(RecordsFault::Invariant("invalid enrollment origin").into());
+                    return Err(RecordsFault::Damaged("invalid enrollment origin").into());
                 }
-                if let Some(signed) = enrollment {
-                    let enrollment = Enrollment::verify(signed, identity, origin)
-                        .map_err(SignerError::StoredData)?;
-                    if enrollment.body().nonce != *nonce
-                        || enrollment.body().policy != *policy
-                        || !matches!(enrollment.body().intent, EnrollmentIntent::Create { .. })
-                    {
-                        return Err(RecordsFault::Invariant("another initial enrollment").into());
-                    }
-                }
+                self.first_creation_at(identity, origin)?;
             }
             Self::FirstAccountPresent {
                 origin,

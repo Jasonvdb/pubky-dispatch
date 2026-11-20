@@ -1931,10 +1931,9 @@ impl Service {
 
     /// Authenticate the caller of a call the signer or an own app makes, as far as needs no
     /// account state (Switch wire 7.2 Order): the network source's failed-authentication
-    /// limit, the headers and the timestamp, and the signer's signature. An own app's
-    /// signature is verified under the lock, with the key the account holds for it; an app
-    /// of another identity is `403 not_admitted` (Switch wire 6.4 step 1), unless the call
-    /// takes `others`.
+    /// limit, the headers and the timestamp, and the signer's signature. The caller of this helper verifies an own app
+    /// before taking the account lock. The locked dispatch checks the app's current standing.
+    /// Other apps follow the certificate and endpoint checks in `other_app_before_lock`.
     fn authenticate_caller(
         &self,
         account: &str,
@@ -1999,8 +1998,9 @@ impl Service {
         Err(rules::other_app_refusal(call))
     }
 
-    /// Decode and verify a request's signature (Switch wire 7.2): the signer's with the
-    /// identity key. An own app's is verified under the lock, by the endpoint.
+    /// Decode the caller and verify signer requests with the identity key (Switch wire 7.2).
+    /// Own-app requests use the signing key in the stored or first-call app record.
+    /// Requests from another identity's app use the key in its supplied certificate.
     fn authenticate(
         &self,
         account: &[u8; 32],

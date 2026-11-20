@@ -59,7 +59,7 @@ The API listener.
 
 A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `POST`, `GET` and `DELETE /v1/{id}/connect`; `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations receive webhooks for notifying entries and for connect requests when the account enables them. The freeze, the export and the import (the cooperative move) are answered `503 unavailable` until they land. `GET /v1/{id}/apps` fills `recovery` once the account has recovered from a provider loss. The sweeps of Switch wire 9.1 run once a minute at a request to the account, with one part not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move).
+Account and app endpoints include `GET /v1/{id}/account` and `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `POST`, `GET` and `DELETE /v1/{id}/connect`; `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations receive webhooks for notifying entries and for connect requests when the account enables them. The freeze, the export and the import (the cooperative move) are answered `503 unavailable` until they land. `GET /v1/{id}/apps` fills `recovery` once the account has recovered from a provider loss. The sweeps of Switch wire 9.1 run once a minute at a request to the account, with one part not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move).
 
 ### `[log]`
 
@@ -385,6 +385,9 @@ It reads the configuration file as the service does (it needs `server.origin`, `
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `pubky_switch_http_requests_total{call,status}` | counter | requests handled, by call and HTTP status |
+| `pubky_switch_http_request_seconds{call}` | histogram | time to handle a request, in seconds |
+| `pubky_switch_push_webhooks_total{result}` | counter | completed webhook attempts, by delivery or failure outcome |
 | `pubky_switch_build_info{version}` | gauge | always 1 |
 | `pubky_switch_trusted_time_available` | gauge | 1 with trusted time, 0 without |
 | `pubky_switch_trusted_time_uncertainty_ms` | gauge | the uncertainty of trusted time |

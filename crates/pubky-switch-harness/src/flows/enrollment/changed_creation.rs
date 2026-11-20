@@ -6,7 +6,8 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::store::{StateStore, WriteBatch};
 use pubky_switch_core::records::SIGNER_BACKUP_PATH;
 use pubky_switch_signer::{
-    BackupFound, KeyRecoveryStop, Refusal, SignerError, SignerStatus, UserConfirmed,
+    Alert, BackupFound, KeyRecoveryConfirmed, KeyRecoveryStop, Refusal, SignerEnv, SignerError,
+    SignerStatus, Source, UserConfirmed,
 };
 
 /// The selected recovery has gained only its bound enrollment answer. A changed survey
@@ -48,6 +49,281 @@ async fn test_restore_changed_first_creation_scripted() {
 #[tokio::test]
 async fn test_restore_changed_first_creation_service() {
     check_changed_creation(Backend::Service).await;
+}
+
+#[tokio::test]
+async fn test_repair_first_enrollment_origin_scripted() {
+    check_repaired_origin(Backend::Scripted).await;
+}
+
+#[tokio::test]
+async fn test_repair_first_enrollment_origin_service() {
+    check_repaired_origin(Backend::Service).await;
+}
+
+async fn check_repaired_origin(backend: Backend) {
+    for retained_alarm in [false, true] {
+        let result = Box::pin(crate::run_here(backend, async |world: &World| {
+            Box::pin(repair_first_origin(world, retained_alarm)).await
+        }))
+        .await;
+        assert!(result.is_ok(), "alarm {retained_alarm}: {result:?}");
+        if backend == Backend::Scripted {
+            assert!(result.unwrap().is_some());
+        }
+    }
+}
+
+async fn repair_first_origin(world: &World, retained_alarm: bool) -> FlowResult {
+    use pubky_switch_signer::{RecordsDiscarded, RecordsFault};
+    let alice = world.identity("alice")?;
+    let id = alice.public();
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let key = || world.keyring(&alice);
+    let mut signer = Box::pin(Signer::create(env.clone(), key()?, ORIGIN)).await?;
+    let install = signer.install_id();
+    world.unreachable("POST", "/v1/enroll");
+    assert!(matches!(
+        Box::pin(signer.resume()).await,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    let mut other = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let earlier = world
+        .files()
+        .file(id, SIGNER_BACKUP_PATH)
+        .ok_or("missing backup")?;
+    let serving = Box::pin(other.set_record_max_age(Some(3600))).await?;
+    let current = world
+        .files()
+        .file(id, SIGNER_BACKUP_PATH)
+        .ok_or("missing current backup")?;
+    assert!(matches!(
+        Box::pin(signer.resume()).await,
+        Err(SignerError::Switch(_))
+    ));
+    assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
+    let mut alerts = signer.alerts().to_vec();
+    drop(signer);
+    let ns = pubky_switch_signer::state::signer_namespace(&id);
+    let mut state = store.get(&ns, b"state")?.ok_or("missing state")?;
+    let original = store.get(&ns, b"flow")?.ok_or("missing creation")?;
+    let mut damaged: serde_json::Value = serde_json::from_slice(&original)?;
+    *damaged
+        .pointer_mut("/Enroll/origin")
+        .ok_or("missing origin")? = "unreadable".into();
+    let damaged = serde_json::to_vec(&damaged)?;
+    let mut write = WriteBatch::new();
+    let alarm = Alert::Rollback {
+        source: Source::Switch,
+        version: None,
+        generation: None,
+        high_water_version: serving.version(),
+    };
+    if retained_alarm {
+        alerts.push(alarm.clone());
+        let mut held: serde_json::Value = serde_json::from_slice(&state)?;
+        held["alerts"] = serde_json::to_value(&alerts)?;
+        held["switch_unconfirmed"] = true.into();
+        state = serde_json::to_vec(&held)?;
+        write.put(&ns, b"state", state.clone())?;
+    }
+    write.put(&ns, b"flow", damaged.clone())?;
+    store.commit(write)?;
+    let before = world.enrollments_sent();
+    let confirm = RecordsDiscarded::shown_and_confirmed;
+    let diagnosis = Box::pin(Signer::open(env.clone(), key()?))
+        .await
+        .unwrap_err();
+    let start = world.trace().lines.len();
+    for (backup, refusal) in [
+        (None, Refusal::NoBackup),
+        (Some(earlier), Refusal::StaleBackup),
+    ] {
+        if let Some(bytes) = backup {
+            world.files().put(id, SIGNER_BACKUP_PATH, bytes);
+        } else {
+            world.files().remove(id, SIGNER_BACKUP_PATH);
+        }
+        assert_eq!(
+            Box::pin(Signer::restore_over_unusable(
+                env.clone(),
+                key()?,
+                confirm()
+            ))
+            .await
+            .unwrap_err(),
+            refusal.into()
+        );
+        assert_eq!(store.get(&ns, b"state")?.as_ref(), Some(&state));
+        assert_eq!(store.get(&ns, b"flow")?.as_ref(), Some(&damaged));
+        assert_eq!(world.enrollments_sent(), before);
+    }
+    world.files().put(id, SIGNER_BACKUP_PATH, current);
+    let repaired = Box::pin(Signer::restore_over_unusable(
+        env.clone(),
+        key()?,
+        confirm(),
+    ))
+    .await?;
+    assert!(matches!(
+        diagnosis,
+        SignerError::Records(RecordsFault::Damaged(_))
+    ));
+    assert_eq!(repaired.install_id(), install);
+    assert_eq!(repaired.identity(), id);
+    assert_eq!(repaired.alerts(), alerts);
+    let restored_state = store.get(&ns, b"state")?.ok_or("missing repaired state")?;
+    if retained_alarm {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&restored_state)?,
+            serde_json::from_slice::<serde_json::Value>(&state)?
+        );
+    } else {
+        assert_eq!(restored_state, state);
+    }
+    assert_eq!(store.get(&ns, b"flow")?, Some(original));
+    drop(repaired);
+    if retained_alarm {
+        return Box::pin(resolve_first_alarm(
+            world, &alice, env, &store, &alarm, &serving,
+        ))
+        .await;
+    }
+    let mut signer = Box::pin(Signer::open(env, key()?)).await?;
+    assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
+    let shown = Box::pin(signer.survey_first_enrollment_restore(ORIGIN)).await?;
+    assert_eq!(shown.identity_doc.signed(), serving.signed());
+    assert_eq!(world.enrollments_sent(), before);
+    assert!(
+        world.trace().lines[start..]
+            .iter()
+            .all(|line| line.call != Some("enroll"))
+    );
+    Box::pin(signer.restore_first_enrollment(&shown, &[], UserConfirmed::shown_and_confirmed()))
+        .await?;
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    let next = Box::pin(signer.set_record_max_age(Some(7200))).await?;
+    assert_eq!(next.body().signer, install);
+    assert_eq!(next.generation(), serving.generation());
+    assert_eq!(next.version(), serving.version() + 2);
+    assert_eq!(world.enrollments_sent(), before);
+    Ok(())
+}
+
+async fn resolve_first_alarm(
+    world: &World,
+    identity: &super::TestIdentity,
+    env: SignerEnv,
+    store: &MemoryStore,
+    alarm: &Alert,
+    serving: &IdentityDoc,
+) -> FlowResult {
+    use pubky_switch_client::testing::Router;
+    const REPLACEMENT: &str = "https://recovery.example";
+    let key = || world.keyring(identity);
+    let ns = pubky_switch_signer::state::signer_namespace(&identity.public());
+    let held = store.scan(&ns, b"", None, 64)?;
+    let before = world.enrollments_sent();
+    let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
+    let install = signer.install_id();
+    let first_hold = Alert::FirstEnrollmentHeld {
+        reason: pubky_switch_signer::FirstEnrollmentStop::Changed,
+    };
+    assert!(signer.alerts().contains(&first_hold));
+    let acknowledged = Box::pin(signer.clear_alert(alarm)).await;
+    drop(signer);
+    let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
+    let survey = Box::pin(signer.survey_first_enrollment_restore(ORIGIN)).await;
+    let expected = SignerError::Alarm(alarm.clone());
+    assert_eq!(
+        (acknowledged, signer.alerts().contains(alarm), survey.err()),
+        (Err(expected.clone()), true, Some(expected))
+    );
+    assert_eq!(store.scan(&ns, b"", None, 64)?, held);
+    drop(signer);
+
+    world.add_switch(REPLACEMENT, &[identity]).await?;
+    let shown = Box::pin(Signer::survey_provider_loss_with_key(
+        env.clone(),
+        key()?,
+        REPLACEMENT,
+    ))
+    .await?;
+    assert_eq!(
+        (shown.generation, shown.version),
+        (serving.generation(), serving.version())
+    );
+    let confirm = || KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]);
+    let mut offline = env.clone();
+    offline.transport = Arc::new(Router::new());
+    let refused = Box::pin(Signer::declare_provider_loss_with_key(
+        offline,
+        key()?,
+        confirm(),
+    ))
+    .await;
+    assert!(
+        matches!(refused, Err(SignerError::Switch(ClientError::Transport(_)))),
+        "{refused:?}"
+    );
+    let reopened = Box::pin(Signer::open(env.clone(), key()?)).await?;
+    assert!(reopened.alerts().contains(alarm));
+    assert!(reopened.alerts().contains(&first_hold));
+    assert_eq!(store.scan(&ns, b"", None, 64)?, held);
+    assert_eq!(world.enrollments_sent(), before);
+    drop(reopened);
+
+    world.lose_answer("POST", "/v1/enroll");
+    let unanswered = Box::pin(Signer::declare_provider_loss_with_key(
+        env.clone(),
+        key()?,
+        confirm(),
+    ))
+    .await;
+    assert!(matches!(
+        unanswered,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    let mut recovered = Box::pin(Signer::open(env, key()?)).await?;
+    assert_eq!(
+        recovered.status(),
+        SignerStatus::Recovering {
+            origin: REPLACEMENT.into()
+        }
+    );
+    assert!(recovered.alerts().contains(alarm));
+    let first_hold_after_reopen = recovered.alerts().contains(&first_hold);
+    Box::pin(recovered.resume()).await?;
+    let doc = recovered
+        .identity_doc()?
+        .ok_or("missing recovered version")?;
+    assert!(!recovered.alerts().contains(alarm));
+    assert_eq!(recovered.status(), SignerStatus::Signing);
+    assert_eq!(
+        (
+            first_hold_after_reopen,
+            recovered.alerts().contains(&first_hold)
+        ),
+        (false, false)
+    );
+    assert_eq!(doc.body().signer, install);
+    assert_eq!(doc.inbox().url, REPLACEMENT);
+    assert_eq!(doc.body().recovery_from, Some(serving.generation()));
+    assert_eq!(doc.generation(), serving.generation() + 1);
+    assert!(doc.version() > serving.version());
+    let next = Box::pin(recovered.set_record_max_age(Some(7200))).await?;
+    assert_eq!(next.version(), doc.version() + 1);
+    assert_eq!(
+        world
+            .files()
+            .identity_doc(&identity.public())
+            .unwrap()
+            .signed(),
+        next.signed()
+    );
+    Ok(())
 }
 
 async fn check_changed_creation(backend: Backend) {

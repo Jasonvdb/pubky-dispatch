@@ -16,7 +16,7 @@ use pubky_switch::{
 use pubky_switch_core::{
     ident::invite_code_hash,
     keys::IdentityKey,
-    ops::{AllowKind, InviteCodePut, InviteContext, OpKind, OpsRequest, sign_batch},
+    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, sign_batch},
     records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox, RemovedApp},
     sig::SignedDoc,
 };
@@ -278,7 +278,6 @@ async fn test_peers_removed_app_gets_no_older_document_held() {
             code_hash: invite_code_hash(code).expect("hash"),
             expires_at: ms(&at) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         74,
         &at,
@@ -435,7 +434,6 @@ async fn test_peers_removed_apps_copy_never_pushes_out_an_admitted_one() {
             code_hash: invite_code_hash(code).expect("hash"),
             expires_at: ms(&at) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         43,
         &at,
@@ -481,7 +479,6 @@ async fn test_peers_removed_app_is_charged_the_invite_codes_rate() {
             code_hash: invite_code_hash(code).expect("hash"),
             expires_at: ms(&at) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         44,
         &at,

@@ -1158,7 +1158,6 @@ async fn test_revoke_rules() {
         code_hash: [5; 32],
         expires_at: ms(AT) + 86_400_000,
         max_uses: 1,
-        context: pubky_switch_core::ops::InviteContext::new(Value::Null),
     });
     let ops = wallet_batch(32, 1, vec![(Vec::new(), invite)]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
@@ -2012,7 +2011,6 @@ fn invite(code: u8, expires_at: u64, max_uses: u64) -> (Vec<Condition>, OpKind) 
             code_hash: [code; 32],
             expires_at,
             max_uses,
-            context: pubky_switch_core::ops::InviteContext::new(Value::Null),
         }),
     )
 }

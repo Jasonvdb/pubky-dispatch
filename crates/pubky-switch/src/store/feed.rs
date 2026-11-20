@@ -305,13 +305,13 @@ pub(super) async fn read_feed(
     let mut rows = sqlx::query(
         "SELECT 'chain' AS kind, seq, item_type, item_bytes, envelope, chain_hash, proof, \
                 only_for, NULL::BYTEA AS entry_id, NULL::BYTEA AS sender, NULL::BYTEA AS cert, \
-                NULL::BIGINT AS accepted_at_ms, NULL::BYTEA[] AS targets, NULL::BYTEA AS context, \
+                NULL::BIGINT AS accepted_at_ms, NULL::BYTEA[] AS targets, NULL::BYTEA AS invite_code_hash, \
                 NULL::TEXT AS item_kind, NULL::BIGINT AS missed_entries, \
                 NULL::BIGINT AS missed_from_ms, NULL::BIGINT AS missed_until_ms \
          FROM chain_items WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
          UNION ALL \
          SELECT 'entry', seq, NULL, NULL, envelope, NULL, NULL, NULL, entry_id, sender, cert, \
-                accepted_at_ms, targets, context, kind, missed_entries, missed_from_ms, \
+                accepted_at_ms, targets, invite_code_hash, kind, missed_entries, missed_from_ms, \
                 missed_until_ms \
          FROM inbox_entries WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
          AND (kind = 'unreadable' OR $5 = ANY(targets)) \

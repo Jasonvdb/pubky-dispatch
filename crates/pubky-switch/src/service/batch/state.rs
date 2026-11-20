@@ -165,11 +165,6 @@ pub struct HeldInvite {
     pub writer: [u8; 16],
     /// When it expires.
     pub expires_at: u64,
-    /// Its context, any JSON.
-    pub context: Value,
-    /// The context's bytes as its writer wrote them, which the feed repeats (Switch wire
-    /// 1.1).
-    pub context_written: Vec<u8>,
 }
 
 impl HeldInvite {

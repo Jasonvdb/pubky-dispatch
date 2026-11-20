@@ -342,8 +342,6 @@ fn apply_op(
                     uses: 0,
                     writer: cert.app_id(),
                     expires_at: put.expires_at,
-                    context: put.context.value().clone(),
-                    context_written: put.context.written_bytes().to_vec(),
                 },
             );
             StateAfter::Op
@@ -632,8 +630,6 @@ mod tests {
                 uses: 0,
                 writer,
                 expires_at: 2_000,
-                context: Value::Null,
-                context_written: b"null".to_vec(),
             },
         );
         state.invites.insert(
@@ -643,8 +639,6 @@ mod tests {
                 uses: 0,
                 writer,
                 expires_at: 1_000,
-                context: Value::Null,
-                context_written: b"null".to_vec(),
             },
         );
         assert_eq!(state.live_invites(), 4, "the expired code doesn't count");

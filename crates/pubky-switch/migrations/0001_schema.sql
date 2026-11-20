@@ -381,8 +381,8 @@ CREATE TABLE claim_entries (
 CREATE INDEX claim_entries_by_seq ON claim_entries (account_id, seq);
 
 -- The contacts, conversation entries and deny list (Switch wire 6.2, 7.4.6). A conversation
--- entry the service writes for a sender an invite code admitted names the code and its
--- context, and no app (Switch wire 7.4.6). An entry's last admitted append is kept for
+-- entry the service writes for a sender an invite code admitted names the code hash
+-- and no app (Switch wire 7.4.6). An entry's last admitted append is kept for
 -- pruning.
 CREATE TABLE list_entries (
     account_id  TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
@@ -392,7 +392,6 @@ CREATE TABLE list_entries (
     written_by  BYTEA   CHECK (octet_length(written_by) = 16),
     at_ms       BIGINT  NOT NULL CHECK (at_ms >= 0),
     code_hash   BYTEA   CHECK (octet_length(code_hash) = 32),
-    context     BYTEA,
     last_used_ms BIGINT CHECK (last_used_ms >= 0),
     PRIMARY KEY (account_id, list, pubky),
     CHECK (written_by IS NOT NULL OR (list = 'conversation' AND code_hash IS NOT NULL))
@@ -407,9 +406,6 @@ CREATE TABLE invite_codes (
     -- The app that wrote it.
     writer        BYTEA   NOT NULL CHECK (octet_length(writer) = 16),
     expires_at_ms BIGINT  NOT NULL CHECK (expires_at_ms >= 0),
-    -- The code's context as JSON, as its writer wrote it, shown in the clear (Switch wire
-    -- 7.4.6).
-    context       BYTEA   NOT NULL,
     PRIMARY KEY (account_id, code_hash)
 );
 
@@ -516,8 +512,8 @@ CREATE TABLE inbox_entries (
     envelope_hash   BYTEA    CHECK (octet_length(envelope_hash) = 32),
     -- The apps it was wrapped to.
     targets         BYTEA[]  NOT NULL,
-    -- The invite code's context, as its writer wrote it, when a code admitted the sender.
-    context         BYTEA,
+    -- The code redeemed on this delivery (Switch wire 7.4.3).
+    invite_code_hash BYTEA   CHECK (octet_length(invite_code_hash) = 32),
     -- The answer the append got, which a retry by content gets again.
     answer          BYTEA,
     -- What it counts against the inbox quota: its envelope's bytes and the entry overhead.

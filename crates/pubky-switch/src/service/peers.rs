@@ -61,21 +61,31 @@ impl Service {
         Ok(standing)
     }
 
-    /// The hash of the invite code `header` presents, if it names a code live at `now`.
+    /// Look up a code with remaining uses. Only an unexpired code admits the caller
+    /// (Switch wire 7.2, 7.3).
     pub(super) async fn live_invite(
         &self,
         txn: &mut AccountTxn,
         header: Option<&str>,
-        now: u64,
+        now: Option<u64>,
     ) -> Result<Option<[u8; 32]>, ApiError> {
         let Some(hash) = header.and_then(|code| invite_code_hash(code).ok()) else {
             return Ok(None);
         };
-        let invites = txn.invites(&[hash]).await.map_err(|e| storage(&e))?;
-        Ok(invites
-            .iter()
-            .any(|invite| invite.uses < invite.max_uses && now < invite.expires_at_ms)
-            .then_some(hash))
+        let Some(expires_at) = txn
+            .unspent_invite_expiry(&hash)
+            .await
+            .map_err(|e| storage(&e))?
+        else {
+            return Ok(None);
+        };
+        let now = now.ok_or_else(|| {
+            self.refused_without_trusted_time(
+                "append",
+                "7.3: an invite code's expiry needs trusted time",
+            )
+        })?;
+        Ok((now < expires_at).then_some(hash))
     }
 
     /// `PUT /v1/{id}/peers` (Switch wire 7.4.5), from an own app or an app of another
@@ -144,7 +154,7 @@ impl Service {
         let invite = if listed {
             None
         } else {
-            self.live_invite(txn, invite_code, time_ms).await?
+            self.live_invite(txn, invite_code, Some(time_ms)).await?
         };
         // While admission is staged after a provider loss, a sender it can't otherwise admit,
         // a denied one included, gets `503 staged` and retries (Switch spec 12.6 step 2; wire

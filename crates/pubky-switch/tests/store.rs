@@ -1403,7 +1403,7 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
         .expect("batch");
         sqlx::query(
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
-             expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, 'null')",
+             expires_at_ms) VALUES ($1, $2, 1, 0, $3, $4)",
         )
         .bind(ID_A)
         .bind([i; 32].as_slice())

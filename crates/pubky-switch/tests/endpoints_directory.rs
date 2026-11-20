@@ -247,7 +247,6 @@ async fn put_code(replay: &Replay, batch: u8) {
                 code_hash: pubky_switch_core::ident::invite_code_hash(CODE).expect("hash"),
                 expires_at: ms(&setup_time()) + 3_600_000,
                 max_uses: 1,
-                context: pubky_switch_core::ops::InviteContext::new(json!(null)),
             },
         )],
         batch,

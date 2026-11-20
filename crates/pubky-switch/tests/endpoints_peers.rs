@@ -453,11 +453,7 @@ async fn test_peers_limit_drops_strangers_first_and_leaves_floors() {
 
 #[tokio::test]
 async fn test_peers_certificates_invite_codes_and_removed_apps() {
-    use pubky_switch_core::{
-        ident::invite_code_hash,
-        ops::{InviteCodePut, InviteContext},
-        records::RemovedApp,
-    };
+    use pubky_switch_core::{ident::invite_code_hash, ops::InviteCodePut, records::RemovedApp};
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
@@ -499,7 +495,6 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
             code_hash: invite_code_hash(code).expect("hash"),
             expires_at: ms(&at) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         71,
         &at,
@@ -557,7 +552,7 @@ async fn insert_invite(replay: &Replay, account: &str, code: &str, expires_at_ms
         .expect("conn");
     sqlx::query(
         "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
-         expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, $5)",
+         expires_at_ms) VALUES ($1, $2, 1, 0, $3, $4)",
     )
     .bind(account)
     .bind(
@@ -567,7 +562,6 @@ async fn insert_invite(replay: &Replay, account: &str, code: &str, expires_at_ms
     )
     .bind([1u8; 16].as_slice())
     .bind(i64::try_from(expires_at_ms).expect("time"))
-    .bind(b"null".as_slice())
     .execute(&mut conn)
     .await
     .expect("invite");

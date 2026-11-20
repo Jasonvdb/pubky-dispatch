@@ -64,7 +64,7 @@ impl Service {
             let invite = if listed {
                 None
             } else {
-                self.live_invite(txn, invite_code, time_ms).await?
+                self.live_invite(txn, invite_code, Some(time_ms)).await?
             };
             // While admission is staged after a provider loss, a reader it can't otherwise
             // admit, a denied one included, gets `503 staged` and retries, as at the inbox and

@@ -3,6 +3,7 @@
 
 use pubky_switch_client::app::{App, AppError, Delivery, OutgoingMessage};
 use pubky_switch_client::testing::TestProtocol;
+use pubky_switch_core::admission::ReplyOrigin;
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -81,12 +82,15 @@ pub(super) async fn lists(world: &World, name: &str, app: &mut App) -> FlowResul
     world.outcome(
         name,
         &json!({
-            "contacts": list.contacts.len(),
+            "contacts": list.peers.iter().filter(|peer| peer.kept).count(),
             "deny": list.deny.len(),
             "flagged": list.flagged.len(),
-            "conversations": list.conversations.iter().map(|entry| json!({
-                "written_by": format!("{:?}", entry.written_by).split('(').next(),
-                "by_a_code": entry.code_hash.is_some(),
+            "conversations": list.peers.iter().filter_map(|peer| peer.reply).map(|reply| json!({
+                "written_by": match reply.origin {
+                    ReplyOrigin::App(_) => "App",
+                    ReplyOrigin::Invite(_) => "Service",
+                },
+                "by_a_code": matches!(reply.origin, ReplyOrigin::Invite(_)),
             })).collect::<Vec<_>>(),
             "invite_codes": list.invite_codes.iter().map(|code| json!({
                 "max_uses": code.max_uses,

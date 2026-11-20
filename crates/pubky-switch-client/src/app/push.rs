@@ -162,6 +162,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             let service = self.state.meta.service_key;
             let held = self.push_record().await?;
             let replaces = held
@@ -192,6 +193,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             let service = self.state.meta.service_key;
             let Some(held) = self
                 .push_record()
@@ -229,6 +231,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             let Some(held) = self.push_record().await? else {
                 return Ok(None);
             };

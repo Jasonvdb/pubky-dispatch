@@ -204,6 +204,20 @@ pub struct PendingDuty {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AppEvent {
+    /// This installation's service requires recovery (Switch spec 12.6).
+    RecoveryRequired {
+        /// The durable host event.
+        id: EventId,
+        /// The verified notice.
+        notice: super::RecoveryNotice,
+    },
+    /// A verified subsequent success cleared the service's recovery notice.
+    RecoveryNoticeCleared {
+        /// The durable host event.
+        id: EventId,
+        /// The generation that resumed serving.
+        generation: u64,
+    },
     /// An alarm stopped the app.
     Alarm(Alarm),
     /// A message passed every check and its effect was committed with the cursor move.
@@ -1095,7 +1109,9 @@ impl AppEvent {
     pub fn id(&self) -> Option<EventId> {
         match self {
             Self::Parked { id, .. } => *id,
-            Self::EffectRefused { id, .. }
+            Self::RecoveryRequired { id, .. }
+            | Self::RecoveryNoticeCleared { id, .. }
+            | Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
             | Self::ReleasedDuplicate { id, .. }
             | Self::StoredEntryDropped { id, .. }
@@ -1257,6 +1273,12 @@ impl KeptDuty {
 /// A duty event, as [`KeptDuty`] keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Duty {
+    RecoveryRequired {
+        notice: super::RecoveryNotice,
+    },
+    RecoveryNoticeCleared {
+        generation: u64,
+    },
     Parked {
         seq: u64,
         stored_id: u64,
@@ -1409,6 +1431,10 @@ impl Duty {
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
+            Self::RecoveryRequired { notice } => AppEvent::RecoveryRequired { id, notice },
+            Self::RecoveryNoticeCleared { generation } => {
+                AppEvent::RecoveryNoticeCleared { id, generation }
+            }
             Self::Parked {
                 seq,
                 stored_id,

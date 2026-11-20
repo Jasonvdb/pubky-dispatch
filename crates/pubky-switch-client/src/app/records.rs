@@ -4610,6 +4610,7 @@ impl App {
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
         Box::pin(async move {
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             // Before the key bundle is fetched and the protocol marks the value.
             refuse_non_json(value)?;
             let epoch = self.state.own_doc.data_epoch();

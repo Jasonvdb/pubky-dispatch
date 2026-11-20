@@ -46,7 +46,7 @@ use pubky_switch_core::{
 use serde_json::json;
 
 use super::{
-    Answer, Deferred, PreLock, Service,
+    Answer, PreLock, Service,
     marking::{self, Judged},
     signed::{AnswerTime, Asked, sign_answer},
     store_error,
@@ -67,36 +67,14 @@ use crate::{
 /// Table 3).
 const RECORD_KEPT_AT_LEAST_MS: u64 = 24 * 60 * 60 * 1000;
 
-impl Service {
-    /// The checks of an erasure from the signer, under the account's lock and the verdict
-    /// `judged` (Switch wire 7.4.16): its binding to the account ([`erasure_binding`]). The
-    /// answer it returns erases nothing yet: [`Service::finish_erasure`] does.
-    ///
-    /// # Errors
-    ///
-    /// As [`erasure_binding`].
-    pub(super) fn erase_answer(
-        &self,
-        request: &SwitchRequest,
-        held: Option<&IdentityDoc>,
-        judged: &Judged,
-        _time_ms: u64,
-    ) -> Result<Answer, ApiError> {
-        let created = erasure_binding(request, held, judged)?;
-        let selected_account = judged
-            .account_binding()
-            .map_err(|_| ApiError::unavailable("account binding: unknown association"))?
-            .association()
-            == AccountAssociation::Account;
-        let mut answer = Answer::ok(ERASED_BODY.to_vec());
-        answer.deferred = Some(Deferred::Erase {
-            created,
-            identity_hash: held.filter(|_| selected_account).map(IdentityDoc::hash),
-        });
-        Ok(answer)
-    }
+/// The account creation and held document verified for this erasure (Switch wire 7.4.16).
+pub(super) struct Erasure {
+    created: u64,
+    identity_hash: Option<[u8; 32]>,
+}
 
-    /// Erase the account whose lock `txn` holds and answer `answer`, signed with `signer`
+impl Service {
+    /// Erase the account whose lock `txn` holds and sign the answer with `signer`
     /// once the deletion is durable (Switch wire 7.4.16 Order, 7.3 Table 3). `committed_ms`
     /// is the time the account last committed, for the `503` of an erasure that doesn't
     /// commit.
@@ -107,16 +85,14 @@ impl Service {
         asked: Asked<'_>,
         committed_ms: u64,
         time_ms: u64,
-        mut answer: Answer,
+        erasure: Erasure,
     ) -> SwitchResponse {
         // Dated no earlier than the creation it erases (Switch wire 7.3, Table 3).
-        let (created_at_ms, record_at, identity_hash) = match answer.deferred.take() {
-            Some(Deferred::Erase {
-                created,
-                identity_hash,
-            }) => (created, time_ms.max(created), identity_hash),
-            _ => (txn.head().created_at_ms, time_ms, None),
-        };
+        let Erasure {
+            created: created_at_ms,
+            identity_hash,
+        } = erasure;
+        let record_at = time_ms.max(created_at_ms);
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         let account = txn.head().id.clone();
         // The erasure moves a mark: not while another process may hold the database.
@@ -286,7 +262,12 @@ impl Service {
         }
         self.forget_account(&account);
         self.forget_aged_erasures().await;
-        sign_answer(signer, asked, AnswerTime::Account(time_ms), answer)
+        sign_answer(
+            signer,
+            asked,
+            AnswerTime::Account(time_ms),
+            Answer::ok(ERASED_BODY.to_vec()),
+        )
     }
 
     /// Publish only an established outcome, under the identity lock. Absence alone says
@@ -434,9 +415,10 @@ impl Service {
             let Some(signer) = self.signer_of(&routed.key) else {
                 return refuse(unavailable());
             };
-            if let Err(error) = erasure_binding(request, held.as_ref(), &judged) {
-                return Self::signed_error(&signer, asked, at, &error);
-            }
+            let erasure = match erasure_binding(request, held.as_ref(), &judged) {
+                Ok(erasure) => erasure,
+                Err(error) => return Self::signed_error(&signer, asked, at, &error),
+            };
             // Step 3 as for every request, so the erasure's answer shows no time before one
             // shown for the identity, and the floor rises past it (Switch wire 7.3,
             // "Trusted time").
@@ -448,12 +430,8 @@ impl Service {
                 Ok(time_ms) => time_ms,
                 Err(error) => return Self::signed_error(&signer, asked, at, &error),
             };
-            let answer = match self.erase_answer(request, held.as_ref(), &judged, time_ms) {
-                Ok(answer) => answer,
-                Err(error) => return Self::signed_error(&signer, asked, at, &error),
-            };
             return self
-                .finish_erasure(txn, &signer, asked, committed_ms, time_ms, answer)
+                .finish_erasure(txn, &signer, asked, committed_ms, time_ms, erasure)
                 .await;
         }
         // This is new authenticated authorization at an absent account, not an inference
@@ -617,7 +595,7 @@ impl Service {
             _ => return refuse(unavailable()),
         }
         let created = match erasure_binding(request, None, &judged) {
-            Ok(created) => created,
+            Ok(erasure) => erasure.created,
             Err(error) => return refuse(error),
         };
         // Dated no earlier than the creation it erases (Switch wire 7.3, Table 3).
@@ -830,7 +808,7 @@ impl Service {
 /// replay doesn't reach a later account of the identity; then `held`, the account's newest
 /// `identity.json`, by its hash, left out only where the account holds none. At an identity
 /// whose account is lost no document is held to compare: the mark's creation time binds it.
-/// The creation time it names, which the erasure's record is dated no earlier than.
+/// The verified creation time and document hash for the erasure record.
 ///
 /// # Errors
 ///
@@ -840,11 +818,11 @@ impl Service {
 /// where the account holds no `identity.json`, or none where it holds one is `409 conflict`.
 /// For a document conflict at an account that answers the notice, the `409` carries the
 /// held copy too, and at a lost identity `identity: null`.
-fn erasure_binding(
+pub(super) fn erasure_binding(
     request: &SwitchRequest,
     held: Option<&IdentityDoc>,
     judged: &Judged,
-) -> Result<u64, ApiError> {
+) -> Result<Erasure, ApiError> {
     let named = parse_erase_body(&request.body)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     super::account::check_creation(request, judged)?;
@@ -868,18 +846,14 @@ fn erasure_binding(
     if named.created != Some(created) {
         return Err(conflict("7.4.16: the account was created at another time"));
     }
-    if !selected_account {
-        return Ok(created);
-    }
-    let matches = match (named.identity_hash, held) {
-        (Some(hash), Some(held)) => hash == held.hash(),
-        (None, None) => true,
-        (Some(_), None) | (None, Some(_)) => false,
-    };
-    if !matches {
+    let identity_hash = held.filter(|_| selected_account).map(IdentityDoc::hash);
+    if selected_account && named.identity_hash != identity_hash {
         return Err(conflict("7.4.16: the account holds another identity.json"));
     }
-    Ok(created)
+    Ok(Erasure {
+        created,
+        identity_hash,
+    })
 }
 
 /// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that

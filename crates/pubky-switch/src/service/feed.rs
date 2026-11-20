@@ -763,7 +763,7 @@ impl Service {
         writer: Option<&AppCert>,
         query: &Result<BTreeMap<String, String>, crate::http::route::QueryError>,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<Box<FeedRead>, ApiError> {
         let Some(reader) = writer else {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
@@ -774,16 +774,14 @@ impl Service {
             .as_ref()
             .map_err(|_| ApiError::bad_request("7.1: the query doesn't decode"))?;
         let query = FeedQuery::parse(query)?;
-        let mut answer = Answer::ok(Vec::new());
-        answer.deferred = Some(super::Deferred::Feed(Box::new(FeedRead {
+        Ok(Box::new(FeedRead {
             account: account.clone(),
             mark_floor_ms,
             key,
             reader: VerifiedApp::reading(reader.app_id(), reader.signing_key()),
             query,
             time_ms,
-        })));
-        Ok(answer)
+        }))
     }
 
     /// The feed page of `read`, once the lock is gone, and the service time to sign it at:

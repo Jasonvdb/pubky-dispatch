@@ -72,6 +72,7 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
         record: Default::default(),
         interrupt_remove: true.into(),
     };
+    let delivered_claim = std::cell::RefCell::new(Vec::new());
     for confirmed in [false, true] {
         let claim_sent = std::cell::Cell::new(false);
         let grant_sent = std::cell::Cell::new(false);
@@ -91,6 +92,7 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
                 assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, declined })) if key == &hash && request == &app.request && saved == auth && declined == &[TAGS_PATH]));
                 let claim = ApprovalClaim::from_plaintext(bytes)?;
                 claim.verify(&world.key.public(), auth)?;
+                delivered_claim.replace(bytes.to_vec());
                 claim_sent.set(true);
                 Ok(())
             },
@@ -121,6 +123,13 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
     let doc = signer.identity_doc().unwrap().unwrap();
     let app_id = app.keys.app_id_bytes();
     let cert = doc.listed_cert(&app_id).unwrap();
+    let delivered = pubky_switch_signer::ApprovedRequest {
+        request: hash,
+        app_id,
+        caps: record_cap,
+        claim: delivered_claim.into_inner(),
+    };
+    assert_eq!(world.join(&app, &delivered).hash(), cert);
     drop(signer);
 
     let mut reopened = pubky_switch_signer::Signer::open(world.env(signer_store), world.keyring())

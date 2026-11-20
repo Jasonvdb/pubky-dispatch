@@ -474,6 +474,10 @@ pub enum Alert {
 }
 
 impl Alert {
+    pub(crate) fn is_signing_alarm(&self) -> bool {
+        matches!(self, Self::Rollback { .. } | Self::Equivocation { .. })
+    }
+
     /// Whether this alert is about the app `app_id`: it names that app, as its subject, among
     /// the apps it lists, or as the app a hand-over goes to.
     pub fn names_app(&self, app_id: &[u8; 16]) -> bool {

@@ -15239,6 +15239,54 @@ async fn test_record_put_back_renewal_without_write_scope_releases() {
 }
 
 #[tokio::test]
+async fn test_backup_identifies_record_replacement_notices_by_duty() {
+    use crate::app::events::{CertificateRefusal, Duty};
+    use crate::app::state::key;
+
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    read_on(&mut reader).await;
+    let record_key = reader.record_key(&target).unwrap();
+    let mut tx = reader.tx().unwrap();
+    reader
+        .keep_duty(
+            &mut tx,
+            Duty::CertificateRefused {
+                issued_at: 1,
+                refusal: CertificateRefusal::Protocol {
+                    protocol: "sample".into(),
+                    reason: "PutBackWaits or PutBackRefused".into(),
+                },
+            },
+        )
+        .unwrap();
+    reader.commit(tx).await.unwrap();
+    for backup in [
+        reader.backup().await.unwrap(),
+        reader.backup_layered().await.unwrap(),
+    ] {
+        assert!(matches!(backup.put_back_notices.as_slice(),
+            [notice] if matches!(notice.duty, Duty::PutBackWaits { key, .. } if key == record_key)));
+    }
+
+    let damaged_id = reader.state.next_duty;
+    let mut tx = reader.tx().unwrap();
+    tx.put(
+        &key::duty(damaged_id),
+        &json!({"to": ["sample"], "duty": {"PutBackRefused": {}}}),
+    )
+    .unwrap();
+    reader.commit(tx).await.unwrap();
+    for error in [
+        reader.backup().await.unwrap_err(),
+        reader.backup_layered().await.unwrap_err(),
+    ] {
+        assert!(matches!(error, AppError::InvalidData(ref reason)
+            if *reason == format!("unreadable record replacement notice {}", key::num(damaged_id))));
+    }
+}
+
+#[tokio::test]
 async fn test_record_put_back_older_backup_keeps_in_place_work_but_respects_release() {
     let s = Setup::new();
     let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;

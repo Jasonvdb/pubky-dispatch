@@ -1755,6 +1755,179 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     both_answered(&lost, &app).await;
 }
 
+async fn restored_loss_answers(add_protocol: bool) {
+    use super::moves::LossProtocol;
+    let (lost, chat, store) = lost_beside(1).await;
+    let original = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
+    let id = app_keys("wallet").app_id_bytes();
+    let mut source = App::load(
+        lost.router.env(&lost.w, store),
+        original,
+        World::config(),
+        id,
+    )
+    .await
+    .unwrap();
+    let before_loss = source.backup().await.unwrap();
+    source.refresh_identity().await.unwrap();
+    assert!(
+        matches!(source.receive(None).await, Err(AppError::Protocol(error))
+        if *error.error() == StoreError::Unavailable)
+    );
+    let before = source.recovery_info().await.unwrap().unwrap();
+    assert_eq!(before.step, crate::app::RecoveryStep::Resend);
+    assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
+    assert!(chat.losses.lock().unwrap().is_empty());
+    assert!(conversations_added(&lost.next).is_empty());
+    let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
+    drop(source);
+
+    let sample = Arc::new(LossProtocol {
+        counterparties: vec![lost.w.bob.public()],
+        ..LossProtocol::default()
+    });
+    let chat = Arc::new(LossProtocol {
+        name: Some("chat"),
+        counterparties: vec![carol()],
+        ..LossProtocol::default()
+    });
+    let mail = Arc::new(LossProtocol {
+        name: Some("mail"),
+        failing: Mutex::new(1),
+        ..LossProtocol::default()
+    });
+    let mut members = vec![sample.clone() as Arc<dyn Protocol>];
+    if add_protocol {
+        members.push(mail.clone());
+    }
+    members.push(chat.clone());
+    let protocols = ProtocolSet::new(members).unwrap();
+    let mut env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+    let backup = AppBackup::from_bytes(&bytes).unwrap();
+    let partial = App::restore(
+        env.clone(),
+        ProtocolSet::new(vec![sample.clone()]).unwrap(),
+        World::config(),
+        &backup,
+    )
+    .await;
+    assert!(matches!(partial, Err(AppError::InvalidData(_))));
+    let mut app = App::restore(env.clone(), protocols.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(app.recovery_info().await.unwrap(), Some(before));
+    let stale = App::restore(
+        env.clone(),
+        protocols.clone(),
+        World::config(),
+        &before_loss,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(why)))
+        if why == "the backup predates the installation's provider loss answers"));
+    assert_eq!(
+        app.protocol_get("sample", b"lost/1").await.unwrap(),
+        Some(vec![b'1'])
+    );
+    assert!(app.protocol_get("chat", b"lost/1").await.unwrap().is_none());
+    if add_protocol {
+        // A subsequent backup includes the new protocol's layer, but keeps the
+        // original recipients and the answer already committed for this loss.
+        let bytes = app.backup_layered().await.unwrap().to_bytes().unwrap();
+        drop(app);
+        env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+        app = App::restore(
+            env.clone(),
+            protocols.clone(),
+            World::config(),
+            &AppBackup::from_bytes(&bytes).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let events = app.receive(None).await.unwrap().events;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AppEvent::ProviderRecovered { generation: 2 }))
+            .count(),
+        1
+    );
+    both_answered(&lost, &app).await;
+    drop(app);
+
+    let stale = App::restore(env.clone(), protocols.clone(), World::config(), &backup).await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(_)))));
+    let mut app = App::load(env, protocols, World::config(), id)
+        .await
+        .unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    let events = app.receive(None).await.unwrap().events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::ProviderRecovered { .. }))
+    );
+    assert!(sample.losses.lock().unwrap().is_empty());
+    assert_eq!(*chat.losses.lock().unwrap(), [before.loss]);
+    assert_eq!(*mail.failing.lock().unwrap(), 1);
+    assert!(mail.losses.lock().unwrap().is_empty());
+    both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() {
+    restored_loss_answers(false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_skips_a_protocol_first_registered_on_restore() {
+    restored_loss_answers(true).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_answers() {
+    let (lost, chat, store) = lost_beside(1).await;
+    let protocols = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
+    let mut source = App::load(
+        lost.router.env(&lost.w, store),
+        protocols.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    source.refresh_identity().await.unwrap();
+    assert!(matches!(
+        source.follow_provider().await,
+        Err(AppError::Protocol(_))
+    ));
+    lost.next
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(source.follow_provider().await.is_err());
+    let before = source.recovery_info().await.unwrap().unwrap();
+    assert_eq!(before.step, crate::app::RecoveryStep::Conversations);
+    let applied = lost.next.applied();
+    assert_eq!(conversations_added(&lost.next).len(), 2);
+    let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
+    drop(source);
+    let backup = AppBackup::from_bytes(&bytes).unwrap();
+    let mut app = App::restore(
+        lost.router.env(&lost.w, Arc::new(MemoryStore::new())),
+        protocols,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.recovery_info().await.unwrap(), Some(before));
+    app.follow_provider().await.unwrap();
+    both_answered(&lost, &app).await;
+    assert_eq!(lost.next.applied(), applied);
+    assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
+    assert_eq!(*chat.losses.lock().unwrap(), [before.loss]);
+}
+
 /// The `expires_at` of `app`'s record.
 fn record_expiry(app: &App) -> Option<u64> {
     pubky_switch_core::records::AppRecord::verify(app.record(), &app.identity())

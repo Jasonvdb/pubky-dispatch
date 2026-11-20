@@ -1409,6 +1409,19 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
+    /// The backup keeps these outcomes for the protocol whose local operation
+    /// or provider-loss callback has already been decided.
+    pub(super) fn carried_for_protocol(&self) -> bool {
+        matches!(
+            self,
+            Self::PutBackWaits { .. }
+                | Self::PutBackRefused { .. }
+                | Self::LocalWritesRefused {
+                    call: KeptRefusal::Loss { .. }
+                }
+        )
+    }
+
     /// The message whose delivery the event gives up, if it gives one up.
     pub(crate) fn given_up(&self) -> Option<&str> {
         match self {

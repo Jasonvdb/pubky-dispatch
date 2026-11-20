@@ -3798,8 +3798,21 @@ async fn test_app_leaves_in_two_steps() {
 #[tokio::test]
 async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     let w = World::new();
+    let sibling = w.join("phone").await;
     let mut app = w.join("wallet").await;
     let me = app.app_id();
+    let ns = crate::store::client_namespace(&me);
+    let sibling_ns = crate::store::client_namespace(&sibling.app_id());
+    app.hold_queued(&w.bob.public()).await.unwrap();
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: b"draft".to_vec(),
+            value: b"content".to_vec(),
+        }],
+    )
+    .await
+    .unwrap();
     assert!(!refuse_next(&w, &mut app).await.is_empty());
     let now = w.clock.now_ms();
     w.switch.push_missed(1, now - HOUR, now);
@@ -3807,6 +3820,8 @@ async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     app.receive(None).await.unwrap();
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
     assert!(!app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    assert_eq!(app.reader().scan_raw("outhold/").await.unwrap().len(), 1);
+    assert!(app.reader().exists("p/sample/draft").await.unwrap());
     app.leave(LeaveMode::TwoStep).await.unwrap();
     w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
@@ -3817,10 +3832,39 @@ async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     });
     app.finish_leave().await.unwrap();
     w.clock.advance_ms(11 * 60_000);
+    drop(app);
+
+    let snapshot = |ns: &str| w.store.scan(ns, b"", None, u32::MAX).unwrap();
+    let before = snapshot(&ns);
+    let sibling_before = snapshot(&sibling_ns);
+    let faulty = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = App::load(
+        w.env_on(faulty.clone()),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    faulty.fail_put_once(b"leave");
+    assert_eq!(
+        app.finish_leave().await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unavailable)
+    );
+    assert_eq!(app.state.leave.unwrap().keys_deleted_ms, None);
+    assert_eq!(snapshot(&ns), before);
+    drop(app);
+    let mut app = w.load(me).await;
     assert_eq!(app.finish_leave().await.unwrap(), LeaveReport::Done);
     // With the keys, what the app owed its protocol is gone from the store.
     assert!(app.reader().scan_raw("duty/").await.unwrap().is_empty());
     assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+    assert!(app.reader().scan_raw("outhold/").await.unwrap().is_empty());
+    assert!(!app.reader().exists("keys").await.unwrap());
+    assert!(!app.reader().exists("p/sample/draft").await.unwrap());
+    assert!(!app.reader().scan_raw("kid/").await.unwrap().is_empty());
+    assert!(app.reader().exists("dutye").await.unwrap());
+    assert_eq!(snapshot(&sibling_ns), sibling_before);
 }
 
 #[tokio::test]

@@ -16,6 +16,11 @@ use super::{App, AppError, FeedPosition, ProtocolSet, PutBack};
 
 pub(super) const PREFIX: &str = "delobs/";
 pub(super) const RECEIPTS: &str = "delack/";
+
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[PREFIX, RECEIPTS])
+}
+
 /// Space for the signed delete, sealed predecessor, their certificates and proof,
 /// the outstanding signed batch, its successor merge, the owner's local writes and mark.
 pub(super) const ROOM: u64 = 8 << 20;

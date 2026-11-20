@@ -36,6 +36,17 @@ const MESSAGE_PREFIX: &str = "kbm/";
 /// The prefix of the attempts kept batches carry, by claim key and attempt ID.
 const ATTEMPT_PREFIX: &str = "kba/";
 
+/// A departed app no longer flushes kept batches or prunes their ends and indexes.
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[
+        super::batch::PENDING_PREFIX,
+        END_PREFIX,
+        END_TIME_PREFIX,
+        MESSAGE_PREFIX,
+        ATTEMPT_PREFIX,
+    ])
+}
+
 fn end_key(batch_id: &[u8; 16]) -> String {
     format!("{END_PREFIX}{}", b64(batch_id))
 }

@@ -4046,27 +4046,21 @@ impl App {
     async fn destroy_keys(&mut self) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = Tx::new(&self.ns);
-        for prefix in [
-            "rk/",
-            "scope/",
-            "parked/",
-            "pending/",
-            "p/",
-            key::DUTY_PREFIX,
-            key::OWED_PREFIX,
-            order::TOLD_PREFIX,
-            deletion::PREFIX,
-            deletion::RECEIPTS,
-        ] {
-            tx.delete_prefix(prefix)?;
-        }
-        records::destroy_shared(&mut tx)?;
         tx.delete(key::KEYS)?;
         tx.delete(key::NAMING)?;
-        let leave = self.state.leave.get_or_insert_with(LeaveState::default);
+        tx.delete_prefixes(&["rk/", "scope/", "parked/", "pending/", "p/"])?;
+        order::clear_on_leave(&mut tx)?;
+        deletion::clear_on_leave(&mut tx)?;
+        records::clear_on_leave(&mut tx)?;
+        recovery::inventory::clear_on_leave(&mut tx)?;
+        send::clear_on_leave(&mut tx)?;
+        admission::clear_on_leave(&mut tx)?;
+        kept::clear_on_leave(&mut tx)?;
+        let mut leave = self.state.leave.unwrap_or_default();
         leave.keys_deleted_ms = Some(now);
-        tx.put(key::LEAVE, leave)?;
+        tx.put(key::LEAVE, &leave)?;
         self.commit(tx).await?;
+        self.state.leave = Some(leave);
         self.state.receive_keys.clear();
         self.state.scope_keys = ScopeKeys::default();
         self.state.parked.clear();

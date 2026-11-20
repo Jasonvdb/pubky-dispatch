@@ -75,6 +75,7 @@ const RECORD_PREFIX: &str = "rec/";
 /// [`put_held`], so a listing page judges absence without reading every held record.
 const PERMANENT_PREFIX: &str = "recp/";
 const SEEN_PREFIX: &str = "hw/";
+const NAME_PREFIX: &str = "recname/";
 const FLAG_PREFIX: &str = "flag/";
 /// The most flagged writes kept for one record ([`App::flagged_writes`]).
 const FLAGGED_WRITES_PER_RECORD: usize = 8;
@@ -5232,41 +5233,21 @@ pub(crate) fn with_named(
     conditions
 }
 
-/// Delete, with the keys on a leave, every record of the shared state, the outbox and the
-/// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3), and the
-/// kept batches with their ends and indexes, which no flush of a left app would prune.
-pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
+/// Remove the held records, their indexes and any unfinished listing (Switch spec 12.3).
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(page_reader::READER_RENEWAL)?;
-    for prefix in [
+    inventory::clear_on_leave(tx)?;
+    tx.delete_prefixes(&[
         RECORD_PREFIX,
         PERMANENT_PREFIX,
         SEEN_PREFIX,
-        "recname/",
-        "loss-data/",
-        "loss-upload/",
-        "out/",
-        "sent/",
-        "sentt/",
-        "outgone/",
-        "outhold/",
-        "outheld/",
-        "invite/",
-        "opq/",
-        "kb/",
-        "kbt/",
-        "kbm/",
-        "kba/",
-        "clpage/",
-        "clwrite/",
+        NAME_PREFIX,
         LISTC_PREFIX,
-    ] {
-        tx.delete_prefix(prefix)?;
-    }
-    Ok(())
+    ])
 }
 
 pub(crate) fn pending_name_key(key: &[u8; 32]) -> String {
-    format!("recname/{}", b64(key))
+    format!("{NAME_PREFIX}{}", b64(key))
 }
 
 /// `hw/<key>`: the protocol's mark of what the app has seen in a record.

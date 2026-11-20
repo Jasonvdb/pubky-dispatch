@@ -30,7 +30,7 @@
 //!   comes back.
 
 use pubky_switch_core::claims::ClaimType;
-use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
+use pubky_switch_core::enc::{b64, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
 use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
@@ -51,7 +51,7 @@ use crate::error::{ClientError, StoreError};
 
 /// The keys of this part's records (`STATE.md`, "Moves, recovery and push").
 pub(crate) mod keys {
-    use super::{b64, key, pubky_id};
+    use super::{b64, key};
 
     /// A move in progress.
     pub(crate) const MOVE: &str = "mv";
@@ -63,16 +63,6 @@ pub(crate) mod keys {
     /// The service and last own `identity.json` of a generation the app left.
     pub(crate) fn generation(generation: u64) -> String {
         format!("gens/{}", key::num(generation))
-    }
-
-    /// A contact in the app's copy of the lists.
-    pub(crate) fn contact(pubky: &[u8; 32]) -> String {
-        format!("lc/contact/{}", pubky_id(pubky))
-    }
-
-    /// A deny list entry in the app's copy of the lists.
-    pub(crate) fn deny(pubky: &[u8; 32]) -> String {
-        format!("lc/deny/{}", pubky_id(pubky))
     }
 
     /// An invite code this app registered.
@@ -1121,6 +1111,7 @@ impl App {
                 });
             }
             let mut tx = self.tx()?;
+            self.keep_list_placements(&checked, &mut tx).await?;
             // The deny list's history has the same gap (Switch spec 8.3).
             if let Some((verified_seq, _)) = checked.gap {
                 self.note_deny_gap(self.state.cursor.generation, verified_seq, &mut tx)
@@ -1275,7 +1266,8 @@ impl App {
         doc: &IdentityDoc,
         mv: &mut MoveRecord,
     ) -> Result<(), AppError> {
-        self.complete_applied_effect().await?;
+        let lists = self.old_list_writes().await?;
+        self.complete_applied_effect(&lists).await?;
         let old = self.state.meta.clone();
         let mut tx = self.tx()?;
         let gen_key = keys::generation(old.generation);
@@ -1312,7 +1304,7 @@ impl App {
         } else {
             Carry::ResendFirst
         };
-        let events = self.carry_kept_writes(&mut tx, carry).await?;
+        let events = self.carry_kept_writes(&mut tx, carry, &lists).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
@@ -1344,7 +1336,10 @@ impl App {
     /// changing provider state. Reuse the ordinary effect completion and its pre-send
     /// outcome budget, keeping lifecycle keys and batches in the following transaction
     /// (Switch spec 11, 12.5 "Kept batches", 12.6). An uncertain effect stays unanswered.
-    pub(crate) async fn complete_applied_effect(&mut self) -> Result<(), AppError> {
+    pub(super) async fn complete_applied_effect(
+        &mut self,
+        lists: &super::list_settlement::OldListWrites,
+    ) -> Result<(), AppError> {
         let Some(pending) = self.state.pending_effect.clone() else {
             return Ok(());
         };
@@ -1359,7 +1354,8 @@ impl App {
         if let Some(to) = pending.cursor_to {
             self.state.cursor.at_service = self.state.cursor.at_service.max(to);
         }
-        self.commit_effect(&pending, &batch, &[]).await?;
+        self.commit_effect(&pending, &batch, &[], Some(lists))
+            .await?;
         self.events.push(AppEvent::MessageReceived {
             receipt: pending.entry.receipt,
             seq: pending.seq,
@@ -1394,10 +1390,11 @@ impl App {
     ///
     /// Returns the informational events to report once `tx` commits; the duty events are
     /// kept in `tx`, and reported by its commit.
-    pub(crate) async fn carry_kept_writes(
+    pub(super) async fn carry_kept_writes(
         &mut self,
         tx: &mut Tx,
         carry: Carry,
+        lists: &super::list_settlement::OldListWrites,
     ) -> Result<Vec<AppEvent>, AppError> {
         let mut events = Vec::new();
         let resend_first = carry == Carry::ResendFirst;
@@ -1423,7 +1420,7 @@ impl App {
                 .id()
                 .is_some_and(|wire| self.applied_by_old_service(&wire))
             {
-                self.settle_kept_batch(&id, &pending, tx).await?;
+                self.settle_kept_batch(&id, &pending, lists, tx).await?;
                 events.push(AppEvent::KeptBatchApplied { batch_id: id });
                 continue;
             }
@@ -1748,38 +1745,29 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The app's copy of the lists, from the feed (Switch spec 8.3, 12.5 step 4, 12.6 step 2)
 
-    /// Keep an allowlist, deny list or invite code change seen in the feed.
-    pub(crate) fn note_list_op(&self, body: &OpBody, tx: &mut Tx) -> Result<(), AppError> {
+    /// Keep a contact or invite-code change from a verified feed entry (Switch spec 8.3).
+    pub(super) async fn note_list_op(
+        &self,
+        body: &OpBody,
+        position: super::FeedPosition,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some((key, present)) = super::list_settlement::ListKey::change(&body.kind) {
+            return self
+                .apply_list_change(
+                    key,
+                    present,
+                    super::list_settlement::ListPlacement::At(position),
+                    tx,
+                )
+                .await;
+        }
         match &body.kind {
-            OpKind::AllowPut {
-                pubky,
-                kind: AllowKind::Contact,
-            } => tx.put(&keys::contact(pubky), &()),
-            OpKind::AllowDelete {
-                pubky,
-                kind: AllowKind::Contact,
-            } => tx.delete(&keys::contact(pubky)),
-            OpKind::DenyPut { pubky } => self.note_deny_change(pubky, true, tx),
-            OpKind::DenyDelete { pubky } => self.note_deny_change(pubky, false, tx),
             OpKind::InviteCodePut(put) if body.app_id == Some(self.state.meta.app_id) => {
                 tx.put(&keys::code(&put.code_hash), &())
             }
             OpKind::InviteCodeDelete { code_hash } => tx.delete(&keys::code(code_hash)),
             _ => Ok(()),
-        }
-    }
-
-    /// Keep a deny list change: `pubky` denied when `added`, no longer denied otherwise.
-    pub(crate) fn note_deny_change(
-        &self,
-        pubky: &[u8; 32],
-        added: bool,
-        tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        if added {
-            tx.put(&keys::deny(pubky), &())
-        } else {
-            tx.delete(&keys::deny(pubky))
         }
     }
 

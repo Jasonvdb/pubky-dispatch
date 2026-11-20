@@ -65,6 +65,7 @@ mod owed;
 
 pub(crate) use owed::{Owed, OwedCall, owed_place};
 
+use super::list_settlement::{ListKey, ListPlacement};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -1037,6 +1038,7 @@ impl App {
         // item, and blocks the cursor there if it is still held; later pages of the read
         // carry the block on.
         let mut read = Read::new(self.tx()?, *blocked);
+        self.keep_list_placements(&checked, &mut read.tx).await?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -2421,7 +2423,7 @@ impl App {
                 return Ok(sent);
             }
         };
-        self.commit_effect(&pending, batch, &submitted.proofs)
+        self.commit_effect(&pending, batch, &submitted.proofs, None)
             .await?;
         self.check_attempts_of(batch, &submitted).await?;
         Ok(Sent::Applied)
@@ -2430,11 +2432,12 @@ impl App {
     /// The outcome of an applied effect, with the proofs its answer carried, if any: what
     /// its operations settle, the processed pair, the protocol's local writes and the
     /// cursor, in one commit.
-    pub(crate) async fn commit_effect(
+    pub(super) async fn commit_effect(
         &mut self,
         pending: &PendingEffect,
         batch: &Batch,
         proofs: &[pubky_switch_core::chain::TransitionProof],
+        historical: Option<&super::list_settlement::OldListWrites>,
     ) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = self.tx()?;
@@ -2443,8 +2446,14 @@ impl App {
             ..PendingBatch::default()
         };
         for (index, op) in batch.ops().iter().enumerate() {
-            self.settle_op(op, proofs.get(index), &settles, &mut tx)
-                .await?;
+            if let Some(plan) = historical
+                && let Some(write) = plan.get(op, index)
+            {
+                self.settle_old_op(op, write, &mut tx).await?;
+            } else {
+                self.settle_op(op, proofs.get(index), &settles, &mut tx)
+                    .await?;
+            }
         }
         processed_writes(
             &mut tx,
@@ -2533,7 +2542,7 @@ impl App {
             }
             Err(error) => return Err(error),
         };
-        self.commit_effect(&pending, batch, &proofs).await?;
+        self.commit_effect(&pending, batch, &proofs, None).await?;
         self.events.push(AppEvent::MessageReceived {
             receipt: pending.entry.receipt,
             seq: pending.seq,
@@ -3531,7 +3540,13 @@ impl App {
             if owed_to.is_empty() {
                 tx.delete(&at)?;
                 if let OwedCall::Deny { pubky, added, .. } = &call {
-                    self.note_deny_change(pubky, *added, &mut tx)?;
+                    self.apply_list_change(
+                        ListKey::Deny(pubky),
+                        *added,
+                        ListPlacement::At(FeedPosition { generation, seq }),
+                        &mut tx,
+                    )
+                    .await?;
                 }
             } else {
                 tx.put(
@@ -3637,7 +3652,16 @@ impl App {
         read: &mut Read,
     ) -> Result<bool, AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
-            self.note_deny_change(&change.pubky, change.added, &mut read.tx)?;
+            self.apply_list_change(
+                ListKey::Deny(&change.pubky),
+                change.added,
+                ListPlacement::At(FeedPosition {
+                    generation: change.generation,
+                    seq: change.seq,
+                }),
+                &mut read.tx,
+            )
+            .await?;
             return Ok(true);
         }
         self.commit_read(read).await?;
@@ -3717,7 +3741,7 @@ impl App {
             return Ok(true);
         }
         let (generation, seq) = (owed.generation, owed.seq);
-        let result = self.client.allow().await;
+        let result = self.client.observed_allow().await;
         let list = match self.take(result).await {
             Ok(list) => Some(list),
             // An answer that verifies but doesn't read: the gap is told without the list.
@@ -3738,7 +3762,7 @@ impl App {
             seq,
             denied: list
                 .as_ref()
-                .map(|list| list.deny.clone())
+                .map(|observation| observation.list.deny.clone())
                 .unwrap_or_default(),
             list_read: list.is_some(),
         };
@@ -4163,7 +4187,15 @@ impl App {
                     self.take_deny_op(&item.item, &body, change, read).await?;
                     return Ok(Step::Pass);
                 }
-                self.note_list_op(body, &mut read.tx)?;
+                self.note_list_op(
+                    body,
+                    FeedPosition {
+                        generation: envelope.generation,
+                        seq: item.seq,
+                    },
+                    &mut read.tx,
+                )
+                .await?;
                 match &body.kind {
                     OpKind::ReceiveKeyPut { record } if body.app_id == Some(me) => {
                         match self.own_registration(

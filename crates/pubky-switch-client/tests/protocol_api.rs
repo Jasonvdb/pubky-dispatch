@@ -8,6 +8,9 @@
 // The helpers set up fixed test state, where a failure is a test failure.
 #![allow(clippy::unwrap_used)]
 
+#[path = "../examples/app_host.rs"]
+mod app_host;
+
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_client::app::{
@@ -439,4 +442,76 @@ fn test_restore_context_for_a_protocols_own_tests() {
             value: b"v".to_vec()
         }]
     );
+}
+
+#[tokio::test]
+async fn test_host_wake_reads_another_page_while_a_duty_waits() {
+    use app_host::NextRead;
+    use pubky_switch_client::app::AppEvent;
+
+    let w = World::new();
+    let protocol = Arc::new(NotesProtocol::default());
+    let keys = w.alice.identity().app_keys("wallet");
+    let approval = w
+        .alice
+        .approve(
+            &keys,
+            &AppSpec::new(&["notes"]).with_permissions(&Permission::ALL),
+        )
+        .unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let env = || w.alice.env_with(store.clone(), w.router.clone());
+    let config = || AppConfig {
+        page_size: 1,
+        ..AppConfig::default()
+    };
+    let mut saved = None;
+    let joined = app_host::join_approved(env(), protocol.clone(), config(), approval, |id| {
+        saved = Some(id);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(saved, Some(joined.app_id()));
+    drop(joined);
+    let mut app = app_host::reopen(env(), protocol.clone(), config(), saved.unwrap(), |_| {})
+        .await
+        .unwrap();
+    let mut manager = w.join(&w.alice, "manager", &["notes"], &protocol).await;
+    let peer = w.bob.identity().public();
+    let id = app.queue(note(peer, "queued")).await.unwrap();
+    assert_eq!(
+        app.withdraw_queued(&peer).await.unwrap().as_slice(),
+        std::slice::from_ref(&id)
+    );
+    for index in 1..=10 {
+        manager.add_contact(&[index; 32]).await.unwrap();
+    }
+    let mut shown = false;
+    let show = |event: &AppEvent| {
+        if matches!(event, AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == id) {
+            shown = true;
+        }
+    };
+    assert_eq!(
+        app_host::on_wake(&mut app, "notes", show, |_| None)
+            .await
+            .unwrap(),
+        NextRead::ReadAgain
+    );
+    assert!(shown);
+    let first = app.cursor();
+    let mut next = NextRead::ReadAgain;
+    for _ in 0..16 {
+        if next != NextRead::ReadAgain {
+            break;
+        }
+        next = app_host::on_wake(&mut app, "notes", |_| {}, |_| None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(app.cursor().generation, first.generation);
+    assert!(app.cursor().seq > first.seq);
+    assert_eq!(next, NextRead::AttendToHostWork);
+    assert!(app.unacknowledged_events_for("notes").await.unwrap().iter().any(|event| matches!(event, AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == id)));
 }

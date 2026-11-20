@@ -101,8 +101,8 @@ pub async fn on_wake(
             && let Some(writes) = writes_for_duty(&event)
         {
             app.ack_event_with(owner, id, &writes).await?;
-        } else if let Ok(action) = &mut next {
-            *action = NextRead::AttendToHostWork;
+        } else if matches!(next, Ok(NextRead::Wait)) {
+            next = Ok(NextRead::AttendToHostWork);
         }
     }
     next

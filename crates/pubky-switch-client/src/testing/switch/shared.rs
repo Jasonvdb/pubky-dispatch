@@ -473,7 +473,7 @@ impl Shared {
                     entries[slot] = retained;
                 }
             }
-            if let Some(slot) = comparison.remove {
+            for slot in comparison.remove {
                 let entries = self.divergent.get_mut(&key).expect("retained slot");
                 entries.remove(slot);
                 if entries.is_empty() {

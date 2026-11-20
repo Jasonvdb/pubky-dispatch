@@ -120,6 +120,8 @@ enum RecordMerge {
     Fill,
     /// It succeeds a record held only from uploads.
     Replace,
+    /// A retained operation and the current write are now ordered; release its retained slot.
+    OrderedRetained { position: usize, newer: bool },
     /// It becomes current, with the displaced operation reported as divergent.
     ReplaceDivergent {
         /// Where to keep the displaced operation: the incoming operation's former slot,
@@ -168,6 +170,9 @@ fn merge_record(
                 };
             }
             let previous = kept.iter().position(|hash| *hash == upload.op_hash);
+            if previous.is_some() && !upload.version.exact {
+                return RecordMerge::Unchanged;
+            }
             let order = match (upload.version.exact, version.exact) {
                 (true, true) if upload.built_on != built_on => {
                     Some(upload.version.version.cmp(&version.version))
@@ -176,10 +181,15 @@ fn merge_record(
                 (true, false) if built_on == upload.version.version => Some(Ordering::Less),
                 _ => None,
             };
-            match order {
-                Some(Ordering::Greater) if previous.is_none() => RecordMerge::Replace,
-                Some(Ordering::Less) => RecordMerge::Unchanged,
-                Some(Ordering::Greater) => RecordMerge::ReplaceDivergent { position: previous },
+            match (order, previous) {
+                (Some(Ordering::Greater | Ordering::Less), Some(position)) => {
+                    RecordMerge::OrderedRetained {
+                        position,
+                        newer: order == Some(Ordering::Greater),
+                    }
+                }
+                (Some(Ordering::Greater), None) => RecordMerge::Replace,
+                (Some(Ordering::Less), None) => RecordMerge::Unchanged,
                 _ if upload.version.exact && !version.exact => RecordMerge::ReplaceDivergent {
                     position: previous.or((kept.len() < max_divergent).then_some(kept.len())),
                 },
@@ -247,14 +257,14 @@ pub enum RecordSource {
 }
 
 /// Changes to the current operation and the bounded list of retained conflicts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordComparison {
     /// Install this operation at the upload transition, and list its key in `records`.
     pub install: Option<RecordSource>,
     /// Store this operation at the given position, before removing any resolved conflict.
     pub keep: Option<(usize, RecordSource)>,
-    /// Remove a resolved conflict from its former position.
-    pub remove: Option<usize>,
+    /// Remove these resolved conflicts in descending position order after writing `keep`.
+    pub remove: Vec<usize>,
     /// The proved immediate predecessor of the selected current operation, when known.
     pub parent: Option<[u8; 32]>,
     /// List the key in the upload transition's `divergent` member.
@@ -292,6 +302,10 @@ pub fn merge_checked_record<'a>(
         RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
             comparison.install = Some(Incoming)
         }
+        RecordMerge::OrderedRetained { position, newer } => {
+            comparison.install = Some(if newer { Incoming } else { Current });
+            comparison.remove.push(position);
+        }
         RecordMerge::ReplaceDivergent { position } => {
             comparison.install = Some(Incoming);
             comparison.keep = position.map(|i| (i, Current));
@@ -327,11 +341,12 @@ pub fn merge_checked_record<'a>(
     // application and the set of conflicts can remain as they are.
     if candidate.op_hash != op_hash
         && built_on == candidate.version.version
-        && decision == RecordMerge::Unchanged
+        && matches!(
+            decision,
+            RecordMerge::Unchanged | RecordMerge::OrderedRetained { newer: false, .. }
+        )
     {
         comparison.parent = Some(candidate.op_hash);
-        comparison.remove = previous;
-        comparison.install = previous.map(|_| Current);
         return comparison;
     }
     let mut successor = None;
@@ -355,9 +370,14 @@ pub fn merge_checked_record<'a>(
         && let Some(slot) = successor
     {
         comparison.install = Some(Retained(slot));
-        comparison.remove = Some(slot);
+        if matches!(decision, RecordMerge::ReplaceDivergent { .. }) && previous.is_none() {
+            comparison.keep = Some((slot, Current));
+        } else {
+            comparison.remove.push(slot);
+        }
         comparison.parent = Some(candidate.op_hash);
     }
+    comparison.remove.sort_unstable_by(|a, b| b.cmp(a));
     comparison
 }
 

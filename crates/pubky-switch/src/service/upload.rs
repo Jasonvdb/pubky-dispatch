@@ -468,7 +468,7 @@ impl Service {
                     at.divergent[slot] = keep;
                 }
             }
-            if let Some(slot) = comparison.remove {
+            for slot in comparison.remove {
                 txn.remove_divergent_upload(&key, slot, at.divergent.len())
                     .await
                     .map_err(stored)?;

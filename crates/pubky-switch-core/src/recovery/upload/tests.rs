@@ -618,6 +618,78 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
     assert!(check(&body, &[]).settled.is_empty());
 }
 
+/// A signed write on the given base, with its ordinary lost-service receipt if supplied.
+fn checked_write(base: u64, applied: Option<u64>) -> CheckedRecord {
+    let op = op_at(LOST, OpKind::RecordPut(put(RecordVersion::new(LOST, base))));
+    let proof = applied.map(|n| record_proof(&op, RecordVersion::new(LOST, n), NOW));
+    check(&body_with(vec![uploaded(&op, proof)], vec![]), &[])
+        .records
+        .remove(0)
+}
+
+fn compare(
+    current: &CheckedRecord,
+    kept: &[&CheckedRecord],
+    incoming: &CheckedRecord,
+    limit: usize,
+) -> crate::recovery::RecordComparison {
+    use crate::recovery::{HeldRecord, merge_checked_record};
+    let hashes: Vec<_> = kept.iter().map(|r| r.uploaded.op_hash).collect();
+    let held = HeldRecord::FromUpload {
+        op_hash: current.uploaded.op_hash,
+        built_on: current.uploaded.built_on,
+        version: current.uploaded.version,
+        divergent: &hashes,
+    };
+    let state = crate::shared::RecordState::after(
+        &current.put,
+        LOST,
+        current.uploaded.version.version.version,
+    );
+    merge_checked_record(
+        &held,
+        Some(&state),
+        None,
+        kept.iter().copied().enumerate(),
+        incoming,
+        limit,
+    )
+}
+
+#[test]
+fn test_recovery_a_promoted_successor_frees_space_for_the_displaced_write() {
+    use crate::recovery::RecordSource;
+    let current = checked_write(9, None);
+    let child = checked_write(50, None);
+    let other = checked_write(55, None);
+    let proved = checked_write(10, Some(50));
+    let result = compare(&current, &[&other, &child], &proved, 2);
+    assert_eq!(result.install, Some(RecordSource::Retained(1)));
+    assert_eq!(result.keep, Some((1, RecordSource::Current)));
+    assert!(result.remove.is_empty());
+    assert!(result.divergent);
+}
+
+#[test]
+fn test_recovery_two_ordered_receipts_clear_the_old_conflict_in_either_order() {
+    use crate::recovery::RecordSource;
+    let older = checked_write(10, Some(30));
+    let newer = checked_write(37, Some(50));
+    let without_receipt = |r: &CheckedRecord| {
+        CheckedRecord::from_storage(r.op.clone(), r.cert.clone(), None).unwrap()
+    };
+    let promoted = compare(&older, &[&without_receipt(&newer)], &newer, 1);
+    assert_eq!(promoted.install, Some(RecordSource::Incoming));
+    assert_eq!(promoted.remove, [0]);
+    assert!(promoted.keep.is_none() && !promoted.divergent);
+    let resolved = compare(&newer, &[&without_receipt(&older)], &older, 1);
+    assert_eq!(resolved.install, Some(RecordSource::Current));
+    assert_eq!(resolved.remove, [0]);
+    assert!(resolved.keep.is_none() && !resolved.divergent);
+    let replay = compare(&newer, &[], &older, 1);
+    assert_eq!(replay, Default::default());
+}
+
 #[test]
 fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
     use crate::recovery::{HeldRecord, RecordSource, merge_checked_record};
@@ -656,7 +728,7 @@ fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
             hashes.len(),
         );
         assert_eq!(result.install, Some(selected));
-        assert_eq!(result.remove, removed);
+        assert_eq!(result.remove, removed.into_iter().collect::<Vec<_>>());
         assert_eq!(result.keep, None);
     }
 }

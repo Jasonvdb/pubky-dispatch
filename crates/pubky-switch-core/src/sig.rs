@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::enc::{b64, hash, lp, unb64, unb64_array};
 use crate::error::{Error, Result};
-use crate::json::{Doc, parse_json_as};
-use crate::labels;
+use crate::json::parse_json;
 
 /// The signature input: `lp(label, field1, ..., fieldn)` (Switch wire 2.1).
 pub fn signed_bytes(label: &str, fields: &[&[u8]]) -> Vec<u8> {
@@ -188,9 +187,6 @@ impl SignedDoc {
 
     /// Verify, then parse the body strictly (Switch wire 1.1, 2.2).
     ///
-    /// The label names the document, and with it its opaque members: an operation's, a
-    /// service transition's, or none.
-    ///
     /// # Errors
     ///
     /// As [`SignedDoc::verify`], and [`Error::Invalid`] if the body isn't strict JSON of
@@ -201,12 +197,7 @@ impl SignedDoc {
         label: &str,
         prefix: &[&[u8]],
     ) -> Result<T> {
-        let doc = match label {
-            labels::sig::OP => Doc::Op,
-            labels::sig::SERVICE_OP => Doc::ServiceOp,
-            _ => Doc::Plain,
-        };
-        parse_json_as(&self.verify(public, label, prefix)?, doc)
+        parse_json(&self.verify(public, label, prefix)?)
     }
 
     /// Parse the body without verifying, to find the key that must verify it (an app
@@ -217,7 +208,7 @@ impl SignedDoc {
     ///
     /// [`Error::Invalid`] if the body doesn't decode or isn't strict JSON of type `T`.
     pub fn peek<T: DeserializeOwned>(&self) -> Result<T> {
-        parse_json_as(&self.body_bytes()?, Doc::SignedBody)
+        parse_json(&self.body_bytes()?)
     }
 
     /// The compact form `<body>.<sig>`, as headers carry it (Switch wire 2.2).
@@ -255,6 +246,7 @@ impl SignedDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels;
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[9; 32])

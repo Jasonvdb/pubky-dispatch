@@ -10,7 +10,7 @@ use super::{CHUNK_KIND, MAX_CHUNK_BYTES, bad, reason};
 use crate::enc::hash;
 use crate::error::Result;
 use crate::http::ErrorCode;
-use crate::json::{Doc, MAX_INT, parse_json_as};
+use crate::json::{MAX_INT, parse_json};
 use crate::ops::Refusal;
 
 /// A chunk (Switch wire 10.3): `v`, `kind`, its `index` in the manifest's `chunks`, the
@@ -68,12 +68,11 @@ impl Chunk {
         Ok(frame(self.index, self.first, &parts))
     }
 
-    /// Read a chunk's own members and its parts as JSON values: strict JSON whose opaque
-    /// members are the parts' invite code contexts (Switch wire 1.1), `v` 1 and `kind`
-    /// [`CHUNK_KIND`].
+    /// Read a chunk's members and parts as strict JSON (Switch wire 1.1), with `v` 1 and
+    /// `kind` [`CHUNK_KIND`].
     fn read_values(bytes: &[u8]) -> std::result::Result<(u64, u64, Vec<Value>), Refusal> {
         let fail = |why: &str| Err(bad(format!("Switch wire 10.3: {why}")));
-        let v: Value = parse_json_as(bytes, Doc::ExportChunk).map_err(|e| bad(reason(e)))?;
+        let v: Value = parse_json(bytes).map_err(|e| bad(reason(e)))?;
         if v.get("v").and_then(Value::as_u64) != Some(1)
             || v.get("kind").and_then(Value::as_str) != Some(CHUNK_KIND)
         {

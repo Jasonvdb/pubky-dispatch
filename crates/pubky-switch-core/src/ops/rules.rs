@@ -21,10 +21,6 @@ use crate::sig::SignedDoc;
 /// 9.2).
 pub const MAX_INVITE_USES: u64 = 100;
 
-/// The longest invite code context, as its writer serialized it (Switch wire 6.2): else `413
-/// too_large`.
-pub const MAX_INVITE_CONTEXT_BYTES: usize = 1024;
-
 /// The writer of an operation, as the service authenticated it (Switch wire 7.2).
 #[derive(Clone, Copy, Debug)]
 pub enum Writer<'a> {
@@ -108,7 +104,7 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
 ///   past the cap); `id_inputs` on a create and only then, and at creation the key and the
 ///   collection recomputed from them, the policy hash and the identity; and, at a
 ///   permanent policy, its rule ([`check_permanent`]);
-/// - `invite_code.put`: at least one use, and its context at most 1024 bytes (`413`);
+/// - `invite_code.put`: at least one use;
 /// - `receive_key.put`: a record whose key isn't of low order and whose `suite_keys` has the
 ///   right form;
 /// - `key_bundle.put`: `first_epoch` at most `last_epoch`, and the bundle's signature (`401
@@ -166,14 +162,6 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
         OpKind::InviteCodePut(put) => {
             if put.max_uses == 0 {
                 return bad("an invite code's max_uses is at least 1");
-            }
-            // Measured as the writer wrote it, whitespace and escapes included, so that the
-            // service and every reader count the same bytes.
-            if put.context.written_len() > MAX_INVITE_CONTEXT_BYTES {
-                return Err(Refusal::new(
-                    ErrorCode::TooLarge,
-                    "Switch wire 6.2: an invite code context over 1024 bytes as written",
-                ));
             }
             Ok(())
         }
@@ -533,7 +521,7 @@ mod tests {
     use crate::claims::{ClaimFields, ClaimType};
     use crate::ident::{NamingKey, Policy};
     use crate::keys::{AppKeys, ReceiveKey};
-    use crate::ops::body::{BatchRef, IdInputs, InviteContext, RecordPut, RecordVersion};
+    use crate::ops::body::{BatchRef, IdInputs, RecordPut, RecordVersion};
     use crate::records::KeyBundle;
     use crate::records::{AppCertBody, AppRecordBody, DEFAULT_CERT_LIFETIME_MS};
     use crate::sealed::SealedValue;
@@ -674,7 +662,6 @@ mod tests {
                 code_hash: [1; 32],
                 expires_at: ISSUED,
                 max_uses: 1,
-                context: InviteContext::new(json!(null)),
             }),
             OpKind::InviteCodeDelete { code_hash: [1; 32] },
             OpKind::AppPut {
@@ -892,45 +879,15 @@ mod tests {
 
     #[test]
     fn test_shape_of_an_invite_and_a_bundle() {
-        let invite = |uses: u64, context: serde_json::Value| {
+        let invite = |uses: u64| {
             OpKind::InviteCodePut(InviteCodePut {
                 code_hash: [1; 32],
                 expires_at: ISSUED,
                 max_uses: uses,
-                context: InviteContext::new(context),
             })
         };
-        assert!(check_shape(&body(invite(1, json!({"ref": "x"})))).is_ok());
-        assert_eq!(
-            check_shape(&body(invite(0, json!(null))))
-                .unwrap_err()
-                .status(),
-            400
-        );
-        let long = json!("x".repeat(1100));
-        assert_eq!(
-            check_shape(&body(invite(1, long))).unwrap_err().status(),
-            413
-        );
-        // Measured as written in the signed body: 1,024 bytes pass, and a context whose
-        // whitespace takes it past 1,024 bytes is refused, though compacted it would pass.
-        let at_limit = |pad: usize| {
-            let written = format!(r#"{{{}"ref":"{}"}}"#, " ".repeat(pad), "x".repeat(1000));
-            let text = String::from_utf8(body(invite(1, json!({}))).to_json().unwrap())
-                .unwrap()
-                .replace(r#""context":{}"#, &format!(r#""context":{written}"#));
-            OpBody::parse(text.as_bytes()).unwrap()
-        };
-        let compact_len = 1000 + r#"{"ref":""}"#.len();
-        let fits = at_limit(MAX_INVITE_CONTEXT_BYTES - compact_len);
-        assert!(check_shape(&fits).is_ok());
-        let over = at_limit(MAX_INVITE_CONTEXT_BYTES - compact_len + 1);
-        let OpKind::InviteCodePut(put) = &over.kind else {
-            unreachable!()
-        };
-        assert_eq!(put.context.written_len(), MAX_INVITE_CONTEXT_BYTES + 1);
-        assert!(serde_json::to_vec(put.context.value()).unwrap().len() < MAX_INVITE_CONTEXT_BYTES);
-        assert_eq!(check_shape(&over).unwrap_err().status(), 413);
+        assert!(check_shape(&body(invite(1))).is_ok());
+        assert_eq!(check_shape(&body(invite(0))).unwrap_err().status(), 400);
         let id = identity();
         let target = [5u8; 16];
         let envelope = vec![1u8, 2, 3];
@@ -1247,7 +1204,6 @@ mod tests {
             code_hash: [1; 32],
             expires_at: ISSUED,
             max_uses: uses,
-            context: InviteContext::new(json!({})),
         };
         assert!(check_invite_code_put(&put(100), MAX_INVITE_USES, false).is_ok());
         assert_eq!(

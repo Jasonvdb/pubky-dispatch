@@ -2208,6 +2208,185 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
 }
 
 #[tokio::test]
+async fn test_proved_contact_add_and_removal_contribute_to_the_recovery_upload() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let old = w.bob.public();
+    let added = IdentityKey::from_secret(seed("carol/identity")).public();
+    let formerly_denied = IdentityKey::from_secret(seed("previous/identity")).public();
+    let denied = IdentityKey::from_secret(seed("restricted/identity")).public();
+    app.add_contact(&old).await.unwrap();
+    app.deny(&formerly_denied).await.unwrap();
+    let changes = crate::app::OpBatch::new()
+        .op(OpKind::AllowDelete {
+            pubky: old,
+            kind: AllowKind::Contact,
+        })
+        .op(OpKind::AllowPut {
+            pubky: added,
+            kind: AllowKind::Contact,
+        })
+        .op(OpKind::DenyDelete {
+            pubky: formerly_denied,
+        })
+        .op(OpKind::DenyPut { pubky: denied });
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let kept = app
+        .submit_batch(changes)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    app.receive(None).await.unwrap();
+    assert!(matches!(
+        app.kept_batch(kept).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Kept { .. })
+    ));
+    assert!(app.admits(&old).await.unwrap());
+    assert!(!app.admits(&added).await.unwrap());
+
+    let key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    router.remove(ORIGIN);
+    app.refresh_identity().await.unwrap();
+    app.follow_provider().await.unwrap();
+    assert!(matches!(
+        app.kept_batch(kept).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
+    let lists = next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the loss list upload");
+    assert_eq!(
+        lists["contacts"],
+        json!([pubky_switch_core::enc::pubky_id(&added)])
+    );
+    assert_eq!(
+        lists["deny"],
+        json!([pubky_switch_core::enc::pubky_id(&denied)])
+    );
+}
+
+#[tokio::test]
+async fn test_signed_list_before_upload_preserves_the_contact_contribution() {
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(
+        store.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+        false,
+        true,
+    )
+    .await;
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    lost.next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::Unavailable,
+        current: json!({}),
+    });
+    app.refresh_identity().await.unwrap();
+    assert_eq!(
+        app.follow_provider().await.unwrap_err().code(),
+        Some(ErrorCode::Unavailable)
+    );
+    let progress = app.recovery_info().await.unwrap().unwrap();
+    assert!(matches!(
+        progress.step,
+        crate::app::RecoveryStep::Upload | crate::app::RecoveryStep::Lists
+    ));
+    let before = app.allow_list().await.unwrap();
+    assert!(before.contacts.is_empty() && before.deny.is_empty());
+    assert!(!app.admits(&lost.carol).await.unwrap());
+    drop(app);
+    let mut app = load_loss(&lost, store).await.unwrap();
+    app.follow_provider().await.unwrap();
+    let lists = app.allow_list().await.unwrap();
+    assert_eq!(
+        lists.contacts,
+        [lost.carol],
+        "the new service still needed the original contact contribution"
+    );
+    assert_eq!(lists.deny, [lost.dave]);
+}
+
+/// Resume the original list upload from a real backup taken after registration and
+/// the evidence upload. The replacement's signed empty list was already observed.
+async fn restore_owed_lists(layered: bool) {
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(
+        store.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+        true,
+        true,
+    )
+    .await;
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    lost.next.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
+    assert!(app.allow_list().await.unwrap().contacts.is_empty());
+    let backup = if layered {
+        app.backup_layered().await.unwrap()
+    } else {
+        app.backup().await.unwrap()
+    };
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    drop(app);
+    let fresh = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let mut restored = App::restore(
+        lost.router.env(&lost.w, fresh),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.follow_provider().await.unwrap();
+    let observed = restored.allow_list().await.unwrap();
+    assert_eq!(observed.contacts, [lost.carol]);
+    assert_eq!(observed.deny, [lost.dave]);
+    let count = || {
+        lost.next
+            .uploads()
+            .into_iter()
+            .filter(|(body, _)| body.get("lists").is_some())
+            .count()
+    };
+    assert_eq!(count(), 1);
+    restored.follow_provider().await.unwrap();
+    assert_eq!(count(), 1);
+}
+
+#[tokio::test]
+async fn test_plain_backup_before_list_upload_resumes_the_original_contribution() {
+    restore_owed_lists(false).await;
+}
+
+#[tokio::test]
+async fn test_layered_backup_before_list_upload_resumes_the_original_contribution() {
+    restore_owed_lists(true).await;
+}
+
+#[tokio::test]
 async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
     // The next switch merges the app's record and lists, and its contacts, from an app
     // holding `lists.manage`, end staged admission (Switch spec 12.6 step 2, wire 7.4.14).

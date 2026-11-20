@@ -2508,6 +2508,171 @@ async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
 }
 
 #[tokio::test]
+async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        w.store.clone(),
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+    )
+    .await;
+    // Two real signed list reads, each within the default quotas. The
+    // replacement's rows are disjoint from those still owed to it.
+    let fill = |service: &ScriptedSwitch, contact_domain, deny_domain| {
+        let peers = |domain| {
+            (0u32..80_000).map(move |n| {
+                let mut id = [domain; 32];
+                id[28..].copy_from_slice(&n.to_be_bytes());
+                id
+            })
+        };
+        let mut state = service.lock();
+        state.shared.contacts.extend(peers(contact_domain));
+        state.shared.deny.extend(peers(deny_domain));
+    };
+    fill(&w.switch, 1, 2);
+    let first = app.allow_list().await.unwrap();
+    assert_eq!((first.contacts.len(), first.deny.len()), (80_000, 80_000));
+    drop(first);
+    app.keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
+        .await
+        .unwrap();
+    let key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    router.remove(ORIGIN);
+    next.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
+    fill(&next, 3, 4);
+    let replacement = app.allow_list().await.unwrap();
+    assert_eq!(
+        (replacement.contacts.len(), replacement.deny.len()),
+        (80_000, 80_000)
+    );
+    drop(replacement);
+    let third = third_recovering(&w, &router, 3, 2);
+    {
+        let mut service = third.lock();
+        service.max_contacts = 1;
+        service.max_deny = 1;
+    }
+    // The evidence POST and first list page are answered. The service commits
+    // the second page, then the client loses its answer.
+    third.fail_next(Fault::LoseAnswerAfter {
+        path: "recovery/upload".into(),
+        after: 2,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
+    assert!(!third.lock().admission_staged);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.follow_provider().await.unwrap();
+    assert!(restored.recovery_info().await.unwrap().unwrap().steps_done);
+    let uploads = third.uploads();
+    let pages: Vec<_> = uploads
+        .iter()
+        .filter_map(|(body, _)| body.get("lists"))
+        .collect();
+    assert_eq!(pages.len(), 3);
+    let first_count = pages[0]["contacts"].as_array().unwrap().len();
+    assert!(first_count > 0 && first_count < 160_000);
+    assert_eq!(pages[0]["deny"].as_array().unwrap().len(), 160_000);
+    assert_eq!(
+        pages[1]["contacts"].as_array().unwrap().len(),
+        160_000 - first_count
+    );
+    assert!(pages[1]["deny"].as_array().unwrap().is_empty());
+    assert!(pages[1] == pages[2], "the same final page was retried");
+    assert_eq!(third.lock().shared.contacts.len(), 1);
+    assert_eq!(third.lock().shared.deny.len(), 1);
+}
+
+#[tokio::test]
+async fn test_refused_list_upload_remains_owed_after_reopen() {
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(
+        store.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+        true,
+        true,
+    )
+    .await;
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    lost.next.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    lost.next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!({}),
+    });
+    assert!(matches!(
+        app.follow_provider().await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
+    assert!(
+        lost.next
+            .uploads()
+            .iter()
+            .all(|(body, _)| body.get("lists").is_none())
+    );
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut app = App::restore(
+        lost.router.env(&lost.w, store),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    app.follow_provider().await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    let lists = app.allow_list().await.unwrap();
+    assert_eq!(lists.contacts, [lost.carol]);
+    assert_eq!(lists.deny, [lost.dave]);
+}
+
+#[tokio::test]
 async fn test_read_only_recovery_without_denies_keeps_an_earlier_backup_restorable() {
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let lost = lost_world_with(store.clone(), &[Permission::ListsRead], false, false).await;

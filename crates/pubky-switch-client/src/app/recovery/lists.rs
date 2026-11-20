@@ -524,6 +524,23 @@ impl SavedLists {
                 return Err(invalid());
             }
         }
+        if let Some(remaining) = &self.remaining {
+            // A later observation may reduce the original contribution. Peers
+            // learned at the replacement have their own origin in the backup.
+            for (old, reduced) in [
+                (&self.input.contacts, &remaining.contacts),
+                (&self.input.deny, &remaining.deny),
+            ] {
+                let old = ids(old).map_err(|_| invalid())?;
+                if ids(reduced)
+                    .map_err(|_| invalid())?
+                    .iter()
+                    .any(|id| old.binary_search(id).is_err())
+                {
+                    return Err(invalid());
+                }
+            }
+        }
         let completed = backup.finished_list_upload == Some(target);
         if self.waiting.is_none() != completed
             || backup

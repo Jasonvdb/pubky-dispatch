@@ -1024,7 +1024,8 @@ impl App {
         let (body, step) = cursor.page(&input, cap)?;
         match self.upload_here(body).await? {
             inventory::UploadReply::Answered(answer)
-                if answer.head.is_some() && answer.proof.is_some() && answer.result.is_some() =>
+                if inventory::checked_upload(&answer, self.state.meta.app_id, loss.generation)
+                    .is_some() =>
             {
                 Ok(step)
             }

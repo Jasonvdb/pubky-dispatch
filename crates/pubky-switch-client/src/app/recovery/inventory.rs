@@ -159,6 +159,45 @@ enum StoredOutcome {
     Answered { head: Value, proof: SignedDoc },
 }
 
+fn matches_proof(
+    app_id: [u8; 16],
+    generation: u64,
+    head: &SignedHead,
+    proof: &TransitionProof,
+) -> bool {
+    let env = proof.envelope();
+    matches!(ServiceTransition::from_value(&proof.body().state),
+            Ok(ServiceTransition::Upload { by, at, .. }) if by == app_id && at == env.server_time)
+        && head.generation == generation
+        && env.generation == generation
+        && env.item_type == ItemType::Service
+        && proof.body().object == "upload"
+        && env.seq == head.seq
+        && proof.body().chain.chain_hash == head.chain_hash
+}
+
+/// The precise result of an upload at the current lost account. The signed
+/// transition identifies the submitter, the service position and the changes.
+pub(super) fn checked_upload(
+    answer: &UploadAnswer,
+    app_id: [u8; 16],
+    generation: u64,
+) -> Option<(&SignedHead, &TransitionProof)> {
+    let (head, proof, result) = (
+        answer.head.as_ref()?,
+        answer.proof.as_ref()?,
+        answer.result.as_ref()?,
+    );
+    let changes = proof.body().state.get("changes")?;
+    (matches_proof(app_id, generation, head, proof)
+        && Obj::of(changes, "Switch wire 7.4.14: upload changes")
+            .and_then(UploadChanges::read)
+            .ok()
+            .as_ref()
+            == Some(result))
+    .then_some((head, proof))
+}
+
 impl Attempt {
     fn key(&self) -> String {
         format!(
@@ -167,18 +206,6 @@ impl Attempt {
             b64(&self.body.hash),
             b64(&self.omitted.hash)
         )
-    }
-
-    fn matches_proof(&self, head: &SignedHead, proof: &TransitionProof) -> bool {
-        let env = proof.envelope();
-        matches!(ServiceTransition::from_value(&proof.body().state),
-            Ok(ServiceTransition::Upload { by, at, .. }) if by == self.app_id && at == env.server_time)
-            && head.generation == self.generation
-            && env.generation == self.generation
-            && env.item_type == ItemType::Service
-            && proof.body().object == "upload"
-            && env.seq == head.seq
-            && proof.body().chain.chain_hash == head.chain_hash
     }
 
     fn outcome(&self) -> Result<LossUploadOutcome, AppError> {
@@ -193,7 +220,7 @@ impl Attempt {
                 let head = SignedHead::from_value(head)?;
                 head.verify(&self.service_key, &self.identity)?;
                 let proof = TransitionProof::verify(proof, &self.service_key, &self.identity)?;
-                if !self.matches_proof(&head, &proof) {
+                if !matches_proof(self.app_id, self.generation, &head, &proof) {
                     return Err(corrupt());
                 }
                 LossUploadOutcome::Answered {
@@ -411,23 +438,10 @@ impl App {
             UploadReply::TooLarge => StoredOutcome::TooLarge,
             UploadReply::Refused(code) => StoredOutcome::Refused(code.as_str().to_owned()),
             UploadReply::Answered(answer) => {
-                let (Some(head), Some(proof), Some(result)) =
-                    (answer.head, answer.proof, answer.result)
+                let Some((head, proof)) = checked_upload(&answer, entry.app_id, entry.generation)
                 else {
                     return Ok(());
                 };
-                let Some(changes) = proof.body().state.get("changes") else {
-                    return Ok(());
-                };
-                if !entry.matches_proof(&head, &proof)
-                    || Obj::of(changes, "Switch wire 7.4.14: upload changes")
-                        .and_then(UploadChanges::read)
-                        .ok()
-                        .as_ref()
-                        != Some(&result)
-                {
-                    return Ok(());
-                }
                 StoredOutcome::Answered {
                     head: head.to_value(),
                     proof: proof.signed().clone(),

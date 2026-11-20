@@ -791,6 +791,14 @@ async fn test_inbox_invitation_follows_each_distinct_delivery() {
     .await;
     assert_eq!(second.status, 200);
     let ordinary_envelope = to_wallet(23, false);
+    let spent = from_shop(
+        &replay,
+        ordinary_envelope.clone(),
+        version,
+        Some(&second_code),
+    )
+    .await;
+    assert_eq!(code_of(&spent), (403, json!("not_admitted")));
     let ordinary = from_shop(&replay, ordinary_envelope.clone(), version, None).await;
     assert_eq!(ordinary.status, 200);
     let page = feed(&replay, "1:9").await;

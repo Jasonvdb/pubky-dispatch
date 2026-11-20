@@ -69,7 +69,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::state::Tx;
+use super::state::{Tx, key};
 use super::{App, AppError};
 
 /// Where an item stands in feed order, as [`App::feed_order`] gives it.
@@ -77,6 +77,11 @@ pub(crate) type FeedOrder = (u8, u64, u64);
 
 /// `told/<name>`: how far protocol `name` has been told ([`Told`]).
 pub(crate) const TOLD_PREFIX: &str = "told/";
+
+/// No more events or calls are due to a departed app's protocols (Switch spec 12.3).
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[key::DUTY_PREFIX, key::OWED_PREFIX, TOLD_PREFIX])
+}
 
 fn told_key(name: &str) -> String {
     format!("{TOLD_PREFIX}{name}")

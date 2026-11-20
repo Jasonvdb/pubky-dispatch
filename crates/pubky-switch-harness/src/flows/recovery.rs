@@ -12,6 +12,10 @@
 //! chain. What an upload merges is in [`super::upload`].
 
 #[cfg(test)]
+mod member;
+#[cfg(test)]
+pub(super) use member::{app_env, join_member};
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;

@@ -15,6 +15,7 @@
 pub mod answers;
 mod batch;
 mod calls;
+pub(crate) mod own;
 pub(crate) mod read;
 
 pub use batch::{Batch, Submitted};
@@ -533,8 +534,64 @@ pub(crate) struct ComparedTimes {
     pub(crate) backwards: Option<(u64, u64)>,
 }
 
+/// What the pinned service's answer to an own signed request establishes (Switch spec 12.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnAnswer {
+    /// A verified recovery refusal, including its signed time even though that time
+    /// is excluded from service-clock comparisons (Switch wire 7.6).
+    Notice {
+        notice: Option<http::RecoveryNotice>,
+        time_ms: u64,
+    },
+    /// The generation of a verified successful answer's head, if it carried one.
+    Success(Option<u64>),
+    /// The service answered a signed request, without confirming a usable account.
+    Answered,
+    /// No verified usable answer to this call.
+    Unavailable,
+    /// A signed refusal saying this service doesn't host the account.
+    NotHosted,
+}
+
+impl OwnAnswer {
+    pub(crate) fn from_response(
+        result: Result<&CheckedResponse, &ClientError>,
+        response: &Response,
+    ) -> Option<Self> {
+        match result {
+            Ok(answer) => Some(OwnAnswer::Success(answer.head.map(|head| head.generation))),
+            Err(error) => match error {
+                ClientError::Switch {
+                    code: ErrorCode::RecoveryRequired,
+                    current,
+                    ..
+                } => response
+                    .header(header::SERVER_TIME)
+                    .and_then(|s| parse_rfc3339(s).ok())
+                    .map(|time_ms| OwnAnswer::Notice {
+                        notice: http::RecoveryNotice::from_current(current).ok(),
+                        time_ms,
+                    }),
+                ClientError::Switch {
+                    code: ErrorCode::Unavailable,
+                    ..
+                } => Some(OwnAnswer::Unavailable),
+                error if error.is_not_hosted() => Some(OwnAnswer::NotHosted),
+                ClientError::Switch { .. } | ClientError::BodyUnread { .. } => {
+                    Some(OwnAnswer::Answered)
+                }
+                ClientError::BadServiceSignature { .. }
+                | ClientError::InvalidResponse(_)
+                | ClientError::Chain(_) => Some(OwnAnswer::Unavailable),
+                _ => None,
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 struct CallTimes {
+    own: Option<OwnAnswer>,
     latest: Option<u64>,
     compared: Option<ComparedTimes>,
 }
@@ -580,6 +637,8 @@ pub struct SwitchClient {
     last_server_time: Mutex<Option<u64>>,
     latest_server_time: Mutex<Option<u64>>,
     call_times: Mutex<CallTimes>,
+    own_hold: Option<u64>,
+    pub(crate) own_reads: Option<Arc<own::OwnReads>>,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
 }
@@ -638,6 +697,8 @@ impl SwitchClient {
             last_server_time: Mutex::new(None),
             latest_server_time: Mutex::new(None),
             call_times: Mutex::new(CallTimes::default()),
+            own_hold: None,
+            own_reads: None,
             transport,
             clock,
         })
@@ -748,6 +809,43 @@ impl SwitchClient {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .compared
+    }
+
+    /// Consume only the evidence from the own signed request just taken by the app.
+    pub(crate) fn take_own_answer(&self) -> Option<OwnAnswer> {
+        self.call_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .own
+            .take()
+    }
+
+    /// A hold set only by the app for its own followed service (Switch spec 12.6).
+    pub(crate) fn hold_own_writes(&mut self, generation: Option<u64>) {
+        self.own_hold = generation;
+    }
+
+    pub(crate) fn follow_own_reads(
+        &mut self,
+        generation: u64,
+        notice: Option<own::RecoveryNotice>,
+        prior: Option<&Self>,
+    ) {
+        self.own_reads = prior
+            .filter(|client| {
+                client.account == self.account
+                    && client.origin == self.origin
+                    && client.pinned_key() == self.pinned_key()
+            })
+            .and_then(|client| client.own_reads.as_ref())
+            .filter(|reads| reads.generation == generation)
+            .cloned()
+            .or_else(|| {
+                Some(Arc::new(own::OwnReads::new(
+                    generation,
+                    notice.filter(|n| n.generation == generation),
+                )))
+            });
     }
 
     /// Forget the latest call's times, before a call.
@@ -1127,6 +1225,13 @@ impl SwitchClient {
         request: Request,
         first: Option<&crate::transport::FirstSend>,
     ) -> Result<Response, ClientError> {
+        if request.method != "GET"
+            && let Some(generation) = self
+                .own_hold
+                .or_else(|| self.own_reads.as_ref()?.held_generation())
+        {
+            return Err(ClientError::OwnRecoveryRequired { generation });
+        }
         check_body_cap(&request.method, &request.path_and_query, &request.body)?;
         self.check_request_binding(&request)?;
         match first {
@@ -1262,7 +1367,25 @@ impl SwitchClient {
     ) -> Result<CheckedResponse, CallError> {
         *public_time = None;
         let sent = SentRequest::of(&signed.request);
-        let response = self.send_response_before(signed.request, first).await?;
+        let own = matches!(&self.credentials, Credentials::App { identity, .. } if *identity == self.account)
+            && !sent.headers.values(header::SIGNATURE).is_empty();
+        let ordered = if own && let Some(reads) = &self.own_reads {
+            Some((reads, reads.issue()?))
+        } else {
+            None
+        };
+        let response = match self.send_response_before(signed.request, first).await {
+            Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. }))
+                if own =>
+            {
+                self.call_times
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .own = Some(OwnAnswer::Unavailable);
+                return Err(error.into());
+            }
+            result => result?,
+        };
         let key = match success_key {
             Some(success) if (200..300).contains(&response.status) => success,
             _ => key,
@@ -1311,6 +1434,19 @@ impl SwitchClient {
         } else {
             checked
         };
+        if own {
+            let observation = OwnAnswer::from_response(
+                checked.as_ref().map_err(|failure| &failure.error),
+                &response,
+            );
+            self.call_times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .own = observation;
+            if let (Some((reads, order)), Some(answer)) = (ordered, observation) {
+                reads.observe(order.order, answer, self.clock.now_ms());
+            }
+        }
         self.note_server_time(
             &sent,
             checked.as_ref().map_err(|failure| &failure.error),

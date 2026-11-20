@@ -4367,7 +4367,7 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
-        self.take_own_copy_with(doc, None, |_| Ok(())).await
+        self.take_own_copy_with(doc, None, None, |_| Ok(())).await
     }
 
     /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
@@ -4376,6 +4376,7 @@ impl App {
         &mut self,
         doc: IdentityDoc,
         at: Option<(u64, u64)>,
+        serving_generation: Option<u64>,
         also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
     ) -> Result<bool, AppError> {
         // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
@@ -4390,7 +4391,9 @@ impl App {
         also(&mut read.tx)?;
         let epoch_rose = read.epoch_rose;
         self.commit(read.tx).await?;
-        if epoch_rose {
+        // Only a verified answer from a later generation precludes the ordinary key read.
+        // A published identity can change before the service followed has changed.
+        if epoch_rose && serving_generation.is_none_or(|g| g <= self.state.meta.generation) {
             self.fetch_key_bundle().await?;
         }
         Ok(self.state.own_doc.version() > version)

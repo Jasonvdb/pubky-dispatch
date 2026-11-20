@@ -437,6 +437,8 @@ pub(crate) struct Inner {
     /// The account's enrollment: its limits, and the answer to each enrollment taken, by
     /// enrollment hash. `None` for an account that doesn't exist until it is enrolled.
     pub(crate) enrolled: Option<signer::Enrolled>,
+    /// The enrollment held aside while a test serves this account as missing.
+    withheld_enrollment: Option<signer::Enrolled>,
     /// The App IDs the enrollment that made the account named, kept for good (Switch wire
     /// 3.7).
     pub(crate) kept_app_ids: Vec<[u8; 16]>,
@@ -543,6 +545,7 @@ impl Inner {
             directory_version: 0,
             origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
+            withheld_enrollment: None,
             kept_app_ids: Vec::new(),
             kept_at: 0,
             delivery_proof: None,

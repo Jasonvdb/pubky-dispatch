@@ -98,7 +98,7 @@ The signer can recover with the identity key alone, at the account's service or,
 
 - A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 
-- The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The signer remembers whether it sent the enrollment and what result it verified before signing.
+- The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. After reopening, the signer distinguishes an unsent enrollment, one it may have sent, and one with a verified result.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
 

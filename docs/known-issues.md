@@ -34,6 +34,18 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 - Pass an explicit `TimeoutClass` as the final argument to `SwitchClient::sign_request`. Replace `TimeoutClass::default()` with the class appropriate for the call when constructing a transport `Request`. Use `Bulk` for claim, app-record, receive-key or shared-record writes and for batches with `record_current` or `claim_step` conditions. A small batch can return a claim view for each successful claim or a held record or claim view in a conflict.
 
+An app can receive a stopped read with a durable recovery notice. Hosts can show
+`App::recovery_required` and `App::provider_health`, and keep an attempt held
+on `Refusal::RecoveryRequired` until the app verifies service again or follows
+a later generation. A host displaying recovery progress can use `RecoveryInfo::step`.
+A signed `not_hosted` reply prompts the app to recheck its signed provider document.
+If the document still names this service, repeated unavailable reads count toward
+the outage reported by `provider_health`.
+A separate display process that can exit during a peek needs a durable original
+transport reply. Reserve the signed page with `App::begin_display_read`, render
+with `App::display_preview` and pass the retained receipt to the state owner on
+reopen using `App::finish_display_read`.
+
 - The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
@@ -105,7 +117,6 @@ Collection listings show live records. A protected deletion can therefore be abs
 - [data] **One stalled protocol can cost another messages.** A shared deny-list change or missing list baseline can stop the whole app's feed until every protocol catches up. Monitor stalled callbacks and listings because other protocols can miss entries if the app falls behind retention or fills its inbox.
 - [data] **Senders share the limit on messages waiting locally.** At the total limit, traffic from two admitted senders can cause another sender's waiting entries to be discarded. Consume the durable drop notices and request the missing messages again where the protocol permits it.
 - [data] **Some discarded work cannot be identified after restart.** A stored message outside the bounded waiting pool can fail a check on retry and disappear with only an in-memory event, while an in-place restore can reduce some unreadable pending duties to a count. An empty queue cannot establish that every obligation completed.
-- [wrong result] **A recovery notice does not reliably suspend saved writes.** The client can retry a saved batch after `recovery_required`, and a signed `not_hosted` response can surface only as a call error while the identity document still names that service. Pause submissions and confirm the current service and generation before resuming.
 - [wrong result] **A newly held peer can still gain inbox admission.** If a batch adding its conversation was already sent and the answer was lost, the client can retry that batch after the host places the hold. Treat admission as unresolved until the earlier write is reconciled.
 - [availability] **Two successive provider losses can leave a record readable but unwritable.** The client can retain the original proven version while the latest service reconstructs a lower version for the same write. Retrying the same conditional update keeps failing, and treating the record as absent risks repeating its effect.
 - [availability] **An incorrect service clock can make an app's records unusable.** A far-future signed time can become the minimum timestamp for later app records, including after the device clock moves backward. Other apps can reject every such record as too far in the future even after the service clock is corrected.

@@ -2,6 +2,8 @@
 
 Embed `App` to act for one approved app of an identity. The signer approves the app and can later renew or revoke it. The client holds the app's keys, checks signed documents and service answers, follows the feed and saves work across restarts. The host supplies the user interface, storage, clock, network and the rules of each protocol. It chooses how to present events and which diagnostic details to show. For the other side of approval, see the [signer host guide](signer-host-guide.md).
 
+The [Rust host example](../crates/pubky-switch-client/examples/app_host.rs) joins an approved app, reopens it from its saved App ID and handles one foreground wake. Build it with `cargo build -p pubky-switch-client --example app_host`. Supply your platform's storage, clock, network and registered protocol. On a wake, handle the reported next action and acknowledge each duty after saving the work it requires.
+
 ## Joining an identity
 
 - Supply an `AppEnv` with a `StoreHandle`, a millisecond Unix `Clock`, a `Transport` and a `HomeserverReader`. Return a missing file only for an actual absence. A timeout, denied read or malformed reply is a failure. For a publishing app, set `AppConfig::publishes_record` and supply a `HomeserverWriter`. Report success only once a put took effect or the deleted file is absent.
@@ -277,6 +279,8 @@ Keep the local batch ID returned in `AppError::Kept`. Look it up with `kept_batc
 ## Publishing the app's own record and rotating keys
 
 Use `set_protocol_member` for a protocol's public data with an absolute expiry, or `set_protocol_member_with_lifetime` for a lifetime measured from each newly signed timestamp. Use `renew_record` or `renew_record_with_lifetime` to renew it, `update_accepts` when accepted kinds change, and `publish_record` to check the public copy. The earliest requested expiry wins across protocols. Before a renewed certificate's record is signed, each protocol's `member_for` gives its member and expiry ask under that certificate; the default keeps both, so a protocol whose member depends on its scopes overrides it, and must not panic. Publish only data intended for anyone to read. `sign_protocol` signs permitted protocol-labelled fields with the app key.
+
+Use `set_protocol_member_with_expiry` to set a registered protocol's member and explicit expiry together, including an expiry change to an unchanged member. After reopening, `protocol_record` returns that owner's desired member, expiry and whether an unsigned member edit is pending. Use the publication result below when showing the status of the public copy.
 
 | Case | What happened and what to do |
 |---|---|

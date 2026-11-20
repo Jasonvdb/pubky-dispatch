@@ -380,9 +380,6 @@ impl World {
 
     /// Erase through the authenticated endpoint, then create a distinct staged account.
     pub async fn create_after_erasure(&self) -> u64 {
-        use pubky_switch_core::records::{
-            Enrollment, EnrollmentBody, EnrollmentIntent, IdentityPolicy,
-        };
         let created = self.switch.created();
         let following = self.switch.identity_doc().as_ref().map(IdentityDoc::hash);
         self.signer_client(Some(created))
@@ -390,6 +387,16 @@ impl World {
             .await
             .unwrap();
         self.clock.advance_ms(1000);
+        let next = self.create_staged_account().await;
+        assert!(next > created);
+        next
+    }
+
+    /// Enroll an absent account without delivering its first identity document.
+    pub async fn create_staged_account(&self) -> u64 {
+        use pubky_switch_core::records::{
+            Enrollment, EnrollmentBody, EnrollmentIntent, IdentityPolicy,
+        };
         let client = self.signer_client(None);
         let observation = client.observe_account().await.unwrap();
         assert_eq!(observation.body().created, None);
@@ -409,7 +416,6 @@ impl World {
         )
         .unwrap();
         let answer = client.enroll(&enrollment).await.unwrap();
-        assert!(answer.created > created);
         assert!(self.switch.identity_doc().is_none());
         answer.created
     }

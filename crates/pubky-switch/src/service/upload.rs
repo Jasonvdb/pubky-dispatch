@@ -7,7 +7,7 @@
 //! transaction: records, then claims, then lists, then staged admission, then the
 //! transition. Uploads in a cooperative move aren't served yet.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
 use pubky_switch_core::ops::{OpKind, SignedOp};
@@ -26,7 +26,7 @@ use super::{Answer, Service, batch::refused, store_error};
 use crate::{
     http::error::ApiError,
     keys::ServiceSigner,
-    store::{AccountTxn, ListName, RecordOrigin, StoreError, StoredListEntry, StoredRecord},
+    store::{AccountTxn, RecordOrigin, StoreError, StoredRecord},
 };
 
 fn temporary() -> ApiError {
@@ -372,12 +372,9 @@ impl Service {
                 .map_err(stored)?;
         }
         if let Some(lists) = &upload.lists {
-            changes.lists = self
-                .merge_lists(txn, lists, by, time_ms)
-                .await
-                .map_err(stored)?;
+            changes.lists = self.merge_lists(txn, lists).await.map_err(stored)?;
         }
-        // Checked here, as `end_staged_admission` takes it: contacts, from an app holding
+        // Checked here, as `end_staged_admission` takes it: kept peers, from an app holding
         // `lists.manage` (Switch spec 12.6 step 2).
         if upload.ends_staged_admission(caller) {
             self.end_staged_admission(txn, signer, AdmissionEnd::Upload { by }, time_ms)
@@ -504,41 +501,13 @@ impl Service {
         &self,
         txn: &mut AccountTxn,
         lists: &UploadLists,
-        by: [u8; 16],
-        time_ms: u64,
     ) -> Result<bool, StoreError> {
         let mut added = false;
-        for (list, entries, max) in [
-            (ListName::Contact, &lists.contacts, self.limits.max_contacts),
-            (ListName::Deny, &lists.deny, self.limits.max_deny),
-        ] {
-            let Some(entries) = entries else { continue };
-            let unique: Vec<[u8; 32]> = entries
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            let present: HashSet<[u8; 32]> = txn
-                .list_entries(list, &unique)
-                .await?
-                .into_iter()
-                .map(|entry| entry.pubky)
-                .collect();
-            let mut count = txn.list_count(list, &[]).await?;
-            for pubky in unique.iter().filter(|p| !present.contains(*p)) {
-                if count >= max {
-                    break;
-                }
-                let entry = StoredListEntry {
-                    pubky: *pubky,
-                    written_by: Some(by),
-                    at_ms: time_ms,
-                };
-                txn.put_list_entry(list, &entry).await?;
-                count += 1;
-                added = true;
-            }
+        if let Some(kept) = &lists.contacts {
+            added |= txn.restore_kept(kept, self.limits.max_contacts).await?;
+        }
+        if let Some(deny) = &lists.deny {
+            added |= txn.restore_deny(deny, self.limits.max_deny).await?;
         }
         Ok(added)
     }

@@ -1,9 +1,7 @@
-//! `GET /v1/{id}/allow` (Switch wire 7.4.6): the lists an own app with `lists.read` reads,
-//! each whole: contacts, conversation entries, the deny list, flagged senders and live
-//! invite codes. All five are always present, empty or not, since the client refuses an
-//! answer missing one and reads a missing or cut `flagged` as "not flagged".
+//! Signed peer admission, deny, flag and invitation inventories (Switch wire 7.4.6).
 
 use pubky_switch_core::{
+    admission::{PeerEntry, ReplyGrant, ReplyOrigin},
     enc::{b64, pubky_id, zbase32_encode},
     records::AppCert,
     scopes::Permission,
@@ -14,7 +12,7 @@ use super::{AccountOutcome, PageRead, Service, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, AllowEntry, AllowInvite, ListName, SnapshotRead},
+    store::{AccountTxn, AllowInvite, SnapshotRead},
 };
 
 /// A JSON string: the encodings this answer writes (a Pubky ID, an App ID, b64, a time)
@@ -26,36 +24,35 @@ fn string(out: &mut Vec<u8>, text: &str) {
 }
 
 /// `[ "pubky", ... ]`.
-fn pubkys(out: &mut Vec<u8>, entries: &[AllowEntry]) {
+fn pubkys(out: &mut Vec<u8>, entries: &[[u8; 32]]) {
     out.push(b'[');
     for (i, entry) in entries.iter().enumerate() {
         if i > 0 {
             out.push(b',');
         }
-        string(out, &pubky_id(&entry.pubky));
+        string(out, &pubky_id(entry));
     }
     out.push(b']');
 }
 
-/// A conversation entry, in the order of 7.4.6's row: `pubky`, `written_by` (an App ID or
-/// `"service"`), the original `code_hash` for a service grant, `at` and `last_used`.
-fn conversation(out: &mut Vec<u8>, entry: &AllowEntry) {
+/// The grant that the service lists for this conversation (Switch wire 7.4.6).
+fn conversation(out: &mut Vec<u8>, peer: &[u8; 32], grant: ReplyGrant) {
     out.extend_from_slice(b"{\"pubky\":");
-    string(out, &pubky_id(&entry.pubky));
+    string(out, &pubky_id(peer));
     out.extend_from_slice(b",\"written_by\":");
-    match &entry.written_by {
-        Some(app) => string(out, &zbase32_encode(app)),
-        None => string(out, "service"),
-    }
-    if let Some(code_hash) = &entry.code_hash {
-        out.extend_from_slice(b",\"code_hash\":");
-        string(out, &b64(code_hash));
+    match grant.origin {
+        ReplyOrigin::App(app) => string(out, &zbase32_encode(&app)),
+        ReplyOrigin::Invite(hash) => {
+            string(out, "service");
+            out.extend_from_slice(b",\"code_hash\":");
+            string(out, &b64(&hash));
+        }
     }
     out.extend_from_slice(b",\"at\":");
-    string(out, &rfc3339(entry.at_ms));
-    if let Some(last_used) = entry.last_used_ms {
+    string(out, &rfc3339(grant.at));
+    if let Some(last) = grant.last_used {
         out.extend_from_slice(b",\"last_used\":");
-        string(out, &rfc3339(last_used));
+        string(out, &rfc3339(last));
     }
     out.push(b'}');
 }
@@ -74,23 +71,30 @@ fn invite(out: &mut Vec<u8>, invite: &AllowInvite) {
     out.push(b'}');
 }
 
-/// The answer, in the order of 7.4.6's table: `contacts`, `conversations`, `deny`,
-/// `flagged`, `invite_codes`.
+/// The answer in the order of the wire 7.4.6 lists.
 fn answer_body(
-    contacts: &[AllowEntry],
-    conversations: &[AllowEntry],
-    deny: &[AllowEntry],
+    peers: &[PeerEntry],
+    deny: &[[u8; 32]],
     flagged: &[([u8; 32], u64)],
     invites: &[AllowInvite],
 ) -> Vec<u8> {
-    let mut out = b"{\"contacts\":".to_vec();
-    pubkys(&mut out, contacts);
-    out.extend_from_slice(b",\"conversations\":[");
-    for (i, entry) in conversations.iter().enumerate() {
+    let mut out = b"{\"contacts\":[".to_vec();
+    for (i, peer) in peers.iter().filter(|peer| peer.kept).enumerate() {
         if i > 0 {
             out.push(b',');
         }
-        conversation(&mut out, entry);
+        string(&mut out, &pubky_id(&peer.pubky));
+    }
+    out.extend_from_slice(b"],\"conversations\":[");
+    for (i, (pubky, grant)) in peers
+        .iter()
+        .filter_map(|peer| Some((&peer.pubky, peer.reply?)))
+        .enumerate()
+    {
+        if i > 0 {
+            out.push(b',');
+        }
+        conversation(&mut out, pubky, grant);
     }
     out.extend_from_slice(b"],\"deny\":");
     pubkys(&mut out, deny);
@@ -169,18 +173,8 @@ impl Service {
         } = read;
         snapshot.start().await;
         let fail = |e: &crate::store::StoreError| store_error(e);
-        let contacts = snapshot
-            .allow_entries(ListName::Contact)
-            .await
-            .map_err(|e| fail(&e))?;
-        let conversations = snapshot
-            .allow_entries(ListName::Conversation)
-            .await
-            .map_err(|e| fail(&e))?;
-        let deny = snapshot
-            .allow_entries(ListName::Deny)
-            .await
-            .map_err(|e| fail(&e))?;
+        let peers = snapshot.admission_rows().await.map_err(|e| fail(&e))?;
+        let deny = snapshot.deny_rows().await.map_err(|e| fail(&e))?;
         let flagged = snapshot
             .flagged_senders(flag_after)
             .await
@@ -190,13 +184,7 @@ impl Service {
             .await
             .map_err(|e| fail(&e))?;
         snapshot.finish().await.map_err(|e| fail(&e))?;
-        Ok(answer_body(
-            &contacts,
-            &conversations,
-            &deny,
-            &flagged,
-            &invites,
-        ))
+        Ok(answer_body(&peers, &deny, &flagged, &invites))
     }
 }
 
@@ -206,39 +194,37 @@ mod tests {
 
     #[test]
     fn test_allow_answer_has_every_list_in_table_order() {
-        let empty = String::from_utf8(answer_body(&[], &[], &[], &[], &[])).expect("utf-8");
+        let empty = String::from_utf8(answer_body(&[], &[], &[], &[])).expect("utf-8");
         assert_eq!(
             empty,
             "{\"contacts\":[],\"conversations\":[],\"deny\":[],\"flagged\":[],\"invite_codes\":[]}"
         );
-        let service_entry = AllowEntry {
+        let service = PeerEntry {
             pubky: [1; 32],
-            written_by: None,
-            at_ms: 0,
-            code_hash: Some([2; 32]),
-            last_used_ms: Some(1_000),
+            kept: true,
+            reply: Some(ReplyGrant {
+                origin: ReplyOrigin::Invite([2; 32]),
+                at: 0,
+                last_used: Some(1_000),
+            }),
         };
-        let app_entry = AllowEntry {
+        let app = PeerEntry {
             pubky: [3; 32],
-            written_by: Some([4; 16]),
-            at_ms: 0,
-            code_hash: None,
-            last_used_ms: None,
+            kept: false,
+            reply: Some(ReplyGrant {
+                origin: ReplyOrigin::App([4; 16]),
+                at: 0,
+                last_used: None,
+            }),
         };
-        let body = String::from_utf8(answer_body(
-            &[],
-            &[service_entry, app_entry],
-            &[],
-            &[([5; 32], 3)],
-            &[],
-        ))
-        .expect("utf-8");
-        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
-        let conversations = value["conversations"].as_array().expect("array");
-        assert_eq!(conversations[0]["written_by"], "service");
-        assert_eq!(conversations[0]["code_hash"], b64(&[2; 32]));
-        assert!(conversations[1].get("code_hash").is_none());
-        assert!(conversations[1].get("last_used").is_none());
+        let body = answer_body(&[service, app], &[], &[([5; 32], 3)], &[]);
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let rows = value["conversations"].as_array().expect("conversations");
+        assert_eq!(value["contacts"][0], pubky_id(&service.pubky));
+        assert_eq!(rows[0]["written_by"], "service");
+        assert_eq!(rows[0]["code_hash"], b64(&[2; 32]));
+        assert!(rows[1].get("code_hash").is_none());
+        assert!(rows[1].get("last_used").is_none());
         assert_eq!(value["flagged"][0]["hits"], 3);
     }
 }

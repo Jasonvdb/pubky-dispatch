@@ -12,6 +12,7 @@
 //! takes it as an argument, in Unix milliseconds. Scope names, message kinds and collections
 //! are a protocol's, and the crate reads them only as opaque strings (Switch spec 1).
 
+pub mod admission;
 pub mod chain;
 pub mod claims;
 pub mod enc;

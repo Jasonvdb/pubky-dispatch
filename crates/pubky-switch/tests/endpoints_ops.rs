@@ -12,11 +12,7 @@
 
 mod support;
 
-use pubky_switch::{
-    http::Handler,
-    limits::Limits,
-    store::{ListName, StoredApp},
-};
+use pubky_switch::{http::Handler, limits::Limits, store::StoredApp};
 use pubky_switch_core::{
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
@@ -381,44 +377,53 @@ async fn test_ops_control_rate() {
 }
 
 #[tokio::test]
-async fn test_ops_list_quota() {
+async fn test_ops_peer_reason_quotas_are_independent() {
     let limits = Limits {
         max_contacts: 1,
+        max_conversations: 1,
         ..Limits::default()
     };
     let Some(replay) = registered(limits, false).await else {
         return;
     };
-    let (status, body) = post_app(
-        &replay,
-        "wallet",
-        &wallet_batch(9, 1, vec![contact(bob())]),
-        None,
-        AT,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    // The same entry again passes; a new one finds the list full.
-    let (status, body) = post_app(
-        &replay,
-        "wallet",
-        &wallet_batch(10, 1, vec![contact(bob())]),
-        None,
-        AT,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = post_app(
-        &replay,
-        "wallet",
-        &wallet_batch(11, 1, vec![contact(alice_key())]),
-        None,
-        AT,
-    )
-    .await;
-    assert_eq!(status, 429, "{body}");
-    assert_eq!(body["code"], "quota_exceeded");
-    assert_eq!(body["current"]["limit"], "contacts");
+    let put = |pubky, reason| OpKind::AllowPut {
+        pubky,
+        kind: reason,
+    };
+    let remove = |pubky, reason| OpKind::AllowDelete {
+        pubky,
+        kind: reason,
+    };
+    let kept = AllowKind::Contact;
+    let reply = AllowKind::Conversation;
+    let bob = bob();
+    let other = alice_key();
+    // Fill each reason with a different peer, then repeat both at capacity.
+    let cases = [
+        (vec![put(bob, reply), put(other, kept)], None),
+        (vec![put(bob, reply), put(other, kept)], None),
+        (vec![put(bob, kept)], Some("contacts")),
+        (vec![put(other, reply)], Some("conversations")),
+        (vec![remove(other, kept), put(bob, kept)], None),
+        (vec![put(other, reply)], Some("conversations")),
+        (vec![put(other, kept)], Some("contacts")),
+        (vec![remove(bob, reply), put(other, reply)], None),
+    ];
+    for (index, (operations, full)) in cases.into_iter().enumerate() {
+        let kinds = operations
+            .into_iter()
+            .map(|kind| (Vec::new(), kind))
+            .collect();
+        let batch = wallet_batch(40 + u8::try_from(index).expect("case"), 1, kinds);
+        let (status, body) = post_app(&replay, "wallet", &batch, None, AT).await;
+        if let Some(limit) = full {
+            assert_eq!(status, 429, "{body}");
+            assert_eq!(body["code"], "quota_exceeded");
+            assert_eq!(body["current"]["limit"], limit);
+        } else {
+            assert_eq!(status, 200, "{body}");
+        }
+    }
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -446,7 +451,7 @@ async fn test_ops_refused_batch_leaves_nothing() {
         .expect("begin")
         .expect("account");
     assert!(
-        txn.list_entries(ListName::Contact, &[bob()])
+        txn.peer_admissions(&[bob()])
             .await
             .expect("entries")
             .is_empty()
@@ -909,7 +914,7 @@ async fn test_ops_refusal_after_writing_leaves_nothing_but_the_stamp() {
         sqlx::query_as(
             "SELECT a.last_seq, \
              (SELECT count(*) FROM chain_items c WHERE c.account_id = a.id), \
-             (SELECT count(*) FROM list_entries l WHERE l.account_id = a.id), \
+             (SELECT count(*) FROM peer_admissions l WHERE l.account_id = a.id), \
              (SELECT count(*) FROM claims k WHERE k.account_id = a.id), \
              (SELECT max(last_seen_ms) FROM apps p WHERE p.account_id = a.id) \
              FROM accounts a WHERE a.id = $1",

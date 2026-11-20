@@ -184,39 +184,6 @@ pub struct StoredClaimEntry {
     pub proof: SignedDoc,
 }
 
-/// A list of the allowlist or the deny list (Switch wire 7.4.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListName {
-    /// Contacts.
-    Contact,
-    /// Conversation entries.
-    Conversation,
-    /// The deny list.
-    Deny,
-}
-
-impl ListName {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            ListName::Contact => "contact",
-            ListName::Conversation => "conversation",
-            ListName::Deny => "deny",
-        }
-    }
-}
-
-/// A list entry as stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoredListEntry {
-    /// The Pubky ID.
-    pub pubky: [u8; 32],
-    /// The writing app; `None` for a conversation entry the service wrote for a sender an
-    /// invite code admitted.
-    pub written_by: Option<[u8; 16]>,
-    /// The service time of the write.
-    pub at_ms: u64,
-}
-
 /// An invite code as stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredInvite {
@@ -248,7 +215,7 @@ fn opt_doc(bytes: Option<Vec<u8>>, what: &'static str) -> Result<Option<SignedDo
     bytes.map(|b| decode_doc(&b, what)).transpose()
 }
 
-fn keys<const N: usize>(keys: &[[u8; N]]) -> Vec<Vec<u8>> {
+pub(super) fn keys<const N: usize>(keys: &[[u8; N]]) -> Vec<Vec<u8>> {
     keys.iter().map(|key| key.to_vec()).collect()
 }
 
@@ -957,99 +924,6 @@ impl AccountTxn {
         // The entry that settles a claim compacts it in the same request, whichever of the
         // two the batch stores first: its own document goes with the others then.
         self.note_superseded([entry.seq]);
-        Ok(())
-    }
-
-    /// The entries of `list` at `pubkys` that the account holds.
-    pub async fn list_entries(
-        &mut self,
-        list: ListName,
-        pubkys: &[[u8; 32]],
-    ) -> Result<Vec<StoredListEntry>, StoreError> {
-        let id = self.head().id.clone();
-        let rows = sqlx::query(
-            "SELECT pubky, written_by, at_ms FROM list_entries \
-             WHERE account_id = $1 AND list = $2 AND pubky = ANY($3)",
-        )
-        .bind(id)
-        .bind(list.as_str())
-        .bind(keys(pubkys))
-        .fetch_all(self.conn())
-        .await
-        .map_err(db)?;
-        rows.iter()
-            .map(|row| {
-                let pubky: Vec<u8> = row.try_get("pubky")?;
-                let by: Option<Vec<u8>> = row.try_get("written_by")?;
-                Ok(StoredListEntry {
-                    pubky: array(&pubky, "pubky")?,
-                    written_by: by.map(|by| array(&by, "written_by")).transpose()?,
-                    at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
-                })
-            })
-            .collect()
-    }
-
-    /// The entries of `list` not at `excluding`.
-    pub async fn list_count(
-        &mut self,
-        list: ListName,
-        excluding: &[[u8; 32]],
-    ) -> Result<u64, StoreError> {
-        let id = self.head().id.clone();
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = $2 \
-             AND NOT (pubky = ANY($3))",
-        )
-        .bind(id)
-        .bind(list.as_str())
-        .bind(keys(excluding))
-        .fetch_one(self.conn())
-        .await
-        .map_err(db)?;
-        from_db(count, "list entries")
-    }
-
-    /// Add an entry to `list`, or replace it.
-    pub async fn put_list_entry(
-        &mut self,
-        list: ListName,
-        entry: &StoredListEntry,
-    ) -> Result<(), StoreError> {
-        let id = self.head().id.clone();
-        sqlx::query(
-            "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (account_id, list, pubky) DO UPDATE \
-             SET written_by = $4, at_ms = $5",
-        )
-        .bind(id)
-        .bind(list.as_str())
-        .bind(entry.pubky.as_slice())
-        .bind(entry.written_by.map(|app| app.to_vec()))
-        .bind(to_db(entry.at_ms, "at_ms")?)
-        .execute(self.conn())
-        .await
-        .map_err(db)?;
-        // A contact, a conversation entry or a deny list entry for the sender answers its
-        // connect request (Switch wire 7.4.7, 9.1).
-        self.delete_connect(&entry.pubky).await?;
-        Ok(())
-    }
-
-    /// Remove `pubky` from `list`.
-    pub async fn delete_list_entry(
-        &mut self,
-        list: ListName,
-        pubky: &[u8; 32],
-    ) -> Result<(), StoreError> {
-        let id = self.head().id.clone();
-        sqlx::query("DELETE FROM list_entries WHERE account_id = $1 AND list = $2 AND pubky = $3")
-            .bind(id)
-            .bind(list.as_str())
-            .bind(pubky.as_slice())
-            .execute(self.conn())
-            .await
-            .map_err(db)?;
         Ok(())
     }
 

@@ -158,6 +158,16 @@ async fn decline(replay: &Replay, pubky: &str) -> SwitchResponse {
 
 /// A batch of `op` from alice's wallet, applied.
 async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
+    let answer = wallet_ops(replay, vec![op], batch).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+async fn wallet_ops(replay: &Replay, kinds: Vec<OpKind>, batch: u8) -> SwitchResponse {
     let keys = vectors("keys.json");
     let wallet = app(&keys, "wallet");
     let ops = sign_batch(
@@ -172,7 +182,7 @@ async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
         ),
         1,
         [batch; 16],
-        vec![(Vec::new(), op)],
+        kinds.into_iter().map(|op| (Vec::new(), op)).collect(),
     )
     .expect("batch");
     let signed: Vec<SignedDoc> = ops.iter().map(|op| op.signed().clone()).collect();
@@ -184,13 +194,7 @@ async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
         serde_json::to_vec(&json!({ "ops": signed })).expect("body"),
         ms(&at()),
     );
-    let answer = replay.service.handle(request).await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
+    replay.service.handle(request).await
 }
 
 async fn sqlx_scalar(replay: &Replay, query: &str) -> i64 {
@@ -504,6 +508,60 @@ async fn register_executor(replay: &Replay) {
         "{}",
         String::from_utf8_lossy(&registered.body)
     );
+}
+
+#[tokio::test]
+async fn test_connect_ordered_grant_and_removal_settle_the_pending_request() {
+    let Some(replay) = serving(Limits::default(), 50).await else {
+        return;
+    };
+    assert!(pending(&ask(&replay).await));
+    let pubky = bob();
+    for reason in [AllowKind::Contact, AllowKind::Conversation] {
+        let operations = vec![
+            OpKind::AllowPut {
+                pubky,
+                kind: reason,
+            },
+            OpKind::AllowDelete {
+                pubky,
+                kind: reason,
+            },
+        ];
+        let mut refused = operations.clone();
+        refused.push(OpKind::InviteCodeDelete {
+            code_hash: [42; 32],
+        });
+        let answer = wallet_ops(&replay, refused, 46).await;
+        assert_eq!(
+            answer.status,
+            404,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(requested(&list(&replay, "wallet").await).len(), 1);
+        let answer = wallet_ops(
+            &replay,
+            operations,
+            if reason == AllowKind::Contact { 47 } else { 48 },
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let proofs = body(&answer)["proofs"]
+            .as_array()
+            .expect("ordered proofs")
+            .len();
+        assert_eq!(proofs, 2);
+        assert!(requested(&list(&replay, "wallet").await).is_empty());
+        assert!(pending(&ask(&replay).await));
+        assert_eq!(requested(&list(&replay, "wallet").await).len(), 1);
+    }
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]

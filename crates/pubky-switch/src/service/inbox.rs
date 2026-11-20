@@ -162,7 +162,7 @@ impl Service {
                 return Err(refused());
             }
             let invite = self
-                .live_invite(txn, invite_code, trusted.then_some(time_ms))
+                .live_invite(txn, invite_code, trusted.then_some(time_ms), "append")
                 .await?;
             if invite_code.is_some() && invite.is_none() {
                 return Err(refused());

@@ -68,6 +68,7 @@ impl Service {
         txn: &mut AccountTxn,
         header: Option<&str>,
         now: Option<u64>,
+        call: &'static str,
     ) -> Result<Option<[u8; 32]>, ApiError> {
         let Some(hash) = header.and_then(|code| invite_code_hash(code).ok()) else {
             return Ok(None);
@@ -81,7 +82,7 @@ impl Service {
         };
         let now = now.ok_or_else(|| {
             self.refused_without_trusted_time(
-                "append",
+                call,
                 "7.3: an invite code's expiry needs trusted time",
             )
         })?;
@@ -150,11 +151,11 @@ impl Service {
                 .map_err(|e| storage(&e))?;
         let standing = self.standing(txn, &identity).await?;
         let connect_requests = held.is_some_and(|doc| doc.body().policy.connect_requests.enabled);
-        let listed = !standing.denied && !removed && (standing.contact || standing.conversation);
-        let invite = if listed {
+        let invite = if standing.denied || standing.listed(removed) {
             None
         } else {
-            self.live_invite(txn, invite_code, Some(time_ms)).await?
+            self.live_invite(txn, invite_code, trusted.then_some(time_ms), "put_peers")
+                .await?
         };
         // While admission is staged after a provider loss, a sender it can't otherwise admit,
         // a denied one included, gets `503 staged` and retries (Switch spec 12.6 step 2; wire
@@ -171,13 +172,6 @@ impl Service {
         match admitted {
             Admitted::Listed => {}
             Admitted::InviteCode(hash) => {
-                // Admitted only by a code, whose expiry is a time (Switch wire 7.3).
-                if !trusted {
-                    return Err(self.refused_without_trusted_time(
-                        "put_peers",
-                        "7.3: an invite code's expiry needs trusted time",
-                    ));
-                }
                 self.invite_rate
                     .take(
                         (account.id.clone(), hash),

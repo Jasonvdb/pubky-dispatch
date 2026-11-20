@@ -604,20 +604,36 @@ async fn test_peers_invite_code_expiry_and_trusted_time() {
     let at = "2026-01-01T00:09:00.000Z";
     set_time(&bob_switch.clock, at);
     insert_invite(&bob_switch, &bob, CODE, ms(at) + 3_600_000).await;
-    let request = other_request(
-        "wallet",
-        BOB_ORIGIN,
-        "PUT",
-        &format!("/v1/{bob}/peers"),
-        delivery(&doc("alice identity.json")),
-        Some(CODE),
-        ms(at),
+    let deliver = |now| {
+        other_request(
+            "wallet",
+            BOB_ORIGIN,
+            "PUT",
+            &format!("/v1/{bob}/peers"),
+            delivery(&doc("alice identity.json")),
+            Some(CODE),
+            now,
+        )
+    };
+    let expiry = ms(at) + 3_600_000;
+    for now in [ms(at), expiry] {
+        bob_switch.clock.set_wall_ms(now);
+        assert_eq!(
+            status_and_code(&bob_switch.service.handle(deliver(now)).await),
+            (503, json!("unavailable"))
+        );
+    }
+    assert_eq!(bob_switch.service.time_refusals(), 2);
+    // Once time is verified the expired code drops out. This account allows a
+    // stranger to deliver its document through its connect-request policy.
+    bob_switch.time.note(
+        pubky_switch::time::TimeSample {
+            utc_ms: expiry,
+            uncertainty_ms: 0,
+        },
+        0,
     );
-    assert_eq!(
-        status_and_code(&bob_switch.service.handle(request).await),
-        (503, json!("unavailable"))
-    );
-    assert_eq!(bob_switch.service.time_refusals(), 1);
+    assert_eq!(bob_switch.service.handle(deliver(expiry)).await.status, 200);
     bob_switch.db.drop_database().await.expect("drop");
 }
 

@@ -439,18 +439,15 @@ impl Signer {
         }
         let records = match state::read(&store, &identity).await? {
             state::ReadRecords {
-                state: Ok(Some(mut state)),
+                state: Ok(Some(state)),
                 flow: Ok(Some(flow @ Flow::Renew { .. })),
             } if state.handed_over_to.is_none()
                 && gate::refusal(&state).is_none()
                 && state.newest.as_ref().is_some_and(|n| n.account.is_none())
                 && flow.check_state(&state).is_ok() =>
             {
-                let mut signer = Self::restore_target(env, keyring, store)?;
-                Box::pin(signer.bind_renewal_predecessor(&mut state, &flow)).await?;
-                signer.commit(state, Some(flow)).await?;
-                Box::pin(signer.resume()).await?;
-                return Ok(signer);
+                let signer = Self::restore_target(env, keyring, store)?;
+                return Box::pin(signer.restore_renewal(state, flow)).await;
             }
             records => records,
         };
@@ -481,6 +478,13 @@ impl Signer {
             (result, _) => drop(result?),
         }
         Ok(signer)
+    }
+
+    async fn restore_renewal(mut self, mut state: SignerState, flow: Flow) -> Result<Self> {
+        Box::pin(self.bind_renewal_predecessor(&mut state, &flow)).await?;
+        self.commit(state, Some(flow)).await?;
+        Box::pin(self.resume()).await?;
+        Ok(self)
     }
 
     /// Recover the binding of the exact predecessor from its sealed backup. The original

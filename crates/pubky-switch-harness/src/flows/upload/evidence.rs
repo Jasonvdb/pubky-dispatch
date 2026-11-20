@@ -1,20 +1,30 @@
 //! Ordinary provider-loss recovery with one service acknowledgement (Switch wire 7.4.14).
 
 use super::*;
-use crate::{Backend, run};
+use crate::{Backend, run_here};
 use pubky_switch_client::app::Evidence;
 use pubky_switch_client::client::answers::{RecoveryUpload, UploadedOp};
 use pubky_switch_client::error::{ClientError, TransportError};
 
 #[tokio::test]
-async fn test_wallet_record_uploads_with_one_acknowledgement_at_both_switches() {
-    for backend in [Backend::Scripted, Backend::Service] {
-        for proved_first in [true, false] {
-            run(backend, async |world| {
-                recovered_writes(world, proved_first).await
-            })
-            .await
-            .expect("recover the wallet's and phone's writes");
+async fn test_wallet_record_uploads_scripted() {
+    wallet_uploads(Backend::Scripted).await;
+}
+
+#[tokio::test]
+async fn test_wallet_record_uploads_service() {
+    wallet_uploads(Backend::Service).await;
+}
+
+async fn wallet_uploads(backend: Backend) {
+    for proved_first in [true, false] {
+        let trace = Box::pin(run_here(backend, async |world: &World| {
+            Box::pin(recovered_writes(world, proved_first)).await
+        }))
+        .await
+        .expect("recover the wallet's and phone's writes");
+        if backend == Backend::Scripted {
+            assert!(trace.is_some());
         }
     }
 }
@@ -163,12 +173,18 @@ async fn recovered_writes(world: &World, proved_first: bool) -> FlowResult {
 }
 
 #[tokio::test]
-async fn test_retained_record_successor_after_a_later_receipt_at_both_switches() {
-    for backend in [Backend::Scripted, Backend::Service] {
-        run(backend, async |world| arrival_orders(world).await)
-            .await
-            .expect("compare successive writes");
-    }
+async fn test_retained_record_successor_scripted() {
+    Box::pin(run_here(Backend::Scripted, arrival_orders))
+        .await
+        .expect("compare successive writes")
+        .expect("scripted trace");
+}
+
+#[tokio::test]
+async fn test_retained_record_successor_service() {
+    Box::pin(run_here(Backend::Service, arrival_orders))
+        .await
+        .expect("compare successive writes");
 }
 
 async fn arrival_orders(world: &World) -> FlowResult {

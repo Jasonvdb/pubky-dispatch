@@ -239,9 +239,9 @@ impl CheckedRecord {
     /// Returns an error if the stored operation is not an app's record write or its
     /// stored version cannot follow its signed base.
     pub fn from_storage(op: SignedDoc, cert: SignedDoc, exact: Option<u64>) -> crate::Result<Self> {
-        let signed = SignedOp::peek(&op)?;
-        let body = signed.body();
         let invalid = || crate::Error::Invalid("invalid stored record upload".into());
+        let signed = SignedOp::peek(&op).map_err(|_| invalid())?;
+        let body = signed.body();
         let OpKind::RecordPut(put) = &body.kind else {
             return Err(invalid());
         };

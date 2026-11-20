@@ -663,11 +663,19 @@ impl AccountTxn {
             .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?;
         sqlx::query(
             "INSERT INTO divergent_uploads (account_id, key, position, op, cert, op_hash, proved_version) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (account_id,key,position) DO UPDATE SET \
-             op=EXCLUDED.op, cert=EXCLUDED.cert, op_hash=EXCLUDED.op_hash, proved_version=EXCLUDED.proved_version",
-        ).bind(id).bind(key.as_slice()).bind(position).bind(encode_doc(op)?).bind(encode_doc(cert)?)
-         .bind(hash.as_slice()).bind(proved_version.map(|v| to_db(v,"proved_version")).transpose()?)
-         .execute(self.conn()).await.map_err(db)?;
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (account_id, key, position) DO UPDATE SET \
+             op = EXCLUDED.op, cert = EXCLUDED.cert, op_hash = EXCLUDED.op_hash, proved_version = EXCLUDED.proved_version",
+        )
+        .bind(id)
+        .bind(key.as_slice())
+        .bind(position)
+        .bind(encode_doc(op)?)
+        .bind(encode_doc(cert)?)
+        .bind(hash.as_slice())
+        .bind(proved_version.map(|v| to_db(v, "proved_version")).transpose()?)
+        .execute(self.conn())
+        .await
+        .map_err(db)?;
         Ok(())
     }
 

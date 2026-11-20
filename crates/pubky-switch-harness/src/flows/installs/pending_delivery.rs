@@ -267,3 +267,168 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
     assert_eq!(next.body().signer, install);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_restore_stored_epoch_scripted() {
+    check_stored_epoch(Backend::Scripted).await;
+}
+
+#[tokio::test]
+async fn test_restore_stored_epoch_service() {
+    check_stored_epoch(Backend::Service).await;
+}
+
+async fn check_stored_epoch(backend: Backend) {
+    let result = Box::pin(crate::run_here(backend, async |world| {
+        Box::pin(stored_epoch(world)).await
+    }))
+    .await;
+    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+}
+
+async fn stored_epoch(world: &World) -> FlowResult {
+    use crate::parties::{NOTES, NOTES_READER, TASKS};
+    let alice = world.identity("alice")?;
+    let id = alice.public();
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let key = || world.keyring(&alice);
+    let mut signer = Box::pin(Signer::create(env.clone(), key()?, ORIGIN)).await?;
+    Box::pin(signer.resume()).await?;
+    let (mut phone, _) = Box::pin(joined(world, &alice, &mut signer, "phone")).await?;
+    let (mut wallet, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    let before = signer.identity_doc()?.ok_or("missing predecessor")?;
+    let install = signer.install_id();
+    drop(signer);
+
+    let backup = || -> Result<SignerBackup, Box<dyn std::error::Error>> {
+        let bytes = world
+            .files()
+            .file(id, SIGNER_BACKUP_PATH)
+            .ok_or("missing backup")?;
+        Ok(serde_json::from_slice(&bytes)?)
+    };
+    assert_eq!(
+        backup()?.open(alice.key())?.identity_doc().signed(),
+        before.signed()
+    );
+    let ns = signer_namespace(&id);
+    let record = |key: &[u8]| -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(
+            &store.get(&ns, key)?.ok_or("missing signer record")?,
+        )?)
+    };
+    let write_state = |state: &Value| -> FlowResult {
+        let mut write = WriteBatch::new();
+        write.put(&ns, b"state", serde_json::to_vec(state)?)?;
+        store.commit(write)?;
+        Ok(())
+    };
+    // A refused earlier reduction spent its signed version and epoch. The signer's
+    // records tests exercise that refusal; start both services from the resulting floors.
+    let epoch = before.data_epoch() + 1;
+    let mut state = record(b"state")?;
+    state["epoch_through"] = epoch.into();
+    state["signed_through"] = (before.version() + 1).into();
+    write_state(&state)?;
+    let reduce = || CertChange {
+        scopes: Some(vec![NOTES_READER.into()]),
+        expires_at: None,
+    };
+    let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
+    world.unreachable("POST", "/ops");
+    assert!(matches!(
+        Box::pin(signer.renew(phone.app_id(), reduce())).await,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    drop(signer);
+
+    // Stop just after the signer writes the acknowledgment and before identity delivery.
+    let faulty = Arc::new(FaultStore::new(store.clone(), Fault::StopAfter(1)));
+    let mut signer = Box::pin(Signer::open(world.signer_env(&alice, faulty)?, key()?)).await?;
+    let start = world.trace().lines.len();
+    assert!(matches!(
+        Box::pin(signer.resume()).await,
+        Err(SignerError::Store(StoreError::Unavailable))
+    ));
+    let trace = world.trace();
+    let responses: Vec<_> = trace.lines[start..]
+        .iter()
+        .filter(|line| line.label == "{alice} POST /v1/{alice}/ops")
+        .filter_map(|line| line.facts.get("status").map(String::as_str))
+        .collect();
+    assert_eq!(responses, ["200"]);
+    drop(signer);
+    let flow = record(b"flow")?;
+    let batch_count = flow["Renew"]["batches"]
+        .as_array()
+        .ok_or("missing batches")?
+        .len();
+    assert!(batch_count > 0);
+    assert_eq!(flow["Renew"]["sent"], batch_count);
+    let signed: SignedDoc = serde_json::from_value(flow["Renew"]["doc"].clone())?;
+    let expected = IdentityDoc::verify(&signed, &id)?;
+    assert_eq!(expected.data_epoch(), epoch);
+    assert_eq!(expected.version(), before.version() + 2);
+    assert_eq!(expected.body().apps, before.body().apps);
+    let mut state = record(b"state")?;
+    *state
+        .pointer_mut("/newest/account")
+        .ok_or("missing original account")? = Value::Null;
+    write_state(&state)?;
+    assert!(matches!(
+        Box::pin(Signer::open(env.clone(), key()?)).await,
+        Err(SignerError::Records(RecordsFault::Damaged(_)))
+    ));
+
+    let start = world.trace().lines.len();
+    let signer = Box::pin(Signer::restore_over_unusable(
+        env.clone(),
+        key()?,
+        RecordsDiscarded::shown_and_confirmed(),
+    ))
+    .await?;
+    let trace = world.trace();
+    let after = &trace.lines[start..];
+    let delivery = after
+        .iter()
+        .filter(|line| line.label == "{alice} PUT /v1/{alice}/identity")
+        .collect::<Vec<_>>();
+    assert_eq!(delivery.len(), 1);
+    assert_eq!(
+        delivery[0].facts.get("status").map(String::as_str),
+        Some("200")
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|line| line.label.ends_with(" POST /v1/{alice}/ops"))
+    );
+    assert_eq!(signer.install_id(), install);
+    assert_eq!(
+        signer
+            .identity_doc()?
+            .ok_or("missing signed epoch")?
+            .signed(),
+        &signed
+    );
+    assert_eq!(
+        backup()?.open(alice.key())?.identity_doc().signed(),
+        &signed
+    );
+    drop(signer);
+    for app in [&mut phone, &mut wallet] {
+        Box::pin(app.receive(None)).await?;
+        Box::pin(app.fetch_key_bundle()).await?;
+        assert_eq!(app.own_identity().signed(), &signed);
+        assert_eq!(expected.listed_cert(&app.app_id()), Some(app.cert().hash()));
+        assert!(app.scope_key(epoch, NOTES).is_some());
+        assert!(app.scope_key(epoch, TASKS).is_none());
+    }
+    let mut signer = Box::pin(Signer::open(env, key()?)).await?;
+    let next = Box::pin(signer.renew(wallet.app_id(), reduce())).await?;
+    assert_eq!(next.data_epoch(), epoch + 1);
+    assert_eq!(next.body().signer, install);
+    Ok(())
+}

@@ -5,8 +5,9 @@
 // Helpers of tests fail the test on any error.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::panic::AssertUnwindSafe;
+use std::sync::LazyLock;
 
 use futures_util::FutureExt;
 
@@ -21,53 +22,84 @@ use pubky_switch_harness::{
 };
 use tokio::sync::OnceCell;
 
-/// Every flow's comparison, made once for the tests of this file; `None` when no test
-/// database is configured. A flow that fails is kept as the failure: every test that asks
-/// then fails at once with it, and no flow is run again.
-async fn comparisons() -> Option<&'static [(&'static str, Comparison)]> {
-    static COMPARISONS: OnceCell<Comparisons> = OnceCell::const_new();
-    let made = COMPARISONS
-        .get_or_init(|| async {
-            collect_comparisons(FLOWS, async |name, flow| compare_backends(name, flow).await).await
+/// A completed comparison holds only traces and a verdict, or the failure of this flow.
+struct CachedFlow {
+    name: &'static str,
+    run: Flow,
+    result: OnceCell<Result<Option<Comparison>, String>>,
+}
+
+static CACHED_FLOWS: LazyLock<Vec<CachedFlow>> = LazyLock::new(|| cached_flows(FLOWS));
+
+fn cached_flows(flows: &[(&'static str, Flow)]) -> Vec<CachedFlow> {
+    flows
+        .iter()
+        .map(|&(name, run)| CachedFlow {
+            name,
+            run,
+            result: OnceCell::new(),
         })
-        .await;
-    match made {
-        Ok(all) => all.as_deref(),
-        Err(failure) => panic!("{failure}"),
+        .collect()
+}
+
+fn named_flow<'a>(flows: &'a [CachedFlow], name: &str) -> &'a CachedFlow {
+    flows
+        .iter()
+        .find(|flow| flow.name == name)
+        .unwrap_or_else(|| panic!("no flow named {name}"))
+}
+
+impl CachedFlow {
+    async fn comparison(
+        &self,
+        compare: impl AsyncFn(&'static str, Flow) -> Result<Option<Comparison>, HarnessError>,
+    ) -> Result<Option<&Comparison>, &str> {
+        let result = self
+            .result
+            .get_or_init(|| async {
+                let name = self.name;
+                // Cache a panic too, so another caller does not rerun this flow.
+                match AssertUnwindSafe(compare(name, self.run))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result.map_err(|error| format!("{name}: {error}")),
+                    Err(_) => Err(format!("{name}: the flow panicked")),
+                }
+            })
+            .await;
+        result.as_ref().map(Option::as_ref).map_err(String::as_str)
     }
 }
 
-type Comparisons = Result<Option<Vec<(&'static str, Comparison)>>, String>;
-
-async fn collect_comparisons(
-    flows: &[(&'static str, Flow)],
+async fn check_comparisons(
+    flows: &[CachedFlow],
     compare: impl AsyncFn(&'static str, Flow) -> Result<Option<Comparison>, HarnessError>,
-) -> Comparisons {
-    let mut all = Some(Vec::new());
-    for &(name, flow) in flows {
-        // Keep panics as failures too: an unwinding initializer would run the flows again.
-        let compared = AssertUnwindSafe(compare(name, flow)).catch_unwind().await;
-        match compared {
-            Err(_) => return Err(format!("{name}: the flow panicked")),
-            Ok(Err(error)) => return Err(format!("{name}: {error}")),
-            Ok(Ok(None)) => all = None,
-            Ok(Ok(Some(comparison))) => {
-                if let Some(all) = &mut all {
-                    all.push((name, comparison));
-                }
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut ran_against_service = false;
+    for flow in flows {
+        if let Some(comparison) = flow.comparison(&compare).await? {
+            ran_against_service = true;
+            if !comparison.verdict.agrees() {
+                failures.push(format!("{}:\n{}", flow.name, comparison.verdict));
             }
         }
     }
-    if all.is_none() {
+    if !ran_against_service {
         eprintln!("ran against the scripted switch only: no test database");
     }
-    Ok(all)
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 #[tokio::test]
 async fn test_comparisons_run_every_scripted_flow_without_a_database() {
     let visited = std::cell::RefCell::new(Vec::new());
-    let flows: &[(&str, Flow)] = &[
+    let flows = cached_flows(&[
         ("first", |world| {
             Box::pin(async move {
                 world.outcome("first", &true.into());
@@ -80,30 +112,33 @@ async fn test_comparisons_run_every_scripted_flow_without_a_database() {
                 Ok(())
             })
         }),
-    ];
-    let all = collect_comparisons(flows, async |name, flow| {
+    ]);
+    let compare = async |name, flow| {
         let trace = run(Backend::Scripted, flow)
             .await?
             .expect("a scripted world");
         assert_eq!(trace.lines.len(), 1);
         visited.borrow_mut().push(name);
         Ok(None)
-    })
-    .await
-    .expect("both flows");
-    assert!(all.is_none());
-    assert_eq!(*visited.borrow(), ["first", "second"]);
+    };
+    let second = named_flow(&flows, "second").comparison(&compare).await;
+    assert!(matches!(second, Ok(None)));
+    assert_eq!(*visited.borrow(), ["second"]);
+    check_comparisons(&flows, &compare)
+        .await
+        .expect("both flows");
+    assert_eq!(*visited.borrow(), ["second", "first"]);
 }
 
 #[tokio::test]
 async fn test_comparisons_keep_a_later_scripted_failure_without_a_database() {
-    let flows: &[(&str, Flow)] = &[
+    let flows = cached_flows(&[
         ("first", |_| Box::pin(async { Ok(()) })),
         ("second", |_| {
             Box::pin(async { Err(HarnessError::Setup("second failed".into()).into()) })
         }),
-    ];
-    let error = collect_comparisons(flows, async |_, flow| {
+    ]);
+    let error = check_comparisons(&flows, async |_, flow| {
         run(Backend::Scripted, flow).await?;
         Ok(None)
     })
@@ -118,7 +153,8 @@ async fn test_comparisons_keep_a_later_scripted_failure_without_a_database() {
 #[tokio::test]
 async fn test_comparisons_stop_on_a_database_setup_failure() {
     let visited = std::cell::RefCell::new(Vec::new());
-    let error = collect_comparisons(&FLOWS[..2], async |name, _| {
+    let flows = cached_flows(&FLOWS[..2]);
+    let error = check_comparisons(&flows, async |name, _| {
         visited.borrow_mut().push(name);
         Err(HarnessError::Setup("test database is required".into()))
     })
@@ -130,11 +166,14 @@ async fn test_comparisons_stop_on_a_database_setup_failure() {
 
 /// What the flow `name` showed against the service.
 async fn service_trace(name: &str) -> Option<&'static Trace> {
-    let all = comparisons().await?;
-    let (_, comparison) = all
-        .iter()
-        .find(|(flow, _)| *flow == name)
-        .expect("the flow");
+    let comparison = named_flow(&CACHED_FLOWS, name)
+        .comparison(compare_backends)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    let Some(comparison) = comparison else {
+        eprintln!("ran {name} against the scripted switch only: no test database");
+        return None;
+    };
     Some(&comparison.service)
 }
 
@@ -155,35 +194,9 @@ async fn distorted(
 
 #[tokio::test]
 async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
-    let Some(all) = comparisons().await else {
-        return;
-    };
-    let failures: Vec<String> = all
-        .iter()
-        .filter(|(_, comparison)| !comparison.verdict.agrees())
-        .map(|(name, comparison)| format!("{name}:\n{}", comparison.verdict))
-        .collect();
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[tokio::test]
-async fn test_protocol_deny_barrier_at_the_service_and_the_scripted_switch() {
-    let Some(comparison) = compare_backends("protocol deny barrier", flows::protocol_deny_barrier)
+    check_comparisons(&CACHED_FLOWS, compare_backends)
         .await
-        .expect("the deny barrier flow")
-    else {
-        return;
-    };
-    assert!(comparison.verdict.agrees(), "{}", comparison.verdict);
-    let Some(comparison) = compare_backends(
-        "protocol retry after deny",
-        flows::protocol_retry_after_deny,
-    )
-    .await
-    .expect("the deny retry flow") else {
-        return;
-    };
-    assert!(comparison.verdict.agrees(), "{}", comparison.verdict);
+        .unwrap_or_else(|failure| panic!("{failure}"));
 }
 
 #[test]
@@ -457,17 +470,20 @@ fn test_calls_list_names_each_call_once() {
 /// listed under a flow must be served and sent by it.
 #[tokio::test]
 async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
-    let Some(all) = comparisons().await else {
-        return;
-    };
-    let sent_by = |flow: &str| -> BTreeSet<&str> {
-        let (_, comparison) = all
-            .iter()
-            .find(|(name, _)| *name == flow)
-            .expect("the flow");
-        let lines = comparison.service.lines.iter();
-        lines.filter_map(|line| line.call).collect()
-    };
+    let mut sent_by = BTreeMap::new();
+    for (method, template) in CALLS {
+        let call = route(method, &path_of(template, "id"))
+            .expect("a route")
+            .call;
+        if let Some(flow) = flow_of(&call)
+            && let Entry::Vacant(entry) = sent_by.entry(flow)
+        {
+            let Some(trace) = service_trace(flow).await else {
+                return;
+            };
+            entry.insert(trace.lines.iter().filter_map(|line| line.call).collect());
+        }
+    }
     // As a run of its own, like every flow: on a flow's stack, with the service's log kept.
     // A `503 unavailable` reads as "not served" here, and a request the test database
     // failed is answered the same: such a run fails as the database's, not as a listing's.
@@ -500,7 +516,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
 /// sends yet. `sent_by` gives the calls a flow sent.
 async fn served_calls(
     world: &World,
-    sent_by: &(impl Fn(&str) -> BTreeSet<&'static str> + Sync),
+    sent_by: &BTreeMap<&str, BTreeSet<&str>>,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     flows::enrollment(world).await?;
     let id = world.identity("alice").expect("alice").key().id();
@@ -523,7 +539,7 @@ async fn served_calls(
                     "{method} {template}: listed for {flow}, not served"
                 ));
             }
-            Some(flow) if !sent_by(flow).contains(call.name()) => {
+            Some(flow) if !sent_by[flow].contains(call.name()) => {
                 failures.push(format!("{method} {template}: {flow} doesn't send it"));
             }
             Some(_) => {}

@@ -20,7 +20,16 @@ const ID_B: &str = "7p4fn44qoshcwgfndz5grt7fyyz1eycqyduxdqe8o58of1byzodo";
 async fn woken(receiver: &mut watch::Receiver<u64>, within: Duration) -> bool {
     tokio::time::timeout(within, receiver.changed())
         .await
+        .map(|change| change.expect("change notification channel closed while waiting"))
         .is_ok()
+}
+
+#[tokio::test]
+#[should_panic(expected = "change notification channel closed while waiting")]
+async fn test_waiting_for_a_change_rejects_a_closed_notification_channel() {
+    let (sender, mut receiver) = watch::channel(0);
+    drop(sender);
+    woken(&mut receiver, Duration::from_secs(1)).await;
 }
 
 #[tokio::test]

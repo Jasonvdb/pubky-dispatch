@@ -630,7 +630,7 @@ impl AccountTxn {
     }
 
     /// Grant the sender reply access using the code that admitted it (Switch wire 7.4.3).
-    pub async fn grant_invited_conversation(
+    pub async fn grant_invited_reply(
         &mut self,
         sender: &[u8; 32],
         code_hash: &[u8; 32],
@@ -638,8 +638,8 @@ impl AccountTxn {
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash) \
-             VALUES ($1, 'conversation', $2, NULL, $3, $4)",
+            "INSERT INTO peer_admissions (account_id, kept, pubky, reply_at_ms, reply_code_hash) \
+             VALUES ($1, FALSE, $2, $3, $4)",
         )
         .bind(&id)
         .bind(sender.as_slice())
@@ -648,7 +648,7 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        // The conversation entry answers the sender's connect request (Switch wire 7.4.7).
+        // The reply grant answers the sender's connect request (Switch wire 7.4.7).
         self.delete_connect(sender).await?;
         Ok(())
     }
@@ -682,17 +682,17 @@ impl AccountTxn {
             .collect()
     }
 
-    /// Note an admitted append's time on the sender's conversation entry (Switch spec 7
+    /// Note an admitted append's time on the sender's reply grant (Switch spec 7
     /// "Pruning": `last_used`).
-    pub async fn note_conversation_used(
+    pub async fn note_reply_used(
         &mut self,
         sender: &[u8; 32],
         at_ms: u64,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "UPDATE list_entries SET last_used_ms = $3 WHERE account_id = $1 \
-             AND list = 'conversation' AND pubky = $2",
+            "UPDATE peer_admissions SET last_used_ms = $3 WHERE account_id = $1 \
+             AND reply_at_ms IS NOT NULL AND pubky = $2",
         )
         .bind(id)
         .bind(sender.as_slice())

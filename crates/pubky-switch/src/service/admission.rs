@@ -13,10 +13,8 @@ pub(crate) const NOT_ADMITTED: &str = "7: sender not admitted";
 /// Where the account's lists put a sender identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Standing {
-    /// A contact.
-    pub(crate) contact: bool,
-    /// A conversation entry names it.
-    pub(crate) conversation: bool,
+    /// Has a kept reason, a reply grant, or both.
+    pub(crate) listed: bool,
     /// On the deny list.
     pub(crate) denied: bool,
 }
@@ -24,14 +22,14 @@ pub(crate) struct Standing {
 impl Standing {
     /// Whether an app that remains eligible for list admission is on either list.
     pub(super) fn listed(self, removed: bool) -> bool {
-        !removed && (self.contact || self.conversation)
+        !removed && self.listed
     }
 }
 
 /// What admits a sender (Switch spec 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Admitted {
-    /// A contact or conversation entry.
+    /// Either admission reason.
     Listed,
     /// The invite code of this hash, valid now.
     InviteCode([u8; 32]),
@@ -43,7 +41,7 @@ pub(crate) enum Admitted {
 /// Admit a sender of `standing`, for a delivery of its `identity.json` or a directory read
 /// (Switch spec 7, wire 7.2): the deny list overrides everything, and where connect
 /// requests are on a denied sender is answered like a stranger; a removed app counts only
-/// an invite code, never a contact or conversation entry; `invite` is the hash of the code
+/// an invite code, never either admission reason; `invite` is the hash of the code
 /// it presents, only if that code is live now. `None` is `403 not_admitted`.
 pub(crate) fn admit(
     standing: Standing,
@@ -123,10 +121,9 @@ mod tests {
 
     use super::*;
 
-    fn listed(contact: bool, conversation: bool, denied: bool) -> Standing {
+    fn listed(kept: bool, reply: bool, denied: bool) -> Standing {
         Standing {
-            contact,
-            conversation,
+            listed: kept || reply,
             denied,
         }
     }

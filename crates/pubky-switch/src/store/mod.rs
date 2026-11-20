@@ -27,6 +27,7 @@
 //! durable, and judges every state against it (Switch wire 7.3, "Accounts and marks").
 
 mod account;
+mod admission;
 mod allow;
 mod apps;
 mod chain;
@@ -68,7 +69,7 @@ pub use account::{
     AccountHead, AccountTxn, Committed, Creation, ErasureFailure, NewAccount, Savepoint,
     ServiceRun, committed_time_ms,
 };
-pub use allow::{AllowEntry, AllowInvite};
+pub use allow::AllowInvite;
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
 pub use connect::ConnectRequest;
@@ -78,8 +79,8 @@ pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
 pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming};
 pub use ops::{
-    DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
-    StoredInvite, StoredListEntry, StoredRecord,
+    DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite,
+    StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
 pub use push::{OwedKey, PushRegistration};

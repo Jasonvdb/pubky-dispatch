@@ -95,6 +95,16 @@ async fn sql(replay: &Replay, query: &str) {
 
 /// A batch of `op` from alice's wallet.
 async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
+    let answer = wallet_ops(replay, vec![op], batch).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+async fn wallet_ops(replay: &Replay, kinds: Vec<OpKind>, batch: u8) -> SwitchResponse {
     let keys = vectors("keys.json");
     let wallet = app(&keys, "wallet");
     let ops = sign_batch(
@@ -109,10 +119,10 @@ async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
         ),
         1,
         [batch; 16],
-        vec![(Vec::new(), op)],
+        kinds.into_iter().map(|op| (Vec::new(), op)).collect(),
     )
     .expect("batch");
-    let answer = replay
+    replay
         .service
         .handle(app_request(
             wallet,
@@ -121,13 +131,7 @@ async fn wallet_op(replay: &Replay, op: OpKind, batch: u8) {
             OpsRequest::new(&ops, None).to_json(),
             ms(&at()),
         ))
-        .await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
+        .await
 }
 
 fn put_code(code: &str, expires_at: u64, max_uses: u64) -> OpKind {
@@ -338,6 +342,72 @@ async fn test_allow_shows_each_list_whole() {
             "written_by": wallet_id,
         })
     );
+    // An explicit keep and a repeated grant preserve the service's original grant.
+    let peer = bob_public();
+    for (reason, id) in [(AllowKind::Contact, 80), (AllowKind::Conversation, 81)] {
+        wallet_op(
+            &replay,
+            OpKind::AllowPut {
+                pubky: peer,
+                kind: reason,
+            },
+            id,
+        )
+        .await;
+    }
+    let both = body(&read_as(&replay, "wallet", &at()).await);
+    assert_eq!(
+        both["conversations"]
+            .as_array()
+            .expect("conversations")
+            .len(),
+        1
+    );
+    assert_eq!(both["contacts"], json!([bob_id]));
+    assert_eq!(both["conversations"][0], *conversation);
+    wallet_op(
+        &replay,
+        OpKind::AllowDelete {
+            pubky: peer,
+            kind: AllowKind::Contact,
+        },
+        82,
+    )
+    .await;
+    let reply_only = body(&read_as(&replay, "wallet", &at()).await);
+    assert_eq!(reply_only["contacts"], json!([]));
+    assert_eq!(reply_only["conversations"][0], *conversation);
+
+    // Each regrant begins a new lifetime, even when all operations use one service time.
+    let keep = OpKind::AllowPut {
+        pubky: peer,
+        kind: AllowKind::Contact,
+    };
+    let grant = OpKind::AllowPut {
+        pubky: peer,
+        kind: AllowKind::Conversation,
+    };
+    let prune = OpKind::AllowDelete {
+        pubky: peer,
+        kind: AllowKind::Conversation,
+    };
+    let answer = wallet_ops(&replay, vec![keep, prune.clone(), grant], 83).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let restored = body(&read_as(&replay, "wallet", &at()).await);
+    assert_eq!(restored["contacts"], json!([bob_id]));
+    assert_eq!(
+        restored["conversations"][0],
+        json!({"pubky":bob_id, "written_by": wallet_id, "at": at()})
+    );
+    wallet_op(&replay, prune, 84).await;
+    let kept_only = body(&read_as(&replay, "wallet", &at()).await);
+    assert_eq!(kept_only["contacts"], json!([bob_id]));
+    assert_eq!(kept_only["conversations"], json!([]));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -463,8 +533,8 @@ async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
     // Read the full conversation list while a second request writes to the account.
     sql(
         &replay,
-        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash) \
-         SELECT $1, 'conversation', decode(lpad(to_hex(g), 64, '0'), 'hex'), NULL, 0, \
+        "INSERT INTO peer_admissions (account_id, kept, pubky, reply_at_ms, reply_code_hash) \
+         SELECT $1, FALSE, decode(lpad(to_hex(g), 64, '0'), 'hex'), 0, \
          decode(repeat('cd', 32), 'hex') \
          FROM generate_series(1, 100000) g",
     )

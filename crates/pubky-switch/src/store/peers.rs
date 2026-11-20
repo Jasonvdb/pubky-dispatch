@@ -12,13 +12,12 @@ use super::{
 };
 
 /// Whether the account admits `p.identity` for keeping its copy (Switch wire 7.4.5, 9.1): a
-/// contact or conversation entry, and not denied. A denied identity's copy is kept exactly
+/// kept or reply reason, and not denied. A denied identity's copy is kept exactly
 /// like a stranger's. The one rule, for every copy held and every copy delivered.
-const ADMITTED_FOR_KEEPING: &str = "(EXISTS (SELECT 1 FROM list_entries l \
-     WHERE l.account_id = p.account_id AND l.pubky = p.identity \
-     AND l.list IN ('contact', 'conversation')) \
-     AND NOT EXISTS (SELECT 1 FROM list_entries d \
-     WHERE d.account_id = p.account_id AND d.pubky = p.identity AND d.list = 'deny'))";
+const ADMITTED_FOR_KEEPING: &str = "(EXISTS (SELECT 1 FROM peer_admissions a \
+     WHERE a.account_id = p.account_id AND a.pubky = p.identity) \
+     AND NOT EXISTS (SELECT 1 FROM denied_peers d \
+     WHERE d.account_id = p.account_id AND d.pubky = p.identity))";
 
 /// A peer's copy as the account holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +178,7 @@ impl AccountTxn {
     }
 
     /// The least recently delivered copy other than `except`'s, and its identity: among
-    /// strangers' copies only (neither a contact nor a conversation entry) with
+    /// strangers' copies only (neither a kept peer nor a reply grant) with
     /// `strangers_only`, else among every copy.
     pub async fn oldest_peer(
         &mut self,
@@ -208,8 +207,8 @@ impl AccountTxn {
             .map(|copy| (identity, copy)))
     }
 
-    /// Whether the account admits `identity` for keeping its copy: a contact or
-    /// conversation entry, and not denied (the rule of [`AccountTxn::oldest_peer`]).
+    /// Whether the account admits `identity` for keeping its copy: a kept peer or
+    /// reply grant, and not denied (the rule of [`AccountTxn::oldest_peer`]).
     pub async fn peer_admitted(&mut self, identity: &[u8; 32]) -> Result<bool, StoreError> {
         let id = self.head().id.clone();
         sqlx::query_scalar(&format!(

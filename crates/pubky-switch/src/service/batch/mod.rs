@@ -27,9 +27,7 @@ use serde_json::json;
 
 use self::{
     apply::{Applied, Batch},
-    state::{
-        HeldApp, HeldInvite, HeldOrigin, HeldPart, HeldRecord, ListEntry, Needs, OpsState, Totals,
-    },
+    state::{HeldApp, HeldInvite, HeldOrigin, HeldPart, HeldRecord, Needs, OpsState, Totals},
 };
 use super::{Answer, Service, rules::Claimed, store_error};
 use crate::{
@@ -39,8 +37,8 @@ use crate::{
     },
     keys::ServiceSigner,
     store::{
-        AccountTxn, ListName, NewChainItem, RecordOrigin, StoreError, StoredApp, StoredBundlePart,
-        StoredClaimEntry, StoredInvite, StoredListEntry, StoredRecord,
+        AccountTxn, NewChainItem, RecordOrigin, StoreError, StoredApp, StoredBundlePart,
+        StoredClaimEntry, StoredInvite, StoredRecord,
     },
 };
 
@@ -311,22 +309,13 @@ async fn load_state(
         }
     }
     let pubkys: Vec<[u8; 32]> = needs.pubkys.iter().copied().collect();
-    let entries = |list: Vec<StoredListEntry>| {
-        list.into_iter()
-            .map(|e| {
-                (
-                    e.pubky,
-                    ListEntry {
-                        written_by: e.written_by,
-                        at: e.at_ms,
-                    },
-                )
-            })
-            .collect()
-    };
-    state.contacts = entries(txn.list_entries(ListName::Contact, &pubkys).await?);
-    state.conversations = entries(txn.list_entries(ListName::Conversation, &pubkys).await?);
-    state.deny = entries(txn.list_entries(ListName::Deny, &pubkys).await?);
+    state.peers = txn
+        .peer_admissions(&pubkys)
+        .await?
+        .into_iter()
+        .map(|peer| (peer.pubky, peer))
+        .collect();
+    state.deny = txn.denied_peers(&pubkys).await?.into_iter().collect();
     let hashes: Vec<[u8; 32]> = needs.invites.iter().copied().collect();
     for invite in txn.invites(&hashes).await? {
         state.invites.insert(
@@ -340,6 +329,7 @@ async fn load_state(
         );
     }
     let (live_record_keys, record_bytes) = txn.record_totals(&record_keys).await?;
+    let (kept, replies) = txn.admission_counts(&pubkys).await?;
     state.totals = Totals {
         live_record_keys,
         record_bytes,
@@ -347,9 +337,9 @@ async fn load_state(
             Some(writer) => txn.claim_tally(writer, &claim_keys).await?,
             None => Default::default(),
         },
-        contacts: txn.list_count(ListName::Contact, &pubkys).await?,
-        conversations: txn.list_count(ListName::Conversation, &pubkys).await?,
-        deny: txn.list_count(ListName::Deny, &pubkys).await?,
+        kept,
+        replies,
+        deny: txn.deny_count(&pubkys).await?,
         live_invites: txn.live_invites(now, &hashes).await?,
     };
     Ok(state)
@@ -1191,31 +1181,26 @@ async fn save(
         )
         .await?;
     }
-    for (list, old, new) in [
-        (ListName::Contact, &before.contacts, &after.contacts),
-        (
-            ListName::Conversation,
-            &before.conversations,
-            &after.conversations,
-        ),
-        (ListName::Deny, &before.deny, &after.deny),
-    ] {
-        for (pubky, entry) in new {
-            if old.get(pubky) != Some(entry) {
-                txn.put_list_entry(
-                    list,
-                    &StoredListEntry {
-                        pubky: *pubky,
-                        written_by: entry.written_by,
-                        at_ms: entry.at,
-                    },
-                )
-                .await?;
-            }
+    for (key, peer) in &after.peers {
+        if before.peers.get(key) != Some(peer) {
+            txn.put_admission(peer).await?;
         }
-        for pubky in old.keys().filter(|pubky| !new.contains_key(*pubky)) {
-            txn.delete_list_entry(list, pubky).await?;
-        }
+    }
+    for key in before
+        .peers
+        .keys()
+        .filter(|key| !after.peers.contains_key(*key))
+    {
+        txn.delete_admission(key).await?;
+    }
+    for key in after.deny.difference(&before.deny) {
+        txn.put_deny(key).await?;
+    }
+    for key in before.deny.difference(&after.deny) {
+        txn.delete_deny(key).await?;
+    }
+    for peer in &after.answered_connect {
+        txn.delete_connect(peer).await?;
     }
     for (hash, invite) in &after.invites {
         if before.invites.get(hash) != Some(invite) {

@@ -745,6 +745,117 @@ async fn test_kept_batch_status_refusal_and_its_duty_after_a_crash_at_each_commi
     assert!(refused, "a crash met the batch refused");
 }
 
+#[tokio::test]
+async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen() {
+    use crate::app::FeedPosition;
+    use crate::app::list_settlement::order_key;
+    use pubky_switch_core::ops::AllowKind;
+
+    let w = World::new();
+    let router = Router::of(&w);
+    let permissions = [
+        Permission::ListsRead,
+        Permission::ListsManage,
+        Permission::ConversationAdd,
+    ];
+    let mut app = join_on(
+        &w,
+        &router,
+        w.store.clone(),
+        w.protocol.clone(),
+        &permissions,
+    )
+    .await;
+    let phone_request = w
+        .signer
+        .approve(
+            &app_keys("phone"),
+            &AppSpec::new(&["sample-a"]).with_permissions(&permissions),
+        )
+        .unwrap();
+    let mut phone = App::join(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        phone_request,
+    )
+    .await
+    .unwrap();
+    let peer = carol();
+    app.allow_list().await.unwrap();
+    app.receive(None).await.unwrap();
+    let full = app.list_cutoff().await.unwrap().flatten().unwrap();
+    assert_eq!(full.generation, 1);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let id = app
+        .submit_batch(contact_batch(peer))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+
+    let key = next_key();
+    let next = w.switch.import_into_at(key.to_bytes(), NEXT);
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    phone.refresh_identity().await.unwrap();
+    phone.follow_provider().await.unwrap();
+    assert!(phone.allow_list().await.unwrap().contacts.contains(&peer));
+    let answer = phone
+        .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
+            pubky: peer,
+            kind: AllowKind::Contact,
+        }))
+        .await
+        .unwrap();
+    let envelope = answer.proofs[0].envelope();
+    let position = FeedPosition {
+        generation: envelope.generation,
+        seq: envelope.seq,
+    };
+    assert_eq!(position.generation, 2);
+    app.refresh_identity().await.unwrap();
+    assert!(matches!(
+        app.receive(None).await,
+        Err(AppError::Refused(crate::app::Refusal::NotNow(_)))
+    ));
+    assert!(app.cursor().seq < position.seq);
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept { .. })
+    ));
+    assert!(
+        app.reader()
+            .get::<FeedPosition>(&order_key("contact", &peer))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(app.list_cutoff().await.unwrap(), Some(Some(full)));
+    assert!(!app.allow_list().await.unwrap().contacts.contains(&peer));
+    assert_eq!(
+        app.list_cutoff()
+            .await
+            .unwrap()
+            .flatten()
+            .unwrap()
+            .generation,
+        2
+    );
+    app.receive(None).await.unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Applied { .. })
+    ));
+    assert!(!app.admits(&peer).await.unwrap());
+}
+
 /// A batch applied at generation 1 with its answer lost, then sent again unchanged after a
 /// key change in place, stopped after each commit: its original proofs settle it, and its
 /// end comes in the commit that settles it.

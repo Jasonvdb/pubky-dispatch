@@ -1423,6 +1423,26 @@ impl App {
         Ok(())
     }
 
+    pub(super) async fn settle_old_op(
+        &mut self,
+        op: &SignedOp,
+        write: super::list_settlement::OldWrite,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let super::list_settlement::OldWrite::Apply(position) = write
+            && let Some((key, present)) = super::list_settlement::ListKey::change(&op.body().kind)
+        {
+            self.apply_list_change(
+                key,
+                present,
+                super::list_settlement::ListPlacement::Ordered(position),
+                tx,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// What one answered operation settles, written to `tx`.
     pub(crate) async fn settle_op(
         &mut self,
@@ -1431,6 +1451,17 @@ impl App {
         pending: &PendingBatch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        if let Some((key, present)) = super::list_settlement::ListKey::change(&op.body().kind) {
+            use super::list_settlement::ListPlacement;
+            let placement =
+                proof.map_or(ListPlacement::Generation(op.body().generation), |proof| {
+                    ListPlacement::At(super::FeedPosition {
+                        generation: proof.envelope().generation,
+                        seq: proof.envelope().seq,
+                    })
+                });
+            return self.apply_list_change(key, present, placement, tx).await;
+        }
         match &op.body().kind {
             OpKind::RecordPut(_) => {
                 if let Some(proof) = proof {
@@ -1454,12 +1485,6 @@ impl App {
             }
             OpKind::AllowDelete { pubky, kind } => {
                 tx.delete(&super::admission::allow_key(*kind, pubky))?;
-            }
-            OpKind::DenyPut { pubky } => {
-                tx.put(&super::admission::deny_key(pubky), &())?;
-            }
-            OpKind::DenyDelete { pubky } => {
-                tx.delete(&super::admission::deny_key(pubky))?;
             }
             OpKind::InviteCodePut(put) => {
                 let hash = b64(&put.code_hash);
@@ -1876,15 +1901,20 @@ impl App {
 
     /// A kept batch the old service applied, though its answer was lost: what it settles
     /// without its proofs goes into `tx`, and it is no longer kept, its end written.
-    pub(crate) async fn settle_kept_batch(
+    pub(super) async fn settle_kept_batch(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
+        lists: &super::list_settlement::OldListWrites,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let batch = Batch::from_body(pending.body.clone())?;
-        for op in batch.ops() {
-            self.settle_op(op, None, pending, tx).await?;
+        for (index, op) in batch.ops().iter().enumerate() {
+            if let Some(write) = lists.get(op, index) {
+                self.settle_old_op(op, write, tx).await?;
+            } else {
+                self.settle_op(op, None, pending, tx).await?;
+            }
         }
         self.settle_kept_writes(pending, tx).await?;
         self.end_kept_batch(id, pending, Ended::Applied, tx)

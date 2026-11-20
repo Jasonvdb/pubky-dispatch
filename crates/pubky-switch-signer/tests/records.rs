@@ -360,9 +360,7 @@ async fn test_records_enrollment_and_delivery_copies_fail_before_retry() {
     world.assert_no_version_sent_twice();
 }
 
-#[tokio::test]
-async fn test_records_renewal_operation_authentication_precedes_retry() {
-    let world = World::new();
+async fn interrupted_renewal(world: &World) -> (Arc<MemoryStore>, Vec<KeyValue>) {
     let (mut signer, store) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     world.approve(&mut signer, &app).await;
@@ -383,7 +381,14 @@ async fn test_records_renewal_operation_authentication_precedes_retry() {
         Err(SignerError::Switch(_))
     ));
     drop(signer);
-    let original = snapshot(&world, &store);
+    let original = snapshot(world, &store);
+    (store, original)
+}
+
+#[tokio::test]
+async fn test_records_renewal_operation_authentication_precedes_retry() {
+    let world = World::new();
+    let (store, original) = interrupted_renewal(&world).await;
     let damaged = change(&original, b"flow", |flow| {
         let bytes = &mut flow["Renew"]["batches"][0]["bytes"];
         let mut batch: Value =
@@ -397,6 +402,34 @@ async fn test_records_renewal_operation_authentication_precedes_retry() {
         .await
         .unwrap();
     signer.resume().await.unwrap();
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_records_renewal_binding_repair_requires_the_original_account_and_authority() {
+    let world = World::new();
+    let (store, original) = interrupted_renewal(&world).await;
+    let missing = change(&original, b"state", |s| {
+        s["newest"]["account"] = Value::Null
+    });
+    let different = change(&missing, b"flow", |f| {
+        let created = &mut f["Renew"]["account"]["created"];
+        *created = Value::from(created.as_u64().unwrap() + 1);
+    });
+    assert_confirmed_refusal(&world, &store, &different, Refusal::FlowInProgress.into()).await;
+    let held = change(&missing, b"state", |s| {
+        s["switch_unconfirmed"] = Value::Bool(true)
+    });
+    assert_confirmed_refusal(&world, &store, &held, Refusal::SwitchUnconfirmed.into()).await;
+    replace(&world, &store, &missing);
+    let signer = Box::pin(Signer::restore_over_unusable(
+        world.env(store),
+        world.keyring(),
+        discard_confirmed(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Signing);
     world.assert_no_version_sent_twice();
 }
 

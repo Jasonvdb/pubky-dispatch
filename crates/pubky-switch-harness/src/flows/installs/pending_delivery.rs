@@ -1,12 +1,12 @@
-//! Restore when the last settings delivery and its backup survived local damage (Switch wire 3.13).
+//! Recover a pending signer operation after local damage (Switch spec 12.8, Switch wire 3.13).
 
 use super::*;
 use crate::Backend;
 use pubky_switch_client::store::{Fault, FaultStore, StateStore, WriteBatch};
 use pubky_switch_client::{ClientError, StoreError};
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_signer::RecordsDiscarded;
 use pubky_switch_signer::state::signer_namespace;
+use pubky_switch_signer::{RecordsDiscarded, RecordsFault};
 
 #[tokio::test]
 async fn test_restore_pending_settings_delivery_scripted() {
@@ -140,5 +140,116 @@ async fn pending_delivery(world: &World, applied: bool) -> FlowResult {
             .version(),
         next.version() + 1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_restore_pending_renewal_scripted() {
+    check_pending_renewal(Backend::Scripted).await;
+}
+
+#[tokio::test]
+async fn test_restore_pending_renewal_service() {
+    check_pending_renewal(Backend::Service).await;
+}
+
+async fn check_pending_renewal(backend: Backend) {
+    for applied in [false, true] {
+        let result = Box::pin(crate::run_here(backend, async |world: &World| {
+            Box::pin(pending_renewal(world, applied)).await
+        }))
+        .await;
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "applied {applied}: {result:?}"
+        );
+    }
+}
+
+async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let id = alice.public();
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let key = || world.keyring(&alice);
+    let mut signer = Box::pin(Signer::create(env.clone(), key()?, ORIGIN)).await?;
+    Box::pin(signer.resume()).await?;
+    let (app, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    let install = signer.install_id();
+    if applied {
+        world.lose_answer("POST", "/ops");
+    } else {
+        world.unreachable("POST", "/ops");
+    }
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(world.now_ms() + 400 * DAY_MS),
+    };
+    assert!(matches!(
+        Box::pin(signer.renew(app.app_id(), change)).await,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    drop(signer);
+    let ns = signer_namespace(&id);
+    let state = store.get(&ns, b"state")?.ok_or("missing state")?;
+    let flow = store.get(&ns, b"flow")?.ok_or("missing renewal")?;
+    let held: Value = serde_json::from_slice(&flow)?;
+    let signed: SignedDoc = serde_json::from_value(held["Renew"]["doc"].clone())?;
+    let mut damaged: Value = serde_json::from_slice(&state)?;
+    *damaged
+        .pointer_mut("/newest/account")
+        .ok_or("missing original account")? = Value::Null;
+    let mut write = WriteBatch::new();
+    write.put(&ns, b"state", serde_json::to_vec(&damaged)?)?;
+    store.commit(write)?;
+    assert!(matches!(
+        Box::pin(Signer::open(env.clone(), key()?)).await,
+        Err(SignerError::Records(RecordsFault::Damaged(_)))
+    ));
+
+    let confirmed = RecordsDiscarded::shown_and_confirmed;
+    let signer = if applied {
+        // The repair commits but its answer is lost. The binding is the only field repaired.
+        let faulty = Arc::new(FaultStore::new(store.clone(), Fault::FailAfter(1)));
+        let result = Box::pin(Signer::restore_over_unusable(
+            world.signer_env(&alice, faulty)?,
+            key()?,
+            confirmed(),
+        ))
+        .await;
+        assert!(
+            matches!(result, Err(SignerError::Store(StoreError::Unknown))),
+            "{result:?}"
+        );
+        assert_eq!(store.get(&ns, b"state")?, Some(state));
+        assert_eq!(store.get(&ns, b"flow")?, Some(flow));
+        let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
+        Box::pin(signer.resume()).await?;
+        signer
+    } else {
+        Box::pin(Signer::restore_over_unusable(
+            env.clone(),
+            key()?,
+            confirmed(),
+        ))
+        .await?
+    };
+    assert_eq!(signer.install_id(), install);
+    drop(signer);
+    let mut signer = Box::pin(Signer::open(env, key()?)).await?;
+    let renewed = signer.identity_doc()?.ok_or("missing renewed document")?;
+    assert_eq!(renewed.signed(), &signed);
+    assert_eq!(
+        world
+            .files()
+            .identity_doc(&id)
+            .as_ref()
+            .map(IdentityDoc::signed),
+        Some(&signed)
+    );
+    let next = Box::pin(signer.set_record_max_age(Some(120))).await?;
+    assert_eq!(next.version(), renewed.version() + 1);
+    assert_eq!(next.body().signer, install);
     Ok(())
 }

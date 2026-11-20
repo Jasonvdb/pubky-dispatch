@@ -327,6 +327,10 @@ impl App {
         }
         if self.after_list_observations(position, full, previous)? {
             let local = key.local_key();
+            let who = match key {
+                ListKey::Contact(who) | ListKey::Deny(who) => who,
+            };
+            self.note_loss_list_change(&local, who, present, tx).await?;
             if present {
                 tx.put(&local, &())?;
             } else {

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{Backend, run};
-use pubky_switch_client::app::AppEvent;
+use pubky_switch_client::app::Evidence;
 use pubky_switch_client::client::answers::{RecoveryUpload, UploadedOp};
 use pubky_switch_client::error::{ClientError, TransportError};
 
@@ -43,25 +43,10 @@ async fn recovered_writes(world: &World, proved_first: bool) -> FlowResult {
     let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
     let mut wallet = join_wallet(world, &alice, &mut signer, "wallet").await?;
     let mut phone = join_wallet(world, &alice, &mut signer, "phone").await?;
-    // The reader has no shared write to upload when it follows the provider change.
-    let mut reader = join_wallet(world, &alice, &mut signer, "reader").await?;
     let original = signer.identity_doc()?.ok_or("missing original identity")?;
     let target = RecordTarget::new(notes_collection(), b"shopping list");
-    let first = Box::pin(wallet.put_record(&target, br#"{"items":["milk"]}"#, vec![])).await?;
-    let evidence = wallet.shared_evidence().await?;
-    let [held] = evidence.ops.as_slice() else {
-        return Err("expected a single wallet write".into());
-    };
-    let proved = UploadedOp {
-        op: held.op.clone(),
-        cert: held.cert.clone(),
-        proof: Some(held.proof.clone().ok_or("missing wallet acknowledgement")?),
-    };
-
-    // An intervening write leaves the final write's signed base beyond the wallet's
-    // acknowledged version. The phone keeps its signed batch when its answer is lost.
-    Box::pin(phone.read_record(&target)).await?;
-    Box::pin(phone.put_record(&target, br#"{"items":["milk","eggs"]}"#, vec![])).await?;
+    // The phone keeps the signed create whose submission timed out. It has never read
+    // the key, so it cannot contribute a receipt for this write or an intervening one.
     let old = client_of(
         world,
         &alice,
@@ -92,78 +77,194 @@ async fn recovered_writes(world: &World, proved_first: bool) -> FlowResult {
         proof: None,
     };
 
+    phone
+        .keep_evidence(vec![Evidence::Op {
+            op: unanswered.op.clone(),
+            cert: unanswered.cert.clone(),
+            proof: None,
+        }])
+        .await?;
+    assert!(phone.shared_evidence().await?.ops.is_empty());
+    Box::pin(wallet.read_record(&target))
+        .await?
+        .ok_or("missing the phone's write")?;
+    let first = Box::pin(wallet.put_record(&target, br#"{"items":["milk"]}"#, vec![])).await?;
+    let evidence = wallet.shared_evidence().await?;
+    let [proved] = evidence.ops.as_slice() else {
+        return Err("expected the wallet's acknowledged write".into());
+    };
+    assert!(proved.proof.is_some());
+
     Box::pin(lose_and_recover(world, &alice, &mut signer)).await?;
+    let order = if proved_first {
+        [("wallet", &mut wallet), ("phone", &mut phone)]
+    } else {
+        [("phone", &mut phone), ("wallet", &mut wallet)]
+    };
+    for (i, (name, app)) in order.into_iter().enumerate() {
+        Box::pin(follow_recovery(world, app, name, original.generation())).await?;
+        expect_records(
+            world,
+            name,
+            usize::from(i == 0 || !proved_first),
+            usize::from(i == 1),
+        )?;
+    }
     let new = signer.identity_doc()?.ok_or("missing recovery identity")?;
-    Box::pin(follow_recovery(
-        world,
-        &mut reader,
-        "reader",
-        original.generation(),
-    ))
-    .await?;
     let client = client_of(
         world,
         &alice,
-        "reader",
-        &reader,
+        "wallet",
+        &wallet,
         RECOVERY_ORIGIN,
         new.inbox().service_key,
     )?;
-    let uploads = if proved_first {
-        [&proved, &unanswered]
-    } else {
-        [&unanswered, &proved]
-    };
-    let body = |write: &UploadedOp| RecoveryUpload {
-        lost_identity: Some(original.signed().clone()),
-        records: vec![write.clone()],
-        ..RecoveryUpload::default()
-    };
-    for (i, write) in uploads.into_iter().enumerate() {
-        let result = client
-            .recovery_upload(&body(write), false)
-            .await?
-            .result
-            .ok_or("missing upload result")?;
-        assert_eq!(result.records.contains(&first.key), i == 0 || !proved_first);
-        assert_eq!(result.divergent.contains(&first.key), i == 1);
-    }
-    for write in uploads {
-        let repeated = client
-            .recovery_upload(&body(write), false)
-            .await?
-            .result
-            .ok_or("missing repeated upload result")?;
-        assert!(repeated.records.is_empty() && repeated.divergent.is_empty());
-    }
     let installed = client.record(&first.key).await?.view;
     assert_eq!(installed.op, proved.op);
     assert_eq!(installed.version, first.version.version);
     assert!(installed.divergent);
-    let shown = Box::pin(reader.read_record(&target))
+    let shown = Box::pin(wallet.read_record(&target))
         .await?
         .ok_or("missing recovered record")?;
     assert_eq!(shown.content, first.content);
     assert!(shown.divergent);
-    assert!(
-        reader.take_events().iter().any(
-            |event| matches!(event, AppEvent::RecordDivergent { key, .. } if key == &first.key)
-        )
-    );
+
     let resolved =
-        Box::pin(reader.put_record(&target, br#"{"items":["milk","eggs"]}"#, vec![])).await?;
+        Box::pin(wallet.put_record(&target, br#"{"items":["milk","eggs"]}"#, vec![])).await?;
     assert!(!resolved.divergent);
     let written_here = client.record(&first.key).await?.view;
     assert!(!written_here.divergent);
-    let replay = client
-        .recovery_upload(&body(&unanswered), false)
+    let phone_client = client_of(
+        world,
+        &alice,
+        "phone",
+        &phone,
+        RECOVERY_ORIGIN,
+        new.inbox().service_key,
+    )?;
+    let replay = phone_client
+        .recovery_upload(
+            &RecoveryUpload {
+                lost_identity: Some(original.signed().clone()),
+                records: vec![unanswered],
+                ..RecoveryUpload::default()
+            },
+            false,
+        )
         .await?
         .result
-        .ok_or("missing upload result after the local write")?;
+        .ok_or("missing repeated upload result")?;
     assert!(replay.records.is_empty());
-    assert_eq!(replay.divergent, vec![first.key]);
     let kept = client.record(&first.key).await?.view;
     assert_eq!(kept.op, written_here.op);
-    assert!(kept.divergent);
+    // This create's bound is below the acknowledged version that the local write built on.
+    assert!(replay.divergent.is_empty() && !kept.divergent);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retained_record_successor_after_a_later_receipt_at_both_switches() {
+    for backend in [Backend::Scripted, Backend::Service] {
+        run(backend, async |world| arrival_orders(world).await)
+            .await
+            .expect("compare successive writes");
+    }
+}
+
+async fn arrival_orders(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let mut writer = join_wallet(world, &alice, &mut signer, "wallet").await?;
+    let mut phone = join_wallet(world, &alice, &mut signer, "phone").await?;
+    let original = signer.identity_doc()?.ok_or("missing original identity")?;
+    let origin = client_of(
+        world,
+        &alice,
+        "wallet",
+        &writer,
+        ORIGIN,
+        original.inbox().service_key,
+    )?;
+    let orders = [
+        [0, 1, 2],
+        [1, 0, 2],
+        [2, 0, 1],
+        [2, 1, 0],
+        [1, 2, 0],
+        [0, 2, 1],
+    ];
+    let mut cases = Vec::new();
+    for order in orders {
+        let target = RecordTarget::new(notes_collection(), &order);
+        let first = Box::pin(writer.put_record(&target, br#"{"items":["milk"]}"#, vec![])).await?;
+        let parent = origin.record(&first.key).await?.view;
+        let receipt = parent.proof.ok_or("missing original receipt")?;
+        let parent = UploadedOp {
+            op: parent.op,
+            cert: parent.cert,
+            proof: None,
+        };
+        let second = Box::pin(writer.put_record(&target, br#"{"items":["eggs"]}"#, vec![])).await?;
+        let child = origin.record(&second.key).await?.view;
+        let child = UploadedOp {
+            op: child.op,
+            cert: child.cert,
+            proof: None,
+        };
+        let proved = UploadedOp {
+            proof: Some(receipt),
+            ..parent.clone()
+        };
+        cases.push((first.key, order, [parent, child, proved]));
+    }
+    Box::pin(lose_and_recover(world, &alice, &mut signer)).await?;
+    Box::pin(follow_recovery(
+        world,
+        &mut phone,
+        "phone",
+        original.generation(),
+    ))
+    .await?;
+    let new = signer.identity_doc()?.ok_or("missing recovery identity")?;
+    let client = client_of(
+        world,
+        &alice,
+        "phone",
+        &phone,
+        RECOVERY_ORIGIN,
+        new.inbox().service_key,
+    )?;
+    for (key, order, writes) in cases {
+        for i in order {
+            let upload = RecoveryUpload {
+                lost_identity: Some(original.signed().clone()),
+                records: vec![writes[usize::from(i)].clone()],
+                ..RecoveryUpload::default()
+            };
+            client.recovery_upload(&upload, false).await?;
+        }
+        let installed = client.record(&key).await?.view;
+        assert_eq!(installed.op, writes[1].op, "order {order:?}");
+        assert_eq!(installed.cert, writes[1].cert);
+        assert!(!installed.divergent, "order {order:?}");
+        let repeated = client
+            .recovery_upload(
+                &RecoveryUpload {
+                    lost_identity: Some(original.signed().clone()),
+                    records: writes.to_vec(),
+                    ..RecoveryUpload::default()
+                },
+                false,
+            )
+            .await?
+            .result
+            .ok_or("missing repeated upload result")?;
+        assert!(
+            repeated.records.is_empty() && repeated.divergent.is_empty(),
+            "order {order:?}"
+        );
+        assert_eq!(client.record(&key).await?.view.revision, installed.revision);
+    }
     Ok(())
 }

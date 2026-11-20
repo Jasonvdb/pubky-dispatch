@@ -260,6 +260,35 @@ fn parse(value: Value) -> Result<UploadBody, Refusal> {
 }
 
 #[test]
+fn test_reused_service_key_keeps_each_generations_receipts_separate() {
+    let previous = LOST - 1;
+    let mut body = body_with(Vec::new(), Vec::new());
+    for gen_no in [previous, LOST] {
+        let base = RecordVersion::new(gen_no, 2);
+        let op = op_at(gen_no, OpKind::RecordPut(put(base)));
+        let receipt = record_proof(&op, RecordVersion::new(gen_no, 9), NOW);
+        body.records.push(uploaded(&op, Some(receipt.clone())));
+        body.records.push(uploaded(&op, None));
+        body.proofs.push(receipt);
+        body.heads.push(SignedHead::sign(
+            &lost_key(),
+            &identity().public(),
+            &ChainTip {
+                generation: gen_no,
+                seq: 9,
+                chain_hash: [8; 32],
+            },
+        ));
+    }
+    let result = check(&body, &[]);
+    assert_eq!((result.heads, result.proofs, result.unverified), (1, 1, 2));
+    let versions: Vec<_> = result.records.iter().map(|r| r.uploaded.version).collect();
+    let bound = UploadVersion::bound(previous, RecordVersion::new(previous, 2)).unwrap();
+    let exact = UploadVersion::proved(RecordVersion::new(LOST, 9));
+    assert_eq!(versions, [bound, bound, exact, exact]);
+}
+
+#[test]
 fn test_upload_body_reads_each_member_and_an_empty_one() {
     let op = record_op(LOST);
     let head = SignedHead::sign(
@@ -590,8 +619,51 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
 }
 
 #[test]
+fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
+    use crate::recovery::{HeldRecord, RecordSource, merge_checked_record};
+    use crate::shared::RecordState;
+    let first = record_op(LOST);
+    let at = RecordVersion::new(LOST, 50);
+    let receipt = record_proof(&first, at, NOW);
+    let mut uploads = vec![uploaded(&first, None), uploaded(&first, Some(receipt))];
+    for base in [at, at, RecordVersion::new(LOST, 51)] {
+        let op = op_at(LOST, OpKind::RecordPut(put(base)));
+        uploads.push(uploaded(&op, None));
+    }
+    let checked = check(&body_with(uploads, vec![]), &[]);
+    let [current, proved, child, sibling, other] = checked.records.as_slice() else {
+        panic!("five valid writes")
+    };
+    let state = RecordState::after(&current.put, LOST, 11);
+    for (kept, selected, removed) in [
+        (vec![other, child], RecordSource::Retained(1), Some(1)),
+        (vec![child, sibling], RecordSource::Incoming, None),
+        (vec![other], RecordSource::Incoming, None),
+    ] {
+        let hashes: Vec<_> = kept.iter().map(|r| r.uploaded.op_hash).collect();
+        let held = HeldRecord::FromUpload {
+            op_hash: current.uploaded.op_hash,
+            built_on: current.uploaded.built_on,
+            version: current.uploaded.version,
+            divergent: &hashes,
+        };
+        let result = merge_checked_record(
+            &held,
+            Some(&state),
+            None,
+            kept.into_iter().enumerate(),
+            proved,
+            hashes.len(),
+        );
+        assert_eq!(result.install, Some(selected));
+        assert_eq!(result.remove, removed);
+        assert_eq!(result.keep, None);
+    }
+}
+
+#[test]
 fn test_upload_record_of_another_collection_or_policy_is_divergent() {
-    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::recovery::{HeldRecord, RecordMerge, compare_pair};
     use crate::shared::RecordState;
     let op = record_op(LOST);
     let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
@@ -610,7 +682,7 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
         divergent,
     };
     assert_eq!(
-        merge_checked_record(&held(&[]), Some(&state), upload, 8),
+        compare_pair(&held(&[]), Some(&state), upload, 8),
         RecordMerge::Replace
     );
     let other_policy = RecordState {
@@ -623,11 +695,11 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
     };
     for state in [&other_policy, &other_collection] {
         assert_eq!(
-            merge_checked_record(&held(&[]), Some(state), upload, 8),
+            compare_pair(&held(&[]), Some(state), upload, 8),
             RecordMerge::Divergent { kept: true }
         );
         assert_eq!(
-            merge_checked_record(&held(&[[2; 32]]), Some(state), upload, 1),
+            compare_pair(&held(&[[2; 32]]), Some(state), upload, 1),
             RecordMerge::Divergent { kept: false }
         );
         let kept = [upload.uploaded.op_hash];
@@ -638,7 +710,7 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
             divergent: &kept,
         };
         assert_eq!(
-            merge_checked_record(&holding, Some(state), upload, 8),
+            compare_pair(&holding, Some(state), upload, 8),
             RecordMerge::Unchanged
         );
     }
@@ -646,7 +718,7 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
 
 #[test]
 fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
-    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::recovery::{HeldRecord, RecordMerge, compare_pair};
     use crate::shared::RecordState;
     // An upload that drops the member of a permanent record the service holds, or names
     // another generation in it, can't build on that record (Switch spec 10.3.1): it is
@@ -678,7 +750,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
             deleted: false,
         };
         assert_eq!(
-            merge_checked_record(&held, Some(&state), upload, 8),
+            compare_pair(&held, Some(&state), upload, 8),
             RecordMerge::Divergent { kept: true },
             "{:?} over {policy:?}",
             upload.put.policy
@@ -689,7 +761,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
             ..state
         };
         assert_eq!(
-            merge_checked_record(&held, Some(&same), upload, 8),
+            compare_pair(&held, Some(&same), upload, 8),
             RecordMerge::Replace
         );
     }

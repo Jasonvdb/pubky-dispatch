@@ -115,7 +115,7 @@ pub enum HeldRecord<'a> {
 
 /// What an uploaded `record.put` does to the record at its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordMerge {
+enum RecordMerge {
     /// It becomes the record: the service lacked one.
     Fill,
     /// It succeeds a record held only from uploads.
@@ -144,7 +144,7 @@ pub enum RecordMerge {
 /// step 3). Among uploads, only proved versions and a signed base equal to a proved version
 /// establish order. If their order is unresolved, the proved operation is current and the
 /// record is divergent. Writes made at the replacement service stay current.
-pub fn merge_record(
+fn merge_record(
     held: &HeldRecord<'_>,
     upload: &UploadedRecord,
     max_divergent: usize,
@@ -208,7 +208,7 @@ pub fn merge_record(
 /// `state` (`None` when it lacks one): [`merge_record`], except that an upload whose
 /// collection or policy isn't the record's is divergent, since a write with them is refused
 /// (Switch wire 6.2): it can't build on the record.
-pub fn merge_checked_record(
+fn compare_pair(
     held: &HeldRecord<'_>,
     state: Option<&RecordState>,
     upload: &CheckedRecord,
@@ -233,6 +233,132 @@ pub fn merge_checked_record(
             kept: kept.len() < max_divergent,
         }
     }
+}
+
+/// The operation selected by a recovery comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordSource {
+    /// The incoming operation.
+    Incoming,
+    /// The operation already current.
+    Current,
+    /// A previously retained conflict, at its position before this comparison.
+    Retained(usize),
+}
+
+/// Changes to the current operation and the bounded list of retained conflicts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordComparison {
+    /// Install this operation at the upload transition, and list its key in `records`.
+    pub install: Option<RecordSource>,
+    /// Store this operation at the given position, before removing any resolved conflict.
+    pub keep: Option<(usize, RecordSource)>,
+    /// Remove a resolved conflict from its former position.
+    pub remove: Option<usize>,
+    /// The proved immediate predecessor of the selected current operation, when known.
+    pub parent: Option<[u8; 32]>,
+    /// List the key in the upload transition's `divergent` member.
+    pub divergent: bool,
+}
+
+/// Compare the incoming evidence with the current operation and the retained signed writes.
+/// The positions supplied by `retained` are the positions of their hashes in `held`.
+pub fn merge_checked_record<'a>(
+    held: &HeldRecord<'_>,
+    state: Option<&RecordState>,
+    parent: Option<[u8; 32]>,
+    retained: impl Iterator<Item = (usize, &'a CheckedRecord)>,
+    upload: &CheckedRecord,
+    max_divergent: usize,
+) -> RecordComparison {
+    use RecordSource::{Current, Incoming, Retained};
+    let mut comparison = RecordComparison {
+        parent,
+        ..RecordComparison::default()
+    };
+    let candidate = upload.uploaded;
+    if parent == Some(candidate.op_hash) {
+        return comparison;
+    }
+    let slots = match held {
+        HeldRecord::Lacking => &[][..],
+        HeldRecord::FromUpload { divergent, .. } | HeldRecord::WrittenHere { divergent, .. } => {
+            divergent
+        }
+    };
+    let previous = slots.iter().position(|hash| *hash == candidate.op_hash);
+    let decision = compare_pair(held, state, upload, max_divergent);
+    match decision {
+        RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
+            comparison.install = Some(Incoming)
+        }
+        RecordMerge::ReplaceDivergent { position } => {
+            comparison.install = Some(Incoming);
+            comparison.keep = position.map(|i| (i, Current));
+            comparison.divergent = true;
+        }
+        RecordMerge::Divergent { kept } => {
+            comparison.keep = kept.then_some((slots.len(), Incoming));
+            comparison.divergent = true;
+        }
+        RecordMerge::Unchanged => {}
+    }
+    let HeldRecord::FromUpload {
+        op_hash,
+        built_on,
+        version,
+        ..
+    } = *held
+    else {
+        return comparison;
+    };
+    if state.is_none_or(|s| s.collection != upload.put.collection || s.policy != upload.put.policy)
+    {
+        return comparison;
+    }
+    if comparison.install == Some(Incoming) && candidate.op_hash != op_hash {
+        comparison.parent =
+            (version.exact && candidate.built_on == version.version).then_some(op_hash);
+    }
+    if !candidate.version.exact {
+        return comparison;
+    }
+    // Its child may already be current. Remember the parent even when the current
+    // application and the set of conflicts can remain as they are.
+    if candidate.op_hash != op_hash
+        && built_on == candidate.version.version
+        && decision == RecordMerge::Unchanged
+    {
+        comparison.parent = Some(candidate.op_hash);
+        comparison.remove = previous;
+        comparison.install = previous.map(|_| Current);
+        return comparison;
+    }
+    let mut successor = None;
+    let mut multiple = false;
+    for (slot, r) in retained {
+        if r.uploaded.op_hash == candidate.op_hash {
+            // A retained fork can itself gain a receipt while another proved write stays
+            // current. Keep that stronger evidence through subsequent comparisons.
+            if decision == RecordMerge::Unchanged && !r.uploaded.version.exact {
+                comparison.keep = Some((slot, Incoming));
+            }
+        } else if r.put.collection == upload.put.collection
+            && r.put.policy == upload.put.policy
+            && r.uploaded.built_on == candidate.version.version
+        {
+            multiple |= successor.replace(slot).is_some();
+        }
+    }
+    if comparison.install == Some(Incoming)
+        && !multiple
+        && let Some(slot) = successor
+    {
+        comparison.install = Some(Retained(slot));
+        comparison.remove = Some(slot);
+        comparison.parent = Some(candidate.op_hash);
+    }
+    comparison
 }
 
 /// Whether an operation of an app the newest `identity.json` lists in `removed` counts in an

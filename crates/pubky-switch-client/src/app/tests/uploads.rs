@@ -749,7 +749,11 @@ async fn test_upload_divergent_flag_of_a_record_the_app_doesnt_take_isnt_kept() 
     let (lost, mut app) = followed(&store, false).await;
     let key = upload_unheld_record(&lost, &mut app).await;
     *lost.protocol.collections.lock().unwrap() = vec![];
-    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    lost.next
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32].into()]);
     let report = app.receive(None).await.unwrap();
     assert!(app.shared_record(&key).await.unwrap().is_none());
     assert_eq!(divergent(&report.events, key), 0, "{:?}", report.events);
@@ -828,7 +832,11 @@ async fn test_upload_record_view_of_another_key_isnt_taken() {
     let (lost, mut app) = followed(&store, false).await;
     let key = upload_unheld_record(&lost, &mut app).await;
     let other = [9; 32];
-    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    lost.next
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32].into()]);
     lost.next.fail_next(Fault::Replace {
         path: "/records/".into(),
         member: "key".into(),
@@ -1185,7 +1193,11 @@ async fn test_record_read_answered_with_another_records_view_flags_neither() {
         .next()
         .expect("the record");
     let key = upload_unheld_record(&lost, &mut app).await;
-    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    lost.next
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32].into()]);
     lost.next.fail_next(Fault::Replace {
         path: "/records/".into(),
         member: "key".into(),
@@ -1246,7 +1258,11 @@ async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() 
     };
     let key = put.key;
     w.switch.app_op(&phone, kind).unwrap();
-    w.switch.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    w.switch
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32].into()]);
     let report = app.receive(None).await.unwrap();
     assert_eq!(w.switch.lock().shared.listings, listings, "no listing");
     let held = app.shared_record(&key).await.unwrap().unwrap();

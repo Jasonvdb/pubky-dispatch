@@ -1774,8 +1774,8 @@ impl ScriptedSwitch {
             return Err(ScriptError::Missing("no record at the key".into()));
         }
         let kept = inner.shared.divergent.entry(key).or_default();
-        if !kept.contains(&doc_hash) {
-            kept.push(doc_hash);
+        if !kept.iter().any(|r| r.hash() == doc_hash) {
+            kept.push(doc_hash.into());
         }
         let changes = UploadChanges {
             divergent: std::collections::BTreeSet::from([key]),

@@ -2880,7 +2880,7 @@ async fn test_records_overtaken_answer_is_handed_apart_from_an_older_one() {
         .lock()
         .shared
         .divergent
-        .insert(key, vec![[1; 32]]);
+        .insert(key, vec![[1; 32].into()]);
     s.w.switch.fail_next(Fault::Head {
         path: "/records/".into(),
         at: Some(at),
@@ -8594,7 +8594,7 @@ async fn test_scripted_records_deleted_key_a_divergent_upload_names_is_kept() {
         .lock()
         .shared
         .divergent
-        .insert(key, vec![[1; 32]]);
+        .insert(key, vec![[1; 32].into()]);
     read_on(&mut wallet).await;
     read_on(&mut phone).await;
     assert!(held_at_switch(&s, &key));

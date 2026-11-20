@@ -1144,9 +1144,10 @@ async fn save(
                         .ok_or(StoreError::Corrupt("a record write without its proof"))?,
                     upload_base: *upload_base,
                 },
-                HeldOrigin::Uploaded { seq, exact } => RecordOrigin::Uploaded {
+                HeldOrigin::Uploaded { seq, exact, parent } => RecordOrigin::Uploaded {
                     seq: *seq,
                     exact: *exact,
+                    parent: *parent,
                 },
             };
             txn.put_record(&StoredRecord {

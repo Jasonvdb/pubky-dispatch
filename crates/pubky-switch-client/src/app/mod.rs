@@ -37,10 +37,12 @@
 
 mod chain;
 mod deletion;
+mod display;
 mod error;
 mod events;
 mod feed;
 mod forget;
+mod health;
 mod held_cursor;
 mod identity;
 mod kept;
@@ -55,8 +57,10 @@ mod protocols;
 mod provider;
 mod push;
 mod put_back;
+mod record_members;
 mod recovery;
 mod renewal;
+mod retirement;
 mod rotation;
 mod state;
 mod unverified;
@@ -76,12 +80,14 @@ mod send;
 mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
+pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
     EventIdError, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
+pub use health::{ProviderHealth, RecoveryNotice};
 pub use held_cursor::HeldCursor;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
@@ -89,21 +95,24 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication, RecordEx
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
-    LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
-    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, PutBackSuccessor, RETRY_EVENT_READS,
-    ReceivedMessage, RecordDeletion, RecordMarkContext, RecordObservation, RecordRepair,
-    RecordSuccessor, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
-    encode_local_state, local_writes_bytes,
+    AdmissionCustody, DeferCustody, DenyListChange, DenyListGap, Effect, EntryReceipt,
+    FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
+    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack,
+    PutBackSuccessor, RETRY_EVENT_READS, ReceivedMessage, RecordDeletion, RecordMarkContext,
+    RecordObservation, RecordRepair, RecordSuccessor, ResendNeeded, ResendReason, StoreFailure,
+    WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
+pub use record_members::ProtocolRecord;
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
-pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
+pub use recovery::{
+    Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo, RecoveryStep,
+};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 pub use unverified::{
     MAX_UNVERIFIED_AGE_MS, MAX_UNVERIFIED_PER_SENDER, MAX_UNVERIFIED_TOTAL,
@@ -128,15 +137,15 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, CollectionListed, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ,
-    LossRecordApplication, PolicyFamily, RecordContent, RecordRead, RecordTarget, SharedEvidence,
-    SharedRecord, ShownWrite, Unopened,
+    Collection, CollectionListed, CurrentCollection, FlaggedWrite, KeptOp, KeptReason,
+    LISTING_PAGES_PER_READ, LossRecordApplication, PolicyFamily, RecordContent, RecordRead,
+    RecordTarget, SharedEvidence, SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
-    Delivery, DeliveryOrigin, DeliveryView, MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH,
-    OutboxReport, OutgoingMessage, QueuedMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
-    UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    AppendDecision, Delivery, DeliveryOrigin, DeliveryView, MAX_APPEND_RECORDS,
+    MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage, QueuedMessage,
+    RecordJob, SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS,
+    UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -202,8 +211,6 @@ pub const SERVICE_TIME_AHEAD_MS: u64 = DAY_MS;
 /// The integrator's choices for one app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
-    /// The display label in the app record.
-    pub label: Option<String>,
     /// The receive key rotation interval, at least [`MIN_ROTATION_MS`].
     pub rotation_interval_ms: u64,
     /// The bounded wait before an entry whose sender can't be checked is stored locally.
@@ -227,12 +234,12 @@ pub struct AppConfig {
     /// - [`App::list_collection`] and [`App::list_collections`] ask for no further page
     ///   after their first, and [`App::peek`] reads no further page.
     ///
-    /// It bounds when those steps stop, not the call's whole time: each call's docs state
-    /// what it may still send after the budget ran out. A write ([`App::submit_batch`])
-    /// doesn't take it: its bound is the requests it sends. One message's try
-    /// ([`App::send`], [`App::resend`], [`App::flush_message`]) starts no retry of its
-    /// delivery once the budget has passed since the delivery began, and its record job is
-    /// an [`App::update_record`], with a budget of its own.
+    /// Each in-flight HTTP send has its own timeout. [`App::submit_batch`] bounds its
+    /// work by the calls it makes. One message's delivery round ([`App::send`],
+    /// [`App::resend`], [`App::flush_message`]) checks elapsed time before retrying a
+    /// stale key, delivering a needed identity or rereading after an unverified answer. A signed
+    /// timestamp correction can add an HTTP send within a call. The message's record
+    /// job uses the separate budget of [`App::update_record`].
     pub call_budget_ms: u64,
 }
 
@@ -258,7 +265,6 @@ impl CallBudget {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            label: None,
             rotation_interval_ms: DEFAULT_ROTATION_MS,
             park_after_ms: DEFAULT_PARK_AFTER_MS,
             cursor_defer_ms: DEFAULT_CURSOR_DEFER_MS,
@@ -409,7 +415,8 @@ pub struct AppBackup {
     /// The record the app presents, which may be one the switch hasn't accepted yet.
     record: SignedDoc,
     /// The newest record the switch accepted from the app (`record/accepted`), apart from
-    /// `record`: a restore publishes this one, never `record` (Switch spec 4.2). Absent from
+    /// `record`: a restore publishes only accepted bytes, deferring repair while a newer
+    /// local record choice is unresolved (Switch spec 4.2). Absent from
     /// a backup of an app the switch accepted no record from that it knows of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted: Option<SignedDoc>,
@@ -466,6 +473,8 @@ pub struct AppBackup {
     /// finite policy is the record's expiry. Empty while no protocol asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     record_expiries: Vec<(String, own_record::RecordExpiry)>,
+    /// Unsigned member edits, paired with their owners' expiry choices above.
+    record_members: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -502,6 +511,10 @@ struct LayerOut {
 struct BeyondCursor {
     /// The registered protocols whose layers and feed progress were taken together.
     protocols: Vec<String>,
+    /// Missed items already handed beyond the committed cursor.
+    missed: Vec<u64>,
+    /// The sequence and highest held cursor already handed to these layers.
+    held_gap: Option<(u64, u64)>,
     seen: Vec<u64>,
     parked: Vec<(u64, ParkedEntry)>,
     /// Each pair's key after `proc/`, and its record.
@@ -609,7 +622,7 @@ pub(crate) struct AppState {
     pub(crate) meta: Meta,
     pub(crate) keys: AppKeys,
     pub(crate) cert: AppCert,
-    pub(crate) renewal: Option<AppCert>,
+    pub(crate) renewal: Option<renewal::KeptRenewal<AppCert>>,
     pub(crate) record: SignedDoc,
     pub(crate) naming: NamingKey,
     pub(crate) scope_keys: ScopeKeys,
@@ -654,6 +667,8 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    pub(crate) health: health::ServiceHealth,
+    display_read: Option<DisplayRead>,
     /// The ID the next duty event takes (`dutyn`).
     pub(crate) next_duty: u64,
     /// The store's event epoch (`dutye`).
@@ -677,6 +692,10 @@ pub struct App {
     service_time_dirty: bool,
     /// The held alarm still needs a confirmed durable commit.
     alarm_dirty: bool,
+    /// A verified health change awaiting its durable state and duty commit.
+    pending_health: Option<health::ServiceHealth>,
+    /// Device-clock interval for reporting a sustained outage (Switch spec 12.6).
+    unreachable_after_ms: u64,
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     /// The listed certificates the own directory answered a read for, to judge a record
@@ -755,6 +774,9 @@ pub struct App {
     /// The worst held-cursor verdict of the read under way's pages ([`HeldCursor::worse`]),
     /// taken into its report. In memory only.
     held_cursor_read: Option<HeldCursor>,
+    last_collection_read: Option<Arc<feed::ReadCoverage>>,
+    /// Which local certificate a checked own directory establishes at one signed service head.
+    record_page_reader: Option<records::PageReader>,
     /// The sequence and highest held cursor reported ahead with
     /// [`AppEvent::HeldCursorAhead`], so a report isn't told again at every page; cleared by
     /// a page that isn't ahead. In memory only.
@@ -998,10 +1020,10 @@ impl App {
             let first = ReceiveKey::generate(0)?;
             let key_record =
                 ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-            let record =
-                next_body::CertBody::first(&cert, protocols.accepts(&cert), config.label.clone())
-                    .sign(&keys, now, None)?;
-            let client = Self::client_for(&env, &meta, &keys, &cert)?;
+            let record = next_body::CertBody::first(&cert, protocols.accepts(&cert))
+                .sign(&keys, now, None)?;
+            let mut client = Self::client_for(&env, &meta, &keys, &cert)?;
+            client.follow_own_reads(meta.generation, None, None);
             let batch = client.sign_batch(
                 meta.generation,
                 vec![
@@ -1074,6 +1096,8 @@ impl App {
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
+                health: health::ServiceHealth::default(),
+                display_read: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
@@ -1090,6 +1114,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1119,6 +1145,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1249,7 +1277,9 @@ impl App {
             check_protocol_names(&names, &protocols)?;
             protocols.check_cert(&state.cert)?;
             protocols.check_own_certificate(&state.cert)?;
-            let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
+            let mut client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
+            client.follow_own_reads(state.meta.generation, state.health.notice, None);
+            display::restore(&client, &state)?;
             let mut app = App {
                 env,
                 clock,
@@ -1261,6 +1291,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -1290,6 +1322,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -1324,9 +1358,15 @@ impl App {
         let cert_doc: SignedDoc = reader.get(key::CERT).await?.ok_or_else(missing)?;
         let cert = AppCert::verify(&cert_doc, &meta.identity).map_err(|_| corrupt())?;
         send::validate_outbox(reader, &meta, &cert).await?;
-        let renewal = match reader.get::<SignedDoc>(key::CERT_RENEWAL).await? {
+        let renewal = match reader
+            .get::<renewal::KeptRenewal<SignedDoc>>(key::CERT_RENEWAL)
+            .await?
+        {
             None => None,
-            Some(doc) => Some(AppCert::verify(&doc, &meta.identity).map_err(|_| corrupt())?),
+            Some(kept) => Some(renewal::KeptRenewal {
+                cert: AppCert::verify(&kept.cert, &meta.identity).map_err(|_| corrupt())?,
+                at: kept.at,
+            }),
         };
         let mut scope_keys = ScopeKeys::default();
         for (_, scope_key) in reader.scan::<ScopeKey>("scope/").await? {
@@ -1347,6 +1387,8 @@ impl App {
         }
         let parked: BTreeMap<u64, ParkedEntry> = reader.scan_numbered("parked/").await?;
         let next_stored_id = next_stored_id(reader.get::<u64>(key::STORED_NEXT).await?, &parked);
+        let health = health::ServiceHealth::read(reader, meta.generation).await?;
+        let display_read = display::load(reader, &meta, health.display_id).await?;
         Ok(AppState {
             keys,
             cert,
@@ -1386,6 +1428,8 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            health,
+            display_read,
             next_duty: Self::next_duty(reader).await?,
             duty_epoch: reader.get(key::DUTY_EPOCH).await?.ok_or_else(missing)?,
             erasing: reader.get(provider::keys::ERASING).await?,
@@ -1511,6 +1555,7 @@ impl App {
             held_counterparties: Vec::new(),
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
+            record_members: Vec::new(),
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
@@ -1653,6 +1698,7 @@ impl App {
             .map(|(rest, _)| rest)
             .collect();
         backup.record_expiries = self.record_expiries().await?.into_iter().collect();
+        backup.record_members = self.record_members().await?.into_iter().collect();
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -1819,6 +1865,14 @@ impl App {
             }
             backup.beyond_cursor = Some(BeyondCursor {
                 protocols: self.protocols.names(),
+                missed: reader
+                    .scan::<bool>("asked/")
+                    .await?
+                    .into_iter()
+                    .filter(|(_, missed)| *missed)
+                    .map(|(rest, _)| state::parse_num(&rest))
+                    .collect::<Result<_, _>>()?,
+                held_gap: reader.get(held_cursor::GAP_HANDED).await?,
                 seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
@@ -2086,6 +2140,19 @@ impl App {
                     "its record expiry policies are invalid or repeated",
                 ));
             }
+            let pending_members: record_members::RecordMembers =
+                backup.record_members.iter().cloned().collect();
+            if pending_members.len() != backup.record_members.len()
+                || pending_members
+                    .keys()
+                    .any(|name| !expiry_owners.contains(name))
+            {
+                return Err(invalid(
+                    "its pending record members are repeated or lack an expiry",
+                ));
+            }
+            record_members::check_members(&pending_members, &protocols)
+                .map_err(|_| invalid("its pending record members are invalid or too large"))?;
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
@@ -2122,10 +2189,62 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let same_installation = old
+            let installation = old
                 .get::<Meta>(key::META)
                 .await?
-                .is_some_and(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+                .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
+            let same_installation = installation.is_some();
+            if same_installation {
+                let live_members: record_members::RecordMembers =
+                    old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
+                record_members::check_members(&live_members, &protocols).map_err(|_| corrupt())?;
+                let live_expiries: own_record::RecordExpiries =
+                    old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
+                for (name, member) in &live_members {
+                    let expiry = live_expiries
+                        .get(name)
+                        .filter(|expiry| expiry.valid())
+                        .ok_or_else(corrupt)?;
+                    if pending_members.get(name) != Some(member)
+                        || !backup
+                            .record_expiries
+                            .iter()
+                            .any(|(owner, ask)| owner == name && ask == expiry)
+                    {
+                        return Err(Refusal::NotNow(
+                            "finish the pending record member before replacing its local state"
+                                .into(),
+                        )
+                        .into());
+                    }
+                }
+                if pending_members
+                    .keys()
+                    .any(|name| !live_members.contains_key(name))
+                {
+                    // The store can have completed a newer choice since this backup.
+                    // A local signature protects that intent even before acceptance;
+                    // accepted bytes protect it when only that copy survives locally.
+                    for key in [key::RECORD, key::ACCEPTED_RECORD] {
+                        let Some(signed) = old.get::<SignedDoc>(key).await? else {
+                            continue;
+                        };
+                        let current =
+                            AppRecord::verify(&signed, &meta.identity).map_err(|_| corrupt())?;
+                        if current.cert().app_id() != meta.app_id
+                            || current.cert().signing_key() != backup.keys.signing_public()
+                        {
+                            return Err(corrupt());
+                        }
+                        if current.updated_at() > record.updated_at() {
+                            return Err(Refusal::NotNow(
+                                "the backup's unsigned member predates a newer local record".into(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
             let mut deletions = deletion::restore(
                 &old,
                 &backup.deletions,
@@ -2136,6 +2255,15 @@ impl App {
             .await?;
             let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let previous = same_installation.then_some(&old);
+            let previous_health = if installation.is_some_and(|live| {
+                live.generation == meta.generation
+                    && live.service_key == meta.service_key
+                    && live.origin == meta.origin
+            }) {
+                health::ServiceHealth::read(&old, meta.generation).await?
+            } else {
+                health::ServiceHealth::default()
+            };
             let put_backs = put_back::restore(
                 previous,
                 &backup.put_backs,
@@ -2259,7 +2387,11 @@ impl App {
                 next_stored_id: next_stored_id(None, &parked),
                 parked_round: backup.waiting.round,
                 seen,
-                asked: BTreeSet::new(),
+                asked: backup
+                    .beyond_cursor
+                    .iter()
+                    .flat_map(|layer| layer.missed.iter().copied())
+                    .collect(),
                 parked,
                 departed,
                 join: JoinStep::Done,
@@ -2268,8 +2400,9 @@ impl App {
                 pending_publish: None,
                 // The newest record the switch accepted, as the backup carries it apart from
                 // the record held, which may be one whose `app.put` was refused or never
-                // answered: only the accepted one is published, and never over a later
-                // Homeserver copy (Switch spec 4.2). The record held goes to the switch again
+                // answered: repair of the accepted one waits for newer local intent to
+                // settle, and never overwrites a later Homeserver copy (Switch spec 4.2).
+                // The record held goes to the switch again
                 // only with the next change the protocol makes (`own_record.rs`).
                 accepted: backup.accepted.clone(),
                 alarm: None,
@@ -2290,19 +2423,34 @@ impl App {
                 }),
                 leave: None,
                 service_time: None,
+                health: previous_health,
+                display_read: if previous_health.display_id.is_some() {
+                    display::load(&old, &meta, previous_health.display_id).await?
+                } else {
+                    None
+                },
                 gone: None,
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
+            let mut candidate = next_body::NextBody::held(&state)?;
+            for (name, member) in &pending_members {
+                candidate.set_member(name.clone(), member.clone());
+            }
+            if !pending_members.is_empty() {
+                candidate
+                    .check_writable(state.meta.generation, record.updated_at(), None)
+                    .map_err(|_| invalid("its pending record cannot be written"))?;
+            }
             // Every restore takes the backup's owed calls, each checked as a carried one is
             // and keeping only the protocols registered here; one that isn't whole, or is
             // owed to none of them, is left behind and counted. The restore replaces each
             // protocol's local state with its layer, or with nothing, so a call the store
             // made after the backup is owed again: its writes are gone with that state. A
             // restore in place also carries the store's own calls; for a key both hold, the
-            // owners are both values' (`to`), the rest of the value the store's
-            // ([`union_owners`]).
+            // missed notices follow the layer's completed effects and each recipient's
+            // original read. Other calls keep the union of the two owner sets.
             let from_backup = Self::owed_of_backup(backup, &protocols);
             let mut waiting_notices = Vec::new();
             for notice in &backup.waiting.notices {
@@ -2367,8 +2515,10 @@ impl App {
                 next_stored_id,
                 ..state
             };
-            let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            let mut client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            client.follow_own_reads(meta.generation, state.health.notice, None);
             let protocols_names = protocols.names();
+            display::restore(&client, &state)?;
             let mut app = App {
                 env,
                 clock,
@@ -2380,6 +2530,8 @@ impl App {
                 reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
+                pending_health: None,
+                unreachable_after_ms: health::DEFAULT_UNREACHABLE_MS,
                 identity_confirmed: None,
                 directory_asked: Vec::new(),
                 directory_failed_ms: None,
@@ -2409,6 +2561,8 @@ impl App {
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
                 held_cursor_read: None,
+                last_collection_read: None,
+                record_page_reader: None,
                 held_ahead_told: None,
                 listed_before_items: false,
                 listing_waits: false,
@@ -2431,6 +2585,10 @@ impl App {
                 app.restore_record_settlements(&backup.record_settlements, previous, &mut tx)
                     .await?;
                 app.write_all(&mut tx).await?;
+                let mut held_gap = backup
+                    .beyond_cursor
+                    .as_ref()
+                    .and_then(|layer| layer.held_gap);
                 let mut put_back_notices = backup.put_back_notices.clone();
                 for hold in app.state.put_backs.values().filter(|h| h.waited) {
                     // The protocol's local preparation may have been acknowledged after
@@ -2501,6 +2659,9 @@ impl App {
                         backup.record_expiries.iter().cloned().collect();
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
+                if !pending_members.is_empty() {
+                    tx.put(key::RECORD_MEMBERS, &pending_members)?;
+                }
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
                 // carries no deny list call and no gap, and the feed doesn't hand again what
@@ -2521,7 +2682,24 @@ impl App {
                 }
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                let current_sequence = app.state.own_doc.body().recovery_from.unwrap_or(0);
+                let mut retain_gap = |generation: u64, held: Option<u64>| {
+                    if generation > current_sequence
+                        && let Some(held) = held
+                    {
+                        let previous = held_gap
+                            .filter(|(sequence, _)| *sequence == current_sequence)
+                            .map_or(0, |(_, seq)| seq);
+                        held_gap = Some((current_sequence, previous.max(held)));
+                    }
+                };
                 for (stored, value) in &from_backup.0 {
+                    let (generation, seq) = feed::owed_place(
+                        stored.strip_prefix(key::OWED_PREFIX).ok_or_else(corrupt)?,
+                    )?;
+                    let owed: feed::Owed =
+                        serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                    retain_gap(generation, owed.call.held_gap(seq));
                     tx.put(stored, value)?;
                 }
                 carrying = true;
@@ -2531,6 +2709,25 @@ impl App {
                         .0
                         .iter()
                         .find_map(|(key, kept)| (key == stored).then_some(kept));
+                    if let Some(rest) = stored.strip_prefix(key::OWED_PREFIX) {
+                        let live: feed::Owed =
+                            serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                        if matches!(live.call, feed::OwedCall::Missed { .. }) {
+                            let place = live.check_place(rest)?;
+                            let original = in_backup
+                                .cloned()
+                                .map(serde_json::from_value::<feed::Owed>)
+                                .transpose()
+                                .map_err(|_| corrupt())?;
+                            if let Some(owed) =
+                                app.restore_missed(backup, place, original.as_ref(), &live)
+                            {
+                                retain_gap(place.0, owed.call.held_gap(place.1));
+                                tx.put(stored, &owed)?;
+                            }
+                            continue;
+                        }
+                    }
                     match in_backup {
                         Some(kept) if kept == value => {}
                         Some(kept) => {
@@ -2545,6 +2742,9 @@ impl App {
                         }
                         None => tx.put(stored, value)?,
                     }
+                }
+                if let Some(gap) = held_gap {
+                    tx.put(held_cursor::GAP_HANDED, &gap)?;
                 }
                 // What didn't read is left behind, and the protocol told how much.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
@@ -2586,6 +2786,10 @@ impl App {
     async fn write_all(&mut self, tx: &mut Tx) -> Result<(), AppError> {
         let s = &mut self.state;
         tx.put(key::META, &s.meta)?;
+        s.health.write(tx)?;
+        if let Some(read) = &s.display_read {
+            tx.put(display::PENDING, read)?;
+        }
         tx.put(key::KEYS, &s.keys)?;
         tx.put(key::CERT, s.cert.signed())?;
         tx.put(key::RECORD, &s.record)?;
@@ -2630,6 +2834,9 @@ impl App {
         tx.put(key::CURSOR, &s.cursor)?;
         for (app, at) in &s.departed {
             tx.put(&key::departed(app), at)?;
+        }
+        for seq in &s.asked {
+            tx.put(&key::asked(*seq), &true)?;
         }
         for seq in &s.seen {
             tx.put(&key::seen(*seq), &())?;
@@ -2779,6 +2986,7 @@ impl App {
     ///
     /// The [`Refusal`] that holds the attempt back.
     pub fn may_attempt(&self, automatic: bool) -> Result<(), Refusal> {
+        self.may_write_own()?;
         if self.state.alarm.is_some() {
             return Err(Refusal::Stopped);
         }
@@ -3432,10 +3640,14 @@ impl App {
             // left behind, and counted.
             let read = feed::owed_place(&rest)
                 .and_then(|_| state::decode::<feed::Owed>(&bytes))
-                .and_then(|owed| owed.call.kept_op_body().map(|_| owed));
+                .and_then(|owed| {
+                    owed.check_place(&rest)?;
+                    owed.call.kept_op_body().map(|_| owed)
+                });
             match read {
                 Ok(mut owed) => {
                     owed.to.retain(|name| protocols.contains(name));
+                    owed.call.retain_owners(&owed.to);
                     if owed.check_owners(protocols).is_err() {
                         carried.lost_owed = carried.lost_owed.saturating_add(1);
                         continue;
@@ -3456,6 +3668,51 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// A missed call follows the installed layer. A live call supplies the original
+    /// observation for an owner whose installed state has yet to see the occurrence.
+    fn restore_missed(
+        &self,
+        backup: &AppBackup,
+        place: (u64, u64),
+        original: Option<&feed::Owed>,
+        live: &feed::Owed,
+    ) -> Option<feed::Owed> {
+        let (generation, seq) = place;
+        let after_cursor = self.feed_order(generation, seq)
+            > self.feed_order(backup.cursor.generation, backup.cursor.seq);
+        let gap = live.call.held_gap(seq);
+        let sequence = self.state.own_doc.body().recovery_from.unwrap_or(0);
+        let seen = |layer: &BeyondCursor| match gap {
+            Some(held) => layer.held_gap.is_some_and(|(s, last)| {
+                s == sequence && self.current_sequence(generation) && last >= held
+            }),
+            None => {
+                !after_cursor
+                    || (generation == backup.cursor.generation && layer.missed.contains(&seq))
+            }
+        };
+        let mut reads = Vec::new();
+        for name in self.protocols.names() {
+            if let Some(from_backup) = original.filter(|owed| owed.to.contains(&name)) {
+                reads.push((name.clone(), from_backup.call.missed_for(&name)?.clone()));
+                continue;
+            }
+            let installed = backup
+                .beyond_cursor
+                .as_ref()
+                .filter(|layer| layer.protocols.contains(&name));
+            if installed.is_some_and(|layer| original.is_some() || seen(layer)) {
+                continue;
+            }
+            let later =
+                original.is_none() && (after_cursor || (gap.is_some() && installed.is_some()));
+            if live.to.contains(&name) || later {
+                reads.push((name.clone(), live.call.missed_for(&name)?.clone()));
+            }
+        }
+        feed::Owed::missed_owners(reads)
     }
 
     /// The owed calls a backup carries, by stored key, each whole as a carried one must be
@@ -3487,7 +3744,12 @@ impl App {
                     continue;
                 }
             };
+            if owed.check_place(rest).is_err() {
+                lost = lost.saturating_add(1);
+                continue;
+            }
             owed.to.retain(|name| protocols.contains(name));
+            owed.call.retain_owners(&owed.to);
             if owed.check_owners(protocols).is_err() {
                 lost = lost.saturating_add(1);
                 continue;
@@ -3782,27 +4044,21 @@ impl App {
     async fn destroy_keys(&mut self) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = Tx::new(&self.ns);
-        for prefix in [
-            "rk/",
-            "scope/",
-            "parked/",
-            "pending/",
-            "p/",
-            key::DUTY_PREFIX,
-            key::OWED_PREFIX,
-            order::TOLD_PREFIX,
-            deletion::PREFIX,
-            deletion::RECEIPTS,
-        ] {
-            tx.delete_prefix(prefix)?;
-        }
-        records::destroy_shared(&mut tx)?;
         tx.delete(key::KEYS)?;
         tx.delete(key::NAMING)?;
-        let leave = self.state.leave.get_or_insert_with(LeaveState::default);
+        tx.delete_prefixes(&["rk/", "scope/", "parked/", "pending/", "p/"])?;
+        order::clear_on_leave(&mut tx)?;
+        deletion::clear_on_leave(&mut tx)?;
+        records::clear_on_leave(&mut tx)?;
+        recovery::inventory::clear_on_leave(&mut tx)?;
+        send::clear_on_leave(&mut tx)?;
+        admission::clear_on_leave(&mut tx)?;
+        kept::clear_on_leave(&mut tx)?;
+        let mut leave = self.state.leave.unwrap_or_default();
         leave.keys_deleted_ms = Some(now);
-        tx.put(key::LEAVE, leave)?;
+        tx.put(key::LEAVE, &leave)?;
         self.commit(tx).await?;
+        self.state.leave = Some(leave);
         self.state.receive_keys.clear();
         self.state.scope_keys = ScopeKeys::default();
         self.state.parked.clear();
@@ -3847,6 +4103,21 @@ impl App {
             Arc::clone(&env.transport),
             Arc::clone(&env.clock),
         )?)
+    }
+
+    fn own_read_client(&self) -> Result<SwitchClient, AppError> {
+        let mut client = Self::client_for(
+            &self.env,
+            &self.state.meta,
+            &self.state.keys,
+            &self.state.cert,
+        )?;
+        client.follow_own_reads(
+            self.state.meta.generation,
+            self.state.health.notice,
+            Some(&self.client),
+        );
+        Ok(client)
     }
 
     /// The app's device clock. A host checking an action against the app's own
@@ -3939,18 +4210,17 @@ impl App {
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.validate_waiting_state()?;
-            self.client = Self::client_for(
-                &self.env,
-                &self.state.meta,
-                &self.state.keys,
-                &self.state.cert,
-            )?;
+            self.client = self.own_read_client()?;
+            display::restore(&self.client, &self.state)?;
             self.service_time_dirty = false;
             // The reload is done only once the kept duty events it may owe the host are
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
         }
+        self.keep_read_decisions().await?;
+        self.client
+            .hold_own_writes(self.recovery_required().map(|n| n.generation));
         if told {
             self.load_told().await?;
         }
@@ -4027,7 +4297,14 @@ impl App {
     /// a time that went back, and a rollback for an answer that contradicts itself (Switch
     /// spec 10.1).
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
+        if Box::pin(self.observe_own_answer()).await?.is_some() {
+            return Err(Self::later_generation_answer());
+        }
         self.take_answer(result, true).await
+    }
+
+    fn later_generation_answer() -> AppError {
+        Refusal::NotNow("the service answered for a later generation".into()).into()
     }
 
     /// [`App::take`] for an answer that binds no request of the app's, the public read's
@@ -4248,12 +4525,9 @@ impl App {
         // A time an answer of the client before brought may be of another service: the
         // next stamp or window reads one from this client's service.
         self.time_fresh_at = None;
-        self.client = Self::client_for(
-            &self.env,
-            &self.state.meta,
-            &self.state.keys,
-            &self.state.cert,
-        )?;
+        self.client = self.own_read_client()?;
+        self.client
+            .hold_own_writes(self.recovery_required().map(|n| n.generation));
         Ok(())
     }
 }

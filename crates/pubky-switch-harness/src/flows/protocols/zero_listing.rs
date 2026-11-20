@@ -74,11 +74,17 @@ struct WaitingListing {
     listed: Arc<ListedProtocol>,
 }
 
-async fn wait_for_listing(
-    world: &World,
-    restore: bool,
-) -> Result<Box<WaitingListing>, Box<dyn std::error::Error>> {
-    use crate::flows::recovery::{RECOVERY_ORIGIN, SENDERS_ORIGIN};
+struct ListingSetup {
+    waiting: WaitingListing,
+    shop: App,
+    phone: [u8; 16],
+    protocols: ProtocolSet,
+    identity: TestIdentity,
+}
+
+// Keep enrollment's polling frame separate from recovery and restore.
+async fn prepare_listing(world: &World) -> Result<Box<ListingSetup>, Box<dyn std::error::Error>> {
+    use crate::flows::recovery::SENDERS_ORIGIN;
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -120,7 +126,7 @@ async fn wait_for_listing(
     ))
     .await?;
     let (shop_tasks, shop_chat) = both();
-    let mut shop = Box::pin(joined_with_both(
+    let shop = Box::pin(joined_with_both(
         world,
         &bob,
         &mut bob_signer,
@@ -128,8 +134,42 @@ async fn wait_for_listing(
         set_of(&shop_tasks, &shop_chat)?,
     ))
     .await?;
-    Box::pin(alice_signer.revoke(phone.app_id(), None, UserConfirmed::shown_and_confirmed()))
-        .await?;
+    Ok(Box::new(ListingSetup {
+        waiting: WaitingListing {
+            wallet,
+            signer: alice_signer,
+            tasks,
+            chat,
+            listed,
+        },
+        shop,
+        phone: phone.app_id(),
+        protocols,
+        identity: alice,
+    }))
+}
+
+async fn hold_listing(
+    world: &World,
+    setup: Box<ListingSetup>,
+    restore: bool,
+) -> Result<Box<WaitingListing>, Box<dyn std::error::Error>> {
+    use crate::flows::recovery::RECOVERY_ORIGIN;
+    let ListingSetup {
+        waiting,
+        mut shop,
+        phone,
+        protocols,
+        identity: alice,
+    } = *setup;
+    let WaitingListing {
+        mut wallet,
+        signer: mut alice_signer,
+        tasks,
+        chat,
+        listed,
+    } = waiting;
+    Box::pin(alice_signer.revoke(phone, None, UserConfirmed::shown_and_confirmed())).await?;
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
     Box::pin(
@@ -211,7 +251,8 @@ async fn wait_for_listing(
 }
 
 async fn listing_and_gap(world: &World, restore: bool) -> FlowResult {
-    let mut waiting = Box::pin(wait_for_listing(world, restore)).await?;
+    let setup = Box::pin(prepare_listing(world)).await?;
+    let mut waiting = Box::pin(hold_listing(world, setup, restore)).await?;
     Box::pin(waiting.signer.run_due()).await?;
     for _ in 0..4 {
         Box::pin(waiting.wallet.receive(None)).await?;

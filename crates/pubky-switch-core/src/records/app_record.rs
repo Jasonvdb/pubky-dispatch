@@ -45,9 +45,6 @@ pub struct AppRecordBody {
     /// as empty, and a protocol's `null` value as no member.
     #[serde(default, deserialize_with = "protocols::deserialize")]
     pub protocols: ProtocolMembers,
-    /// A display label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
     /// When the record was made; the later `updated_at` wins between two records.
     #[serde(with = "fmt::time_ms")]
     pub updated_at: u64,
@@ -58,7 +55,7 @@ pub struct AppRecordBody {
 }
 
 impl AppRecordBody {
-    /// A record for the app `cert` certifies, with no protocol members and no label.
+    /// A record for the app `cert` certifies, with no protocol members.
     pub fn new(cert: &AppCert, accepts: Vec<String>, updated_at: u64) -> Self {
         Self {
             identity: cert.identity(),
@@ -67,7 +64,6 @@ impl AppRecordBody {
             cert: cert.signed().clone(),
             accepts,
             protocols: ProtocolMembers::new(),
-            label: None,
             updated_at,
             expires_at: None,
         }
@@ -353,10 +349,8 @@ mod tests {
     use crate::Error;
     use crate::records::fixtures::{app, cert, identity, other_app};
 
-    fn record(updated_at: u64, label: &str) -> AppRecord {
-        let mut body =
-            AppRecordBody::new(&cert(&["scope-a"]), vec!["sample.kind".into()], updated_at);
-        body.label = Some(label.to_owned());
+    fn record(updated_at: u64, kind: &str) -> AppRecord {
+        let body = AppRecordBody::new(&cert(&["scope-a"]), vec![kind.to_owned()], updated_at);
         AppRecord::sign(&app(), body).unwrap()
     }
 
@@ -369,12 +363,12 @@ mod tests {
     }
 
     fn value() -> Value {
-        serde_json::from_slice(&record(10, "a").signed().body_bytes().unwrap()).unwrap()
+        serde_json::from_slice(&record(10, "sample.kind").signed().body_bytes().unwrap()).unwrap()
     }
 
     #[test]
     fn test_app_record_sign_and_verify_round_trip() {
-        let r = record(10, "a");
+        let r = record(10, "sample.kind");
         let read = AppRecord::verify(r.signed(), &identity().public()).unwrap();
         assert_eq!(read, r);
         assert!(read.accepts("sample.kind") && !read.accepts("other.kind"));
@@ -409,7 +403,8 @@ mod tests {
     #[test]
     fn test_app_record_protocols_are_checked_for_form_only() {
         // Written as `{}` when the protocols add nothing.
-        let text = String::from_utf8(record(10, "a").signed().body_bytes().unwrap()).unwrap();
+        let text =
+            String::from_utf8(record(10, "sample.kind").signed().body_bytes().unwrap()).unwrap();
         assert!(text.contains(r#""protocols":{}"#), "{text}");
         // A protocol's member is any object, read back as it was written.
         let mut v = value();
@@ -461,7 +456,11 @@ mod tests {
 
     #[test]
     fn test_app_record_order_and_conflict() {
-        let (a, b, later) = (record(10, "a"), record(10, "b"), record(11, "a"));
+        let (a, b, later) = (
+            record(10, "sample.kind"),
+            record(10, "sample.other"),
+            record(11, "sample.kind"),
+        );
         assert_eq!(a.order(&b), RecordOrder::Conflict);
         assert_eq!(a.order(&a.clone()), RecordOrder::Same);
         assert_eq!(later.order(&a), RecordOrder::Later);
@@ -471,10 +470,10 @@ mod tests {
     #[test]
     fn test_record_view_keeps_the_earlier_record_during_a_conflict() {
         let (old, a, b, later) = (
-            record(5, "o"),
-            record(10, "a"),
-            record(10, "b"),
-            record(11, "c"),
+            record(5, "sample.old"),
+            record(10, "sample.kind"),
+            record(10, "sample.other"),
+            record(11, "sample.later"),
         );
         let now = 1_000;
         let mut view = RecordView::new();
@@ -484,7 +483,7 @@ mod tests {
         assert!(view.see(&b, now));
         assert_eq!(view.used(), Some(&old));
         assert!(view.see(&old, now), "an older record changes nothing");
-        let ahead = record(now + CLOCK_TOLERANCE_MS + 1, "f");
+        let ahead = record(now + CLOCK_TOLERANCE_MS + 1, "sample.ahead");
         assert!(
             view.see(&ahead, now),
             "a record too far ahead takes part in nothing"
@@ -499,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_app_record_carries_its_certificate_or_an_earlier_one() {
-        let r = record(10, "a");
+        let r = record(10, "sample.kind");
         assert!(r.carries(r.cert()));
         let mut renewed_body = crate::records::fixtures::cert_body(&["scope-a"]);
         renewed_body.issued_at += 1;
@@ -520,7 +519,7 @@ mod tests {
     #[test]
     fn test_app_record_age_and_ahead_rules() {
         let t = 1_000_000;
-        let r = record(t, "a");
+        let r = record(t, "sample.kind");
         assert_eq!(r.trusted_until(60), t + 60_000);
         assert!(!r.is_ahead(t - CLOCK_TOLERANCE_MS));
         assert!(r.is_ahead(t - CLOCK_TOLERANCE_MS - 1));

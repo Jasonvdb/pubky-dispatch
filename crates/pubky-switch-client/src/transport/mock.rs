@@ -104,7 +104,7 @@ mod tests {
             path_and_query: path.into(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: crate::transport::TimeoutClass::default(),
+            timeout: crate::transport::TimeoutClass::Ordinary,
         }
     }
 

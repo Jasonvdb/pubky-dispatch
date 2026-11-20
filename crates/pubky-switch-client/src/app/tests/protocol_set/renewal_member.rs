@@ -143,7 +143,7 @@ fn renew_to(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
 }
 
 /// The signer stores a renewal of `app`'s certificate to `scopes` (Switch spec 3.2 step 1).
-fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
+pub(super) fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
     let renewed = issue_cert(
         &p.w.alice,
         &app_keys("wallet"),
@@ -568,46 +568,6 @@ fn changed(events: Vec<AppEvent>) -> Vec<String> {
         .collect()
 }
 
-/// A plain renewal with the default hook carries members and asks as they are, as before
-/// members were judged: an ask without a member, a member without an ask, both, neither.
-#[tokio::test]
-async fn test_renewal_member_default_carries_members_and_asks() {
-    let p = Pair::new();
-    let (mut app, _) = join(&p).await;
-    let me = app.app_id();
-    let deadline = p.w.clock.now_ms() + HOUR;
-    // `tasks` has both; `chat`'s member comes from another device without an ask.
-    app.set_protocol_member(
-        "tasks",
-        Some(object(json!({ "list": "a" }))),
-        Some(deadline),
-    )
-    .await
-    .unwrap();
-    let mut asks = app.record_expiries().await.unwrap();
-    asks.remove("chat");
-    let mut tx = app.tx().unwrap();
-    tx.put(crate::app::state::key::RECORD_EXPIRIES, &asks)
-        .unwrap();
-    app.commit(tx).await.unwrap();
-    // A protocol with an ask and no member, and one with neither.
-    let p2 = Pair::new();
-    let (mut other, _) = join(&p2).await;
-    other.set_protocol_member("chat", None, None).await.unwrap();
-    other.renew_record("chat", Some(deadline)).await.unwrap();
-    for (app, p) in [(&mut app, &p), (&mut other, &p2)] {
-        let before = (members(app), app.record_expiries().await.unwrap());
-        p.w.clock.advance_ms(1000);
-        let renewed = renew_to(p, app, &SCOPES);
-        app.receive(None).await.unwrap();
-        assert_eq!(app.cert().hash(), renewed.hash());
-        assert_eq!((members(app), app.record_expiries().await.unwrap()), before);
-        let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
-        assert_eq!(held.body().expires_at, Some(deadline));
-    }
-    let _ = me;
-}
-
 /// Two devices hold one reducing renewal from its `cert.put`: `b`, running `tasks` and
 /// `chat`, takes it first; `a`, running `tasks` only, then builds on `b`'s record instead of
 /// signing over it, `chat`'s member kept, with a change kept on `a` too.
@@ -931,4 +891,39 @@ async fn test_renewal_member_ask_without_member_survives_a_take() {
         app.record_expiries().await.unwrap().get("chat"),
         Some(&RecordExpiry::At(deadline))
     );
+}
+
+#[tokio::test]
+async fn test_renewal_member_uses_pending_choice_under_the_new_certificate() {
+    let p = Pair::new();
+    let (mut app, store) = Box::pin(join(&p)).await;
+    let until = p.w.clock.now_ms() + HOUR;
+    app.renew_record("tasks", Some(until)).await.unwrap();
+    app.renew_record("chat", Some(until)).await.unwrap();
+    p.w.clock.advance_ms(2 * HOUR);
+    let desired = object(json!({ "list": "next", "assign": "team2" }));
+    usage(
+        app.set_protocol_member("tasks", Some(desired), None).await,
+        "chat",
+    );
+    *p.tasks.member_for.lock().unwrap() = Some(drop_assign);
+    *p.chat.member_for.lock().unwrap() = Some(|_, _, _| (None, RecordExpiry::Never));
+    let renewed = renew(&p, &app);
+    for _ in 0..3 {
+        p.w.clock.advance_ms(1000);
+        let _ = app.receive(None).await;
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    let desired = object(json!({ "list": "next" }));
+    let mut matched = 0;
+    for signed in store.records.lock().unwrap().iter() {
+        let record = AppRecord::verify(signed, &app.identity()).unwrap();
+        if record.cert().hash() == renewed.hash() {
+            matched += 1;
+            assert_eq!(record.body().protocol("tasks"), Some(&desired));
+            assert!(record.body().protocol("chat").is_none());
+        }
+    }
+    assert!(matched > 0);
+    assert!(!app.protocol_record("tasks").await.unwrap().pending);
 }

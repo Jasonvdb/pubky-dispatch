@@ -399,31 +399,13 @@ impl Service {
         recovery_from: u64,
         time_ms: u64,
     ) -> Result<(), ApiError> {
-        let temporary = |_| ApiError::unavailable("7.6: a temporary failure");
         let transition = ServiceTransition::Recovery {
             recovery_from,
             at: time_ms,
         };
-        let signed = self.sign_transition(txn, signer, &transition)?;
-        let item_bytes = signed.doc_bytes().map_err(temporary)?;
-        let hash = item_hash(ItemType::Service, &item_bytes);
-        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
-        let (stub, _tip) = txn
-            .head()
-            .chain_tip()
-            .append(seq, time_ms, ItemType::Service, hash, None)
-            .map_err(temporary)?;
-        txn.append_chain_item(&NewChainItem {
-            seq,
-            item_type: ItemType::Service,
-            item_bytes: &item_bytes,
-            stub: &stub,
-            server_time_ms: time_ms,
-            only_for: None,
-            proof: None,
-        })
-        .await
-        .map_err(|e| store_error(&e))
+        self.append_service_transition(txn, signer, &transition, None, time_ms)
+            .await?;
+        Ok(())
     }
 
     /// Chain a new `identity.json` version and answer with its proof and the new head.

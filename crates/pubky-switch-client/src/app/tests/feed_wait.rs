@@ -38,6 +38,8 @@ struct Mode {
     refuse_waits: bool,
     /// Every feed read fails to connect.
     feeds_down: bool,
+    /// Deliver a completed, verified-by-the-client-later wait after an overlapping call.
+    hold_wait_answer: bool,
     /// Every request waits here, before it reaches the switch.
     paused: bool,
 }
@@ -47,6 +49,7 @@ struct Gate {
     inner: Arc<dyn Transport>,
     mode: Mutex<Mode>,
     waits: Mutex<Vec<String>>,
+    waiting_answer: std::sync::atomic::AtomicBool,
 }
 
 impl Gate {
@@ -55,6 +58,7 @@ impl Gate {
             inner,
             mode: Mutex::new(Mode::default()),
             waits: Mutex::new(Vec::new()),
+            waiting_answer: false.into(),
         })
     }
 
@@ -104,7 +108,15 @@ impl Transport for Gate {
             if query.is_some() && mode.feeds_down {
                 return Err(TransportError::Connect("the switch is down".into()));
             }
-            self.inner.send(request).await
+            let answer = self.inner.send(request).await;
+            if waits && self.mode().hold_wait_answer {
+                self.waiting_answer
+                    .store(true, std::sync::atomic::Ordering::Release);
+                while self.mode().hold_wait_answer {
+                    tokio::task::yield_now().await;
+                }
+            }
+            answer
         })
     }
 }
@@ -273,6 +285,81 @@ async fn test_feed_wait_is_ready_quiet_or_read_now() {
     s.w.clock
         .set_ms(app.cert().expires_at().saturating_add(1_000));
     assert_eq!(app.feed_wait(25).wait().await, Woken::ReadNow);
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_orders_concurrent_waits_by_the_original_request() {
+    use crate::testing::Fault;
+    use pubky_switch_core::http::{ErrorCode, NoticeReason, RecoveryNotice};
+    for older_notice in [true, false] {
+        let s = Setup::new(false);
+        let mut app = s.join("wallet").await;
+        let notice = |permanent| Fault::Error {
+            path: "/feed".into(),
+            code: ErrorCode::RecoveryRequired,
+            current: RecoveryNotice {
+                generation: 1,
+                reason: NoticeReason::Behind,
+                permanent,
+            }
+            .to_current(),
+        };
+        s.gate.set(|mode| mode.hold_wait_answer = true);
+        if older_notice {
+            s.w.switch.fail_next(notice(false));
+        }
+        let waiting = tokio::spawn(app.feed_wait(1).wait());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !s
+                .gate
+                .waiting_answer
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        s.w.switch.fail_next(notice(!older_notice));
+        assert!(app.receive(None).await.unwrap().stopped);
+        if older_notice {
+            assert!(!app.recovery_required().unwrap().permanent);
+            app.follow_provider().await.unwrap();
+            assert!(app.recovery_required().is_none());
+        }
+        s.gate.set(|mode| mode.hold_wait_answer = false);
+        let _ = waiting.await.unwrap();
+        if older_notice {
+            assert!(app.recovery_required().is_none());
+            assert!(app.may_attempt(false).is_ok());
+        } else {
+            assert!(app.recovery_required().unwrap().permanent);
+            assert_eq!(
+                app.may_attempt(true),
+                Err(crate::app::Refusal::RecoveryRequired { generation: 1 })
+            );
+            assert!(app.state.alarm.is_none());
+            assert!(matches!(
+                app.follow_provider().await,
+                Err(AppError::Alarm(crate::app::Alarm::Rollback { .. }))
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_allows_delivery_to_an_existing_peer() {
+    let s = Setup::new(false);
+    let mut app = s.join("wallet").await;
+    let (_, first) = app.send(note_to_bob(&s, "hello")).await.unwrap();
+    assert!(matches!(first, crate::app::Delivery::Accepted { .. }));
+    s.w.switch.lose_mark();
+    assert!(app.receive(None).await.unwrap().stopped);
+    let notice = app.recovery_required().unwrap();
+    let (id, delivered) = app.send(note_to_bob(&s, "follow-up")).await.unwrap();
+    assert!(matches!(delivered, crate::app::Delivery::Accepted { .. }));
+    assert!(s.peer.received().contains(&id));
+    assert_eq!(app.recovery_required(), Some(notice));
 }
 
 #[tokio::test]

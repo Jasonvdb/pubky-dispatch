@@ -102,6 +102,11 @@ pub enum Refusal {
     /// The app isn't current any more, or its account is gone (Switch spec 12.2, 12.7): it
     /// reads and writes nothing more.
     Gone,
+    /// A signed notice forbids attempts and writes to the app's own account.
+    RecoveryRequired {
+        /// The followed generation.
+        generation: u64,
+    },
     /// The approval doesn't pass the app's checks (Switch wire 3.10); the text names the
     /// step.
     Approval(String),
@@ -196,6 +201,10 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::Stopped => f.write_str("the app stopped on an alarm"),
             Refusal::Left => f.write_str("the app left its identity or was removed"),
+            Refusal::RecoveryRequired { generation } => write!(
+                f,
+                "the service requires recovery for generation {generation}"
+            ),
             Refusal::Gone => f.write_str("the app isn't current any more, or its account is gone"),
             Refusal::Approval(why) => write!(f, "approval refused: {why}"),
             Refusal::NotJoined => f.write_str("no app with this App ID in the store"),
@@ -521,6 +530,12 @@ pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
 impl From<ClientError> for AppError {
     fn from(error: ClientError) -> Self {
         match error {
+            ClientError::DisplayReadPending => {
+                Refusal::NotNow("the display read is awaiting its original response".into()).into()
+            }
+            ClientError::OwnRecoveryRequired { generation } => {
+                Refusal::RecoveryRequired { generation }.into()
+            }
             ClientError::Transport(error) => AppError::Transport(error),
             other => AppError::Switch(other),
         }
@@ -582,7 +597,7 @@ mod tests {
             path_and_query: path.into(),
             headers: vec![Header::new(header::SIGNATURE, "c2ln")],
             body: b"{}".to_vec(),
-            timeout: Default::default(),
+            timeout: crate::transport::TimeoutClass::Bulk,
         };
         let body = serde_json::json!({ "code": code.as_str(), "message": "m" })
             .to_string()

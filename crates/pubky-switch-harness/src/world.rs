@@ -456,6 +456,36 @@ impl World {
         }
     }
 
+    /// Temporarily withhold an enrolled account or reattach it on the same generation.
+    /// The independent mark stays in place. The wallet sees a signed temporary `behind`
+    /// notice while the account is missing (Switch wire 7.3).
+    /// Use a dedicated test origin. The real service uses a disposable copy of that
+    /// origin's database until the original database is reattached.
+    ///
+    /// # Errors
+    ///
+    /// When the account is absent at the start or the test service cannot be restarted.
+    pub async fn set_account_missing(
+        &self,
+        origin: &str,
+        identity: &TestIdentity,
+        missing: bool,
+    ) -> Result<(), HarnessError> {
+        match self.backend {
+            Backend::Service => {
+                let id = identity.key().id();
+                self.change_service(origin, async |switch| {
+                    switch.set_account_missing(&id, missing).await
+                })
+                .await
+            }
+            Backend::Scripted => self
+                .scripted_switch(origin, identity)?
+                .set_account_missing(missing)
+                .map_err(|error| HarnessError::Setup(error.to_string())),
+        }
+    }
+
     /// The switch at `origin` loses `identity`'s record at `key`, as a faulty switch would:
     /// its reads answer `404` and its listings leave the key out (Switch spec 10.3.1
     /// "Absence"). The service is stopped for the change and started again.
@@ -829,7 +859,7 @@ impl World {
                 path_and_query: path.to_owned(),
                 headers: Vec::new(),
                 body: Vec::new(),
-                timeout: pubky_switch_client::transport::TimeoutClass::default(),
+                timeout: pubky_switch_client::transport::TimeoutClass::Bulk,
             })
             .await
     }

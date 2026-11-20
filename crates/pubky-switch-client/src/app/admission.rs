@@ -41,6 +41,11 @@ pub const INVITE_CODE_BYTES: usize = 32;
 
 const INVITE_PREFIX: &str = "invite/";
 
+/// Remove bearer invite codes when the app destroys its keys.
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefix(INVITE_PREFIX)
+}
+
 /// The app's copy of the lists lives under `lc/`, shared with the moves and recovery code,
 /// which uploads it after a provider loss: `lc/contact/<pubky>`, `lc/deny/<pubky>` and
 /// `lc/code/<code_hash>` there, and `lc/conv/<pubky>` here, each holding `()`.
@@ -639,6 +644,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            self.may_write_own()?;
             self.need(Permission::ConversationAdd)?;
             let result = self.client.decline_connect(pubky).await;
             self.take(result).await?;

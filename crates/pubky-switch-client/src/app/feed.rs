@@ -67,7 +67,7 @@ pub(crate) use owed::{Owed, OwedCall, owed_place};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, Verifier};
+use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, SignedHead, Verifier};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::message::{Message, MessagePlaintext};
@@ -88,7 +88,7 @@ use super::events::{AppEvent, DropReason, Duty, KeptRefusal, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::order::{Handover, Kept, Walk};
 use super::protocol::{
-    DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
+    DeferCustody, DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, Need, OpaqueRule,
     Outcome, PARKED_RETRIES_PER_READ, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
     ResendReason, StoreFailure, local_writes_bytes,
@@ -140,6 +140,7 @@ pub(crate) struct OwedGap {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReceiveReport {
+    pub(crate) coverage: Option<Arc<ReadCoverage>>,
     /// Everything that happened, in order.
     pub events: Vec<AppEvent>,
     /// The position processed to.
@@ -165,6 +166,15 @@ pub struct ReceiveReport {
     /// committed or sent, the worst of the read's pages (Switch spec 8.3); `None` when the
     /// read read no page.
     pub held_cursor: Option<super::HeldCursor>,
+}
+
+/// The authenticated final page of one completed receive on this app instance.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReadCoverage {
+    pub(crate) identity: [u8; 32],
+    pub(crate) cert: [u8; 32],
+    pub(crate) through: Position,
+    pub(crate) head: SignedHead,
 }
 
 /// How far an item lets the cursor go.
@@ -416,6 +426,7 @@ impl App {
     /// and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
+            self.last_collection_read = None;
             self.ready_local().await?;
             // Local age selection runs even when an alarm forbids intake or callbacks.
             self.bound_unverified().await?;
@@ -455,9 +466,8 @@ impl App {
         .await
     }
 
-    /// One read. [`AppEvent::KeptBatchesWaiting`] goes only in the report of the read that
-    /// met it: a read that fails drops it, its error being the outcome, so no later report
-    /// carries a stale one.
+    /// A failed read discards wait observations made on that pass. The next read asks
+    /// the protocol and checks the pending batches again.
     async fn receive_once(
         &mut self,
         wait: Option<u32>,
@@ -470,7 +480,11 @@ impl App {
             let mut index = 0;
             self.events.retain(|event| {
                 index += 1;
-                index <= raised || !matches!(event, AppEvent::KeptBatchesWaiting { .. })
+                index <= raised
+                    || !matches!(
+                        event,
+                        AppEvent::KeptBatchesWaiting { .. } | AppEvent::ProtocolDeferred { .. }
+                    )
             });
         }
         result
@@ -650,6 +664,7 @@ impl App {
         };
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]).
         let mut reached = None;
+        let mut end_head = None;
         // The read's listing waits for a scope key: no wait on the feed shows the key
         // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
         let mut key_wait = waits_for_key;
@@ -769,6 +784,7 @@ impl App {
                 let result = self.client.feed(query).await;
                 let page = self.take(result).await?;
                 let scanned = page.scanned_through;
+                let head = page.head;
                 let ended = self
                     .process_page(page, after, &mut blocked, Some(budget), admission_declined)
                     .await;
@@ -783,6 +799,9 @@ impl App {
                         // cursor again, and meets them.
                         let seq = after.max(scanned);
                         reached = Some(Position { generation, seq });
+                        if scanned >= after {
+                            end_head = Some(head);
+                        }
                         self.feed_read_to_end().await?;
                         break;
                     }
@@ -907,6 +926,23 @@ impl App {
         };
         report.cursor = self.cursor();
         report.held_cursor = self.held_cursor_read.take();
+        if !report.stopped
+            && !report.more
+            && let Some((through, head)) = reached.zip(end_head)
+            && through.generation == self.state.meta.generation
+            && head.generation == through.generation
+            && through.seq >= head.seq
+            && matches!(report.held_cursor, Some(super::HeldCursor::Clean))
+        {
+            let coverage = Arc::new(ReadCoverage {
+                identity: self.identity(),
+                cert: self.state.cert.hash(),
+                through,
+                head,
+            });
+            self.last_collection_read = Some(coverage.clone());
+            report.coverage = Some(coverage);
+        }
         Ok(report)
     }
 
@@ -1045,7 +1081,7 @@ impl App {
             // page, unless this read made one before any item, as after a restore (Switch
             // spec 8.3 "Ahead", 12.4 condition 4).
             let listed = self.listed_before_items;
-            self.hand_held_gap(held, position, !listed, &mut read)
+            self.hand_held_gap(held, position, page.server_time_ms, !listed, &mut read)
                 .await?;
             if !listed {
                 list_through = Some(start);
@@ -1183,6 +1219,7 @@ impl App {
                         *seq,
                         *entries,
                         accepted_from.zip(*accepted_until),
+                        page.server_time_ms,
                         &mut read,
                     )
                     .await?
@@ -1859,21 +1896,29 @@ impl App {
                 Outcome::Retry(failure) => {
                     return self.retry_later(entry, &received.plaintext, parked, failure, read);
                 }
+                Outcome::Defer { reason, custody } => {
+                    let step = self.defer(entry, &received.plaintext, custody, read)?;
+                    self.events.push(AppEvent::ProtocolDeferred {
+                        seq: entry.seq,
+                        stored_id: entry.stored,
+                        protocol: owner.name,
+                        reason,
+                    });
+                    return Ok(step);
+                }
                 // Passed, not processed: no processed pair, so a re-send is delivered again
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
                 Outcome::AwaitAdmission => {
-                    let custody = self
-                        .park_waiting(
-                            entry,
-                            &received.plaintext,
-                            ParkReason::AwaitingAdmission,
-                            None,
-                            read,
-                        )
-                        .await?;
-                    read.admission_declined.insert(custody.id);
-                    return Ok(Step::Pass);
+                    return self
+                        .await_admission(entry, &received.plaintext, &[], read)
+                        .await;
+                }
+                Outcome::AwaitAdmissionWithCustody(custody) => {
+                    let local = super::protocols::qualify(&owner.name, custody.into_writes());
+                    return self
+                        .await_admission(entry, &received.plaintext, &local, read)
+                        .await;
                 }
                 Outcome::Consume => Effect::default(),
                 Outcome::AwaitKey { data_epoch } => {
@@ -2139,7 +2184,7 @@ impl App {
             Some(self.keys_held())
         };
         let custody = self
-            .park_waiting(entry, &received.plaintext, reason, keys_at, read)
+            .park_waiting(entry, &received.plaintext, reason, keys_at, &[], read)
             .await?;
         Ok(Some(if entry.stored.is_some() && custody.retained {
             Step::Hold
@@ -2691,7 +2736,35 @@ impl App {
         Ok(Step::Hold)
     }
 
-    /// An entry processed at last, and not stored locally: its count of retries goes.
+    /// Hold an input for its protocol, or store it where normal reads can retry it.
+    fn defer(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        custody: DeferCustody,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        if let Some(id) = entry.stored {
+            self.drop_retries(None, id, &mut read.tx)?;
+            if self
+                .state
+                .parked
+                .get(&id)
+                .is_some_and(|p| p.reason != ParkReason::ProtocolDeferred)
+            {
+                self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+            }
+            return Ok(Step::Hold);
+        }
+        self.clear_retry(entry.seq, read)?;
+        if custody == DeferCustody::AfterBoundedWait && !self.feed_wait_elapsed(entry.seq) {
+            return Ok(Step::Hold);
+        }
+        self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+        Ok(Step::Pass)
+    }
+
+    /// An entry no longer waiting for a failing store: its count of retries goes.
     fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
         if self.state.retries.remove(&seq).is_some() {
             read.tx.delete(&key::retry(seq))?;
@@ -2715,14 +2788,8 @@ impl App {
     ) -> Result<Step, AppError> {
         // Held since its first hold, whatever that waited for; the read keeps its
         // observation as it holds it.
-        let now = self.now();
-        let since = self
-            .state
-            .held
-            .get(&entry.seq)
-            .map_or(now, |held| held.since_ms);
-        if now.saturating_sub(since) >= self.config.park_after_ms {
-            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, read)
+        if self.feed_wait_elapsed(entry.seq) {
+            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, &[], read)
                 .await?;
             return Ok(Step::Pass);
         }
@@ -2730,14 +2797,42 @@ impl App {
         Ok(Step::Hold)
     }
 
-    /// Select bounds with the new input included, then attach every custody write before
-    /// the caller can pass its cursor (Switch spec 8.2). No callback write enters this Tx.
+    fn feed_wait_elapsed(&self, seq: u64) -> bool {
+        let now = self.now();
+        let since = self.state.held.get(&seq).map_or(now, |held| held.since_ms);
+        now.saturating_sub(since) >= self.config.park_after_ms
+    }
+
+    async fn await_admission(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        local: &[LocalWrite],
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let custody = self
+            .park_waiting(
+                entry,
+                plaintext,
+                ParkReason::AwaitingAdmission,
+                None,
+                local,
+                read,
+            )
+            .await?;
+        read.admission_declined.insert(custody.id);
+        Ok(Step::Pass)
+    }
+
+    /// Select bounds including the new input. Commit the selection and any designated
+    /// owner-local writes together before passing the cursor (Switch spec 8.2).
     async fn park_waiting(
         &mut self,
         entry: &Entry,
         plaintext: &MessagePlaintext,
         reason: ParkReason,
         keys_at: Option<u64>,
+        local: &[LocalWrite],
         read: &mut Read,
     ) -> Result<Custody, AppError> {
         let id = entry.stored.unwrap_or(self.state.next_stored_id);
@@ -2763,11 +2858,12 @@ impl App {
             },
         };
         let drops = self.waiting_drops(Some((id, &candidate)));
-        let change = self.waiting_change(
+        let mut change = self.waiting_change(
             Some((id, candidate)),
             entry.stored.is_none().then_some(entry.seq),
             &drops,
         )?;
+        change.keep_local(local)?;
         let retained = change.retained(id);
         if !self.make_room(read, change.size()).await? {
             return Err(crate::store::BatchError::BatchTooLarge {
@@ -2834,7 +2930,7 @@ impl App {
                 read.tx.put(&key::stored_retry(id), &retry)?;
                 self.state.stored_retries.insert(id, retry);
             }
-            self.events.push(AppEvent::Parked {
+            read.tx.report(AppEvent::Parked {
                 id: None,
                 seq: entry.seq,
                 stored_id: id,
@@ -3301,15 +3397,17 @@ impl App {
         &mut self,
         held: u64,
         position: u64,
+        read_at_ms: u64,
         list: bool,
         read: &mut Read,
     ) -> Result<(), AppError> {
-        let call = OwedCall::Missed {
+        let call = OwedCall::from(crate::app::MissedEntries {
+            read_at_ms,
             seq: held,
             entries: 0,
             accepted_from_ms: self.resend_floor(),
             accepted_until_ms: u64::MAX,
-        };
+        });
         // Owed at the compared position, at or before the cursor, so the queue makes it
         // before anything after the gap (Switch spec 8.3).
         // The gap is no feed item: it is noted at the position the page starts from, which
@@ -3381,7 +3479,7 @@ impl App {
         let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
         let mut owed_to = self.protocols.names();
         let generation = self.state.cursor.generation;
-        let at = key::owed(generation, seq);
+        let at = call.stored_at(generation, seq);
         read.tx.put(
             &at,
             &Owed {
@@ -3389,8 +3487,11 @@ impl App {
                 call: call.clone(),
             },
         )?;
-        self.state.asked.insert(seq);
-        read.tx.put(&key::asked(seq), &())?;
+        if call.held_gap(seq).is_none() {
+            self.state.asked.insert(seq);
+            read.tx
+                .put(&key::asked(seq), &matches!(call, OwedCall::Missed { .. }))?;
+        }
         self.commit_read(read).await?;
         for registered in protocols {
             // In step with the item, or waiting only for the listing the `missed` item
@@ -3912,9 +4013,16 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         tx.delete(at)?;
-        kept.retain(|item| !item.call || (item.generation, item.seq) != (generation, seq));
-        if ahead && self.state.asked.insert(seq) {
-            tx.put(&key::asked(seq), &())?;
+        let gap = at
+            .rsplit_once('/')
+            .and_then(|(prefix, held)| (prefix == key::owed(generation, seq)).then_some(held))
+            .map(super::state::parse_num)
+            .transpose()?;
+        kept.retain(|item| {
+            !item.call || (item.generation, item.seq, item.held_gap) != (generation, seq, gap)
+        });
+        if ahead && gap.is_none() && self.state.asked.insert(seq) {
+            tx.put(&key::asked(seq), &false)?;
         }
         Ok(())
     }
@@ -3960,13 +4068,14 @@ impl App {
         seq: u64,
         entries: u64,
         accepted: Option<(u64, u64)>,
+        read_at_ms: u64,
         read: &mut Read,
     ) -> Result<Step, AppError> {
         let Some((from, until)) = accepted else {
             // The service writes the item: one whose times don't parse asks for no re-send,
             // but still owes the listing (Switch spec 8.2, wire 7.4.4).
             if self.state.asked.insert(seq) {
-                read.tx.put(&key::asked(seq), &())?;
+                read.tx.put(&key::asked(seq), &false)?;
                 self.owe_item_listing(seq, true, None, read).await?;
             }
             return Ok(Step::Pass);
@@ -3974,12 +4083,13 @@ impl App {
         if self.state.asked.insert(seq) {
             self.commit_read(read).await?;
             let accepted_from_ms = from.max(self.resend_floor());
-            let call = OwedCall::Missed {
+            let call = OwedCall::from(crate::app::MissedEntries {
+                read_at_ms,
                 seq,
                 entries,
                 accepted_from_ms,
                 accepted_until_ms: until.max(accepted_from_ms),
-            };
+            });
             self.owe_item_listing(seq, true, None, read).await?;
             self.hand_call(seq, call, read).await?;
             self.events.push(AppEvent::Missed { seq, entries });
@@ -4073,7 +4183,7 @@ impl App {
                         target_app_id,
                         cert,
                     } if *target_app_id == me && body.app_id.is_none() => {
-                        self.note_renewal(cert, &mut read.tx)?;
+                        self.note_renewal(cert, (envelope.generation, item.seq), &mut read.tx)?;
                         Ok(Step::Pass)
                     }
                     // A record write is judged and marked for the protocol of its collection:
@@ -4220,12 +4330,18 @@ impl App {
             });
             return Ok(Step::Stop);
         }
-        if self
+        if let Some(renewal) = self
             .state
             .renewal
-            .as_ref()
-            .is_some_and(|r| doc.listed_cert(&me) == Some(r.hash()))
+            .as_mut()
+            .filter(|renewal| doc.listed_cert(&me) == Some(renewal.cert.hash()))
         {
+            // If taking the certificate fails after the document is committed, a
+            // reopened app owes the widened listing at the same position.
+            if let Some(at) = at {
+                renewal.at = at;
+                renewal.keep(&mut read.tx)?;
+            }
             // Everything read so far first, so the delivery is in the store.
             read.tx.put(key::CURSOR, &self.state.cursor)?;
             self.put_told(&mut read.tx)?;
@@ -4251,7 +4367,7 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
-        self.take_own_copy_with(doc, |_| Ok(())).await
+        self.take_own_copy_with(doc, None, None, |_| Ok(())).await
     }
 
     /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
@@ -4259,13 +4375,15 @@ impl App {
     pub(crate) async fn take_own_copy_with(
         &mut self,
         doc: IdentityDoc,
+        at: Option<(u64, u64)>,
+        serving_generation: Option<u64>,
         also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
     ) -> Result<bool, AppError> {
         // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
         self.clear_erasing().await?;
         let version = self.state.own_doc.version();
         let mut read = Read::outside(self.tx()?);
-        let result = self.own_identity_copy(doc, None, &mut read).await;
+        let result = self.own_identity_copy(doc, at, &mut read).await;
         if result.is_err() {
             self.reload = true;
         }
@@ -4273,7 +4391,9 @@ impl App {
         also(&mut read.tx)?;
         let epoch_rose = read.epoch_rose;
         self.commit(read.tx).await?;
-        if epoch_rose {
+        // Only a verified answer from a later generation precludes the ordinary key read.
+        // A published identity can change before the service followed has changed.
+        if epoch_rose && serving_generation.is_none_or(|g| g <= self.state.meta.generation) {
             self.fetch_key_bundle().await?;
         }
         Ok(self.state.own_doc.version() > version)

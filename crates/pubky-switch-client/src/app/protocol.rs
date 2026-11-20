@@ -49,7 +49,7 @@ use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::{Map, Value};
 
 use super::context::{LocalView, ReceiveContext, RestoreContext};
-use super::error::AppError;
+use super::error::{AppError, Refusal};
 use super::own_record::RecordExpiry;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
@@ -655,6 +655,66 @@ impl std::fmt::Display for StoreFailure {
     }
 }
 
+/// Local writes that must commit even while ordinary admission of the input waits
+/// (Switch spec 8.2). On each retry the protocol returns only writes still owed.
+/// It must be safe to apply them again after another input changed its state.
+///
+/// ```
+/// use pubky_switch_client::app::{AdmissionCustody, LocalWrite, Outcome, Refusal};
+///
+/// fn wait_with_evidence(key: Vec<u8>, evidence: Vec<u8>) -> Result<Outcome, Refusal> {
+///     let mut custody = AdmissionCustody::default();
+///     custody.try_push(LocalWrite::Put { key, value: evidence })?;
+///     Ok(Outcome::AwaitAdmissionWithCustody(custody))
+/// }
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct AdmissionCustody {
+    writes: Vec<LocalWrite>,
+    bytes: usize,
+}
+
+impl AdmissionCustody {
+    /// Add an exact-key put or deletion to commit with the waiting input or its drop notice.
+    /// Add mandatory writes before optional cleanup.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a prefix deletion or a write that would exceed
+    /// [`MAX_STEP_LOCAL_BYTES`]. On refusal, all previously added writes remain.
+    pub fn try_push(&mut self, write: LocalWrite) -> Result<(), Refusal> {
+        if matches!(write, LocalWrite::DeletePrefix { .. }) {
+            return Err(Refusal::Usage(
+                "admission custody requires an exact key".into(),
+            ));
+        }
+        let bytes = self
+            .bytes
+            .saturating_add(local_writes_bytes(std::slice::from_ref(&write)));
+        if bytes > MAX_STEP_LOCAL_BYTES {
+            return Err(Refusal::Usage(format!(
+                "admission custody writes at most {MAX_STEP_LOCAL_BYTES} bytes of local state"
+            )));
+        }
+        self.writes.push(write);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn into_writes(self) -> Vec<LocalWrite> {
+        self.writes
+    }
+}
+
+/// When an unprocessed input waiting for protocol data goes into retriable local storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferCustody {
+    /// Hold it on the feed until the configured bounded wait expires.
+    AfterBoundedWait,
+    /// Save it locally before passing its feed position on this read.
+    Immediate,
+}
+
 /// The protocol's answer for a received message. Later versions may add answers: a host
 /// that matches on it keeps a catch-all arm.
 #[derive(Clone, Debug)]
@@ -706,6 +766,16 @@ pub enum Outcome {
     /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
     /// retry doesn't change what it shows.
     Retry(StoreFailure),
+    /// Required protocol data is unavailable (Switch spec 8.2). Discard all staged work
+    /// and keep this delivery unprocessed. Other eligible protocols may continue. The
+    /// host sees the reason on each deferral in [`super::AppEvent::ProtocolDeferred`].
+    /// A saved input retains its acceptance time and is tried on the stored-input schedule.
+    Defer {
+        /// A protocol-defined label for the missing prerequisite, without message content.
+        reason: &'static str,
+        /// When the input should leave the feed for durable local storage.
+        custody: DeferCustody,
+    },
     /// Passed, not processed: the protocol can't take the message now, such as a reply its
     /// own store bounds out, and wants a later re-send of it delivered again. The cursor
     /// moves past the entry as past a processed one, but no processed pair is kept (Switch
@@ -735,8 +805,8 @@ pub enum Outcome {
     /// [`MAX_STEP_LOCAL_BYTES`] bound as an [`Outcome::Apply`], and an over-bound step is
     /// stored and passed as too large without committing any of its local changes.
     Consume,
-    /// This input has not been admitted because the protocol's ordinary retained-state
-    /// rule cannot remove its required victim (Switch spec 8.2). All operations, local
+    /// The protocol cannot admit this input within its retained-state bound without
+    /// discarding protected state (Switch spec 8.2). All operations, local
     /// writes and processed-pair forgets staged by this callback are discarded. No pair
     /// is added. Before its cursor passes, the input or its payload-free drop notice is
     /// kept in the same transaction as the shared waiting-pool selection.
@@ -746,6 +816,10 @@ pub enum Outcome {
     /// current state, retaining the input's original receipt and storage order. This is
     /// neither a storage failure nor an immediate request to repeat the read.
     AwaitAdmission,
+    /// Wait as for [`Outcome::AwaitAdmission`], committing the designated protocol-local
+    /// writes together with the waiting input or its drop notice. All work staged through
+    /// [`ReceiveContext`] is discarded. The input stays unprocessed (Switch spec 8.2).
+    AwaitAdmissionWithCustody(AdmissionCustody),
     /// The step needs a scope key of `data_epoch` that the app doesn't hold yet (Switch
     /// spec 3.5, 8.2), such as to read a record held sealed at that epoch
     /// ([`super::Unopened::KeyNotHeld`]) or to write while the app lacks the current data
@@ -801,8 +875,11 @@ pub enum ResendReason {
 /// asks the counterparties of its unfinished activity to re-send what their inboxes
 /// accepted from `accepted_from_ms`, through `accepted_until_ms` if it bounds its
 /// re-sends, and lists its collections again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MissedEntries {
+    /// The authenticated service time of the feed page that first incurred this call.
+    /// A retry or restore keeps that page's time, including Unix epoch zero.
+    pub read_at_ms: u64,
     /// The item's `seq`, in the sequence of the generation the app read it at: a call made
     /// again after a provider change keeps it, as information only.
     pub seq: u64,
@@ -994,6 +1071,41 @@ pub trait Protocol: Send + Sync {
     fn may_send(&self, delivery: &super::DeliveryView<'_>) -> Result<bool, StoreFailure> {
         let _ = delivery;
         Ok(true)
+    }
+
+    /// The owning protocol's records to read in order before one transport attempt for
+    /// this authenticated message (Switch spec 8.2, 11). Each target must select a fixed
+    /// policy registered by this owner and readable by the current certificate. At most
+    /// [`super::MAX_APPEND_RECORDS`] distinct targets are read. Empty by default.
+    ///
+    /// Queued-message enumeration does not call this hook. A retry asks again.
+    ///
+    /// # Errors
+    ///
+    /// A local read failure holds the message for another try.
+    fn append_records(
+        &self,
+        delivery: &super::DeliveryView<'_>,
+    ) -> Result<Vec<super::RecordTarget>, StoreFailure> {
+        let _ = delivery;
+        Ok(Vec::new())
+    }
+
+    /// Decide one append using the exact targets requested by [`Self::append_records`] and
+    /// their checked read outcomes, in order (Switch spec 8.2, 11). Called once the reads
+    /// have finished. The decision expires with this transport attempt. A protocol that
+    /// asks for records holds its message until it explicitly permits or withdraws it.
+    ///
+    /// # Errors
+    ///
+    /// A local read failure holds the delivery and leaves the signed message queued.
+    fn judge_append(
+        &self,
+        delivery: &super::DeliveryView<'_>,
+        records: &[(super::RecordTarget, super::RecordRead)],
+    ) -> Result<super::AppendDecision, StoreFailure> {
+        let _ = (delivery, records);
+        Ok(super::AppendDecision::Hold)
     }
 
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
@@ -1477,9 +1589,11 @@ pub trait Protocol: Send + Sync {
             .collect())
     }
 
-    /// The shared record write of a sent message (Switch spec 8.2): the record's next value
-    /// from its current one (`None` for none, deleted or unreadable), or `None` when the
-    /// record already reflects the message. Nothing by default.
+    /// Build the shared record's next value for a sent message (Switch spec 8.2).
+    /// `current` is `None` for an absent, deleted or unreadable record. The client can call
+    /// this hook again for the same message after a write conflict or when the outcome of
+    /// an earlier write is unknown. Make the update idempotent by returning `None` when
+    /// the current value already reflects the message. The default returns `None`.
     fn sent_record(
         &self,
         job: &RecordJob,
@@ -1494,6 +1608,34 @@ pub trait Protocol: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_admission_custody_refuses_unbounded_cleanup_without_losing_the_replacement() {
+        let mut custody = AdmissionCustody::default();
+        let deletion = LocalWrite::Delete {
+            key: b"old".to_vec(),
+        };
+        let key = b"new".to_vec();
+        let value_len = MAX_STEP_LOCAL_BYTES
+            - LOCAL_WRITE_OVERHEAD_BYTES
+            - key.len()
+            - local_writes_bytes(std::slice::from_ref(&deletion));
+        let replacement = LocalWrite::Put {
+            key,
+            value: vec![7; value_len],
+        };
+        custody.try_push(replacement.clone()).unwrap();
+        assert!(matches!(
+            custody.try_push(LocalWrite::DeletePrefix { prefix: Vec::new() }),
+            Err(Refusal::Usage(_))
+        ));
+        custody.try_push(deletion.clone()).unwrap();
+        assert!(matches!(
+            custody.try_push(deletion.clone()),
+            Err(Refusal::Usage(_))
+        ));
+        assert_eq!(custody.into_writes(), [replacement, deletion]);
+    }
 
     #[test]
     fn test_local_write_debug_hides_values() {

@@ -29,9 +29,10 @@
 //! It closes at once: the next version sets `until` of the app's open renewals to the service
 //! time at which the switch took the renewing version, plus the clock tolerance. That closing
 //! delivery comes before any other, also when a crash came between the two (Switch wire 3.8
-//! "A closing delivery owed"). If the switch never gives that time, the closing uses the next
-//! delivery's, never the signer's own clock. Any other renewal closes once the switch holds the app's record
-//! carrying the new certificate ([`Signer::complete_renewals`]).
+//! "A closing delivery owed"). If the exact retry gives no proof, an authenticated account
+//! read confirming the same document and generation can supply its last committed service
+//! time. A cooperative renewal closes once the switch holds the app's record carrying the
+//! new certificate ([`Signer::complete_renewals`]).
 //!
 //! The signer writes only `key_bundle.put` and `cert.put` (Switch spec 13.5).
 
@@ -647,35 +648,16 @@ impl Signer {
         }))
     }
 
-    /// Whether the newest version is one whose delivery, retried, gave no service time: the
-    /// closing it owes waits for a later version's delivery.
-    fn closing_stalled(&self) -> Result<bool> {
-        Ok(self.state.closing_unavailable.is_some()
-            && self.state.closing_unavailable == self.high_water()?.map(|h| h.version))
-    }
-
     /// Whether a closing delivery is owed and can be made now: the signing gate lets it
     /// through ([`super::gate::refusal`]).
     pub(super) fn owes_closing(&self) -> Result<bool> {
-        Ok(super::gate::refusal(&self.state).is_none()
-            && !self.closing_stalled()?
-            && !self.owed()?.is_empty())
+        Ok(super::gate::refusal(&self.state).is_none() && !self.owed()?.is_empty())
     }
 
-    /// When a closing delivery is owed and no flow is in progress, commit it as the next
-    /// flow and say so (Switch wire 3.8, 7.4.2). The cutoff is the service time at which the
-    /// switch took the newest version, plus the clock tolerance: the renewing version's
-    /// time, or, when the switch never gave that one, the time of a later delivery, which
-    /// cuts off later but never on the signer's own clock. Without the newest version's
-    /// time, as after a crash before the answer was kept, that version is delivered again,
-    /// a retry, whose answer carries its delivery's proof.
-    ///
-    /// The closing goes through the signing gate like every other version: while an alarm is
-    /// latched or held, or the records are behind, it stays owed, and is delivered once the
-    /// user has cleared the alarm and the switch is confirmed again. A failed Homeserver write
-    /// doesn't hold it back. [`Alert::ReductionNotClosed`] is shown while it waits, for an
-    /// alarm or for a retry that gave no time, and goes once the renewals are closed; another
-    /// install that signs closes them itself.
+    /// Queue the signed closure before another delivery (Switch wire 3.8). Prefer the
+    /// renewing delivery's original proof. After its bounded exact retry, a verified
+    /// account read of that same document can supply a conservative cutoff instead.
+    /// The signing gate and all copy checks apply to either source.
     pub(super) async fn queue_owed_closing(&mut self) -> Result<bool> {
         // Nothing is signed while another install signs or the records are behind.
         if self.flow.is_some() || self.check_named().is_err() {
@@ -684,9 +666,7 @@ impl Signer {
         let owed = self.owed()?;
         // The version that drops certificates this install doesn't hold comes first: no
         // backup of a closing that still names them can be sealed (Switch spec 12.8).
-        let stalled = self.closing_stalled()?
-            || super::gate::refusal(&self.state).is_some()
-            || self.unheld_references()?;
+        let stalled = super::gate::refusal(&self.state).is_some() || self.unheld_references()?;
         let mut state = self.state.clone();
         state
             .alerts
@@ -696,7 +676,14 @@ impl Signer {
                 apps.clone_from(&owed);
             }
         }
-        if stalled && !owed.is_empty() {
+        let mark = self.high_water()?;
+        let awaiting_read = self
+            .state
+            .newest
+            .as_ref()
+            .is_some_and(|n| n.delivered_at.is_none())
+            && mark.is_some_and(|m| self.state.time_asked == Some(m.version));
+        if (stalled || awaiting_read) && !owed.is_empty() {
             state.alert(Alert::ReductionNotClosed { apps: owed.clone() });
         }
         if state.alerts != self.state.alerts {
@@ -708,22 +695,9 @@ impl Signer {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(false);
         };
-        let version = self.high_water()?.map_or(0, |h| h.version);
-        let Some(delivered_at) = newest.delivered_at else {
+        if newest.delivered_at.is_none() && !awaiting_read {
             let mut state = self.state.clone();
-            if self.state.time_asked == Some(version) {
-                // The retry's answer carried no proof either (Switch wire 7.4.2): the closing
-                // waits for the next delivery's service time, and the user is told.
-                state.closing_unavailable = Some(version);
-                state.alert(Alert::ReductionNotClosed { apps: owed });
-                self.commit(state, None).await?;
-                return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
-                    "Switch wire 7.4.2: the delivery's retry carried no proof, so the \
-                     reduction has no cutoff time yet"
-                        .into(),
-                )));
-            }
-            state.time_asked = Some(version);
+            state.time_asked = mark.map(|m| m.version);
             let again = Flow::Deliver {
                 account: self.newest_account()?,
                 doc: newest.doc,
@@ -733,14 +707,44 @@ impl Signer {
             };
             self.commit(state, Some(again)).await?;
             return Ok(true);
-        };
-        let until = delivered_at.saturating_add(CLOCK_TOLERANCE_MS);
-        // The copies are checked as before every new version (`ready`), so a closing isn't
-        // signed over an install that took over, or over records that are behind.
-        self.check_copies().await?;
+        }
+        let read = self.check_copies().await?;
         if self.flow.is_some() || super::gate::refusal(&self.state).is_some() {
             return Ok(false);
         }
+        let accepted = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        if accepted.signed() != &newest.doc {
+            return Err(Refusal::Superseded {
+                version: accepted.version(),
+            }
+            .into());
+        }
+        let owed = self.owed_in(&accepted)?;
+        if owed.is_empty() {
+            return Ok(false);
+        }
+        let at = match newest.delivered_at {
+            Some(original) => original,
+            None => {
+                let service = self.service()?;
+                let target = self.service_target(&service);
+                let account = self.newest_account()?;
+                let time = read
+                    .filter(|_| {
+                        target.origin == account.origin
+                            && target.created == Some(account.created)
+                            && target.pinned == Some(account.service_key)
+                    })
+                    .and_then(|read| read.cutoff_for(&accepted));
+                time.ok_or_else(|| {
+                    SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                        "Switch wire 3.8: the account read did not confirm the reducing document"
+                            .into(),
+                    ))
+                })?
+            }
+        };
+        let until = at.saturating_add(CLOCK_TOLERANCE_MS);
         let key = self.signing_key()?;
         let (doc, flow) = self.next_version_closing(&key, |body| {
             for app in &owed {

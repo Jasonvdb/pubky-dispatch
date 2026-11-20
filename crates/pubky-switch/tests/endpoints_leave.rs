@@ -12,7 +12,7 @@ mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch_core::{
-    chain::{SignedHead, TransitionProof},
+    chain::{ServiceTransition, SignedHead, TransitionProof},
     enc::app_id_decode,
     http::{IdentityDelivery, header},
     keys::IdentityKey,
@@ -112,6 +112,13 @@ async fn test_leave_records_the_departure_and_answers_its_proof() {
     replay_chain_through_revoke(&replay).await;
     let at = "2026-01-01T00:05:00.000Z";
     set_time(&replay.clock, at);
+    let position = chain_position(&replay).await;
+    refuse_service_items(&replay, true).await;
+    let refused = leave(&replay, "wallet", "wallet", Vec::new(), at).await;
+    assert_eq!(code(&refused), (503, json!("unavailable")));
+    assert_eq!(chain_position(&replay).await, position);
+    assert_eq!(wallet_status(&replay, at).await["departed_at"], Value::Null);
+    refuse_service_items(&replay, false).await;
     let answer = leave(&replay, "wallet", "wallet", Vec::new(), at).await;
     assert_eq!(
         answer.status,
@@ -125,6 +132,18 @@ async fn test_leave_records_the_departure_and_answers_its_proof() {
     assert_eq!(proofs.len(), 1);
     let signed: SignedDoc = serde_json::from_value(proofs[0].clone()).expect("proof");
     let proof = TransitionProof::verify(&signed, &service_key(), &identity).expect("verifies");
+    let expected = assert_service_item(
+        &replay,
+        position.0,
+        10,
+        ms(at),
+        &ServiceTransition::Leave {
+            app_id: app_id_decode(&app_id("wallet")).expect("app id"),
+            at: ms(at),
+        },
+    )
+    .await;
+    assert_eq!(proof.body().chain, expected);
     assert_eq!(proof.body().object, app_id("wallet"));
     let stub = std::str::from_utf8(&proof.body().chain.envelope).expect("stub");
     assert!(stub.contains(r#""item_type":"service""#), "{stub}");

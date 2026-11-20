@@ -27,7 +27,7 @@ Embed `App` to act for one approved app of an identity. The signer approves the 
 | `AppEvent::CertificateTaken` | The client committed a new certificate and its app record. Use the new permissions. A record delivery can still be pending. |
 | `AppEvent::MemberDropped` | The record signed for a renewal the app took has no member of the named protocol: the member it gave for the renewal broke the JSON rules or came with an expiry that can't be signed, or its expiry ask without a member can no longer be signed, or the protocol isn't registered on this device and the renewal removed a scope or permission. That protocol writes its member again on a device that runs it. |
 | `AppEvent::MemberChanged` | A duty event for the named protocol. The app took a record another device signed, and that protocol's member in it is new, changed or gone; a gone member takes its expiry ask. Write the member again if it is still wanted, then acknowledge. |
-| `AppEvent::CertificateRefused` | A proposed certificate could not run with the registered protocols. Tell every owner, show the reason and retain the current certificate. Ask the signer for a compatible renewal. |
+| `AppEvent::CertificateRefused` | The app kept its earlier certificate because a registered protocol refused the renewal or no registered protocol owns one of its scope roots. Once the service's `identity.json` lists the replacement, an `app.put` that changes the app record using the earlier certificate gets `403 not_current`. Tell every owner, show the reason and ask the signer for a compatible renewal. |
 | `CertificateRefusal::UnownedRoot` | No registered protocol owns a scope root in the renewal. Correct the renewal or register the missing protocol at restore. |
 | `CertificateRefusal::Protocol` | The named protocol rejected this certificate. Use its reason to request a corrected one. |
 
@@ -44,6 +44,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `AppEvent::Duplicate` | The sender and message ID were already seen. Suppress the second effect. If the bytes differed, show a conflict. |
 | `AppEvent::Held` | The client has temporarily left an entry on the feed because its sender could not yet be verified. Later entries can run. Read again later. |
 | `AppEvent::StoreFailing` | The same receive step still fails. On the feed this is reported from the third consecutive retry. A retry of an already parked input can report it sooner. Show the storage failure and duration, repair or free the store and read again. The input remains pending. |
+| `AppEvent::ProtocolDeferred` | The named protocol needs data to process this entry. Use its reason to refresh that prerequisite, then receive again. The original delivery stays pending. |
 | `AppEvent::Parked` | The input was saved locally so the cursor can pass. Use its stable `stored_id` and the reason below. An ID for acknowledgement is present when automatic retry has stopped. |
 | `AppEvent::Unparked` | A locally saved entry has finished or been removed during the stored-input pass. Refresh the stored-entry list. |
 | `AppEvent::EffectRefused` | The saved input's proposed work cannot be applied in this form. Inspect the reason and optional code, then decide how to handle it in the protocol. The client will not send that effect again. |
@@ -62,6 +63,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `ParkReason::AwaitingKey` | A scope key is missing. The client waits for a change in the keys it holds and the required epoch's granted keys. Check the signer's bundle. The waiting pool can lose this copy. |
 | `ParkReason::Quota` | The record work hit a service quota or size limit. Free capacity or adjust the record. A later stored-input pass can try it. |
 | `ParkReason::StoreUnavailable` | The host store stayed unavailable through the feed wait. Restore service and read again for a local retry. |
+| `ParkReason::ProtocolDeferred` | The protocol requested local custody or its feed wait elapsed. Normal reads retry this copy with its original acceptance time. |
 | `ParkReason::StoreRejected` | The store failed on this particular input, such as a corrupt value. Repair it. The client retains the input and schedules further tries. |
 | `ParkReason::Refused` | The effect received a lasting refusal. Handle the saved input explicitly. Its original effect has stopped. |
 | `ParkReason::TooManyOperations` | The remote operations cannot fit one batch beside the cursor movement. Change the protocol's handling. No automatic retry. |
@@ -92,12 +94,16 @@ The client verifies the envelope and signed message, recipient, sender standing,
 | `Outcome::Pass` | Discard staged changes and let a feed copy pass without a marker. Only a resend brings that feed copy back. A locally stored input stays for a later pass. |
 | `Outcome::Consume` | Commit only eligible local writes and marker removals. The input goes away without a new marker, so a resend can reach the callback again. Oversized local work is parked. |
 | `Outcome::Retry` | A host or storage failure prevented a decision. Return `StoreFailure::unavailable` for a temporary failure or `of_entry` for a particular bad entry. The client discards staged changes and retains the input for retry. Inspect `StoreFailure::error` and `is_of_entry` for the cause. |
+| `Outcome::Defer` | Required protocol data is unavailable. Give a content-free reason and choose when the client should store the input. Other eligible protocols can continue. |
+| `DeferCustody::AfterBoundedWait` | Hold the input on the feed. If the data is still unavailable when the bounded wait expires, save the input locally before advancing the cursor past it. |
+| `DeferCustody::Immediate` | Save the input locally on this read before advancing the cursor past it. |
 | `Outcome::Need` | Discard this run's staged changes and ask the client to read missing facts. Expect a fresh callback with those facts, subject to the read limit. |
 | `Need::Claim` | Ask for this claim key once. Inspect `switch_claim` on the next callback. A transient lookup failure leaves the input waiting. |
 | `ClaimFetch::Read` | A checked claim view was fetched. Use the supplied view and entries. |
 | `ClaimFetch::Absent` | The service answered that it holds no claim at this key. Handle absence under the protocol's rules. |
 | `ClaimFetch::Refused` | The service gave a lasting refusal for this read. Handle the code without asking for the same read again. |
 | `Outcome::AwaitAdmission` | The protocol's ordinary storage rule cannot admit the input yet. Staged changes are discarded. The client keeps either the waiting payload or its drop notice before passing it. |
+| `Outcome::AwaitAdmissionWithCustody` | Use when the protocol must keep evidence now while ordinary admission waits. Put replay-safe, exact-key writes in `AdmissionCustody`. They commit with the original input or its drop notice. On retry, check ordinary admission again even if the evidence is already present. |
 | `Outcome::AwaitKey` | The step needs a scope key at this epoch. The client discards staged changes. Obtain the missing key and read again. The waiting copy can reach a shared limit or fail a recipient check on retry. |
 
 ### Waiting and push notifications
@@ -146,6 +152,9 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 
 | Case | What happened and what to do |
 |---|---|
+| `AppendDecision::Send` | Send the imminent append. Each later attempt asks the owner again. |
+| `AppendDecision::Hold` | Keep the signed message queued for fresh observations on a later attempt. |
+| `AppendDecision::Withdraw` | Retire the outstanding delivery. Handle the duty notification, which can report an earlier possible delivery or the end of a resend. |
 | `DeliveryOrigin::Original` | The client has retained the original intent. Use this in the owning protocol's `may_send` check. The separate `resend` flag says whether a copy was accepted before. |
 | `DeliveryOrigin::Reconstructed` | The copy came from signed plaintext without a retained original intent. Apply the protocol's rules for reconstructed sends. |
 | `Delivery::Queued` | A pending resend also reads as queued. If the matching entry in the owning protocol's `queued_messages` has `resend: true`, the inbox accepted this message before. The client reads a queued copy by its signed common fields, so it can still send a body that newer rules would reject. Check the tries, last error, host holds and the owning protocol's `may_send` decision. Flush the existing copy when it can go out. |
@@ -166,9 +175,13 @@ Call `flush_message` for one message or `flush_outbox` for a bounded pass. Conti
 | `WontDeliver::GivenUp` | This store remembers giving up delivery. Preserve that decision. No further undelivered notice is needed for this refusal. |
 | `WontDeliver::TooLarge` | The reconstructed outbox item cannot fit the store. Show that it could not be queued. Repeating those bytes cannot help. |
 
+A protocol whose delivery depends on current records can implement `append_records` and `judge_append`. Derive up to two ordered targets from the signed message and select a fixed policy registered by that owner for each. Before each transport attempt, including a timestamp retry, the client reads those targets and passes each target with its `RecordRead` to the owner. A hosted, current `KeptReason::NotFound` reports absence. Treat an unavailable, refused or unreadable value as a reason to hold. `AppendDecision::Send` permits that attempt, `Hold` keeps the same signed message queued, and `Withdraw` ends the outstanding delivery through the usual duty notification. An earlier unanswered attempt can still result in `DeliveryUnknown`. Queued-message enumeration consults only local state.
+
 For admission or current-certificate refusals, the client gives up after five qualifying answers spread across at least 30 days (at least 7.5 days between counted tries). Once 45 days have passed since the first such answer, the next flush that reaches the message gives up without another delivery try. A held message can still reach a deadline. Only a new user intent should become a new message.
 
 ## Writing records and claims
+
+When a decision needs every current record of a registered collection, pass the report from `app.receive` to `app.current_collection(&collection, &report)`. A complete result contains the live values and any keys whose current value the client could not verify. A count needs an empty `uncertain_keys`. If the result is `None`, continue the bounded receive and use its new report. You can query again with the same report after a local write to include that write. Another app can write after the read.
 
 A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings. After recovery uploads, an older page leaves the listing at the same continuation. A fresh lookup for an outstanding upload returns `KeptReason::Refused` if the service observation cannot establish its current state.
 
@@ -269,6 +282,7 @@ Use `set_protocol_member` for a protocol's public data with an absolute expiry, 
 |---|---|
 | `Publication::NotPublishing` | Public record publication is off. The app uses its service record. No homeserver write is due. |
 | `Publication::NothingAccepted` | The client knows of no service-accepted record to publish yet. Finish registration or delivery first. |
+| `Publication::AwaitingRecord` | A newer local choice is not settled. Finish the owner's member/expiry choice and delivery, or read its verified acceptance or supersession. No older accepted record is repaired meanwhile; the read itself can complete. |
 | `Publication::Published` | The public copy is up to date with the accepted record. Show publication complete. |
 | `Publication::Superseded` | The homeserver has a valid later record, for example from another device. Leave that newer copy in place. |
 | `Publication::Owed` | A required read or put failed. Show that the service accepted the record but publication is pending. The client retries on reads or changes. |
@@ -334,6 +348,13 @@ A freeze, a new provider and a lost provider require different user messages. Us
 
 | Case | What happened and what to do |
 |---|---|
+| `AppEvent::RecoveryRequired` | Tell the user the followed service requires recovery and acknowledge the event after displaying or storing it. Show the verified notice from `App::recovery_required` on reopen. Reads and sends to other identities remain available. |
+| `AppEvent::RecoveryNoticeCleared` | `generation` names the generation whose notice cleared. The app either followed a later generation or verified a successful response to a later request with a head at the temporarily held generation. Check `App::may_attempt` before resuming work. |
+| `ProviderHealth::Ok` | The app has no verified recovery notice or established outage. Use the usual attempt checks before starting new work. |
+| `ProviderHealth::Unreachable` | Show when unanswered own requests began. A host can set its reporting interval with `set_unreachable_after_ms`. |
+| `ProviderHealth::RecoveryRequired` | Show the verified reason, generation and time from the notice. A permanent notice requires following the signed recovery at a later generation. |
+| `ProviderStatus::RecoveryRequired` | Following the provider found an active recovery notice. Continue checking the signed identity for the service to follow, and keep outstanding work for reconciliation. |
+| `Refusal::RecoveryRequired` | The attempt or own-account write is held for the named generation. Show the recovery notice and retain any outstanding operation. |
 | `AppEvent::ProviderChanged` | The newest own identity document points to another generation. Follow it and update the provider display when the change completes. |
 | `AppEvent::Moved` | A verified freeze suspends writes at the old service. Show the move in progress and keep pending writes. |
 | `ProviderStatus::AwaitingMove` | The client is waiting for the next generation to be published. Poll later. Avoid creating new copies of pending work. |
@@ -348,6 +369,12 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::EvidenceUploaded` | The service answered the evidence upload. The reported counts (zero if absent) can help diagnose what was uploaded. This answer alone does not settle every missing record or claim. |
 | `AppEvent::EvidenceRefused` | The upload received a service refusal, or was too large to send. The client reports the code and goes on. Keep the evidence and involve the signer for import conflicts. Other transport failures can be retried. |
 | `AppEvent::ProviderLost` | The identity declared the old generation lost. Suspend new attempts. Show that old inbox entries and unbacked records may be unavailable, and that an unanswered action may already have run. |
+| `RecoveryStep::Register` | The app is registering this installation at the replacement service. Keep its recovery record and let the client resume. |
+| `RecoveryStep::Upload` | The app is submitting the signed evidence it retained. Show the upload result and any omitted items when available. |
+| `RecoveryStep::Lists` | The app is restoring the contact and deny lists its certificate lets it manage. |
+| `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
+| `RecoveryStep::Conversations` | The app is restoring conversation entries at the replacement service. |
+| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and payment evidence before ending reconciliation. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
 | `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |
@@ -393,6 +420,10 @@ In the receive callback, read `sender_disposition`. A flag records repeated rate
 ## Running several protocols
 
 Construct `ProtocolSet::single` or `ProtocolSet::new` from the registered protocols. Names must be distinct, and a collection name has only one owner. Each protocol supplies its own kinds, scopes, record policies and rules. Use `protocols()`, `names`, `contains` and `get` for the roster. Loading requires the stored roster. Restore can add a protocol with no earlier layer, subject to the certificate and layer checks.
+
+To retire a protocol during an upgrade, open the store with its current roster and call `App::retire_protocol(name)`. This consumes the app handle. Once it succeeds, load the same App ID with the remaining protocols and call `receive` to deliver any change to the app record. Take a new layered backup for that roster. To use an older layered backup, restore with its original protocols and repeat the retirement. If the store reports an unknown commit outcome, try loading with the smaller set. A roster mismatch means the host can reopen with the old set and retry.
+
+Finish work that needs the outgoing protocol's certificate scopes before asking the signer to narrow them. If the current or pending certificate still grants one of those scopes, let the app receive a compatible certificate before retirement. On `Refusal::NotNow`, reopen with the original roster and finish the work named in the refusal. Handle and acknowledge events for this owner, let its feed callbacks complete, and finish pending deliveries. Let the app read any outstanding feed entry or marked record whose owner it cannot yet identify. A sent copy can need its original protocol for a resend until normal retention expires. Let the outgoing protocol export or settle its local state and clear the keys it owns. Remove its published member with `set_protocol_member(name, None, None)` and clear a remaining finite expiry with `renew_record(name, None)`. Once it retires, other protocols keep their local state, positions and outstanding work.
 
 Route a kind by the root before its first dot. The owning protocol supplies `check_scopes`, `check_body`, `receives`, `sends_to`, `adds_conversation`, `message_adds_conversation` and `may_send`. The kind and the signed message must both permit adding the recipient to the sender's conversation list. Use `plaintext.json()` for rules on exact signed bytes. Its `accepts` and `opaque_members` describe the messages it accepts, `has_keys` identifies keyed scopes, and `sent_between_own_apps` identifies traffic within the identity. Use a protocol-specific label in inputs to `blind`. `collections`, `record_seen`, `record_regression` and `sent_record` govern its records. `record_regression` checks every write of another app that the client would take, the first of a record too, with `seen` `None`; its `WriteBase` carries the service time the write's stub or proof dates it at. A failed resend or missed-entries callback can hold back its owner while other owners receive. A deny-list change or gap is a barrier for all owners. Use `queued_messages(protocol)` to inspect outstanding copies, including those in saved batches. A message waits if held individually, its recipient is held, or the current `may_send` callback withholds it. That callback sees the signed bytes, origin, resend flag, durable local state and current cert. Its failure must preserve the delivery for a later try.
 
@@ -450,14 +481,14 @@ Implement `StateStore::get`, `scan`, `commit`, `acquire` and `commit_if` with th
 | `BatchError::BatchTooLarge` | The aggregate write size exceeds the cap. Reduce it or separate work that can safely commit independently. |
 | `BatchError::Namespace` | The batch contains a write outside the checked namespace. Fix the caller's namespace before committing. |
 
-The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
+The supplied HTTPS transport restricts connections to allowed public destinations. A custom transport must enforce the origin rules, follow no redirects, preserve the signed path, query, headers and body, and return responses regardless of HTTP status. Honor `Request::timeout`. When signing a raw request with `SwitchClient::sign_request`, choose the class for both the request and its largest valid answer. An app time budget bounds when loops start more requests. Each in-flight request still needs a network timeout.
 
 For a batch with `OpBatch::first_send_before`, the HTTPS transport checks the exclusive deadline at the nonblocking socket write, after waiting for writability. A custom transport implements `Transport::send_before` at its own last cancellable handoff. Its default leaves the batch pending. Only report `FirstSendExpired` if no request bytes left. A partial write has an uncertain outcome. Network transit and service scheduling take additional time, so use a `server_time_in` condition to bound application as well.
 
 | Case | What happened and what to do |
 |---|---|
 | `TimeoutClass::Ordinary` | Use a deadline for a small call, such as a setting or service-time read. |
-| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or record-writing batch with a potentially large answer. |
+| `TimeoutClass::Bulk` | Allow time for a page, record view, upload or batch that can return signed claim proofs, a held record or a claim view. |
 | `TimeoutClass::LongPoll` | Allow the requested `wait_s` at the service plus time to return a bulk page. |
 | `TransportError::Refused` | Local origin or address policy prevented sending. Return this only when zero request bytes left. Correct the destination. |
 | `TransportError::Connect` | A connection could not be made and zero request bytes left. Retry connection later. |
@@ -473,6 +504,8 @@ Only `TransportError::Refused` and `TransportError::Connect` allow the client to
 
 | Case | What happened and what to do |
 |---|---|
+| `ClientError::OwnRecoveryRequired` | The app holds a verified recovery notice for this service generation. Keep the original own-account write for reconciliation and let the app follow its provider. |
+| `ClientError::DisplayReadPending` | The foreground owner is waiting for the original signed display read to finish. Deliver its retained transport outcome through `App::finish_display_read` before starting another own request. |
 | `ClientError::Switch` | The pinned key authenticated a refusal bound to the request. Use `code()`, `retry()`, the current value and any retry interval. Honour backoff and conditions. A caller-level refusal may leave a batch pending. |
 | `ClientError::BodyUnread` | A signed size, rate or not-found answer binds the request without its body. It cannot settle that body's fate. Honour any retry delay and keep the original batch. |
 | `ClientError::BadServiceSignature` | The response signature is missing, unreadable or fails under the pin. Even the status is untrusted. Keep any pending write and check the provider through the signed identity. |
@@ -533,3 +566,11 @@ The optional `test-support` feature exposes a scripted service and store. The fo
 | `ErasureOutcome::UnresolvedAbsent` | Simulate an absent account without outcome evidence. Exercise the missing-evidence path. |
 | `ErasureOutcome::Committed` | Deletion committed before its external completion record was published. Exercise resumption from durable deletion. |
 | `ErasureOutcome::Rejected` | Erasure did not apply and the pending attempt has yet to be withdrawn. Exercise cleanup after a definite rejection. |
+
+### A display read across process exit
+
+A display extension can use `App::peek` through its live foreground owner. An app using a detached `FeedWait` keeps that same owner alive until it has accepted the verified response. A verified recovery notice holds own writes and attempts before foreground processing resumes.
+
+When the display process may exit independently, let the owner reserve one signed page with `App::begin_display_read`. The host transport must retain the original request's identifier and its exact terminal response, together with the device time it arrived, until the owner acknowledges it. It must also distinguish requests never sent or conclusively timed out from an unresolved original reply. The display process can call `App::display_preview` on the retained receipt without writing app state. Show a generic notification for an unchecked remainder or an unverified page.
+
+On reopen, match `App::pending_display_read` against the durable transport outcome. `App::finish_display_read` verifies the reply against the retained request and commits the decision. Redelivering the same receipt after acknowledgement loss has no further effect. An unresolved read holds own requests and attempts. A conclusive transport failure counts toward unavailability. Only a verified recovery response starts a recovery notice. Do not issue the pending read again to reconstruct its original answer. The platform host supplies the transport and its durable delivery across process exit.

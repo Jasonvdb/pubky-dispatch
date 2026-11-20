@@ -169,6 +169,13 @@ pub(crate) struct GoneRecord {
 pub enum ProviderStatus {
     /// The app follows the service its `identity.json` names; nothing to do.
     Current,
+    /// This installation verified an own service recovery notice.
+    RecoveryRequired {
+        /// The followed generation.
+        generation: u64,
+        /// Whether the service retired the generation.
+        permanent: bool,
+    },
     /// The account is frozen for a move: the app uploaded its evidence and waits until
     /// `identity.json` names the next service (Switch spec 12.5 steps 2 to 4).
     AwaitingMove {
@@ -405,6 +412,11 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_halted()?;
             let result = self.provider_step().await;
+            if let Err(error) = &result
+                && let Some(status) = self.recovery_refusal_status(error)
+            {
+                return Ok(status);
+            }
             if result.is_err() {
                 self.reload = true;
             }
@@ -427,14 +439,17 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_halted()?;
-            if self.state.gone.is_some() {
-                // `gone` stops every read: nothing is asked.
+            if self.state.gone.is_some() || self.recovery_required().is_some() {
+                // The follow step owns both a stopped account and a held recovery notice.
                 return self.follow_provider().await;
             }
             let error = match self.follow_public_read().await {
                 Ok(status) => return Ok(status),
                 Err(error) => error,
             };
+            if let Some(status) = self.recovery_refusal_status(&error) {
+                return Ok(status);
+            }
             match error {
                 // The service's signed word that it doesn't host the identity, given to a
                 // request the app signed (Switch spec 12.7 step 5).
@@ -465,6 +480,18 @@ impl App {
         .await
     }
 
+    fn recovery_refusal_status(&self, error: &AppError) -> Option<ProviderStatus> {
+        if error.unkept().code() != Some(ErrorCode::RecoveryRequired) || self.provider_superseded()
+        {
+            return None;
+        }
+        self.recovery_required()
+            .map(|notice| ProviderStatus::RecoveryRequired {
+                generation: notice.generation,
+                permanent: notice.permanent,
+            })
+    }
+
     /// Check the own account with a request-bound feed read (Switch wire 7.1). A public
     /// read can point to a move or prompt an erasure check. Only the signed feed settles
     /// whether the current service is frozen. A stale public read still allows a move
@@ -480,7 +507,8 @@ impl App {
                     return Ok(status);
                 }
             }
-            Err(AppError::Switch(error)) if error.is_not_hosted() => {}
+            Err(AppError::Switch(error))
+                if error.is_not_hosted() || error.code() == Some(ErrorCode::RecoveryRequired) => {}
             Err(AppError::Switch(ClientError::Switch { .. })) if erasing => {}
             Err(error) => return Err(error),
         }
@@ -526,7 +554,9 @@ impl App {
 
     async fn follow_provider_change_body(&mut self) -> Result<Option<ReceiveReport>, AppError> {
         match self.provider_step().await? {
-            ProviderStatus::AwaitingMove { .. } | ProviderStatus::Gone => Ok(Some(ReceiveReport {
+            ProviderStatus::RecoveryRequired { .. }
+            | ProviderStatus::AwaitingMove { .. }
+            | ProviderStatus::Gone => Ok(Some(ReceiveReport {
                 stopped: true,
                 cursor: self.cursor(),
                 ..ReceiveReport::default()
@@ -556,7 +586,20 @@ impl App {
             }
             Err(error) => error,
         };
+        if matches!(error.unkept(), AppError::Switch(failure) if failure.code() == Some(ErrorCode::RecoveryRequired))
+        {
+            self.read_provider_document(None).await?;
+            if self.provider_superseded() {
+                return Ok(TakeOver::ReadAgain);
+            }
+            if self.recovery_required().is_some() {
+                return Ok(TakeOver::Done(Ok(self.stopped_report())));
+            }
+        }
         match &error {
+            AppError::Refused(super::Refusal::NotNow(_)) if self.provider_superseded() => {
+                Ok(TakeOver::ReadAgain)
+            }
             AppError::Switch(ClientError::Switch {
                 code: ErrorCode::Moved,
                 current,
@@ -713,6 +756,24 @@ impl App {
             self.mark_gone(GoneReason::NotCurrent).await?;
             return Ok(ProviderStatus::Gone);
         }
+        if self.recovery_required().is_some() {
+            self.read_provider_document(None).await?;
+            if !self.provider_superseded() {
+                // A bounded signed read can establish service again without writing the cursor.
+                let answer = self.service_freeze().await;
+                if let Err(error) = answer
+                    && !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_))
+                {
+                    return Err(error);
+                }
+                if let Some(notice) = self.recovery_required() {
+                    return Ok(ProviderStatus::RecoveryRequired {
+                        generation: notice.generation,
+                        permanent: notice.permanent,
+                    });
+                }
+            }
+        }
         let mut followed = None;
         for _ in 0..FOLLOW_PASSES {
             if let Some(loss) = self.loss_record().await?
@@ -754,13 +815,26 @@ impl App {
         if !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)) || self.reload {
             return;
         }
+        // An alarm the copy raises is kept; the step's own error is the one returned.
+        let _ = self.read_provider_document(None).await;
+    }
+
+    pub(super) async fn read_provider_document(
+        &mut self,
+        serving_generation: Option<u64>,
+    ) -> Result<bool, AppError> {
         let identity = self.state.meta.identity;
         if let Ok(Some(doc)) =
             identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
         {
-            // An alarm the copy raises is kept; the step's own error is the one returned.
-            let _ = self.take_own_copy(doc).await;
+            let names_service = doc.generation() == self.state.meta.generation
+                && doc.inbox().service_key == self.state.meta.service_key
+                && doc.inbox().url == self.state.meta.origin;
+            self.take_own_copy_with(doc, None, serving_generation, |_| Ok(()))
+                .await?;
+            return Ok(names_service && !self.provider_superseded());
         }
+        Ok(false)
     }
 
     /// The newest own `identity.json` names a later generation and no move is in progress:
@@ -1261,7 +1335,7 @@ impl App {
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         tx.put(keys::MOVE, &*mv)?;
-        self.commit(tx).await?;
+        self.commit_followed_generation(tx).await?;
         self.events.extend(events);
         Ok(())
     }
@@ -1859,7 +1933,7 @@ impl App {
             .collect();
         // `gone` and its duty events go with the copy, in its commit: a copy that fails
         // leaves them.
-        self.take_own_copy_with(doc, |tx| {
+        self.take_own_copy_with(doc, None, None, |tx| {
             tx.delete(keys::GONE)?;
             for n in gone_duties {
                 tx.delete(&key::duty(n))?;

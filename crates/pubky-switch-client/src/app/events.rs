@@ -204,6 +204,21 @@ pub struct PendingDuty {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AppEvent {
+    /// This installation's service requires recovery (Switch spec 12.6).
+    RecoveryRequired {
+        /// The durable host event.
+        id: EventId,
+        /// The verified notice.
+        notice: super::RecoveryNotice,
+    },
+    /// The app followed a later generation, or a later request received a verified
+    /// success with a head at the generation held by a temporary notice.
+    RecoveryNoticeCleared {
+        /// The durable host event.
+        id: EventId,
+        /// The generation whose recovery notice cleared.
+        generation: u64,
+    },
     /// An alarm stopped the app.
     Alarm(Alarm),
     /// A message passed every check and its effect was committed with the cursor move.
@@ -239,6 +254,17 @@ pub enum AppEvent {
     Held {
         /// The entry's `seq`.
         seq: u64,
+    },
+    /// A receive callback needs protocol data before it can process this input.
+    ProtocolDeferred {
+        /// The entry's original feed position.
+        seq: u64,
+        /// Its local ID if this attempt was made from stored custody.
+        stored_id: Option<u64>,
+        /// The registered protocol that owns the message kind.
+        protocol: String,
+        /// The protocol's content-free reason for waiting on this attempt.
+        reason: &'static str,
     },
     /// The protocol's receive step at an entry couldn't finish, because its store or the
     /// host failed ([`super::Outcome::Retry`]), on `reads` reads in a row: raised from the
@@ -1084,7 +1110,9 @@ impl AppEvent {
     pub fn id(&self) -> Option<EventId> {
         match self {
             Self::Parked { id, .. } => *id,
-            Self::EffectRefused { id, .. }
+            Self::RecoveryRequired { id, .. }
+            | Self::RecoveryNoticeCleared { id, .. }
+            | Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
             | Self::ReleasedDuplicate { id, .. }
             | Self::StoredEntryDropped { id, .. }
@@ -1246,6 +1274,12 @@ impl KeptDuty {
 /// A duty event, as [`KeptDuty`] keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Duty {
+    RecoveryRequired {
+        notice: super::RecoveryNotice,
+    },
+    RecoveryNoticeCleared {
+        generation: u64,
+    },
     Parked {
         seq: u64,
         stored_id: u64,
@@ -1398,6 +1432,10 @@ impl Duty {
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
+            Self::RecoveryRequired { notice } => AppEvent::RecoveryRequired { id, notice },
+            Self::RecoveryNoticeCleared { generation } => {
+                AppEvent::RecoveryNoticeCleared { id, generation }
+            }
             Self::Parked {
                 seq,
                 stored_id,
@@ -1681,6 +1719,9 @@ pub enum ParkReason {
     /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
     /// every read, in case the host repaired it.
     StoreRejected,
+    /// The protocol needs data before it can apply the input. Retry from local storage
+    /// within the protocol's own lifetime for this message (Switch spec 8.2).
+    ProtocolDeferred,
     /// Its effect was kept unanswered longer than a resend's answer can tell whether it was
     /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
     /// ([`AppEvent::EffectUncertain`]).
@@ -1720,6 +1761,7 @@ impl ParkReason {
                 | Self::Quota
                 | Self::StoreUnavailable
                 | Self::StoreRejected
+                | Self::ProtocolDeferred
                 | Self::Released
                 | Self::AwaitingKey { .. }
         )

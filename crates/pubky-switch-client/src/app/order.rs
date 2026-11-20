@@ -69,7 +69,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::state::Tx;
+use super::state::{Tx, key};
 use super::{App, AppError};
 
 /// Where an item stands in feed order, as [`App::feed_order`] gives it.
@@ -77,6 +77,11 @@ pub(crate) type FeedOrder = (u8, u64, u64);
 
 /// `told/<name>`: how far protocol `name` has been told ([`Told`]).
 pub(crate) const TOLD_PREFIX: &str = "told/";
+
+/// No more events or calls are due to a departed app's protocols (Switch spec 12.3).
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[key::DUTY_PREFIX, key::OWED_PREFIX, TOLD_PREFIX])
+}
 
 fn told_key(name: &str) -> String {
     format!("{TOLD_PREFIX}{name}")
@@ -106,6 +111,8 @@ pub(crate) struct Kept {
     pub(crate) names: Vec<String>,
     /// A call, whose item the walk doesn't handle again; not a listing.
     pub(crate) call: bool,
+    /// A higher held cursor reported at this position, distinct from its ordinary item.
+    pub(crate) held_gap: Option<u64>,
     /// A deny list change, which no protocol is handed anything past while it is kept.
     pub(crate) deny: bool,
 }
@@ -217,8 +224,9 @@ impl App {
     /// A new retained call becomes a prerequisite before the read can hand over the
     /// next item, including a call kept at sequence zero (Switch spec 8.3).
     pub(crate) fn note_pending_call(&mut self, call: Kept) {
-        self.pending_calls
-            .retain(|kept| (kept.generation, kept.seq) != (call.generation, call.seq));
+        self.pending_calls.retain(|kept| {
+            (kept.generation, kept.seq, kept.held_gap) != (call.generation, call.seq, call.held_gap)
+        });
         self.pending_calls.push(call);
     }
 

@@ -119,6 +119,18 @@ pub(crate) fn put_hold(tx: &mut super::state::Tx, pubky: &[u8; 32]) -> Result<()
 /// A message the app holds ([`App::hold_message`]), by `msg_id`.
 pub(crate) const MESSAGE_HOLD_PREFIX: &str = "outheld/";
 
+/// Remove sent and queued plaintexts, their retention index and delivery holds on leave.
+pub(super) fn clear_on_leave(tx: &mut super::state::Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[
+        OUT_PREFIX,
+        SENT_PREFIX,
+        SENT_TIME_PREFIX,
+        GIVEN_UP_PREFIX,
+        HOLD_PREFIX,
+        MESSAGE_HOLD_PREFIX,
+    ])
+}
+
 fn message_hold_key(msg_id: &str) -> String {
     format!("{MESSAGE_HOLD_PREFIX}{msg_id}")
 }
@@ -236,6 +248,21 @@ pub enum DeliveryOrigin {
     Reconstructed,
 }
 
+/// The most own records a protocol can request before one append (Switch spec 8.2, 11).
+pub const MAX_APPEND_RECORDS: usize = 2;
+
+/// The owning protocol's decision for one append of an authenticated message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendDecision {
+    /// Permit this transport attempt. A later attempt checks again.
+    Send,
+    /// Keep the signed message queued for another try.
+    Hold,
+    /// Give up this outstanding delivery, preserving uncertainty about earlier attempts
+    /// and any record job still owed for a previously accepted message.
+    Withdraw,
+}
+
 /// An authenticated outgoing message and its owning protocol's committed local state.
 ///
 /// The plaintext retains the exact signed JSON bytes. Its hash and origin are the same
@@ -247,6 +274,7 @@ pub struct DeliveryView<'a> {
     resend: bool,
     local: super::LocalView<'a>,
     cert: &'a AppCert,
+    recovery_from: Option<u64>,
     naming: &'a NamingKey,
     store: &'a dyn crate::store::StateStore,
     ns: &'a str,
@@ -296,6 +324,12 @@ impl<'a> DeliveryView<'a> {
     /// The app's current certificate, as [`App::cert`] gives it.
     pub fn cert(&self) -> &AppCert {
         self.cert
+    }
+
+    /// The lost generation named by the app's current signed identity document
+    /// (Switch wire 3.3), or `None` when no provider loss is recorded.
+    pub fn recovery_from(&self) -> Option<u64> {
+        self.recovery_from
     }
 
     /// `blind(input)` under the app's naming key (Switch wire 1.5), as [`App::blind`]
@@ -759,9 +793,9 @@ pub(crate) struct OutboxItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record_batch: Option<String>,
     /// An envelope of it was committed to be sent, so a request carrying it may have
-    /// reached the recipient's switch, its answer lost. Never cleared: a give-up of it then
-    /// can't say the message was not delivered ([`OutboxItem::give_up_duty`]). Always
-    /// written: a record without it is refused, never read as never sent.
+    /// reached the recipient's switch, its answer lost. Once a transport call is attempted,
+    /// this stays set for a give-up ([`OutboxItem::give_up_duty`]). Always written: a record
+    /// without it is refused, never read as never sent.
     envelope_sent: bool,
 }
 
@@ -1068,6 +1102,7 @@ pub(crate) fn put_outbox_item(
 enum Tried {
     /// The current hold decision stopped the remaining delivery work, without an answer.
     Held,
+    Withdraw,
     Accepted(AppendAnswer),
     Queued(String),
     /// Queued after `403 not_admitted` or `403 not_current`, for a bounded time.
@@ -1180,6 +1215,18 @@ pub(crate) async fn validate_outbox(
     cert: &pubky_switch_core::records::AppCert,
 ) -> Result<(), AppError> {
     retained_copies(reader, meta, cert).await.map(|_| ())
+}
+
+impl App {
+    /// Queued and sent copies may still need their original protocol on a resend (Switch spec 11).
+    pub(super) async fn has_retained_messages_for(&self, protocol: &str) -> Result<bool, AppError> {
+        let copies = retained_copies(&self.reader(), &self.state.meta, &self.state.cert).await?;
+        Ok(copies.values().any(|copy| {
+            self.protocols
+                .of_kind(&copy.kind)
+                .is_some_and(|owner| owner.name == protocol)
+        }))
+    }
 }
 
 /// The exact condition under which settlement can materialize a retained queued intent.
@@ -1664,6 +1711,23 @@ impl App {
         .await
     }
 
+    /// End this materialized outbox delivery with the same custody information as an
+    /// explicit withdrawal or an expired replay deadline (Switch spec 11).
+    async fn give_up_outbox(&mut self, item: OutboxItem) -> Result<Duty, AppError> {
+        let msg_id = item.msg_id.clone();
+        let to = self.owners_of_kind(&item.kind);
+        let (kept, duty) = item.give_up_delivery();
+        let mut tx = self.tx()?;
+        match &kept {
+            Some(kept) => tx.put(&out_key(&msg_id), kept)?,
+            None => tx.delete(&out_key(&msg_id))?,
+        }
+        self.end_delivery(&msg_id, &mut tx).await?;
+        self.keep_duty_for(&mut tx, to, duty.clone())?;
+        self.commit(tx).await?;
+        Ok(duty)
+    }
+
     /// Give up every message `matches` takes whose delivery is owed, as
     /// [`App::withdraw_queued`] says: those of the outbox in queue order, each in a commit of
     /// its own, then those of kept batches.
@@ -1685,17 +1749,7 @@ impl App {
         let mut withdrawn = Vec::new();
         for item in items {
             let msg_id = item.msg_id.clone();
-            let to = self.owners_of_kind(&item.kind);
-            let (kept, duty) = item.give_up_delivery();
-            let mut tx = self.tx()?;
-            match &kept {
-                // Kept for its record job: the mark stops a re-send after a loss.
-                Some(kept) => tx.put(&out_key(&msg_id), kept)?,
-                None => tx.delete(&out_key(&msg_id))?,
-            }
-            self.end_delivery(&msg_id, &mut tx).await?;
-            self.keep_duty_for(&mut tx, to, duty)?;
-            self.commit(tx).await?;
+            self.give_up_outbox(item).await?;
             withdrawn.push(msg_id);
         }
         // The messages kept batches would queue once they settle: never in an outbox, so
@@ -2277,20 +2331,15 @@ impl App {
     ///   again. A unit once begun goes whole. The call starts no unit once its time budget
     ///   ([`super::AppConfig::call_budget_ms`]) is spent, but its first. So its worst case is
     ///   the budget and one unit begun within it.
-    /// - One unit is bounded on its own. A delivery of the own `identity.json` is one
-    ///   request. A message's try is, at the default timeouts with every request waiting to
-    ///   the end of its timeout:
-    ///   - the service-time fetch of a message with a replay deadline, about 10 s;
-    ///   - its conversation entry, a write that may send a kept batch first under the long
-    ///     timeout, about 60 s;
-    ///   - one delivery round: its first attempt, at most four requests with the directory
-    ///     under the long timeout, and no retry once the budget has passed since the round
-    ///     began, about 90 s;
-    ///   - the own `identity.json` delivered after the acceptance asks for it, about 10 s;
-    ///   - its record job ([`super::App::update_record`], bounded the same way), about 130 s
-    ///     on a switch that answers nothing in time.
-    ///
-    ///   So about 5 minutes. A try against switches that answer takes seconds.
+    /// - Delivering the own `identity.json` uses a bulk call. A message's try can also
+    ///   read the service time for its replay deadline, write its conversation entry,
+    ///   fetch the recipient's identity and directory, append its envelope and run its
+    ///   record job ([`super::App::update_record`]). A switch call can repeat once
+    ///   after a verified timestamp correction. Each HTTP send has its own deadline
+    ///   ([`crate::transport::HttpConfig`]). Before retrying an append with a corrected
+    ///   timestamp, the app checks whether the delivery is held. The round's time budget
+    ///   governs a reseal after `stale_key`, identity delivery after `identity_needed`
+    ///   and a reread of the peer identity after an unverified answer.
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
@@ -2561,19 +2610,7 @@ impl App {
                 }
             }
             if self.kept_window_now() > deadline {
-                let to = self.owners_of_kind(&item.kind);
-                let (kept, duty) = item.give_up_delivery();
-                let mut tx = self.tx()?;
-                match &kept {
-                    Some(kept) => tx.put(&out_key(msg_id), kept)?,
-                    None => {
-                        tx.delete(&out_key(msg_id))?;
-                    }
-                }
-                self.end_delivery(msg_id, &mut tx).await?;
-                self.keep_duty_for(&mut tx, to, duty.clone())?;
-                self.commit(tx).await?;
-                return Ok(Some(duty));
+                return self.give_up_outbox(item).await.map(Some);
             }
         }
         // Past the firm bound, the message goes before it is tried again.
@@ -2631,6 +2668,7 @@ impl App {
         if item.delivery_owed() && !held {
             match self.deliver(&mut item).await? {
                 Tried::Held => self.save_item(&item).await?,
+                Tried::Withdraw => return self.give_up_outbox(item).await.map(Some),
                 Tried::Accepted(answer) => self.accept(&mut item, &answer).await?,
                 Tried::Queued(why) => {
                     item.last_error = Some(why);
@@ -3005,17 +3043,12 @@ impl App {
     /// ([`App::reread_after_unverified`]); an answer that still doesn't verify is queued as
     /// any other.
     ///
-    /// The round is bounded: it reads the newest copy at most once, and it starts no retry,
-    /// that reread, a reseal after `409 stale_key` or the own `identity.json` delivered again
-    /// after `409 identity_needed`, once the call's time budget
-    /// ([`super::AppConfig::call_budget_ms`]) has passed since the round began. Its worst case
-    /// is the budget and the attempt under way when it ran out: an attempt is at most the
-    /// recipient's `identity.json` from the Homeserver, the own one delivered, the
-    /// directory, and the append, each under its timeout. A retry left so is recorded, the
-    /// new keys taken and the envelope dropped, or the switch's copy of the own
-    /// `identity.json` taken as unknown, so the next try's first attempt makes it.
+    /// An unverified answer allows one peer identity reread for retry. The round's budget controls
+    /// that reread, resealing after `409 stale_key` and delivery of the own identity after
+    /// `409 identity_needed`. A timestamp correction inside a switch call is a separate
+    /// HTTP send. The append checks delivery holds before its timestamp retry.
     async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
-        // The time of this round: it starts no retry once the call's budget has passed.
+        // The outer delivery retries share the time budget of this round.
         let round = self.begin_budget();
         let mut reread = false;
         loop {
@@ -3122,10 +3155,24 @@ impl App {
                 return Ok(Delivered::Tried(Tried::Queued("not sealed".into())));
             };
             // Identity delivery, sealing and retry preparation may write state. The
-            // same current decision gates every actual append, own or peer, including
-            // retries, with no state-changing await between this check and the call.
-            if self.delivery_waits(item).await? {
-                return Ok(Delivered::Tried(Tried::Held));
+            // owning protocol checks the resulting state before each actual append,
+            // including every retry, for both own and peer recipients.
+            if let Some(stopped) = self.before_append(item).await? {
+                return Ok(Delivered::Tried(stopped));
+            }
+            // A prepared envelope can be held or withdrawn before its first attempt.
+            // Commit possible delivery immediately before the first transport call, so
+            // a crash after it can never be reported as definite non-delivery.
+            if !item.envelope_sent {
+                item.envelope_sent = true;
+                self.save_item(item).await?;
+                if self.delivery_waits(item).await? {
+                    // No transport call followed this new mark. Restore the known
+                    // non-delivery before exposing the stopped item to another caller.
+                    item.envelope_sent = false;
+                    self.save_item(item).await?;
+                    return Ok(Delivered::Tried(Tried::Held));
+                }
             }
             let peer = if own {
                 None
@@ -3154,8 +3201,8 @@ impl App {
                         if own {
                             self.keep_observations().await?;
                         }
-                        if self.delivery_waits(item).await? {
-                            return Ok(Delivered::Tried(Tried::Held));
+                        if let Some(stopped) = self.before_append(item).await? {
+                            return Ok(Delivered::Tried(stopped));
                         }
                     }
                     let answer = peer
@@ -3235,6 +3282,9 @@ impl App {
     /// [`App::flush_outbox`]) goes through `try_item`, which asks this, so no call passes
     /// any of the holds.
     async fn delivery_waits(&self, item: &OutboxItem) -> Result<bool, AppError> {
+        if item.to == self.state.meta.identity && self.recovery_required().is_some() {
+            return Ok(true);
+        }
         Ok(item.delivery_owed() && self.delivery_holds(item).await?.any())
     }
 
@@ -3256,14 +3306,22 @@ impl App {
         let Some(owner) = self.protocols.of_kind(&item.kind) else {
             return true;
         };
-        let Ok(plaintext) = item.plaintext() else {
-            return false;
-        };
-        // A kept message is read by its common fields, so a protocol's changed body rules
-        // never hold it for good; the protocol's own hook decides.
-        let Some(message) = super::protocols::kept_message(plaintext.json()) else {
-            return false;
-        };
+        self.with_delivery(item, owner, |delivery| {
+            owner.protocol.may_send(delivery).unwrap_or(false)
+        })
+        .unwrap_or(false)
+    }
+
+    fn with_delivery<T>(
+        &self,
+        item: &OutboxItem,
+        owner: &super::protocols::Registered,
+        use_view: impl FnOnce(&DeliveryView<'_>) -> T,
+    ) -> Option<T> {
+        let plaintext = item.plaintext().ok()?;
+        // Retained copies use the authenticated common fields even when the owner's body
+        // rules have changed since the message was signed.
+        let message = super::protocols::kept_message(plaintext.json())?;
         let local = super::LocalView::new(
             self.state.meta.identity,
             self.state.meta.app_id,
@@ -3278,12 +3336,78 @@ impl App {
             resend: item.is_resend(),
             local,
             cert: &self.state.cert,
+            recovery_from: self.state.own_doc.body().recovery_from,
             naming: &self.state.naming,
             store: self.env.store.store().as_ref(),
             ns: &self.ns,
             clock: self.env.clock.as_ref(),
         };
-        owner.protocol.may_send(&delivery).unwrap_or(false)
+        Some(use_view(&delivery))
+    }
+
+    /// Read only this message owner's registered policies and keep their observations
+    /// in this attempt. A retry, including the signed timestamp retry, starts here anew.
+    async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
+        if self.delivery_waits(item).await? {
+            return Ok(Some(Tried::Held));
+        }
+        let Some(owner) = self.protocols.of_kind(&item.kind).cloned() else {
+            return Ok(None);
+        };
+        let Some(Ok(targets)) =
+            self.with_delivery(item, &owner, |d| owner.protocol.append_records(d))
+        else {
+            return Ok(Some(Tried::Held));
+        };
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let members = owner.protocol.collections();
+        if targets.len() > MAX_APPEND_RECORDS
+            || targets.iter().enumerate().any(|(i, target)| {
+                let collection = &target.collection;
+                targets[..i].contains(target)
+                    || collection.family != super::PolicyFamily::Fixed
+                    || !self.state.cert.holds_scope(&collection.policy.read_scope)
+                    || self
+                        .protocols
+                        .foreign_owner(
+                            &owner.name,
+                            Some(&collection.name),
+                            &collection.policy.read_scope,
+                        )
+                        .is_some()
+                    || !members
+                        .iter()
+                        .any(|m| m.name == collection.name && m.admits(&collection.policy))
+            })
+        {
+            return Ok(Some(Tried::Held));
+        }
+        let authority = (self.state.own_doc.hash(), self.state.cert.hash());
+        let mut records = Vec::with_capacity(targets.len());
+        for target in targets {
+            let read = Box::pin(self.read_record_fresh(&target)).await?;
+            records.push((target, read));
+        }
+        if authority != (self.state.own_doc.hash(), self.state.cert.hash())
+            || self.delivery_waits(item).await?
+        {
+            return Ok(Some(Tried::Held));
+        }
+        if item
+            .replay_until_ms
+            .is_some_and(|until| self.kept_window_now() > until)
+        {
+            return Ok(Some(Tried::Withdraw));
+        }
+        Ok(
+            match self.with_delivery(item, &owner, |d| owner.protocol.judge_append(d, &records)) {
+                Some(Ok(AppendDecision::Send)) => None,
+                Some(Ok(AppendDecision::Withdraw)) => Some(Tried::Withdraw),
+                _ => Some(Tried::Held),
+            },
+        )
     }
 
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope
@@ -3308,8 +3432,6 @@ impl App {
             origin: doc.inbox().url.clone(),
             generation: doc.generation(),
         });
-        // Committed with the envelope, before it is first sent.
-        item.envelope_sent = true;
         self.save_item(item).await
     }
 

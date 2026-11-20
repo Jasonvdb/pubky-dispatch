@@ -3,6 +3,8 @@
 //! 4.2, 12.1 step 2; Switch wire 2.1, 3.2, 6.2), and signing under a protocol's own label
 //! (Switch spec 13.2).
 
+mod restore_publication;
+
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::labels;
 use pubky_switch_core::records::{AppRecord, AppRecordBody, app_record_path};
@@ -331,7 +333,7 @@ async fn test_own_record_conflict_with_another_device_is_written_again_later() {
     w.clock.advance_ms(1_000);
     // Another device of the app delivered a record at the time this one is about to use.
     let mut other = AppRecordBody::new(app.cert(), Vec::new(), w.clock.now_ms());
-    other.label = Some("other device".into());
+    other.protocols.insert("calendar".into(), Map::new());
     let other = AppRecord::sign(&app_keys("wallet"), other).unwrap();
     w.switch
         .app_op(
@@ -1015,8 +1017,8 @@ async fn restored_publishing(w: &World, backup: &crate::app::AppBackup) -> App {
 }
 
 /// Switch spec 4.2: a backup taken while a record's `app.put` was refused carries the
-/// accepted record apart. The restored app publishes only that one, never the refused
-/// record it holds; the protocol's next change delivers the record held again, signed
+/// accepted record apart. Repair waits for the newer local choice, never publishing
+/// refused bytes. The protocol's next change delivers the record held again, signed
 /// anew, and publishes it once the switch accepts it.
 #[tokio::test]
 async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
@@ -1041,7 +1043,7 @@ async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
     restored.receive(None).await.unwrap();
     assert_eq!(
         restored.publish_record().await.unwrap(),
-        Publication::Published
+        Publication::AwaitingRecord
     );
     assert_eq!(w.held(id), accepted);
     assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
@@ -1061,7 +1063,7 @@ async fn test_own_record_restore_never_publishes_a_record_the_switch_refused() {
 }
 
 /// As above, the `app.put` never answered when the backup was taken: a restored read
-/// publishes the accepted record, never the one held.
+/// neither repairs the older accepted record nor publishes the unaccepted one held.
 #[tokio::test]
 async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
     let w = World::new();
@@ -1086,7 +1088,7 @@ async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
     restored.receive(None).await.unwrap();
     assert_eq!(w.held(id), accepted);
     assert_ne!(w.published(id), Some(bytes_of(&undelivered)));
-    assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
+    assert!(w.published(id).is_none());
 }
 
 /// A backup carrying no accepted record publishes nothing once restored, until the switch
@@ -1360,7 +1362,7 @@ async fn test_own_record_conflict_on_a_resend_a_later_record_superseded_is_dropp
     // Another device of the app puts a later record, and publishes it.
     w.clock.advance_ms(1_000);
     let mut later = AppRecordBody::new(app.cert(), Vec::new(), w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -1386,13 +1388,13 @@ async fn test_own_record_conflict_on_a_resend_a_later_record_superseded_is_dropp
     assert_eq!(w.held(id).as_ref(), Some(later.signed()));
     assert_eq!(w.published(id), Some(bytes_of(later.signed())));
     app.receive(None).await.unwrap();
-    // The next change builds on the later record: the other device's label stays.
+    // The next change carries the other device's calendar member forward.
     w.clock.advance_ms(1_000);
     app.set_protocol_member(PROTO, member(json!({ "b": 2 })), None)
         .await
         .unwrap();
     let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
-    assert_eq!(held.body().label.as_deref(), Some("other device"));
+    assert!(held.body().protocol("calendar").is_some());
     assert_eq!(
         held.body().protocol(PROTO),
         member(json!({ "b": 2 })).as_ref()
@@ -1551,7 +1553,7 @@ async fn test_own_record_superseded_drop_then_unchanged_call_signs_nothing() {
     w.clock.advance_ms(1_000);
     let accepts = record_of(&app).body().accepts.clone();
     let mut later = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -1570,8 +1572,7 @@ async fn test_own_record_superseded_drop_then_unchanged_call_signs_nothing() {
     assert_eq!(
         w.app_puts(),
         puts,
-        "an unchanged call signed again: the switch now holds label {:?}, protocols {:?}",
-        held.body().label,
+        "an unchanged call signed again: the switch now holds protocols {:?}",
         held.body().protocols.keys().collect::<Vec<_>>()
     );
 }
@@ -1739,7 +1740,7 @@ async fn test_own_record_superseded_by_a_record_under_a_renewal_takes_the_renewa
     let renewed = super::flows::renew_listed(&w, &app);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -1840,7 +1841,7 @@ async fn test_own_record_superseded_under_a_renewal_the_app_holds_keeps_the_late
     w.clock.advance_ms(1_000);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -1858,8 +1859,7 @@ async fn test_own_record_superseded_under_a_renewal_the_app_holds_keeps_the_late
     assert_eq!(
         w.app_puts(),
         puts,
-        "signed over the later record: the switch holds label {:?}, protocols {:?} ({outcome:?})",
-        held.body().label,
+        "signed over the later record: the switch holds protocols {:?} ({outcome:?})",
         held.body().protocols.keys().collect::<Vec<_>>()
     );
 }
@@ -1924,7 +1924,7 @@ async fn test_own_record_conflict_naming_no_record_with_a_same_time_record_keeps
     w.clock.advance_ms(1_000);
     let accepts = record_of(&app).body().accepts.clone();
     let mut shown = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
-    shown.label = Some("shown".into());
+    shown.protocols.insert("calendar".into(), Map::new());
     let shown = AppRecord::sign(&app_keys("wallet"), shown).unwrap();
     w.switch.fail_next(Fault::Error {
         path: "/ops".into(),
@@ -1963,7 +1963,7 @@ async fn test_own_record_superseding_record_taken_holds_across_a_load() {
     w.clock.advance_ms(1_000);
     let accepts = record_of(&app).body().accepts.clone();
     let mut later = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -2044,7 +2044,7 @@ async fn test_own_record_superseded_under_a_renewal_whose_take_fails_recovers() 
     let renewed = super::flows::renew_listed(&w, &app);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -2078,7 +2078,7 @@ async fn test_own_record_superseded_under_a_renewal_whose_take_fails_recovers() 
         "renewal taken: {taken}; first read {first:?}; update_accepts {call:?}; reads {reads:?}"
     );
     let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
-    assert_eq!(held.body().label.as_deref(), Some("other device"));
+    assert!(held.body().protocol("calendar").is_some());
 }
 
 /// Another device takes a renewal and puts a record carrying it while this device is
@@ -2093,7 +2093,7 @@ async fn test_own_record_renewal_another_device_took_while_offline_is_taken() {
     let renewed = super::flows::renew_listed(&w, &app);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -2188,7 +2188,7 @@ async fn test_take_listed_renewal_kept_record_under_the_old_cert() {
     let renewed = super::flows::renew_listed(&w, &app);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -2226,7 +2226,7 @@ async fn test_take_listed_renewal_publish_check_compares_the_taken_record() {
     let renewed = super::flows::renew_listed(&w, &app);
     let accepts = w.protocol.accepts(&renewed);
     let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
-    later.label = Some("other device".into());
+    later.protocols.insert("calendar".into(), Map::new());
     let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
     w.switch
         .app_op(
@@ -2288,10 +2288,7 @@ async fn test_take_listed_renewal_keeps_a_later_held_renewal() {
         .unwrap();
     w.clock.advance_ms(1_000);
     app.receive(None).await.unwrap();
-    assert_eq!(
-        app.state.renewal.as_ref().map(|r| r.hash()),
-        Some(third.hash())
-    );
+    assert_eq!(app.kept_renewal().map(|r| r.hash()), Some(third.hash()));
     w.clock.advance_ms(1_000);
     app.receive(None).await.unwrap();
     list_renewal(&w, me, &renewed, &third);
@@ -2709,6 +2706,55 @@ async fn test_own_record_lifetime_rollback_samples_current_time_before_signing()
     assert_eq!(record.expires_at(), Some(record.updated_at() + day));
     assert!(record.trusted_until(86_400) > w.clock.now_ms());
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// The default protocol hook carries the signed member and the local expiry ask
+/// independently when the app takes a renewed certificate (Switch spec 3.2 step 3).
+#[tokio::test]
+async fn test_renewal_member_default_carries_members_and_asks() {
+    for (has_member, has_ask) in [(false, false), (false, true), (true, false), (true, true)] {
+        let w = World::new();
+        let mut app = w.join_publishing("wallet").await;
+        let expected = if has_member {
+            member(json!({ "room": 1 }))
+        } else {
+            None
+        };
+        let deadline = has_ask.then(|| w.clock.now_ms() + pubky_switch_core::records::DAY_MS);
+        if has_member {
+            // The other device's member arrives with no expiry ask in this store.
+            app.set_multi_device(true).await.unwrap();
+            let backup = app.backup().await.unwrap();
+            let mut other = restored_publishing(&w, &backup).await;
+            other
+                .set_protocol_member(PROTO, expected.clone(), None)
+                .await
+                .unwrap();
+            app.receive(None).await.unwrap();
+        }
+        if let Some(at) = deadline {
+            app.renew_record(PROTO, Some(at)).await.unwrap();
+        }
+        let ask = deadline.map(crate::app::RecordExpiry::At);
+        assert_eq!(record_of(&app).body().protocol(PROTO), expected.as_ref());
+        assert_eq!(
+            app.record_expiries().await.unwrap().get(PROTO),
+            ask.as_ref()
+        );
+
+        w.clock.advance_ms(1_000);
+        let renewed = super::flows::renew_listed(&w, &app);
+        app.receive(None).await.unwrap();
+        let record = record_of(&app);
+        assert_eq!(record.cert().hash(), renewed.hash());
+        assert_eq!(record.body().protocol(PROTO), expected.as_ref());
+        assert_eq!(
+            app.record_expiries().await.unwrap().get(PROTO),
+            ask.as_ref()
+        );
+        assert_eq!(record.expires_at(), deadline);
+        assert_eq!(w.held(app.app_id()).as_ref(), Some(app.record()));
+    }
 }
 
 #[tokio::test]

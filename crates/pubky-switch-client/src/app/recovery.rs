@@ -75,6 +75,11 @@ pub(crate) mod keys {
     /// The identity document at the opening of the latest loss.
     pub(super) const OPENING: &str = "loss/opening";
 
+    /// The local key a protocol registered for future loss inventories.
+    pub(crate) fn checkpoint(protocol: &str) -> String {
+        format!("loss-checkpoint/{protocol}")
+    }
+
     /// A kept operation, by its document hash.
     pub(crate) fn op(hash: &[u8; 32]) -> String {
         format!("ev/op/{}", b64(hash))
@@ -154,6 +159,8 @@ pub struct LossActions {
 pub struct RecoveryInfo {
     /// The protocol's view of the loss.
     pub loss: ProviderLoss,
+    /// The step the app will resume after a restart (Switch spec 12.6).
+    pub step: RecoveryStep,
     /// Whether the app's steps of the recovery have all run.
     pub steps_done: bool,
     /// How many counterparties of [`LossActions::conversations`] past
@@ -168,12 +175,19 @@ pub struct RecoveryInfo {
 
 /// The steps of following a loss, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) enum LossStep {
+#[non_exhaustive]
+pub enum RecoveryStep {
+    /// Register this installation at the followed generation.
     Register,
+    /// Upload retained evidence.
     Upload,
+    /// Restore the account's allow and deny lists.
     Lists,
+    /// Resume the protocol's resend requests.
     Resend,
+    /// Rebuild conversation entries.
     Conversations,
+    /// All recovery steps have completed.
     Done,
 }
 
@@ -182,7 +196,7 @@ pub(crate) enum LossStep {
 pub(crate) struct LossRecord {
     pub(crate) lost_generation: u64,
     pub(crate) generation: u64,
-    pub(crate) step: LossStep,
+    pub(crate) step: RecoveryStep,
     /// The old service's newest head, while the app had verified the chain it vouches for.
     pub(crate) newest_head: Option<Value>,
     /// The acceptance time of the last entry the cursor passed at the old service.
@@ -210,7 +224,7 @@ pub(crate) struct LossRecord {
 
 impl LossRecord {
     pub(crate) fn done(&self) -> bool {
-        self.step == LossStep::Done
+        self.step == RecoveryStep::Done
     }
 
     /// Add one protocol's counterparties to those the loss adds back: all of them sorted and
@@ -396,6 +410,7 @@ impl App {
     pub async fn recovery_info(&self) -> Result<Option<RecoveryInfo>, AppError> {
         Ok(self.loss_record().await?.map(|loss| RecoveryInfo {
             loss: loss.view(),
+            step: loss.step,
             steps_done: loss.done(),
             conversations_left_out: loss.conversations_left_out,
             claim_entries_left_out: loss.claim_entries_left_out,
@@ -575,7 +590,7 @@ impl App {
         let loss = LossRecord {
             lost_generation: lost,
             generation,
-            step: LossStep::Register,
+            step: RecoveryStep::Register,
             newest_head,
             cursor_time_ms: time_ms,
             declared_at_ms: None,
@@ -592,7 +607,7 @@ impl App {
         Box::pin(self.note_roster_removals(doc, &mut tx)).await?;
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
-        self.commit(tx).await?;
+        self.commit_followed_generation(tx).await?;
         self.events.extend(events);
         self.events.push(AppEvent::ProviderLost {
             lost_generation: lost,
@@ -630,19 +645,19 @@ impl App {
     /// One step of a loss, committed as done.
     async fn loss_step(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
         match loss.step {
-            LossStep::Register => {
+            RecoveryStep::Register => {
                 self.loss_register(loss).await?;
-                loss.step = LossStep::Upload;
+                loss.step = RecoveryStep::Upload;
             }
-            LossStep::Upload => {
+            RecoveryStep::Upload => {
                 loss.claim_entries_left_out = self.loss_upload(loss).await?;
-                loss.step = LossStep::Lists;
+                loss.step = RecoveryStep::Lists;
             }
-            LossStep::Lists => {
+            RecoveryStep::Lists => {
                 self.loss_lists().await?;
-                loss.step = LossStep::Resend;
+                loss.step = RecoveryStep::Resend;
             }
-            LossStep::Resend => {
+            RecoveryStep::Resend => {
                 // Each protocol is asked in registration order, and its answer committed
                 // with its name in `asked`, its local writes under its own prefix: one that
                 // fails leaves the step to the next call, which asks only those not asked
@@ -687,7 +702,7 @@ impl App {
                     );
                     loss.asked.push(name.clone());
                     if n.saturating_add(1) == left.len() {
-                        loss.step = LossStep::Conversations;
+                        loss.step = RecoveryStep::Conversations;
                         loss.asked.clear();
                     }
                     let mut tx = self.tx()?;
@@ -718,17 +733,17 @@ impl App {
                 if !left.is_empty() {
                     return Ok(());
                 }
-                loss.step = LossStep::Conversations;
+                loss.step = RecoveryStep::Conversations;
                 loss.asked.clear();
             }
-            LossStep::Conversations => {
+            RecoveryStep::Conversations => {
                 self.loss_conversations(loss).await?;
-                loss.step = LossStep::Done;
+                loss.step = RecoveryStep::Done;
                 self.events.push(AppEvent::ProviderRecovered {
                     generation: loss.generation,
                 });
             }
-            LossStep::Done => {}
+            RecoveryStep::Done => {}
         }
         let mut tx = self.tx()?;
         tx.put(keys::LOSS, &*loss)?;
@@ -1092,7 +1107,7 @@ mod tests {
         LossRecord {
             lost_generation: 1,
             generation: 2,
-            step: LossStep::Resend,
+            step: RecoveryStep::Resend,
             newest_head: None,
             cursor_time_ms: 5,
             declared_at_ms: Some(6),

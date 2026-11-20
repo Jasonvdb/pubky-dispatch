@@ -59,10 +59,7 @@ impl SwitchClient {
             &self.path(rest),
             Vec::new(),
             Body::Empty,
-            Auth {
-                timeout,
-                ..Auth::default()
-            },
+            Auth::new(timeout),
         )
         .await
     }
@@ -73,7 +70,7 @@ impl SwitchClient {
             &self.path(rest),
             Vec::new(),
             Body::Empty,
-            Auth::default(),
+            Auth::new(TimeoutClass::Ordinary),
         )
         .await
     }
@@ -85,10 +82,7 @@ impl SwitchClient {
         body: Vec<u8>,
         timeout: TimeoutClass,
     ) -> Result<CheckedResponse, ClientError> {
-        let auth = Auth {
-            timeout,
-            ..Auth::default()
-        };
+        let auth = Auth::new(timeout);
         self.call(method, &self.path(rest), body, Body::Json, auth)
             .await
     }
@@ -188,10 +182,7 @@ impl SwitchClient {
             ));
         }
         let body = enrollment.to_request_json()?;
-        let auth = Auth {
-            timeout: TimeoutClass::Bulk,
-            ..Auth::default()
-        };
+        let auth = Auth::new(TimeoutClass::Bulk);
         let signed = self.build("POST", "/v1/enroll", body.clone(), Body::Json, auth)?;
         let sent = SentRequest::of(&signed.request);
         let response = self.send_response(signed.request).await?;
@@ -261,7 +252,13 @@ impl SwitchClient {
         self.signer_only()?;
         self.forget_latest();
         let path = self.path("account");
-        let signed = self.build("GET", &path, Vec::new(), Body::Empty, Auth::default())?;
+        let signed = self.build(
+            "GET",
+            &path,
+            Vec::new(),
+            Body::Empty,
+            Auth::new(TimeoutClass::Ordinary),
+        )?;
         let response = self.send_response(signed.request.clone()).await?;
         let checked = self.account_observation(&signed.request, &response);
         let Some(at) = stale_timestamp_hint(checked.as_ref().err()) else {
@@ -274,7 +271,7 @@ impl SwitchClient {
             Body::Empty,
             Auth {
                 timestamp_ms: Some(at),
-                ..Auth::default()
+                ..Auth::new(TimeoutClass::Ordinary)
             },
         )?;
         let response = self.send_response(signed.request.clone()).await?;
@@ -360,7 +357,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     success_key: new_key,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -406,8 +403,7 @@ impl SwitchClient {
                 Body::Octets,
                 Auth {
                     invite_code,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
                 &mut None,
             )
@@ -433,8 +429,31 @@ impl SwitchClient {
     /// As every call.
     pub async fn feed(&self, query: FeedQuery) -> Result<FeedPage, ClientError> {
         let checked = self.get(&query.path(), query.timeout()).await?;
+        self.feed_page(&checked)
+    }
+
+    pub(crate) fn display_feed_request(
+        &self,
+        query: &FeedQuery,
+        timestamp_ms: Option<u64>,
+    ) -> Result<Request, ClientError> {
+        Ok(self
+            .build(
+                "GET",
+                &self.path(&query.path()),
+                Vec::new(),
+                Body::Empty,
+                Auth {
+                    timestamp_ms,
+                    ..Auth::new(query.timeout())
+                },
+            )?
+            .request)
+    }
+
+    pub(crate) fn feed_page(&self, checked: &CheckedResponse) -> Result<FeedPage, ClientError> {
         let (value, what) =
-            Self::json_answer(&checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
+            Self::json_answer(checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
         let key = self.key()?;
         let page = FeedPage::read(
             Obj::of(&value, what)?,
@@ -470,7 +489,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     invite_code,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -509,7 +528,7 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn connect_requests(&self) -> Result<ConnectList, ClientError> {
-        let checked = self.get("connect", TimeoutClass::Ordinary).await?;
+        let checked = self.get("connect", TimeoutClass::Bulk).await?;
         let (value, what) = Self::json_answer(
             &checked,
             Doc::Plain,
@@ -527,7 +546,13 @@ impl SwitchClient {
     pub async fn decline_connect(&self, pubky: &[u8; 32]) -> Result<[u8; 32], ClientError> {
         let path = self.path(&format!("connect/{}", pubky_id(pubky)));
         let checked = self
-            .call("DELETE", &path, Vec::new(), Body::Empty, Auth::default())
+            .call(
+                "DELETE",
+                &path,
+                Vec::new(),
+                Body::Empty,
+                Auth::new(TimeoutClass::Ordinary),
+            )
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.7: a decline answer")?;
@@ -568,17 +593,14 @@ impl SwitchClient {
                 &self.path(&format!("records/{}", b64(key))),
                 Vec::new(),
                 Body::Empty,
-                Auth {
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
-                },
+                Auth::new(TimeoutClass::Bulk),
             )
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
         Ok(RecordAnswer {
             view: SharedRecordView::read(Obj::of(&value, what)?)?,
-            head: own_head(&checked, "a record view")?,
+            head: own_head(checked.head, "a record view")?,
         })
     }
 
@@ -603,7 +625,10 @@ impl SwitchClient {
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
-        RecordPage::read(Obj::of(&value, what)?, own_head(&checked, "a record page")?)
+        RecordPage::read(
+            Obj::of(&value, what)?,
+            own_head(checked.head, "a record page")?,
+        )
     }
 
     /// `GET /v1/{id}/directory` (own app, or an admitted app of another identity, Switch wire
@@ -614,6 +639,21 @@ impl SwitchClient {
     ///
     /// As every call; [`ClientError::Core`] for a document that doesn't verify.
     pub async fn directory(&self, invite_code: Option<&str>) -> Result<Directory, ClientError> {
+        self.directory_with_head(invite_code)
+            .await
+            .map(|(directory, _)| directory)
+    }
+
+    /// The service must attach its signed head for an authenticated own app (Switch wire 7.1).
+    pub(crate) async fn own_directory(&self) -> Result<(Directory, SignedHead), ClientError> {
+        let (directory, head) = self.directory_with_head(None).await?;
+        Ok((directory, own_head(head, "a directory")?))
+    }
+
+    async fn directory_with_head(
+        &self,
+        invite_code: Option<&str>,
+    ) -> Result<(Directory, Option<SignedHead>), ClientError> {
         let checked = self
             .call(
                 "GET",
@@ -622,14 +662,16 @@ impl SwitchClient {
                 Body::Empty,
                 Auth {
                     invite_code,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.10: a directory")?;
-        Directory::read(Obj::of(&value, what)?, &self.account())
+        Ok((
+            Directory::read(Obj::of(&value, what)?, &self.account())?,
+            checked.head,
+        ))
     }
 
     /// `GET /v1/{id}/apps/{app_id}/keys` for the calling app (Switch wire 7.4.11).
@@ -696,11 +738,22 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn apps(&self) -> Result<AppsAnswer, ClientError> {
+        self.apps_with_head().await.map(|(answer, _)| answer)
+    }
+
+    /// Read the apps and the verified account head on that same response (Switch wire
+    /// 6.7, 7.4.12). A response without a head returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apps`].
+    pub async fn apps_with_head(&self) -> Result<(AppsAnswer, Option<SignedHead>), ClientError> {
         self.signer_only()?;
         let checked = self.get("apps", TimeoutClass::Bulk).await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.12: an apps answer")?;
-        AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)
+        let answer = AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)?;
+        Ok((answer, checked.head))
     }
 
     /// `POST /v1/{id}/apps/{app_id}/revoke` (signer, Switch wire 7.4.12), answered with the
@@ -940,8 +993,7 @@ impl SwitchClient {
                 Body::Json,
                 Auth {
                     with_cert: staged,
-                    timeout: TimeoutClass::Bulk,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
             )
             .await?;
@@ -998,7 +1050,7 @@ impl SwitchClient {
                 Body::Empty,
                 Auth {
                     public: true,
-                    ..Auth::default()
+                    ..Auth::new(TimeoutClass::Bulk)
                 },
                 public_time,
             )
@@ -1036,7 +1088,7 @@ impl SwitchClient {
         self.signer_only()?;
         let body = erase_body(created, identity_hash.as_ref());
         let checked = self
-            .send_json("POST", "erase", body, TimeoutClass::Ordinary)
+            .send_json("POST", "erase", body, TimeoutClass::Bulk)
             .await?;
         let (value, what) = Self::json_answer(
             &checked,
@@ -1089,8 +1141,8 @@ impl SwitchClient {
 
 /// The head of an own app's answer, which every one carries (Switch wire 7.1): an answer
 /// without it isn't the service's, whatever it says.
-fn own_head(checked: &CheckedResponse, what: &str) -> Result<SignedHead, ClientError> {
-    checked.head.ok_or_else(|| {
+fn own_head(head: Option<SignedHead>, what: &str) -> Result<SignedHead, ClientError> {
+    head.ok_or_else(|| {
         ClientError::InvalidResponse(format!(
             "Switch wire 7.1: {what} for an own app carries no Switch-Head"
         ))

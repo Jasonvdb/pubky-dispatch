@@ -26,7 +26,7 @@
 //!   Switch wire 6.4 ([`batch_effect`]).
 
 mod batch;
-pub(crate) mod body;
+mod body;
 mod bundle_parts;
 mod invite;
 mod limits;

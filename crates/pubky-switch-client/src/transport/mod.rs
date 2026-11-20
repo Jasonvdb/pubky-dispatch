@@ -24,7 +24,7 @@ pub use crate::error::TransportError;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One header of a request or a response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Header {
     /// The name, in lower case as the switch sends them; names are case-insensitive (Switch
     /// wire 7.1).
@@ -60,20 +60,16 @@ pub fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
 /// How long a call may take, by what it can carry. The client picks the class of every
 /// call it makes ([`Request::timeout`]), from the call itself, never from its path; a
 /// transport gives each class a timeout (`HttpConfig` for the HTTPS transport).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TimeoutClass {
-    /// A small request with a small answer: a write of a document or a setting, a read of
-    /// one small value, the read of the signed service time (a feed page with no items,
-    /// Switch wire 7.4.4), and a batch of operations that writes no shared record (its
-    /// answer is its proofs, or a refusal that carries at most one small current value,
-    /// such as a claim's view or the held app record, Switch wire 7.6).
-    #[default]
+    /// A call with a small answer, such as a setting change, a service-time read or an
+    /// unconditional allow-list update.
     Ordinary,
-    /// A request or an answer that can carry about a mebibyte or more (Switch wire 7.1
-    /// "Answer sizes"): a paged or listing read, a shared record's view, an upload, and a
-    /// batch of operations that writes a shared record, whose `409 conflict` carries the
-    /// record's view (Switch wire 7.6).
+    /// A potentially large transfer, such as a page, listing or upload. A batch that
+    /// writes claims can return several signed claim views. Other batches can return a
+    /// held signed record, shared record view or claim view in a conflict (Switch wire
+    /// 6.3, 6.5, 7.1, 7.6).
     Bulk,
     /// The feed's long poll (Switch wire 7.4.4): the service holds the read for up to
     /// `wait_s` seconds, then answers a page as a [`TimeoutClass::Bulk`] read does.
@@ -114,7 +110,7 @@ impl Request {
 }
 
 /// A response of the switch, not yet checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Response {
     /// The HTTP status.
     pub status: u16,

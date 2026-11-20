@@ -2,62 +2,10 @@
 
 use super::*;
 use crate::Backend;
-use crate::parties::{Asking, notes_protocol};
-use pubky_switch_client::app::{AppConfig, AppEnv, AppError};
-use pubky_switch_client::testing::TestIdentity;
-use pubky_switch_client::transport::{
-    BoxFuture, FirstSend, Request, Response, Transport, TransportError,
-};
-
-// Poll the in-process HTTP handler separately, as a deployed service would be.
-struct ServiceTask(Arc<dyn Transport>);
-
-impl Transport for ServiceTask {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        let transport = self.0.clone();
-        Box::pin(async move {
-            tokio::spawn(async move { transport.send(request).await })
-                .await
-                .map_err(|error| TransportError::Other(error.to_string()))?
-        })
-    }
-
-    fn send_before<'a>(
-        &'a self,
-        request: Request,
-        first: &'a FirstSend,
-    ) -> BoxFuture<'a, Result<Response, TransportError>> {
-        self.0.send_before(request, first)
-    }
-}
-
-fn app_env(world: &World, store: Arc<MemoryStore>) -> AppEnv {
-    let mut env = world.app_env(store);
-    env.transport = Arc::new(ServiceTask(env.transport));
-    env
-}
-
-async fn join_member(
-    world: &World,
-    owner: &TestIdentity,
-    signer: &mut Signer,
-    name: &str,
-    store: Arc<MemoryStore>,
-) -> Result<App, Box<dyn std::error::Error>> {
-    let asking = Asking::new(world.app_keys(owner, name)?)?;
-    let review = signer.review(asking.request.signed(), &asking.auth)?;
-    let approved = Box::pin(signer.approve(review)).await?;
-    signer.claim_delivered(&approved.request).await?;
-    world.advance_ms(STEP_MS);
-    let app = Box::pin(App::join(
-        app_env(world, store),
-        notes_protocol(),
-        AppConfig::default(),
-        asking.join_request(owner.public(), &approved)?,
-    ))
-    .await?;
-    Ok(app)
-}
+use crate::parties::notes_protocol;
+use crate::service::ServiceTask;
+use pubky_switch_client::app::{AppConfig, AppError};
+use pubky_switch_client::transport::TransportError;
 
 async fn delayed_opening(world: &World, follow_before_removal: bool) -> FlowResult {
     let alice = world.identity("alice")?;

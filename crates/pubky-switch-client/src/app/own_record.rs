@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 
 use super::events::AppEvent;
 use super::next_body::NextBody;
-use super::state::{PendingRecord, key};
+use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Refusal};
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
@@ -104,6 +104,10 @@ pub enum Publication {
     NothingAccepted,
     /// The Homeserver holds the newest record the switch accepted: nothing is owed.
     Published,
+    /// A newer local record choice is unresolved. An unsigned owner change must be
+    /// signed and delivered, or the held newer record accepted or verifiably superseded,
+    /// before repairing the older accepted copy. Reads can still complete.
+    AwaitingRecord,
     /// The Homeserver holds a record of the app with a later `updated_at` than the newest
     /// the switch accepted, as after a restore from an older backup: nothing is written over
     /// it (Switch spec 4.2).
@@ -195,10 +199,10 @@ impl App {
     /// expiry asked (this protocol's or another's) at or before the next signed timestamp, naming the protocol
     /// that asked for it, a member the switch would refuse, or a record over the operation
     /// cap, before anything is signed. When another protocol's expiry has lapsed, this
-    /// protocol's `expires_at`, if later than that timestamp or `None`, is kept for the next signing,
-    /// and its `member` is not: the next record signed, at any protocol's change, carries
-    /// the expiry with the member the record held. [`Refusal::Stopped`], [`Refusal::Left`] or
-    /// [`Refusal::Gone`]; a store failure;
+    /// valid member change and expiry are kept together for the next signing. The call
+    /// still fails: nothing new has been signed or published. Every later signature
+    /// applies the pending members or waits for their owners' valid expiry choices.
+    /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`]; a store failure;
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
     pub async fn set_protocol_member(
@@ -251,6 +255,25 @@ impl App {
         .await
     }
 
+    /// Set a registered protocol's member and its explicit expiry policy together
+    /// (Switch spec 4.2). Unlike the lifetime convenience setter, an unchanged member
+    /// also adopts the supplied policy. Use [`App::protocol_record`] to read the desired
+    /// member and policy, including an unsigned edit held by another protocol's expiry.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::set_protocol_member`]. A refused signing can retain the pair locally;
+    /// it never reports publication of that unsigned edit.
+    pub async fn set_protocol_member_with_expiry(
+        &mut self,
+        protocol: &str,
+        member: Option<Map<String, Value>>,
+        expiry: RecordExpiry,
+    ) -> Result<Publication, AppError> {
+        self.set_member_expiry(protocol, member, expiry, false)
+            .await
+    }
+
     async fn set_member_expiry(
         &mut self,
         protocol: &str,
@@ -270,7 +293,10 @@ impl App {
                     return self.put_own_record(body, false, None).await;
                 }
                 let policies = self.record_expiries().await?;
-                if policies.get(&protocol) == Some(&expiry) && !self.record_needs_new_delivery() {
+                if policies.get(&protocol) == Some(&expiry)
+                    && !self.record_needs_new_delivery()
+                    && self.record_members().await?.is_empty()
+                {
                     let now = self.now().max(self.highest_service_time().unwrap_or(0));
                     for (name, policy) in &policies {
                         if matches!(policy, RecordExpiry::At(at) if *at <= now) {
@@ -285,9 +311,34 @@ impl App {
             } else {
                 expiry
             };
-            let (expiries, updated_at) = self.asked_expiries(&protocol, expiry).await?;
+            let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+            let updated_at = self.next_record_time(held.updated_at()).await?;
+            expiry
+                .at(updated_at, self.state.own_doc.record_max_age_ms())
+                .ok_or_else(|| expiry_refused(&protocol))?;
+            let mut expiries = self.record_expiries().await?;
+            expiries.insert(protocol.clone(), expiry);
+            let mut members = self.record_members().await?;
+            members.insert(protocol.clone(), member.clone());
+            self.check_record_members(&members)?;
             body.set_member(protocol, member);
-            body.set_expires_at(self.resolve_record_expiries(&expiries, updated_at)?);
+            let expires_at = match self.resolve_record_expiries(&expiries, updated_at) {
+                Ok(expires_at) => expires_at,
+                Err(error) => {
+                    // The sibling's eventual ask is unknown. Check the minimum form
+                    // here and the exact resolved form before a later signature.
+                    body.check_writable(self.state.meta.generation, updated_at, None)
+                        .map_err(refused)?;
+                    // The unsigned member and its ask are one choice. Another owner's
+                    // later signature must apply both (Switch spec 4.2).
+                    let mut tx = self.tx()?;
+                    tx.put(key::RECORD_EXPIRIES, &expiries)?;
+                    tx.put(key::RECORD_MEMBERS, &members)?;
+                    self.commit(tx).await?;
+                    return Err(error);
+                }
+            };
+            body.set_expires_at(expires_at);
             self.put_own_record(body, false, Some((&expiries, updated_at)))
                 .await
         })
@@ -451,7 +502,8 @@ impl App {
 
     /// Send what is owed of the app's record: its delivery, then its Homeserver write. The
     /// Homeserver copy is read and, when it differs from the newest record the switch
-    /// accepted, that record is written again, unless the copy is later. A read
+    /// accepted, that record is written again, unless the copy is later or a newer local
+    /// record choice is unresolved ([`Publication::AwaitingRecord`]). A read
     /// ([`App::receive`]) does the same, reading the copy at most once per
     /// [`PUBLISHED_CHECK_MS`] while nothing is owed.
     ///
@@ -498,7 +550,9 @@ impl App {
     async fn own_record_body(&mut self) -> Result<NextBody, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        Ok(NextBody::held(&self.state)?)
+        let mut body = NextBody::held(&self.state)?;
+        self.apply_record_members(&mut body).await?;
+        Ok(body)
     }
 
     /// Sign `body` as the app's next record, unless it is the record held and `renew` is
@@ -517,21 +571,18 @@ impl App {
         // goes again with this change, signed anew: the backup carries the accepted record
         // apart, and only that one is published (Switch spec 4.2).
         let unaccepted = self.record_needs_new_delivery();
-        if renew || unaccepted || body.body() != held.body() {
+        let pending_members = !self.record_members().await?.is_empty();
+        if renew || unaccepted || pending_members || body.body() != held.body() {
             let record = match expiries {
                 Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
                 None => self.sign_next_record(body, held.updated_at()).await?,
             };
-            let batch = self.record_batch(record.signed()).map_err(refused)?;
-            let pending = PendingRecord {
-                body: batch.body().to_vec(),
-            };
             let mut tx = self.tx()?;
-            tx.put(key::RECORD, record.signed())?;
-            tx.put(key::PENDING_RECORD, &pending)?;
+            let pending = self.stage_own_record(&record, &mut tx)?;
             if let Some((expiries, _)) = expiries {
                 tx.put(key::RECORD_EXPIRIES, expiries)?;
             }
+            tx.delete(key::RECORD_MEMBERS)?;
             self.commit(tx).await?;
             self.state.record = record.signed().clone();
             self.state.pending_record = Some(pending);
@@ -543,7 +594,22 @@ impl App {
         self.deliver_record().await
     }
 
-    fn record_needs_new_delivery(&self) -> bool {
+    /// Keep the signed record with the exact batch that will deliver it (Switch wire 6.2).
+    pub(super) fn stage_own_record(
+        &self,
+        record: &AppRecord,
+        tx: &mut Tx,
+    ) -> Result<PendingRecord, AppError> {
+        let batch = self.record_batch(record.signed()).map_err(refused)?;
+        let pending = PendingRecord {
+            body: batch.body().to_vec(),
+        };
+        tx.put(key::RECORD, record.signed())?;
+        tx.put(key::PENDING_RECORD, &pending)?;
+        Ok(pending)
+    }
+
+    pub(super) fn record_needs_new_delivery(&self) -> bool {
         self.state.pending_record.is_none()
             && self
                 .state
@@ -570,6 +636,8 @@ impl App {
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
+        body.check_writable(self.state.meta.generation, updated_at, expires_at)
+            .map_err(refused)?;
         let record = body
             .sign(&self.state.keys, updated_at, expires_at)
             .map_err(refused)?;
@@ -637,7 +705,9 @@ impl App {
     /// copy differs from it (Switch spec 4.2, wire 3.2 "Deliver, then publish"). The copy
     /// is read first: one that is the record already settles what is owed, and one with a
     /// later `updated_at`, as after a restore from an older backup, is never written over
-    /// ([`Publication::Superseded`]). With nothing owed the copy is read at most once per
+    /// ([`Publication::Superseded`]). A newer unresolved local choice defers the older
+    /// accepted copy ([`Publication::AwaitingRecord`]), without failing the read that can
+    /// settle that choice. With nothing owed the copy is read at most once per
     /// [`PUBLISHED_CHECK_MS`], unless `check`. Nothing is published once the app has begun
     /// to leave, from the commit before it deletes its Homeserver record (Switch spec
     /// 12.3): every call that leads here refuses a leaving app first.
@@ -661,6 +731,7 @@ impl App {
         let Some(record) = self.state.accepted.clone() else {
             return Ok(Publication::NothingAccepted);
         };
+        let awaiting_record = self.publication_waits_for_record().await?;
         let owed = self.state.pending_publish.is_some();
         let now = self.now();
         let checked_lately = self
@@ -672,7 +743,7 @@ impl App {
                         .checked_sub(*at)
                         .is_some_and(|age| age < PUBLISHED_CHECK_MS)
             });
-        if !owed && !check && checked_lately {
+        if !awaiting_record && !owed && !check && checked_lately {
             return Ok(Publication::Published);
         }
         self.published_check = None;
@@ -687,7 +758,6 @@ impl App {
             Err(error) => return Ok(Publication::Unchecked { error }),
         };
         let outcome = match copy {
-            Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => {
                 if let Ok(copy) = serde_json::from_slice::<SignedDoc>(&held) {
                     let mut tx = self.tx()?;
@@ -695,8 +765,13 @@ impl App {
                         self.commit(tx).await?;
                     }
                 }
+                if self.publication_waits_for_record().await? {
+                    return Ok(Publication::AwaitingRecord);
+                }
                 Publication::Superseded
             }
+            _ if awaiting_record => return Ok(Publication::AwaitingRecord),
+            Some(held) if held == bytes => Publication::Published,
             None if self.state.device.multi_device && !current => {
                 self.owe_publication(&record).await?;
                 return Ok(Publication::AwaitingRead);
@@ -725,6 +800,29 @@ impl App {
         Ok(outcome)
     }
 
+    /// Current unsigned owner edits and strictly newer signed intent take precedence over
+    /// repairing an older accepted copy (Switch spec 4.2). Equal or older signed bytes
+    /// do not keep repair waiting after the current choice has been superseded.
+    async fn publication_waits_for_record(&self) -> Result<bool, AppError> {
+        if !self.record_members().await?.is_empty() {
+            return Ok(true);
+        }
+        self.record_is_newer_than_accepted()
+    }
+
+    /// Signed ordering, shared by publication and an exact held record seen in the feed.
+    pub(super) fn record_is_newer_than_accepted(&self) -> Result<bool, AppError> {
+        let identity = self.state.meta.identity;
+        let held = AppRecord::verify(&self.state.record, &identity)?;
+        let accepted = self
+            .state
+            .accepted
+            .as_ref()
+            .map(|accepted| AppRecord::verify(accepted, &identity))
+            .transpose()?;
+        Ok(accepted.is_none_or(|accepted| held.updated_at() > accepted.updated_at()))
+    }
+
     /// Owe the publication of `record`, the newest accepted, from a check that found the
     /// Homeserver copy missing or different (`pending/publish`).
     async fn owe_publication(&mut self, record: &SignedDoc) -> Result<(), AppError> {
@@ -747,7 +845,8 @@ impl App {
     }
 
     /// Whether the Homeserver copy `held` is a record of this app with an `updated_at`
-    /// later than `record`'s. A copy that doesn't read as one is written over.
+    /// later than `record`'s. A copy ahead of the reader's clock does not participate in
+    /// comparison or adoption (Switch spec 4.2, wire 3.2).
     fn later_copy(&self, held: &[u8], record: &SignedDoc) -> bool {
         let identity = self.state.meta.identity;
         let Ok(held) = serde_json::from_slice::<SignedDoc>(held) else {
@@ -759,7 +858,9 @@ impl App {
         ) else {
             return false;
         };
-        held.cert().app_id() == self.state.meta.app_id && held.updated_at() > record.updated_at()
+        held.cert().app_id() == self.state.meta.app_id
+            && !held.is_ahead(self.now())
+            && held.updated_at() > record.updated_at()
     }
 
     /// The first step of a publishing app's leave (Switch spec 12.3): delete its Homeserver

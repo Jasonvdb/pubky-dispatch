@@ -10,8 +10,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{App, AppError, LossRecord, corrupt, keys};
+use crate::app::state::Tx;
 use crate::client::answers::{UploadAnswer, UploadChanges};
 use crate::client::read::Obj;
+
+const UPLOADS_PREFIX: &str = "loss-upload/";
+const DATA_PREFIX: &str = "loss-data/";
+
+/// Remove every generation's retained upload and the chunks it names.
+pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[UPLOADS_PREFIX, DATA_PREFIX])
+}
 
 /// A retained claim entry the evidence step could not include with a verifying certificate.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +129,7 @@ impl Blob {
     }
 
     fn key(self, generation: u64, part: usize) -> String {
-        format!("loss-data/{generation}/{}/{part}", b64(&self.hash))
+        format!("{DATA_PREFIX}{generation}/{}/{part}", b64(&self.hash))
     }
 }
 
@@ -153,7 +162,7 @@ enum StoredOutcome {
 impl Attempt {
     fn key(&self) -> String {
         format!(
-            "loss-upload/{}/{}/{}",
+            "{UPLOADS_PREFIX}{}/{}/{}",
             self.generation,
             b64(&self.body.hash),
             b64(&self.omitted.hash)
@@ -237,7 +246,7 @@ impl App {
         self.ready_local().await?;
         self.check_registered(protocol)?;
         let mut tx = self.tx()?;
-        tx.put(&format!("loss-checkpoint/{protocol}"), &key)?;
+        tx.put(&keys::checkpoint(protocol), &key)?;
         tx.put("retain-loss-uploads", &true)?;
         self.commit(tx).await
     }
@@ -277,8 +286,8 @@ impl App {
     pub async fn forget_loss_uploads(&mut self, generation: u64) -> Result<(), AppError> {
         self.ready_local().await?;
         let mut tx = self.tx()?;
-        tx.delete_prefix(&format!("loss-upload/{generation}/"))?;
-        tx.delete_prefix(&format!("loss-data/{generation}/"))?;
+        tx.delete_prefix(&format!("{UPLOADS_PREFIX}{generation}/"))?;
+        tx.delete_prefix(&format!("{DATA_PREFIX}{generation}/"))?;
         self.commit(tx).await
     }
 
@@ -439,7 +448,7 @@ impl App {
     ///
     /// A failed read or invalid retained evidence.
     pub async fn loss_uploads(&self, generation: u64) -> Result<Vec<LossUpload>, AppError> {
-        let prefix = format!("loss-upload/{generation}/");
+        let prefix = format!("{UPLOADS_PREFIX}{generation}/");
         self.reader()
             .scan::<Attempt>(&prefix)
             .await?
@@ -479,7 +488,7 @@ impl App {
         upload: &LossUpload,
     ) -> Result<(UploadBody, LossInventoryDetails), AppError> {
         let key = format!(
-            "loss-upload/{}/{}/{}",
+            "{UPLOADS_PREFIX}{}/{}/{}",
             upload.generation,
             b64(&upload.body_hash),
             b64(&upload.details_hash)

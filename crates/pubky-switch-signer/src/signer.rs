@@ -357,7 +357,7 @@ impl Signer {
         let _budget = self.budget();
         self.refresh().await?;
         loop {
-            self.finish_flow().await?;
+            Box::pin(self.finish_flow()).await?;
             // An erased account: nothing more is owed to it (Switch spec 12.7).
             if self.state.erased {
                 return Ok(());
@@ -1647,7 +1647,7 @@ impl Signer {
     /// Nothing else changes: a `404` with no request in doubt is never an erasure (Switch
     /// wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
-        let read = self.service_client()?.apps().await;
+        let read = self.service_client()?.apps_with_head().await;
         // The device clock when the answer came, before the alert's commit below, so a step
         // judging the clock against the answer's time isn't off by that commit.
         let device_ms = self.env.clock.now_ms();
@@ -1687,7 +1687,7 @@ impl Signer {
         // 7.4.12 `recovery`), so a restore or a take-over finds it too: owed while the wait is
         // staged and no listed app could end it, or the user asked; never once it ended or
         // without a recovery (Switch spec 12.6 step 2).
-        if let Ok(answer) = &read {
+        if let Ok((answer, _)) = &read {
             match &answer.recovery {
                 Some(recovery) if recovery.admission_staged => {
                     if let Some(newest) = state.newest_doc()?
@@ -1711,8 +1711,10 @@ impl Signer {
         if state != self.state || flow != self.flow {
             self.commit(state, flow).await?;
         }
+        let (answer, head) = read?;
         Ok(SwitchRead {
-            answer: read?,
+            answer,
+            head_generation: head.filter(|head| head.seq > 0).map(|head| head.generation),
             device_ms,
         })
     }
@@ -2523,8 +2525,19 @@ fn stale_without_copy() -> SignerError {
 pub(crate) struct SwitchRead {
     /// The answer.
     pub(crate) answer: AppsAnswer,
+    /// Generation of the response's verified head, when it covers a committed item.
+    head_generation: Option<u64>,
     /// The device clock when the answer arrived.
     pub(crate) device_ms: u64,
+}
+
+impl SwitchRead {
+    /// The conservative cutoff for this exact document (Switch wire 3.8).
+    fn cutoff_for(&self, accepted: &IdentityDoc) -> Option<u64> {
+        (self.head_generation == Some(accepted.generation())
+            && self.answer.identity.as_ref() == Some(accepted.signed()))
+        .then_some(self.answer.server_time)
+    }
 }
 
 /// Whether a delivery's refusal is for good, so the same bytes would be refused again: a

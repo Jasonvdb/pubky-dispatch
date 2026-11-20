@@ -244,13 +244,7 @@ pub(super) async fn read_feed(
     };
     let generation = from_db(row.try_get("generation")?, "generation")?;
     let last_seq = from_db(row.try_get("last_seq")?, "last_seq")?;
-    let chain_seq: Option<i64> = row.try_get("chain_seq")?;
-    let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
-    let chain = match (chain_seq, chain_hash) {
-        (Some(seq), Some(hash)) => Some((from_db(seq, "chain_seq")?, hash32(&hash, "chain_hash")?)),
-        (None, None) => None,
-        _ => return Err(StoreError::Corrupt("chain head")),
-    };
+    let chain = super::chain_head(&row, "chain head")?;
     // A position of another sequence reads from the start of this one (Switch wire 7.4.4).
     // One behind the oldest kept stub reads on from there: the stubs dropped show no more,
     // the inbox entries at those positions still do, and the page carries the checkpoint.

@@ -464,13 +464,19 @@ impl Signer {
         Self::survey_new(env, keyring, None).await
     }
 
-    /// [`Signer::survey_key_recovery_new`] at the service at `origin`, which the user gave:
-    /// when no copy the identity key signed names the service that serves the account
-    /// ([`KeyRecoveryStop::NoCopy`]), or the newest one names a former service
-    /// ([`KeyRecoveryStop::NotServing`]), as after the user changed Homeserver or moved. Every
-    /// other rule holds: that service's copy verifies and names `origin` and the key that
-    /// signed its answers, and nothing the install reads shows a newer one. The survey shows
-    /// the origin as the user's ([`KeyRecoverySurvey::origin_supplied`]).
+    /// [`Signer::survey_key_recovery_new`] at the `origin` the user supplies (Switch spec
+    /// 12.8). Offer this when no signed copy is found ([`KeyRecoveryStop::NoCopy`]) or
+    /// the service named by the newest copy no longer serves the account
+    /// ([`KeyRecoveryStop::NotServing`]).
+    ///
+    /// If the survey cannot reach the service named by the copy, it returns a transport
+    /// error in [`SignerError::Switch`]. A temporary outage and an unreachable former
+    /// service give the same error. Offer to retry there, or let the user supply the current
+    /// origin if they know the account moved.
+    ///
+    /// The supplied service's copy must verify and name `origin` and the key that signed
+    /// its answers. No copy the install reads may be newer. The survey identifies the
+    /// origin as the user's ([`KeyRecoverySurvey::origin_supplied`]).
     ///
     /// # Errors
     ///

@@ -4,6 +4,48 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Protocols waiting for required data return `Outcome::Defer` with a content-free reason and the custody their receive rule requires. Hosts see `AppEvent::ProtocolDeferred` on the read. Keep `Outcome::Retry` for failures of the store or host.
+
+- Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
+  A newer retained signed record or unsigned owner edit defers repair of the older
+  accepted record, including after restore. Finish the owner's choice and delivery or
+  read its verified acceptance or supersession. An accepted-only restore still repairs
+  a missing public copy. No record is published before its acceptance is established.
+
+- App-record writers can use `App::set_protocol_member_with_expiry` with `RecordExpiry`
+  and read their registered owner's desired state with `App::protocol_record`. Existing
+  member setters now retain a blocked member change together with its expiry. A refusal
+  still means the change has not been signed or published; `ProtocolRecord::pending`
+  reports that local intent. Use `App::record` and the publication result separately.
+  Explicit policy-only renewals retain their existing meaning. Regenerate development
+  backups: the current format requires `record_members`, even when empty. An in-place
+  restore refuses to replace a different pending member choice or import an unsigned
+  edit whose signed basis predates a newer local record. Finish the current choice and
+  take a backup carrying it before restoring. A newer local signature protects the
+  intent even while its delivery is pending; it is not proof of publication.
+
+- Keep an app display name in the host's local settings. Callers that set `AppConfig::label` or construct `AppRecordBody` with a `label` field must remove that assignment.
+
+- Surface `Alert::ReductionNotClosed` while a reduction still owes its closing delivery. Call `Signer::resume` or `Signer::run_due` when the account is reachable and any signing alarm is cleared. After one exact retry for the original proof, the signer can use the service time of a verified read of the same document. Development signer stores now retain the version of the proof retry without permanently disabling its closing.
+
+- `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.
+
+- When an upgrade drops a registered protocol, call `App::retire_protocol` with that protocol still registered. Load the same App ID with the reduced set after it succeeds. A backup made before retirement can still require the former registration. The [app host guide](app-host-guide.md#running-several-protocols) describes how to finish outstanding work and take a backup for the new set.
+
+- Pass an explicit `TimeoutClass` as the final argument to `SwitchClient::sign_request`. Replace `TimeoutClass::default()` with the class appropriate for the call when constructing a transport `Request`. Use `Bulk` for claim, app-record, receive-key or shared-record writes and for batches with `record_current` or `claim_step` conditions. A small batch can return a claim view for each successful claim or a held record or claim view in a conflict.
+
+An app can receive a stopped read with a durable recovery notice. Hosts can show
+`App::recovery_required` and `App::provider_health`, and keep an attempt held
+on `Refusal::RecoveryRequired` until the app verifies service again or follows
+a later generation. A host displaying recovery progress can use `RecoveryInfo::step`.
+A signed `not_hosted` reply prompts the app to recheck its signed provider document.
+If the document still names this service, repeated unavailable reads count toward
+the outage reported by `provider_health`.
+A separate display process that can exit during a peek needs a durable original
+transport reply. Reserve the signed page with `App::begin_display_read`, render
+with `App::display_preview` and pass the retained receipt to the state owner on
+reopen using `App::finish_display_read`.
+
 - The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
@@ -39,7 +81,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 
 **Stored formats are not stable yet.** Nothing migrates between development builds: a store, backup or service database written by an earlier build can be refused by a later one. Recreate test stores and databases after updating. The formats still expected to change:
 
-- **Client.** A pending collection listing records its upload position. Recreate a development store from an earlier build that has pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
+- **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. The client can adopt a wider certificate while a protocol still owes a callback. The protocol receives its earlier work before the newly visible records. Recreate a development store from an earlier build that has a kept certificate renewal, pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
 - **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs`, `put_back_notices` and `record_settlements`, even when both lists are empty.
@@ -75,25 +117,21 @@ Collection listings show live records. A protected deletion can therefore be abs
 - [data] **One stalled protocol can cost another messages.** A shared deny-list change or missing list baseline can stop the whole app's feed until every protocol catches up. Monitor stalled callbacks and listings because other protocols can miss entries if the app falls behind retention or fills its inbox.
 - [data] **Senders share the limit on messages waiting locally.** At the total limit, traffic from two admitted senders can cause another sender's waiting entries to be discarded. Consume the durable drop notices and request the missing messages again where the protocol permits it.
 - [data] **Some discarded work cannot be identified after restart.** A stored message outside the bounded waiting pool can fail a check on retry and disappear with only an in-memory event, while an in-place restore can reduce some unreadable pending duties to a count. An empty queue cannot establish that every obligation completed.
-- [wrong result] **A recovery notice does not reliably suspend saved writes.** The client can retry a saved batch after `recovery_required`, and a signed `not_hosted` response can surface only as a call error while the identity document still names that service. Pause submissions and confirm the current service and generation before resuming.
 - [wrong result] **A newly held peer can still gain inbox admission.** If a batch adding its conversation was already sent and the answer was lost, the client can retry that batch after the host places the hold. Treat admission as unresolved until the earlier write is reconciled.
 - [availability] **Two successive provider losses can leave a record readable but unwritable.** The client can retain the original proven version while the latest service reconstructs a lower version for the same write. Retrying the same conditional update keeps failing, and treating the record as absent risks repeating its effect.
 - [availability] **An incorrect service clock can make an app's records unusable.** A far-future signed time can become the minimum timestamp for later app records, including after the device clock moves backward. Other apps can reject every such record as too far in the future even after the service clock is corrected.
 - [data] **Two devices of one app can overwrite each other's protocol member.** When both change the same member, the later record wins and the earlier change is not merged. The protocol on the device that lost is told with `MemberChanged`; write the member again there if it still applies. A member taken from another device's record also arrives without that device's expiry request, so the next plain renewal signs it with no deadline; the protocol is told with `MemberChanged` and can set the expiry again.
 - [availability] **One protocol's expiry can block app-record signing for all protocols.** A fixed expiry request can block app-record signing for every protocol once its deadline passes, also when its protocol has no member in the record. At a certificate renewal such a request is dropped and reported with `MemberDropped`, but ordinary signing still refuses. Clear or renew the request before its deadline.
 - [availability] **Larger valid lists and backups can exceed one local commit.** The client installs a list copy or restores a backup in a single transaction, so raised service limits can permit data the app cannot refresh or restore. Exercise both operations at the largest sizes the host intends to support.
-- [availability] **Changing the set of protocols can prevent load or restore.** A normal load requires the registered set to match, adding a protocol requires a restore, and removing one can make backups containing its state unusable. Keep the old protocol available while its backup layer or expiry policy is still needed.
 - [wrong result] **A duplicate can be reported as conflicting before the sender's authority is checked.** This can happen when a previously stored copy is released and its bytes differ from the processed copy. The conflict flag alone is insufficient grounds to accuse or block the sender.
 - [wrong result] **Requeuing a signed message can report the wrong kind of error.** `queue_stored` can report caller misuse when today's message rules reject previously valid bytes, or store corruption when different bytes reuse a retained message ID. Check the rules, ID and original bytes before taking action on the store.
-- [wrong result] **A protocol wait can look like a storage outage.** The general retry outcome takes a storage failure, so using it while waiting for a record or list can produce `StoreFailing` on repeated reads. Check the protocol's reason before treating that event as evidence of damaged storage.
 - [wrong result] **The recovery count can overstate how many peers were left out.** A peer beyond the conversation limit can be counted once for each protocol that named it. Display `conversations_left_out` as an upper bound on distinct peers.
 - [wrong result] **A custom request can reach a different target from the one signed.** The low-level transport accepts methods outside the Switch wire format, some of which encode the request target differently. Hosts constructing requests directly should use only the methods defined for the endpoint.
 
 ### Signer
 
 - [keys] **A hand-over can strand the only sealed copy of the identity key.** If the receiver recorded that its take-over won, it can finish installing the key in its original vault after the service disappears, then use confirmed recovery at another provider. If the receiver has only an offer and could still have lost to a withdrawal, it needs the original service's decision or an independent copy of the identity key. Retain that copy until the receiving vault has confirmed possession.
-- [keys] **An accepted permission reduction can leave the previous certificate effective.** If the signer cannot obtain the service time needed to close the reduction, the earlier certificate can retain its wider permissions. Surface `ReductionNotClosed` and use revocation when access must end immediately.
-- [keys] **Some damaged signer stores cannot be restored in place.** A surviving operation, hand-over restriction or alarm can still block replacement after local damage. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
+- [keys] **Some damaged signer stores cannot be restored in place.** An interrupted certificate renewal can resume on its original install when only the preceding document's account binding is missing and the private backup and original service both verify it. A pending app removal, epoch completion, hand-over restriction or alarm can still block replacement. Preserve the store and the identity key because discarding the records can discard restrictions on who may sign.
 - [availability] **First enrollment at a changed account.** When the original account observation expires, hosts can offer `Signer::restart_first_enrollment` at the same service after explicit confirmation. A signed changed binding can lead to confirmed same-service restore when the original service now serves a verified identity document for the current account. Other permanent refusals and a surviving mark retain the applicable recovery options.
 - [availability] **Changing answers can prevent key recovery from finishing.** If a read changes what the user confirmed, recovery at a serving account returns `SurveyChanged`. Survey again when the sources are stable. A provider loss declared with the key can proceed when a source shows less than before, but new evidence still requires confirmation.
 - [data] **Key recovery at a lost service can drop revoked App IDs without saying how many.** When more revoked IDs exist than one enrollment carries, the extra ones that no version of the identity document lists are dropped, and the survey does not show the count. A dropped ID comes back only through a new approval by the user.

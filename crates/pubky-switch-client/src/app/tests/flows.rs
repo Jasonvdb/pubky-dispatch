@@ -38,6 +38,425 @@ pub(crate) fn received(events: &[AppEvent], seq: u64) -> bool {
 }
 
 #[tokio::test]
+async fn test_service_recovery_notice_survives_reload_and_a_later_signed_read_clears_it() {
+    use crate::app::{ProviderHealth, ProviderStatus};
+    use pubky_switch_core::http::{NoticeReason, RecoveryNotice};
+
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let notice = RecoveryNotice {
+        generation: 1,
+        reason: NoticeReason::Behind,
+        permanent: false,
+    };
+    w.switch.fail_next(Fault::Error {
+        path: "/feed".into(),
+        code: ErrorCode::RecoveryRequired,
+        current: notice.to_current(),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    let observed = app.recovery_required().unwrap();
+    assert_eq!(observed.generation, 1);
+    assert_eq!(observed.reason, Some(NoticeReason::Behind));
+    assert!(!observed.permanent);
+    assert_eq!(
+        app.provider_health(),
+        ProviderHealth::RecoveryRequired(observed)
+    );
+    let event = report
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::RecoveryRequired { id, notice } if notice == &observed => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    drop(app);
+    let mut app = w.load(me).await;
+    assert_eq!(app.recovery_required(), Some(observed));
+    for automatic in [true, false] {
+        assert_eq!(
+            app.may_attempt(automatic),
+            Err(Refusal::RecoveryRequired { generation: 1 })
+        );
+    }
+    let before = (w.switch.mark(), w.switch.lock().feed_reads);
+    assert!(matches!(
+        app.submit_batch(conversation([47; 32])).await,
+        Err(AppError::Refused(Refusal::RecoveryRequired {
+            generation: 1
+        }))
+    ));
+    assert_eq!(before, (w.switch.mark(), w.switch.lock().feed_reads));
+    assert!(
+        app.pending_duty_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.event.id() == Some(event))
+    );
+    // Reinstalling this device's own backup in its live store keeps its later notice.
+    drop(app);
+    let mut app = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(app.recovery_required(), Some(observed));
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    assert_eq!(app.provider_health(), ProviderHealth::Ok);
+    let cleared = app.pending_duty_events().await.unwrap();
+    assert!(cleared.iter().any(|d| matches!(
+        d.event,
+        AppEvent::RecoveryNoticeCleared { generation: 1, .. }
+    )));
+    drop(app);
+    assert!(w.load(me).await.recovery_required().is_none());
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_keeps_unavailability_separate_across_reopen() {
+    use crate::app::ProviderHealth;
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    let since_ms = w.clock.now_ms();
+    app.set_unreachable_after_ms(20 * MINUTE);
+    for attempt in 0..3 {
+        w.switch.fail_next(Fault::Error {
+            path: "/feed".into(),
+            code: ErrorCode::Unavailable,
+            current: json!({}),
+        });
+        assert_eq!(
+            app.check_for_move().await.unwrap_err().code(),
+            Some(ErrorCode::Unavailable)
+        );
+        assert!(app.recovery_required().is_none());
+        if attempt < 2 {
+            assert_eq!(app.provider_health(), ProviderHealth::Ok);
+            w.clock.advance_ms(8 * MINUTE);
+        }
+    }
+    assert_eq!(app.provider_health(), ProviderHealth::Ok);
+    drop(app);
+    let mut app = w.load(me).await;
+    assert_eq!(
+        app.provider_health(),
+        ProviderHealth::Unreachable { since_ms }
+    );
+    app.check_for_move().await.unwrap();
+    assert_eq!(app.provider_health(), ProviderHealth::Ok);
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_holds_the_original_batch_until_service_resumes() {
+    use pubky_switch_core::http::{NoticeReason, RecoveryNotice};
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::RecoveryRequired,
+        current: RecoveryNotice {
+            generation: 1,
+            reason: NoticeReason::Behind,
+            permanent: false,
+        }
+        .to_current(),
+    });
+    let failed = app.submit_batch(conversation([48; 32])).await.unwrap_err();
+    assert_eq!(failed.unkept().code(), Some(ErrorCode::RecoveryRequired));
+    let held = app.kept_batches().await.unwrap();
+    assert_eq!(held.len(), 1);
+    let (id, body) = (held[0].0, held[0].1.body.clone());
+    // The same service still reports the old account below its retained mark.
+    let original_marks = w.switch.lock().marks.clone();
+    w.switch.lose_mark();
+    drop(app);
+    let mut app = w.load(me).await;
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.body, body);
+    assert!(!w.switch.lock().batches.contains_key(&id));
+    w.switch.lock().marks = original_marks;
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_required().is_none());
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(w.switch.lock().batches.contains_key(&id));
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_from_a_detached_read_precedes_a_write_and_survives_reload() {
+    use crate::app::Woken;
+    for display in [false, true] {
+        let w = World::new();
+        let mut app = w.join("wallet").await;
+        app.receive(None).await.unwrap();
+        let me = app.app_id();
+        w.switch.lose_mark();
+        let before = w.switch.lock().batches.len();
+        if display {
+            assert_eq!(
+                app.peek().await.unwrap_err().code(),
+                Some(ErrorCode::RecoveryRequired)
+            );
+        } else {
+            assert_eq!(app.feed_wait(1).wait().await, Woken::ReadNow);
+        }
+        assert_eq!(
+            app.may_attempt(false),
+            Err(Refusal::RecoveryRequired { generation: 1 })
+        );
+        let notice = app.recovery_required().unwrap();
+        assert!(matches!(
+            app.submit_batch(conversation([73; 32])).await,
+            Err(AppError::Refused(Refusal::RecoveryRequired {
+                generation: 1
+            }))
+        ));
+        assert_eq!(w.switch.lock().batches.len(), before);
+        drop(app);
+        let mut app = w.load(me).await;
+        assert_eq!(app.recovery_required(), Some(notice));
+        assert_eq!(
+            app.pending_duty_events()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.event, AppEvent::RecoveryRequired { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_portable_display_retains_the_original_reply_across_reopen() {
+    use crate::app::{DisplayRead, DisplayReceipt, Peeked};
+    use crate::store::{WriteBatch, client_namespace};
+    use crate::transport::Response;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Delivery {
+        app_id: [u8; 16],
+        records: Vec<(Vec<u8>, Vec<u8>)>,
+        response: Response,
+        when: u64,
+        preview_seq: Option<u64>,
+    }
+
+    // The notification process gets the retained app snapshot and the transport's
+    // actual reply. Its durable receipt is the only value returned to the owner.
+    const RESULT_FILE: &str = "SWITCH_TEST_DISPLAY_RESULT";
+    if let Some(path) = std::env::var_os(RESULT_FILE) {
+        let data: Delivery = serde_json::from_reader(std::io::stdin().lock()).unwrap();
+        let w = World::new();
+        let ns = client_namespace(&data.app_id);
+        for (key, value) in data.records {
+            let mut batch = WriteBatch::new();
+            batch.put(&ns, key, value).unwrap();
+            w.store.commit(batch).unwrap();
+        }
+        let app = w.load(data.app_id).await;
+        let read = app.pending_display_read().unwrap();
+        let receipt = read.receipt(Some(data.response), data.when);
+        if let Some(seq) = data.preview_seq {
+            let preview = app.display_preview(&receipt).await.unwrap();
+            assert!(preview.chain_verified);
+            assert!(
+                preview
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Peeked::Show { seq: s, .. } if *s == seq))
+            );
+            assert!(app.cursor().seq < seq);
+        }
+        let mut file = std::fs::File::create_new(path).unwrap();
+        serde_json::to_writer(&mut file, &receipt).unwrap();
+        file.sync_all().unwrap();
+        return;
+    }
+
+    let after_exit = |w: &World, me: [u8; 16], read: &DisplayRead, response, preview_seq| {
+        let path = std::env::temp_dir().join(format!("switch-display-{}", hex::encode(read.id())));
+        let data = Delivery {
+            app_id: me,
+            records: w
+                .store
+                .scan(&client_namespace(&me), b"", None, u32::MAX)
+                .unwrap(),
+            response,
+            when: w.clock.now_ms(),
+            preview_seq,
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["app::tests::flows::test_service_recovery_notice_portable_display_retains_the_original_reply_across_reopen", "--exact"])
+            .env(RESULT_FILE, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&data).unwrap())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        bytes
+    };
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    w.note(me, "first");
+    app.receive(None).await.unwrap();
+    let (seq, _) = w.note(me, "an ordinary preview");
+    let read = app.begin_display_read().await.unwrap();
+    let signed: DisplayRead = serde_json::from_slice(&serde_json::to_vec(&read).unwrap()).unwrap();
+    let response = w.env().transport.send(signed.request()).await.unwrap();
+    let receipt: DisplayReceipt =
+        serde_json::from_slice(&after_exit(&w, me, &signed, response, Some(seq))).unwrap();
+    let preview = app.display_preview(&receipt).await.unwrap();
+    assert!(preview.chain_verified);
+    assert!(
+        preview
+            .items
+            .iter()
+            .any(|item| matches!(item, Peeked::Show { seq: shown, .. } if *shown == seq))
+    );
+    assert!(app.cursor().seq < seq);
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    app.receive(None).await.unwrap();
+
+    let read = app.begin_display_read().await.unwrap();
+    let issued = read.id();
+    let original_marks = w.switch.lock().marks.clone();
+    w.switch.lose_mark();
+    let response = w.env().transport.send(read.request()).await.unwrap();
+    let observed_at = w.clock.now_ms();
+    let original = after_exit(&w, me, &read, response, None);
+    drop(app);
+    w.clock.advance_ms(MINUTE);
+    w.switch.lock().marks = original_marks;
+    let mut app = w.load(me).await;
+    assert_eq!(
+        app.pending_display_read().map(DisplayRead::id),
+        Some(issued)
+    );
+    assert!(app.recovery_required().is_none());
+    assert!(matches!(app.may_attempt(false), Err(Refusal::NotNow(_))));
+    assert!(app.submit_batch(conversation([74; 32])).await.is_err());
+    let receipt: DisplayReceipt = serde_json::from_slice(&original).unwrap();
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    let notice = app.recovery_required().unwrap();
+    assert_eq!(notice.first_seen_ms, observed_at);
+    assert!(app.pending_display_read().is_none());
+    drop(app);
+    let mut app = w.load(me).await;
+    assert!(!app.finish_display_read(&receipt).await.unwrap());
+    assert_eq!(app.recovery_required(), Some(notice));
+    assert_eq!(
+        app.pending_duty_events()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, AppEvent::RecoveryRequired { .. }))
+            .count(),
+        1
+    );
+    app.follow_provider().await.unwrap();
+    assert!(app.recovery_required().is_none());
+    let read = app.begin_display_read().await.unwrap();
+    let terminal = read.receipt(None, w.clock.now_ms());
+    assert!(app.finish_display_read(&terminal).await.unwrap());
+    assert!(app.recovery_required().is_none());
+    assert!(app.may_attempt(false).is_ok());
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_finishes_one_display_reply_across_a_store_interruption() {
+    for fault in [StoreFault::FailBefore(1), StoreFault::FailAfter(1)] {
+        let w = World::new();
+        let mut app = w.join("wallet").await;
+        app.receive(None).await.unwrap();
+        let read = app.begin_display_read().await.unwrap();
+        let original_marks = w.switch.lock().marks.clone();
+        w.switch.lose_mark();
+        let reply = w.env().transport.send(read.request()).await.unwrap();
+        let receipt = read.receipt(Some(reply), w.clock.now_ms());
+        let (mut app, _) = load_behind(&w, app, fault).await;
+        assert!(app.finish_display_read(&receipt).await.is_err());
+        assert!(app.may_attempt(false).is_err());
+        app.finish_display_read(&receipt).await.unwrap();
+        assert!(app.pending_display_read().is_none());
+        assert!(app.recovery_required().is_some());
+        assert!(!app.finish_display_read(&receipt).await.unwrap());
+        assert_eq!(
+            pending_events(&mut app)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, AppEvent::RecoveryRequired { .. }))
+                .count(),
+            1
+        );
+        w.switch.lock().marks = original_marks;
+        app.follow_provider().await.unwrap();
+        assert!(app.may_attempt(false).is_ok());
+        assert!(app.begin_display_read().await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn test_service_recovery_notice_keeps_permanent_loss_across_further_reads() {
+    use crate::app::{ProviderHealth, ProviderStatus};
+    use pubky_switch_core::http::NoticeReason;
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    w.switch.lose_mark();
+    w.switch.retire(1);
+    let stopped = app.receive(None).await.unwrap();
+    assert!(stopped.stopped);
+    let notice = app.recovery_required().unwrap();
+    assert_eq!(notice.reason, Some(NoticeReason::MarkLost));
+    assert!(notice.permanent);
+    let original_events = app.pending_duty_events().await.unwrap().len();
+    assert_eq!(
+        app.check_for_move().await.unwrap(),
+        ProviderStatus::RecoveryRequired {
+            generation: 1,
+            permanent: true
+        }
+    );
+    assert_eq!(
+        app.pending_duty_events().await.unwrap().len(),
+        original_events
+    );
+    w.clock.advance_ms(24 * HOUR);
+    assert_eq!(
+        app.provider_health(),
+        ProviderHealth::RecoveryRequired(notice)
+    );
+}
+
+#[tokio::test]
 async fn test_app_join_registers_and_receives_a_note() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -963,12 +1382,13 @@ async fn test_app_restore_in_place_leaves_behind_an_owed_call_that_isnt_whole() 
     let mut app = w.join("wallet").await;
     let backup = app.backup().await.unwrap();
     app.receive(None).await.unwrap();
-    let missed = crate::app::feed::OwedCall::Missed {
+    let missed = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let unchecked = crate::app::feed::OwedCall::DenyUnverified {
         generation: 1,
         seq: 1,
@@ -1544,6 +1964,12 @@ async fn test_app_restore_listed_cert_stops_at_a_newer_generation() {
     w.switch.deliver_identity(&doc).unwrap();
     let (mut restored, _) = restored(&w, &backup).await;
     let applied = w.switch.applied().len();
+    // The feed also answers at the new generation, but supplies no identity document.
+    assert!(matches!(
+        restored.check_for_move().await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert_eq!(restored.own_identity().generation(), 1);
     assert!(matches!(
         restored.take_listed_cert().await.unwrap(),
         crate::app::renewal::Listed::NotCurrentHere
@@ -3372,8 +3798,21 @@ async fn test_app_leaves_in_two_steps() {
 #[tokio::test]
 async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     let w = World::new();
+    let sibling = w.join("phone").await;
     let mut app = w.join("wallet").await;
     let me = app.app_id();
+    let ns = crate::store::client_namespace(&me);
+    let sibling_ns = crate::store::client_namespace(&sibling.app_id());
+    app.hold_queued(&w.bob.public()).await.unwrap();
+    app.protocol_commit(
+        "sample",
+        &[LocalWrite::Put {
+            key: b"draft".to_vec(),
+            value: b"content".to_vec(),
+        }],
+    )
+    .await
+    .unwrap();
     assert!(!refuse_next(&w, &mut app).await.is_empty());
     let now = w.clock.now_ms();
     w.switch.push_missed(1, now - HOUR, now);
@@ -3381,6 +3820,8 @@ async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     app.receive(None).await.unwrap();
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
     assert!(!app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    assert_eq!(app.reader().scan_raw("outhold/").await.unwrap().len(), 1);
+    assert!(app.reader().exists("p/sample/draft").await.unwrap());
     app.leave(LeaveMode::TwoStep).await.unwrap();
     w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
@@ -3391,10 +3832,39 @@ async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
     });
     app.finish_leave().await.unwrap();
     w.clock.advance_ms(11 * 60_000);
+    drop(app);
+
+    let snapshot = |ns: &str| w.store.scan(ns, b"", None, u32::MAX).unwrap();
+    let before = snapshot(&ns);
+    let sibling_before = snapshot(&sibling_ns);
+    let faulty = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut app = App::load(
+        w.env_on(faulty.clone()),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    faulty.fail_put_once(b"leave");
+    assert_eq!(
+        app.finish_leave().await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unavailable)
+    );
+    assert_eq!(app.state.leave.unwrap().keys_deleted_ms, None);
+    assert_eq!(snapshot(&ns), before);
+    drop(app);
+    let mut app = w.load(me).await;
     assert_eq!(app.finish_leave().await.unwrap(), LeaveReport::Done);
     // With the keys, what the app owed its protocol is gone from the store.
     assert!(app.reader().scan_raw("duty/").await.unwrap().is_empty());
     assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+    assert!(app.reader().scan_raw("outhold/").await.unwrap().is_empty());
+    assert!(!app.reader().exists("keys").await.unwrap());
+    assert!(!app.reader().exists("p/sample/draft").await.unwrap());
+    assert!(!app.reader().scan_raw("kid/").await.unwrap().is_empty());
+    assert!(app.reader().exists("dutye").await.unwrap());
+    assert_eq!(snapshot(&sibling_ns), sibling_before);
 }
 
 #[tokio::test]
@@ -3794,7 +4264,7 @@ async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
 #[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
-    let app = w.join("wallet").await;
+    let mut app = w.join("wallet").await;
     let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3806,9 +4276,10 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
         AppBackup::from_bytes(&other),
         Err(AppError::InvalidData(_))
     ));
-    value["layers"] = json!([{ "name": "sample", "data": "" }]);
-    value["beyond_cursor"] =
-        json!({ "protocols": ["sample"], "seen": [], "parked": [], "processed": [] });
+    let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&layered).unwrap();
+    assert!(value["beyond_cursor"].is_object());
+    value["v"] = json!(9);
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),
@@ -5084,7 +5555,7 @@ async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
                     ),
                 ],
                 body,
-                timeout: crate::transport::TimeoutClass::default(),
+                timeout: crate::transport::TimeoutClass::Bulk,
             })
             .unwrap()
             .status
@@ -5431,6 +5902,7 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
     // The call fails: owed, made again by the next read, whose answer is over the bound.
     app.receive(None).await.unwrap();
     assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    w.clock.advance_ms(1000);
     let (plain, _) = w.note(app.app_id(), "plain");
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, plain), "{:?}", report.events);
@@ -5440,7 +5912,7 @@ async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
         AppEvent::LocalWritesRefused {
             call: RefusedCall::Missed(missed),
             ..
-        } if missed.seq == seq
+        } if missed.seq == seq && missed.read_at_ms == now
     )));
     let key = format!("missed/{seq}");
     assert!(
@@ -6758,12 +7230,13 @@ async fn test_deny_list_owed_call_of_a_generation_not_followed_yet_waits() {
     assert!(reader.cursor().seq > 1);
     // The join's gap is told by that first read.
     kinds.log.lock().unwrap().clear();
-    let call = crate::app::feed::OwedCall::Missed {
+    let call = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let mut tx = reader.tx().unwrap();
     tx.put(
         &crate::app::state::key::owed(5, 1),
@@ -7017,12 +7490,13 @@ async fn test_app_owed_call_whose_key_names_no_position_fails_closed() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     app.receive(None).await.unwrap();
-    let call = crate::app::feed::OwedCall::Missed {
+    let call = crate::app::feed::OwedCall::from(crate::app::MissedEntries {
+        read_at_ms: 6,
         seq: 1,
         entries: 1,
         accepted_from_ms: 5,
         accepted_until_ms: 6,
-    };
+    });
     let mut tx = app.tx().unwrap();
     tx.put(
         &format!("{}not-a-position", crate::app::state::key::OWED_PREFIX),

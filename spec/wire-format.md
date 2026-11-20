@@ -2,7 +2,9 @@
 
 **Status.** Complete; a review candidate, with the Pubky Switch spec. The wire format of `spec/spec.md` ("the spec"). The spec decides behaviour; this document decides bytes. It settles every wire detail the spec leaves open, taking the reference prototype as the source of truth, so that a second team can build an interoperable switch, signer or app without reading the prototype. Where this document had to choose something the prototype doesn't fix, Appendix A says so.
 
-**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
+**Named record authority.** Sections 1.5 and 6.2 specify the next record format. Until the client and service implement it and the corresponding vectors and examples are updated together, the executable examples use one set of write scopes and carry the address inputs on creation. A deployment adopts the new format as a whole.
+
+**Test vectors.** `spec/vectors/` holds the executable vectors for the current encodings, signatures, derivations, envelopes and state transitions. Its `README.md` lists the files. The runtime that adopts separate creation authority adds the corresponding record vectors. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the reference prototype's answer and says so. The JSON samples in this document, like the test vectors and the prose, use the scopes, message kinds, collections and app record member of the spec's sample protocol, `tasks` (spec 1). The switch treats every protocol's names as opaque. The reference prototype, shared separately, computes every vector from its code, but for the cases the vectors README lists as `pubky-switch-core`'s, which that crate's tests compute.
 
 **Conventions.**
 
@@ -112,15 +114,16 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 | HPKE `info` | `lp("pubky-switch/v1/hpke", recipient identity, kid)` (72 bytes) |
 | Document hash (certificate hash, freeze hash, enrollment hash) | `hash(signed document bytes)` (2.2) |
 | Policy hash | `hash(lp("pubky-switch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n))`; for a permanent policy (6.2, spec 10.3.1), `hash(lp("pubky-switch/v1/permanent-policy", read_scope, u64(n), write_scope_1, ..., write_scope_n, u64(g)))`, `g` being its `permanent.generation`, 0 when that is `null`; write scopes sorted ascending by bytes, no duplicates, n at least 1 |
+| Policy hash with a create scope | Use the policy hash above with label `pubky-switch/v1/create-scope-policy`, or `pubky-switch/v1/permanent-create-scope-policy` for a permanent policy. Insert `create_scope` immediately after `read_scope` in the length-prefixed inputs. The scope count still counts only `write_scopes`, and a permanent policy still ends with `u64(g)`. |
 | Collection ID | `derive("pubky-switch/v1/collection", collection name, identity)` |
-| Record key | `derive("pubky-switch/v1/record", collection name, blind(natural key), policy hash)`; the creating `record.put` carries `blind(natural key)` in `id_inputs` (6.2) |
+| Record key | `derive("pubky-switch/v1/record", collection name, blind(natural key), policy hash)`; every signed `record.put` carries `blind(natural key)` in `id_inputs` (6.2) |
 | Chain item hash | `hash(lp("pubky-switch/v1/item", item type, signed document bytes))` (6.6) |
 | Chain hash | `hash(lp("pubky-switch/v1/chain", previous chain hash, chain envelope bytes))` (6.6) |
 | Invite code hash | `hash(code bytes)`, the code decoded from base64url (1.7) |
 
 - **Whose naming key.** Record keys, and a protocol's claim keys, are blinded with the naming key of the identity whose Pubky Switch holds them. Equal inputs give equal outputs within one identity, so all its apps find the same record and claim, and the stored keys name neither the counterparty nor the other inputs. That protects stored state and exports, not against a live operator, which links records and claims to senders through batches and timing (spec 15).
 
-Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` `blinded_inputs` and every value of the table, with the blinded inputs of each record key; the record keys use the collections and natural keys of `tasks`.
+Vectors: `encoding.json` `derive`; `keys.json` the Switch root, naming key and backup key of each identity, `scope_keys` and `sub_scope_keys`; `identifiers.json` contains the current policy hashes and record keys with their blinded inputs, using the collections and natural keys of `tasks`. The new hashes and record keys for policies with a `create_scope` arrive with the runtime that implements them.
 
 ### 1.6 Times
 
@@ -236,7 +239,7 @@ Signed by the identity key (label `pubky-switch/v1/app-cert`). The signer delive
 
 A verifier checks: the signature with the key of the identity it expects; `v` and `kind`; that the body has no unknown members (1.1); that `identity` is that identity; that `app_id` is derived from `signing_key`; that both keys are 32 bytes, that `bundle_key` isn't an X25519 key of low order (4.2), and both times parse; that `suite_keys`, if present, has the form above; that `scopes` follows the scope rule (Scope names, below); that `permissions` holds only switch permissions (below), each once and in their order; and that `expires_at` is present, not `null`, later than `issued_at` and at most 730 days after it. A certificate that fails any of these is invalid at every reader: the switch and every app. The switch then enforces exactly `permissions`. A protocol's verifiers also check its own scope rules and the permissions its scopes need (Several protocols, below); a certificate that fails these is invalid at those verifiers, though the switch takes it. Expiry is checked against the verifier's clock (the service uses its own time, 7.2). For the claim rules an app whose certificate has expired isn't current, so its open attempts are orphaned (6.8).
 
-**Scope names** (spec 3.3). The switch knows no scope names, only this rule. A scope is `name` or `name:<sub>`: `name` is 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit, and `<sub>` is 1 to 32 characters of `a-z`, `0-9` and `-`, starting with a letter or digit. Wherever a scope is compared, for a record's `read_scope` and `write_scopes` (6.2, 7.4.9, 7.5) and for the keys an app holds (3.5), holding `name` covers every `name:<sub>`: a certificate holding `name` holds every one of its sub-scopes, and one holding `name:<sub>` holds only that one. That is the one rule of hierarchy among scopes, and the switch applies it. So a certificate never holds both `name` and a `name:<sub>`: holding both would say nothing more, and every verifier refuses such a certificate. A certificate holds at most 32 scopes in all; a protocol may keep lower bounds of its own. A sub-scope's key derives from its parent's (1.5). Vectors: `documents.json` `scope_rule`.
+**Scope names** (spec 3.3). The switch knows no scope names, only this rule. A scope is `name` or `name:<sub>`: `name` is 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit, and `<sub>` is 1 to 32 characters of `a-z`, `0-9` and `-`, starting with a letter or digit. Wherever a scope is compared, for a record's `read_scope`, `write_scopes` and optional `create_scope` (6.2, 7.4.9, 7.5) and for the keys an app holds (3.5), holding `name` covers every `name:<sub>`: a certificate holding `name` holds every one of its sub-scopes, and one holding `name:<sub>` holds only that one. That is the one rule of hierarchy among scopes, and the switch applies it. So a certificate never holds both `name` and a `name:<sub>`: holding both would say nothing more, and every verifier refuses such a certificate. A certificate holds at most 32 scopes in all; a protocol may keep lower bounds of its own. A sub-scope's key derives from its parent's (1.5). Vectors: `documents.json` `scope_rule`.
 
 **Switch permissions** (spec 3.2). The switch permissions are these names, in this order: `claims.read`, `claims.write`, `lists.read`, `lists.manage`, `conversation.add`.
 
@@ -295,7 +298,6 @@ Signed by the app's signing key (label `pubky-switch/v1/app-record`). Delivered 
 | `cert` | `signed<AppCert>` | yes | carrying form, signed by `identity` | |
 | `accepts` | `array<string>` | yes | full kind strings of the app's protocol, such as `tasks.assignment` or an extension kind such as `tasks-cap.offer` | may narrow the certificate's scopes, never widen them (spec 3.4). The app signs its record, so it adds a kind under a scope it holds, such as an extension kind, without a new certificate |
 | `protocols` | object | no | each member named by a protocol, with the syntax of a scope `name` (3.1); each value an object | default empty, and written as `{}` when the app's protocols add nothing. The members the app's protocols add to its record, each defined by its protocol, such as `tasks` for the `tasks` protocol. The switch checks only their form (Protocols' members, below) |
-| `label` | `string \| null` | no | | display only |
 | `updated_at` | time | yes | | the later `updated_at` wins between two copies; two different bodies with one `updated_at` are a conflict (Equal times, below; spec 4.2) |
 | `expires_at` | `time \| null` | yes, always written | | chosen by the app; `null` means the record doesn't expire. A protocol may require one |
 
@@ -343,7 +345,6 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
       }
     }
   },
-  "label": "bob shop",
   "updated_at": "2025-12-31T00:00:00.000Z",
   "expires_at": "2026-01-30T00:00:00.000Z"
 }
@@ -1155,7 +1156,7 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
 
 A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A type other than `done` carrying it is `400`, and so is basis `evidence` without it. The service never interprets `attempt_id` or `evidence_ref`. 6.8 gives the rules each type follows.
 
-**`record.put`** (spec 10.3). Needs one of the record's `write_scopes`; a scope's name covers each of its sub-scopes (3.1).
+**`record.put`** (spec 10.3). A create (signed `expected_version` equal to `{0, 0}`) requires `create_scope` when present. All other writes, and creates when that member is absent, require one of `write_scopes`. The original writer's certificate must grant the required scope under the usual hierarchy (3.1). This selection also applies to a signed write carried in an upload or import, regardless of the receiving service's current state.
 
 | Field | Type | Req | Constraints |
 |---|---|---|---|
@@ -1163,15 +1164,16 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
 | `collection` | `b64(32)` | yes | the collection ID (1.5), not the name |
 | `read_scope` | string | yes | |
 | `write_scopes` | `array<string>` | yes | at least one, sorted ascending by bytes, no duplicates |
+| `create_scope` | string | no | scope required to create at this address (3.1). Part of the immutable policy and its hash (1.5). A present `null` is malformed. |
 | `permanent` | object | no | `{ "generation": int \| null }`, present for a permanent policy only (spec 10.3.1): `generation` is required, a generation, at least 1, or `null`; `0` is `400`. Part of the policy and of its hash (1.5) |
 | `expected_version` | Record version | yes | `{ "generation", "version" }` of the version the writer read (1.7); `{0, 0}` to create |
 | `value_sealed` | Sealed value | yes | below |
-| `id_inputs` | object | when `expected_version` is `{0, 0}`, and only then | `{ "collection": collection name, "blinded_key": b64(32) }`, the blinded natural key `blind(natural key)` (1.5). On any other write it is refused, `400 bad_request`, as part of the operation's shape (6.4 step 9), so before the compare-and-swap |
+| `id_inputs` | object | yes | `{ "collection": collection name, "blinded_key": b64(32) }`. The blinded key is `blind(natural key)` (1.5). |
 
 - **Versions** (spec 10.3): a record's version is the (generation, `seq`) of the write that produced it, given by the service; the transition proof's `state` shows it (6.5). Versions are ordered by generation, then `seq`, so they only grow across the account, whoever writes. A writer can't know its new version before the service gives it.
 - **Compare-and-swap:** `expected_version` must be the record's current version, else `409 conflict` (7.6). `{0, 0}` holds only when the service holds nothing at the key: a writer that holds or follows a delete (one it refused that the switch shows as current, spec 8.2) names that delete's version, and once the service has forgotten the key gets `409 conflict` with version 0 as current and decides again. A version with `version` 0 and another generation is `400`. When the record's current write was taken from a recovery upload (its `revision` isn't at its version, 6.3), `expected_version` holds only beside a `record_current` condition of the same operation that names that write (7.4.14).
-- **At creation** (`expected_version` `{0, 0}`) the service recomputes `key` from `id_inputs` and the operation's policy hash, and `collection` from the name and the identity; a mismatch is `400`. The service sees only the blinded natural key, so the key names neither the counterparty nor the request; a live operator still links it to a sender through the batch and its timing (spec 15).
-- **Later writes** repeat `collection`, `read_scope`, `write_scopes` and `permanent` exactly; a difference is `400`. A write to a deleted record the service keeps names its delete's version and continues it; a create at the key is refused until the service forgets it. A create over a record the service holds, live or deleted, repeats them too: a difference is `400`, before the compare-and-swap, which then refuses the create (`409`). Its key derives from its policy, so a record held there under another policy came in from a recovery upload that wasn't a create (7.4.14) or from an import (10.5), neither of which ties the key to its policy, and a permanent key is never created again over it (spec 10.3.1).
+- **Derivation.** For every write the service derives `collection` from `id_inputs.collection` and the identity, and `key` from that name, `id_inputs.blinded_key` and the signed policy hash (1.5). A mismatch is `400 bad_request` on submission (6.4 step 9). Recovery upload (7.4.14) and import activation (10.5) check the same two addresses before installing the record. The blinded input leaves the natural key private. A live operator can still link a write to a sender through its batch and timing (spec 15).
+- **Immutable policy.** All writes over a live record or retained delete repeat the collection, read and write scopes, and the presence and value of each of `create_scope` and `permanent`. A difference is `400 bad_request` before the compare-and-swap. A write over a retained delete names that delete's version. A create at an occupied key with the matching policy fails with `409 conflict`.
 - **One write per record per batch** (spec 13.5): a batch that writes one record twice is `400 bad_request`, since the second write couldn't name the first one's version.
 - **A conflict carries the current write**: when the writer holds the record's read scope, the `409` answer's `current` holds `record` (`key`, `generation`, `version`) and `record_view`, the current write as `GET /records/{key}` returns it (7.4.9). The writer drops or redoes its write without reading the record again. A writer without the read scope gets `current: {}`. When the service holds nothing at the key, every writer, with the read scope or without, gets `record` at version `{0, 0}` and `record_view` null (spec 10.3).
 - **Sealed value:**
@@ -1195,13 +1197,13 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
 - **Accepting a write** (spec 10.3): an app acts on a `record.put` it reads, from the feed (7.5), `GET /records`, a list page or a `409`'s `record_view`, only after these checks:
   1. The writer's certificate: one that verifies for the identity (3.1) and names the operation's `app_id`, from the record view's `cert` (7.4.9), the certificate the service checked the write against, or else the app's own, or the app records it keeps from the directory (7.4.10) and `app.put` items. The operation's signature verifies with its `signing_key`, and `identity` is the account's. Without a certificate, or with a writer the app's `identity.json` doesn't name, the app first reads its `identity.json` and directory again. A write names no certificate: every certificate of its writer has the `signing_key` that verifies it, so the record view's `cert` is the one the service chose. The write counts when a certificate of the writer the app holds, the view's `cert` among them, was in force at the write's time (step 4) and holds a write scope of the record (step 5), and is judged with the view's `cert` when that one counts, so a renewal later doesn't change what an earlier write is judged with; a write without a view, such as a feed item, with the writer's certificate that counts. An app that doesn't hold a certificate the newest own `identity.json` names for the writer as in force at that time, and holds none that counts, reads the record's view (7.4.9) and judges the write with its `cert` too. When that doesn't count either, it reads its directory again for the writer's listed certificate, once for each the directory answers for while it runs, a read that fails being made again by a later write's judging, at most once a minute; while it still lacks the one in force then, a failure of steps 4 and 5 is only the service's choice of certificate, and the write is ignored, naming no app.
   2. A feed item matches its stub (6.6); a stub the app verified in its chain dates the write and gives its version, including the stubs of the page just read whose hashes the page's checkpoint prunes. A transition proof whose stub is of the generation the newest own `identity.json` names, and that verifies with that document's `inbox.service_key`, must have a stub whose `item_hash` is the operation's and whose generation is the operation's `generation`, an `object` that is `key`, a `state` whose `generation` and `version` are the stub's, and must not contradict a chain hash the app verified; it then gives the version if no stub did. A proof of an earlier generation, as a switch keeps it with a record after a key change or carries it after a move, gives no version, but dates the write for step 4 when it verifies with the key the newest own `identity.json` lists for the generation its stub names in `service_keys` (3.3), and its stub's `item_hash` and generation are the operation's. A generation the list doesn't name dates nothing, whatever key its proof verifies with; an honest signer lists every generation a current record's proof names (3.3).
-  3. `key` is the one read; `collection` is a collection of the reading app's protocol, and the policy one that protocol fixes for it; `value_sealed.scope` is `read_scope`; a create's `key` derives from `id_inputs` (1.5); a write at a permanent policy keeps its rule (Permanent policies, above), judged by the operation's own `generation`.
+  3. `key` is the one read; `collection` is a collection of the reading app's protocol, and the policy one that protocol fixes for it; `value_sealed.scope` is `read_scope`; `collection` and `key` derive from the signed `id_inputs` and policy (1.5); a write at a permanent policy keeps its rule (Permanent policies, above), judged by the operation's own `generation`.
   4. Standing: in the newest own `identity.json` the app holds, the certificate is listed; or it is an earlier certificate of a listed app in `renewed`, with `until` `null` or after the write's time; or the app is in `removed` and the write's time is at or before `distrust_from`. Only a proof (step 2) or a verified stub gives the write's time. An earlier certificate whose `until` is set counts only when one does and puts the write before `until`. Without one it doesn't count, and since the service keeps the proof of every current write (7.4.9), the missing date is the service's word: a write that no other certificate counts for (step 1) is ignored, naming no app. A removed app's write without a time counts as doubtful (spec 12.2 step 3). A certificate expired at the write's time doesn't count.
-  5. The certificate holds one of `write_scopes`.
+  5. The certificate holds the scope required by the signed `expected_version` under the rule above. When the policy names a create scope, the applicable role must be established for the original write. A later grant alone cannot establish it for an undated or earlier write.
   6. The version: from step 2 when a proof or a verified stub gives it (authenticated); otherwise the record view's (unauthenticated). Either way its generation is the operation's `generation` and it is after `expected_version`.
   7. The content: `value_sealed` opened with the scope key of its `data_epoch` (1.5, spec 13.4), and its padding removed (above). An empty plaintext is a delete, and nothing else is: a `deleted` flag or a 16-byte `ct` alone proves nothing. Without that epoch's key the value is unreadable; a value that doesn't open with the key, whose length or padding is wrong, or that isn't JSON, fails.
 
-  Signed evidence of misbehaviour (an item that doesn't match its stub, a proof that names another operation or object, or contradicts the verified chain) is a rollback (spec 10.1). So is a write that fails the rule of a permanent policy (step 3) whose version step 2 authenticates, by a proof or a verified stub: the service applied a write it must refuse. Without that, such a write is only the service's word, and is ignored, naming no app. Some failures are only the service's word, not the writer's: a write whose signature doesn't verify with a certificate of its writer the app finds, or that is of another `key` than the one read, or of a collection of another protocol (steps 1 and 3), the certificate the service shows with it or a missing date (steps 1 and 4), and a version that fails step 6. Each leaves the write ignored, naming no app, which loses nothing a service withholding the write couldn't take. A write signed with the reading app's own key is that app's own (spec 3.1): steps 4 and 5 don't apply to it, but for a removed app's `distrust_from`, since a lost device holds the key too (spec 12.2 step 3), and a failure of steps 3 to 6 leaves it ignored, naming no app. A value that doesn't open (step 7) names the app that signed it, the reading app included, since the signature covers `value_sealed`. Any other failure leaves the write ignored and shown with the app it names (spec 8.2). The app shows each such write once, by its item hash (6.6), at the version it was last shown at, and keeps at most eight for a record, the one shown at the lowest version dropped first. A write ignored only for the certificate the service shows or a missing date, whose version passes step 6, is followed, naming nobody: the app builds its next write on it, as on a flagged write, and the record doesn't read as flagged. Any other write ignored without naming an app isn't followed: the app builds its next write on the version it holds (spec 8.2). A write at the key read that its writer signed for another collection or policy fails step 3 and names its writer; from the feed, which reads no key, a write whose collection and policy name no collection of the app's protocol is ignored, naming no app. The app takes an accepted write in place of the one it holds only if it is newer: with both versions authenticated, the higher one; with the new version unauthenticated, only if its `expected_version` is the held version or later; with the held version unauthenticated, the held write counts as just after its own `expected_version`. The same write again, with an authenticated version, makes the held one authenticated. The AAD stays `lp("pubky-switch/v1/sealed", identity, scope, record key)`: the operation's signature binds the writer.
+  Signed evidence of misbehaviour (an item that doesn't match its stub, a proof that names another operation or object, or contradicts the verified chain) is a rollback (spec 10.1). So is a write that fails the rule of a permanent policy (step 3) whose version step 2 authenticates, by a proof or a verified stub: the service applied a write it must refuse. Without that, such a write is only the service's word, and is ignored, naming no app. Some failures are only the service's word, not the writer's: a write whose signature doesn't verify with a certificate of its writer the app finds, or that is of another `key` than the one read, or of a collection of another protocol (steps 1 and 3), the certificate the service shows with it or a missing date (steps 1 and 4), and a version that fails step 6. Each leaves the write ignored, naming no app, which loses nothing a service withholding the write couldn't take. A write signed with the reading app's own key is that app's own (spec 3.1): a policy without `create_scope` exempts it from steps 4 and 5, subject to its removal's `distrust_from` (spec 12.2 step 3). With `create_scope` present, apply steps 4 and 5 to one's own write too. The certificate must have granted the role required by the signed base at the write. A certificate issued after the authenticated write time cannot establish this. The operation's signature and proof do not identify a particular certificate across a same-key renewal. Any certificate established as valid for this write and granting that role suffices. If the original authority cannot be established, keep the value out of use. A failure of steps 3 to 6 for an own write leaves it ignored, naming no app. A value that doesn't open (step 7) names the app that signed it, the reading app included, since the signature covers `value_sealed`. Any other failure leaves the write ignored and shown with the app it names (spec 8.2). The app shows each such write once, by its item hash (6.6), at the version it was last shown at, and keeps at most eight for a record, the one shown at the lowest version dropped first. A write ignored only for the certificate the service shows or a missing date, whose version passes step 6, is followed, naming nobody: the app builds its next write on it, as on a flagged write, and the record doesn't read as flagged. Any other write ignored without naming an app isn't followed: the app builds its next write on the version it holds (spec 8.2). A write at the key read that its writer signed for another collection or policy fails step 3 and names its writer; from the feed, which reads no key, a write whose collection and policy name no collection of the app's protocol is ignored, naming no app. The app takes an accepted write in place of the one it holds only if it is newer: with both versions authenticated, the higher one; with the new version unauthenticated, only if its `expected_version` is the held version or later; with the held version unauthenticated, the held write counts as just after its own `expected_version`. The same write again, with an authenticated version, makes the held one authenticated. The AAD stays `lp("pubky-switch/v1/sealed", identity, scope, record key)`: the operation's signature binds the writer.
 
 Example (`operations.json` `record.put create`, which `chain.json` applies at `seq` 6, giving the record version (1, 6); `ct`, cut short, seals a `task_items` record holding bob's assignment):
 
@@ -1330,19 +1332,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
+      "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
+      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
+    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
   }
 }
 ```
@@ -1359,7 +1361,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
   "ops": [
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "_yTDzcX99n7F-4c5R39619aNnDuSEZMTMCYtQ_RdfbUPBfE04MGc9FIiHqYGd5kPDUnJWpn4-nKgGEnPElmsDw"
+      "sig": "nmioOfbKIcvRzKA8d-PcgIkjqMGZ8Ld-005cEm2kyDIKdPJbDVx2h7S0ex3Y81eaCHSMBhwPoejCoMrbg5ZeCg"
     },
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
@@ -1431,7 +1433,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
+    "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
   },
   "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
@@ -1491,7 +1493,7 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw",
+  "prev_chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
   "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
@@ -1517,11 +1519,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
+  "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+  "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
 }
 ```
 
@@ -1975,7 +1977,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "jjMkxY3N9g4KTZ5l0nIgjk9pCBnf0fLun1aMA8OWYPw"
+        "chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q"
       }
     },
     {
@@ -1983,7 +1985,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "39Z4TXAiQunrwwnx_BUO46H96vxegqPZNl261qJJ8Qo"
+        "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
       },
       "item_type": "op",
       "item": {
@@ -1992,7 +1994,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRytVy7NoyzEuWBFXlvnWZ8pOe_v4IOVclvBlEPZkT_Q61jBw"
+        "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
       }
     },
     {
@@ -2000,7 +2002,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "L0v5_hmltlaZgDMwk4pDQeO0KqqDwXeRvtBGVY5z0Q4"
+        "chain_hash": "FUO2jAt4Utmo_VDYg-Xj_2dx4sYVafF_zT41AbQA3jI"
       },
       "item_type": "op",
       "item": {
@@ -2009,7 +2011,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBblYIH6CHdzoHoWgVJU99bdzE62W6eBccnxjyQCnlZMWmACg"
+        "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
       }
     },
     {
@@ -2017,7 +2019,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA"
+        "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE"
       },
       "item_type": "service",
       "item": {
@@ -2034,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "muYjBhuz6UI1RX8upIrIIMIBpI_3gRvfhwQtrDldImA",
-    "sig": "b23xHVPZCR7bOgQ96HIIVCo2SbATzUQfj0rxYuBdkO-b79ebvDt9YOOwHTf0tNLlS-4YLxu2lJknsQCZIwO2BA"
+    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
+    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
   }
 }
 ```
@@ -2096,7 +2098,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
   |---|---|---|
   | `key` | `b64(32)` | |
   | `collection` | `b64(32)` | the collection ID |
-  | `read_scope`, `write_scopes` | | the policy's scopes; a permanent policy's `permanent` member (6.2) is in `op` |
+  | `read_scope`, `write_scopes` | | the read and write scopes. The signed `op` carries `create_scope` and `permanent` when the policy names them (6.2) |
   | `generation`, `version` | int | the current version |
   | `revision` | reference | the current write's application (6.3), which a `record_current` condition names |
   | `seq` | int | the write's `seq`; for a record taken from a recovery upload, the `upload` transition's (7.4.14) |
@@ -2144,7 +2146,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbrcoWMIYkueFEF0uL1L2P7uViYpyru26Lkipx-i1t02MneCQ"
+        "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk5kI3A1XBsBqD5HDaHZHqzd2LwtqS3ManDz5P2wKDVrtfCg"
       }
     },
     {
@@ -2155,7 +2157,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
+        "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
       }
     },
     {
@@ -2166,7 +2168,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "cZqYi_BOCmqHIY80XwzbE2L5DPdsie1e5Zv6Il2EvKhavdUXmup0lG01pmVdc4Tap7I-WaNL_DXmLDbQQbRbAg"
+        "sig": "OQZs0jtgT_O6ypCGAtgzycQZvHM4zCYU2di6nd2adg_y8zESH8L8nl-RItHdINXbHd4o1-EnwLVZaZJ2l0GyDw"
       }
     }
   ],
@@ -2250,7 +2252,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 - **Answer** after a provider loss: `{ "result": changes, "proof": the upload transition's proof, "head" }`, where `changes` is `{ "records": [key], "divergent": [key], "claims": [claim key], "divergent_claims": [claim key], "unverified": int, "distrusted": int, "refused": int, "heads": int, "lists": bool }`. Its members:
   - `records`, `claims`: the keys whose state at N this upload changed: filled in, replaced, rebuilt, reopened or settled;
   - `divergent`, `divergent_claims`: the keys that became divergent, or gained a divergent upload, through this upload, a divergent upload past `max_divergent_uploads` included;
-  - `unverified`: the uploaded items that count for nothing: an operation whose signature or certificate doesn't verify for the identity, whose certificate lacks the scope its kind needs (`claims.write`, or one of the record's write scopes), that isn't of the lost generation or an earlier one (Records, below), that isn't of its array's type (`record.put` in `records`, `claim` in `claims`), or that a service would refuse for its shape (6.4 step 9), for building on a later generation than its own, or for a lower bound (Records, below) past 2^53 - 1, which no record view could carry (1.1); a head or a `proofs` entry that isn't of the lost generation or doesn't verify with its service key, every one of them when `lost_identity` is missing or doesn't count (Members by stage);
+  - `unverified`: the uploaded items that count for nothing: an operation whose signature or certificate doesn't verify for the identity, whose certificate lacks the scope its kind needs (`claims.write`, or the scope required by the original record operation's signed base under 6.2), that isn't of the lost generation or an earlier one (Records, below), that isn't of its array's type (`record.put` in `records`, `claim` in `claims`), or that a service would refuse for its shape (6.4 step 9), for building on a later generation than its own, or for a lower bound (Records, below) past 2^53 - 1, which no record view could carry (1.1); a head or a `proofs` entry that isn't of the lost generation or doesn't verify with its service key, every one of them when `lost_identity` is missing or doesn't count (Members by stage);
   - `distrusted`: operations of an app now listed in `removed` that no proof dates before its `distrust_from`;
   - `refused`: claim entries without a proof from O that the live writer rules refuse (below);
   - `heads`: the heads that verified;
@@ -2432,7 +2434,7 @@ Example (`409 stale_key`, records cut short):
         "app_id": "c1utah9jitjs43etzdkj6cqdwr",
         "app_record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "M-2HJw3X_8STEphe67IcgEjAcSQCDo6xzoZn-4heZF2NWsRkpRTxgNZ1hINObcUFo39gZ6bFX4ZkGTxr1BDxCA"
+          "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
         },
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
@@ -2878,7 +2880,7 @@ An account requiring recovery activation cannot import or activate an export (ac
    - neither `last_time` nor that `at` is more than the clock tolerance (5 minutes) ahead of N's own time (`409 conflict`). N continues from `last_time`, so a time further ahead would move its clock ahead for good: certificates expiring, deadlines passing and sweeps deleting early;
    - every head an app uploaded at or after the checkpoint is at or before that end and has the chain hash the chain has at its `seq` (`409 conflict`). A head older than the checkpoint can't be checked against the chain parts, which start after it, so N ignores it: it is neither evidence for nor against the import. An honest app holds one only if O dropped the stubs after its position, as O may for an app more than 30 days behind, or for one restored from a backup whose position its cursor at O had passed (7.4.4). Such an app uploads no head while its continuity is unverified (7.4.14);
    - the apps: there is an `app` part for every app the imported `identity.json` lists in `apps`, and for every app whose `app.put` or `receive_key.put` a `chain` part holds with its document (`409 conflict`), so O can't leave an app out; app records, receive key records and renewed certificates verify (`400`, or `401 bad_signature`); the record and the renewed certificate name the part's App ID (`400`), and each key bundle part carries the identity's signature (`401 bad_signature`); an app's receive key records come in strictly increasing `n` and `seq`, each one after the checkpoint is the `receive_key.put` chain item at its `seq` with that record, and the newest `receive_key.put` the chain parts hold for the app is its last one, unless the app is a purged app's tombstone that the imported `identity.json` doesn't list (`409 conflict`), so O can't make an older key current; a `leave` or `revoke` transition in the chain parts makes the app departed or revoked at N, whatever its part says: N adds those flags from the chain and never clears one, and a departed app still listed awaits its rotation. The meta part's `apps_version` and `app_added_at` are taken as written: they decide only which current apps an append must also be wrapped to (7.4.3 step 5), never an app's standing, an attempt's orphaning, a claim or a record, so a false value can only make senders wrap to an app again or let an append leave one out, as an O that dropped entries could;
-   - every shared record is derived from its signed operation, its `op` or the `chain` part at its `seq`, never taken as written. The operation verifies with a certificate whose App ID is the operation's writer, its `app_id`: the part's `cert`, or else the one in the writer's `app` part (`401 bad_signature`, also for a certificate of another app, since the writer comes from the operation itself; neither is there, `409 conflict`), and that certificate holds one of its write scopes; `key`, `collection`, the policy, `writer`, `deleted` and `size` are the operation's, and `generation` is the operation's, at most g (`409 conflict`). A write at a permanent policy keeps that policy's rule (6.2), else `409 conflict`. A write made at O after the checkpoint is the full chain item at its `seq` (a part that carries `op` as well carries those very bytes), in that item's generation, its `version` is that `seq`, and no later `record.put` of its key is in the chain parts; one at or behind the checkpoint, which no chain part covers, has a version at or before the checkpoint and no `record.put` of its key in the chain parts; one O took from a recovery upload (spec 12.6 step 3, when O was itself a recovering service) is of an earlier generation and listed by the `upload` transition at its `seq`. And every `record.put` the chain parts hold with its document is the current write of its key, since a superseded write keeps only its stub (`409 conflict`). Every part but one taken from a recovery upload carries `proof`, and an upload's carries none (`409 conflict` otherwise). The proof names that write: its stub's `item_hash` is the operation's at the part's `seq`, and its stub's generation is the one the operation names, the record's, since a service applies only operations of its own generation (6.4 step 6); its `object` is `key` and its state shows the part's `generation` and `version`; and it verifies with that generation's service key: O's for g, else the one the imported `identity.json` lists for it in `service_keys` (3.3) (`409 conflict` for either). A proof of a generation that list doesn't name is refused too (`409 conflict`): an honest signer lists every generation that O reports a current record's proof names (3.3). The one exception is a generation the imported `identity.json` declares lost (`recovery_from` and earlier): its proofs date nothing, so N keeps the record without one. Vectors: `export.json` `record_rejections` (no proof, a signature that doesn't verify, the proof of another write). So O can't relabel a record's version, generation, policy or size, or pass an older write off as current while the chain holds the newer one in full;
+   - every shared record is derived from its signed operation, its `op` or the `chain` part at its `seq`, never taken as written. The operation verifies with a certificate whose App ID is the operation's writer, its `app_id`: the part's `cert`, or else the one in the writer's `app` part (`401 bad_signature`, also for a certificate of another app, since the writer comes from the operation itself; neither is there, `409 conflict`), and that certificate holds the scope required by the signed `expected_version` (6.2). The collection ID and key must derive from the signed `id_inputs` and complete policy (1.5), else `409 conflict`; `key`, `collection`, the policy, `writer`, `deleted` and `size` are the operation's, and `generation` is the operation's, at most g (`409 conflict`). A write at a permanent policy keeps that policy's rule (6.2), else `409 conflict`. A write made at O after the checkpoint is the full chain item at its `seq` (a part that carries `op` as well carries those very bytes), in that item's generation, its `version` is that `seq`, and no later `record.put` of its key is in the chain parts; one at or behind the checkpoint, which no chain part covers, has a version at or before the checkpoint and no `record.put` of its key in the chain parts; one O took from a recovery upload (spec 12.6 step 3, when O was itself a recovering service) is of an earlier generation and listed by the `upload` transition at its `seq`. And every `record.put` the chain parts hold with its document is the current write of its key, since a superseded write keeps only its stub (`409 conflict`). Every part but one taken from a recovery upload carries `proof`, and an upload's carries none (`409 conflict` otherwise). The proof names that write: its stub's `item_hash` is the operation's at the part's `seq`, and its stub's generation is the one the operation names, the record's, since a service applies only operations of its own generation (6.4 step 6); its `object` is `key` and its state shows the part's `generation` and `version`; and it verifies with that generation's service key: O's for g, else the one the imported `identity.json` lists for it in `service_keys` (3.3) (`409 conflict` for either). A proof of a generation that list doesn't name is refused too (`409 conflict`): an honest signer lists every generation that O reports a current record's proof names (3.3). The one exception is a generation the imported `identity.json` declares lost (`recovery_from` and earlier): its proofs date nothing, so N keeps the record without one. Vectors: `export.json` `record_rejections` (no proof, a signature that doesn't verify, the proof of another write). So O can't relabel a record's version, generation, policy or size, or pass an older write off as current while the chain holds the newer one in full;
    - every live claim is replayed from its entries: their steps strictly increase; each entry's operation verifies with a certificate whose App ID is the operation's writer, its `app_id`: the part's `cert`, or else the one the record in the writer's `app` part carries (`401 bad_signature`, also for a certificate of another app, since the writer comes from the operation itself; neither is there, `409 conflict`), is a `claim` of this identity for this claim at the entry's step, and that certificate holds `claims.write` (`409 conflict`), as for a record's operation, so O can't make up an entry, such as a `failed` that frees an open attempt, nor pass an entry one app signed under its own certificate off as another app's; each entry's proof is of the generation the entry's operation names, since a service applies only operations of its own generation (6.4 step 6), and verifies with that generation's service key, O's for g, else the one the imported `identity.json` lists for it in `service_keys`, which the signer keeps for every generation a live claim's entry names (3.3); a proof of another generation, or of a generation that list doesn't name, is refused (`409 conflict`), so no entry's time or state is taken unchecked, behind the checkpoint either; the proof names the claim, and is that entry's (its stub's item hash is the entry's operation, at the entry's `seq`, and its `step` the entry's plus one); after the checkpoint each entry is the chain item at its `seq`, with the chain hash the chain parts give it; and every `claim` operation for the claim's key that the chain parts hold with its document, from the claim's first entry on, is one of its entries (`409 conflict`), so O can't leave an entry out, such as the newest, to roll the claim back. The claim's `step` is after its last entry and, unless the claim was rebuilt from recovery uploads (`rebuilt`, below), exactly one after it. A claim not rebuilt is replayed from nothing: N applies each entry's effect in order, by the rows of 6.8, at the time its proof's stub carries, and the state after each entry is the state that entry's proof shows, leaving out what depends on when it is read (`orphaned`, `next_possibly_duplicate`) (`409 conflict`). Whether a row applied when O took the entry, which depends on which apps were current then and which attempts were orphaned, isn't judged again: N can't tell, and the entry's writer signed it. The claim's `creator` is the owner of its first attempt, and unless it was rebuilt its `last_entry_ms` is the service time of its last entry, the `server_time` that entry's proof stub carries (`409 conflict`), so O can't charge another app's share of the claim limit, nor bring forward the deletion of a claim pinned to "none". And the claim is the state its entries lead to, member for member, those no claim view shows included, such as an attempt's `deadline_ms` and `from_upload` (`409 conflict`). So an open attempt can't be exported as `failed`, even under a proof O signs again to match. **Rebuilt claims:** only a provider loss rebuilds a claim from uploads (spec 12.6), and the `identity.json` keeps the generation it lost in `recovery_from` from then on, so N accepts a claim marked `rebuilt` only when the imported `identity.json`'s `recovery_from` isn't `null` (`409 conflict`). Uploads merge per attempt, only add attempts or settle them, and may fall anywhere between the claim's entries, and the export carries none of them, so N checks a rebuilt claim attempt by attempt, whatever the order its uploads came in (`409 conflict` for each rule): every attempt an entry names is one the claim holds; every attempt it holds is exactly one of these: marked `from_upload`; the one an `attempt` entry of the claim wrote, with the members that entry gives (its writer as `owner`, its stub's time as `opened_at_ms`, its `orphan_after` and its `deadline`); or one a reopened tombstone kept (below); and each attempt's outcome is the one the latest entry naming it wrote, with that entry's writer as `resolved_by`, or `open` when only its `attempt` entry names it. An attempt marked `from_upload` may be `done` instead, since an uploaded `done` settles an attempt whatever its outcome; one that no entry names keeps its outcome as written, and the uploaded evidence checks it (below). An attempt ID is random (1.7), so no upload names an attempt an `attempt` entry wrote. **Reopened tombstones:** evidence for an obligation N holds only as a tombstone reopens it (spec 12.6 step 3): the claim is live again, marked `rebuilt`, with the tombstone's step and attempts, each with the members the tombstone kept, while compaction removed their entries (6.8), whose chain items show as stubs (7.5). A tombstone is SETTLED and holds only `done` and `failed` attempts, and the claim it reopens stays SETTLED, so it refuses every `attempt` from then on (6.8 row 7). So N takes an attempt neither marked `from_upload` nor written by an `attempt` entry as one a reopened tombstone kept only when the attempt is `done` or `failed`, the claim is SETTLED and none of its entries is an `attempt`; its members are taken as written, as a tombstone's are, and its outcome is still the one the latest entry naming it wrote, when one does, such as its owner's `done` on a `failed` one (6.8 row 2). What only uploads change is taken as written: `divergent`, `last_entry_ms`, the pin, each attempt's `possibly_duplicate` and `duplicate`, and the states the entries' proofs show, which include the uploads merged between them; each proof is still that entry's. Within the bounds that hold whatever the order: the claim is SETTLED exactly when one of its attempts is `done`; its `current` is `null` or an open attempt it holds; and two open attempts make it `divergent`, since an upload opens a second attempt only beside an open one and only resolving them clears it. A tombstone's `last_entry_ms` is taken as written, since it keeps no entries, while each tombstone's `creator` must be the owner of its own first attempt (`409 conflict`). Vectors: `export.json` `claim_rejections` (another creator, another last entry time, the open attempt shown `failed` under a proof signed again, a `failed` entry O signed itself, a `failed` entry the executor signed under its own certificate naming the wallet as its writer, and the claim marked `rebuilt` on an account without a provider loss);
    - each inbox entry's `seq` is one O gave out (at most the meta part's `seq`), no chain item's, and appears once; every batch ID a kept stub names has its `batch` part, since O keeps a batch's ID while any of its stubs is kept (6.4) (`409 conflict`);
    - **the uploaded evidence** (spec 12.5 step 3): a claim an uploaded proof shows SETTLED is SETTLED in the import, live or as a tombstone, unless the proof's deadline plus the 30-day reconciliation window (6.8) is at or before `last_time`, or, for a proof without a deadline, its time plus `max_claim_age_ms` is; a claim an uploaded proof shows with an attempt (the proof of an app's own open attempt) is held, live or as a tombstone, with that attempt, at that step or a later one; a live claim at that step or a later one gives each attempt that the proof shows of the uploading app's own the outcome the proof shows, unless one of the claim's entries at or after the proof's step writes another for it (a `done`, `failed` or `unknown` naming it), or, on a rebuilt claim, the attempt is marked `from_upload` and `done`, which a later upload may have made it, or is one a reopened tombstone kept, whose entries compaction removed; so an uploaded attempt taken as written can't contradict its owner's evidence: one its owner's proof shows open isn't `failed` or `unknown` in the import unless a verified entry made it so. Another app's attempts in a proof aren't compared, since an upload may have changed them after the proof without the uploading app seeing it. A tombstone keeps no entries, and is SETTLED, so what it holds frees no obligation, and neither does what a reopened tombstone kept, on a claim that stays SETTLED; a record an uploaded proof shows at version v is that very write, by the proof's item hash, or one whose signed `expected_version` is v or later, or absent when v is a delete (`409 conflict`, naming the app whose evidence fails). The checks compare what the operations signed, not version numbers O wrote;
@@ -2927,17 +2929,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "HDiFHOlPNQId9KGGr1CcEfpCfks1oxSkDba9uRxfO58",
-    "sig": "AxFJFQnl71N8EFGYMpWPkFBwQdAJOK_IJz2nWZsS..."
+    "chain_hash": "iHbOghlbHysr_-JXzT77EybQD1PuuuzturKanqf6YFg",
+    "sig": "gi1IwXy4tJh7ozhLclnPGed17QgayBNQ4zZJtvKD..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 28982,
+  "bytes": 29038,
   "chunks": [
     {
       "id": "00000",
-      "len": 28982,
-      "hash": "dG2Xe-sx30GQlHT3YT6ennfz_Q5-2pL7199woRB_vbo",
+      "len": 29038,
+      "hash": "bcxYROF7FzGEgvT-Nxo4wf0ti2wExdwgTgixDWh1cXU",
       "first": 0,
       "last": 18
     }
@@ -3030,7 +3032,7 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "Z3_U3AsxoDiMQTgRCZ8fF9E_P0Ex2tL8skLWlSRy..."
+    "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5..."
   },
   "cert": null
 }
@@ -3051,7 +3053,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "svZhsiF2IRrW30xJK0hM9m3784FyWv9LoTeA8gBb..."
+      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjU..."
     },
     "read_scope": "tasks",
     "seq": 8,
@@ -3074,7 +3076,7 @@ The wallet's `app` part:
   "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "record": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "soHnAkpU7U2ovHwh3rpcP-UlAgRUZFE0SOWUwzbr..."
+    "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
@@ -3108,7 +3110,7 @@ The first `batch` part:
   "id": "43lMSHQ8vKwdwxES7T9SUw",
   "record": {
     "at_ms": 1767225601000,
-    "ops_hash": "piV-jr-g2YX_JlSqnH26awNUBwM1TpMuhq6DnsJ1gPE",
+    "ops_hash": "ny26f78GClxEQ7P6maDnoueX0NvFubeZ2sCTy5a16-I",
     "proofs": []
   }
 }

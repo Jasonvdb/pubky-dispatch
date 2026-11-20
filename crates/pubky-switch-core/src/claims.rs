@@ -14,7 +14,7 @@
 
 use serde_json::{Value, json};
 
-use crate::enc::{b64, zbase32_encode};
+use crate::enc::{Obj, b64, zbase32_encode};
 use crate::error::{Error, Result, invalid};
 use crate::http::ErrorCode;
 use crate::ops::Refusal;
@@ -163,7 +163,7 @@ impl ClaimFields {
         })
     }
 
-    pub(crate) fn write(&self, o: &mut crate::ops::body::Obj) {
+    pub(crate) fn write(&self, o: &mut Obj) {
         o.str("claim_key", &b64(&self.claim_key))
             .str("type", self.kind.as_str())
             .int("expected_step", self.expected_step)

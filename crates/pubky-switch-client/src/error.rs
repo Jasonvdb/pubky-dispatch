@@ -137,6 +137,15 @@ pub enum TransportError {
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// A recovery notice held by the own app forbids a write to this service.
+    #[error("the app holds a recovery notice for generation {generation}")]
+    OwnRecoveryRequired {
+        /// The generation that stopped serving the account.
+        generation: u64,
+    },
+    /// The owner is awaiting the original response to a signed display read.
+    #[error("the display read is awaiting its original response")]
+    DisplayReadPending,
     /// An error answer of the switch, checked with the pinned service key (Switch wire 7.1,
     /// 7.6).
     #[error("{code}: {message}")]

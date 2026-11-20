@@ -94,7 +94,7 @@ impl Signer {
     /// and sent again by [`Signer::resume`].
     pub async fn hand_over_to(&mut self, to_app: [u8; 16], confirmed: UserConfirmed) -> Result<()> {
         self.ready().await?;
-        // Any closing owed, one waiting for a later version's service time included.
+        // A reduction must close before the signer hands its records over.
         if !self.owed()?.is_empty() {
             return Err(Refusal::ClosingOwed.into());
         }

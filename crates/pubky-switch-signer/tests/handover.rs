@@ -620,28 +620,47 @@ async fn test_old_signer_finds_the_proof_at_a_later_version() {
     // version with its backup is the proof.
     let world = World::new();
     let mut s = setup(&world).await;
-    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
-    let mut new = Signer::receive_hand_over(
-        world.env(Arc::new(MemoryStore::new())),
-        &s.target,
-        empty_vault(),
-    )
-    .await
-    .unwrap();
-    new.set_record_max_age(Some(60)).await.unwrap();
+    let app_id = s.app_id();
+    s.old.hand_over_to(app_id, confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let vault = empty_vault();
+    let mut new = Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
+        .await
+        .unwrap();
+    let accepted = new.set_record_max_age(Some(60)).await.unwrap();
+    assert_eq!(accepted.version(), s.handed.version() + 2);
+    assert_eq!(world.backup().identity_doc().signed(), accepted.signed());
+    drop(new);
+    drop(s.old);
+
+    let mut old = Signer::open(world.env(s.old_store.clone()), world.keyring())
+        .await
+        .unwrap();
+    let mut new = Signer::open(world.env(store), IdentityKeyring::open(vault).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(new.status(), SignerStatus::Signing);
+    assert_eq!(accepted.body().signer, new.install_id());
+    assert_eq!(old.status(), SignerStatus::HandingOver { to_app: app_id });
+    let handed_over = SignerError::HandedOver {
+        install: new.install_id(),
+    };
     assert_eq!(
-        world.backup().identity_doc().version(),
-        s.handed.version() + 2
+        old.set_record_max_age(Some(90)).await.unwrap_err(),
+        handed_over
     );
-    assert_eq!(
-        s.old.resume().await.unwrap_err(),
-        SignerError::HandedOver {
-            install: new.install_id()
-        }
-    );
+    assert_eq!(old.resume().await.unwrap_err(), handed_over);
     assert!(!vault_holds(&world.vault));
     assert!(!holds_records(&s.old_store).await);
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        accepted.signed()
+    );
+    let next = new.set_record_max_age(Some(90)).await.unwrap();
+    assert_eq!(next.version(), accepted.version() + 1);
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
 }
+
 #[tokio::test]
 async fn test_hand_over_run_due_signs_nothing_routine() {
     let world = World::new();
@@ -1158,7 +1177,7 @@ async fn test_hand_over_decided_before_a_failed_publication() {
 }
 #[tokio::test]
 async fn test_hand_over_refused_while_a_closing_is_owed() {
-    // A reduction's closing waits for a service time the switch didn't give: still owed.
+    // A reduction stays owed while the signer cannot verify its account read.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
@@ -1173,17 +1192,36 @@ async fn test_hand_over_refused_while_a_closing_is_owed() {
     };
     signer.renew(id, reduce).await.unwrap_err();
     world.switch.forget_delivery_proof();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
     signer.resume().await.unwrap_err();
     assert!(
         signer
             .alerts()
             .contains(&Alert::ReductionNotClosed { apps: vec![id] })
     );
-    assert_eq!(
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    assert!(matches!(
         signer.hand_over_to(id, confirmed()).await.unwrap_err(),
-        SignerError::Refused(Refusal::ClosingOwed)
-    );
+        SignerError::Switch(pubky_switch_client::ClientError::Transport(_))
+    ));
     assert_eq!(world.switch.stored_handover(), None);
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::ReductionNotClosed { apps: vec![id] })
+    );
+    signer.resume().await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::ReductionNotClosed { apps: vec![id] })
+    );
 }
 
 #[tokio::test]

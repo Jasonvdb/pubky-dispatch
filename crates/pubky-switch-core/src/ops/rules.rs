@@ -5,7 +5,8 @@
 use serde_json::json;
 
 use super::Refusal;
-use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut, carrying};
+use super::body::{InviteCodePut, KeyBundlePut, OpBody, OpKind, RecordPut};
+use crate::enc::carrying;
 use crate::error::{Error, Result};
 use crate::http::ErrorCode;
 use crate::ident::{collection_id, record_key_from_blinded};
@@ -1019,16 +1020,15 @@ mod tests {
         );
     }
 
-    fn app_record(updated_at: u64, label: Option<&str>) -> AppRecord {
-        let mut b = AppRecordBody::new(&cert(), Vec::new(), updated_at);
-        b.label = label.map(str::to_owned);
+    fn app_record(updated_at: u64, accepts: Vec<String>) -> AppRecord {
+        let b = AppRecordBody::new(&cert(), accepts, updated_at);
         AppRecord::sign(&app(), b).unwrap()
     }
 
     #[test]
     fn test_app_put_rules() {
         let a = app().app_id_bytes();
-        let held = app_record(ISSUED, None);
+        let held = app_record(ISSUED, vec![]);
         let listed = Some(cert().hash());
         assert_eq!(
             check_app_put(&a, &held, listed, None).unwrap(),
@@ -1038,12 +1038,12 @@ mod tests {
             check_app_put(&a, &held, listed, Some(&held)).unwrap(),
             AppPutEffect::Unchanged
         );
-        let later = app_record(ISSUED + 1, None);
+        let later = app_record(ISSUED + 1, vec![]);
         assert_eq!(
             check_app_put(&a, &later, listed, Some(&held)).unwrap(),
             AppPutEffect::Replaces
         );
-        let same_time = app_record(ISSUED, Some("other"));
+        let same_time = app_record(ISSUED, vec!["sample.other".into()]);
         let refused = check_app_put(&a, &same_time, listed, Some(&held)).unwrap_err();
         assert_eq!(refused.status(), 409);
         assert_eq!(refused.current.unwrap()["record"]["sig"], held.signed().sig);

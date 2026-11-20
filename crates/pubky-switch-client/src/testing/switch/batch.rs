@@ -18,7 +18,7 @@ use pubky_switch_core::ops::{
 };
 use pubky_switch_core::records::{AppCert, AppRecord, ReceiveKeyRecord, Standing};
 use pubky_switch_core::sig::SignedDoc;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::shared::{Before, OpContext, Shared, Written};
 use super::{Answer, Inner, Readers, SwitchApp, missing};

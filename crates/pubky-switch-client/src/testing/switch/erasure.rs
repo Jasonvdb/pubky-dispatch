@@ -193,7 +193,6 @@ mod tests {
                     uses: 0,
                     writer: [4; 16],
                     expires_at: 1,
-                    context: Value::Null,
                 },
             );
             let created = inner.creation_time();

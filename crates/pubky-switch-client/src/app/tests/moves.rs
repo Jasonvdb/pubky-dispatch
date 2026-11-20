@@ -2029,6 +2029,7 @@ async fn store_entries(
             let stored = crate::app::state::ParkedEntry {
                 receipt: crate::app::EntryReceipt {
                     entry_id: [1; 16],
+                    invite_code_hash: None,
                     service_key: [2; 32],
                     read_at_ms: lost.w.clock.now_ms(),
                 },
@@ -2038,7 +2039,6 @@ async fn store_entries(
                 cert: lost.w.bob_cert.signed().clone(),
                 accepted_at_ms: lost.w.clock.now_ms(),
                 plaintext: vec![0xff; bytes],
-                context: None,
                 reason: ParkReason::Refused,
                 round: 0,
                 released: false,
@@ -2121,6 +2121,7 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
     let stored = crate::app::state::ParkedEntry {
         receipt: crate::app::EntryReceipt {
             entry_id: [1; 16],
+            invite_code_hash: None,
             service_key: [2; 32],
             read_at_ms: lost.note_at_ms,
         },
@@ -2130,7 +2131,6 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
         cert: lost.w.bob_cert.signed().clone(),
         accepted_at_ms: lost.note_at_ms,
         plaintext: b"kept".to_vec(),
-        context: None,
         reason: ParkReason::Refused,
         round: 0,
         released: false,
@@ -4679,12 +4679,12 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         entry: crate::app::state::KeptEntry {
             receipt: crate::app::EntryReceipt {
                 entry_id: [1; 16],
+                invite_code_hash: None,
                 service_key: [2; 32],
                 read_at_ms: lost.w.clock.now_ms(),
             },
             cert: app.cert().signed().clone(),
             plaintext: Vec::new(),
-            context: None,
         },
     };
     let mut tx = app.tx().unwrap();
@@ -4731,12 +4731,12 @@ async fn keep_an_effect(
     let entry = crate::app::state::KeptEntry {
         receipt: crate::app::EntryReceipt {
             entry_id: [1; 16],
+            invite_code_hash: None,
             service_key: [2; 32],
             read_at_ms: w.clock.now_ms(),
         },
         cert: w.bob_cert.signed().clone(),
         plaintext: b"kept".to_vec(),
-        context: None,
     };
     let pending = crate::app::state::PendingEffect {
         body: batch.body().to_vec(),
@@ -4768,7 +4768,6 @@ async fn keep_an_effect(
             cert: entry.cert,
             accepted_at_ms: pending.accepted_at_ms,
             plaintext: entry.plaintext,
-            context: None,
             reason: ParkReason::Quota,
             round: 0,
             released: false,

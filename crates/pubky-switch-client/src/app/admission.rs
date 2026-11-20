@@ -6,7 +6,7 @@
 //! - **Conversation entries**: an invite is a conversation entry before any message
 //!   (`conversation.add`); a first message adds one itself ([`super::send`]).
 //! - **Invite codes**: the app makes a code of 32 random bytes, registers its hash with an
-//!   expiry, a number of uses and an opaque context (`invite_code.put`), shows it as
+//!   expiry and a maximum number of uses (`invite_code.put`), shows it as
 //!   `pubky://<id>?switch=invite&code=<code>`, and may withdraw it.
 //! - **Connect requests**: asking a stranger's switch to be invited, and listing, allowing
 //!   (an invite) and declining the requests at the own switch.
@@ -23,10 +23,9 @@
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{invite_code_hash, invite_code_uri};
-use pubky_switch_core::ops::{AllowKind, InviteCodePut, InviteContext, OpKind, SignedOp};
+use pubky_switch_core::ops::{AllowKind, InviteCodePut, OpKind, SignedOp};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::batch::OpBatch;
 use super::error::Refusal;
@@ -147,8 +146,6 @@ pub struct InviteCode {
     pub expires_at: u64,
     /// How many appends it admits.
     pub max_uses: u64,
-    /// The opaque context the switch stores in the clear.
-    pub context: Value,
 }
 
 impl std::fmt::Debug for InviteCode {
@@ -167,7 +164,6 @@ pub(crate) fn keep_invite(tx: &mut Tx, put: &InviteCodePut, code: &str) -> Resul
             code_hash: put.code_hash,
             expires_at: put.expires_at,
             max_uses: put.max_uses,
-            context: put.context.value().clone(),
         },
     )
 }
@@ -491,9 +487,8 @@ impl App {
     // Invite codes
 
     /// Make and register an invite code (`invite_code.put`, `conversation.add`): 32 random
-    /// bytes, its hash, `expires_at`, `max_uses` and an opaque `context` the switch stores
-    /// in the clear, so the context holds nothing the operator shouldn't read (Switch spec
-    /// 7). The app keeps the code to show it again ([`InviteCode::uri`]).
+    /// bytes, its hash, `expires_at` and `max_uses` (Switch spec 7). The app keeps the
+    /// code to show it again ([`InviteCode::uri`]).
     ///
     /// # Errors
     ///
@@ -503,7 +498,6 @@ impl App {
         &mut self,
         expires_at: u64,
         max_uses: u64,
-        context: Value,
     ) -> Result<InviteCode, AppError> {
         Box::pin(async move {
             self.need(Permission::ConversationAdd)?;
@@ -518,7 +512,6 @@ impl App {
                 code_hash,
                 expires_at,
                 max_uses,
-                context: InviteContext::new(context.clone()),
             };
             self.submit_batch(
                 OpBatch::new()
@@ -531,7 +524,6 @@ impl App {
                 code_hash,
                 expires_at,
                 max_uses,
-                context,
             })
         })
         .await
@@ -674,7 +666,6 @@ mod tests {
             code_hash: [1; 32],
             expires_at: 1,
             max_uses: 1,
-            context: Value::Null,
         };
         assert!(!format!("{code:?}").contains("secret"));
         assert!(

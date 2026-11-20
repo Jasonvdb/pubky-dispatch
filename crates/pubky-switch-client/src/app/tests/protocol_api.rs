@@ -58,6 +58,8 @@ enum Mode {
     OtherWriteScope,
     /// A write of `inbox` with a value that isn't JSON.
     NotJson,
+    /// Keep the received note locally, without changing service admission.
+    LocalNote,
     /// Complete the input's local handling without a processed pair.
     Consume,
     /// Keep the input in admission custody without its staged local write.
@@ -75,7 +77,7 @@ struct Seen {
     conflict: bool,
     /// The context's answers to the writes, as text.
     writes: Vec<Result<(), String>>,
-    context: Option<Value>,
+    invite_code_hash: Option<[u8; 32]>,
     /// What the context knew of the sender's standing in the lists.
     disposition: Option<SenderDisposition>,
     /// The condition the context named on `inbox`, in the record modes.
@@ -211,9 +213,9 @@ impl Protocol for ApiProtocol {
         self.items.accepts(cert)
     }
 
-    /// The plain mode receives as [`ItemsProtocol`] does; the others take any body.
+    /// Plain and locally kept notes use [`ItemsProtocol`]'s body checks.
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
-        if *self.mode.lock().unwrap() == Mode::Plain {
+        if matches!(*self.mode.lock().unwrap(), Mode::Plain | Mode::LocalNote) {
             self.items.check_body(message)
         } else {
             Ok(())
@@ -229,7 +231,7 @@ impl Protocol for ApiProtocol {
             held: None,
             conflict: message.conflict.is_some(),
             writes: Vec::new(),
-            context: message.context.clone(),
+            invite_code_hash: message.receipt.invite_code_hash,
             disposition: cx.sender_disposition(&message.sender).ok(),
             condition: None,
         };
@@ -245,16 +247,16 @@ impl Protocol for ApiProtocol {
         }
         let outcome = match mode {
             Mode::Plain => self.items.receive(message, cx),
-            Mode::Consume | Mode::AwaitAdmission => {
+            Mode::LocalNote | Mode::Consume | Mode::AwaitAdmission => {
                 cx.local(LocalWrite::Put {
                     key: format!("notes/{msg_id}").into_bytes(),
                     value: b"1".to_vec(),
                 })
                 .unwrap();
-                if mode == Mode::Consume {
-                    Outcome::Consume
-                } else {
-                    Outcome::AwaitAdmission
+                match mode {
+                    Mode::Consume => Outcome::Consume,
+                    Mode::AwaitAdmission => Outcome::AwaitAdmission,
+                    _ => Outcome::Apply(Effect::default()),
                 }
             }
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
@@ -1788,15 +1790,12 @@ async fn test_scripted_inbox_admits_after_an_invite_and_delivers() {
 }
 
 #[tokio::test]
-async fn test_scripted_inbox_invite_code_admits_once_with_its_context() {
+async fn test_scripted_inbox_invite_code_admits_once_with_its_hash() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
     let mut shop = p.join(&p.bob, "shop", &protocol).await;
-    let code = shop
-        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
-        .await
-        .unwrap();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
     let mut first = Pair::note(&p.bob, "order");
     first.invite_code = Some(code.code.clone());
     let (_, delivery) = wallet.send(first).await.unwrap();
@@ -1807,10 +1806,7 @@ async fn test_scripted_inbox_invite_code_admits_once_with_its_context() {
     assert_eq!(p.bob.switch().invite_uses_left(&code.code), Some(0));
     shop.receive(None).await.unwrap();
     let seen = protocol.seen();
-    assert_eq!(
-        seen.last().unwrap().context,
-        Some(json!({ "order": "o-1" }))
-    );
+    assert_eq!(seen.last().unwrap().invite_code_hash, Some(code.code_hash));
     // The service's conversation entry admits the sender from then on, without the code.
     let (_, delivery) = wallet.send(Pair::note(&p.bob, "again")).await.unwrap();
     assert!(
@@ -1823,6 +1819,139 @@ async fn test_scripted_inbox_invite_code_admits_once_with_its_context() {
     late.invite_code = Some(code.code);
     let (_, delivery) = carol_app.send(late).await.unwrap();
     assert!(queued_with(&delivery, "not_admitted"), "{delivery:?}");
+}
+
+/// An accepted outbox item with an owed record job resends under ordinary admission.
+/// An unanswered first append retries the invited envelope and its single-use code.
+#[tokio::test]
+async fn test_invited_append_retry_and_resend_with_an_owed_record() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    let mut note = Pair::note(&p.bob, "order");
+    note.invite_code = Some(code.code.clone());
+    let signed = wallet.sign_message(note).unwrap().with_record(RecordJob {
+        target: inbox(),
+        tag: b"sent".to_vec(),
+    });
+    let id = wallet.queue_signed(signed).await.unwrap();
+
+    p.bob.switch().fail_next(Fault::LoseAnswer {
+        path: "inbox".into(),
+    });
+    let first = wallet.flush_message(&id).await.unwrap();
+    assert!(matches!(first, Some(Delivery::Queued { .. })), "{first:?}");
+    let alice = p.alice.identity().public();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    assert_eq!(p.bob.switch().invite_uses_left(&code.code), Some(0));
+
+    p.alice
+        .switch()
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let confirmed = wallet.flush_message(&id).await.unwrap();
+    assert!(
+        matches!(confirmed, Some(Delivery::Accepted { .. })),
+        "{confirmed:?}"
+    );
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    assert!(
+        wallet.outbox_record(&id).await.is_some(),
+        "the accepted record job is owed"
+    );
+
+    let resent = wallet.resend(&id).await.unwrap();
+    assert!(matches!(resent, Delivery::Accepted { .. }), "{resent:?}");
+    assert_eq!(p.bob.switch().entries_from(&alice), 2);
+    shop.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 1, "the same signed message is applied once");
+    assert_eq!(seen[0].msg_id, id);
+    assert_eq!(seen[0].invite_code_hash, Some(code.code_hash));
+}
+
+/// Both targets read each delivery's redeemed code, including a wallet restored from
+/// before the codes were registered. An already-admitted sender may redeem a second code.
+#[tokio::test]
+async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_wallet() {
+    let p = Pair::new();
+    let sender = ApiProtocol::new(Mode::Plain);
+    let managing = ApiProtocol::new(Mode::LocalNote);
+    let sibling = ApiProtocol::new(Mode::LocalNote);
+    let mut wallet = p.join(&p.alice, "wallet", &sender).await;
+    let mut shop = p.join(&p.bob, "shop", &managing).await;
+    let mut till = p
+        .join_with(
+            &p.bob,
+            "till",
+            sibling.clone(),
+            Arc::new(MemoryStore::new()),
+            &[],
+        )
+        .await;
+    shop.receive(None).await.unwrap();
+    let backup = shop.backup().await.unwrap();
+    let first = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    let second = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    assert_ne!(first.code_hash, second.code_hash);
+    drop(shop);
+
+    let mut expected = Vec::new();
+    for (text, code) in [
+        ("first", Some(&first)),
+        ("second", Some(&second)),
+        ("ordinary", None),
+    ] {
+        let mut note = Pair::note(&p.bob, text);
+        note.invite_code = code.map(|invite| invite.code.clone());
+        let (id, sent) = wallet.send(note).await.unwrap();
+        assert!(matches!(sent, Delivery::Accepted { .. }), "{sent:?}");
+        expected.push((id, code.map(|invite| invite.code_hash)));
+    }
+    assert_eq!(p.bob.switch().invite_uses_left(&first.code), Some(0));
+    assert_eq!(p.bob.switch().invite_uses_left(&second.code), Some(0));
+
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::new(MemoryStore::new())),
+        managing.clone(),
+        config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    for (app, protocol) in [(&mut till, &sibling), (&mut restored, &managing)] {
+        let mut delivered = Vec::new();
+        for _ in 0..3 {
+            let report = app.receive(None).await.unwrap();
+            delivered.extend(report.events.into_iter().filter_map(|event| match event {
+                AppEvent::MessageReceived {
+                    msg_id, receipt, ..
+                } => Some((msg_id, receipt.invite_code_hash)),
+                _ => None,
+            }));
+            if delivered.len() == expected.len() {
+                break;
+            }
+        }
+        assert_eq!(delivered, expected);
+        let observed: Vec<_> = protocol
+            .seen()
+            .into_iter()
+            .map(|seen| (seen.msg_id, seen.invite_code_hash))
+            .collect();
+        assert_eq!(observed, expected);
+    }
+    let lists = restored.allow_list().await.unwrap();
+    let [conversation] = lists.conversations.as_slice() else {
+        panic!("{lists:?}");
+    };
+    assert_eq!(conversation.pubky, p.alice.identity().public());
+    assert_eq!(conversation.code_hash, Some(first.code_hash));
+    let mut spent = Pair::note(&p.bob, "spent");
+    spent.invite_code = Some(first.code);
+    let (_, sent) = wallet.send(spent).await.unwrap();
+    assert!(queued_with(&sent, "not_admitted"), "{sent:?}");
 }
 
 #[tokio::test]
@@ -2064,10 +2193,7 @@ async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_dec
 
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
-    let code = shop
-        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
-        .await
-        .unwrap();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
     let mut first = Pair::note(&p.bob, "order");
     first.invite_code = Some(code.code.clone());
     let (_, delivery) = wallet.send(first).await.unwrap();
@@ -3739,10 +3865,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         vec![claims],
     ));
     // An invite code: `lists.read` or `conversation.add`, each alone.
-    let code = shop
-        .register_invite_code(START + DAY_MS, 1, json!({}))
-        .await
-        .unwrap();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
     rows.push((
         "invite_code.put",
         switch.seq(),
@@ -4581,18 +4704,12 @@ async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
     let mut shop = p.join(&p.bob, "shop", &protocol).await;
-    let spent = shop
-        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
-        .await
-        .unwrap();
+    let spent = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
     let expiring = shop
-        .register_invite_code(START + 10 * MINUTE, 1, Value::Null)
+        .register_invite_code(START + 10 * MINUTE, 1)
         .await
         .unwrap();
-    let live = shop
-        .register_invite_code(START + DAY_MS, 2, Value::Null)
-        .await
-        .unwrap();
+    let live = shop.register_invite_code(START + DAY_MS, 2).await.unwrap();
     let mut first = Pair::note(&p.bob, "order");
     first.invite_code = Some(spent.code.clone());
     let (_, delivery) = wallet.send(first).await.unwrap();
@@ -4604,7 +4721,7 @@ async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
     assert_eq!(p.bob.switch().invite_uses_left(&spent.code), Some(0));
     // A code expiring at the very time of the sweep is expired then, as at the service.
     let at_the_sweep = shop
-        .register_invite_code(p.clock.now_ms() + 11 * MINUTE, 1, Value::Null)
+        .register_invite_code(p.clock.now_ms() + 11 * MINUTE, 1)
         .await
         .unwrap();
     p.clock.advance_ms(11 * MINUTE);
@@ -4623,10 +4740,7 @@ async fn test_scripted_invite_codes_sweep_with_the_clock_behind_its_mark() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut shop = p.join(&p.bob, "shop", &protocol).await;
-    let code = shop
-        .register_invite_code(START + MINUTE, 1, Value::Null)
-        .await
-        .unwrap();
+    let code = shop.register_invite_code(START + MINUTE, 1).await.unwrap();
     p.bob.switch().lock().shared.swept_at = Some(START + DAY_MS);
     p.clock.advance_ms(2 * MINUTE);
     shop.receive(None).await.unwrap();

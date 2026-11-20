@@ -122,43 +122,7 @@
         "writer": "wallet"
       }
     ],
-    "description": "Wire 1.1: every int is a JSON number from 0 to 2^53 - 1 (9007199254740991), without sign, fraction or exponent. Each case is the operation named in based_on with its orphan_after written as number, signed again by its writer, so its signature verifies and only the integer rule decides: the largest integer is valid; 2^53, a fraction (86400.0 included), an exponent and a sign are refused with 400 bad_request, before the operation's fields are read. Only the opaque members wire 1.1 names by path are exempt: a message body's metadata, a tasks.done body's proof, an invite code's context (encoding.json json)."
-  },
-  "invite_context": {
-    "cases": [
-      {
-        "based_on": "invite_code.put",
-        "body": "{\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"app_id\":\"w8amtmn13m6p5bwnmj9wejbq4c\",\"generation\":1,\"batch\":{\"id\":\"DGGVc1sXuBvvZH4cyxt3mQ\",\"count\":1},\"op\":\"invite_code.put\",\"code_hash\":\"puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo\",\"expires_at\":\"2026-01-02T00:00:00.000Z\",\"max_uses\":1,\"context\":{                        \"board\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}",
-        "compact_bytes": 1000,
-        "context_bytes": 1024,
-        "expect": {
-          "valid": true
-        },
-        "name": "1024 bytes as written: taken",
-        "signed": {
-          "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQxOGhza2RveGR4enVldXRpdTNmMzkxcm5udXh6bnhtcXA1Ym8iLCJhcHBfaWQiOiJ3OGFtdG1uMTNtNnA1YndubWo5d2VqYnE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiREdHVmMxc1h1QnZ2Wkg0Y3l4dDNtUSIsImNvdW50IjoxfSwib3AiOiJpbnZpdGVfY29kZS5wdXQiLCJjb2RlX2hhc2giOiJwdWl0UVg2QXZpV0pSWnhleU93MGRrZTg2U3NrX2I3ZTF5ZGRmQkhfYkJvIiwiZXhwaXJlc19hdCI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAwWiIsIm1heF91c2VzIjoxLCJjb250ZXh0Ijp7ICAgICAgICAgICAgICAgICAgICAgICAgImJvYXJkIjoieHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eCJ9fQ",
-          "sig": "kP9sCzq8I-g1P7M_xhM9T6F3H1Ud95dBTcmOoqLyQFBF1WPH5daTVsj52YaBldfhQhqfKZ_aryRP6QC3Ufn1Dg"
-        },
-        "writer": "wallet"
-      },
-      {
-        "based_on": "invite_code.put",
-        "body": "{\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"app_id\":\"w8amtmn13m6p5bwnmj9wejbq4c\",\"generation\":1,\"batch\":{\"id\":\"DGGVc1sXuBvvZH4cyxt3mQ\",\"count\":1},\"op\":\"invite_code.put\",\"code_hash\":\"puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo\",\"expires_at\":\"2026-01-02T00:00:00.000Z\",\"max_uses\":1,\"context\":{                         \"board\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}",
-        "compact_bytes": 1000,
-        "context_bytes": 1025,
-        "expect": {
-          "code": "too_large",
-          "status": 413
-        },
-        "name": "1025 bytes as written, 1000 compacted: refused",
-        "signed": {
-          "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQxOGhza2RveGR4enVldXRpdTNmMzkxcm5udXh6bnhtcXA1Ym8iLCJhcHBfaWQiOiJ3OGFtdG1uMTNtNnA1YndubWo5d2VqYnE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiREdHVmMxc1h1QnZ2Wkg0Y3l4dDNtUSIsImNvdW50IjoxfSwib3AiOiJpbnZpdGVfY29kZS5wdXQiLCJjb2RlX2hhc2giOiJwdWl0UVg2QXZpV0pSWnhleU93MGRrZTg2U3NrX2I3ZTF5ZGRmQkhfYkJvIiwiZXhwaXJlc19hdCI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAwWiIsIm1heF91c2VzIjoxLCJjb250ZXh0Ijp7ICAgICAgICAgICAgICAgICAgICAgICAgICJib2FyZCI6Inh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHgifX0",
-          "sig": "y9wjttbfrTfqA0QTki10LFbYQ3fOeC-92M-vDEQmUdIhWfKOUqNfLca4cuGUI6vtsXnQ9ycko8VvngbruNDRDA"
-        },
-        "writer": "wallet"
-      }
-    ],
-    "description": "Wire 6.2: an invite code's context is at most 1024 bytes as the writer serialized it, the bytes of its value within the signed body from its first byte to its last, whitespace included, never a re-serialization; else 413 too_large. Each case is the invite_code.put of operations with its context written with spaces inside its object, signed again by the wallet, so its signature verifies and only the length decides. context_bytes is the context as written, compact_bytes compacted."
+    "description": "Wire 1.1: every int is a JSON number from 0 to 2^53 - 1 (9007199254740991), without sign, fraction or exponent. Each case is the operation named in based_on with its orphan_after written as number, signed again by its writer, so its signature verifies and only the integer rule decides: the largest integer is valid; 2^53, a fraction (86400.0 included), an exponent and a sign are refused with 400 bad_request, before the operation's fields are read. Only the opaque members wire 1.1 names by path are exempt: a message body's metadata and a tasks.done body's proof (encoding.json json)."
   },
   "operations": [
     {
@@ -324,11 +288,11 @@
       "writer": "wallet"
     },
     {
-      "body": "{\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"app_id\":\"w8amtmn13m6p5bwnmj9wejbq4c\",\"generation\":1,\"batch\":{\"id\":\"DGGVc1sXuBvvZH4cyxt3mQ\",\"count\":1},\"op\":\"invite_code.put\",\"code_hash\":\"puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo\",\"expires_at\":\"2026-01-02T00:00:00.000Z\",\"max_uses\":1,\"context\":{\"board\":\"home\"}}",
+      "body": "{\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"app_id\":\"w8amtmn13m6p5bwnmj9wejbq4c\",\"generation\":1,\"batch\":{\"id\":\"DGGVc1sXuBvvZH4cyxt3mQ\",\"count\":1},\"op\":\"invite_code.put\",\"code_hash\":\"puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo\",\"expires_at\":\"2026-01-02T00:00:00.000Z\",\"max_uses\":1}",
       "name": "invite_code.put",
       "signed": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQxOGhza2RveGR4enVldXRpdTNmMzkxcm5udXh6bnhtcXA1Ym8iLCJhcHBfaWQiOiJ3OGFtdG1uMTNtNnA1YndubWo5d2VqYnE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiREdHVmMxc1h1QnZ2Wkg0Y3l4dDNtUSIsImNvdW50IjoxfSwib3AiOiJpbnZpdGVfY29kZS5wdXQiLCJjb2RlX2hhc2giOiJwdWl0UVg2QXZpV0pSWnhleU93MGRrZTg2U3NrX2I3ZTF5ZGRmQkhfYkJvIiwiZXhwaXJlc19hdCI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAwWiIsIm1heF91c2VzIjoxLCJjb250ZXh0Ijp7ImJvYXJkIjoiaG9tZSJ9fQ",
-        "sig": "tl19hnF6sARSDVJ8qni84KTvNfhja-4sYrzZqE8USiiKST_GrC95SrdYj9JoAUAQ2lrW6cddqDgEISZOTNLkDA"
+        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQxOGhza2RveGR4enVldXRpdTNmMzkxcm5udXh6bnhtcXA1Ym8iLCJhcHBfaWQiOiJ3OGFtdG1uMTNtNnA1YndubWo5d2VqYnE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiREdHVmMxc1h1QnZ2Wkg0Y3l4dDNtUSIsImNvdW50IjoxfSwib3AiOiJpbnZpdGVfY29kZS5wdXQiLCJjb2RlX2hhc2giOiJwdWl0UVg2QXZpV0pSWnhleU93MGRrZTg2U3NrX2I3ZTF5ZGRmQkhfYkJvIiwiZXhwaXJlc19hdCI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAwWiIsIm1heF91c2VzIjoxfQ",
+        "sig": "ngVIooylcR_ZTqSOIjdhLTM_tOgzzf6KUwSajBw3WWT-ezewDiWPbWJ59lPptVopU_S84y0FNxhp2kJjCnpgBw"
       },
       "writer": "wallet"
     },
@@ -846,6 +810,6 @@
         "writer": "signer"
       }
     ],
-    "description": "Wire 1.1, 6.1: unknown members are refused at every depth of an operation body, as at its top level: in batch, a condition and its object, expected_version, value_sealed, id_inputs, the carrying form of a signed record or cert, and the key bundle. Each case is the operation named in based_on with the member future_restriction added at the path in member (a dotted path; numbers index arrays), signed again by its writer, so its signature verifies and only the member check refuses it: 400 bad_request. The opaque context of invite_code.put is exempt."
+    "description": "Wire 1.1, 6.1: unknown members are refused at every depth of an operation body, as at its top level: in batch, a condition and its object, expected_version, value_sealed, id_inputs, the carrying form of a signed record or cert, and the key bundle. Each case is the operation named in based_on with the member future_restriction added at the path in member (a dotted path; numbers index arrays), signed again by its writer, so its signature verifies and only the member check refuses it: 400 bad_request."
   }
 }

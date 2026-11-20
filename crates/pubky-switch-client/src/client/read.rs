@@ -3,20 +3,16 @@
 
 use pubky_switch_core::chain::SignedHead;
 use pubky_switch_core::enc::{app_id_decode, pubky_key, unb64, unb64_array};
-use pubky_switch_core::json::{Doc, parse_json_as};
+use pubky_switch_core::json::parse_json;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::parse_rfc3339;
 use serde_json::{Map, Value};
 
 use crate::error::ClientError;
 
-/// Parse a checked body as strict JSON read as `doc`, which must be an object.
-pub(crate) fn body<'a>(
-    bytes: &[u8],
-    doc: Doc<'_>,
-    what: &'a str,
-) -> Result<(Value, &'a str), ClientError> {
-    let value: Value = parse_json_as(bytes, doc)
+/// Parse a checked body as strict JSON, which must be an object.
+pub(crate) fn body<'a>(bytes: &[u8], what: &'a str) -> Result<(Value, &'a str), ClientError> {
+    let value: Value = parse_json(bytes)
         .map_err(|_| ClientError::InvalidResponse(format!("{what} isn't strict JSON")))?;
     if !value.is_object() {
         return Err(ClientError::InvalidResponse(format!(
@@ -70,8 +66,16 @@ impl<'a> Obj<'a> {
         Obj::of(self.req(name)?, self.what)
     }
 
-    pub(crate) fn value(&self, name: &str) -> Option<Value> {
-        self.get(name).cloned()
+    /// A required base64url member which may explicitly be null.
+    pub(crate) fn nullable_b64n<const N: usize>(
+        &self,
+        name: &str,
+    ) -> Result<Option<[u8; N]>, ClientError> {
+        match self.map.get(name) {
+            Some(Value::Null) => Ok(None),
+            Some(_) => self.b64n(name).map(Some),
+            None => Err(bad(self.what, name)),
+        }
     }
 
     pub(crate) fn u64(&self, name: &str) -> Result<u64, ClientError> {

@@ -2804,6 +2804,9 @@ impl App {
     ) -> Result<(), AppError> {
         let at = answer.accepted_at;
         let first = *item.accepted_at_ms.get_or_insert(at);
+        // The verified append spent this envelope's invitation. A later re-send uses
+        // ordinary admission, including when a record job keeps the message in the outbox.
+        item.invite_code = None;
         item.resend = false;
         item.last_error = None;
         item.clear_undeliverable();

@@ -118,8 +118,8 @@ pub struct EntryItem {
     pub cert: SignedDoc,
     /// When the switch accepted it, in Unix milliseconds.
     pub accepted_at: u64,
-    /// The invite code's context, if one admitted it; opaque.
-    pub context: Option<Value>,
+    /// The hash of the invite code redeemed for this delivery, if any.
+    pub invite_code_hash: Option<[u8; 32]>,
     /// The envelope bytes.
     pub envelope: Vec<u8>,
 }
@@ -135,8 +135,6 @@ pub struct ChainItem {
     pub item_type: ItemType,
     /// The signed document.
     pub item: SignedDoc,
-    /// The context of a service-written conversation entry; opaque.
-    pub context: Option<Value>,
     /// A signed operation's transition proof, unverified: the reader checks it with the
     /// service key of its generation (Switch wire 6.5).
     pub proof: Option<SignedDoc>,
@@ -211,7 +209,7 @@ impl FeedItem {
                 sender: o.pubky("sender")?,
                 cert: o.doc("cert")?,
                 accepted_at: o.time("accepted_at")?,
-                context: o.value("context"),
+                invite_code_hash: o.nullable_b64n("invite_code_hash")?,
                 envelope: o.bytes("envelope")?,
             }),
             "unreadable" => FeedItem::Unreadable {
@@ -237,7 +235,6 @@ impl FeedItem {
                     stub: stub(&o)?,
                     item_type,
                     item: o.doc("item")?,
-                    context: o.value("context"),
                     proof: o.opt_doc("proof")?,
                 })
             }
@@ -254,8 +251,7 @@ impl FeedItem {
     }
 }
 
-/// A page of `GET /v1/{id}/feed` (Switch wire 7.4.4), read as a feed page so its opaque
-/// contexts read (Switch wire 1.1).
+/// A page of `GET /v1/{id}/feed` (Switch wire 7.4.4).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedPage {
     /// The time stamped on this verified response, in Unix milliseconds.
@@ -380,8 +376,6 @@ pub struct Conversation {
     pub written_by: WrittenBy,
     /// The hash of the invite code that created it.
     pub code_hash: Option<[u8; 32]>,
-    /// The invite code's context; opaque.
-    pub context: Option<Value>,
     /// When it was written, in Unix milliseconds.
     pub at: u64,
     /// The service time of the last append it admitted.
@@ -397,7 +391,7 @@ pub struct Flagged {
     pub hits: u64,
 }
 
-/// A live invite code of `GET /v1/{id}/allow`, without its context (Switch wire 7.4.6).
+/// A live invite code of `GET /v1/{id}/allow` (Switch wire 7.4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InviteCodeStatus {
     /// The code's hash.
@@ -412,8 +406,7 @@ pub struct InviteCodeStatus {
     pub written_by: [u8; 16],
 }
 
-/// The answer of `GET /v1/{id}/allow` (Switch wire 7.4.6), read as an allow list so the
-/// conversations' opaque contexts read (Switch wire 1.1).
+/// The answer of `GET /v1/{id}/allow` (Switch wire 7.4.6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AllowList {
     /// The contacts.
@@ -446,7 +439,6 @@ impl AllowList {
                     pubky: c.pubky("pubky")?,
                     written_by,
                     code_hash: c.opt_b64n("code_hash")?,
-                    context: c.value("context"),
                     at: c.time("at")?,
                     last_used: c.opt_time("last_used")?,
                 })
@@ -1470,6 +1462,28 @@ mod tests {
         assert!(read_apps(&value).unwrap().proof_generations.is_empty());
         value["proof_generations"] = json!([1, 2]);
         assert_eq!(read_apps(&value).unwrap().proof_generations, [1, 2]);
+    }
+
+    #[test]
+    fn test_entry_requires_the_redeemed_invite_hash_or_null() {
+        let mut entry = json!({
+            "type": "entry", "seq": 1, "entry_id": b64(&[1; 16]),
+            "sender": pubky_id(&account()), "cert": doc_value(),
+            "accepted_at": "2026-01-01T00:00:00.000Z", "envelope": b64(&[2]),
+        });
+        let parse = |value: &Value| FeedItem::read(Obj::of(value, "entry")?);
+        assert!(parse(&entry).is_err());
+        for invalid in [json!(4), json!("!"), json!(b64(&[1; 31]))] {
+            entry["invite_code_hash"] = invalid;
+            assert!(parse(&entry).is_err());
+        }
+        for expected in [None, Some([8; 32])] {
+            entry["invite_code_hash"] = json!(expected.as_ref().map(|hash| b64(hash)));
+            let Some(FeedItem::Entry(item)) = parse(&entry).unwrap() else {
+                panic!("expected entry");
+            };
+            assert_eq!(item.invite_code_hash, expected);
+        }
     }
 
     #[test]

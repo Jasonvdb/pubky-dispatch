@@ -75,7 +75,7 @@ pub(super) async fn send(
 /// What an app with `lists.read` reads of the lists (`GET /v1/{id}/allow`), for the trace:
 /// how many entries each list holds, who wrote each conversation entry and whether a code
 /// made it, and each live code's uses. The answer's own facts hold the rest, such as an
-/// entry's `context` and `last_used`.
+/// entry's `last_used`.
 pub(super) async fn lists(world: &World, name: &str, app: &mut App) -> FlowResult {
     let list = app.allow_list().await?;
     world.outcome(
@@ -144,7 +144,7 @@ pub async fn invite_code(world: &World) -> FlowResult {
 
     // One use, good for an hour.
     let code = wallet
-        .register_invite_code(world.now_ms() + HOUR_MS, 1, json!({ "order": "A-17" }))
+        .register_invite_code(world.now_ms() + HOUR_MS, 1)
         .await?;
     world.outcome(
         "the wallet registered a code for one use",
@@ -197,7 +197,7 @@ pub async fn invite_code(world: &World) -> FlowResult {
 
     // A code nobody uses in time.
     let late = wallet
-        .register_invite_code(world.now_ms() + HOUR_MS, 1, json!({ "order": "A-18" }))
+        .register_invite_code(world.now_ms() + HOUR_MS, 1)
         .await?;
     world.outcome(
         "the wallet registered a second code",

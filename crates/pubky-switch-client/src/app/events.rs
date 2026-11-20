@@ -223,6 +223,8 @@ pub enum AppEvent {
     Alarm(Alarm),
     /// A message passed every check and its effect was committed with the cursor move.
     MessageReceived {
+        /// The original verified feed observation for this delivery (Switch wire 7.5).
+        receipt: EntryReceipt,
         /// The entry's `seq`.
         seq: u64,
         /// The message kind.
@@ -1321,7 +1323,7 @@ pub(crate) enum Duty {
         accepted_at_ms: u64,
         reason: DropReason,
         waiting: WaitingReason,
-        message: StoredMessageIdentity,
+        message: Box<StoredMessageIdentity>,
         sender_verified: bool,
         receipt: EntryReceipt,
         #[serde(with = "event_id")]
@@ -1513,7 +1515,7 @@ impl Duty {
                 accepted_at_ms,
                 reason,
                 waiting,
-                message,
+                message: *message,
                 sender_verified,
                 receipt,
                 notice_id,

@@ -174,6 +174,7 @@ impl App {
                         trusted,
                         super::protocol::EntryReceipt {
                             entry_id: entry.entry_id,
+                            invite_code_hash: entry.invite_code_hash,
                             service_key: page.service_key,
                             read_at_ms: page.server_time_ms,
                         },
@@ -254,7 +255,6 @@ impl App {
             plaintext: received.plaintext,
             cert: received.cert,
             standing: received.standing,
-            context: entry.context.clone(),
             parked: false,
             released: false,
             conflict: None,

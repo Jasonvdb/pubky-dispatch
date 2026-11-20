@@ -17,7 +17,6 @@ use pubky_switch_core::{
     shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
 };
-use serde_json::Value;
 use sqlx::Row;
 
 use super::{
@@ -231,11 +230,6 @@ pub struct StoredInvite {
     pub writer: [u8; 16],
     /// When it expires.
     pub expires_at_ms: u64,
-    /// Its context.
-    pub context: Value,
-    /// The context's bytes as its writer wrote them, which a reader repeats (Switch wire
-    /// 1.1).
-    pub context_written: Vec<u8>,
 }
 
 fn array<const N: usize>(bytes: &[u8], what: &'static str) -> Result<[u8; N], StoreError> {
@@ -1066,7 +1060,7 @@ impl AccountTxn {
     ) -> Result<Vec<StoredInvite>, StoreError> {
         let id = self.head().id.clone();
         let rows = sqlx::query(
-            "SELECT code_hash, max_uses, uses, writer, expires_at_ms, context FROM invite_codes \
+            "SELECT code_hash, max_uses, uses, writer, expires_at_ms FROM invite_codes \
              WHERE account_id = $1 AND code_hash = ANY($2)",
         )
         .bind(id)
@@ -1078,19 +1072,32 @@ impl AccountTxn {
             .map(|row| {
                 let hash: Vec<u8> = row.try_get("code_hash")?;
                 let writer: Vec<u8> = row.try_get("writer")?;
-                let context: Vec<u8> = row.try_get("context")?;
                 Ok(StoredInvite {
                     code_hash: array(&hash, "code_hash")?,
                     max_uses: from_db(row.try_get("max_uses")?, "max_uses")?,
                     uses: from_db(row.try_get("uses")?, "uses")?,
                     writer: array(&writer, "writer")?,
                     expires_at_ms: from_db(row.try_get("expires_at_ms")?, "expires_at_ms")?,
-                    context: serde_json::from_slice(&context)
-                        .map_err(|_| StoreError::Corrupt("an invite code's context"))?,
-                    context_written: context,
                 })
             })
             .collect()
+    }
+
+    /// The registered expiry of a code with a remaining use (Switch wire 7.2).
+    pub async fn unspent_invite_expiry(
+        &mut self,
+        code_hash: &[u8; 32],
+    ) -> Result<Option<u64>, StoreError> {
+        let id = self.head().id.clone();
+        let expiry: Option<i64> = sqlx::query_scalar(
+            "SELECT expires_at_ms FROM invite_codes WHERE account_id = $1 AND code_hash = $2 AND uses < max_uses",
+        )
+        .bind(id)
+        .bind(code_hash.as_slice())
+        .fetch_optional(self.conn())
+        .await
+        .map_err(db)?;
+        expiry.map(|ms| from_db(ms, "expires_at_ms")).transpose()
     }
 
     /// Live invite codes, with uses left and unexpired at `now_ms`, not at `excluding`.
@@ -1116,13 +1123,11 @@ impl AccountTxn {
     /// Store an invite code, replacing one at its hash.
     pub async fn put_invite(&mut self, invite: &StoredInvite) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        // The bytes as written, never a re-serialization (Switch wire 1.1).
-        let context = invite.context_written.clone();
         sqlx::query(
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
-             expires_at_ms, context) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             expires_at_ms) VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (account_id, code_hash) DO UPDATE SET max_uses = $3, uses = $4, \
-             writer = $5, expires_at_ms = $6, context = $7",
+             writer = $5, expires_at_ms = $6",
         )
         .bind(id)
         .bind(invite.code_hash.as_slice())
@@ -1130,7 +1135,6 @@ impl AccountTxn {
         .bind(to_db(invite.uses, "uses")?)
         .bind(invite.writer.as_slice())
         .bind(to_db(invite.expires_at_ms, "expires_at_ms")?)
-        .bind(context)
         .execute(self.conn())
         .await
         .map_err(db)?;

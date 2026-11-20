@@ -38,9 +38,7 @@ fn pubkys(out: &mut Vec<u8>, entries: &[AllowEntry]) {
 }
 
 /// A conversation entry, in the order of 7.4.6's row: `pubky`, `written_by` (an App ID or
-/// `"service"`), `code_hash` and `context` on an entry the service wrote, `at`, and
-/// `last_used` once an append it admitted. The context is the invite code's as its writer
-/// wrote it (Switch wire 1.1).
+/// `"service"`), the original `code_hash` for a service grant, `at` and `last_used`.
 fn conversation(out: &mut Vec<u8>, entry: &AllowEntry) {
     out.extend_from_slice(b"{\"pubky\":");
     string(out, &pubky_id(&entry.pubky));
@@ -53,10 +51,6 @@ fn conversation(out: &mut Vec<u8>, entry: &AllowEntry) {
         out.extend_from_slice(b",\"code_hash\":");
         string(out, &b64(code_hash));
     }
-    if let Some(context) = &entry.context {
-        out.extend_from_slice(b",\"context\":");
-        out.extend_from_slice(context);
-    }
     out.extend_from_slice(b",\"at\":");
     string(out, &rfc3339(entry.at_ms));
     if let Some(last_used) = entry.last_used_ms {
@@ -66,7 +60,7 @@ fn conversation(out: &mut Vec<u8>, entry: &AllowEntry) {
     out.push(b'}');
 }
 
-/// A live invite code, without its context: `code_hash`, `expires_at`, `max_uses`, `uses`,
+/// A live invite code: `code_hash`, `expires_at`, `max_uses`, `uses`,
 /// `written_by`.
 fn invite(out: &mut Vec<u8>, invite: &AllowInvite) {
     out.extend_from_slice(b"{\"code_hash\":");
@@ -222,7 +216,6 @@ mod tests {
             written_by: None,
             at_ms: 0,
             code_hash: Some([2; 32]),
-            context: Some(b"{\"n\":1.50}".to_vec()),
             last_used_ms: Some(1_000),
         };
         let app_entry = AllowEntry {
@@ -230,7 +223,6 @@ mod tests {
             written_by: Some([4; 16]),
             at_ms: 0,
             code_hash: None,
-            context: None,
             last_used_ms: None,
         };
         let body = String::from_utf8(answer_body(
@@ -244,8 +236,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).expect("json");
         let conversations = value["conversations"].as_array().expect("array");
         assert_eq!(conversations[0]["written_by"], "service");
-        // The context as written, byte for byte: 1.50 stays 1.50.
-        assert!(body.contains("\"context\":{\"n\":1.50}"));
+        assert_eq!(conversations[0]["code_hash"], b64(&[2; 32]));
         assert!(conversations[1].get("code_hash").is_none());
         assert!(conversations[1].get("last_used").is_none());
         assert_eq!(value["flagged"][0]["hits"], 3);

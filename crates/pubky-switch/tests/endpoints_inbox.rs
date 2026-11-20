@@ -16,10 +16,11 @@ use pubky_switch::{
 };
 use pubky_switch_core::{
     chain::ServiceTransition,
-    enc::unb64,
+    enc::{b64, unb64},
     envelope::{Recipient, seal},
+    ident::invite_code_hash,
     keys::AppKeys,
-    ops::{AllowKind, InviteCodePut, InviteContext, OpKind, OpsRequest, Position, sign_batch},
+    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, Position, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -205,18 +206,12 @@ fn bob() -> Value {
 async fn feed(replay: &Replay, after: &str) -> Value {
     let keys = vectors("keys.json");
     let path = format!("/v1/{}/feed?after={after}", alice_id());
-    body(
-        &replay
-            .service
-            .handle(app_request(
-                app(&keys, "wallet"),
-                "GET",
-                &path,
-                Vec::new(),
-                ms(&at()),
-            ))
-            .await,
-    )
+    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(&at()));
+    let sent = Sent::of(&request);
+    let answer = replay.service.handle(request).await;
+    assert_eq!(answer.status, 200);
+    assert!(signed_with(&answer, &service_public(replay), &sent));
+    body(&answer)
 }
 
 #[tokio::test]
@@ -264,7 +259,7 @@ async fn test_inbox_append_reaches_its_target_and_goes_once_read() {
         unb64(entry["envelope"].as_str().expect("envelope")).expect("b64"),
         envelope
     );
-    assert!(entry.get("context").is_none());
+    assert_eq!(entry.get("invite_code_hash"), Some(&Value::Null));
     let seq = entry["seq"].as_u64().expect("seq");
     let unread = || async {
         sql_value(
@@ -615,7 +610,6 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
         &ServiceTransition::ConversationAdd {
             pubky: hex32(&bob()["public_hex"]),
             code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
-            context: json!({ "order": 7 }),
             at: ms(&at()),
         },
     )
@@ -644,19 +638,20 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    // The feed shows the entry with the code's context, and the conversation.add item.
     let page = feed(&replay, "1:9").await;
     let items = page["items"].as_array().expect("items");
-    assert!(
-        items
-            .iter()
-            .any(|item| item["type"] == "chain" && item["context"] == json!({ "order": 7 }))
-    );
-    let first = items
+    let hashes: Vec<_> = items
         .iter()
-        .find(|item| item["type"] == "entry")
-        .expect("entry");
-    assert_eq!(first["context"], json!({ "order": 7 }));
+        .filter(|item| item["type"] == "entry")
+        .map(|item| item.get("invite_code_hash").expect("entry reference"))
+        .collect();
+    assert_eq!(
+        hashes,
+        [
+            &json!(b64(&invite_code_hash(code).expect("hash"))),
+            &Value::Null
+        ]
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -709,7 +704,6 @@ async fn deliver_bob_with_code(replay: &Replay) {
             code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
             expires_at: ms(&at()) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         71,
         None,
@@ -757,106 +751,85 @@ async fn test_inbox_own_app_appends_without_admission() {
 }
 
 #[tokio::test]
-async fn test_inbox_invite_context_reaches_the_feed_as_written() {
-    use pubky_switch_core::{labels::sig::OP, ops::SignedOp};
+async fn test_inbox_invitation_follows_each_distinct_delivery() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    // An invite_code.put whose context holds numbers a re-serialization would change.
-    let code = "IRrC78oNIjZ4hcet2fYnJQ";
-    let keys = vectors("keys.json");
-    let wallet = app(&keys, "wallet");
-    let app_keys = AppKeys::from_secrets(
-        hex32(&wallet["signing_secret_hex"]),
-        hex32(&wallet["bundle_secret_hex"]),
-    );
-    let alice_key = hex32(&alice(&keys)["public_hex"]);
-    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
-        .expect("app id");
-    let ops = sign_batch(
-        &app_keys,
-        &alice_key,
-        Some(app_id),
-        1,
-        [91; 16],
-        vec![(
-            Vec::new(),
-            OpKind::InviteCodePut(InviteCodePut {
-                code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
-                expires_at: ms(&at()) + 3_600_000,
-                max_uses: 1,
-                context: InviteContext::new(json!({ "order": 7 })),
-            }),
-        )],
+    deliver_bob_with_code(&replay).await;
+    let first_code = "IRrC78oNIjZ4hcet2fYnJQ";
+    let second_code = b64(&[72; 16]);
+    let first_hash = invite_code_hash(first_code).expect("first code");
+    let second_hash = invite_code_hash(&second_code).expect("second code");
+    wallet_op(
+        &replay,
+        OpKind::InviteCodePut(InviteCodePut {
+            code_hash: second_hash,
+            expires_at: ms(&at()) + 3_600_000,
+            max_uses: 1,
+        }),
+        72,
+        None,
     )
-    .expect("batch");
-    let written = r#"{"n":12345678901234567890123,"r":1.50}"#;
-    let body_text = String::from_utf8(ops[0].signed().body_bytes().expect("body"))
-        .expect("utf-8")
-        .replace(
-            r#""context":{"order":7}"#,
-            &format!(r#""context":{written}"#),
+    .await;
+
+    let version = Some(apps_version(&replay).await);
+    let first_envelope = to_wallet(21, false);
+    let first = from_shop(&replay, first_envelope.clone(), version, Some(first_code)).await;
+    assert_eq!(first.status, 200);
+    let repeat = from_shop(&replay, first_envelope.clone(), version, Some(&second_code)).await;
+    assert_eq!(repeat.status, 200);
+    assert_eq!(repeat.body, first.body);
+
+    let second_envelope = to_wallet(22, false);
+    let refusal = from_shop(&replay, second_envelope.clone(), version, Some(first_code)).await;
+    assert_eq!(code_of(&refusal), (403, json!("not_admitted")));
+    let second = from_shop(
+        &replay,
+        second_envelope.clone(),
+        version,
+        Some(&second_code),
+    )
+    .await;
+    assert_eq!(second.status, 200);
+    let ordinary_envelope = to_wallet(23, false);
+    let spent = from_shop(
+        &replay,
+        ordinary_envelope.clone(),
+        version,
+        Some(&second_code),
+    )
+    .await;
+    assert_eq!(code_of(&spent), (403, json!("not_admitted")));
+    let ordinary = from_shop(&replay, ordinary_envelope.clone(), version, None).await;
+    assert_eq!(ordinary.status, 200);
+    let page = feed(&replay, "1:9").await;
+    let entries: Vec<_> = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| item["type"] == "entry")
+        .collect();
+    assert_eq!(entries.len(), 3);
+    for (entry, (answer, envelope, hash)) in entries.iter().zip([
+        (first, first_envelope, Some(first_hash)),
+        (second, second_envelope, Some(second_hash)),
+        (ordinary, ordinary_envelope, None),
+    ]) {
+        assert_eq!(entry["entry_id"], body(&answer)["entry_id"]);
+        assert_eq!(entry["envelope"], b64(&envelope));
+        assert_eq!(
+            entry.get("invite_code_hash"),
+            Some(&json!(hash.map(|h| b64(&h))))
         );
-    assert!(body_text.contains(written));
-    let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
-    let signed = SignedDoc::sign_bytes(&signing, OP, &[&alice_key], body_text.into_bytes());
-    let op = SignedOp::peek(&signed).expect("op");
-    let path = format!("/v1/{}/ops", alice_id());
-    let answer = replay
-        .service
-        .handle(app_request(
-            wallet,
-            "POST",
-            &path,
-            OpsRequest::new(&[op], None).to_json(),
-            ms(&at()),
-        ))
-        .await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    // Stored as written.
+    }
+
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
-    let stored: Vec<u8> =
-        sqlx::query_scalar("SELECT context FROM invite_codes WHERE account_id = $1")
-            .bind(alice_id())
-            .fetch_one(&mut conn)
-            .await
-            .expect("context");
-    assert_eq!(stored, written.as_bytes());
-    // The shop, admitted by the code, appends: its entry shows the context as written.
-    let path = format!("/v1/{}/peers", alice_id());
-    let peer = serde_json::to_vec(&doc("bob identity.json")).expect("body");
-    let request = other_request("shop", ORIGIN, "PUT", &path, peer, Some(code), ms(&at()));
-    assert_eq!(replay.service.handle(request).await.status, 200);
-    let version = apps_version(&replay).await;
-    let answer = from_shop(&replay, to_wallet(21, false), Some(version), Some(code)).await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    let path = format!("/v1/{}/feed?after=1:9", alice_id());
-    let page = replay
-        .service
-        .handle(app_request(
-            app(&keys, "wallet"),
-            "GET",
-            &path,
-            Vec::new(),
-            ms(&at()),
-        ))
-        .await;
-    let text = String::from_utf8(page.body).expect("utf-8");
-    assert!(
-        text.contains(&format!(r#""context":{written},"envelope""#)),
-        "{text}"
-    );
+    let origins: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT code_hash FROM list_entries WHERE account_id = $1 AND list = 'conversation' AND written_by IS NULL"
+    ).bind(alice_id()).fetch_all(&mut conn).await.expect("grant");
+    assert_eq!(origins, [first_hash.to_vec()]);
+    conn.close().await.expect("close");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -958,7 +931,6 @@ async fn test_inbox_removed_app_and_closed_renewal() {
             code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
             expires_at: ms(&at()) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!(null)),
         }),
         72,
         None,
@@ -1076,7 +1048,6 @@ async fn test_inbox_code_only_append_needs_trusted_time() {
             code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
             expires_at: ms(&at()) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!(null)),
         }),
         71,
         None,
@@ -1108,7 +1079,7 @@ async fn test_inbox_code_only_append_needs_trusted_time() {
         .await,
         0
     );
-    // A contact needs no time: the same append is taken.
+    // Explicit redemption needs trusted time for a contact as well.
     wallet_op(
         &replay,
         OpKind::AllowPut {
@@ -1119,7 +1090,11 @@ async fn test_inbox_code_only_append_needs_trusted_time() {
         None,
     )
     .await;
-    let answer = untrusted.handle(append(Some(code))).await;
+    assert_eq!(
+        code_of(&untrusted.handle(append(Some(code))).await),
+        (503, json!("unavailable"))
+    );
+    let answer = untrusted.handle(append(None)).await;
     assert_eq!(
         answer.status,
         200,
@@ -1247,6 +1222,60 @@ async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
     .await;
     assert_eq!(code_of(&answer), (429, json!("quota_exceeded")));
     assert_eq!(body(&answer)["current"]["limit"], "conversations");
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    let peer = hex32(&bob()["public_hex"]);
+    let candidate = to_wallet(34, false);
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: peer,
+            kind: AllowKind::Contact,
+        },
+        73,
+        None,
+    )
+    .await;
+    wallet_op(&replay, OpKind::DenyPut { pubky: peer }, 74, None).await;
+    let blocked = from_shop(&replay, candidate.clone(), Some(version), Some(code)).await;
+    assert_eq!(code_of(&blocked), (403, json!("not_admitted")));
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT uses FROM invite_codes WHERE account_id = $1"
+        )
+        .await,
+        0
+    );
+    wallet_op(&replay, OpKind::DenyDelete { pubky: peer }, 75, None).await;
+    let accepted = from_shop(&replay, candidate, Some(version), Some(code)).await;
+    assert_eq!(accepted.status, 200);
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT uses FROM invite_codes WHERE account_id = $1"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+        )
+        .await,
+        0
+    );
+    let page = feed(&replay, "1:9").await;
+    let entry = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["entry_id"] == body(&accepted)["entry_id"])
+        .expect("accepted entry");
+    assert_eq!(
+        entry["invite_code_hash"],
+        b64(&invite_code_hash(code).expect("hash"))
+    );
     replay.db.drop_database().await.expect("drop");
 }
 

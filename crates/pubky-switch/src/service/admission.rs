@@ -21,6 +21,13 @@ pub(crate) struct Standing {
     pub(crate) denied: bool,
 }
 
+impl Standing {
+    /// Whether an app that remains eligible for list admission is on either list.
+    pub(super) fn listed(self, removed: bool) -> bool {
+        !removed && (self.contact || self.conversation)
+    }
+}
+
 /// What admits a sender (Switch spec 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Admitted {
@@ -48,7 +55,7 @@ pub(crate) fn admit(
     if standing.denied {
         return stranger;
     }
-    if !removed && (standing.contact || standing.conversation) {
+    if standing.listed(removed) {
         return Some(Admitted::Listed);
     }
     invite.map(Admitted::InviteCode).or(stranger)

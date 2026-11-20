@@ -1565,9 +1565,9 @@ async fn expired_invite(replay: &Replay, at: &str) {
         .await
         .expect("due");
     sqlx::query(
-        "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, expires_at_ms, \
-         context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
-         decode(repeat('cd', 16), 'hex'), $2, 'null')",
+        "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, expires_at_ms) \
+         VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+         decode(repeat('cd', 16), 'hex'), $2)",
     )
     .bind(alice_id())
     .bind(i64::try_from(ms(at)).expect("ms"))

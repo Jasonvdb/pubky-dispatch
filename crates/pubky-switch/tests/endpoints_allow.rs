@@ -1,5 +1,5 @@
 //! `GET /v1/{id}/allow` (Switch wire 7.4.6) on `chain.json`'s account: every list present,
-//! each whole; a service-written conversation entry with its code, context and last use;
+//! each whole; a service-written conversation entry with its code and last use;
 //! flagged senders from `flag_after`; live invite codes only; who may read it; and the
 //! answer's service time as the time of the state it shows.
 //!
@@ -15,7 +15,7 @@ use pubky_switch_core::{
     enc::unb64,
     envelope::{Recipient, seal},
     keys::AppKeys,
-    ops::{AllowKind, InviteCodePut, InviteContext, OpKind, OpsRequest, sign_batch},
+    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -135,7 +135,6 @@ fn put_code(code: &str, expires_at: u64, max_uses: u64) -> OpKind {
         code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
         expires_at,
         max_uses,
-        context: InviteContext::new(json!({ "order": 7 })),
     })
 }
 
@@ -243,7 +242,7 @@ async fn test_allow_shows_each_list_whole() {
         .expect("code");
     }
     // A conversation entry the service writes when the code admits bob's shop, then used
-    // by a second append: it carries the code's hash and context, and its last use.
+    // by a second append: it carries the original code hash and its last use.
     wallet_op(
         &replay,
         OpKind::AllowDelete {
@@ -317,7 +316,6 @@ async fn test_allow_shows_each_list_whole() {
             &pubky_switch_core::ident::invite_code_hash(CODE).expect("hash")
         )
     );
-    assert_eq!(conversation["context"], json!({ "order": 7 }));
     assert_eq!(conversation["at"], at());
     assert_eq!(conversation["last_used"], at());
     assert_eq!(lists["conversations"].as_array().map(Vec::len), Some(1));
@@ -325,7 +323,7 @@ async fn test_allow_shows_each_list_whole() {
         lists["flagged"],
         json!([{ "pubky": pubky_switch_core::enc::pubky_id(&[0x11; 32]), "hits": 3 }])
     );
-    // Only the live code, used once by the append it admitted, without its context.
+    // Only the live code, used once by the append that redeemed it.
     let codes = lists["invite_codes"].as_array().expect("codes");
     assert_eq!(codes.len(), 1, "{codes:?}");
     assert_eq!(
@@ -339,35 +337,6 @@ async fn test_allow_shows_each_list_whole() {
             "uses": 1,
             "written_by": wallet_id,
         })
-    );
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_allow_repeats_a_context_as_written() {
-    let Some(replay) = replay().await else { return };
-    replay_chain_through_revoke(&replay).await;
-    // A service-written conversation entry whose context holds numbers a re-serialization
-    // would change.
-    sql(
-        &replay,
-        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash, \
-         context) VALUES ($1, 'conversation', decode(repeat('33', 32), 'hex'), NULL, 0, \
-         decode(repeat('44', 32), 'hex'), convert_to('{\"n\":12345678901234567890123,\"r\":1.50}', 'UTF8'))",
-    )
-    .await;
-    let answer = read_as(&replay, "wallet", &at()).await;
-    assert_eq!(
-        answer.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    assert!(
-        String::from_utf8_lossy(&answer.body)
-            .contains("\"context\":{\"n\":12345678901234567890123,\"r\":1.50}"),
-        "{}",
-        String::from_utf8_lossy(&answer.body)
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -491,12 +460,12 @@ async fn stamped_time(replay: &Replay) -> i64 {
 async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    // 100,000 conversation entries with a full context: a read of several seconds.
+    // Read the full conversation list while a second request writes to the account.
     sql(
         &replay,
-        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash, context) \
+        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash) \
          SELECT $1, 'conversation', decode(lpad(to_hex(g), 64, '0'), 'hex'), NULL, 0, \
-         decode(repeat('cd', 32), 'hex'), convert_to('{\"note\":\"' || repeat('x', 1000) || '\"}', 'UTF8') \
+         decode(repeat('cd', 32), 'hex') \
          FROM generate_series(1, 100000) g",
     )
     .await;
@@ -575,8 +544,8 @@ async fn test_allow_reads_the_state_under_the_lock_not_after() {
             sql(
                 &replay,
                 "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
-             expires_at_ms, context) VALUES ($1, decode(repeat('ee', 32), 'hex'), 1, 0, \
-             decode(repeat('ab', 16), 'hex'), 9000000000000, convert_to('null', 'UTF8'))",
+             expires_at_ms) VALUES ($1, decode(repeat('ee', 32), 'hex'), 1, 0, \
+             decode(repeat('ab', 16), 'hex'), 9000000000000)",
             )
             .await;
             pause.resume.notify_one();

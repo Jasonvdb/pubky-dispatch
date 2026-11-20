@@ -453,11 +453,7 @@ async fn test_peers_limit_drops_strangers_first_and_leaves_floors() {
 
 #[tokio::test]
 async fn test_peers_certificates_invite_codes_and_removed_apps() {
-    use pubky_switch_core::{
-        ident::invite_code_hash,
-        ops::{InviteCodePut, InviteContext},
-        records::RemovedApp,
-    };
+    use pubky_switch_core::{ident::invite_code_hash, ops::InviteCodePut, records::RemovedApp};
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
@@ -499,7 +495,6 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
             code_hash: invite_code_hash(code).expect("hash"),
             expires_at: ms(&at) + 3_600_000,
             max_uses: 1,
-            context: InviteContext::new(json!({ "order": 7 })),
         }),
         71,
         &at,
@@ -557,7 +552,7 @@ async fn insert_invite(replay: &Replay, account: &str, code: &str, expires_at_ms
         .expect("conn");
     sqlx::query(
         "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
-         expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, $5)",
+         expires_at_ms) VALUES ($1, $2, 1, 0, $3, $4)",
     )
     .bind(account)
     .bind(
@@ -567,7 +562,6 @@ async fn insert_invite(replay: &Replay, account: &str, code: &str, expires_at_ms
     )
     .bind([1u8; 16].as_slice())
     .bind(i64::try_from(expires_at_ms).expect("time"))
-    .bind(b"null".as_slice())
     .execute(&mut conn)
     .await
     .expect("invite");
@@ -610,20 +604,36 @@ async fn test_peers_invite_code_expiry_and_trusted_time() {
     let at = "2026-01-01T00:09:00.000Z";
     set_time(&bob_switch.clock, at);
     insert_invite(&bob_switch, &bob, CODE, ms(at) + 3_600_000).await;
-    let request = other_request(
-        "wallet",
-        BOB_ORIGIN,
-        "PUT",
-        &format!("/v1/{bob}/peers"),
-        delivery(&doc("alice identity.json")),
-        Some(CODE),
-        ms(at),
+    let deliver = |now| {
+        other_request(
+            "wallet",
+            BOB_ORIGIN,
+            "PUT",
+            &format!("/v1/{bob}/peers"),
+            delivery(&doc("alice identity.json")),
+            Some(CODE),
+            now,
+        )
+    };
+    let expiry = ms(at) + 3_600_000;
+    for now in [ms(at), expiry] {
+        bob_switch.clock.set_wall_ms(now);
+        assert_eq!(
+            status_and_code(&bob_switch.service.handle(deliver(now)).await),
+            (503, json!("unavailable"))
+        );
+    }
+    assert_eq!(bob_switch.service.time_refusals(), 2);
+    // Once time is verified the expired code drops out. This account allows a
+    // stranger to deliver its document through its connect-request policy.
+    bob_switch.time.note(
+        pubky_switch::time::TimeSample {
+            utc_ms: expiry,
+            uncertainty_ms: 0,
+        },
+        0,
     );
-    assert_eq!(
-        status_and_code(&bob_switch.service.handle(request).await),
-        (503, json!("unavailable"))
-    );
-    assert_eq!(bob_switch.service.time_refusals(), 1);
+    assert_eq!(bob_switch.service.handle(deliver(expiry)).await.status, 200);
     bob_switch.db.drop_database().await.expect("drop");
 }
 

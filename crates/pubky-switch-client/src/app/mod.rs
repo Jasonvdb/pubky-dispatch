@@ -908,7 +908,6 @@ fn uncertain_copy(
             cert: pending.entry.cert.clone(),
             accepted_at_ms: pending.accepted_at_ms,
             plaintext: pending.entry.plaintext.clone(),
-            context: pending.entry.context.clone(),
             reason: ParkReason::Uncertain,
             round: state.parked_round.number,
             released: false,

@@ -83,8 +83,6 @@ pub struct ParkedMessage {
     pub message: Option<Message>,
     /// The sender's certificate, as the entry carried it.
     pub cert: SignedDoc,
-    /// The invite code's context, if one admitted the entry; opaque.
-    pub context: Option<Value>,
     /// The reads in a row that ended with the protocol's store or the host keeping the
     /// receive step from finishing ([`super::Outcome::Retry`]); 0 for none.
     pub retry_reads: u32,
@@ -213,7 +211,6 @@ impl App {
                 plaintext,
                 message,
                 cert: stored.cert,
-                context: stored.context,
                 retry_reads: retry.map_or(0, |r| r.reads),
                 retrying_since_ms: retry.map(|r| r.since_ms),
             }))

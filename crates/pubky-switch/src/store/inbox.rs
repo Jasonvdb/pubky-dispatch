@@ -36,8 +36,8 @@ pub struct NewEntry<'a> {
     pub envelope_hash: [u8; 32],
     /// The apps it is wrapped to.
     pub targets: &'a [[u8; 16]],
-    /// The context of the invite code that admitted the sender, as written.
-    pub context: Option<&'a [u8]>,
+    /// Hash of the code redeemed on this append (Switch wire 7.4.3).
+    pub invite_code_hash: Option<[u8; 32]>,
     /// The append's answer, for a retry by content.
     pub answer: &'a [u8],
     /// What it counts against the inbox quota.
@@ -61,8 +61,8 @@ pub struct StoredEntry {
     pub envelope: Vec<u8>,
     /// The apps it is wrapped to.
     pub targets: Vec<[u8; 16]>,
-    /// The invite code's context, as written.
-    pub context: Option<Vec<u8>>,
+    /// Hash of the code redeemed on this entry (Switch wire 7.5).
+    pub invite_code_hash: Option<[u8; 32]>,
 }
 
 /// An item of the inbox as the feed shows it (Switch wire 7.5).
@@ -182,7 +182,14 @@ pub(super) fn entry_of(row: &sqlx::postgres::PgRow) -> Result<StoredEntry, Store
                     .map_err(|_| StoreError::Corrupt("an entry's target"))
             })
             .collect::<Result<_, _>>()?,
-        context: row.try_get("context")?,
+        invite_code_hash: row
+            .try_get::<Option<Vec<u8>>, _>("invite_code_hash")?
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupt("an entry's invite code hash"))
+            })
+            .transpose()?,
     })
 }
 
@@ -242,7 +249,7 @@ impl AccountTxn {
         let targets: Vec<Vec<u8>> = entry.targets.iter().map(|app| app.to_vec()).collect();
         sqlx::query(
             "INSERT INTO inbox_entries (account_id, generation, seq, entry_id, sender, \
-             sender_app, cert, accepted_at_ms, envelope, envelope_hash, targets, context, \
+             sender_app, cert, accepted_at_ms, envelope, envelope_hash, targets, invite_code_hash, \
              answer, quota_bytes) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
@@ -257,7 +264,7 @@ impl AccountTxn {
         .bind(entry.envelope)
         .bind(entry.envelope_hash.as_slice())
         .bind(targets)
-        .bind(entry.context)
+        .bind(entry.invite_code_hash.as_ref().map(|hash| hash.as_slice()))
         .bind(entry.answer)
         .bind(to_db(entry.quota_bytes, "quota_bytes")?)
         .execute(self.conn())
@@ -474,7 +481,8 @@ impl AccountTxn {
             let seq = self.next_seq()?;
             sqlx::query(
                 "UPDATE inbox_entries SET seq = $4, kind = 'unreadable', envelope = '\\x', \
-                 quota_bytes = $5 WHERE account_id = $1 AND generation = $2 AND seq = $3",
+                 invite_code_hash = NULL, quota_bytes = $5 \
+                 WHERE account_id = $1 AND generation = $2 AND seq = $3",
             )
             .bind(&head.id)
             .bind(generation)
@@ -607,16 +615,8 @@ impl AccountTxn {
             .collect()
     }
 
-    /// Use one of the invite code `code_hash`'s uses, and write the service's conversation
-    /// entry for `sender` naming it, with its context (Switch spec 7, wire 7.4.3 check 7),
-    /// atomically with the append.
-    pub async fn use_invite(
-        &mut self,
-        code_hash: &[u8; 32],
-        sender: &[u8; 32],
-        context: &[u8],
-        at_ms: u64,
-    ) -> Result<(), StoreError> {
+    /// Consume one use of a checked invitation under the account lock (Switch wire 7.4.3).
+    pub async fn consume_invite(&mut self, code_hash: &[u8; 32]) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
             "UPDATE invite_codes SET uses = uses + 1 WHERE account_id = $1 AND code_hash = $2",
@@ -626,16 +626,25 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
+    /// Grant the sender reply access using the code that admitted it (Switch wire 7.4.3).
+    pub async fn grant_invited_conversation(
+        &mut self,
+        sender: &[u8; 32],
+        code_hash: &[u8; 32],
+        at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
         sqlx::query(
-            "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash, \
-             context) VALUES ($1, 'conversation', $2, NULL, $3, $4, $5) \
-             ON CONFLICT (account_id, list, pubky) DO NOTHING",
+            "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash) \
+             VALUES ($1, 'conversation', $2, NULL, $3, $4)",
         )
         .bind(&id)
         .bind(sender.as_slice())
         .bind(to_db(at_ms, "at_ms")?)
         .bind(code_hash.as_slice())
-        .bind(context)
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;

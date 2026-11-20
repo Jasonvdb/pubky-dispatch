@@ -849,7 +849,6 @@ fn check_chain_cross(f: &Fixture, import: &Import) {
         } else {
             assert_eq!(part.doc.as_ref(), Some(&doc));
         }
-        assert!(part.context.is_null());
     }
     let head9 = arr(&chain, "signed_heads")
         .iter()

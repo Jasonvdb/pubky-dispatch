@@ -279,7 +279,6 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
             stub,
             item_type: *item_type,
             doc: Some(signed.clone()),
-            context: Value::Null,
         }));
     }
     let head = SignedHead::sign(&old_key(), &id, &tip);
@@ -778,7 +777,6 @@ fn test_chunk_refuses_other_forms() {
     ] {
         assert_eq!(Chunk::parse(bad).unwrap_err().status(), 400);
     }
-    // A chain part's context is opaque; a number elsewhere isn't.
     let ok = br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[{"part":"contact","pubky":"PK"}]}"#;
     let text = String::from_utf8(ok.to_vec())
         .unwrap()
@@ -803,7 +801,7 @@ fn test_pack_splits_at_the_target_and_refuses_oversized_parts() {
         assert!(r.matches(bytes));
     }
     let huge = Part::Chain(ChainPart {
-        context: json!("x".repeat(MAX_CHUNK_BYTES)),
+        doc: Some(SignedDoc::from_parts(&vec![0; MAX_CHUNK_BYTES], &[0; 64])),
         ..match &f.parts[1] {
             Part::Chain(c) => c.clone(),
             _ => unreachable!(),
@@ -825,7 +823,7 @@ fn other_parts() -> Vec<Value> {
     let t = "2026-01-01T00:00:00.000Z";
     vec![
         json!({ "part": "entry", "seq": 9, "sender": pk, "cert": f.cert.signed(), "accepted_at_ms": 1,
-            "context": null, "envelope": "", "targets": [app],
+            "invite_code_hash": null, "envelope": "", "targets": [app],
             "result": { "entry_id": b64(&[2; 16]), "accepted_at": t, "directory_version": 3 },
             "unreadable": true, "missed": { "entries": 2, "from_ms": 1, "until_ms": 2 } }),
         json!({ "part": "key_bundle", "app_id": app, "bundle": { "envelope": "AQID", "sig": b64(&[1; 64]) },
@@ -838,10 +836,10 @@ fn other_parts() -> Vec<Value> {
         json!({ "part": "contact", "pubky": pk }),
         json!({ "part": "deny", "pubky": pk }),
         json!({ "part": "conversation", "pubky": pk, "written_by": "service", "code_hash": k,
-            "context": { "ref": 1.5 }, "at": t, "last_used": t }),
+            "at": t, "last_used": t }),
         json!({ "part": "conversation", "pubky": pk, "written_by": app, "at": t }),
         json!({ "part": "invite_code", "code_hash": k, "expires_at": t, "expires_at_ms": 1767225600000u64,
-            "max_uses": 1, "uses": 0, "context": null, "written_by": app }),
+            "max_uses": 1, "uses": 0, "written_by": app }),
         json!({ "part": "connect", "pubky": pk, "at": t }),
         json!({ "part": "flag", "pubky": pk, "hits": 3 }),
         json!({ "part": "peer", "doc": f.doc.signed() }),
@@ -862,6 +860,53 @@ fn test_part_every_kind_round_trips() {
         let part = Part::read(&value).unwrap_or_else(|e| panic!("{}: {e}", value["part"]));
         let again: Value = serde_json::from_slice(&part.to_json().unwrap()).unwrap();
         assert_eq!(again, value, "{}", part.kind());
+    }
+}
+
+#[test]
+fn test_entry_part_requires_a_nullable_invite_hash() {
+    let mut value = other_parts()
+        .into_iter()
+        .find(|p| p["part"] == "entry")
+        .unwrap();
+    value["unreadable"] = false.into();
+    value.as_object_mut().unwrap().remove("missed");
+    value["envelope"] = b64(&[7, 8]).into();
+    for hash in [Some([1; 32]), None] {
+        value["invite_code_hash"] = json!(hash.as_ref().map(|h| b64(h)));
+        let part = Part::read(&value).unwrap();
+        let Part::Entry(entry) = &part else {
+            unreachable!()
+        };
+        assert_eq!(entry.invite_code_hash, hash);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&part.to_json().unwrap()).unwrap(),
+            value
+        );
+    }
+    value.as_object_mut().unwrap().remove("invite_code_hash");
+    assert_eq!(Part::read(&value).unwrap_err().status(), 400);
+    for invalid in [json!(false), json!(b64(&[1; 31])), json!("invalid=")] {
+        value["invite_code_hash"] = invalid;
+        assert_eq!(Part::read(&value).unwrap_err().status(), 400);
+    }
+
+    let mut notice = other_parts()
+        .into_iter()
+        .find(|p| p["part"] == "entry")
+        .unwrap();
+    let missed = notice.as_object_mut().unwrap().remove("missed").unwrap();
+    for (unreadable, counts) in [(true, Value::Null), (false, missed)] {
+        notice["unreadable"] = unreadable.into();
+        notice["missed"] = counts;
+        notice["invite_code_hash"] = Value::Null;
+        let Part::Entry(mut entry) = Part::read(&notice).unwrap() else {
+            unreachable!()
+        };
+        entry.invite_code_hash = Some([1; 32]);
+        assert!(Part::Entry(entry).to_json().is_err());
+        notice["invite_code_hash"] = b64(&[1; 32]).into();
+        assert_eq!(Part::read(&notice).unwrap_err().status(), 400);
     }
 }
 
@@ -911,11 +956,6 @@ fn test_part_reading_rules() {
             v["written_by"] = json!("service");
             v
         }),
-        ("invite_code without context", {
-            let mut v = find("invite_code");
-            v.as_object_mut().unwrap().remove("context");
-            v
-        }),
         ("key_bundle from epoch 0", {
             let mut v = find("key_bundle");
             v["first_epoch"] = json!(0);
@@ -941,9 +981,14 @@ fn test_part_reading_rules() {
             v.as_object_mut().unwrap().remove("envelope");
             v
         }),
-        ("conversation code without context", {
+        ("conversation with a malformed code_hash", {
             let mut v = find("conversation");
-            v.as_object_mut().unwrap().remove("context");
+            v["code_hash"] = json!("AA");
+            v
+        }),
+        ("conversation with a null code_hash", {
+            let mut v = find("conversation");
+            v["code_hash"] = Value::Null;
             v
         }),
         ("peer_floor body hash", {
@@ -2255,7 +2300,6 @@ fn second_generation(service_keys: Vec<ServiceKeyEntry>) -> Fixture {
             stub,
             item_type,
             doc: Some(signed),
-            context: Value::Null,
         }));
     }
     let head = SignedHead::sign(&key2, &f.id, &tip);
@@ -2637,7 +2681,6 @@ fn recovered(
             stub,
             item_type: *item_type,
             doc: (!stub_only.contains(&seq)).then(|| signed.clone()),
-            context: Value::Null,
         }));
     }
     let head = SignedHead::sign(&old_key(), &f.id, &tip);
@@ -3376,6 +3419,97 @@ fn test_activation_reopened_tombstone_evidence_of_a_kept_attempt() {
 }
 
 #[test]
+fn test_activation_keeps_the_pending_entry_invite_hash() {
+    use crate::envelope::{Recipient, seal};
+    use crate::message::{Message, Sender};
+
+    let f = fixture();
+    let peer = IdentityKey::from_secret([19; 32]);
+    let sender = other_app();
+    let cert = AppCert::issue(
+        &peer,
+        AppCertBody::new(
+            peer.public(),
+            sender.signing_public(),
+            sender.bundle_public(),
+            vec![SCOPE.into()],
+            &[],
+            START - DAY,
+            START + DAY,
+        ),
+    )
+    .unwrap();
+    let message = Message::new(
+        "sample.reply",
+        Sender {
+            identity: peer.public(),
+            app_id: sender.app_id_bytes(),
+        },
+        f.id,
+        START,
+        vec![],
+        Default::default(),
+    )
+    .unwrap()
+    .sign(&sender)
+    .unwrap();
+    let receive_key = ReceiveKey::from_secret(0, [8; 32]);
+    let envelope = seal(
+        &f.id,
+        &[Recipient::new(receive_key.public)],
+        &message.encode(),
+        false,
+    )
+    .unwrap();
+    let entry = EntryPart {
+        seq: 5,
+        sender: peer.public(),
+        cert: cert.signed().clone(),
+        accepted_at_ms: START,
+        invite_code_hash: Some([4; 32]),
+        envelope,
+        targets: vec![app().app_id_bytes()],
+        result: EntryResult {
+            entry_id: [2; 16],
+            accepted_at: START,
+            directory_version: 1,
+        },
+        unreadable: false,
+        missed: None,
+    };
+    let parts = sorted(f.with(|parts| parts.push(Part::Entry(entry.clone()))));
+    let chunks = pack(&parts, DEFAULT_CHUNK_TARGET).unwrap();
+    let manifest = f.resign(|b| {
+        b.parts = parts.len() as u64;
+        b.bytes = chunks.iter().map(|(r, _)| r.len).sum();
+        b.chunks = chunks.iter().map(|(r, _)| r.clone()).collect();
+    });
+    let verified = Manifest::verify(
+        manifest.signed(),
+        &old_key().verifying_key().to_bytes(),
+        &f.id,
+    )
+    .unwrap();
+    let bytes: Vec<_> = chunks.iter().map(|(_, data)| data.as_slice()).collect();
+    let decoded = verified.read_parts(&bytes).unwrap();
+    let import = f.run_manifest(&verified, &decoded).unwrap();
+    assert_eq!(import.entries, [entry]);
+
+    let mut altered = decoded;
+    let Part::Entry(pending) = altered
+        .iter_mut()
+        .find(|p| matches!(p, Part::Entry(_)))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    pending.invite_code_hash = Some([5; 32]);
+    let chunks = pack(&altered, DEFAULT_CHUNK_TARGET).unwrap();
+    let bytes: Vec<_> = chunks.iter().map(|(_, data)| data.as_slice()).collect();
+    assert_eq!(verified.read_parts(&bytes).unwrap_err().status(), 409);
+}
+
+#[test]
 fn test_activation_tombstones_entries_and_batches() {
     let f = fixture();
     let app_id = app().app_id_bytes();
@@ -3421,7 +3555,7 @@ fn test_activation_tombstones_entries_and_batches() {
             sender: f.id,
             cert: f.cert.signed().clone(),
             accepted_at_ms: START,
-            context: Value::Null,
+            invite_code_hash: None,
             envelope: Vec::new(),
             targets: vec![app_id],
             result: EntryResult {

@@ -6,7 +6,7 @@ use pubky_switch_core::export::{
     ActivateAnswer, ActivateRequest, ChunkAnswer, ImportStart, ImportStatus, Manifest,
 };
 use pubky_switch_core::http::{self, IdentityDelivery, erase_body, header};
-use pubky_switch_core::json::{Doc, parse_json};
+use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
     AccountObservation, AccountObservationBody, CarriedAccountObservation, DiscardAnswer,
     Enrollment, EnrollmentAnswer, Freeze, IdentityDoc, Unfreeze,
@@ -111,7 +111,7 @@ impl SwitchClient {
         expect: Expect<'_>,
         key: &[u8; 32],
     ) -> Result<WriteAnswer, ClientError> {
-        let (value, what) = read::body(&checked.body, Doc::Plain, "a write answer")?;
+        let (value, what) = read::body(&checked.body, "a write answer")?;
         let o = Obj::of(&value, what)?;
         let head = o.head("head")?;
         verify_head(&head, key, &self.account())?;
@@ -149,10 +149,9 @@ impl SwitchClient {
 
     fn json_answer<'a>(
         checked: &CheckedResponse,
-        doc: Doc<'_>,
         what: &'a str,
     ) -> Result<(serde_json::Value, &'a str), ClientError> {
-        read::body(&checked.body, doc, what)
+        read::body(&checked.body, what)
     }
 
     /// `POST /v1/enroll` (signer, Switch wire 3.7, 7.4.1): send the signed enrollment, kept
@@ -416,8 +415,7 @@ impl SwitchClient {
         call: AppendCall,
     ) -> Result<AppendAnswer, ClientError> {
         let checked = self.finish_call(call.0, &mut None).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.3: an append answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.3: an append answer")?;
         AppendAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -452,8 +450,7 @@ impl SwitchClient {
     }
 
     pub(crate) fn feed_page(&self, checked: &CheckedResponse) -> Result<FeedPage, ClientError> {
-        let (value, what) =
-            Self::json_answer(checked, Doc::FeedPage, "Switch wire 7.4.4: a feed page")?;
+        let (value, what) = Self::json_answer(checked, "Switch wire 7.4.4: a feed page")?;
         let key = self.key()?;
         let page = FeedPage::read(
             Obj::of(&value, what)?,
@@ -493,8 +490,7 @@ impl SwitchClient {
                 },
             )
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.5: a peers answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.5: a peers answer")?;
         PeersAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -505,8 +501,7 @@ impl SwitchClient {
     /// As every call.
     pub async fn allow(&self) -> Result<AllowList, ClientError> {
         let checked = self.get("allow", TimeoutClass::Bulk).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::AllowList, "Switch wire 7.4.6: an allow list")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.6: an allow list")?;
         AllowList::read(Obj::of(&value, what)?)
     }
 
@@ -517,8 +512,7 @@ impl SwitchClient {
     /// As every call.
     pub async fn connect(&self) -> Result<ConnectAnswer, ClientError> {
         let checked = self.post_empty("connect").await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.7: a connect answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: a connect answer")?;
         ConnectAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -529,11 +523,7 @@ impl SwitchClient {
     /// As every call.
     pub async fn connect_requests(&self) -> Result<ConnectList, ClientError> {
         let checked = self.get("connect", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(
-            &checked,
-            Doc::Plain,
-            "Switch wire 7.4.7: the connect requests",
-        )?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: the connect requests")?;
         ConnectList::read(Obj::of(&value, what)?)
     }
 
@@ -554,8 +544,7 @@ impl SwitchClient {
                 Auth::new(TimeoutClass::Ordinary),
             )
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.7: a decline answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: a decline answer")?;
         Obj::of(&value, what)?.pubky("declined")
     }
 
@@ -568,7 +557,7 @@ impl SwitchClient {
         let checked = self
             .get(&format!("claims/{}", b64(claim_key)), TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.8: a claim")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.8: a claim")?;
         ClaimAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -596,8 +585,7 @@ impl SwitchClient {
                 Auth::new(TimeoutClass::Bulk),
             )
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record view")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.9: a record view")?;
         Ok(RecordAnswer {
             view: SharedRecordView::read(Obj::of(&value, what)?)?,
             head: own_head(checked.head, "a record view")?,
@@ -623,8 +611,7 @@ impl SwitchClient {
             rest.push_str(&format!("&limit={limit}"));
         }
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.9: a record page")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.9: a record page")?;
         RecordPage::read(
             Obj::of(&value, what)?,
             own_head(checked.head, "a record page")?,
@@ -666,8 +653,7 @@ impl SwitchClient {
                 },
             )
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.10: a directory")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.10: a directory")?;
         Ok((
             Directory::read(Obj::of(&value, what)?, &self.account())?,
             checked.head,
@@ -685,8 +671,7 @@ impl SwitchClient {
         let checked = self
             .get(&format!("apps/{app}/keys"), TimeoutClass::Bulk)
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.11: a keys answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.11: a keys answer")?;
         KeysAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -700,8 +685,7 @@ impl SwitchClient {
     pub async fn request_full_bundle(&self) -> Result<u64, ClientError> {
         let app = Self::app_segment(&self.own_app_id()?);
         let checked = self.post_empty(&format!("apps/{app}/keys")).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.11: a request answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.11: a request answer")?;
         Obj::of(&value, what)?.time("requested")
     }
 
@@ -715,8 +699,7 @@ impl SwitchClient {
         let checked = self
             .send_json("PUT", "push", setting.to_json(), TimeoutClass::Ordinary)
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 8.1: a push answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 8.1: a push answer")?;
         PushAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -750,8 +733,7 @@ impl SwitchClient {
     pub async fn apps_with_head(&self) -> Result<(AppsAnswer, Option<SignedHead>), ClientError> {
         self.signer_only()?;
         let checked = self.get("apps", TimeoutClass::Bulk).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.12: an apps answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.12: an apps answer")?;
         let answer = AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)?;
         Ok((answer, checked.head))
     }
@@ -845,8 +827,7 @@ impl SwitchClient {
     pub async fn export(&self) -> Result<Manifest, ClientError> {
         self.signer_only()?;
         let checked = self.get("export", TimeoutClass::Bulk).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 10.3: an export answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 10.3: an export answer")?;
         let signed = Obj::of(&value, what)?.doc("manifest")?;
         Ok(Manifest::verify(&signed, &self.key()?, &self.account())?)
     }
@@ -997,8 +978,7 @@ impl SwitchClient {
                 },
             )
             .await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.14: an upload answer")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.14: an upload answer")?;
         let o = Obj::of(&value, what)?;
         let mut answer = UploadAnswer::read_counts(o)?;
         answer.head = match o.opt_head("head")? {
@@ -1056,8 +1036,7 @@ impl SwitchClient {
             )
             .await?;
         let checked = self.finish_call(step, public_time).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.15: a public read")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.15: a public read")?;
         PublicIdentity::read(
             Obj::of(&value, what)?,
             &self.account(),
@@ -1090,11 +1069,7 @@ impl SwitchClient {
         let checked = self
             .send_json("POST", "erase", body, TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(
-            &checked,
-            Doc::Plain,
-            "Switch wire 7.4.16: an erasure answer",
-        )?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.16: an erasure answer")?;
         if Obj::of(&value, what)?.bool("erased")? {
             Ok(())
         } else {
@@ -1118,11 +1093,7 @@ impl SwitchClient {
         let checked = self
             .send_json("PUT", "handover", stored.to_json()?, TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(
-            &checked,
-            Doc::Plain,
-            "Switch wire 7.4.17: a hand-over answer",
-        )?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.17: a hand-over answer")?;
         HandoverStored::read(Obj::of(&value, what)?)
     }
 
@@ -1133,8 +1104,7 @@ impl SwitchClient {
     /// As every call; `404` when none is held for the caller.
     pub async fn get_handover(&self) -> Result<StoredHandover, ClientError> {
         let checked = self.get("handover", TimeoutClass::Bulk).await?;
-        let (value, what) =
-            Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.17: a hand-over")?;
+        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.17: a hand-over")?;
         StoredHandover::read(Obj::of(&value, what)?)
     }
 }

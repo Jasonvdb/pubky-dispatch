@@ -336,8 +336,6 @@ async fn load_state(
                 uses: invite.uses,
                 writer: invite.writer,
                 expires_at: invite.expires_at_ms,
-                context: invite.context,
-                context_written: invite.context_written,
             },
         );
     }
@@ -1227,8 +1225,6 @@ async fn save(
                 uses: invite.uses,
                 writer: invite.writer,
                 expires_at_ms: invite.expires_at,
-                context: invite.context.clone(),
-                context_written: invite.context_written.clone(),
             })
             .await?;
         }

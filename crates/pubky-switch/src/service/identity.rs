@@ -2,13 +2,14 @@
 //! 7.4.15).
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, ProofState, ServiceTransition, item_hash},
+    chain::{ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, item_hash},
     enc::b64,
     http::IdentityDelivery,
     records::{
         AccountActivation, AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc,
         KeptProofs, check_delivery, recovery_apps_version,
     },
+    sig::SignedDoc,
 };
 use serde_json::{Value, json};
 
@@ -37,10 +38,7 @@ pub fn stale_identity_current(held: Option<&IdentityDoc>) -> Value {
 }
 
 /// A write answer's body: `{ "proofs": [...], "head": signed head }` (Switch wire 7.1).
-pub(super) fn write_answer(
-    proofs: &[&pubky_switch_core::sig::SignedDoc],
-    head: &[u8],
-) -> Result<Vec<u8>, ApiError> {
+pub(super) fn write_answer(proofs: &[&SignedDoc], head: &[u8]) -> Result<Vec<u8>, ApiError> {
     let mut body = b"{\"proofs\":[".to_vec();
     for (index, proof) in proofs.iter().enumerate() {
         if index > 0 {
@@ -54,6 +52,26 @@ pub(super) fn write_answer(
     body.extend_from_slice(head);
     body.push(b'}');
     Ok(body)
+}
+
+/// The proof and head produced when a new identity document is chained (Switch wire 7.4.2).
+struct AppliedIdentity {
+    proof: SignedDoc,
+    head: SignedHead,
+}
+
+impl AppliedIdentity {
+    fn into_answer(self) -> Result<Answer, ApiError> {
+        let body = write_answer(&[&self.proof], &self.head.to_json())?;
+        Ok(Answer::ok(body).with_head(Some(self.head)))
+    }
+
+    fn into_recovery_answer(self, doc: &IdentityDoc) -> Result<Answer, ApiError> {
+        let mut answer = self.into_answer()?;
+        answer.key = Some(doc.inbox().service_key);
+        answer.starts_generation = true;
+        Ok(answer)
+    }
 }
 
 impl Service {
@@ -81,7 +99,8 @@ impl Service {
         if afresh {
             return self
                 .start_afresh(txn, held, judged, &doc, trusted, time_ms)
-                .await;
+                .await?
+                .into_recovery_answer(&doc);
         }
         let service_key = super::PublicKeyBytes::public_key_bytes(signer);
         let staged = !super::rules::names_this_service(held, &self.origin, &service_key);
@@ -156,10 +175,10 @@ impl Service {
             }
             // A provider loss at this service: the account starts afresh (Switch wire 3.3,
             // 7.4.2).
-            Ok(Delivery::New(Some(GenerationChange::ProviderLoss))) => {
-                self.recover_in_place(txn, held, &doc, trusted, time_ms)
-                    .await
-            }
+            Ok(Delivery::New(Some(GenerationChange::ProviderLoss))) => self
+                .recover_in_place(txn, held, &doc, trusted, time_ms)
+                .await?
+                .into_recovery_answer(&doc),
             // Without `recovery_from`, a service key change: its key differs from the ending
             // generation's (Switch wire 3.3).
             Ok(Delivery::New(Some(GenerationChange::KeyRotation)))
@@ -194,7 +213,8 @@ impl Service {
                     .await?;
                 let mut answer = self
                     .chain_delivery(txn, signer, None, &doc, trusted, time_ms)
-                    .await?;
+                    .await?
+                    .into_answer()?;
                 answer.starts_generation = true;
                 Ok(answer)
             }
@@ -210,7 +230,8 @@ impl Service {
             Ok(Delivery::New(None)) => {
                 let mut answer = self
                     .chain_delivery(txn, signer, held, &doc, trusted, time_ms)
-                    .await?;
+                    .await?
+                    .into_answer()?;
                 // An account's first document starts its first generation (Switch wire 7.3,
                 // Table 3).
                 answer.starts_generation = held.is_none();
@@ -234,7 +255,7 @@ impl Service {
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AppliedIdentity, ApiError> {
         let refused = || match judged.judgement.decision.verdict {
             verdict::Verdict::Failing { notice, .. } | verdict::Verdict::Bounded { notice, .. } => {
                 self.notice(&txn.head().id, notice)
@@ -313,7 +334,7 @@ impl Service {
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AppliedIdentity, ApiError> {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
         let generation = txn.head().generation;
         // The generation after the one it ends, the account's (wire 3.3): checked by the
@@ -354,7 +375,7 @@ impl Service {
         signer: &ServiceSigner,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AppliedIdentity, ApiError> {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
         let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
         // Read reachability before the reset deletes the app records and receive keys.
@@ -382,12 +403,8 @@ impl Service {
         .map_err(|e| store_error(&e))?;
         self.chain_recovery(txn, signer, recovery_from, time_ms)
             .await?;
-        let mut answer = self
-            .chain_delivery(txn, signer, None, doc, trusted, time_ms)
-            .await?;
-        answer.key = Some(doc.inbox().service_key);
-        answer.starts_generation = true;
-        Ok(answer)
+        self.chain_delivery(txn, signer, None, doc, trusted, time_ms)
+            .await
     }
 
     /// The `recovery` transition, the first chain item of the generation a provider loss
@@ -408,7 +425,7 @@ impl Service {
         Ok(())
     }
 
-    /// Chain a new `identity.json` version and answer with its proof and the new head.
+    /// Chain a new `identity.json` version and return its proof and the new head.
     async fn chain_delivery(
         &self,
         txn: &mut AccountTxn,
@@ -417,7 +434,7 @@ impl Service {
         doc: &IdentityDoc,
         trusted: bool,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AppliedIdentity, ApiError> {
         let failure = |_| ApiError::unavailable("7.6: a temporary failure");
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let item_bytes = doc.signed().doc_bytes().map_err(failure)?;
@@ -443,8 +460,9 @@ impl Service {
             generation: doc.generation(),
             data_epoch: doc.data_epoch(),
         };
-        let proof =
-            self.sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?;
+        let proof = self
+            .sign_proof(txn, signer, ProofBody::new(stub, "identity".into(), &state))?
+            .into_signed();
         // An app it no longer makes current stops holding entries at once (Switch wire
         // 7.4.2, 9.1). Read the old app set before retaining the new document's exclusions.
         let release = self.release(trusted);
@@ -453,7 +471,7 @@ impl Service {
             .map_err(|e| store_error(&e))?;
         txn.set_identity(&HeldIdentity {
             doc: doc.signed().clone(),
-            proof: Some(proof.signed().clone()),
+            proof: Some(proof.clone()),
         })
         .await
         .map_err(|e| store_error(&e))?;
@@ -484,8 +502,7 @@ impl Service {
             .head(txn, signer)
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
-        let body = write_answer(&[proof.signed()], &head.to_json())?;
-        Ok(Answer::ok(body).with_head(Some(head)))
+        Ok(AppliedIdentity { proof, head })
     }
 
     /// The public read of the newest `identity.json` (Switch wire 7.4.15): its limits are

@@ -913,6 +913,11 @@ impl TransitionProof {
         &self.signed
     }
 
+    /// Consume the proof and return its original signed document.
+    pub fn into_signed(self) -> SignedDoc {
+        self.signed
+    }
+
     /// Whether this verified proof names the delivered document and the identity state
     /// it establishes (Switch wire 6.5). The caller verifies the service key and account.
     ///

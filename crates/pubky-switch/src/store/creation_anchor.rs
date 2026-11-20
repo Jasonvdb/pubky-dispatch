@@ -237,25 +237,28 @@ impl AccountTxn {
         {
             return Ok(false);
         }
-        let opening: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT enrollment_hash FROM enrollment_answers WHERE account_id = $1 AND creating",
-        )
-        .bind(self.head().id.clone())
-        .fetch_optional(self.conn())
-        .await?;
-        let Some(hash) = opening.and_then(|bytes| bytes.try_into().ok()) else {
-            return Ok(false);
-        };
-        self.covers_opening_receipt(store_id, hash, limits, mark)
+        self.covers_marked_opening(store_id, None, limits, mark)
             .await
     }
 
-    /// Verify the opening receipt against the creation and actual retained positions.
-    /// The account's common verdict separately checks the chain at the mark.
+    /// Verify a retried creating enrollment's own receipt at the marked position.
     pub(crate) async fn covers_opening_receipt(
         &mut self,
         store_id: [u8; 16],
         enrollment: [u8; 32],
+        limits: &Limits,
+        mark: &crate::marks::AccountMark,
+    ) -> Result<bool, StoreError> {
+        self.covers_marked_opening(store_id, Some(enrollment), limits, mark)
+            .await
+    }
+
+    // The common verdict checks the chain. Both callers still need the original
+    // receipt and its actual retained state position (account binding 3).
+    async fn covers_marked_opening(
+        &mut self,
+        store_id: [u8; 16],
+        enrollment: Option<[u8; 32]>,
         limits: &Limits,
         mark: &crate::marks::AccountMark,
     ) -> Result<bool, StoreError> {
@@ -272,28 +275,52 @@ impl AccountTxn {
         if head.state_version == 0 && (mark.generation != 0 || head.last_seq != 0) {
             return Ok(false);
         }
+        self.covers_creation_receipt_at(
+            store_id,
+            enrollment,
+            limits,
+            anchor,
+            mark.state_version,
+            mark.state_tag,
+        )
+        .await
+    }
+
+    async fn covers_creation_receipt_at(
+        &mut self,
+        store_id: [u8; 16],
+        enrollment: Option<[u8; 32]>,
+        limits: &Limits,
+        anchor: [u8; 32],
+        count: u64,
+        tag: [u8; 16],
+    ) -> Result<bool, StoreError> {
+        let head = self.loaded();
         let identity = head.identity_key;
         let created = head.created_at_ms;
         let id = head.id.clone();
         // A positive marked position must carry this same origin at its tagged history
         // row. A zero mark can attest to the immutable opening receipt only; it never
         // establishes coverage of later exclusion changes.
-        let material: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT a.opening_material FROM accounts a JOIN enrollment_answers e ON e.account_id = a.id \
-             WHERE a.id = $1 AND a.opening_material IS NOT NULL AND e.enrollment_hash = $2 AND \
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT a.opening_material, e.enrollment_hash FROM accounts a JOIN enrollment_answers e ON e.account_id = a.id \
+             WHERE a.id = $1 AND a.opening_material IS NOT NULL AND ($2::bytea IS NULL OR e.enrollment_hash = $2) AND \
              e.store_id = $3 AND e.creating AND e.created_at_ms = a.created_at_ms AND ($4::bigint = 0 OR EXISTS( \
              SELECT 1 FROM state_history WHERE account_id = $1 AND state_version = $4 \
              AND state_tag = $5 AND creation_anchor = $6))",
         )
         .bind(id)
-        .bind(enrollment.as_slice())
+        .bind(enrollment.as_ref().map(|hash| hash.as_slice()))
         .bind(store_id.as_slice())
-        .bind(super::to_db(mark.state_version, "state_version")?)
-        .bind(mark.state_tag.as_slice())
+        .bind(super::to_db(count, "state_version")?)
+        .bind(tag.as_slice())
         .bind(anchor.as_slice())
         .fetch_optional(self.conn())
         .await?;
-        let Some(material) = material.and_then(|bytes| bytes.try_into().ok()) else {
+        let Some((material, enrollment)) = row else {
+            return Ok(false);
+        };
+        let (Ok(material), Ok(enrollment)) = (material.try_into(), enrollment.try_into()) else {
             return Ok(false);
         };
         Ok(receipt_anchor(

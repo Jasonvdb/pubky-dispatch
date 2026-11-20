@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 use super::Refusal;
 use super::body::{
     BatchRef, Condition, KeyBundlePut, MAX_OP_BYTES, OpBody, OpKind, RecordVersion, SignedOp,
-    carrying, carrying_len,
+    carrying_len,
 };
-use crate::enc::{b64, hash, lp, random_bytes};
+use crate::enc::{Obj, array, b64, carrying, hash, lp, random_bytes};
 use crate::error::{Result, invalid};
 use crate::http::ErrorCode;
 use crate::json::{MAX_INT, parse_json};
@@ -102,15 +102,15 @@ impl OpsRequest {
             .map(|e| match e {
                 Entry::Signed(doc) => carrying(doc),
                 Entry::Cursor(position) => {
-                    let mut o = super::body::Obj::new();
+                    let mut o = Obj::new();
                     o.str("op", "cursor.set")
                         .str("position", &position.to_string());
                     o.finish()
                 }
             })
             .collect();
-        let mut o = super::body::Obj::new();
-        o.raw("ops", &super::body::array(&entries));
+        let mut o = Obj::new();
+        o.raw("ops", &array(&entries));
         o.finish()
     }
 

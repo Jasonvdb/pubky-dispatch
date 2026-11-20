@@ -10,12 +10,11 @@
 use serde_json::{Value, json};
 
 use crate::chain::{ItemType, TransitionProof, item_hash};
-use crate::enc::{b64, unb64_array};
+use crate::enc::{Obj, b64, unb64_array};
 use crate::error::{Error, Result, invalid};
 use crate::http::ErrorCode;
 use crate::ident::Policy;
 use crate::json::{MAX_INT, parse_json, reject_unknown_members};
-use crate::ops::body::Obj;
 use crate::ops::{Condition, RecordPut, RecordVersion, Refusal, SignedOp};
 use crate::records::IdentityDoc;
 

@@ -7,6 +7,12 @@
 // Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "../../../tests/support/guide_enums.rs"]
+mod guide_enums;
+
+use guide_enums::{public_enums, rust_files};
+use std::path::Path;
+
 /// The guide.
 const GUIDE: &str = include_str!("../../../docs/signer-host-guide.md");
 
@@ -103,169 +109,30 @@ const COVERED: &[&str] = &[
 /// Each entry says why. Empty: every public enum of the crate is shown to a host.
 const NOT_SHOWN: &[&str] = &[];
 
-/// Remove line comments, block comments and string literals from Rust source, so that the
-/// braces and words inside them aren't read as code.
-fn strip_comments_and_strings(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '/' if chars.peek() == Some(&'/') => {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut last = ' ';
-                for next in chars.by_ref() {
-                    if last == '*' && next == '/' {
-                        break;
-                    }
-                    last = next;
-                }
-            }
-            '"' => {
-                let mut escaped = false;
-                for next in chars.by_ref() {
-                    if escaped {
-                        escaped = false;
-                    } else if next == '\\' {
-                        escaped = true;
-                    } else if next == '"' {
-                        break;
-                    }
-                }
-                out.push_str("\"\"");
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Remove attributes, `#[...]` and `#![...]`, with whatever brackets they hold.
-fn strip_attributes(code: &str) -> String {
-    let mut out = String::with_capacity(code.len());
-    let mut chars = code.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '#' && matches!(chars.peek(), Some('[') | Some('!')) {
-            if chars.peek() == Some(&'!') {
-                chars.next();
-            }
-            let mut depth = 0usize;
-            for next in chars.by_ref() {
-                match next {
-                    '[' => depth += 1,
-                    ']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The source as code only: no comments, no string contents, no attributes.
-fn code_of(source: &str) -> String {
-    strip_attributes(&strip_comments_and_strings(source))
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// The names of the `pub enum`s in `source`, in order.
-fn pub_enum_names(source: &str) -> Vec<String> {
-    let code = code_of(source);
-    let mut names = Vec::new();
-    let mut rest = code.as_str();
-    while let Some(at) = rest.find("pub enum ") {
-        let before = &rest[..at];
-        rest = &rest[at + "pub enum ".len()..];
-        if before.chars().next_back().is_some_and(is_ident_char) {
-            continue;
-        }
-        let name: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| is_ident_char(*c))
-            .collect();
-        if !name.is_empty() {
-            names.push(name);
-        }
-    }
-    names
-}
-
-/// The variant names of `pub enum <name>` in `source`, in order: the first word of each item
-/// at the enum's top level, whatever payload follows it (a tuple, a struct, a discriminant).
-/// `None` when `source` holds no such enum.
-fn enum_variants(source: &str, name: &str) -> Option<Vec<String>> {
-    let code = code_of(source);
-    let head = format!("pub enum {name}");
-    let mut search = 0;
-    let body_start = loop {
-        let at = search + code[search..].find(&head)?;
-        let after = &code[at + head.len()..];
-        if !after.starts_with(is_ident_char) {
-            break at + head.len() + after.find('{')? + 1;
-        }
-        search = at + head.len();
-    };
-    let mut variants = Vec::new();
-    let mut depth = 1usize;
-    let mut expecting = true;
-    let mut word = String::new();
-    for c in code[body_start..].chars() {
-        if depth == 1 && expecting {
-            if is_ident_char(c) {
-                word.push(c);
+/// The declarations the signer guide requires, excluding any listed as never shown.
+fn covered_enums() -> Vec<(String, Vec<String>)> {
+    let mut enums = Vec::new();
+    for (path, source) in SOURCES {
+        for (name, variants) in public_enums(source) {
+            if NOT_SHOWN.contains(&name.as_str()) {
                 continue;
             }
-            if !word.is_empty() {
-                variants.push(std::mem::take(&mut word));
-                expecting = false;
-            }
-        }
-        match c {
-            '{' | '(' | '[' => depth += 1,
-            '}' | ')' | ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            ',' if depth == 1 => expecting = true,
-            _ => {}
+            assert!(
+                COVERED.contains(&name.as_str()),
+                "{path} holds `pub enum {name}`, which is neither covered by the host guide \
+                 nor listed as not shown to a host"
+            );
+            assert!(!variants.is_empty(), "`{name}` has no variants");
+            enums.push((name, variants));
         }
     }
-    Some(variants)
-}
-
-/// Each covered enum with its variants, read from the crate's sources.
-fn covered_enums() -> Vec<(String, Vec<String>)> {
-    COVERED
-        .iter()
-        .map(|name| {
-            let variants = SOURCES
-                .iter()
-                .find_map(|(_, source)| enum_variants(source, name))
-                .unwrap_or_else(|| panic!("no source holds `pub enum {name}`"));
-            assert!(!variants.is_empty(), "`{name}` has no variants");
-            ((*name).to_owned(), variants)
-        })
-        .collect()
+    for name in COVERED {
+        assert!(
+            enums.iter().any(|(declared, _)| declared == name),
+            "no source holds `pub enum {name}`"
+        );
+    }
+    enums
 }
 
 /// The `Name::Variant` pairs of `enums` that `guide` doesn't name in backticks.
@@ -289,7 +156,10 @@ fn unknown_variants(guide: &str, enums: &[(String, Vec<String>)]) -> Vec<String>
         let Some((name, rest)) = span.split_once("::") else {
             continue;
         };
-        let variant: String = rest.chars().take_while(|c| is_ident_char(*c)).collect();
+        let variant: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
         if let Some((_, variants)) = enums.iter().find(|(n, _)| n == name)
             && !variants.contains(&variant)
         {
@@ -301,16 +171,6 @@ fn unknown_variants(guide: &str, enums: &[(String, Vec<String>)]) -> Vec<String>
 
 #[test]
 fn test_host_guide_names_every_variant() {
-    // Every public enum of the crate is either covered or listed as never shown to a host.
-    for (path, source) in SOURCES {
-        for name in pub_enum_names(source) {
-            assert!(
-                COVERED.contains(&name.as_str()) || NOT_SHOWN.contains(&name.as_str()),
-                "{path} holds `pub enum {name}`, which is neither covered by the host guide \
-                 nor listed as not shown to a host"
-            );
-        }
-    }
     let missing = missing_variants(GUIDE, &covered_enums());
     assert!(
         missing.is_empty(),
@@ -318,42 +178,26 @@ fn test_host_guide_names_every_variant() {
     );
 }
 
-/// The paths under `dir`, relative to `root` and joined with `/`, of every `.rs` file in it
-/// and its subfolders.
-fn rust_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            rust_files(root, &path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path.strip_prefix(root).unwrap();
-            let parts: Vec<String> = relative
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            out.push(parts.join("/"));
-        }
-    }
-}
-
 #[test]
 fn test_host_guide_sources_cover_every_module() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_files(&root, &root, &mut files);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = rust_files(&root);
     assert!(
-        files.iter().any(|f| f == "lib.rs"),
+        files.contains(&root.join("lib.rs")),
         "no sources found under {}",
         root.display()
     );
     let mut uncovered = Vec::new();
-    for file in &files {
-        if TEST_ONLY.contains(&file.as_str()) || SOURCES.iter().any(|(path, _)| path == file) {
+    for path in &files {
+        let file = path.strip_prefix(&root).unwrap();
+        if TEST_ONLY.iter().any(|entry| Path::new(entry) == file)
+            || SOURCES.iter().any(|(entry, _)| Path::new(entry) == file)
+        {
             continue;
         }
-        let source = std::fs::read_to_string(root.join(file)).unwrap();
-        if !pub_enum_names(&source).is_empty() {
-            uncovered.push(file.clone());
+        let source = std::fs::read_to_string(path).unwrap();
+        if !public_enums(&source).is_empty() {
+            uncovered.push(file);
         }
     }
     assert!(
@@ -363,13 +207,13 @@ fn test_host_guide_sources_cover_every_module() {
     // Every listed path is a file that exists, so a moved module isn't silently skipped.
     for (path, _) in SOURCES {
         assert!(
-            files.iter().any(|f| f == path),
+            files.contains(&root.join(path)),
             "`SOURCES` names {path}, which isn't under src"
         );
     }
     for path in TEST_ONLY {
         assert!(
-            files.iter().any(|f| f == path),
+            files.contains(&root.join(path)),
             "`TEST_ONLY` names {path}, which isn't under src"
         );
     }
@@ -423,12 +267,30 @@ fn test_host_guide_enum_parser_reads_variants() {
         pub enum SampleTwo { One }
         pub(crate) enum Inner { Two }
     "#;
+    let enums = public_enums(sample);
+    assert_eq!(enums.len(), 2);
+    assert_eq!(enums[0].0, "Sample");
+    assert_eq!(enums[0].1, ["Unit", "Tuple", "Struct", "Last"]);
+    assert_eq!(enums[1].0, "SampleTwo");
+    assert_eq!(enums[1].1, ["One"]);
+}
+
+#[test]
+fn test_host_guide_requires_explicit_enum_in_item_macro() {
+    let source = r#"
+        macro_rules! declare { ($item:item) => { $item }; }
+        declare! {
+            pub enum HostInventoryOutcome { Paused }
+        }
+        declare! { pub(crate) enum Internal { Hidden } }
+    "#;
+    let enums = public_enums(source);
+    assert_eq!(enums.len(), 1);
+    assert_eq!(enums[0].0, "HostInventoryOutcome");
+    assert_eq!(enums[0].1, ["Paused"]);
     assert_eq!(
-        enum_variants(sample, "Sample").unwrap(),
-        ["Unit", "Tuple", "Struct", "Last"]
+        missing_variants("", &enums),
+        ["HostInventoryOutcome::Paused"]
     );
-    assert_eq!(enum_variants(sample, "SampleTwo").unwrap(), ["One"]);
-    assert_eq!(enum_variants(sample, "Hidden"), None);
-    assert_eq!(enum_variants(sample, "Inner"), None);
-    assert_eq!(pub_enum_names(sample), ["Sample", "SampleTwo"]);
+    assert!(missing_variants("`HostInventoryOutcome::Paused`", &enums).is_empty());
 }

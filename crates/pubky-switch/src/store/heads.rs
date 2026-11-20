@@ -171,17 +171,7 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
     rows.iter()
         .map(|row| {
             let identity_key: Vec<u8> = row.try_get("identity_key")?;
-            let chain_seq: Option<i64> = row.try_get("chain_seq")?;
-            let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
-            let chain = match (chain_seq, chain_hash) {
-                (Some(seq), Some(hash)) => Some((
-                    from_db(seq, "chain_seq")?,
-                    <[u8; 32]>::try_from(hash.as_slice())
-                        .map_err(|_| StoreError::Corrupt("chain_hash"))?,
-                )),
-                (None, None) => None,
-                _ => return Err(StoreError::Corrupt("chain_seq and chain_hash")),
-            };
+            let chain = super::chain_head(row, "chain_seq and chain_hash")?;
             Ok(StoredHead {
                 id: row.try_get("id")?,
                 identity_key: <[u8; 32]>::try_from(identity_key.as_slice())

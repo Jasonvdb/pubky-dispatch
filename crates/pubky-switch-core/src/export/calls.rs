@@ -6,13 +6,12 @@ use serde_json::Value;
 use super::manifest::{ChunkRef, Manifest};
 use super::{bad, bad_signature, conflict, doc_refusal};
 use crate::chain::SignedHead;
-use crate::enc::{b64, unb64, unb64_array};
+use crate::enc::{Obj, b64, carrying, string_array, unb64, unb64_array};
 use crate::error::{Error, Result, invalid};
 use crate::http::ErrorCode;
 use crate::json::{MAX_INT, parse_json};
 use crate::labels;
 use crate::ops::Refusal;
-use crate::ops::body::{Obj, carrying, string_array};
 use crate::records::{ExportTransfer, Freeze, IdentityDoc, Inbox, Unfreeze};
 use crate::sig::{self, SignedDoc};
 

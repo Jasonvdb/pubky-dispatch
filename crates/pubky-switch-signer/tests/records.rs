@@ -407,6 +407,8 @@ async fn test_records_renewal_operation_authentication_precedes_retry() {
 
 #[tokio::test]
 async fn test_records_renewal_binding_repair_requires_the_original_account_and_authority() {
+    use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+
     let world = World::new();
     let (store, original) = interrupted_renewal(&world).await;
     let missing = change(&original, b"state", |s| {
@@ -421,6 +423,15 @@ async fn test_records_renewal_binding_repair_requires_the_original_account_and_a
         s["switch_unconfirmed"] = Value::Bool(true)
     });
     assert_confirmed_refusal(&world, &store, &held, Refusal::FlowInProgress.into()).await;
+    let backup = world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH)
+        .unwrap();
+    assert_confirmed_refusal(&world, &store, &missing, Refusal::FlowInProgress.into()).await;
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
     replace(&world, &store, &missing);
     let signer = Box::pin(Signer::restore_over_unusable(
         world.env(store),

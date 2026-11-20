@@ -1,8 +1,7 @@
 //! The futures of the signer's entry points a host may spawn are `Send`: a host runs them on
 //! a multi-threaded runtime, and a future that holds a non-`Send` value, such as a borrowed
-//! iterator, across an await can't be spawned. The checks are at compile time: the function
-//! below is never called, and building the tests fails if one of them isn't. It names every
-//! public async function of the signer.
+//! iterator, across an await can't be spawned. Building the library checks every public async
+//! function of the signer. The function below is never called.
 
 use std::sync::Arc;
 

@@ -74,8 +74,6 @@ const SOURCES: &[(&str, &str)] = &[
 /// The source files compiled only under `cfg(test)`, by path under `src`: a public enum in one
 /// of them is never shown to a host, so `SOURCES` needn't hold them.
 const TEST_ONLY: &[&str] = &[
-    // `#[cfg(test)] mod send_futures;` in `lib.rs`.
-    "send_futures.rs",
     // `#[cfg(test)] mod vector_cases;` in `signer.rs`.
     "signer/vector_cases.rs",
 ];
